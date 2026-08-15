@@ -11,6 +11,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -313,6 +315,73 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
     EXPECT_LE(longVariable, mediumVariable * 50u);
     EXPECT_LE(longLoop.regionLookups,
               longLoop.leafReads + 2u * longLoop.childReads + longLoop.executedCountReads + longLoop.exitKindReads);
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureRollsBackPipelineWrites) {
+    ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    auto calibrationPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
+        std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, calibrationPolicy);
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+
+    float x = 1.25f;
+    int32_t count = 1;
+    float output = -17.0f;
+    const uint64_t shape[]{1};
+    VernonAdValue inputValues[]{
+        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+        {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &output, sizeof(output), 1, shape},
+    };
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonPullback *calibrationPullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(calibrationPullback, nullptr);
+    const size_t oneInvocationBytes =
+        vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy);
+    ASSERT_GT(oneInvocationBytes, 0u);
+    vernonPullbackDestroy(calibrationPullback);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+
+    auto boundedPolicy =
+        std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(oneInvocationBytes, oneInvocationBytes);
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
+    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    count = 1500;
+    output = -31.0f;
+    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
+    EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback),
+              VERNON_STATUS_INTERNAL_ERROR);
+    EXPECT_EQ(rejectedPullback, nullptr);
+    const std::string rejectionError = lastError(context);
+    EXPECT_NE(rejectionError.find("autodiff tape allocator host allocation failed"), std::string::npos)
+        << rejectionError;
+    EXPECT_NE(rejectionError.find("context limit"), std::string::npos) << rejectionError;
+    EXPECT_FLOAT_EQ(output, -31.0f);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);

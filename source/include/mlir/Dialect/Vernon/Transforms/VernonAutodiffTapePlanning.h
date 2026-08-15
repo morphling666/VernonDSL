@@ -85,16 +85,6 @@ struct AutodiffTapeRecord {
     uint64_t alignment{1};
 };
 
-enum class AutodiffParentRecordKind {
-    Invocation,
-    DynamicRegion,
-};
-
-struct AutodiffParentRecordIdentity {
-    AutodiffParentRecordKind kind{AutodiffParentRecordKind::Invocation};
-    std::optional<unsigned> regionOrdinal;
-};
-
 struct AutodiffReverseControlRequirements {
     bool predicate{};
     bool executedCount{};
@@ -104,7 +94,7 @@ struct AutodiffReverseControlRequirements {
 struct AutodiffTapeRegion {
     Operation *operation{};
     unsigned ordinal{};
-    AutodiffParentRecordIdentity parentRecord;
+    std::optional<unsigned> parentRegionOrdinal;
     unsigned childOrdinal{};
     SmallVector<unsigned> childRegionOrdinals;
     AutodiffReverseControlRequirements control;
@@ -164,7 +154,6 @@ struct AdResidualSourceKey {
 };
 
 struct AdResidualSource {
-    AdResidualSourceKey key;
     AdResidualSourceKind kind{AdResidualSourceKind::Unsupported};
     bool legal{};
     bool availableInCurrentContract{};

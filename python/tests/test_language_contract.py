@@ -1167,8 +1167,9 @@ class LanguageVersionTests(unittest.TestCase):
             "    return result\n",
             "float_range.py",
         )
+        self.assertIn("scf.for", float_output)
+        self.assertIn("index to i32", float_output)
         self.assertIn("arith.sitofp", float_output)
-        self.assertNotIn("arith.index_cast", float_output)
 
         natural_output = compile_source(
             "from vernon_dsl import *\n"

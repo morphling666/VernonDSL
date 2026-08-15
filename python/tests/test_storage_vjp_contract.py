@@ -100,6 +100,46 @@ def objective(
         compiled = _native.Compiler().compile_program_result(backward, _native.Target.CPU)
         self.assertTrue(compiled.ok, compiled.diagnostics)
 
+    def test_frontend_nested_canonical_ranges_reach_native_vjp_profiles(self) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        transform = vd.ad.ProgramTransformSpec(
+            "vjp",
+            ("values",),
+            output_cotangents=("loss",),
+        )
+        result = self.compile_source(
+            """
+import vernon_dsl as vd
+
+@vd.kernel
+def objective(
+    values: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    target: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.read],
+    count: vd.i32,
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    total = 0.0
+    for y in range(count):
+        for x in range(count):
+            difference = values[y, x] - target[y, x]
+            total = total + difference * difference
+    loss[0] = total
+""",
+            transform=transform,
+        )
+        self.assertEqual(result.mlir.count("scf.for"), 2)
+        self.assertNotIn("scf.while", result.mlir)
+
+        structured = build_structured_vjp(_native, result, transform)
+        self.assertEqual(structured.residual_storage_kind, "none")
+        forward = structured.profiles["forward_with_tape"]
+        backward = structured.profiles["backward"]
+        self.assertEqual(forward.count("scf.for"), 2)
+        self.assertEqual(backward.count("scf.for"), 2)
+        self.assertNotIn("scf.while", forward)
+        self.assertNotIn("scf.while", backward)
+
     def test_non_void_compute_kernel_is_rejected(self) -> None:
         with self.assertRaisesRegex(CompileError, "must return None"):
             self.compile_source(

@@ -56,6 +56,14 @@ def graph_heavy_square(
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
+def graph_checkpoint_product(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.read_write],
+) -> None:
+    output[0] = source[0] * output[0]
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
 def graph_cube(
     source: vd.TensorView[vd.f32, (1,), vd.read],
     output: vd.TensorView[vd.f32, (1,), vd.write],
@@ -83,6 +91,7 @@ def graph_scale(
 
 graph_square_vjp = vd.ad.vjp(graph_square, wrt=("source",), outputs=("output",))
 graph_heavy_square_vjp = vd.ad.vjp(graph_heavy_square, wrt=("source",), outputs=("output",))
+graph_checkpoint_product_vjp = vd.ad.vjp(graph_checkpoint_product, wrt=("source",), outputs=("output",))
 graph_cube_vjp = vd.ad.vjp(graph_cube, wrt=("source",), outputs=("output",))
 graph_product_vjp = vd.ad.vjp(graph_product, wrt=("left", "right"), outputs=("output",))
 graph_scale_vjp = vd.ad.vjp(graph_scale, wrt=("factor",), outputs=("output",))
@@ -176,7 +185,7 @@ class CpuExecutionGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "non-negative integer"):
             graph.plan_autodiff_checkpoints(memory_budget=-1)
 
-    def test_autodiff_budget_charges_static_tape_allocation_overhead_per_pass(self) -> None:
+    def test_autodiff_budget_accepts_no_tape_plan_and_charges_gradients(self) -> None:
         def make_graph() -> vd.ExecutionGraph:
             source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
             intermediate = vd.storage.zeros(dtype=vd.f32, shape=(1,))
@@ -201,11 +210,18 @@ class CpuExecutionGraphTests(unittest.TestCase):
             return graph
 
         pullback = make_graph().compile().vjp()
-        logical_only_budget = pullback.logical_residual_bytes + 2 * np.dtype(np.float32).itemsize
-        self.assertGreater(pullback.peak_runtime_managed_bytes, logical_only_budget)
+        gradient_only_budget = 2 * np.dtype(np.float32).itemsize
+        self.assertEqual(pullback.logical_residual_bytes, 0)
+        self.assertEqual(pullback.resident_tape_bytes, 0)
+        self.assertEqual(pullback.allocated_tape_bytes, 0)
+        self.assertEqual(pullback.peak_runtime_managed_bytes, gradient_only_budget)
 
         graph = make_graph()
-        graph.plan_autodiff_checkpoints(memory_budget=logical_only_budget)
+        graph.plan_autodiff_checkpoints(memory_budget=gradient_only_budget)
+        graph.compile()
+
+        graph = make_graph()
+        graph.plan_autodiff_checkpoints(memory_budget=gradient_only_budget - 1)
         with self.assertRaisesRegex(ValueError, "cannot satisfy the memory budget"):
             graph.compile()
 
@@ -403,15 +419,17 @@ class CpuExecutionGraphTests(unittest.TestCase):
 
     def test_graph_vjp_replays_checkpointed_segments_and_remains_reusable(self) -> None:
         source = vd.storage.from_numpy(np.array([1.0], dtype=np.float32))
-        states = [vd.storage.zeros(dtype=vd.f32, shape=(1,)) for _ in range(4)]
+        ping = vd.storage.from_numpy(np.array([1.0], dtype=np.float32))
+        pong = vd.storage.from_numpy(np.array([1.0], dtype=np.float32))
         graph = vd.ExecutionGraph()
         previous = graph.differentiable_input("source", source)
-        for index, state in enumerate(states):
-            output = graph.objective("loss", state) if index == 3 else graph.import_resource(state, exported=False)
+        ping_resource = graph.import_resource(ping, exported=False)
+        pong_resource = graph.objective("loss", pong)
+        for index, output in enumerate((ping_resource, pong_resource, ping_resource, pong_resource)):
             graph.add_pass(
                 vd.VjpComputePass(
-                    f"square-{index}",
-                    graph_heavy_square_vjp,
+                    f"product-{index}",
+                    graph_checkpoint_product_vjp,
                     {"source": previous, "output": output},
                     grid=(1, 1, 1),
                 )
@@ -438,13 +456,13 @@ class CpuExecutionGraphTests(unittest.TestCase):
             pullback.allocated_tape_bytes + pullback.checkpoint_bytes,
         )
         expected_loss = np.float32(1.0)
-        self.assertAlmostEqual(float(states[-1].to_numpy()[0]), float(expected_loss), places=5)
-        expected_gradient = np.float32(2**32)
+        self.assertAlmostEqual(float(pong.to_numpy()[0]), float(expected_loss), places=5)
+        expected_gradient = np.float32(1.0)
         source.copy_from_numpy(np.array([2.0], dtype=np.float32))
         for _ in range(2):
             gradient = pullback(None)["source"].to_numpy()
             self.assertAlmostEqual(float(gradient[0]), float(expected_gradient), places=4)
-            self.assertAlmostEqual(float(states[-1].to_numpy()[0]), float(expected_loss), places=5)
+            self.assertAlmostEqual(float(pong.to_numpy()[0]), float(expected_loss), places=5)
             np.testing.assert_array_equal(source.to_numpy(), np.array([2.0], dtype=np.float32))
 
     def test_graph_vjp_accumulates_branches_deterministically(self) -> None:

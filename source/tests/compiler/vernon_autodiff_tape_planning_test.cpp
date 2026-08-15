@@ -231,11 +231,13 @@ module {
       %factor: f32 {vernon.source_name = "factor", vernon.abi_leaf_dtypes = ["f32"]})
       -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
     %true = arith.constant true
+    %zero = arith.constant 0.0 : f32
     %result = scf.while (%before = %x) : (f32) -> (f32) {
       scf.condition(%true) %before : f32
     } do {
     ^bb0(%after: f32):
-      %selected = scf.if %true -> (f32) {
+      %positive = arith.cmpf ogt, %after, %zero : f32
+      %selected = scf.if %positive -> (f32) {
         %product = arith.mulf %after, %factor : f32
         scf.yield %product : f32
       } else {
@@ -255,10 +257,9 @@ module {
 
     const AutodiffTapeRegion &loop = plan->getRegions()[0];
     const AutodiffTapeRegion &branch = plan->getRegions()[1];
-    EXPECT_EQ(loop.parentRecord.kind, AutodiffParentRecordKind::Invocation);
-    EXPECT_EQ(branch.parentRecord.kind, AutodiffParentRecordKind::DynamicRegion);
-    ASSERT_TRUE(branch.parentRecord.regionOrdinal);
-    EXPECT_EQ(*branch.parentRecord.regionOrdinal, loop.ordinal);
+    EXPECT_FALSE(loop.parentRegionOrdinal);
+    ASSERT_TRUE(branch.parentRegionOrdinal);
+    EXPECT_EQ(*branch.parentRegionOrdinal, loop.ordinal);
     EXPECT_EQ(branch.childOrdinal, 0u);
     ASSERT_EQ(loop.childRegionOrdinals, SmallVector<unsigned>({branch.ordinal}));
     EXPECT_TRUE(loop.control.executedCount);
@@ -291,7 +292,7 @@ module {
               1u);
 }
 
-TEST_F(VernonAutodiffTapePlanningTest, EnumeratesExactVersionReloadBeforeSelectingCurrentCapture) {
+TEST_F(VernonAutodiffTapePlanningTest, SelectsExactVersionReloadForRetainedReadOnlyStorage) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
   func.func @load_square(
@@ -320,15 +321,16 @@ module {
     ASSERT_NE(source, plan->getMemoryPlan().getSourceSelections().end());
     EXPECT_TRUE(llvm::any_of(source->candidates, [](const AdResidualSource &candidate) {
         return candidate.kind == AdResidualSourceKind::ExactVersionReload && candidate.legal &&
-               !candidate.availableInCurrentContract && candidate.storageIdentity && candidate.versionBefore &&
+               candidate.availableInCurrentContract && candidate.storageIdentity && candidate.versionBefore &&
                candidate.resourceReloadCost == 1 && candidate.deterministicReductionLegal;
     }));
     const AdResidualSource &selected = source->candidates[source->selectedCandidate];
-    EXPECT_EQ(selected.kind, AdResidualSourceKind::StaticCapture);
-    EXPECT_EQ(selected.captureStoreBytes, sizeof(float));
-    EXPECT_EQ(selected.backwardLoadBytes, sizeof(float));
-    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().captureStoreBytes, sizeof(float));
-    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().backwardLoadBytes, sizeof(float));
+    EXPECT_EQ(selected.kind, AdResidualSourceKind::ExactVersionReload);
+    EXPECT_TRUE(plan->getInvocationRecord().leaves.empty());
+    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().captureStoreBytes, 0u);
+    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().backwardLoadBytes, 0u);
+    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().resourceReloadCost, 1u);
+    EXPECT_EQ(plan->getMemoryPlan().getCostComponents().retainedTapeBytes, 0u);
     EXPECT_EQ(plan->getMemoryPlan().getMemoryBudgetBytes(), 64u * 1024u * 1024u);
     EXPECT_EQ(plan->getMemoryPlan().getSelectedPolicy(), "min_memory");
 
@@ -342,7 +344,7 @@ module {
     ASSERT_TRUE(succeeded(runtime));
     EXPECT_EQ(runtime->getMemoryPlan().getSelectedPolicy(), "min_runtime");
     function->setAttr("vernon.ad.memory_budget_bytes", IntegerAttr::get(IntegerType::get(&context, 64), 3));
-    EXPECT_TRUE(failed(planFunction(*module, "load_square", {"input"}, registry)));
+    EXPECT_TRUE(succeeded(planFunction(*module, "load_square", {"input"}, registry)));
     function->removeAttr("vernon.ad.memory_budget_bytes");
     function->setAttr("vernon.ad.planning_policy", StringAttr::get(&context, "fastest"));
     EXPECT_TRUE(failed(planFunction(*module, "load_square", {"input"}, registry)));
@@ -412,7 +414,7 @@ module {
     EXPECT_EQ(record.leaves.front().dtype, "u32");
 }
 
-TEST_F(VernonAutodiffTapePlanningTest, LaysOutNestedAggregateInsideDynamicRecord) {
+TEST_F(VernonAutodiffTapePlanningTest, RematerializesNestedAggregateWithoutIfHistory) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
   func.func @nested_record(
@@ -446,9 +448,8 @@ module {
         {}, [](Operation *) { return success(); }))));
     FailureOr<VernonAutodiffTapePlan> plan = planFunction(*module, "nested_record", {"x"}, registry);
     ASSERT_TRUE(succeeded(plan));
-    ASSERT_EQ(plan->getRegions().size(), 1u);
-    const AutodiffTapeRecord &record = plan->getRegions().front().record;
-    EXPECT_TRUE(record.leaves.empty());
+    EXPECT_TRUE(plan->getRegions().empty());
+    EXPECT_TRUE(plan->getInvocationRecord().leaves.empty());
     EXPECT_TRUE(llvm::any_of(plan->getMemoryPlan().getSourceSelections(), [](const auto &selection) {
         return selection.candidates[selection.selectedCandidate].kind == AdResidualSourceKind::PureRematerialization;
     }));

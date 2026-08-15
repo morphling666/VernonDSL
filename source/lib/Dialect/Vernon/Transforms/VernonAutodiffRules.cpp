@@ -303,8 +303,8 @@ LogicalResult verifyElementwiseOperation(Operation *operation, unsigned operandC
 }
 
 bool isStructuralAutodiffOperation(Operation *operation) {
-    return isa<scf::IfOp, scf::WhileOp, StructGetOp, TupleGetOp, StructCreateOp, TupleCreateOp, LoadOp, StoreOp,
-               ReduceSumOp, ScatterAddOp, AtomicOp>(operation);
+    return isa<scf::IfOp, scf::ForOp, scf::WhileOp, StructGetOp, TupleGetOp, StructCreateOp, TupleCreateOp, LoadOp,
+               StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(operation);
 }
 
 bool isDifferentiableValueType(Type type) { return succeeded(getDerivativeValueType(type)); }

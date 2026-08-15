@@ -66,6 +66,7 @@ target_link_libraries(
             MLIRPass
             MLIRRegisterAllDialects
             MLIRRegisterAllExtensions
+            MLIRSCFTransforms
             MLIRSCFToControlFlow
             MLIRSPIRVDialect
             MLIRSPIRVSerialization

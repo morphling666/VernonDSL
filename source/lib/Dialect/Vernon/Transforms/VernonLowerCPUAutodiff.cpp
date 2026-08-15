@@ -174,19 +174,21 @@ public:
     LogicalResult run() {
         bool hasCapture = false;
         bool hasAutodiffHandles = false;
+        bool hasAdjointBuffers = false;
         function.walk([&](Operation *operation) {
             hasCapture = hasCapture || isa<AdCaptureOp>(operation);
+            hasAdjointBuffers = hasAdjointBuffers || isa<AdAdjointBufferCreateOp>(operation);
             for (Type type : operation->getOperandTypes())
                 hasAutodiffHandles = hasAutodiffHandles || containsLogicalAutodiffHandle(type);
             for (Type type : operation->getResultTypes())
                 hasAutodiffHandles = hasAutodiffHandles || containsLogicalAutodiffHandle(type);
         });
-        if (!hasCapture && !hasAutodiffHandles)
+        if (!hasCapture && !hasAutodiffHandles && !hasAdjointBuffers)
             return success();
         if (hasCapture) {
             if (failed(prepareForward()))
                 return failure();
-        } else {
+        } else if (hasAutodiffHandles) {
             if (failed(prepareBackward()))
                 return failure();
         }

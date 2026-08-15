@@ -357,11 +357,17 @@ module {
     ASSERT_TRUE(succeeded(result));
     EXPECT_TRUE(succeeded(verify(*module)));
     EXPECT_EQ(result->backward.getNumResults(), 0u);
-    ASSERT_EQ(result->backward.getNumArguments(), 5u);
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    EXPECT_EQ(result->tapeBytes, 0u);
+    EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.values"}));
+    ASSERT_EQ(result->backward.getNumArguments(), 4u);
     auto gradient = dyn_cast<TensorViewType>(result->backward.getArgumentTypes().back());
     ASSERT_TRUE(gradient);
     EXPECT_EQ(gradient.getShape(), ArrayRef<int64_t>({-1}));
     EXPECT_EQ(gradient.getAccess(), "write");
+    unsigned reverseReloads = 0;
+    result->backward.walk([&](LoadOp) { ++reverseReloads; });
+    EXPECT_GT(reverseReloads, 0u);
     unsigned dynamicBuffers = 0;
     result->backward.walk([&](AdAdjointBufferCreateOp create) {
         dynamicBuffers += llvm::is_contained(create.getBuffer().getType().getShape(), int64_t{-1});
@@ -369,7 +375,7 @@ module {
     EXPECT_EQ(dynamicBuffers, 0u);
 }
 
-TEST_F(VernonStructuredVjpTest, BuildsDynamicForStorageObjective) {
+TEST_F(VernonStructuredVjpTest, ReconstructsCanonicalForWithoutLoopHistory) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
         R"mlir(
 module {
@@ -401,19 +407,132 @@ module {
                            StructuredVjpOptions{{"x"}, "for_forward", "for_backward", {"loss"}});
     ASSERT_TRUE(succeeded(result));
     EXPECT_TRUE(succeeded(verify(*module)));
-    EXPECT_GT(result->tapeBytes, 0u);
-    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
-    EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
+    EXPECT_EQ(result->tapeBytes, 0u);
+    EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.count"}));
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
     unsigned dynamicRegions = 0;
     result->forward.walk([&](AdBeginRegionOp) { ++dynamicRegions; });
-    EXPECT_GT(dynamicRegions, 1u);
+    EXPECT_EQ(dynamicRegions, 0u);
+    unsigned forwardFors = 0;
+    result->forward.walk([&](scf::ForOp) { ++forwardFors; });
+    EXPECT_EQ(forwardFors, 1u);
+    unsigned backwardFors = 0;
+    result->backward.walk([&](scf::ForOp) { ++backwardFors; });
+    EXPECT_EQ(backwardFors, 1u);
+    unsigned executedCountReads = 0;
+    result->backward.walk([&](AdReadExecutedCountOp) { ++executedCountReads; });
+    EXPECT_EQ(executedCountReads, 0u);
     unsigned sourceFors = 0;
     module->lookupSymbol<func::FuncOp>("primal").walk([&](scf::ForOp) { ++sourceFors; });
     EXPECT_EQ(sourceFors, 1u);
     EXPECT_EQ(llvm::range_size(module->getOps<func::FuncOp>()), 3u);
 }
 
-TEST_F(VernonStructuredVjpTest, BuildsDynamicIfStorageObjectiveAndReplaysSelectedRegion) {
+TEST_F(VernonStructuredVjpTest, CapturesOnlyRequiredLoopCarriedPrimalPerIteration) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %x: f32 {vernon.source_name = "x", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %count: i32 {vernon.source_name = "count", vernon.dtype = "i32", vernon.abi_leaf_dtypes = ["i32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      attributes {vernon.entry, vernon.stage = "compute"} {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %upper = arith.index_cast %count : i32 to index
+    %result = scf.for %index = %zero to %upper step %one
+        iter_args(%value = %x) -> (f32) {
+      %next = arith.mulf %value, %x : f32
+      scf.yield %next : f32
+    }
+    "vernon.store"(%result, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x"}, "for_capture_forward", "for_capture_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_GT(result->tapeBytes, 0u);
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
+    unsigned forwardFors = 0;
+    result->forward.walk([&](scf::ForOp) { ++forwardFors; });
+    EXPECT_EQ(forwardFors, 1u);
+    unsigned backwardFors = 0;
+    result->backward.walk([&](scf::ForOp) { ++backwardFors; });
+    EXPECT_EQ(backwardFors, 1u);
+    unsigned predicateOrCountReads = 0;
+    result->backward.walk([&](AdReadExecutedCountOp) { ++predicateOrCountReads; });
+    EXPECT_EQ(predicateOrCountReads, 0u);
+    unsigned primalReads = 0;
+    result->backward.walk([&](AdReadLeafOp) { ++primalReads; });
+    EXPECT_GT(primalReads, 0u);
+}
+
+TEST_F(VernonStructuredVjpTest, ReconstructsNestedForWithExactVersionReloads) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %input: !vernon.tensor_view<f32, [2, 2], "read", "device">
+          {vernon.source_name = "input", vernon.abi_leaf_dtypes = ["f32"]},
+      %target: !vernon.tensor_view<f32, [2, 2], "read", "device">
+          {vernon.source_name = "target", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]})
+      attributes {vernon.entry, vernon.stage = "compute"} {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %two = arith.constant 2 : index
+    %zero_value = arith.constant 0.0 : f32
+    %result = scf.for %y = %zero to %two step %one
+        iter_args(%row_accumulator = %zero_value) -> (f32) {
+      %row_result = scf.for %x = %zero to %two step %one
+          iter_args(%accumulator = %row_accumulator) -> (f32) {
+        %input_value = "vernon.load"(%input, %y, %x)
+            : (!vernon.tensor_view<f32, [2, 2], "read", "device">, index, index) -> f32
+        %target_value = "vernon.load"(%target, %y, %x)
+            : (!vernon.tensor_view<f32, [2, 2], "read", "device">, index, index) -> f32
+        %difference = arith.subf %input_value, %target_value : f32
+        %squared = arith.mulf %difference, %difference : f32
+        %next = arith.addf %accumulator, %squared : f32
+        scf.yield %next : f32
+      }
+      scf.yield %row_result : f32
+    }
+    "vernon.store"(%result, %loss, %zero)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"input"}, "nested_for_forward", "nested_for_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->tapeBytes, 0u);
+    EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.input", "primal.target"}));
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    unsigned backwardFors = 0;
+    result->backward.walk([&](scf::ForOp) { ++backwardFors; });
+    EXPECT_EQ(backwardFors, 2u);
+    unsigned exactReloads = 0;
+    result->backward.walk([&](LoadOp) { ++exactReloads; });
+    EXPECT_GE(exactReloads, 2u);
+}
+
+TEST_F(VernonStructuredVjpTest, ReconstructsPureIfWithoutControlHistory) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
         R"mlir(
 module {
@@ -445,14 +564,125 @@ module {
                            StructuredVjpOptions{{"x"}, "if_forward", "if_backward", {"loss"}});
     ASSERT_TRUE(succeeded(result));
     EXPECT_TRUE(succeeded(verify(*module)));
-    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
-    EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
+    EXPECT_EQ(result->tapeBytes, 0u);
+    EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.x"}));
     unsigned encodedRegions = 0;
     result->forward.walk([&](AdBeginRegionOp) { ++encodedRegions; });
-    EXPECT_GT(encodedRegions, 1u);
+    EXPECT_EQ(encodedRegions, 0u);
     unsigned backwardIfs = 0;
     result->backward.walk([&](scf::IfOp) { ++backwardIfs; });
     EXPECT_GT(backwardIfs, 0u);
+    unsigned predicateReads = 0;
+    result->backward.walk([&](AdReadLeafOp) { ++predicateReads; });
+    EXPECT_EQ(predicateReads, 0u);
+}
+
+TEST_F(VernonStructuredVjpTest, ReconstructsIfPredicateFromCanonicalForInduction) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %x: f32 {vernon.source_name = "x", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      attributes {vernon.entry, vernon.stage = "compute"} {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %four = arith.constant 4 : index
+    %two = arith.constant 2 : index
+    %result = scf.for %index = %zero to %four step %one
+        iter_args(%value = %x) -> (f32) {
+      %first_half = arith.cmpi slt, %index, %two : index
+      %next = scf.if %first_half -> (f32) {
+        %sum = arith.addf %value, %x : f32
+        scf.yield %sum : f32
+      } else {
+        %difference = arith.subf %value, %x : f32
+        scf.yield %difference : f32
+      }
+      scf.yield %next : f32
+    }
+    "vernon.store"(%result, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x"}, "nested_for_if_forward", "nested_for_if_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->tapeBytes, 0u);
+    unsigned forwardRegions = 0;
+    result->forward.walk([&](AdBeginRegionOp) { ++forwardRegions; });
+    EXPECT_EQ(forwardRegions, 0u);
+    unsigned backwardFors = 0;
+    unsigned backwardIfs = 0;
+    result->backward.walk([&](scf::ForOp) { ++backwardFors; });
+    result->backward.walk([&](scf::IfOp) { ++backwardIfs; });
+    EXPECT_EQ(backwardFors, 1u);
+    EXPECT_EQ(backwardIfs, 1u);
+}
+
+TEST_F(VernonStructuredVjpTest, ReconstructsNestedIfInsideCapturedOuterControl) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %x: f32 {vernon.source_name = "x", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %control: !vernon.tensor_view<f32, [1], "read_write", "device">
+          {vernon.source_name = "control", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      attributes {vernon.entry, vernon.stage = "compute"} {
+    %zero = arith.constant 0.0 : f32
+    %one = arith.constant 1.0 : f32
+    %control_value = "vernon.load"(%control, %gid)
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">, index) -> f32
+    %outer_condition = arith.cmpf ogt, %control_value, %zero : f32
+    %result = scf.if %outer_condition -> (f32) {
+      %inner_condition = arith.cmpf olt, %x, %one : f32
+      %inner = scf.if %inner_condition -> (f32) {
+        %squared = arith.mulf %x, %x : f32
+        scf.yield %squared : f32
+      } else {
+        %negated = arith.negf %x : f32
+        scf.yield %negated : f32
+      }
+      scf.yield %inner : f32
+    } else {
+      scf.yield %x : f32
+    }
+    "vernon.store"(%result, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x"}, "nested_if_forward", "nested_if_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "dynamic");
+    unsigned forwardRegions = 0;
+    result->forward.walk([&](AdBeginRegionOp) { ++forwardRegions; });
+    EXPECT_EQ(forwardRegions, 2u);
+    unsigned backwardIfs = 0;
+    result->backward.walk([&](scf::IfOp) { ++backwardIfs; });
+    EXPECT_EQ(backwardIfs, 2u);
+    unsigned predicateReads = 0;
+    result->backward.walk([&](AdReadLeafOp) { ++predicateReads; });
+    EXPECT_EQ(predicateReads, 1u);
 }
 
 TEST_F(VernonStructuredVjpTest, BuildsDynamicWhileStorageObjective) {
@@ -473,7 +703,7 @@ module {
       scf.condition(%continue) %value, %index : f32, i32
     } do {
     ^bb0(%value: f32, %index: i32):
-      %next = arith.addf %value, %x : f32
+      %next = arith.mulf %value, %x : f32
       %next_index = arith.addi %index, %one : i32
       scf.yield %next, %next_index : f32, i32
     }
@@ -496,6 +726,12 @@ module {
     unsigned dynamicRegions = 0;
     result->forward.walk([&](AdBeginRegionOp) { ++dynamicRegions; });
     EXPECT_GT(dynamicRegions, 1u);
+    unsigned executedCountReads = 0;
+    unsigned carriedPrimalReads = 0;
+    result->backward.walk([&](AdReadExecutedCountOp) { ++executedCountReads; });
+    result->backward.walk([&](AdReadLeafOp) { ++carriedPrimalReads; });
+    EXPECT_EQ(executedCountReads, 1u);
+    EXPECT_GT(carriedPrimalReads, 0u);
 }
 
 TEST_F(VernonStructuredVjpTest, RejectsFunctionReturnComputeObjective) {

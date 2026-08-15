@@ -233,6 +233,15 @@ private:
                 return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
                                           : FailureOr<SmallVector<std::string>>(failure());
             }
+            if (auto forOp = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp())) {
+                if (argument == forOp.getInductionVar())
+                    return SmallVector<std::string>{};
+                if (argument.getArgNumber() == 0 || argument.getArgNumber() > forOp.getInitArgs().size())
+                    return failure();
+                FailureOr<ValueAbiLayout> initial = resolve(forOp.getInitArgs()[argument.getArgNumber() - 1]);
+                return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
+                                          : FailureOr<SmallVector<std::string>>(failure());
+            }
             return failure();
         }
 
@@ -249,6 +258,13 @@ private:
             if (result.getResultNumber() >= whileOp.getInits().size())
                 return failure();
             FailureOr<ValueAbiLayout> initial = resolve(whileOp.getInits()[result.getResultNumber()]);
+            return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
+                                      : FailureOr<SmallVector<std::string>>(failure());
+        }
+        if (auto forOp = dyn_cast<scf::ForOp>(operation)) {
+            if (result.getResultNumber() >= forOp.getInitArgs().size())
+                return failure();
+            FailureOr<ValueAbiLayout> initial = resolve(forOp.getInitArgs()[result.getResultNumber()]);
             return succeeded(initial) ? FailureOr<SmallVector<std::string>>(copyDtypes(*initial))
                                       : FailureOr<SmallVector<std::string>>(failure());
         }
@@ -569,6 +585,20 @@ void AutodiffAnalysisBuilder::buildDependencies(Operation *operation) {
             addAllDependencies(argument, ValueRange(condition.getArgs()[index]));
         return;
     }
+    if (auto forOp = dyn_cast<scf::ForOp>(operation)) {
+        auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+        for (auto [index, value] : llvm::enumerate(forOp.getResults())) {
+            addAllDependencies(value, ValueRange(yield.getResults()[index]));
+            SmallVector<Value> carried = {forOp.getInitArgs()[index], forOp.getRegionIterArgs()[index],
+                                          yield.getResults()[index], value};
+            verifySameAbi(operation, carried);
+        }
+        for (auto [index, argument] : llvm::enumerate(forOp.getRegionIterArgs())) {
+            addAllDependencies(argument, ValueRange(forOp.getInitArgs()[index]));
+            addAllDependencies(argument, ValueRange(yield.getResults()[index]));
+        }
+        return;
+    }
     if (auto get = dyn_cast<StructGetOp>(operation)) {
         addProjectedGetDependencies(get.getResult(), get.getInput(), ValueAbiPathComponent::getField(get.getField()));
         return;
@@ -777,6 +807,37 @@ LogicalResult AutodiffAnalysisBuilder::buildStructuredDependencies(Region &regio
                 if (failed(merged))
                     return ifOp.emitError("cannot create autodiff Storage branch merge version");
                 versions[identity.id] = *merged;
+            }
+            continue;
+        }
+        if (auto forOp = dyn_cast<scf::ForOp>(operation)) {
+            buildDependencies(forOp);
+            DenseMap<unsigned, unsigned> loopVersions;
+            for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+                FailureOr<unsigned> phi =
+                    createStorageVersion(identity.id, StorageVersionKind::ForPhi, forOp, {versions[identity.id]});
+                if (failed(phi))
+                    return forOp.emitError("cannot create autodiff Storage for-loop phi version");
+                loopVersions[identity.id] = *phi;
+            }
+            DenseMap<unsigned, unsigned> bodyVersions = loopVersions;
+            if (failed(buildStructuredDependencies(forOp.getRegion(), bodyVersions)))
+                return failure();
+            for (const AutodiffStorageIdentity &identity : result.storageIdentities) {
+                const unsigned phi = loopVersions[identity.id];
+                const unsigned backedge = bodyVersions[identity.id];
+                result.storageVersions[phi].incomingVersions.push_back(backedge);
+                for (auto [leafIndex, phiNode] : llvm::enumerate(result.storageVersionNodes[phi])) {
+                    if (phiNode == kInvalidNode)
+                        continue;
+                    unsigned backedgeNode = result.storageVersionNodes[backedge][leafIndex];
+                    if (backedgeNode != kInvalidNode)
+                        addDependency(phiNode, backedgeNode);
+                }
+                FailureOr<unsigned> exit = createStorageVersion(identity.id, StorageVersionKind::ForExit, forOp, {phi});
+                if (failed(exit))
+                    return forOp.emitError("cannot create autodiff Storage for-loop exit version");
+                versions[identity.id] = *exit;
             }
             continue;
         }
@@ -1283,7 +1344,7 @@ bool AutodiffAnalysisBuilder::hasActiveDescendant(Operation *operation) const {
 LogicalResult AutodiffAnalysisBuilder::discoverRegions() {
     DenseMap<Operation *, unsigned> ordinals;
     WalkResult walkResult = function.walk<WalkOrder::PreOrder>([&](Operation *operation) {
-        if (!isa<scf::IfOp, scf::WhileOp>(operation))
+        if (!isa<scf::IfOp, scf::ForOp, scf::WhileOp>(operation))
             return WalkResult::advance();
         std::optional<unsigned> parent;
         for (Operation *ancestor = operation->getParentOp(); ancestor && ancestor != function.getOperation();
@@ -1300,9 +1361,7 @@ LogicalResult AutodiffAnalysisBuilder::discoverRegions() {
             return WalkResult::interrupt();
         }
         ordinals.try_emplace(operation, *ordinal);
-        result.regions.push_back(AutodiffRegion{operation, *ordinal, parent, {}});
-        if (parent)
-            result.regions[*parent].childOrdinals.push_back(*ordinal);
+        result.regions.push_back(AutodiffRegion{operation, *ordinal, parent});
         return WalkResult::advance();
     });
     return failure(walkResult.wasInterrupted());
@@ -1331,9 +1390,10 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
             operationActive |=
                 llvm::any_of(operation->getOperands(), [&](Value value) { return anyActiveLeaf(value); });
         }
-        if (isa<scf::IfOp, scf::WhileOp>(operation))
+        if (isa<scf::IfOp, scf::ForOp, scf::WhileOp>(operation))
             operationActive |= hasActiveDescendant(operation);
-        if (operation->getNumRegions() != 0 && !isa<scf::IfOp, scf::WhileOp>(operation) && operationActive) {
+        if (operation->getNumRegions() != 0 && !isa<scf::IfOp, scf::ForOp, scf::WhileOp>(operation) &&
+            operationActive) {
             operation->emitError("autodiff analysis does not support an active unstructured region operation");
             status = failure();
             return WalkResult::interrupt();
@@ -1341,30 +1401,31 @@ LogicalResult AutodiffAnalysisBuilder::collectOperations() {
         result.operations.push_back(AutodiffOperationActivity{operation, effect, operationActive});
         if (operationActive)
             result.activeOperationSet.insert(operation);
-        if (operationActive) {
-            if (auto load = dyn_cast<LoadOp>(operation)) {
-                const AutodiffStorageEffect *storageEffect = result.getStorageEffect(operation);
-                if (!storageEffect) {
-                    load.emitError("active Storage load has no exact-version effect metadata");
-                    status = failure();
-                    return WalkResult::interrupt();
-                }
-                AutodiffActiveLoad activeLoad;
-                activeLoad.operation = operation;
-                activeLoad.identity = storageEffect->identity;
-                activeLoad.versionBefore = storageEffect->versionBefore;
-                llvm::append_range(activeLoad.indices, load.getIndices());
-                for (Value index : load.getIndices())
-                    activeLoad.indexProvenance.push_back(classifyIndexProvenance(index, function));
-                FailureOr<unsigned> loadIndex = checkedUnsigned(result.activeLoads.size());
-                if (failed(loadIndex)) {
-                    load.emitError("active Storage load count exceeds the analysis representation");
-                    status = failure();
-                    return WalkResult::interrupt();
-                }
-                result.activeLoadIndices.try_emplace(operation, *loadIndex);
-                result.activeLoads.push_back(std::move(activeLoad));
+        if (auto load = dyn_cast<LoadOp>(operation)) {
+            const AutodiffStorageEffect *storageEffect = result.getStorageEffect(operation);
+            if (!storageEffect) {
+                load.emitError("Storage load has no exact-version effect metadata");
+                status = failure();
+                return WalkResult::interrupt();
             }
+            AutodiffLoadInfo loadInfo;
+            loadInfo.operation = operation;
+            loadInfo.identity = storageEffect->identity;
+            loadInfo.versionBefore = storageEffect->versionBefore;
+            llvm::append_range(loadInfo.indices, load.getIndices());
+            for (Value index : load.getIndices())
+                loadInfo.indexProvenance.push_back(classifyIndexProvenance(index, function));
+            if (auto view = dyn_cast<TensorViewType>(load.getStorage().getType());
+                view && view.getAccess() == "read" && isa<BlockArgument>(load.getStorage()))
+                loadInfo.stability = AutodiffStorageStabilityRequirement::RetainedExactVersion;
+            FailureOr<unsigned> loadIndex = checkedUnsigned(result.loads.size());
+            if (failed(loadIndex)) {
+                load.emitError("Storage load count exceeds the analysis representation");
+                status = failure();
+                return WalkResult::interrupt();
+            }
+            result.loadInfoIndices.try_emplace(operation, *loadIndex);
+            result.loads.push_back(std::move(loadInfo));
         }
         if (operationActive &&
             (effect == AutodiffEffectKind::Unsupported || effect == AutodiffEffectKind::ExternallyVisible)) {
@@ -1421,6 +1482,11 @@ bool VernonAutodiffAnalysisResult::isActive(Value value, unsigned abiLeafIndex) 
     return activity != activeValues.end() && llvm::is_contained(activity->activeAbiLeaves, abiLeafIndex);
 }
 
+bool VernonAutodiffAnalysisResult::hasAnyActiveLeaf(Value value) const {
+    auto activity = llvm::find_if(activeValues, [&](const AutodiffValueActivity &item) { return item.value == value; });
+    return activity != activeValues.end() && !activity->activeAbiLeaves.empty();
+}
+
 const ValueAbiLayout *VernonAutodiffAnalysisResult::getValueAbi(Value value) const {
     auto found = valueAbiIndices.find(value);
     return found == valueAbiIndices.end() ? nullptr : &valueAbis[found->second].layout;
@@ -1436,9 +1502,9 @@ const AutodiffStorageEffect *VernonAutodiffAnalysisResult::getStorageEffect(Oper
     return found == storageEffectIndices.end() ? nullptr : &storageEffects[found->second];
 }
 
-const AutodiffActiveLoad *VernonAutodiffAnalysisResult::getActiveLoad(Operation *operation) const {
-    auto found = activeLoadIndices.find(operation);
-    return found == activeLoadIndices.end() ? nullptr : &activeLoads[found->second];
+const AutodiffLoadInfo *VernonAutodiffAnalysisResult::getLoadInfo(Operation *operation) const {
+    auto found = loadInfoIndices.find(operation);
+    return found == loadInfoIndices.end() ? nullptr : &loads[found->second];
 }
 
 bool VernonAutodiffAnalysisResult::isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const {
@@ -1501,7 +1567,7 @@ AutodiffEffectKind classifyAutodiffEffect(Operation *operation) {
         return AutodiffEffectKind::Unsupported;
     // Structured containers inherit execution activity from their regions;
     // their nested operations carry the actual effect classifications.
-    if (isa<scf::IfOp, scf::WhileOp>(operation))
+    if (isa<scf::IfOp, scf::ForOp, scf::WhileOp>(operation))
         return AutodiffEffectKind::Pure;
     if (isMemoryEffectFree(operation) || isa<func::ReturnOp, scf::YieldOp, scf::ConditionOp>(operation))
         return AutodiffEffectKind::Pure;

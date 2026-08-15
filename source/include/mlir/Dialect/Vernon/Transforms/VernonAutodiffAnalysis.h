@@ -56,7 +56,6 @@ struct AutodiffRegion {
     Operation *operation{};
     unsigned ordinal{};
     std::optional<unsigned> parentOrdinal;
-    SmallVector<unsigned> childOrdinals;
 };
 
 enum class StorageVersionKind {
@@ -64,6 +63,8 @@ enum class StorageVersionKind {
     Write,
     AdditiveWrite,
     IfMerge,
+    ForPhi,
+    ForExit,
     WhilePhi,
     WhileExit,
 };
@@ -120,7 +121,7 @@ enum class AutodiffStorageStabilityRequirement {
     RestoreExactVersion,
 };
 
-struct AutodiffActiveLoad {
+struct AutodiffLoadInfo {
     Operation *operation{};
     unsigned identity{};
     unsigned versionBefore{};
@@ -141,12 +142,13 @@ public:
     ArrayRef<AutodiffStorageIdentity> getStorageIdentities() const { return storageIdentities; }
     ArrayRef<AutodiffStorageVersion> getStorageVersions() const { return storageVersions; }
     ArrayRef<AutodiffStorageEffect> getStorageEffects() const { return storageEffects; }
-    ArrayRef<AutodiffActiveLoad> getActiveLoads() const { return activeLoads; }
+    ArrayRef<AutodiffLoadInfo> getLoads() const { return loads; }
 
     const ValueAbiLayout *getValueAbi(Value value) const;
     const AutodiffStorageIdentity *getStorageIdentity(Value binding) const;
     const AutodiffStorageEffect *getStorageEffect(Operation *operation) const;
-    const AutodiffActiveLoad *getActiveLoad(Operation *operation) const;
+    const AutodiffLoadInfo *getLoadInfo(Operation *operation) const;
+    bool hasAnyActiveLeaf(Value value) const;
     bool isActive(Value value, unsigned abiLeafIndex) const;
     bool isActive(Operation *operation) const;
     bool isActiveStorageVersion(unsigned version, unsigned abiLeafIndex) const;
@@ -164,13 +166,13 @@ private:
     SmallVector<AutodiffStorageIdentity> storageIdentities;
     SmallVector<AutodiffStorageVersion> storageVersions;
     SmallVector<AutodiffStorageEffect> storageEffects;
-    SmallVector<AutodiffActiveLoad> activeLoads;
+    SmallVector<AutodiffLoadInfo> loads;
     SmallVector<SmallVector<unsigned>> storageVersionNodes;
     SmallVector<SmallVector<unsigned>> activeStorageVersionLeaves;
     DenseMap<Value, unsigned> valueAbiIndices;
     DenseMap<Value, unsigned> storageIdentityIndices;
     DenseMap<Operation *, unsigned> storageEffectIndices;
-    DenseMap<Operation *, unsigned> activeLoadIndices;
+    DenseMap<Operation *, unsigned> loadInfoIndices;
     DenseSet<Operation *> activeOperationSet;
 };
 

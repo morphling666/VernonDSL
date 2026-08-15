@@ -500,7 +500,7 @@ def update(
         self.assertIn('"vernon.swizzle"', output)
         self.assertIn('"vernon.load"', output)
         self.assertIn('"vernon.store"', output)
-        self.assertIn("scf.while", output)
+        self.assertIn("scf.for", output)
 
     def test_if_merges_existing_values(self) -> None:
         source = """
@@ -543,6 +543,106 @@ def bad(x: f32) -> f32:
         output = compile_source(source, "shader.py")
         self.assertIn("scf.while", output)
         self.assertIn("arith.subf", output)
+
+    def test_canonical_ranges_lower_to_scf_for(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def sum_nested(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        for j in range(1, stop, 1):
+            result = result + i + j
+    return result
+"""
+        output = compile_source(source, "canonical_ranges.py")
+        self.assertEqual(output.count("scf.for"), 2)
+        self.assertNotIn("scf.while", output)
+
+    def test_noncanonical_ranges_remain_scf_while(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def dynamic_step(stop: i32, step: i32) -> i32:
+    result = 0
+    for i in range(0, stop, step):
+        result = result + i
+    return result
+
+@func
+def negative_step(stop: i32) -> i32:
+    result = 0
+    for i in range(stop, 0, -1):
+        result = result + i
+    return result
+
+@func
+def static_stride(stop: i32) -> i32:
+    result = 0
+    for i in range(0, stop, 2):
+        result = result + i
+    return result
+
+@func
+def exits(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i > 2:
+            break
+        result = result + i
+    return result
+
+@func
+def continues(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i < 2:
+            continue
+        result = result + i
+    return result
+
+@func
+def early_return(stop: i32) -> i32:
+    for i in range(stop):
+        if i > 2:
+            return i
+    return stop
+"""
+        output = compile_source(source, "noncanonical_ranges.py")
+        self.assertEqual(output.count("scf.while"), 6)
+        self.assertNotIn("scf.for", output)
+
+    def test_canonical_range_else_is_unconditional(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def range_else(stop: i32) -> i32:
+    result = 1
+    for i in range(stop):
+        result = result + i
+    else:
+        result = result + 7
+    return result
+"""
+        output = compile_source(source, "range_else.py")
+        self.assertIn("scf.for", output)
+        self.assertNotIn("vernon.loop_control_index", output)
+
+    def test_canonical_induction_preserves_storage_index(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def fill(values: TensorView[f32, (dyn,), write]) -> None:
+    for i in range(0, 4):
+        values[i] = 1.0
+"""
+        output = compile_source(source, "canonical_storage_index.py")
+        self.assertIn("scf.for", output)
+        self.assertEqual(output.count("arith.index_cast"), 3)
 
     def test_output_is_deterministic(self) -> None:
         source = """

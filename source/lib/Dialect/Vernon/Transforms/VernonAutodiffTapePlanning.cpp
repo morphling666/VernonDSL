@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <functional>
 #include <limits>
 
 namespace mlir::vernon {
@@ -506,6 +507,10 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     DenseMap<Operation *, uint64_t> operationOrder;
     for (auto [index, activity] : llvm::enumerate(analysis.getOperations()))
         operationOrder.try_emplace(activity.operation, static_cast<uint64_t>(index));
+    auto isFunctionArgument = [&](Value value) {
+        auto argument = dyn_cast<BlockArgument>(value);
+        return argument && argument.getOwner() == &function.getBody().front();
+    };
     const uint64_t scheduleLength = static_cast<uint64_t>(analysis.getOperations().size());
     FailureOr<uint64_t> reverseScheduleEnd = checkedMultiply(scheduleLength, 2);
     if (failed(reverseScheduleEnd)) {
@@ -514,9 +519,147 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     }
     DenseMap<Operation *, unsigned> regionPlanIndices;
     DenseMap<unsigned, unsigned> sourceToPlanIndex;
+    DenseSet<Operation *> reconstructibleControl;
+    DenseSet<Operation *> reconstructibleLoops;
+    using AvailableRoot = std::function<bool(Value)>;
+    auto isControlRoot = [&](Value value) {
+        if (isFunctionArgument(value))
+            return true;
+        auto argument = dyn_cast<BlockArgument>(value);
+        if (!argument)
+            return false;
+        auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+        if (!loop || argument != loop.getInductionVar())
+            return false;
+        auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+        return step && step.value() > 0;
+    };
+    auto isExactReloadAvailable = [&](Value value, const AvailableRoot &isAvailableRoot) {
+        auto load = value.getDefiningOp<LoadOp>();
+        const AutodiffLoadInfo *loadInfo = load ? analysis.getLoadInfo(load) : nullptr;
+        if (!load || !loadInfo || loadInfo->stability != AutodiffStorageStabilityRequirement::RetainedExactVersion ||
+            !isa<BlockArgument>(load.getStorage()) || !isAvailableRoot(load.getStorage()))
+            return false;
+        return llvm::all_of(load.getIndices(), [&](Value index) {
+            return succeeded(buildAutodiffRematerializationRecipe(index, function, isAvailableRoot));
+        });
+    };
+    auto buildReconstructionRecipe = [&](Value value, const AvailableRoot &isAvailableRoot,
+                                         SmallVectorImpl<Value> *exactReloadRoots = nullptr) {
+        return buildAutodiffRematerializationRecipe(value, function, [&](Value root) {
+            if (isAvailableRoot(root))
+                return true;
+            if (!isExactReloadAvailable(root, isAvailableRoot))
+                return false;
+            if (exactReloadRoots && !llvm::is_contained(*exactReloadRoots, root))
+                exactReloadRoots->push_back(root);
+            return true;
+        });
+    };
+    auto canReconstructValue = [&](Value value, const AvailableRoot &isAvailableRoot) {
+        return succeeded(buildReconstructionRecipe(value, isAvailableRoot));
+    };
+    auto canReconstructActiveOperation = [&](Operation *operation, const AvailableRoot &isAvailableRoot,
+                                             bool rejectStorageEffects) {
+        if (!analysis.isActive(operation))
+            return true;
+        if (rejectStorageEffects && analysis.getStorageEffect(operation))
+            return false;
+        if (const DifferentiationRule *rule = registry.lookup(operation)) {
+            SmallVector<unsigned> activeOperands;
+            for (auto [operandIndex, operand] : llvm::enumerate(operation->getOperands()))
+                if (analysis.hasAnyActiveLeaf(operand))
+                    activeOperands.push_back(static_cast<unsigned>(operandIndex));
+            for (const AutodiffPrimalRequirement &requirement : rule->getVjpPrimalRequirements()) {
+                if (!requirement.isRequiredFor(activeOperands))
+                    continue;
+                Value value = requirement.kind == AutodiffPrimalKind::Operand ? operation->getOperand(requirement.index)
+                                                                              : operation->getResult(requirement.index);
+                if (!canReconstructValue(value, isAvailableRoot))
+                    return false;
+            }
+        }
+        ValueRange indices;
+        if (auto load = dyn_cast<LoadOp>(operation))
+            indices = load.getIndices();
+        else if (auto store = dyn_cast<StoreOp>(operation))
+            indices = store.getIndices();
+        else if (auto extract = dyn_cast<tensor::ExtractOp>(operation))
+            indices = extract.getIndices();
+        return llvm::all_of(indices, [&](Value index) {
+            return succeeded(buildAutodiffRematerializationRecipe(index, function, isAvailableRoot));
+        });
+    };
+    std::function<bool(scf::IfOp, const AvailableRoot &)> canReconstructIf;
+    std::function<bool(scf::ForOp, const AvailableRoot &)> canReconstructFor;
+    canReconstructIf = [&](scf::IfOp branch, const AvailableRoot &isAvailableRoot) {
+        if (!canReconstructValue(branch.getCondition(), isAvailableRoot))
+            return false;
+        WalkResult result = branch.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+            if (operation == branch.getOperation())
+                return WalkResult::advance();
+            if (!analysis.isActive(operation))
+                return operation->getNumRegions() == 0 ? WalkResult::advance() : WalkResult::skip();
+            if (auto nestedIf = dyn_cast<scf::IfOp>(operation))
+                return canReconstructIf(nestedIf, isAvailableRoot) ? WalkResult::skip() : WalkResult::interrupt();
+            if (auto nestedFor = dyn_cast<scf::ForOp>(operation))
+                return canReconstructFor(nestedFor, isAvailableRoot) ? WalkResult::skip() : WalkResult::interrupt();
+            if (isa<scf::WhileOp>(operation))
+                return analysis.isActive(operation) ? WalkResult::interrupt() : WalkResult::skip();
+            return canReconstructActiveOperation(operation, isAvailableRoot, true) ? WalkResult::advance()
+                                                                                   : WalkResult::interrupt();
+        });
+        return !result.wasInterrupted();
+    };
+    canReconstructFor = [&](scf::ForOp loop, const AvailableRoot &parentRoot) {
+        auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+        if (!step || step.value() <= 0)
+            return false;
+        AvailableRoot isAvailableRoot = [parentRoot, induction = loop.getInductionVar()](Value value) {
+            return parentRoot(value) || value == induction;
+        };
+        if (failed(buildAutodiffRematerializationRecipe(loop.getLowerBound(), function, parentRoot)) ||
+            failed(buildAutodiffRematerializationRecipe(loop.getUpperBound(), function, parentRoot)))
+            return false;
+        WalkResult result = loop.walk<WalkOrder::PreOrder>([&](Operation *operation) {
+            if (operation == loop.getOperation())
+                return WalkResult::advance();
+            if (!analysis.isActive(operation))
+                return operation->getNumRegions() == 0 ? WalkResult::advance() : WalkResult::skip();
+            if (auto branch = dyn_cast<scf::IfOp>(operation)) {
+                return canReconstructIf(branch, isAvailableRoot) ? WalkResult::skip() : WalkResult::interrupt();
+            }
+            if (auto nestedFor = dyn_cast<scf::ForOp>(operation))
+                return canReconstructFor(nestedFor, isAvailableRoot) ? WalkResult::skip() : WalkResult::interrupt();
+            if (isa<scf::WhileOp>(operation))
+                return analysis.isActive(operation) ? WalkResult::interrupt() : WalkResult::skip();
+            return canReconstructActiveOperation(operation, isAvailableRoot, false) ? WalkResult::advance()
+                                                                                    : WalkResult::interrupt();
+        });
+        return !result.wasInterrupted();
+    };
     for (const AutodiffRegion &source : analysis.getRegions()) {
         if (!analysis.isActive(source.operation))
             continue;
+        if (auto loop = dyn_cast<scf::ForOp>(source.operation)) {
+            auto step = loop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+            if (!step || step.value() <= 0 ||
+                failed(buildAutodiffRematerializationRecipe(loop.getLowerBound(), function, isControlRoot)) ||
+                failed(buildAutodiffRematerializationRecipe(loop.getUpperBound(), function, isControlRoot))) {
+                loop.emitError(
+                    "autodiff requires canonical positive-step scf.for bounds reconstructible from entry primals");
+                return failure();
+            }
+        }
+        AvailableRoot sourceRoot = isControlRoot;
+        if (auto branch = dyn_cast<scf::IfOp>(source.operation); branch && canReconstructIf(branch, sourceRoot)) {
+            reconstructibleControl.insert(source.operation);
+            continue;
+        }
+        if (auto loop = dyn_cast<scf::ForOp>(source.operation); loop && canReconstructFor(loop, sourceRoot)) {
+            reconstructibleLoops.insert(source.operation);
+            continue;
+        }
         FailureOr<unsigned> planIndex = checkedUnsigned(plan.regions.size());
         if (failed(planIndex)) {
             function.emitError("autodiff region count exceeds the planner representation");
@@ -529,6 +672,15 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         region.ordinal = source.ordinal;
         plan.regions.push_back(std::move(region));
     }
+    auto isAvailablePlanningRoot = [&](Value value) {
+        if (isFunctionArgument(value))
+            return true;
+        auto argument = dyn_cast<BlockArgument>(value);
+        if (!argument)
+            return false;
+        auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+        return loop && argument == loop.getInductionVar() && reconstructibleLoops.contains(loop.getOperation());
+    };
 
     SmallVector<unsigned> rootRegions;
     for (const AutodiffRegion &source : analysis.getRegions()) {
@@ -543,7 +695,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return failure();
             }
             AutodiffTapeRegion &parentRegion = plan.regions[parent->second];
-            region.parentRecord = {AutodiffParentRecordKind::DynamicRegion, parentRegion.ordinal};
+            region.parentRegionOrdinal = parentRegion.ordinal;
             FailureOr<unsigned> childOrdinal = checkedUnsigned(parentRegion.childRegionOrdinals.size());
             if (failed(childOrdinal)) {
                 region.operation->emitError("autodiff child-region count exceeds the planner representation");
@@ -552,7 +704,6 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             region.childOrdinal = *childOrdinal;
             parentRegion.childRegionOrdinals.push_back(region.ordinal);
         } else {
-            region.parentRecord = {AutodiffParentRecordKind::Invocation, std::nullopt};
             FailureOr<unsigned> childOrdinal = checkedUnsigned(rootRegions.size());
             if (failed(childOrdinal)) {
                 region.operation->emitError("autodiff root-region count exceeds the planner representation");
@@ -563,7 +714,11 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
         }
         if (isa<scf::IfOp>(source.operation))
             region.control.predicate = true;
-        else if (isa<scf::WhileOp>(source.operation)) {
+        else if (isa<scf::ForOp>(source.operation)) {
+            // Canonical positive-step scf.for reconstructs its trip count and
+            // induction value. A region, when present, stores only selected
+            // per-iteration residuals and nested dynamic children.
+        } else if (isa<scf::WhileOp>(source.operation)) {
             region.control.executedCount = true;
             region.control.exitKind = true;
         } else {
@@ -585,7 +740,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     SmallVector<RecordBuilder, 0> regionBuilders(plan.regions.size());
     for (auto [index, region] : llvm::enumerate(plan.regions)) {
         SmallVector<FieldSpec> headerFields = {
-            {AutodiffTapeFieldKind::ParentRecordIdentity, region.parentRecord.regionOrdinal},
+            {AutodiffTapeFieldKind::ParentRecordIdentity, region.parentRegionOrdinal},
             {AutodiffTapeFieldKind::ChildRegionOrdinal, region.ordinal},
             {AutodiffTapeFieldKind::LastRecordOffset, region.ordinal},
         };
@@ -644,10 +799,6 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     DenseSet<Value> plannedResidualValues;
     DenseSet<Value> plannedSourceValues;
     uint64_t selectedCaptureBytes = 0;
-    auto isFunctionArgument = [&](Value value) {
-        auto argument = dyn_cast<BlockArgument>(value);
-        return argument && argument.getOwner() == &function.getBody().front();
-    };
     auto appendSourceSelections = [&](Value value, const ValueAbiLayout &layout, std::optional<unsigned> owner,
                                       const FailureOr<AdRematerializationRecipe> &recipe) {
         if (!plannedSourceValues.insert(value).second)
@@ -666,7 +817,6 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                                     std::optional<unsigned> version = std::nullopt,
                                     ArrayRef<Operation *> operations = {}, bool legal = true) {
                 AdResidualSource source;
-                source.key = selection.key;
                 source.kind = kind;
                 source.legal = legal;
                 source.availableInCurrentContract = current;
@@ -697,17 +847,20 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 }
             }
             if (auto load = value.getDefiningOp<LoadOp>()) {
-                if (const AutodiffActiveLoad *activeLoad = analysis.getActiveLoad(load)) {
-                    const bool reconstructibleIndices =
-                        llvm::none_of(activeLoad->indexProvenance, [](AutodiffIndexProvenanceKind provenance) {
-                            return provenance == AutodiffIndexProvenanceKind::Dynamic;
-                        });
+                if (const AutodiffLoadInfo *loadInfo = analysis.getLoadInfo(load)) {
+                    const bool reconstructibleIndices = llvm::all_of(load.getIndices(), [&](Value index) {
+                        return succeeded(
+                            buildAutodiffRematerializationRecipe(index, function, isAvailablePlanningRoot));
+                    });
+                    const bool retainedExactVersion =
+                        loadInfo->stability == AutodiffStorageStabilityRequirement::RetainedExactVersion &&
+                        isa<BlockArgument>(load.getStorage());
                     if (reconstructibleIndices)
-                        addCandidate(AdResidualSourceKind::ExactVersionReload, false, 1, activeLoad->identity,
-                                     activeLoad->versionBefore);
+                        addCandidate(AdResidualSourceKind::ExactVersionReload, retainedExactVersion, 1,
+                                     loadInfo->identity, loadInfo->versionBefore, {}, retainedExactVersion);
                     else
-                        addCandidate(AdResidualSourceKind::Unsupported, false, 0, activeLoad->identity,
-                                     activeLoad->versionBefore, {}, false);
+                        addCandidate(AdResidualSourceKind::Unsupported, false, 0, loadInfo->identity,
+                                     loadInfo->versionBefore, {}, false);
                 }
             }
             if (succeeded(recipe))
@@ -823,7 +976,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             continue;
         SmallVector<unsigned> activeOperands;
         for (auto [operandIndex, operand] : llvm::enumerate(operation->getOperands()))
-            if (analysis.isActive(operand, 0))
+            if (analysis.hasAnyActiveLeaf(operand))
                 activeOperands.push_back(static_cast<unsigned>(operandIndex));
         for (const AutodiffPrimalRequirement &requirement : rule->getVjpPrimalRequirements()) {
             if (!requirement.isRequiredFor(activeOperands))
@@ -839,23 +992,43 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
                 return failure();
             }
+            SmallVector<Value> exactReloadRoots;
             FailureOr<AdRematerializationRecipe> recipe =
-                buildAutodiffRematerializationRecipe(value, function, isFunctionArgument);
-            AdResidualSourceKind selectedSource = appendSourceSelections(value, *layout, owner, recipe);
+                buildReconstructionRecipe(value, isAvailablePlanningRoot, &exactReloadRoots);
+            for (Value root : exactReloadRoots) {
+                if (root == value || plannedSourceValues.contains(root))
+                    continue;
+                const ValueAbiLayout *rootLayout = analysis.getValueAbi(root);
+                if (!rootLayout || appendSourceSelections(root, *rootLayout, owningRegion(root),
+                                                          FailureOr<AdRematerializationRecipe>(failure())) !=
+                                       AdResidualSourceKind::ExactVersionReload) {
+                    operation->emitError("cannot select an exact-version reload dependency for rematerialization");
+                    return failure();
+                }
+            }
+            FailureOr<AdRematerializationRecipe> selectedRecipe = failure();
+            if (!llvm::is_contained(exactReloadRoots, value))
+                selectedRecipe = std::move(recipe);
+            AdResidualSourceKind selectedSource = appendSourceSelections(value, *layout, owner, selectedRecipe);
             const bool externalPrimal = selectedSource == AdResidualSourceKind::Builtin ||
                                         selectedSource == AdResidualSourceKind::PrimalArgument;
-            const bool rematerialized = selectedSource == AdResidualSourceKind::PureRematerialization || externalPrimal;
+            const bool rematerialized = selectedSource == AdResidualSourceKind::PureRematerialization ||
+                                        selectedSource == AdResidualSourceKind::ExactVersionReload || externalPrimal;
             if (!rematerialized && failed(builder.add(value, *layout))) {
                 operation->emitError("cannot lay out a rule-required primal value on the autodiff tape");
                 return failure();
             }
             const uint64_t lifetimeEnd =
                 *reverseScheduleEnd - std::min(scheduleLength, operationOrder.lookup(operation));
-            if (failed(appendResidualIntervals(value, *layout, lifetimeEnd, rematerialized,
-                                               rematerialized ? recipe->estimatedCost : uint64_t{0}, operation)))
+            const uint64_t selectedRecomputationCost =
+                selectedSource == AdResidualSourceKind::PureRematerialization && succeeded(selectedRecipe)
+                    ? selectedRecipe->estimatedCost
+                    : uint64_t{0};
+            if (failed(appendResidualIntervals(value, *layout, lifetimeEnd, rematerialized, selectedRecomputationCost,
+                                               operation)))
                 return failure();
             if (selectedSource == AdResidualSourceKind::PureRematerialization)
-                rematerializations.push_back(std::move(*recipe));
+                rematerializations.push_back(std::move(*selectedRecipe));
         }
     }
     auto saveIndexSource = [&](Value index, RecordBuilder &builder, uint64_t lifetimeEnd, Operation *diagnostic,
@@ -866,9 +1039,12 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             auto owner = dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp());
             if (owner && owner.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
                 return success();
+            if (auto loop = dyn_cast_or_null<scf::ForOp>(argument.getOwner()->getParentOp());
+                loop && argument == loop.getInductionVar())
+                return success();
         }
         FailureOr<AdRematerializationRecipe> recipe =
-            buildAutodiffRematerializationRecipe(index, function, isFunctionArgument);
+            buildAutodiffRematerializationRecipe(index, function, isAvailablePlanningRoot);
         if (succeeded(recipe)) {
             const ValueAbiLayout *knownLayout = analysis.getValueAbi(index);
             FailureOr<ValueAbiLayout> canonical =
@@ -930,15 +1106,15 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return failure();
             }
     }
-    auto appendControlSource = [&](AutodiffTapeRegion &region, AdControlSourceKind controlKind,
-                                   Value reconstructibleValue = {}) {
+    auto appendControlSource = [&](Operation *operation, AdControlSourceKind controlKind, Value reconstructibleValue,
+                                   bool captureRequired) {
         AdResidualSourceSelection selection;
-        selection.key.controlOperation = region.operation;
+        selection.key.value = reconstructibleValue;
+        selection.key.controlOperation = operation;
         selection.key.controlKind = controlKind;
         auto add = [&](AdResidualSourceKind kind, bool current, uint64_t cost = 0,
                        ArrayRef<Operation *> operations = {}) {
             AdResidualSource candidate;
-            candidate.key = selection.key;
             candidate.kind = kind;
             candidate.legal = true;
             candidate.availableInCurrentContract = current;
@@ -958,27 +1134,42 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                     if (function.getArgAttr(argument.getArgNumber(), kBuiltinAttrName))
                         add(AdResidualSourceKind::Builtin, true);
                     else
-                        add(AdResidualSourceKind::PrimalArgument, false);
+                        add(AdResidualSourceKind::PrimalArgument, true);
                 }
             }
             FailureOr<AdRematerializationRecipe> recipe =
-                buildAutodiffRematerializationRecipe(reconstructibleValue, function);
-            if (succeeded(recipe))
+                buildAutodiffRematerializationRecipe(reconstructibleValue, function, isAvailablePlanningRoot);
+            if (succeeded(recipe) && !recipe->operations.empty())
                 add(AdResidualSourceKind::PureRematerialization, true, recipe->estimatedCost, recipe->operations);
         }
-        add(AdResidualSourceKind::DynamicCapture, true);
-        // The current profile contract always records control history. Phase 3E
-        // may select a reconstructible candidate only in the versioned profile.
+        if (captureRequired)
+            add(AdResidualSourceKind::DynamicCapture, true);
+        if (selection.candidates.empty())
+            add(AdResidualSourceKind::Unsupported, false);
         selection.selectedCandidate = static_cast<unsigned>(selection.candidates.size() - 1);
         plan.memoryPlan.sourceSelections.push_back(std::move(selection));
     };
     for (AutodiffTapeRegion &region : plan.regions) {
         if (auto ifOp = dyn_cast<scf::IfOp>(region.operation))
-            appendControlSource(region, AdControlSourceKind::Predicate, ifOp.getCondition());
+            appendControlSource(region.operation, AdControlSourceKind::Predicate, ifOp.getCondition(), true);
         if (region.control.executedCount)
-            appendControlSource(region, AdControlSourceKind::ExecutedCount);
+            appendControlSource(region.operation, AdControlSourceKind::ExecutedCount, {}, true);
         if (region.control.exitKind)
-            appendControlSource(region, AdControlSourceKind::ExitKind);
+            appendControlSource(region.operation, AdControlSourceKind::ExitKind, {}, true);
+    }
+    for (Operation *operation : reconstructibleControl) {
+        auto branch = cast<scf::IfOp>(operation);
+        appendControlSource(operation, AdControlSourceKind::Predicate, branch.getCondition(), false);
+    }
+    for (const AutodiffRegion &source : analysis.getRegions()) {
+        if (!analysis.isActive(source.operation))
+            continue;
+        auto loop = dyn_cast<scf::ForOp>(source.operation);
+        if (!loop)
+            continue;
+        appendControlSource(source.operation, AdControlSourceKind::ExecutedCount, loop.getLowerBound(), false);
+        appendControlSource(source.operation, AdControlSourceKind::ExecutedCount, loop.getUpperBound(), false);
+        appendControlSource(source.operation, AdControlSourceKind::ExecutedCount, loop.getStep(), false);
     }
 
     FailureOr<AutodiffTapeRecord> invocationRecord = std::move(invocationBuilder).finish();

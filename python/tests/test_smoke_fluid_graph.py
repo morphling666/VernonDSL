@@ -268,6 +268,11 @@ class SmokeFluidGraphTests(unittest.TestCase):
                 3.5,
                 "resident/logical regression tolerance is frozen at 3.5 for normal CI grids",
             )
+            loss_telemetry = next(item for item in pullback.pass_telemetry if item["pass_name"] == "smoke-loss")
+            self.assertEqual(loss_telemetry["control_history_kind"], "none")
+            self.assertEqual(loss_telemetry["logical_residual_bytes"], 4)
+            self.assertEqual(loss_telemetry["resident_tape_bytes"], 4)
+            self.assertEqual(loss_telemetry["allocated_tape_bytes"], 4)
             pullback(
                 {
                     "density": np.zeros((size, size), dtype=np.float32),

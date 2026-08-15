@@ -66,6 +66,14 @@ Value createI32Constant(OpBuilder &builder, Location location, int32_t value) {
     return arith::ConstantIntOp::create(builder, location, value, 32);
 }
 
+Value buildPositiveStepTripCount(OpBuilder &builder, Location location, Value lower, Value upper, Value step) {
+    Value zero = createIndexConstant(builder, location, 0);
+    Value distance = arith::SubIOp::create(builder, location, upper, lower);
+    Value positive = arith::CmpIOp::create(builder, location, arith::CmpIPredicate::sgt, distance, zero);
+    Value count = arith::CeilDivSIOp::create(builder, location, distance, step);
+    return arith::SelectOp::create(builder, location, positive, count, zero);
+}
+
 bool isValueDefinedIn(Value value, Region &region) {
     Region *owner = value.getParentRegion();
     return owner && (owner == &region || region.isAncestor(owner));
@@ -237,7 +245,7 @@ LogicalResult reverseScalarOperation(Operation &operation, OpBuilder &builder,
     SmallVector<unsigned> activeOperands;
     for (auto [operandIndex, operand] : llvm::enumerate(operation.getOperands())) {
         operands.push_back(primals.lookup(operand));
-        if (analysis.isActive(operand, 0))
+        if (analysis.hasAnyActiveLeaf(operand))
             activeOperands.push_back(static_cast<unsigned>(operandIndex));
     }
     SmallVector<Value> results = {primals.lookup(operation.getResult(0))};
@@ -251,72 +259,14 @@ LogicalResult reverseScalarOperation(Operation &operation, OpBuilder &builder,
     return success();
 }
 
-LogicalResult lowerForToWhile(scf::ForOp source) {
-    auto yield = dyn_cast<scf::YieldOp>(source.getBody()->getTerminator());
-    if (!yield || yield.getNumOperands() != source.getInitArgs().size())
-        return source.emitError("structured VJP requires canonical scf.for iter_args");
-
-    OpBuilder builder(source);
-    SmallVector<Value> inits = {source.getLowerBound()};
-    llvm::append_range(inits, source.getInitArgs());
-    SmallVector<Type> resultTypes;
-    for (Value init : inits)
-        resultTypes.push_back(init.getType());
-    OperationState state(source.getLoc(), scf::WhileOp::getOperationName());
-    state.addOperands(inits);
-    state.addTypes(resultTypes);
-    state.addRegion();
-    state.addRegion();
-    auto target = cast<scf::WhileOp>(builder.create(state));
-
-    Block *before = new Block();
-    target.getBefore().push_back(before);
-    for (Type type : resultTypes)
-        before->addArgument(type, source.getLoc());
-    OpBuilder beforeBuilder(before, before->end());
-    Value condition = arith::CmpIOp::create(beforeBuilder, source.getLoc(), arith::CmpIPredicate::slt,
-                                            before->getArgument(0), source.getUpperBound());
-    scf::ConditionOp::create(beforeBuilder, source.getLoc(), condition, before->getArguments());
-
-    Block *after = new Block();
-    target.getAfter().push_back(after);
-    for (Type type : resultTypes)
-        after->addArgument(type, source.getLoc());
-    IRMapping mapping;
-    for (auto [sourceArgument, targetArgument] :
-         llvm::zip_equal(source.getBody()->getArguments(), after->getArguments()))
-        mapping.map(sourceArgument, targetArgument);
-    OpBuilder afterBuilder(after, after->end());
-    for (Operation &operation : source.getBody()->without_terminator())
-        afterBuilder.clone(operation, mapping);
-    SmallVector<Value> next = {
-        arith::AddIOp::create(afterBuilder, source.getLoc(), after->getArgument(0), source.getStep())};
-    for (Value value : yield.getResults())
-        next.push_back(mapping.lookup(value));
-    scf::YieldOp::create(afterBuilder, yield.getLoc(), next);
-
-    source.replaceAllUsesWith(target.getResults().drop_front());
-    source.erase();
-    return success();
-}
-
-LogicalResult normalizeStructuredLoops(func::FuncOp function) {
-    SmallVector<scf::ForOp> loops;
-    function.walk<WalkOrder::PostOrder>([&](scf::ForOp loop) { loops.push_back(loop); });
-    for (scf::ForOp loop : loops)
-        if (failed(lowerForToWhile(loop)))
-            return failure();
-    return success();
-}
-
 LogicalResult validateStructuredPhase(func::FuncOp primal, const VernonAutodiffAnalysisResult &analysis) {
     if (!llvm::hasSingleElement(primal.getBody()))
         return primal.emitError("structured VJP requires one structured entry block");
     if (primal.getNumResults() != 0 || analysis.getActiveResultLeaves().empty() || analysis.getWrtLeaves().empty())
         return primal.emitError("structured VJP requires selected Storage outputs and at least one wrt leaf");
     WalkResult structured = primal.walk([&](Operation *operation) {
-        if (operation->getNumRegions() != 0 && !isa<func::FuncOp, scf::IfOp, scf::WhileOp>(operation)) {
-            operation->emitError("structured VJP supports only scf.if and scf.while regions");
+        if (operation->getNumRegions() != 0 && !isa<func::FuncOp, scf::IfOp, scf::ForOp, scf::WhileOp>(operation)) {
+            operation->emitError("structured VJP supports only scf.if, scf.for, and scf.while regions");
             return WalkResult::interrupt();
         }
         return WalkResult::advance();
@@ -493,9 +443,9 @@ FailureOr<Value> readCanonicalTapeValue(OpBuilder &builder, Location location, M
 
 class ForwardEmitterCore {
 public:
-    ForwardEmitterCore(func::FuncOp primal, const VernonAutodiffTapePlan &plan, Value tape, Value rootRegion,
-                       Value rootRecord)
-        : primal(primal), tape(tape), rootRegion(rootRegion), rootRecord(rootRecord) {
+    ForwardEmitterCore(func::FuncOp primal, const VernonAutodiffAnalysisResult &analysis,
+                       const VernonAutodiffTapePlan &plan, Value tape, Value rootRegion, Value rootRecord)
+        : primal(primal), analysis(analysis), tape(tape), rootRegion(rootRegion), rootRecord(rootRecord) {
         for (const AutodiffTapeRegion &region : plan.getRegions()) {
             regions.try_emplace(region.operation, &region);
             regionsByOrdinal.try_emplace(region.ordinal, &region);
@@ -516,12 +466,27 @@ private:
         if (planRegion(operation)) {
             if (auto ifOp = dyn_cast<scf::IfOp>(operation))
                 return emitIf(ifOp, builder, parentRegion, parentRecord);
+            if (auto forOp = dyn_cast<scf::ForOp>(operation))
+                return emitFor(forOp, builder, parentRegion, parentRecord);
             if (auto whileOp = dyn_cast<scf::WhileOp>(operation))
                 return emitWhile(whileOp, builder, parentRegion, parentRecord);
         }
+        WalkResult validatedWrites = operation.walk([&](Operation *nested) {
+            if (!isa<StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(nested))
+                return WalkResult::advance();
+            if (!analysis.getStorageEffect(nested)) {
+                nested->emitError("structured VJP cannot functionalize a write without analyzed Storage effects");
+                return WalkResult::interrupt();
+            }
+            return WalkResult::advance();
+        });
+        if (validatedWrites.wasInterrupted())
+            return failure();
         Operation *clone = builder.clone(operation, mapping);
-        if (isa<StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(operation))
-            clone->setAttr("vernon.ad.functionalized", UnitAttr::get(builder.getContext()));
+        clone->walk([&](Operation *nested) {
+            if (isa<StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(nested))
+                nested->setAttr("vernon.ad.functionalized", UnitAttr::get(builder.getContext()));
+        });
         for (auto [source, target] : llvm::zip_equal(operation.getResults(), clone->getResults()))
             mapping.map(source, target);
         return success();
@@ -636,6 +601,54 @@ private:
         createOperation(
             builder, source.getLoc(), AdEndRegionOp::getOperationName(),
             {handle, createIndexConstant(builder, source.getLoc(), 1), createI32Constant(builder, source.getLoc(), 0)});
+        return success();
+    }
+
+    LogicalResult emitFor(scf::ForOp source, OpBuilder &builder, Value parentRegion, Value parentRecord) {
+        const AutodiffTapeRegion *region = regions.lookup(source.getOperation());
+        if (!region)
+            return source.emitError("active scf.for has no residual region plan");
+        Value handle = beginRegion(builder, source.getLoc(), tape, parentRegion, parentRecord, region->childOrdinal);
+        SmallVector<Value> inits;
+        for (Value init : source.getInitArgs())
+            inits.push_back(mapping.lookup(init));
+        inits.push_back(createIndexConstant(builder, source.getLoc(), 0));
+        scf::ForOp target =
+            scf::ForOp::create(builder, source.getLoc(), mapping.lookup(source.getLowerBound()),
+                               mapping.lookup(source.getUpperBound()), mapping.lookup(source.getStep()), inits);
+        mapping.map(source.getInductionVar(), target.getInductionVar());
+        for (auto [sourceArgument, targetArgument] :
+             llvm::zip_equal(source.getRegionIterArgs(), target.getRegionIterArgs().drop_back()))
+            mapping.map(sourceArgument, targetArgument);
+        Block *body = target.getBody();
+        scf::YieldOp targetYield = body->empty() ? scf::YieldOp{} : dyn_cast<scf::YieldOp>(body->back());
+        OpBuilder bodyBuilder = targetYield ? OpBuilder(targetYield) : OpBuilder::atBlockEnd(body);
+        Value record =
+            reserveRecord(bodyBuilder, source.getLoc(), handle, region->record.stride, region->record.alignment);
+        if (failed(emitBlock(*source.getBody(), *body, handle, record)))
+            return failure();
+        if (targetYield)
+            bodyBuilder.setInsertionPoint(targetYield);
+        else
+            bodyBuilder.setInsertionPointToEnd(body);
+        if (failed(writePlannedLeaves(bodyBuilder, source.getLoc(), *region, handle, record)))
+            return failure();
+        auto sourceYield = cast<scf::YieldOp>(source.getBody()->getTerminator());
+        SmallVector<Value> yielded;
+        for (Value value : sourceYield.getResults())
+            yielded.push_back(mapping.lookup(value));
+        yielded.push_back(createOperation(bodyBuilder, source.getLoc(), AdCheckedIncrementOp::getOperationName(),
+                                          target.getRegionIterArgs().back(), bodyBuilder.getIndexType())
+                              ->getResult(0));
+        if (targetYield)
+            targetYield->setOperands(yielded);
+        else
+            scf::YieldOp::create(bodyBuilder, source.getLoc(), yielded);
+        for (auto [sourceResult, targetResult] : llvm::zip_equal(source.getResults(), target.getResults().drop_back()))
+            mapping.map(sourceResult, targetResult);
+        builder.setInsertionPointAfter(target);
+        createOperation(builder, source.getLoc(), AdEndRegionOp::getOperationName(),
+                        {handle, target.getResults().back(), createI32Constant(builder, source.getLoc(), 0)});
         return success();
     }
 
@@ -763,6 +776,7 @@ private:
     }
 
     func::FuncOp primal;
+    const VernonAutodiffAnalysisResult &analysis;
     Value tape;
     Value rootRegion;
     Value rootRecord;
@@ -1027,19 +1041,75 @@ private:
         return dominatesInsertion(value, builder) ? value : Value{};
     }
 
+    const AdResidualSource *selectedSource(Value value) const {
+        const AdResidualSource *selected = nullptr;
+        for (const AdResidualSourceSelection &selection : plan.getMemoryPlan().getSourceSelections()) {
+            if (selection.key.value != value || selection.key.controlKind != AdControlSourceKind::None)
+                continue;
+            if (selection.selectedCandidate >= selection.candidates.size())
+                return nullptr;
+            const AdResidualSource &candidate = selection.candidates[selection.selectedCandidate];
+            if (!selected) {
+                selected = &candidate;
+                continue;
+            }
+            if (selected->kind != candidate.kind || selected->storageIdentity != candidate.storageIdentity ||
+                selected->versionBefore != candidate.versionBefore)
+                return nullptr;
+        }
+        return selected;
+    }
+
     FailureOr<Value> materializePrimal(Value value, OpBuilder &builder) {
         if (Value available = availablePrimal(value, builder))
             return available;
-        FailureOr<AdRematerializationRecipe> recipe = buildAutodiffRematerializationRecipe(
-            value, primal, [&](Value root) { return static_cast<bool>(availablePrimal(root, builder)); });
-        if (failed(recipe))
-            return failure();
+        const AdResidualSource *source = selectedSource(value);
+        if (source && source->kind == AdResidualSourceKind::ExactVersionReload) {
+            auto load = value.getDefiningOp<LoadOp>();
+            const AutodiffLoadInfo *loadInfo = load ? analysis.getLoadInfo(load) : nullptr;
+            if (!load || !loadInfo || !source->storageIdentity || !source->versionBefore ||
+                loadInfo->identity != *source->storageIdentity || loadInfo->versionBefore != *source->versionBefore ||
+                loadInfo->stability != AutodiffStorageStabilityRequirement::RetainedExactVersion)
+                return failure();
+            IRMapping mapping;
+            FailureOr<Value> storage = materializePrimal(load.getStorage(), builder);
+            if (failed(storage))
+                return failure();
+            mapping.map(load.getStorage(), *storage);
+            for (Value index : load.getIndices()) {
+                FailureOr<Value> materialized = materializePrimal(index, builder);
+                if (failed(materialized))
+                    return failure();
+                mapping.map(index, *materialized);
+            }
+            Operation *clone = builder.clone(*load, mapping);
+            Value reloaded = clone->getResult(0);
+            primals[value] = reloaded;
+            return reloaded;
+        }
+        FailureOr<AdRematerializationRecipe> rebuiltRecipe = failure();
+        ArrayRef<Operation *> operations;
+        if (source) {
+            if (source->kind != AdResidualSourceKind::PureRematerialization)
+                return failure();
+            operations = source->recipe;
+        } else {
+            rebuiltRecipe = buildAutodiffRematerializationRecipe(
+                value, primal, [&](Value root) { return static_cast<bool>(availablePrimal(root, builder)); });
+            if (failed(rebuiltRecipe))
+                return failure();
+            operations = rebuiltRecipe->operations;
+        }
         IRMapping local;
-        for (Operation *operation : recipe->operations) {
+        for (Operation *operation : operations) {
             for (Value operand : operation->getOperands()) {
                 Value materialized = availablePrimal(operand, builder, &local);
-                if (!materialized)
-                    return failure();
+                if (!materialized) {
+                    FailureOr<Value> dependency = materializePrimal(operand, builder);
+                    if (failed(dependency))
+                        return failure();
+                    materialized = *dependency;
+                }
                 local.map(operand, materialized);
             }
             Operation *clone = builder.clone(*operation, local);
@@ -1258,7 +1328,7 @@ private:
             return operation.emitError("active scalar operation has no VJP rule");
         SmallVector<unsigned> activeOperands;
         for (auto [operandIndex, operand] : llvm::enumerate(operation.getOperands()))
-            if (analysis.isActive(operand, 0))
+            if (analysis.hasAnyActiveLeaf(operand))
                 activeOperands.push_back(static_cast<unsigned>(operandIndex));
         for (const AutodiffPrimalRequirement &requirement : rule->getVjpPrimalRequirements()) {
             if (!requirement.isRequiredFor(activeOperands))
@@ -1357,6 +1427,11 @@ private:
                     return failure();
                 continue;
             }
+            if (auto forOp = dyn_cast<scf::ForOp>(operation)) {
+                if (failed(reverseFor(forOp, builder, adjoints, parentRegion, parentRecordIndex)))
+                    return failure();
+                continue;
+            }
             if (auto whileOp = dyn_cast<scf::WhileOp>(operation)) {
                 if (failed(reverseWhile(whileOp, builder, adjoints, parentRegion, parentRecordIndex)))
                     return failure();
@@ -1428,16 +1503,23 @@ private:
         if (!seeded)
             return success();
         const AutodiffTapeRegion *region = regions.lookup(source.getOperation());
-        if (!region)
-            return source.emitError("active scf.if has no reverse tape region");
-        Value handle =
-            readNestedRegion(builder, source.getLoc(), parentRegion, parentRecordIndex, region->childOrdinal);
-        Value zero = createIndexConstant(builder, source.getLoc(), 0);
-        const AutodiffTapeField *predicate = findField(region->record.prefix, AutodiffTapeFieldKind::Predicate);
-        if (!predicate)
-            return source.emitError("scf.if reverse tape record has no predicate");
-        Value condition = readLeaf(builder, source.getLoc(), handle, zero, builder.getI1Type(), region->record.stride,
-                                   region->record.alignment, predicate->offset);
+        Value handle = parentRegion;
+        Value recordIndex = parentRecordIndex;
+        Value condition;
+        if (region) {
+            handle = readNestedRegion(builder, source.getLoc(), parentRegion, parentRecordIndex, region->childOrdinal);
+            recordIndex = createIndexConstant(builder, source.getLoc(), 0);
+            const AutodiffTapeField *predicate = findField(region->record.prefix, AutodiffTapeFieldKind::Predicate);
+            if (!predicate)
+                return source.emitError("scf.if reverse tape record has no predicate");
+            condition = readLeaf(builder, source.getLoc(), handle, recordIndex, builder.getI1Type(),
+                                 region->record.stride, region->record.alignment, predicate->offset);
+        } else {
+            FailureOr<Value> reconstructed = materializePrimal(source.getCondition(), builder);
+            if (failed(reconstructed))
+                return source.emitError("cannot reconstruct the selected scf.if predicate");
+            condition = *reconstructed;
+        }
 
         SmallVector<AdjointKey> external = externalActiveLeaves(source.getThenRegion());
         for (AdjointKey value : externalActiveLeaves(source.getElseRegion()))
@@ -1453,7 +1535,8 @@ private:
                 reverseBlockRef.empty() ? scf::YieldOp{} : dyn_cast<scf::YieldOp>(reverseBlockRef.back());
             OpBuilder branchBuilder = reverseYield ? OpBuilder(reverseYield) : OpBuilder::atBlockEnd(&reverseBlockRef);
             SmallVector<std::pair<Value, Value>> savedPrimals;
-            if (failed(loadRegionPrimals(branchBuilder, *region, handle, zero, savedPrimals, &sourceRegion)))
+            if (region &&
+                failed(loadRegionPrimals(branchBuilder, *region, handle, recordIndex, savedPrimals, &sourceRegion)))
                 return failure();
             AdjointMap local;
             auto sourceYield = cast<scf::YieldOp>(sourceRegion.front().getTerminator());
@@ -1467,7 +1550,7 @@ private:
                         local[{yielded, leafIndex}] = seed;
                 }
             }
-            if (failed(reverseBlock(sourceRegion.front(), branchBuilder, local, handle, zero)))
+            if (failed(reverseBlock(sourceRegion.front(), branchBuilder, local, handle, recordIndex)))
                 return failure();
             SmallVector<Value> yielded;
             for (auto [value, leafIndex] : external) {
@@ -1484,6 +1567,105 @@ private:
         builder.setInsertionPointAfter(reverse);
         for (auto [key, contribution] : llvm::zip_equal(external, reverse.getResults()))
             accumulate(builder, source.getLoc(), adjoints, key.first, key.second, contribution);
+        return success();
+    }
+
+    LogicalResult reverseFor(scf::ForOp source, OpBuilder &builder, AdjointMap &adjoints, Value parentRegion,
+                             Value parentRecordIndex) {
+        bool seeded = llvm::any_of(source.getResults(), [&](Value result) {
+            const ValueAbiLayout *layout = analysis.getValueAbi(result);
+            if (!layout)
+                return false;
+            return llvm::any_of(llvm::seq<unsigned>(0, layout->leaves.size()),
+                                [&](unsigned leaf) { return adjoints.contains({result, leaf}); });
+        });
+        seeded |= hasActiveStorageEffect(source.getRegion());
+        if (!seeded)
+            return success();
+        auto stepConstant = source.getStep().getDefiningOp<arith::ConstantIndexOp>();
+        if (!stepConstant || stepConstant.value() <= 0)
+            return source.emitError("structured VJP requires a canonical positive constant scf.for step");
+        FailureOr<Value> lower = materializePrimal(source.getLowerBound(), builder);
+        FailureOr<Value> upper = materializePrimal(source.getUpperBound(), builder);
+        FailureOr<Value> step = materializePrimal(source.getStep(), builder);
+        if (failed(lower) || failed(upper) || failed(step))
+            return source.emitError("cannot reconstruct scf.for bounds in reverse");
+        Value count = buildPositiveStepTripCount(builder, source.getLoc(), *lower, *upper, *step);
+
+        const AutodiffTapeRegion *region = regions.lookup(source.getOperation());
+        Value handle = parentRegion;
+        if (region)
+            handle = readNestedRegion(builder, source.getLoc(), parentRegion, parentRecordIndex, region->childOrdinal);
+        auto yield = cast<scf::YieldOp>(source.getBody()->getTerminator());
+        SmallVector<std::pair<unsigned, unsigned>> carriedIndices;
+        for (auto [index, result] : llvm::enumerate(source.getResults())) {
+            const ValueAbiLayout *layout = analysis.getValueAbi(result);
+            if (!layout)
+                continue;
+            for (unsigned leafIndex = 0; leafIndex < layout->leaves.size(); ++leafIndex)
+                if (analysis.isActive(result, leafIndex))
+                    carriedIndices.emplace_back(index, leafIndex);
+        }
+        SmallVector<AdjointKey> external = externalActiveLeaves(source.getRegion());
+        SmallVector<Value> initial;
+        for (auto [index, leafIndex] : carriedIndices) {
+            Value seed = adjoints.lookup({source.getResult(index), leafIndex});
+            initial.push_back(seed ? seed : zeroFor(builder, source.getLoc(), source.getResult(index), leafIndex));
+        }
+        for (auto [value, leafIndex] : external)
+            initial.push_back(zeroFor(builder, source.getLoc(), value, leafIndex));
+
+        Value zero = createIndexConstant(builder, source.getLoc(), 0);
+        Value one = createIndexConstant(builder, source.getLoc(), 1);
+        scf::ForOp reverse = scf::ForOp::create(builder, source.getLoc(), zero, count, one, initial);
+        Block *body = reverse.getBody();
+        scf::YieldOp reverseYield = body->empty() ? scf::YieldOp{} : dyn_cast<scf::YieldOp>(body->back());
+        OpBuilder bodyBuilder = reverseYield ? OpBuilder(reverseYield) : OpBuilder::atBlockEnd(body);
+        Value last = arith::SubIOp::create(bodyBuilder, source.getLoc(), count, one);
+        Value iteration = arith::SubIOp::create(bodyBuilder, source.getLoc(), last, reverse.getInductionVar());
+        Value offset = arith::MulIOp::create(bodyBuilder, source.getLoc(), iteration, *step);
+        Value primalInduction = arith::AddIOp::create(bodyBuilder, source.getLoc(), *lower, offset);
+        Value previousInduction = primals.lookup(source.getInductionVar());
+        primals[source.getInductionVar()] = primalInduction;
+
+        SmallVector<std::pair<Value, Value>> savedPrimals;
+        if (region && failed(loadRegionPrimals(bodyBuilder, *region, handle, iteration, savedPrimals)))
+            return failure();
+        AdjointMap local;
+        unsigned position = 0;
+        for (auto [index, leafIndex] : carriedIndices)
+            local[{yield.getOperand(index), leafIndex}] = reverse.getRegionIterArgs()[position++];
+        for (AdjointKey value : external)
+            local[value] = reverse.getRegionIterArgs()[position++];
+        if (failed(reverseBlock(*source.getBody(), bodyBuilder, local, handle, iteration)))
+            return failure();
+        SmallVector<Value> next;
+        for (auto [index, leafIndex] : carriedIndices) {
+            Value argument = source.getRegionIterArgs()[index];
+            Value contribution = local.lookup({argument, leafIndex});
+            next.push_back(contribution ? contribution : zeroFor(bodyBuilder, source.getLoc(), argument, leafIndex));
+        }
+        for (auto [value, leafIndex] : external) {
+            Value contribution = local.lookup({value, leafIndex});
+            next.push_back(contribution ? contribution : zeroFor(bodyBuilder, source.getLoc(), value, leafIndex));
+        }
+        if (reverseYield)
+            reverseYield->setOperands(next);
+        else
+            scf::YieldOp::create(bodyBuilder, source.getLoc(), next);
+        restorePrimals(savedPrimals);
+        if (previousInduction)
+            primals[source.getInductionVar()] = previousInduction;
+        else
+            primals.erase(source.getInductionVar());
+
+        builder.setInsertionPointAfter(reverse);
+        position = 0;
+        for (auto [index, leafIndex] : carriedIndices)
+            accumulate(builder, source.getLoc(), adjoints, source.getInitArgs()[index], leafIndex,
+                       reverse.getResult(position++));
+        for (auto [value, leafIndex] : external)
+            accumulate(builder, source.getLoc(), adjoints, value, leafIndex, reverse.getResult(position++));
         return success();
     }
 
@@ -1605,6 +1787,9 @@ SmallVector<BlockArgument> requiredPrimalArguments(const VernonAutodiffTapePlan 
         const AdResidualSource &source = selection.candidates[selection.selectedCandidate];
         if (source.kind == AdResidualSourceKind::PrimalArgument)
             append(selection.key.value);
+        if (source.kind == AdResidualSourceKind::ExactVersionReload)
+            if (auto load = selection.key.value.getDefiningOp<LoadOp>())
+                append(load.getStorage());
         if (source.kind == AdResidualSourceKind::PureRematerialization)
             for (Operation *operation : source.recipe)
                 for (Value operand : operation->getOperands())
@@ -1633,6 +1818,7 @@ bool requiresLogicalTape(const VernonAutodiffTapePlan &plan) {
 }
 
 FailureOr<func::FuncOp> createStructuredForward(func::FuncOp primal, StringRef symbol,
+                                                const VernonAutodiffAnalysisResult &analysis,
                                                 const VernonAutodiffTapePlan &plan,
                                                 const ResidualRootLayout &rootLayout, bool usesTape) {
     MLIRContext *context = primal.getContext();
@@ -1672,7 +1858,7 @@ FailureOr<func::FuncOp> createStructuredForward(func::FuncOp primal, StringRef s
                      ->getResult(0);
     Value root = beginRegion(captureBuilder, primal.getLoc(), tape);
     Value rootRecord = reserveRecord(captureBuilder, primal.getLoc(), root, rootLayout.stride, rootLayout.alignment);
-    ForwardEmitterCore emitter(primal, plan, tape, root, rootRecord);
+    ForwardEmitterCore emitter(primal, analysis, plan, tape, root, rootRecord);
     for (auto [source, target] : llvm::zip_equal(primal.getArguments(), entry->getArguments()))
         emitter.getMapping().map(source, target);
     if (failed(emitter.emitTopLevel(captureBuilder)))
@@ -1929,26 +2115,6 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
         return primal.emitError("structured VJP profile symbol already exists");
 
     func::FuncOp structuredPrimal = primal;
-    func::FuncOp normalizedPrimal;
-    bool hasFor = false;
-    primal.walk([&](scf::ForOp) { hasFor = true; });
-    if (hasFor) {
-        normalizedPrimal = cast<func::FuncOp>(primal.clone());
-        std::string normalizedSymbol = options.forwardSymbol + "__normalized_primal";
-        while (module.lookupSymbol(normalizedSymbol))
-            normalizedSymbol.push_back('_');
-        normalizedPrimal.setSymName(normalizedSymbol);
-        module.getBody()->push_back(normalizedPrimal);
-        if (failed(normalizeStructuredLoops(normalizedPrimal))) {
-            normalizedPrimal.erase();
-            return failure();
-        }
-        structuredPrimal = normalizedPrimal;
-    }
-    auto eraseNormalizedPrimal = llvm::make_scope_exit([&] {
-        if (normalizedPrimal)
-            normalizedPrimal.erase();
-    });
 
     SmallVector<StringRef> wrtPaths;
     for (const std::string &path : options.wrtPaths)
@@ -1976,7 +2142,7 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
     if (failed(rootLayout))
         return structuredPrimal.emitError("structured VJP root record layout overflow");
     FailureOr<func::FuncOp> forward =
-        createStructuredForward(structuredPrimal, options.forwardSymbol, *plan, *rootLayout, usesTape);
+        createStructuredForward(structuredPrimal, options.forwardSymbol, *analysis, *plan, *rootLayout, usesTape);
     if (failed(forward))
         return failure();
     FailureOr<func::FuncOp> backward = createStructuredBackward(structuredPrimal, options.backwardSymbol, *analysis,

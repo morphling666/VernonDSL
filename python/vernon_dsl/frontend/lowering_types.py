@@ -30,6 +30,7 @@ class Value:
     type: DslType
     fields: tuple["Value", ...] | None = None
     access: AccessMode = AccessMode.READ
+    canonical_index: str | None = None
 
     @property
     def abi_type(self) -> DslType:

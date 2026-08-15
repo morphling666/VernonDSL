@@ -4,9 +4,6 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
-#include <array>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -73,6 +70,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     EXPECT_FLOAT_EQ(values[0], 2.0f);
     EXPECT_FLOAT_EQ(values[1], 24.0f);
     EXPECT_FLOAT_EQ(values[2], 5.0f);
+    source[1] = 100.0f;
 
     float scaleGradient{};
     float sourceGradient[3]{};
@@ -111,7 +109,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-TEST(RuntimeStructuredStorageAutodiff, RollsBackWhenCompactTapeWindowDoesNotFit) {
+TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
     ASSERT_EQ(vernonRegisterStructuredStorageAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_STORAGE_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -121,9 +119,9 @@ TEST(RuntimeStructuredStorageAutodiff, RollsBackWhenCompactTapeWindowDoesNotFit)
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    auto calibrationPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
-        std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
-    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, calibrationPolicy);
+    auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(std::numeric_limits<size_t>::max(),
+                                                                                  std::numeric_limits<size_t>::max());
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, tapePolicy);
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
@@ -149,41 +147,16 @@ TEST(RuntimeStructuredStorageAutodiff, RollsBackWhenCompactTapeWindowDoesNotFit)
     };
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
-    VernonPullback *calibrationPullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
-    ASSERT_NE(calibrationPullback, nullptr);
-    const size_t oneInvocationBytes =
-        vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy);
-    ASSERT_GT(oneInvocationBytes, 0u);
-    vernonPullbackDestroy(calibrationPullback);
-    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    ASSERT_NE(pullback, nullptr);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
+    EXPECT_FLOAT_EQ(loss[0], 26.0f);
+    EXPECT_FLOAT_EQ(loss[1], 103.0f);
 
-    auto boundedPolicy =
-        std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(oneInvocationBytes, oneInvocationBytes);
-    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
-    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
-    ASSERT_NE(pipeline, nullptr) << lastError(context);
-    const float originalValues[]{2.0f, 3.0f, 5.0f, 11.0f, 13.0f, 17.0f};
-    const float originalLoss[]{-17.0f, -31.0f};
-    std::copy(std::begin(originalValues), std::end(originalValues), values);
-    std::copy(std::begin(originalLoss), std::end(originalLoss), loss);
-    std::array<unsigned char, sizeof(values)> valuesBefore{};
-    std::array<unsigned char, sizeof(loss)> lossBefore{};
-    std::memcpy(valuesBefore.data(), values, sizeof(values));
-    std::memcpy(lossBefore.data(), loss, sizeof(loss));
-
-    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(rejectedPullback, nullptr);
-    EXPECT_NE(lastError(context).find("compact tape batch"), std::string::npos);
-    EXPECT_NE(lastError(context).find("resident context window"), std::string::npos);
-    EXPECT_EQ(std::memcmp(valuesBefore.data(), values, sizeof(values)), 0);
-    EXPECT_EQ(std::memcmp(lossBefore.data(), loss, sizeof(loss)), 0);
-    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
-
+    vernonPullbackDestroy(pullback);
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

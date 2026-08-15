@@ -25,6 +25,8 @@ def lower_buffer_index(emitter: StorageEmitter, node: ast.AST) -> Value:
     index = emitter._expression(node)
     if not index.type.is_integer:
         raise emitter.context.error(node, "buffer index must be an integer")
+    if index.canonical_index is not None:
+        return Value(index.canonical_index, DslType("index", "index"))
     if index.type.mlir == "index":
         return index
     cast = emitter._fresh()

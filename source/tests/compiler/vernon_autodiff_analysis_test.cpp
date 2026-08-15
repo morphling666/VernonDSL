@@ -191,6 +191,30 @@ module {
     EXPECT_FALSE(analysis->isActive(function.getArgument(0), 2));
 }
 
+TEST_F(VernonAutodiffAnalysisTest, DetectsActivityOutsideFirstAbiLeaf) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @aggregate(
+      %input: tuple<f32, f32> {
+        vernon.source_name = "input",
+        vernon.abi_leaf_dtypes = ["f32", "f32"]
+      }) -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %value = "vernon.tuple_get"(%input) {index = 1 : i64}
+        : (tuple<f32, f32>) -> f32
+    func.return %value : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("aggregate");
+    FailureOr<VernonAutodiffAnalysisResult> analysis = analyzeAutodiffFunction(function, {"input.1"});
+    ASSERT_TRUE(succeeded(analysis));
+
+    EXPECT_TRUE(analysis->hasAnyActiveLeaf(function.getArgument(0)));
+    EXPECT_FALSE(analysis->isActive(function.getArgument(0), 0));
+    EXPECT_TRUE(analysis->isActive(function.getArgument(0), 1));
+}
+
 TEST_F(VernonAutodiffAnalysisTest, PropagatesStructLeavesThroughCreateAndGet) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
@@ -283,7 +307,6 @@ module {
     ASSERT_EQ(analysis->getRegions().size(), 2u);
     EXPECT_TRUE(isa<scf::WhileOp>(analysis->getRegions()[0].operation));
     EXPECT_FALSE(analysis->getRegions()[0].parentOrdinal);
-    ASSERT_EQ(analysis->getRegions()[0].childOrdinals, SmallVector<unsigned>({1}));
     EXPECT_TRUE(isa<scf::IfOp>(analysis->getRegions()[1].operation));
     ASSERT_TRUE(analysis->getRegions()[1].parentOrdinal);
     EXPECT_EQ(*analysis->getRegions()[1].parentOrdinal, 0u);
@@ -692,8 +715,8 @@ module {
               1u);
     for (const AutodiffStorageEffect &effect : analysis->getStorageEffects())
         EXPECT_TRUE(analysis->isActive(effect.operation));
-    ASSERT_EQ(analysis->getActiveLoads().size(), 2u);
-    for (const AutodiffActiveLoad &load : analysis->getActiveLoads()) {
+    ASSERT_EQ(analysis->getLoads().size(), 2u);
+    for (const AutodiffLoadInfo &load : analysis->getLoads()) {
         const AutodiffStorageEffect *effect = analysis->getStorageEffect(load.operation);
         ASSERT_NE(effect, nullptr);
         EXPECT_EQ(load.identity, effect->identity);
@@ -703,9 +726,51 @@ module {
         EXPECT_TRUE(llvm::all_of(load.indexProvenance, [](AutodiffIndexProvenanceKind provenance) {
             return provenance == AutodiffIndexProvenanceKind::PureExpression;
         }));
-        EXPECT_EQ(load.stability, AutodiffStorageStabilityRequirement::RestoreExactVersion);
-        EXPECT_EQ(analysis->getActiveLoad(load.operation), &load);
+        EXPECT_EQ(load.stability, load.identity == inputIdentity->id
+                                      ? AutodiffStorageStabilityRequirement::RetainedExactVersion
+                                      : AutodiffStorageStabilityRequirement::RestoreExactVersion);
+        EXPECT_EQ(analysis->getLoadInfo(load.operation), &load);
     }
+}
+
+TEST_F(VernonAutodiffAnalysisTest, MergesZeroTripAndBackedgeStorageAtForExit) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @for_storage(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]},
+      %scratch: !vernon.tensor_view<f32, [1], "read_write", "workgroup">
+          {vernon.source_name = "scratch", vernon.abi_leaf_dtypes = ["f32"]})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %zero = arith.constant 0 : index
+    %four = arith.constant 4 : index
+    %one = arith.constant 1 : index
+    scf.for %index = %zero to %four step %one {
+      "vernon.store"(%x, %scratch, %zero)
+          : (f32, !vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> ()
+    }
+    %result = "vernon.load"(%scratch, %zero)
+        : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> f32
+    func.return %result : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    FailureOr<VernonAutodiffAnalysisResult> analysis =
+        analyzeAutodiffFunction(module->lookupSymbol<func::FuncOp>("for_storage"), {"x"});
+    ASSERT_TRUE(succeeded(analysis));
+    const AutodiffStorageVersion *phi = nullptr;
+    const AutodiffStorageVersion *exit = nullptr;
+    for (const AutodiffStorageVersion &version : analysis->getStorageVersions()) {
+        if (version.kind == StorageVersionKind::ForPhi)
+            phi = &version;
+        if (version.kind == StorageVersionKind::ForExit)
+            exit = &version;
+    }
+    ASSERT_NE(phi, nullptr);
+    ASSERT_NE(exit, nullptr);
+    ASSERT_EQ(phi->incomingVersions.size(), 2u);
+    ASSERT_EQ(exit->incomingVersions.size(), 1u);
+    EXPECT_EQ(exit->incomingVersions.front(), phi->id);
 }
 
 TEST_F(VernonAutodiffAnalysisTest, RejectsUnsupportedActiveOperation) {

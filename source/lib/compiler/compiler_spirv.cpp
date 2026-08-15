@@ -4,7 +4,9 @@
 #include "compiler_reflection.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
@@ -254,6 +256,7 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
     }
 
     mlir::PassManager passManager(&context);
+    passManager.addNestedPass<mlir::func::FuncOp>(mlir::createForToWhileLoopPass());
     passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUSynchronizationPass(true));
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
