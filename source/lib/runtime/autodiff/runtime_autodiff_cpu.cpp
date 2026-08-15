@@ -22,6 +22,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -802,15 +803,13 @@ class StructuredCpuPullbackExecution final : public PullbackExecution {
 public:
     StructuredCpuPullbackExecution(VernonRuntimeContext &context, std::shared_ptr<CpuKernelState> backward,
                                    HostProfileLayout layout, Signature signature, VernonLaunchSize computeGrid,
-                                   size_t invocationCount, std::shared_ptr<HostStaticTapeBatch> tapeBatch,
-                                   RuntimeTensorShapes tensorShapes, RetainedPrimalLeaves retainedPrimals,
-                                   RetainedPrimalTensorViews retainedTensorViews,
+                                   std::shared_ptr<HostStaticTapeBatch> tapeBatch, RuntimeTensorShapes tensorShapes,
+                                   RetainedPrimalLeaves retainedPrimals, RetainedPrimalTensorViews retainedTensorViews,
                                    std::vector<size_t> resultGradientIndices)
         : context_(context), backward_(std::move(backward)), layout_(std::move(layout)),
           signature_(std::move(signature)), computeGrid_(computeGrid), tensorShapes_(std::move(tensorShapes)),
           retainedPrimals_(std::move(retainedPrimals)), retainedTensorViews_(std::move(retainedTensorViews)),
-          resultGradientIndices_(std::move(resultGradientIndices)), invocationCount_(invocationCount),
-          tapeBatch_(std::move(tapeBatch)) {}
+          resultGradientIndices_(std::move(resultGradientIndices)), tapeBatch_(std::move(tapeBatch)) {}
 
     PullbackMemoryUsage memoryUsage() const override {
         PullbackMemoryUsage usage;
@@ -819,6 +818,19 @@ public:
             usage.residentBytes = tapeBatch_->residentBytes();
             usage.allocatedBytes = tapeBatch_->allocatedBytes();
         }
+        size_t retainedBytes = usage.allocatedBytes;
+        for (const auto &retained : retainedPrimals_)
+            if (!checkedAddBytes(retainedBytes, retained.second.capacity(), sizeof(uint8_t))) {
+                usage.retainedAllocationBytes = std::numeric_limits<size_t>::max();
+                return usage;
+            }
+        for (const auto &retained : retainedTensorViews_)
+            if (!checkedAddBytes(retainedBytes, retained.second.shape.capacity(), sizeof(uint64_t)) ||
+                !checkedAddBytes(retainedBytes, retained.second.packed.capacity(), sizeof(uint8_t))) {
+                usage.retainedAllocationBytes = std::numeric_limits<size_t>::max();
+                return usage;
+            }
+        usage.retainedAllocationBytes = retainedBytes;
         return usage;
     }
 
@@ -1164,13 +1176,13 @@ private:
     RetainedPrimalLeaves retainedPrimals_;
     RetainedPrimalTensorViews retainedTensorViews_;
     std::vector<size_t> resultGradientIndices_;
-    size_t invocationCount_{};
     std::shared_ptr<HostStaticTapeBatch> tapeBatch_;
 };
 
 template <typename Invoke, typename Finish>
 VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayout &layout, const Signature &signature,
                            VernonLaunchSize computeGrid, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
+                           const std::unordered_set<std::string> &requiredPrimalTensorOwners,
                            std::unique_ptr<PullbackExecution> &pullback, Invoke &&invoke, Finish &&finish) {
     const uint32_t grid[3]{computeGrid.x, computeGrid.y, computeGrid.z};
     if (!validateDispatchContract(layout.dispatchContract, grid, layout.workgroup, invocationDiagnostic(context)))
@@ -1197,10 +1209,12 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
     RetainedPrimalTensorViews retainedTensorViews;
     tensorShapes.reserve(tensorViews.size());
     for (const StagedTensorView &view : tensorViews) {
-        const auto [retained, inserted] = tensorShapes.emplace(tensorOwnerName(*view.argument), view.shape);
+        const std::string owner = tensorOwnerName(*view.argument);
+        const auto [retained, inserted] = tensorShapes.emplace(owner, view.shape);
         if (!inserted && retained->second != view.shape)
             return fail(context, "native CPU autodiff retained incompatible TensorView shapes for one owner");
-        retainedTensorViews.emplace(tensorOwnerName(*view.argument), RetainedPrimalTensorView{view.shape, view.packed});
+        if (requiredPrimalTensorOwners.find(owner) != requiredPrimalTensorOwners.end())
+            retainedTensorViews.emplace(owner, RetainedPrimalTensorView{view.shape, view.packed});
     }
     CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context);
     std::mutex invocationFailureMutex;
@@ -1298,18 +1312,106 @@ VernonStatus runCpuForward(VernonRuntimeContext &context, const HostProfileLayou
     return VERNON_STATUS_OK;
 }
 
-class StructuredCpuExecutable final : public HostExecutable {
+std::unordered_set<std::string> requiredPrimalTensorOwners(const HostProfileLayout &backwardLayout) {
+    std::unordered_set<std::string> owners;
+    for (const HostArgument &argument : backwardLayout.arguments)
+        if (isPrimalSource(argument) && argument.tensorView)
+            owners.insert(argument.name.substr(7));
+    return owners;
+}
+
+VernonStatus retainRequiredPrimalLeaves(VernonRuntimeContext &context, const HostProfileLayout &backwardLayout,
+                                        const VernonAdValueSet &inputs, RetainedPrimalLeaves &retainedPrimals) {
+    for (const HostArgument &argument : backwardLayout.arguments) {
+        if (!isPrimalSource(argument) || argument.tensorView)
+            continue;
+        for (const HostFrameLeaf &leaf : argument.leaves) {
+            std::string path = leaf.value.path;
+            if (path.rfind("primal.", 0) != 0)
+                return fail(context, "CPU primal reflection path is invalid");
+            path.erase(0, 7);
+            const VernonAdValue *value = findValue(inputs, path);
+            if (!value || value->size != leaf.value.byteSize || value->dtype != leaf.value.dtype)
+                return fail(context, "CPU required primal does not match the forward inputs");
+            retainedPrimals[path] = std::vector<uint8_t>(static_cast<const uint8_t *>(value->data),
+                                                         static_cast<const uint8_t *>(value->data) + value->size);
+        }
+    }
+    return VERNON_STATUS_OK;
+}
+
+class NoTapeStructuredCpuExecutable final : public HostExecutable {
 public:
-    StructuredCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
-                            HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
-                            std::shared_ptr<CpuKernelState> backward, Signature signature,
-                            std::vector<size_t> resultGradientIndices, uint64_t staticTapeBytesHint)
+    NoTapeStructuredCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
+                                  HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
+                                  std::shared_ptr<CpuKernelState> backward, Signature signature,
+                                  std::vector<size_t> resultGradientIndices)
+        : context_(context), forwardLayout_(std::move(forwardLayout)), backwardLayout_(std::move(backwardLayout)),
+          forward_(std::move(forward)), backward_(std::move(backward)), signature_(std::move(signature)),
+          resultGradientIndices_(std::move(resultGradientIndices)),
+          requiredPrimalTensorOwners_(requiredPrimalTensorOwners(backwardLayout_)) {}
+
+    const Signature &signature() const override { return signature_; }
+
+    VernonStatus forward(VernonLaunchSize computeGrid, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
+                         std::unique_ptr<PullbackExecution> &pullback) override {
+        const uint32_t grid[3]{computeGrid.x, computeGrid.y, computeGrid.z};
+        if (!validateDispatchContract(backwardLayout_.dispatchContract, grid, backwardLayout_.workgroup,
+                                      invocationDiagnostic(context_)))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        RetainedPrimalLeaves retainedPrimals;
+        if (VernonStatus status = retainRequiredPrimalLeaves(context_, backwardLayout_, inputs, retainedPrimals);
+            status != VERNON_STATUS_OK)
+            return status;
+        return runCpuForward(
+            context_, forwardLayout_, signature_, computeGrid, inputs, outputs, requiredPrimalTensorOwners_, pullback,
+            [&](VernonCpuRangeV1 &range, auto &frames, std::string &diagnostic) {
+                for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
+                    const CpuLaneCoordinates coordinates = cpuRangeCoordinates(range, localLinear);
+                    uint8_t *arguments = frames[coordinates.linearIndex].arguments;
+                    for (const HostArgument &argument : forwardLayout_.arguments)
+                        if (!argument.builtin.empty() && !writeInvocationBuiltin(argument, coordinates, arguments)) {
+                            diagnostic = "native CPU no-Tape autodiff has an unsupported builtin ABI";
+                            return VERNON_STATUS_INVALID_ARGUMENT;
+                        }
+                }
+                const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+                return forward_->entry(&invocation);
+            },
+            [&](size_t, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
+                RetainedPrimalTensorViews retainedTensorViews, std::unique_ptr<PullbackExecution> &pending) {
+                pending = std::make_unique<StructuredCpuPullbackExecution>(
+                    context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid, nullptr,
+                    std::move(tensorShapes), std::move(retainedPrimals), std::move(retainedTensorViews),
+                    resultGradientIndices_);
+                return VERNON_STATUS_OK;
+            });
+    }
+
+private:
+    VernonRuntimeContext &context_;
+    HostProfileLayout forwardLayout_;
+    HostProfileLayout backwardLayout_;
+    std::shared_ptr<CpuKernelState> forward_;
+    std::shared_ptr<CpuKernelState> backward_;
+    Signature signature_;
+    std::vector<size_t> resultGradientIndices_;
+    std::unordered_set<std::string> requiredPrimalTensorOwners_;
+};
+
+class TapedStructuredCpuExecutable final : public HostExecutable {
+public:
+    TapedStructuredCpuExecutable(VernonRuntimeContext &context, HostProfileLayout forwardLayout,
+                                 HostProfileLayout backwardLayout, std::shared_ptr<CpuKernelState> forward,
+                                 std::shared_ptr<CpuKernelState> backward, Signature signature,
+                                 std::vector<size_t> resultGradientIndices, uint64_t staticTapeBytesHint)
         : context_(context), forwardLayout_(std::move(forwardLayout)), backwardLayout_(std::move(backwardLayout)),
           forward_(std::move(forward)), backward_(std::move(backward)), signature_(std::move(signature)),
           tapePolicy_(context.cpuTapePolicy), resultGradientIndices_(std::move(resultGradientIndices)),
           staticTapeBytesHint_(staticTapeBytesHint > std::numeric_limits<size_t>::max()
                                    ? std::numeric_limits<size_t>::max()
-                                   : static_cast<size_t>(staticTapeBytesHint)) {}
+                                   : static_cast<size_t>(staticTapeBytesHint)),
+          requiredPrimalTensorOwners_(requiredPrimalTensorOwners(backwardLayout_)) {}
 
     const Signature &signature() const override { return signature_; }
 
@@ -1328,50 +1430,9 @@ public:
             return fail(context_, "native CPU autodiff launch size overflows");
         const size_t tapeBytesHint = staticTapeBytesHint_;
         RetainedPrimalLeaves retainedPrimals;
-        for (const HostArgument &argument : backwardLayout_.arguments) {
-            if (!isPrimalSource(argument))
-                continue;
-            if (argument.tensorView)
-                continue;
-            for (const HostFrameLeaf &leaf : argument.leaves) {
-                std::string path = leaf.value.path;
-                if (path.rfind("primal.", 0) != 0)
-                    return fail(context_, "CPU primal reflection path is invalid");
-                path.erase(0, 7);
-                const VernonAdValue *value = findValue(inputs, path);
-                if (!value || value->size != leaf.value.byteSize || value->dtype != leaf.value.dtype)
-                    return fail(context_, "CPU required primal does not match the forward inputs");
-                retainedPrimals[path] = std::vector<uint8_t>(static_cast<const uint8_t *>(value->data),
-                                                             static_cast<const uint8_t *>(value->data) + value->size);
-            }
-        }
-        if (tapeBytesHint == 0) {
-            return runCpuForward(
-                context_, forwardLayout_, signature_, computeGrid, inputs, outputs, pullback,
-                [&](VernonCpuRangeV1 &range, auto &frames, std::string &diagnostic) {
-                    for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
-                        const CpuLaneCoordinates coordinates = cpuRangeCoordinates(range, localLinear);
-                        uint8_t *arguments = frames[coordinates.linearIndex].arguments;
-                        for (const HostArgument &argument : forwardLayout_.arguments)
-                            if (!argument.builtin.empty() &&
-                                !writeInvocationBuiltin(argument, coordinates, arguments)) {
-                                diagnostic = "native CPU no-Tape autodiff has an unsupported builtin ABI";
-                                return VERNON_STATUS_INVALID_ARGUMENT;
-                            }
-                    }
-                    const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0,
-                                                         nullptr};
-                    return forward_->entry(&invocation);
-                },
-                [&](size_t count, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
-                    RetainedPrimalTensorViews retainedTensorViews, std::unique_ptr<PullbackExecution> &pending) {
-                    pending = std::make_unique<StructuredCpuPullbackExecution>(
-                        context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid, count, nullptr,
-                        std::move(tensorShapes), std::move(retainedPrimals), std::move(retainedTensorViews),
-                        resultGradientIndices_);
-                    return VERNON_STATUS_OK;
-                });
-        }
+        if (VernonStatus status = retainRequiredPrimalLeaves(context_, backwardLayout_, inputs, retainedPrimals);
+            status != VERNON_STATUS_OK)
+            return status;
         if (tapeBytesHint > tapePolicy_->invocationLimit())
             return fail(context_, "CPU autodiff tape allocator static estimate exceeds the per-invocation limit");
         size_t maximumTapeBytes = 0;
@@ -1396,7 +1457,7 @@ public:
             return fail(context_, "CPU autodiff compact tape batch exceeds the host representation");
         }
         const VernonStatus status = runCpuForward(
-            context_, forwardLayout_, signature_, computeGrid, inputs, outputs, pullback,
+            context_, forwardLayout_, signature_, computeGrid, inputs, outputs, requiredPrimalTensorOwners_, pullback,
             [&](VernonCpuRangeV1 &range, auto &frames, std::string &diagnostic) {
                 for (size_t localLinear = range.lane_begin; localLinear < range.lane_end; ++localLinear) {
                     const CpuLaneCoordinates coordinates = cpuRangeCoordinates(range, localLinear);
@@ -1461,13 +1522,13 @@ public:
                 }
                 return VERNON_STATUS_OK;
             },
-            [&](size_t invocationCount, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
+            [&](size_t, Signature runtimeSignature, RuntimeTensorShapes tensorShapes,
                 RetainedPrimalTensorViews retainedTensorViews, std::unique_ptr<PullbackExecution> &pending) {
                 if (!tapeBatch->compact())
                     return fail(context_, "CPU autodiff tape batch could not be compacted");
                 pending = std::make_unique<StructuredCpuPullbackExecution>(
-                    context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid, invocationCount,
-                    tapeBatch, std::move(tensorShapes), std::move(retainedPrimals), std::move(retainedTensorViews),
+                    context_, backward_, backwardLayout_, std::move(runtimeSignature), computeGrid, tapeBatch,
+                    std::move(tensorShapes), std::move(retainedPrimals), std::move(retainedTensorViews),
                     resultGradientIndices_);
                 return VERNON_STATUS_OK;
             });
@@ -1486,6 +1547,7 @@ private:
     std::shared_ptr<HostTapeMemoryPolicy> tapePolicy_;
     std::vector<size_t> resultGradientIndices_;
     size_t staticTapeBytesHint_{};
+    std::unordered_set<std::string> requiredPrimalTensorOwners_;
 };
 
 bool validateDifferentiationSignature(VernonRuntimeContext &context, const Signature &signature) {
@@ -1625,11 +1687,17 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &f
     }
     if (!validateDifferentiationSignature(context, signature))
         return false;
-    if (!context.cpuTapePolicy)
-        context.cpuTapePolicy = std::make_shared<HostTapeMemoryPolicy>();
-    executable = std::make_shared<StructuredCpuExecutable>(
-        context, std::move(forward), std::move(backward), std::move(forwardKernel), std::move(backwardKernel),
-        std::move(signature), std::move(resultGradientIndices), staticTapeBytesHint);
+    if (noTape) {
+        executable = std::make_shared<NoTapeStructuredCpuExecutable>(
+            context, std::move(forward), std::move(backward), std::move(forwardKernel), std::move(backwardKernel),
+            std::move(signature), std::move(resultGradientIndices));
+    } else {
+        if (!context.cpuTapePolicy)
+            context.cpuTapePolicy = std::make_shared<HostTapeMemoryPolicy>();
+        executable = std::make_shared<TapedStructuredCpuExecutable>(
+            context, std::move(forward), std::move(backward), std::move(forwardKernel), std::move(backwardKernel),
+            std::move(signature), std::move(resultGradientIndices), staticTapeBytesHint);
+    }
     return true;
 }
 

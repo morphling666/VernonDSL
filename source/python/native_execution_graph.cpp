@@ -156,6 +156,9 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     const std::vector<vernon::execution::PassDerivativeMapping> &cotangentMappings() const override {
         return cotangentMappings_;
     }
+    const std::vector<vernon::execution::PassPrimalResourceMapping> &requiredPrimalResources() const override {
+        return requiredPrimalResources_;
+    }
     bool forward(vernon::execution::ComputeEncoder &encoder, const vernon::execution::ExecutionResources &resources,
                  std::unique_ptr<vernon::execution::PassPullback> &pullback, std::string &error) override;
     bool zeroCotangent(const std::string &path, const vernon::execution::ExecutionResources &resources,
@@ -171,9 +174,10 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     bool deterministicReductionLegal() const override { return deterministicReductionLegal_; }
     bool hasCheckpointPlanningMetadata() const override { return hasCheckpointPlanningMetadata_; }
     bool supportsReplay() const override { return true; }
-    void setAutodiff(const nb::list &gradients, const nb::list &cotangents, uint64_t invocationCount,
-                     uint64_t tapeStride, uint64_t replayCost, uint64_t resourceReloadCost, uint64_t recomputationCost,
-                     bool deterministicReductionLegal, bool hasCheckpointPlanningMetadata) {
+    void setAutodiff(const nb::list &gradients, const nb::list &cotangents, const nb::list &requiredPrimals,
+                     uint64_t invocationCount, uint64_t tapeStride, uint64_t replayCost, uint64_t resourceReloadCost,
+                     uint64_t recomputationCost, uint64_t retainedPrimalBytes, bool deterministicReductionLegal,
+                     bool hasCheckpointPlanningMetadata) {
         const auto convert = [](const nb::list &values) {
             std::vector<vernon::execution::PassDerivativeMapping> result;
             result.reserve(nb::len(values));
@@ -191,6 +195,14 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
         };
         gradientMappings_ = convert(gradients);
         cotangentMappings_ = convert(cotangents);
+        requiredPrimalResources_.clear();
+        requiredPrimalResources_.reserve(nb::len(requiredPrimals));
+        for (nb::handle value : requiredPrimals) {
+            nb::tuple entry = nb::cast<nb::tuple>(value);
+            if (nb::len(entry) != 2)
+                throw std::invalid_argument("required primal mappings require path and resource id");
+            requiredPrimalResources_.push_back({nb::cast<std::string>(entry[0]), nb::cast<uint32_t>(entry[1])});
+        }
         if (invocationCount > std::numeric_limits<size_t>::max() || tapeStride > std::numeric_limits<size_t>::max() ||
             (tapeStride && invocationCount > std::numeric_limits<uint64_t>::max() / tapeStride))
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
@@ -198,9 +210,12 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
         if (tapeStride && !vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
                               static_cast<size_t>(invocationCount), static_cast<size_t>(tapeStride), forwardPeakBytes))
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
-        estimatedForwardPeakBytes_ = forwardPeakBytes;
-        estimatedRetainedAllocationBytes_ = forwardPeakBytes;
-        estimatedResidualBytes_ = invocationCount * tapeStride;
+        const uint64_t logicalTapeBytes = invocationCount * tapeStride;
+        if (retainedPrimalBytes > std::numeric_limits<uint64_t>::max() - forwardPeakBytes)
+            throw std::overflow_error("autodiff retained allocation estimate overflows");
+        estimatedRetainedAllocationBytes_ = forwardPeakBytes + retainedPrimalBytes;
+        estimatedForwardPeakBytes_ = forwardPeakBytes + retainedPrimalBytes;
+        estimatedResidualBytes_ = logicalTapeBytes;
         replayCost_ = replayCost;
         resourceReloadCost_ = resourceReloadCost;
         recomputationCost_ = recomputationCost;
@@ -231,6 +246,7 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     PyObject *owner{};
     std::vector<vernon::execution::PassDerivativeMapping> gradientMappings_;
     std::vector<vernon::execution::PassDerivativeMapping> cotangentMappings_;
+    std::vector<vernon::execution::PassPrimalResourceMapping> requiredPrimalResources_;
     uint64_t estimatedResidualBytes_{};
     uint64_t estimatedRetainedAllocationBytes_{};
     uint64_t estimatedForwardPeakBytes_{};
@@ -364,6 +380,11 @@ struct PythonCompiledExecutionGraph {
         result["persistent_checkpoint_bytes"] = checkpointPlan->persistentCheckpointBytes;
         result["initial_state_bytes"] = checkpointPlan->initialStateBytes;
         result["restoration_bytes"] = checkpointPlan->restorationBytes;
+        result["transaction_bytes"] = checkpointPlan->transactionBytes;
+        result["logical_residual_bytes"] = checkpointPlan->logicalResidualBytes;
+        result["retained_allocation_bytes"] = checkpointPlan->retainedAllocationBytes;
+        result["maximum_forward_peak_bytes"] = checkpointPlan->maximumForwardPeakBytes;
+        result["backward_value_bytes"] = checkpointPlan->backwardValueBytes;
         result["memory_budget"] = checkpointPlan->memoryBudget;
         result["peak_bytes"] = checkpointPlan->peakBytes;
         result["replay_cost"] = checkpointPlan->replayCost;
@@ -372,7 +393,6 @@ struct PythonCompiledExecutionGraph {
         result["checkpoint_copy_bytes"] = checkpointPlan->checkpointCopyBytes;
         result["resource_reload_cost"] = checkpointPlan->resourceReloadCost;
         result["recomputation_cost"] = checkpointPlan->recomputationCost;
-        result["graph_replay_cost"] = checkpointPlan->graphReplayCost;
         result["weighted_runtime_cost"] = checkpointPlan->weightedRuntimeCost;
         result["deterministic_reduction_legal"] = checkpointPlan->deterministicReductionLegal;
         result["selected_policy"] = checkpointPlan->selectedPolicy;
@@ -380,7 +400,8 @@ struct PythonCompiledExecutionGraph {
         for (const auto &resource : checkpointPlan->checkpointResources) {
             nb::dict value;
             value["producer"] = resource.producer;
-            value["resource"] = resource.resource;
+            value["resource"] = resource.version.resource;
+            value["version"] = resource.version.epoch;
             value["offset"] = resource.offset;
             value["byte_size"] = resource.byteSize;
             value["alignment"] = resource.alignment;
@@ -403,13 +424,42 @@ struct PythonCompiledExecutionGraph {
             value["begin_step"] = segment.beginStep;
             value["end_step"] = segment.endStep;
             value["checkpoint_index"] = segment.checkpointIndex;
-            value["transient_residual_bytes"] = segment.transientResidualBytes;
+            value["logical_residual_bytes"] = segment.logicalResidualBytes;
+            value["retained_allocation_bytes"] = segment.retainedAllocationBytes;
             value["peak_bytes"] = segment.peakBytes;
             value["replay_cost"] = segment.replayCost;
             value["release_checkpoint_resources"] = segment.releaseCheckpointResources;
             segments.append(std::move(value));
         }
         result["replay_segments"] = std::move(segments);
+        nb::list requiredVersions;
+        for (const auto &required : checkpointPlan->requiredVersions) {
+            nb::dict value;
+            value["consumer"] = required.consumer;
+            value["resource"] = required.version.resource;
+            value["version"] = required.version.epoch;
+            if (required.producer == UINT32_MAX)
+                value["producer"] = nb::none();
+            else
+                value["producer"] = required.producer;
+            switch (required.source) {
+            case vernon::execution::AutodiffVersionSource::RetainedOwner:
+                value["source"] = "retained_owner";
+                break;
+            case vernon::execution::AutodiffVersionSource::InitialState:
+                value["source"] = "initial_state";
+                break;
+            case vernon::execution::AutodiffVersionSource::Checkpoint:
+                value["source"] = "checkpoint";
+                break;
+            case vernon::execution::AutodiffVersionSource::Replay:
+                value["source"] = "replay";
+                break;
+            }
+            value["path"] = required.path;
+            requiredVersions.append(std::move(value));
+        }
+        result["required_versions"] = std::move(requiredVersions);
         return std::move(result);
     }
 

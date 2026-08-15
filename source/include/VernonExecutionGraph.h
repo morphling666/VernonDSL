@@ -140,10 +140,16 @@ struct PassDerivativeMapping {
     DerivativeEndpointKey endpoint;
 };
 
+struct PassPrimalResourceMapping {
+    std::string path;
+    uint32_t resource{};
+};
+
 class GraphAutodiffValue {
 public:
     virtual ~GraphAutodiffValue() = default;
     virtual uintptr_t logicalIdentity() const = 0;
+    virtual uint64_t allocationBytes() const = 0;
     virtual std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const = 0;
 };
 
@@ -158,6 +164,7 @@ public:
     virtual uint64_t logicalResidualBytes() const = 0;
     virtual uint64_t residentTapeBytes() const = 0;
     virtual uint64_t allocatedTapeBytes() const = 0;
+    virtual uint64_t retainedAllocationBytes() const { return allocatedTapeBytes(); }
     virtual uint64_t activeOperationCount() const = 0;
     virtual uint64_t recomputationCost() const = 0;
     virtual uint64_t tapeContextLimitBytes() const = 0;
@@ -170,6 +177,10 @@ public:
     virtual ~DifferentiablePass() = default;
     virtual const std::vector<PassDerivativeMapping> &gradientMappings() const = 0;
     virtual const std::vector<PassDerivativeMapping> &cotangentMappings() const = 0;
+    virtual const std::vector<PassPrimalResourceMapping> &requiredPrimalResources() const {
+        static const std::vector<PassPrimalResourceMapping> empty;
+        return empty;
+    }
     virtual bool forward(ComputeEncoder &encoder, const ExecutionResources &resources,
                          std::unique_ptr<PassPullback> &pullback, std::string &error) = 0;
     virtual bool zeroCotangent(const std::string &path, const ExecutionResources &resources,
@@ -325,15 +336,41 @@ struct AutodiffReplaySegment {
     uint32_t beginStep{};
     uint32_t endStep{};
     uint32_t checkpointIndex{std::numeric_limits<uint32_t>::max()};
-    uint64_t transientResidualBytes{};
+    uint64_t logicalResidualBytes{};
+    uint64_t retainedAllocationBytes{};
     uint64_t peakBytes{};
     uint64_t replayCost{};
     std::vector<uint32_t> releaseCheckpointResources;
 };
 
+struct AutodiffResourceVersion {
+    uint32_t resource{};
+    uint32_t epoch{};
+};
+
+enum class AutodiffVersionSource : uint8_t {
+    RetainedOwner,
+    InitialState,
+    Checkpoint,
+    Replay,
+};
+
+struct AutodiffRequiredResourceVersion {
+    uint32_t consumer{};
+    AutodiffResourceVersion version;
+    uint32_t producer{std::numeric_limits<uint32_t>::max()};
+    AutodiffVersionSource source{AutodiffVersionSource::RetainedOwner};
+    std::string path;
+};
+
+struct AutodiffPassVersionState {
+    std::vector<AutodiffResourceVersion> inputs;
+    std::vector<AutodiffResourceVersion> outputs;
+};
+
 struct AutodiffCheckpointResource {
     uint32_t producer{};
-    uint32_t resource{};
+    AutodiffResourceVersion version;
     uint64_t offset{};
     uint64_t byteSize{};
     uint64_t alignment{1};
@@ -350,9 +387,16 @@ struct AutodiffDagCheckpointPlan {
     std::vector<AutodiffCheckpointResource> checkpointResources;
     std::vector<AutodiffLivenessCut> cuts;
     std::vector<AutodiffReplaySegment> replaySegments;
+    std::vector<AutodiffPassVersionState> passVersions;
+    std::vector<AutodiffRequiredResourceVersion> requiredVersions;
     uint64_t persistentCheckpointBytes{};
     uint64_t initialStateBytes{};
     uint64_t restorationBytes{};
+    uint64_t transactionBytes{};
+    uint64_t logicalResidualBytes{};
+    uint64_t retainedAllocationBytes{};
+    uint64_t maximumForwardPeakBytes{};
+    uint64_t backwardValueBytes{};
     uint64_t memoryBudget{};
     uint64_t peakBytes{};
     uint64_t replayCost{};
@@ -361,7 +405,6 @@ struct AutodiffDagCheckpointPlan {
     uint64_t checkpointCopyBytes{};
     uint64_t resourceReloadCost{};
     uint64_t recomputationCost{};
-    uint64_t graphReplayCost{};
     uint64_t weightedRuntimeCost{};
     bool deterministicReductionLegal{true};
     std::string selectedPolicy{"balanced"};
@@ -449,6 +492,7 @@ private:
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
     std::vector<uint32_t> autodiffInitialResources_;
+    std::vector<uint32_t> autodiffTransactionResources_;
     std::vector<uint32_t> autodiffRestorationResources_;
     AutodiffDagCheckpointPlan autodiffCheckpointPlan_;
     uint64_t autodiffMemoryBudget_{};
@@ -529,6 +573,7 @@ struct GraphAutodiffPassTelemetry {
     uint64_t logicalResidualBytes{};
     uint64_t residentTapeBytes{};
     uint64_t allocatedTapeBytes{};
+    uint64_t retainedAllocationBytes{};
     uint64_t checkpointBytes{};
     uint64_t activeOperationCount{};
     uint64_t recomputationCost{};
@@ -547,6 +592,7 @@ public:
     uint64_t logicalResidualBytes() const;
     uint64_t residentTapeBytes() const;
     uint64_t allocatedTapeBytes() const;
+    uint64_t retainedAllocationBytes() const;
     uint64_t checkpointBytes() const;
     uint64_t peakRuntimeManagedBytes() const;
     uint64_t tapeContextLimitBytes() const;

@@ -546,6 +546,8 @@ bool ExecutionGraph::buildPlan(std::string &error) {
     }
     schedule_.clear();
     scopes_.clear();
+    autodiffInitialResources_.clear();
+    autodiffTransactionResources_.clear();
     autodiffRestorationResources_.clear();
     bool compiled = false;
     struct FailedCompileCleanup {
@@ -682,10 +684,12 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         for (uint32_t offset = 0; offset < schedule_.size(); ++offset)
             scheduleOffsets[schedule_[offset]] = offset;
         autodiffNodes.reserve(schedule_.size());
-        autodiffInitialResources_.clear();
         std::vector<uint32_t> lastWriter(resourceRecords_.size(), UINT32_MAX);
         std::vector<uint32_t> lastOutput(resourceRecords_.size(), UINT32_MAX);
+        std::vector<uint32_t> writeEpochs(resourceRecords_.size());
         std::unordered_set<uint32_t> initialResources;
+        std::unordered_set<DerivativeEndpointKey, DerivativeEndpointHash> backwardValueEndpoints;
+        uint64_t backwardValueBytes = 0;
         for (uint32_t offset = 0; offset < schedule_.size(); ++offset) {
             const uint32_t passIndex = schedule_[offset];
             detail::AutodiffDagNode node;
@@ -705,15 +709,52 @@ bool ExecutionGraph::buildPlan(std::string &error) {
             node.resourceReloadCost = differentiable->resourceReloadCost();
             node.recomputationCost = differentiable->recomputationCost();
             node.deterministicReductionLegal = differentiable->deterministicReductionLegal();
-            node.replayable = differentiable->supportsReplay();
+            node.replayable = differentiable->supportsReplay() && !(passes_[passIndex]->flags() & PassSideEffect);
+            const auto accountBackwardEndpoint = [&](const PassDerivativeMapping &mapping) {
+                if (!backwardValueEndpoints.insert(mapping.endpoint).second)
+                    return true;
+                uint64_t bytes = 16;
+                if (mapping.endpoint.kind == DerivativeEndpointKind::Resource) {
+                    if (mapping.endpoint.id >= resourceRecords_.size())
+                        return false;
+                    const auto &checkpoint = resourceRecords_[mapping.endpoint.id].checkpoint;
+                    if (!checkpoint || checkpoint->byteSize() > UINT64_MAX / 2)
+                        return false;
+                    bytes = checkpoint->byteSize() * 2;
+                }
+                if (bytes > UINT64_MAX - backwardValueBytes)
+                    return false;
+                backwardValueBytes += bytes;
+                return true;
+            };
+            for (const PassDerivativeMapping &mapping : differentiable->gradientMappings())
+                if (!accountBackwardEndpoint(mapping)) {
+                    error = "autodiff backward value estimate is invalid or overflows";
+                    return false;
+                }
+            for (const PassDerivativeMapping &mapping : differentiable->cotangentMappings())
+                if (!accountBackwardEndpoint(mapping)) {
+                    error = "autodiff backward value estimate is invalid or overflows";
+                    return false;
+                }
             if (!differentiable->hasCheckpointPlanningMetadata()) {
                 error = "differentiable pass '" + passes_[passIndex]->name() +
                         "' has no compiler-derived checkpoint planning metadata";
                 return false;
             }
+            if (std::any_of(passes_[passIndex]->uses().begin(), passes_[passIndex]->uses().end(),
+                            [](const ResourceUse &use) { return use.resource.kind == ResourceKind::Image; })) {
+                error = "automatic autodiff resource-version planning does not support image resources";
+                return false;
+            }
             for (const ResourceUse &use : passes_[passIndex]->uses()) {
                 if (!reads(use.access))
                     continue;
+                const AutodiffResourceVersion inputVersion{use.resource.id, writeEpochs[use.resource.id]};
+                if (std::find_if(node.inputs.begin(), node.inputs.end(), [&](const AutodiffResourceVersion &version) {
+                        return version.resource == inputVersion.resource && version.epoch == inputVersion.epoch;
+                    }) == node.inputs.end())
+                    node.inputs.push_back(inputVersion);
                 const uint32_t producer = lastWriter[use.resource.id];
                 if (producer == UINT32_MAX)
                     initialResources.insert(use.resource.id);
@@ -728,13 +769,37 @@ bool ExecutionGraph::buildPlan(std::string &error) {
                         consumers.push_back(offset);
                 }
             }
+            std::unordered_set<std::string> primalPaths;
+            for (const PassPrimalResourceMapping &required : differentiable->requiredPrimalResources()) {
+                if (required.path.empty() || required.resource >= resourceRecords_.size() ||
+                    !primalPaths.insert(required.path).second) {
+                    error = "differentiable pass '" + passes_[passIndex]->name() +
+                            "' has an invalid required primal resource mapping";
+                    return false;
+                }
+                const bool readable = std::any_of(
+                    passes_[passIndex]->uses().begin(), passes_[passIndex]->uses().end(),
+                    [&](const ResourceUse &use) { return use.resource.id == required.resource && reads(use.access); });
+                if (!readable) {
+                    error = "differentiable pass '" + passes_[passIndex]->name() +
+                            "' requires a primal resource that is not read by the pass";
+                    return false;
+                }
+                node.requiredVersions.push_back({required.path,
+                                                 {required.resource, writeEpochs[required.resource]},
+                                                 lastWriter[required.resource]});
+            }
             std::unordered_set<uint32_t> writtenResources;
             for (const ResourceUse &use : passes_[passIndex]->uses()) {
                 if (!writes(use.access) || !writtenResources.insert(use.resource.id).second)
                     continue;
                 const detail::ExecutionResourceRecord &record = resourceRecords_[use.resource.id];
                 detail::AutodiffDagOutput output;
-                output.resource = use.resource.id;
+                if (writeEpochs[use.resource.id] == UINT32_MAX) {
+                    error = "autodiff resource write epoch overflows";
+                    return false;
+                }
+                output.version = {use.resource.id, ++writeEpochs[use.resource.id]};
                 output.checkpointable = static_cast<bool>(record.checkpoint);
                 if (record.checkpoint) {
                     output.byteSize = record.checkpoint->byteSize();
@@ -803,7 +868,8 @@ bool ExecutionGraph::buildPlan(std::string &error) {
             }
         if (!detail::planDagAutodiffCheckpoints(autodiffNodes, autodiffMemoryBudget_, autodiffCheckpointPlan_, error,
                                                 initialStateBytes, initialStateCheckpointable, restorationBytes,
-                                                restorationCheckpointable, transactionBytes, transactionCheckpointable))
+                                                restorationCheckpointable, transactionBytes, transactionCheckpointable,
+                                                backwardValueBytes))
             return false;
     }
     const auto validEndpoint = [&](const DerivativeEndpointKey &endpoint) {
@@ -883,13 +949,24 @@ bool ExecutionGraph::buildPlan(std::string &error) {
             for (uint32_t resourceId : autodiffInitialResources_)
                 if (restorationResources.insert(resourceId).second)
                     autodiffRestorationResources_.push_back(resourceId);
+        std::unordered_set<uint32_t> transactionResources;
         for (uint32_t passIndex : schedule_)
             for (const ResourceUse &use : passes_[passIndex]->uses())
-                if (writes(use.access) && restorationResources.insert(use.resource.id).second)
-                    autodiffRestorationResources_.push_back(use.resource.id);
-        for (uint32_t resourceId : autodiffRestorationResources_)
+                if (writes(use.access)) {
+                    if (transactionResources.insert(use.resource.id).second)
+                        autodiffTransactionResources_.push_back(use.resource.id);
+                    if (hasAutodiffSchedule_ && !autodiffCheckpointPlan_.cuts.empty() &&
+                        restorationResources.insert(use.resource.id).second)
+                        autodiffRestorationResources_.push_back(use.resource.id);
+                }
+        for (uint32_t resourceId : autodiffTransactionResources_)
             if (!resourceRecords_[resourceId].checkpoint) {
                 error = "graph VJP forward transaction requires checkpointable writable resources";
+                return false;
+            }
+        for (uint32_t resourceId : autodiffRestorationResources_)
+            if (!resourceRecords_[resourceId].checkpoint) {
+                error = "graph VJP replay restoration requires checkpointable resources";
                 return false;
             }
     }

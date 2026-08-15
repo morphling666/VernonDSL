@@ -29,6 +29,10 @@ bool checkedAlign(uint64_t value, uint64_t alignment, uint64_t &result) {
     return true;
 }
 
+bool sameVersion(const AutodiffResourceVersion &left, const AutodiffResourceVersion &right) {
+    return left.resource == right.resource && left.epoch == right.epoch;
+}
+
 struct OutputKey {
     uint32_t producer;
     uint32_t output;
@@ -37,13 +41,27 @@ struct OutputKey {
 bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, const std::vector<uint32_t> &cutOffsets,
                                   uint64_t initialStateBytes, bool initialStateCheckpointable,
                                   uint64_t restorationBytes, bool restorationCheckpointable, uint64_t transactionBytes,
-                                  bool transactionCheckpointable, AutodiffDagCheckpointPlan &output) {
+                                  bool transactionCheckpointable, uint64_t backwardValueBytes,
+                                  AutodiffDagCheckpointPlan &output, bool includeVersionMetadata = false) {
     if (!transactionCheckpointable ||
         (!cutOffsets.empty() && (!initialStateCheckpointable || !restorationCheckpointable)))
         return false;
     AutodiffDagCheckpointPlan plan;
     plan.initialStateBytes = cutOffsets.empty() ? 0 : initialStateBytes;
-    plan.restorationBytes = cutOffsets.empty() ? transactionBytes : restorationBytes;
+    plan.restorationBytes = cutOffsets.empty() ? 0 : restorationBytes;
+    plan.transactionBytes = transactionBytes;
+    plan.backwardValueBytes = backwardValueBytes;
+    if (includeVersionMetadata) {
+        plan.passVersions.reserve(nodes.size());
+        for (const AutodiffDagNode &node : nodes) {
+            AutodiffPassVersionState state;
+            state.inputs = node.inputs;
+            state.outputs.reserve(node.outputs.size());
+            for (const AutodiffDagOutput &outputValue : node.outputs)
+                state.outputs.push_back(outputValue.version);
+            plan.passVersions.push_back(std::move(state));
+        }
+    }
     std::vector<std::vector<OutputKey>> liveOutputs;
     std::vector<OutputKey> checkpointOutputs;
     liveOutputs.reserve(cutOffsets.size());
@@ -82,7 +100,7 @@ bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, con
             !checkedAdd(offset, value.byteSize, end))
             return false;
         resourceIndices[key.producer][key.output] = static_cast<uint32_t>(plan.checkpointResources.size());
-        plan.checkpointResources.push_back({key.producer, value.resource, offset, value.byteSize, value.alignment});
+        plan.checkpointResources.push_back({key.producer, value.version, offset, value.byteSize, value.alignment});
         plan.persistentCheckpointBytes = end;
     }
     for (size_t cutIndex = 0; cutIndex < cutOffsets.size(); ++cutIndex) {
@@ -106,6 +124,7 @@ bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, con
     boundaries.insert(boundaries.end(), cutOffsets.begin(), cutOffsets.end());
     boundaries.push_back(static_cast<uint32_t>(nodes.size()));
     uint64_t maximumSegmentPeak = 0;
+    uint64_t maximumSegmentRetained = 0;
     for (size_t segmentIndex = 1; segmentIndex < boundaries.size(); ++segmentIndex) {
         AutodiffReplaySegment segment;
         segment.beginStep = boundaries[segmentIndex - 1];
@@ -118,40 +137,57 @@ bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, con
                     segment.releaseCheckpointResources.push_back(resourceIndex);
         }
         uint64_t retainedBytes = 0;
+        uint64_t logicalBytes = 0;
         uint64_t segmentPeak = 0;
         for (uint32_t node = segment.beginStep; node < segment.endStep; ++node) {
             uint64_t forwardPeak = 0;
             if (!checkedAdd(retainedBytes, nodes[node].forwardPeakBytes, forwardPeak) ||
                 !checkedAdd(retainedBytes, nodes[node].retainedAllocationBytes, retainedBytes) ||
+                !checkedAdd(logicalBytes, nodes[node].residualBytes, logicalBytes) ||
                 !checkedAdd(segment.replayCost, nodes[node].replayCost, segment.replayCost))
                 return false;
             segmentPeak = std::max(segmentPeak, forwardPeak);
         }
         segmentPeak = std::max(segmentPeak, retainedBytes);
-        segment.transientResidualBytes = retainedBytes;
+        segment.logicalResidualBytes = logicalBytes;
+        segment.retainedAllocationBytes = retainedBytes;
         segment.peakBytes = segmentPeak;
         if (!checkedAdd(plan.replayCost, segment.replayCost, plan.replayCost))
             return false;
         maximumSegmentPeak = std::max(maximumSegmentPeak, segmentPeak);
+        maximumSegmentRetained = std::max(maximumSegmentRetained, retainedBytes);
         plan.replaySegments.push_back(segment);
     }
     if (plan.replaySegments.size() == 1)
         plan.replayCost = 0;
-    if (!checkedAdd(plan.persistentCheckpointBytes, plan.initialStateBytes, plan.peakBytes) ||
-        !checkedAdd(plan.peakBytes, maximumSegmentPeak, plan.peakBytes) ||
-        !checkedAdd(plan.peakBytes, plan.restorationBytes, plan.peakBytes))
+    uint64_t basePeak = 0;
+    uint64_t forwardPeak = 0;
+    uint64_t replayPeak = 0;
+    uint64_t backwardPeak = 0;
+    if (!checkedAdd(plan.persistentCheckpointBytes, plan.initialStateBytes, basePeak) ||
+        !checkedAdd(basePeak, maximumSegmentPeak, basePeak) ||
+        !checkedAdd(basePeak, plan.transactionBytes, forwardPeak) ||
+        !checkedAdd(basePeak, plan.restorationBytes, replayPeak))
         return false;
+    if (!checkedAdd(plan.persistentCheckpointBytes, plan.initialStateBytes, backwardPeak) ||
+        !checkedAdd(backwardPeak, maximumSegmentRetained, backwardPeak) ||
+        !checkedAdd(backwardPeak, plan.restorationBytes, backwardPeak) ||
+        !checkedAdd(backwardPeak, plan.backwardValueBytes, backwardPeak))
+        return false;
+    plan.peakBytes = std::max({forwardPeak, replayPeak, backwardPeak});
     for (const AutodiffDagNode &node : nodes) {
         plan.deterministicReductionLegal &= node.deterministicReductionLegal;
         if (!checkedAdd(plan.captureStoreBytes, node.residualBytes, plan.captureStoreBytes) ||
             !checkedAdd(plan.backwardLoadBytes, node.residualBytes, plan.backwardLoadBytes) ||
+            !checkedAdd(plan.logicalResidualBytes, node.residualBytes, plan.logicalResidualBytes) ||
+            !checkedAdd(plan.retainedAllocationBytes, node.retainedAllocationBytes, plan.retainedAllocationBytes) ||
             !checkedAdd(plan.resourceReloadCost, node.resourceReloadCost, plan.resourceReloadCost) ||
             !checkedAdd(plan.recomputationCost, node.recomputationCost, plan.recomputationCost))
             return false;
+        plan.maximumForwardPeakBytes = std::max(plan.maximumForwardPeakBytes, node.forwardPeakBytes);
     }
     if (plan.replaySegments.size() > 1 && !checkedMultiply(plan.captureStoreBytes, 2, plan.captureStoreBytes))
         return false;
-    plan.graphReplayCost = plan.replayCost;
     if (!checkedMultiply(plan.persistentCheckpointBytes, 2, plan.checkpointCopyBytes) ||
         !checkedAdd(plan.captureStoreBytes, plan.backwardLoadBytes, plan.weightedRuntimeCost) ||
         !checkedAdd(plan.weightedRuntimeCost, plan.checkpointCopyBytes, plan.weightedRuntimeCost)) {
@@ -168,6 +204,42 @@ bool materializeDagCheckpointPlan(const std::vector<AutodiffDagNode> &nodes, con
     if (!checkedMultiply(plan.replayCost, 16, weightedReplay) ||
         !checkedAdd(plan.weightedRuntimeCost, weightedReplay, plan.weightedRuntimeCost))
         return false;
+    if (includeVersionMetadata) {
+        for (uint32_t consumer = 0; consumer < nodes.size(); ++consumer)
+            for (const AutodiffDagRequiredVersion &required : nodes[consumer].requiredVersions) {
+                AutodiffRequiredResourceVersion planned;
+                planned.consumer = consumer;
+                planned.version = required.version;
+                planned.producer = required.producer;
+                planned.path = required.path;
+                const auto segment = std::find_if(plan.replaySegments.begin(), plan.replaySegments.end(),
+                                                  [&](const AutodiffReplaySegment &value) {
+                                                      return consumer >= value.beginStep && consumer < value.endStep;
+                                                  });
+                if (required.producer == UINT32_MAX) {
+                    planned.source = plan.initialStateBytes ? AutodiffVersionSource::InitialState
+                                                            : AutodiffVersionSource::RetainedOwner;
+                } else {
+                    bool restoredFromStartingCut = false;
+                    if (segment != plan.replaySegments.end() && segment->checkpointIndex != UINT32_MAX &&
+                        segment->checkpointIndex < plan.cuts.size())
+                        for (uint32_t resourceIndex : plan.cuts[segment->checkpointIndex].checkpointResources)
+                            if (resourceIndex < plan.checkpointResources.size() &&
+                                sameVersion(plan.checkpointResources[resourceIndex].version, required.version)) {
+                                restoredFromStartingCut = true;
+                                break;
+                            }
+                    if (restoredFromStartingCut)
+                        planned.source = AutodiffVersionSource::Checkpoint;
+                    else if (segment != plan.replaySegments.end() && segment->checkpointIndex != UINT32_MAX &&
+                             required.producer >= segment->beginStep)
+                        planned.source = AutodiffVersionSource::Replay;
+                    else
+                        planned.source = AutodiffVersionSource::RetainedOwner;
+                }
+                plan.requiredVersions.push_back(std::move(planned));
+            }
+    }
     output = std::move(plan);
     return true;
 }
@@ -178,13 +250,15 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                                 AutodiffDagCheckpointPlan &output, std::string &error, uint64_t initialStateBytes,
                                 bool initialStateCheckpointable, uint64_t restorationBytes,
                                 bool restorationCheckpointable, uint64_t transactionBytes,
-                                bool transactionCheckpointable, AutodiffCheckpointPolicy policy) {
+                                bool transactionCheckpointable, uint64_t backwardValueBytes,
+                                AutodiffCheckpointPolicy policy) {
     output = {};
     error.clear();
     if (nodes.size() > UINT32_MAX) {
         error = "autodiff DAG exceeds the checkpoint planner representation";
         return false;
     }
+    std::unordered_set<uint64_t> outputVersions;
     for (uint32_t node = 0; node < nodes.size(); ++node) {
         const AutodiffDagNode &descriptor = nodes[node];
         std::unordered_set<uint32_t> uniquePredecessors;
@@ -195,9 +269,19 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                 return false;
             }
         }
+        for (const AutodiffResourceVersion &input : descriptor.inputs) {
+            const uint64_t key = (static_cast<uint64_t>(input.resource) << 32u) | input.epoch;
+            if (input.epoch && outputVersions.find(key) == outputVersions.end()) {
+                error = "autodiff DAG input references an unavailable resource version";
+                return false;
+            }
+        }
         std::unordered_set<uint32_t> resources;
         for (const AutodiffDagOutput &outputValue : descriptor.outputs) {
-            if (!resources.insert(outputValue.resource).second ||
+            const uint64_t versionKey =
+                (static_cast<uint64_t>(outputValue.version.resource) << 32u) | outputValue.version.epoch;
+            if (!outputValue.version.epoch || !resources.insert(outputValue.version.resource).second ||
+                !outputVersions.insert(versionKey).second ||
                 (outputValue.checkpointable &&
                  (!outputValue.alignment || (outputValue.alignment & (outputValue.alignment - 1)) != 0))) {
                 error = "autodiff DAG node contains an invalid output";
@@ -217,6 +301,22 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                 }
                 first = false;
                 previous = consumer;
+            }
+        }
+        std::unordered_set<std::string> requiredPaths;
+        for (const AutodiffDagRequiredVersion &required : descriptor.requiredVersions) {
+            const bool initial = required.producer == UINT32_MAX;
+            const bool producerMatches =
+                initial ? required.version.epoch == 0
+                        : required.producer < node &&
+                              std::any_of(
+                                  nodes[required.producer].outputs.begin(), nodes[required.producer].outputs.end(),
+                                  [&](const AutodiffDagOutput &output) {
+                                      return sameVersion(output.version, required.version);
+                                  });
+            if (required.path.empty() || !requiredPaths.insert(required.path).second || !producerMatches) {
+                error = "autodiff DAG contains an invalid required resource version";
+                return false;
             }
         }
     }
@@ -244,7 +344,7 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
     Candidate initial;
     if (!materializeDagCheckpointPlan(nodes, initial.cuts, initialStateBytes, initialStateCheckpointable,
                                       restorationBytes, restorationCheckpointable, transactionBytes,
-                                      transactionCheckpointable, initial.plan)) {
+                                      transactionCheckpointable, backwardValueBytes, initial.plan)) {
         error = "autodiff DAG checkpoint memory or replay cost overflows";
         return false;
     }
@@ -320,6 +420,10 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
             if (!visited.insert(trialCuts).second)
                 continue;
             if (visited.size() > maximumCandidates) {
+                if (bestFeasible) {
+                    frontier = {};
+                    break;
+                }
                 error = "autodiff DAG checkpoint search exceeded its bounded frontier";
                 output = {};
                 return false;
@@ -328,12 +432,20 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
             trial.cuts = std::move(trialCuts);
             if (materializeDagCheckpointPlan(nodes, trial.cuts, initialStateBytes, initialStateCheckpointable,
                                              restorationBytes, restorationCheckpointable, transactionBytes,
-                                             transactionCheckpointable, trial.plan))
+                                             transactionCheckpointable, backwardValueBytes, trial.plan))
                 frontier.push(std::move(trial));
         }
     }
     if (bestFeasible) {
-        output = std::move(bestFeasible->plan);
+        if (!materializeDagCheckpointPlan(nodes, bestFeasible->cuts, initialStateBytes, initialStateCheckpointable,
+                                          restorationBytes, restorationCheckpointable, transactionBytes,
+                                          transactionCheckpointable, backwardValueBytes, output, true)) {
+            error = "autodiff DAG checkpoint memory or replay cost overflows";
+            output = {};
+            return false;
+        }
+        output.memoryBudget = memoryBudget;
+        output.selectedPolicy = policyName();
         return true;
     }
     error = replayBlocked && !deterministicReplay

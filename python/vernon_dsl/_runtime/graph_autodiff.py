@@ -7,7 +7,7 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..ad import ProgramExpression
-from .autodiff import CookedVjpPipeline, _compile_direct_vjp
+from .autodiff import CookedVjpPipeline, _compile_direct_vjp, _retained_primal_allocation_bytes
 from .execution_graph import (
     CompiledExecutionGraph,
     ComputeEncoder,
@@ -166,6 +166,8 @@ class VjpComputePass(ComputePass):
         resource_reload_cost = 0
         recomputation_cost = 0
         deterministic_reduction_legal = True
+        required_primal_resources: list[tuple[str, int]] = []
+        retained_primal_bytes = 0
         if isinstance(self._program, ProgramExpression):
             compiled = _compile_direct_vjp(self._program, self._program_arguments(None))
             workgroup = tuple(int(value) for value in compiled.pipeline.workgroup_size)
@@ -177,14 +179,37 @@ class VjpComputePass(ComputePass):
             deterministic_reduction_legal = compiled.deterministic_reduction_legal
             if max(replay_cost, resource_reload_cost, recomputation_cost) > 2**64 - 1:
                 raise OverflowError("autodiff checkpoint planning metadata exceeds uint64")
+            retained_primal_bindings = {
+                name: value.value if isinstance(value, GraphResource) else value
+                for name, value in self._bindings.items()
+            }
+            required_primal_roots = {_root(path.removeprefix("primal.")) for path in compiled.required_primal_paths}
+            retained_primal_bytes = _retained_primal_allocation_bytes(
+                retained_primal_bindings, compiled.required_primal_paths
+            )
+            retained_primal_bytes += 8 * sum(
+                isinstance(self._bindings.get(root), ExecutionParameter) for root in required_primal_roots
+            )
+            if retained_primal_bytes > 2**64 - 1:
+                raise OverflowError("autodiff retained allocation estimate exceeds uint64")
+            for path in compiled.required_primal_paths:
+                source_path = str(path).removeprefix("primal.")
+                binding = self._bindings.get(_root(source_path))
+                if not isinstance(binding, (GraphResource, TensorStorage, TensorView)):
+                    continue
+                endpoint = self._endpoint_for_path(source_path)
+                if isinstance(endpoint, GraphResource):
+                    required_primal_resources.append((str(path), endpoint.id))
         self._native_pass.set_autodiff(
             [mapping(path, endpoint) for path, endpoint in self._gradient_endpoints.items()],
             [mapping(path, endpoint) for path, endpoint in self._cotangent_resources.items()],
+            required_primal_resources,
             invocation_count,
             tape_stride,
             replay_cost,
             resource_reload_cost,
             recomputation_cost,
+            retained_primal_bytes,
             deterministic_reduction_legal,
             isinstance(self._program, ProgramExpression),
         )
@@ -279,6 +304,10 @@ class GraphPullback:
     @property
     def allocated_tape_bytes(self) -> int:
         return int(self._native.allocated_tape_bytes)
+
+    @property
+    def retained_allocation_bytes(self) -> int:
+        return int(self._native.retained_allocation_bytes)
 
     @property
     def checkpoint_bytes(self) -> int:

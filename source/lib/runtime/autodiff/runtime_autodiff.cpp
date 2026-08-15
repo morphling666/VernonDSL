@@ -245,7 +245,7 @@ vernon::runtime::autodiffPullbackMemoryUsage(const VernonPullback *pullback) {
     if (!pullback || !pullback->execution)
         return {};
     const ad::PullbackMemoryUsage usage = pullback->execution->memoryUsage();
-    return {usage.logicalResidualBytes, usage.residentBytes, usage.allocatedBytes};
+    return {usage.logicalResidualBytes, usage.residentBytes, usage.allocatedBytes, usage.retainedAllocationBytes};
 }
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {

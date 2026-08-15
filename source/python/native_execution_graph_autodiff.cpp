@@ -4,11 +4,51 @@
 
 #include <nanobind/stl/unique_ptr.h>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <utility>
 
 namespace {
+
+uint64_t metadataBytes(const PythonAdMetadata &metadata) {
+    uint64_t scalarBytes = 0;
+    switch (metadata.dtype) {
+    case VERNON_DATA_BOOL:
+    case VERNON_DATA_U8:
+        scalarBytes = 1;
+        break;
+    case VERNON_DATA_F16:
+        scalarBytes = 2;
+        break;
+    case VERNON_DATA_I32:
+    case VERNON_DATA_U32:
+    case VERNON_DATA_F32:
+        scalarBytes = 4;
+        break;
+    case VERNON_DATA_F64:
+        scalarBytes = 8;
+        break;
+    }
+    for (uint64_t extent : metadata.shape) {
+        if (extent && scalarBytes > UINT64_MAX / extent)
+            return UINT64_MAX;
+        scalarBytes *= extent;
+    }
+    return scalarBytes;
+}
+
+uint64_t pythonValueAllocationBytes(const nb::object &value) {
+    nb::object storage = nb::hasattr(value, "_array") ? value.attr("_array") : value;
+    Py_buffer view{};
+    if (PyObject_GetBuffer(storage.ptr(), &view, PyBUF_SIMPLE) != 0) {
+        PyErr_Clear();
+        return 0;
+    }
+    const uint64_t bytes = view.len < 0 ? 0 : static_cast<uint64_t>(view.len);
+    PyBuffer_Release(&view);
+    return bytes;
+}
 
 struct PythonCheckpointResource final : vernon::execution::GraphCheckpointResource {
     explicit PythonCheckpointResource(nb::object value)
@@ -64,9 +104,15 @@ struct PythonCheckpointResource final : vernon::execution::GraphCheckpointResour
 
 struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
     PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState)
-        : value(std::move(value)), callbackState(std::move(callbackState)) {}
+        : value(std::move(value)), allocationBytesValue(pythonValueAllocationBytes(this->value)),
+          callbackState(std::move(callbackState)) {}
+
+    PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState,
+                             uint64_t allocationBytes)
+        : value(std::move(value)), allocationBytesValue(allocationBytes), callbackState(std::move(callbackState)) {}
 
     uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(value.ptr()); }
+    uint64_t allocationBytes() const override { return allocationBytesValue; }
 
     std::shared_ptr<vernon::execution::GraphAutodiffValue> add(const vernon::execution::GraphAutodiffValue &other,
                                                                std::string &error) const override {
@@ -90,7 +136,8 @@ struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
                 nb::object sum = numpy.attr("asarray")(value).attr("__add__")(numpy.attr("asarray")(python->value));
                 result = numpy.attr("ascontiguousarray")(sum);
             }
-            return std::make_shared<PythonGraphAutodiffValue>(std::move(result), callbackState);
+            return std::make_shared<PythonGraphAutodiffValue>(
+                std::move(result), callbackState, std::max(allocationBytesValue, python->allocationBytesValue));
         } catch (...) {
             if (callbackState)
                 callbackState->captureException(std::current_exception());
@@ -100,6 +147,7 @@ struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
     }
 
     nb::object value;
+    uint64_t allocationBytesValue;
     std::shared_ptr<PythonGraphCallbackState> callbackState;
 };
 
@@ -124,10 +172,18 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
             if (callbackState)
                 callbackState->recordReverseCallback();
             nb::dict result = native->applyGrouped(values, gradientGroups, cotangentGroups, carrierShape, true);
-            for (auto item : result)
-                gradients.emplace_back(
-                    nb::cast<std::string>(item.first),
-                    makePythonGraphAutodiffValue(nb::borrow<nb::object>(item.second), callbackState));
+            const auto &metadataValues = native->gradientMetadata();
+            for (auto item : result) {
+                const std::string path = nb::cast<std::string>(item.first);
+                const auto metadata =
+                    std::find_if(metadataValues.begin(), metadataValues.end(),
+                                 [&](const PythonAdMetadata &candidate) { return candidate.path == path; });
+                nb::object gradient = nb::borrow<nb::object>(item.second);
+                gradients.emplace_back(path, std::make_shared<PythonGraphAutodiffValue>(
+                                                 gradient, callbackState,
+                                                 metadata == metadataValues.end() ? pythonValueAllocationBytes(gradient)
+                                                                                  : metadataBytes(*metadata)));
+            }
             return true;
         } catch (...) {
             if (callbackState)
@@ -141,6 +197,7 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
     uint64_t logicalResidualBytes() const override { return native->logicalResidualBytes(); }
     uint64_t residentTapeBytes() const override { return native->residentBytes(); }
     uint64_t allocatedTapeBytes() const override { return native->allocatedBytes(); }
+    uint64_t retainedAllocationBytes() const override { return native->retainedAllocationBytes(); }
     uint64_t activeOperationCount() const override { return activeOperationCountValue; }
     uint64_t recomputationCost() const override { return recomputationCostValue; }
     uint64_t tapeContextLimitBytes() const override { return native->tapeContextLimitBytes(); }
@@ -266,6 +323,8 @@ void bindExecutionGraphAutodiff(nb::module_ &module) {
                      [](const PythonGraphPullback &value) { return value.pullback->residentTapeBytes(); })
         .def_prop_ro("allocated_tape_bytes",
                      [](const PythonGraphPullback &value) { return value.pullback->allocatedTapeBytes(); })
+        .def_prop_ro("retained_allocation_bytes",
+                     [](const PythonGraphPullback &value) { return value.pullback->retainedAllocationBytes(); })
         .def_prop_ro("checkpoint_bytes",
                      [](const PythonGraphPullback &value) { return value.pullback->checkpointBytes(); })
         .def_prop_ro("peak_runtime_managed_bytes",
@@ -288,6 +347,7 @@ void bindExecutionGraphAutodiff(nb::module_ &module) {
                              telemetry["logical_residual_bytes"] = item.logicalResidualBytes;
                              telemetry["resident_tape_bytes"] = item.residentTapeBytes;
                              telemetry["allocated_tape_bytes"] = item.allocatedTapeBytes;
+                             telemetry["retained_allocation_bytes"] = item.retainedAllocationBytes;
                              telemetry["checkpoint_bytes"] = item.checkpointBytes;
                              telemetry["active_operation_count"] = item.activeOperationCount;
                              telemetry["recomputation_cost"] = item.recomputationCost;

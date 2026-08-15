@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import math
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from ..ad import ProgramExpression
 from ..bundle import make_target_options
@@ -30,6 +33,7 @@ class _CompiledDirectVjp:
     recomputation_cost: int
     resource_reload_cost: int
     deterministic_reduction_legal: bool
+    required_primal_paths: tuple[str, ...]
     user_parameters: tuple[str, ...]
     pipeline: Any
     runtime_generation: int
@@ -164,6 +168,32 @@ def _pipeline_derivative_groups(pipeline: Any) -> tuple[DerivativeGroup, ...]:
     if not groups or {group.role for group in groups} != {"gradient", "cotangent"}:
         raise RuntimeError("structured VJP pipeline has no validated derivative groups")
     return groups
+
+
+def _retained_primal_allocation_bytes(bindings: dict[str, Any], required_paths: tuple[str, ...]) -> int:
+    total = 0
+    retained_roots: set[str] = set()
+    for path in required_paths:
+        root = path.removeprefix("primal.").split(".", 1)[0]
+        if root in retained_roots:
+            continue
+        value = bindings.get(root)
+        if isinstance(value, TensorView):
+            total += len(value.shape) * 8 + math.prod(value.shape) * value.dtype.itemsize
+            retained_roots.add(root)
+        elif isinstance(value, TensorStorage):
+            total += len(value.shape) * 8 + value._array.nbytes
+            retained_roots.add(root)
+        elif isinstance(value, np.ndarray):
+            total += value.nbytes
+            retained_roots.add(root)
+        elif isinstance(value, np.generic):
+            total += value.dtype.itemsize
+            retained_roots.add(root)
+        elif isinstance(value, (bool, int, float)):
+            total += 8
+            retained_roots.add(root)
+    return total
 
 
 def _invoke_structured_pipeline(
@@ -333,6 +363,7 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
             recomputation_cost=structured.recomputation_cost,
             resource_reload_cost=int(structured.cost_components.get("resource_reload_cost", 0)),
             deterministic_reduction_legal=True,
+            required_primal_paths=tuple(structured.plan.required_primal_paths),
             user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
             pipeline=None,
             runtime_generation=-1,

@@ -210,18 +210,33 @@ class CpuExecutionGraphTests(unittest.TestCase):
             return graph
 
         pullback = make_graph().compile().vjp()
-        gradient_only_budget = 2 * np.dtype(np.float32).itemsize
+        retained_primal_bytes = 2 * (np.dtype(np.float32).itemsize + np.dtype(np.uint64).itemsize)
+        transaction_bytes = 2 * np.dtype(np.float32).itemsize
+        backward_value_bytes = 3 * 2 * np.dtype(np.float32).itemsize
+        minimum_budget = retained_primal_bytes + backward_value_bytes
         self.assertEqual(pullback.logical_residual_bytes, 0)
         self.assertEqual(pullback.resident_tape_bytes, 0)
         self.assertEqual(pullback.allocated_tape_bytes, 0)
-        self.assertEqual(pullback.peak_runtime_managed_bytes, gradient_only_budget)
+        self.assertEqual(pullback.retained_allocation_bytes, retained_primal_bytes)
+        self.assertEqual(pullback.peak_runtime_managed_bytes, retained_primal_bytes + transaction_bytes)
 
         graph = make_graph()
-        graph.plan_autodiff_checkpoints(memory_budget=gradient_only_budget)
-        graph.compile()
+        graph.plan_autodiff_checkpoints(memory_budget=minimum_budget)
+        compiled = graph.compile()
+        checkpoint_plan = compiled.autodiff_checkpoint_plan
+        assert checkpoint_plan is not None
+        self.assertEqual(checkpoint_plan["logical_residual_bytes"], 0)
+        self.assertEqual(checkpoint_plan["retained_allocation_bytes"], retained_primal_bytes)
+        self.assertEqual(checkpoint_plan["transaction_bytes"], transaction_bytes)
+        self.assertEqual(checkpoint_plan["restoration_bytes"], 0)
+        self.assertEqual(checkpoint_plan["backward_value_bytes"], backward_value_bytes)
+        self.assertEqual(
+            [(item["version"], item["source"]) for item in checkpoint_plan["required_versions"]],
+            [(0, "retained_owner"), (1, "retained_owner")],
+        )
 
         graph = make_graph()
-        graph.plan_autodiff_checkpoints(memory_budget=gradient_only_budget - 1)
+        graph.plan_autodiff_checkpoints(memory_budget=minimum_budget - 1)
         with self.assertRaisesRegex(ValueError, "cannot satisfy the memory budget"):
             graph.compile()
 
@@ -450,6 +465,28 @@ class CpuExecutionGraphTests(unittest.TestCase):
         self.assertEqual(checkpoint_plan["memory_budget"], 240)
         self.assertGreater(checkpoint_plan["initial_state_bytes"], 0)
         self.assertGreater(checkpoint_plan["restoration_bytes"], 0)
+        self.assertGreater(checkpoint_plan["transaction_bytes"], 0)
+        self.assertGreater(checkpoint_plan["logical_residual_bytes"], 0)
+        self.assertGreaterEqual(
+            checkpoint_plan["retained_allocation_bytes"],
+            checkpoint_plan["logical_residual_bytes"],
+        )
+        checkpoint_versions = {(item["resource"], item["version"]) for item in checkpoint_plan["checkpoint_resources"]}
+        self.assertEqual(len(checkpoint_versions), len(checkpoint_plan["checkpoint_resources"]))
+        self.assertTrue(any(version > 1 for _, version in checkpoint_versions))
+        released_checkpoints = {
+            resource
+            for segment in checkpoint_plan["replay_segments"]
+            for resource in segment["release_checkpoint_resources"]
+        }
+        self.assertTrue(released_checkpoints)
+        self.assertTrue(
+            all(
+                checkpoint_plan["checkpoint_resources"][resource]["first_cut"]
+                <= checkpoint_plan["checkpoint_resources"][resource]["last_cut"]
+                for resource in released_checkpoints
+            )
+        )
         self.assertGreater(pullback.checkpoint_bytes, 0)
         self.assertGreaterEqual(
             pullback.peak_runtime_managed_bytes,
@@ -641,8 +678,19 @@ class CpuExecutionGraphTests(unittest.TestCase):
                 grid=(1, 1, 1),
             )
         )
+        graph.plan_autodiff_checkpoints(memory_budget=40)
 
-        gradient = graph.compile().vjp()(None)["source"]
+        compiled = graph.compile()
+        checkpoint_plan = compiled.autodiff_checkpoint_plan
+        assert checkpoint_plan is not None
+        self.assertEqual(checkpoint_plan["retained_allocation_bytes"], 24)
+        self.assertEqual(checkpoint_plan["backward_value_bytes"], 16)
+        self.assertEqual(checkpoint_plan["peak_bytes"], 40)
+        required = checkpoint_plan["required_versions"]
+        self.assertEqual(len(required), 2)
+        self.assertEqual(len({item["resource"] for item in required}), 1)
+        self.assertEqual({item["version"] for item in required}, {0})
+        gradient = compiled.vjp()(None)["source"]
 
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([6.0], dtype=np.float32))
 

@@ -123,7 +123,9 @@ struct PythonPullback {
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
+    size_t retainedAllocationBytes() const { return memoryUsage().retainedAllocationBytes; }
     size_t tapeContextLimitBytes() const { return vernon::runtime::autodiffHostTapeContextLimit(runtime); }
+    const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
 private:
     vernon::runtime::AutodiffPullbackMemoryUsage memoryUsage() const {

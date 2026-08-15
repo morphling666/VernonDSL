@@ -155,6 +155,7 @@ struct ScalarAutodiffValue final : GraphAutodiffValue {
     explicit ScalarAutodiffValue(double value) : value(value) {}
 
     uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(this); }
+    uint64_t allocationBytes() const override { return sizeof(value); }
 
     std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const override {
         const auto *scalar = dynamic_cast<const ScalarAutodiffValue *>(&other);
@@ -288,6 +289,7 @@ public:
     DifferentiablePass *differentiable() override { return this; }
     const std::vector<PassDerivativeMapping> &gradientMappings() const override { return gradients_; }
     const std::vector<PassDerivativeMapping> &cotangentMappings() const override { return cotangents_; }
+    const std::vector<PassPrimalResourceMapping> &requiredPrimalResources() const override { return requiredPrimals_; }
     uint64_t estimatedResidualBytes() const override { return estimatedResidualBytes_; }
     uint64_t estimatedRetainedAllocationBytes() const override { return estimatedResidualBytes_; }
     uint64_t replayCost() const override { return 1; }
@@ -335,6 +337,7 @@ private:
     bool throwForward_;
     std::vector<PassDerivativeMapping> gradients_;
     std::vector<PassDerivativeMapping> cotangents_;
+    std::vector<PassPrimalResourceMapping> requiredPrimals_{{"primal.input", input_.id}};
 };
 
 class ResourceSquarePass final : public ComputePass, public DifferentiablePass {
@@ -1367,9 +1370,12 @@ TEST(ExecutionGraphAutodiff, PublishesNoGradientsWhenBackwardFails) {
 TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails) {
     ExecutionGraph graph;
     std::vector<GraphBuffer> resources;
-    for (uint64_t identity = 1; identity <= 5; ++identity)
-        resources.push_back(graph.importHostBuffer(
-            identity, identity == 5, std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float))));
+    std::vector<std::shared_ptr<ByteCheckpointResource>> resourceStates;
+    for (uint64_t identity = 1; identity <= 5; ++identity) {
+        auto state = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+        resources.push_back(graph.importHostBuffer(identity, identity == 5, state));
+        resourceStates.push_back(std::move(state));
+    }
     const auto forwardCount = std::make_shared<std::atomic<uint32_t>>(0);
     graph.emplacePass<ScalarDifferentiablePass>("replay-failure", resources[0], resources[1], 2.0, false, false,
                                                 forwardCount, 1, 100);
@@ -1386,16 +1392,17 @@ TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails
     ASSERT_TRUE(pullback) << error;
     EXPECT_GT(pullback->checkpointBytes(), 0u);
     EXPECT_GE(pullback->peakRuntimeManagedBytes(), pullback->allocatedTapeBytes() + pullback->checkpointBytes());
+    resourceStates.back()->failRestoreWithoutError();
 
     auto submission = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
     EXPECT_FALSE(submission->wait(error));
-    EXPECT_EQ(error, "test forward failure");
+    EXPECT_EQ(error, "test forward failure; final-state restoration failed: graph final-state restoration failed");
     EXPECT_TRUE(submission->gradients().empty());
     EXPECT_EQ(submission->state(), GraphBackwardSubmission::State::Failed);
 
     auto retry = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
     EXPECT_FALSE(retry->wait(error));
-    EXPECT_EQ(error, "test forward failure");
+    EXPECT_EQ(error, "graph pullback is no longer reusable after failed checkpoint replay");
 }
 
 TEST(ExecutionGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFailure) {
@@ -1435,10 +1442,10 @@ TEST(ExecutionGraphAutodiff, RejectsRuntimeTapeAllocationAbovePlannedBudget) {
     const GraphBuffer input = graph.importHostBuffer(1, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     const GraphBuffer output = graph.importHostBuffer(2, true, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     graph.emplacePass<ScalarDifferentiablePass>("underestimated", input, output, 2.0, false, false, nullptr, UINT32_MAX,
-                                                1, 8);
+                                                1, 64);
     graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
                                {{"objective", {DerivativeEndpointKind::Resource, output.id}}});
-    graph.planAutodiffCheckpoints(5);
+    graph.planAutodiffCheckpoints(17);
     std::string error;
     auto plan = graph.compile(error);
     ASSERT_TRUE(plan) << error;
@@ -1452,8 +1459,9 @@ TEST(ExecutionGraphAutodiff, RejectsCheckpointReplayForNonReplayablePass) {
     const GraphBuffer intermediate =
         graph.importHostBuffer(2, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     const GraphBuffer output = graph.importHostBuffer(3, true, std::make_shared<ByteCheckpointResource>(sizeof(float)));
-    graph.emplacePass<ScalarDifferentiablePass>("side-effectful", input, intermediate, 2.0, false, false, nullptr,
-                                                UINT32_MAX, 100, 0, std::shared_ptr<std::atomic<uint32_t>>{}, false);
+    auto &sideEffectful = graph.emplacePass<ScalarDifferentiablePass>("side-effectful", input, intermediate, 2.0, false,
+                                                                      false, nullptr, UINT32_MAX, 100);
+    sideEffectful.setFlags(PassSideEffect);
     graph.emplacePass<ScalarDifferentiablePass>("pure", intermediate, output, 2.0, false, false, nullptr, UINT32_MAX,
                                                 100);
     graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, input.id}}},
@@ -1555,14 +1563,14 @@ TEST(ExecutionGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplicati
                                                     resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX, 100);
     graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
                                {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
-    graph.planAutodiffCheckpoints(250);
+    graph.planAutodiffCheckpoints(268);
     std::string error;
     auto plan = graph.compile(error);
     ASSERT_TRUE(plan) << error;
     const AutodiffDagCheckpointPlan *checkpointPlan = plan->autodiffCheckpointPlan();
     ASSERT_NE(checkpointPlan, nullptr);
     EXPECT_EQ(checkpointPlan->restorationBytes, 5 * sizeof(float));
-    EXPECT_LE(checkpointPlan->peakBytes, 250u);
+    EXPECT_EQ(checkpointPlan->peakBytes, 268u);
     for (const AutodiffCheckpointResource &checkpoint : checkpointPlan->checkpointResources) {
         ASSERT_LT(checkpoint.producer + 1, checkpointResources.size());
         checkpointResources[checkpoint.producer + 1]->expectAlignment(checkpoint.alignment);
@@ -1631,8 +1639,11 @@ std::vector<detail::AutodiffDagNode> valueDag(std::initializer_list<TestDagNode>
         node.replayCost = source.replayCost;
         node.replayable = source.replayable;
         if (source.checkpointBytes)
-            node.outputs.push_back(
-                {static_cast<uint32_t>(result.size()), source.checkpointBytes, source.checkpointAlignment, true, {}});
+            node.outputs.push_back({{static_cast<uint32_t>(result.size()), 1},
+                                    source.checkpointBytes,
+                                    source.checkpointAlignment,
+                                    true,
+                                    {}});
         result.push_back(std::move(node));
     }
     for (uint32_t consumer = 0; consumer < result.size(); ++consumer)
@@ -1653,9 +1664,11 @@ TEST(ExecutionGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
     });
     nodes[0].resourceReloadCost = 2;
     nodes[1].recomputationCost = 3;
+    nodes[0].requiredVersions.push_back({"primal.initial", {7, 0}, UINT32_MAX});
+    nodes[3].requiredVersions.push_back({"primal.join", nodes[0].outputs[0].version, 0});
     AutodiffDagCheckpointPlan plan;
     std::string error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 27, plan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 27, plan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::MinRuntime))
         << error;
     EXPECT_FALSE(plan.cuts.empty());
@@ -1669,10 +1682,18 @@ TEST(ExecutionGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
     EXPECT_EQ(plan.checkpointCopyBytes, 2 * plan.persistentCheckpointBytes);
     EXPECT_EQ(plan.resourceReloadCost, 2u);
     EXPECT_EQ(plan.recomputationCost, 3u);
-    EXPECT_EQ(plan.graphReplayCost, plan.replayCost);
+    EXPECT_EQ(plan.logicalResidualBytes, 40u);
+    EXPECT_EQ(plan.retainedAllocationBytes, 40u);
+    EXPECT_EQ(plan.maximumForwardPeakBytes, 10u);
+    ASSERT_EQ(plan.passVersions.size(), nodes.size());
+    ASSERT_EQ(plan.requiredVersions.size(), 2u);
+    EXPECT_EQ(plan.requiredVersions[0].source, AutodiffVersionSource::RetainedOwner);
+    EXPECT_EQ(plan.requiredVersions[1].source, AutodiffVersionSource::Checkpoint);
+    EXPECT_EQ(plan.requiredVersions[1].version.resource, nodes[0].outputs[0].version.resource);
+    EXPECT_EQ(plan.requiredVersions[1].version.epoch, nodes[0].outputs[0].version.epoch);
     EXPECT_EQ(plan.weightedRuntimeCost, plan.captureStoreBytes + plan.backwardLoadBytes + plan.checkpointCopyBytes +
                                             4 * plan.resourceReloadCost + 8 * plan.recomputationCost +
-                                            16 * plan.graphReplayCost);
+                                            16 * plan.replayCost);
 }
 
 TEST(ExecutionGraphAutodiffCheckpointTest, RejectsReplayThatViolatesDeterministicReductionConstraints) {
@@ -1699,13 +1720,13 @@ TEST(ExecutionGraphAutodiffCheckpointTest, SupportsInternalMemoryAndRuntimePolic
     AutodiffDagCheckpointPlan memoryPlan;
     AutodiffDagCheckpointPlan balancedPlan;
     std::string error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, runtimePlan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, runtimePlan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::MinRuntime))
         << error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, memoryPlan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, memoryPlan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::MinMemory))
         << error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, balancedPlan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 64, balancedPlan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::Balanced))
         << error;
     EXPECT_EQ(runtimePlan.selectedPolicy, "min_runtime");
@@ -1725,7 +1746,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredec
     nodes[0].outputs[0].consumers.clear();
     AutodiffDagCheckpointPlan plan;
     std::string error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 200, plan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 200, plan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::MinRuntime))
         << error;
     ASSERT_EQ(plan.cuts.size(), 1u);
@@ -1736,12 +1757,12 @@ TEST(ExecutionGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredec
 TEST(ExecutionGraphAutodiffCheckpointTest, CheckpointsOnlyLiveOutputs) {
     std::vector<detail::AutodiffDagNode> nodes =
         valueDag({{{}, 1, 100, 1, true}, {{0}, 0, 100, 1, true}, {{1}, 0, 100, 1, true}});
-    nodes[0].outputs.push_back({99, 1000, 8, true, {}});
+    nodes[0].outputs.push_back({{99, 1}, 1000, 8, true, {}});
     AutodiffDagCheckpointPlan plan;
     std::string error;
     ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 101, plan, error)) << error;
     ASSERT_EQ(plan.checkpointResources.size(), 1u);
-    EXPECT_EQ(plan.checkpointResources[0].resource, 0u);
+    EXPECT_EQ(plan.checkpointResources[0].version.resource, 0u);
     EXPECT_EQ(plan.persistentCheckpointBytes, 1u);
 }
 
@@ -1758,7 +1779,8 @@ TEST(ExecutionGraphAutodiffCheckpointTest, NoCutPlanAllocatesOnlyTransactionSnap
         << error;
     EXPECT_TRUE(plan.cuts.empty());
     EXPECT_EQ(plan.initialStateBytes, 0u);
-    EXPECT_EQ(plan.restorationBytes, 128u);
+    EXPECT_EQ(plan.restorationBytes, 0u);
+    EXPECT_EQ(plan.transactionBytes, 128u);
     EXPECT_EQ(plan.peakBytes, 160u);
 }
 
@@ -1772,7 +1794,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, TracksSharedCheckpointCutLifetimes) {
     });
     AutodiffDagCheckpointPlan plan;
     std::string error;
-    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 24, plan, error, 0, true, 0, true, 0, true,
+    ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 24, plan, error, 0, true, 0, true, 0, true, 0,
                                                    detail::AutodiffCheckpointPolicy::MinRuntime))
         << error;
     ASSERT_EQ(plan.cuts.size(), 2u);
@@ -1814,7 +1836,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, AcceptsTemporaryPeakIncreaseNeededFor
         node.replayCost = 1;
         node.replayable = true;
     }
-    nodes[0].outputs.push_back({0, 15, 1, true, {2}});
+    nodes[0].outputs.push_back({{0, 1}, 15, 1, true, {2}});
     nodes[2].predecessors.push_back(0);
     AutodiffDagCheckpointPlan plan;
     std::string error;
@@ -1853,7 +1875,10 @@ TEST(ExecutionGraphAutodiffCheckpointTest, ChargesPhysicalRetainedAllocationInst
     std::string error;
     ASSERT_TRUE(detail::planDagAutodiffCheckpoints(nodes, 48, plan, error)) << error;
     EXPECT_EQ(plan.peakBytes, 48u);
-    EXPECT_EQ(plan.replaySegments.front().transientResidualBytes, 48u);
+    EXPECT_EQ(plan.replaySegments.front().retainedAllocationBytes, 48u);
+    EXPECT_EQ(plan.replaySegments.front().logicalResidualBytes, 2u);
+    EXPECT_EQ(plan.logicalResidualBytes, 2u);
+    EXPECT_EQ(plan.retainedAllocationBytes, 48u);
 }
 
 TEST(ExecutionGraphAutodiffCheckpointTest, RejectsInvalidOrUnbudgetableDags) {
@@ -1864,6 +1889,10 @@ TEST(ExecutionGraphAutodiffCheckpointTest, RejectsInvalidOrUnbudgetableDags) {
     EXPECT_FALSE(
         detail::planDagAutodiffCheckpoints(valueDag({{{}, 1, 1, 1, true}, {{0, 0}, 1, 1, 1, true}}), 2, plan, error));
     EXPECT_EQ(error, "autodiff DAG node contains a duplicate predecessor");
+    auto invalidVersion = valueDag({{{}, 1, 1, 1, true}, {{0}, 0, 1, 1, true}});
+    invalidVersion[1].requiredVersions.push_back({"primal.missing", {999, 1}, 0});
+    EXPECT_FALSE(detail::planDagAutodiffCheckpoints(invalidVersion, 2, plan, error));
+    EXPECT_EQ(error, "autodiff DAG contains an invalid required resource version");
     EXPECT_FALSE(detail::planDagAutodiffCheckpoints(valueDag({{{}, 1, 1, 1, false}}), 0, plan, error));
     EXPECT_EQ(error, "autodiff DAG checkpoint schedule cannot satisfy the memory budget");
 

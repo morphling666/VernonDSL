@@ -6,16 +6,24 @@
 namespace vernon::execution::detail {
 
 struct AutodiffDagOutput {
-    uint32_t resource{};
+    AutodiffResourceVersion version;
     uint64_t byteSize{};
     uint64_t alignment{1};
     bool checkpointable{};
     std::vector<uint32_t> consumers;
 };
 
+struct AutodiffDagRequiredVersion {
+    std::string path;
+    AutodiffResourceVersion version;
+    uint32_t producer{std::numeric_limits<uint32_t>::max()};
+};
+
 struct AutodiffDagNode {
     std::vector<uint32_t> predecessors;
+    std::vector<AutodiffResourceVersion> inputs;
     std::vector<AutodiffDagOutput> outputs;
+    std::vector<AutodiffDagRequiredVersion> requiredVersions;
     uint64_t residualBytes{};
     uint64_t retainedAllocationBytes{};
     uint64_t forwardPeakBytes{};
@@ -36,7 +44,7 @@ bool planDagAutodiffCheckpoints(const std::vector<AutodiffDagNode> &nodes, uint6
                                 AutodiffDagCheckpointPlan &output, std::string &error, uint64_t initialStateBytes = 0,
                                 bool initialStateCheckpointable = true, uint64_t restorationBytes = 0,
                                 bool restorationCheckpointable = true, uint64_t transactionBytes = 0,
-                                bool transactionCheckpointable = true,
+                                bool transactionCheckpointable = true, uint64_t backwardValueBytes = 0,
                                 AutodiffCheckpointPolicy policy = AutodiffCheckpointPolicy::Balanced);
 
 } // namespace vernon::execution::detail

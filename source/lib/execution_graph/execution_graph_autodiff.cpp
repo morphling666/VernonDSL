@@ -147,6 +147,7 @@ private:
 struct CheckpointEntry {
     uint64_t offset{};
     uint64_t byteSize{};
+    AutodiffResourceVersion version;
     std::shared_ptr<GraphCheckpointResource> resource;
     bool captured{};
     bool released{};
@@ -164,6 +165,11 @@ public:
         if (!plan->hasAutodiffCheckpointPlan)
             return true;
         const AutodiffDagCheckpointPlan &checkpointPlan = plan->autodiffCheckpointPlan;
+        if (checkpointPlan.passVersions.size() != plan->schedule.size()) {
+            error = "compiled graph has no resource-version schedule";
+            return false;
+        }
+        currentResourceEpochs.assign(plan->resourceRecords.size(), 0);
         uint64_t maximumAlignment = alignof(std::max_align_t);
         checkpointEntries.clear();
         checkpointEntries.reserve(checkpointPlan.checkpointResources.size());
@@ -171,21 +177,22 @@ public:
         for (uint32_t resourceIndex = 0; resourceIndex < checkpointPlan.checkpointResources.size(); ++resourceIndex) {
             const AutodiffCheckpointResource &resource = checkpointPlan.checkpointResources[resourceIndex];
             uint64_t end = 0;
-            if (resource.producer >= checkpointResourcesByProducer.size() || !resource.alignment ||
-                (resource.alignment & (resource.alignment - 1)) || resource.resource >= plan->resourceRecords.size() ||
+            if (resource.producer >= checkpointResourcesByProducer.size() || !resource.version.epoch ||
+                !resource.alignment || (resource.alignment & (resource.alignment - 1)) ||
+                resource.version.resource >= plan->resourceRecords.size() ||
                 !checkedAdd(resource.offset, resource.byteSize, end) ||
                 end > checkpointPlan.persistentCheckpointBytes) {
                 error = "compiled graph checkpoint layout is invalid";
                 return false;
             }
-            const auto &checkpoint = plan->resourceRecords[resource.resource].checkpoint;
+            const auto &checkpoint = plan->resourceRecords[resource.version.resource].checkpoint;
             if (!checkpoint || checkpoint->byteSize() != resource.byteSize ||
                 checkpoint->alignment() != resource.alignment) {
                 error = "compiled graph checkpoint resource does not match its storage layout";
                 return false;
             }
             maximumAlignment = std::max(maximumAlignment, resource.alignment);
-            checkpointEntries.push_back({resource.offset, resource.byteSize, checkpoint});
+            checkpointEntries.push_back({resource.offset, resource.byteSize, resource.version, checkpoint});
             checkpointResourcesByProducer[resource.producer].push_back(resourceIndex);
         }
         if (!checkpointStorage.allocate(checkpointPlan.persistentCheckpointBytes, maximumAlignment, error))
@@ -194,11 +201,11 @@ public:
         return true;
     }
 
-    uint64_t allocatedTapeBytesUnlocked() const {
+    uint64_t retainedAllocationBytesUnlocked() const {
         uint64_t result = 0;
         for (const auto &tape : tapes) {
             uint64_t total = 0;
-            if (!checkedAdd(result, tape.second->allocatedTapeBytes(), total))
+            if (!checkedAdd(result, tape.second->retainedAllocationBytes(), total))
                 return std::numeric_limits<uint64_t>::max();
             result = total;
         }
@@ -206,7 +213,7 @@ public:
     }
 
     void observeManagedBytes(uint64_t temporaryBytes = 0) {
-        uint64_t managed = allocatedTapeBytesUnlocked();
+        uint64_t managed = retainedAllocationBytesUnlocked();
         if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
             !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed))
             managed = std::numeric_limits<uint64_t>::max();
@@ -215,7 +222,7 @@ public:
 
     bool observeTapeAllocation(uint64_t additionalTapeBytes, uint64_t budgetTemporaryBytes,
                                uint64_t observedTemporaryBytes, std::string &error) {
-        uint64_t managed = allocatedTapeBytesUnlocked();
+        uint64_t managed = retainedAllocationBytesUnlocked();
         if (!checkedAdd(managed, additionalTapeBytes, managed) ||
             !checkedAdd(managed, checkpointStorage.size(), managed) ||
             !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, budgetTemporaryBytes, managed)) {
@@ -234,7 +241,7 @@ public:
     }
 
     void observeForwardPeak(uint64_t peakTapeBytes, uint64_t observedTemporaryBytes) {
-        uint64_t managed = allocatedTapeBytesUnlocked();
+        uint64_t managed = retainedAllocationBytesUnlocked();
         if (!checkedAdd(managed, peakTapeBytes, managed) || !checkedAdd(managed, checkpointStorage.size(), managed) ||
             !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, observedTemporaryBytes, managed))
             managed = std::numeric_limits<uint64_t>::max();
@@ -242,7 +249,7 @@ public:
     }
 
     bool preflightTapeAllocation(uint64_t peakTapeBytes, uint64_t temporaryBytes, std::string &error) const {
-        uint64_t managed = allocatedTapeBytesUnlocked();
+        uint64_t managed = retainedAllocationBytesUnlocked();
         if (!checkedAdd(managed, peakTapeBytes, managed) || !checkedAdd(managed, checkpointStorage.size(), managed) ||
             !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed)) {
             error = "graph Runtime-managed memory accounting overflows";
@@ -269,10 +276,48 @@ public:
             return false;
         }
         CheckpointEntry &entry = checkpointEntries[resourceIndex];
+        if (entry.version.resource >= currentResourceEpochs.size() ||
+            currentResourceEpochs[entry.version.resource] != entry.version.epoch) {
+            error = "graph checkpoint capture does not match the planned resource version";
+            return false;
+        }
         void *destination = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
         if (!entry.resource->copyTo(destination, entry.byteSize, error))
             return false;
         entry.captured = true;
+        return true;
+    }
+
+    bool validatePassInputs(uint32_t offset, std::string &error) const {
+        if (!plan->hasAutodiffCheckpointPlan)
+            return true;
+        if (offset >= plan->autodiffCheckpointPlan.passVersions.size()) {
+            error = "graph autodiff pass has no resource-version state";
+            return false;
+        }
+        for (const AutodiffResourceVersion &version : plan->autodiffCheckpointPlan.passVersions[offset].inputs)
+            if (version.resource >= currentResourceEpochs.size() ||
+                currentResourceEpochs[version.resource] != version.epoch) {
+                error = "graph replay input does not match the required resource version";
+                return false;
+            }
+        return true;
+    }
+
+    bool publishPassOutputs(uint32_t offset, std::string &error) {
+        if (!plan->hasAutodiffCheckpointPlan)
+            return true;
+        if (offset >= plan->autodiffCheckpointPlan.passVersions.size()) {
+            error = "graph autodiff pass has no resource-version state";
+            return false;
+        }
+        for (const AutodiffResourceVersion &version : plan->autodiffCheckpointPlan.passVersions[offset].outputs) {
+            if (!version.epoch || version.resource >= currentResourceEpochs.size()) {
+                error = "graph autodiff pass produced an invalid resource version";
+                return false;
+            }
+            currentResourceEpochs[version.resource] = version.epoch;
+        }
         return true;
     }
 
@@ -296,6 +341,8 @@ public:
                                 const ExecutionResources &resources) {
             auto &context = *static_cast<Context *>(opaque);
             Impl &pullback = context.pullback;
+            if (!pullback.validatePassInputs(offset, context.error))
+                return VERNON_RHI_STATUS_INTERNAL_ERROR;
             if (DifferentiablePass *differentiable = compute.differentiable()) {
                 if (!pullback.preflightTapeAllocation(differentiable->estimatedForwardPeakBytes(),
                                                       context.temporaryBytes, context.error))
@@ -340,11 +387,12 @@ public:
                     telemetry.logicalResidualBytes = tape->logicalResidualBytes();
                     telemetry.residentTapeBytes = tape->residentTapeBytes();
                     telemetry.allocatedTapeBytes = tape->allocatedTapeBytes();
+                    telemetry.retainedAllocationBytes = tape->retainedAllocationBytes();
                     telemetry.activeOperationCount = tape->activeOperationCount();
                     telemetry.recomputationCost = tape->recomputationCost();
                     pullback.passTelemetryValues.push_back(std::move(telemetry));
                 }
-                if (!pullback.observeTapeAllocation(tape->allocatedTapeBytes(), context.temporaryBytes,
+                if (!pullback.observeTapeAllocation(tape->retainedAllocationBytes(), context.temporaryBytes,
                                                     context.temporaryBytesAllocated ? context.temporaryBytes : 0,
                                                     context.error))
                     return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -366,6 +414,8 @@ public:
                     pullback.passTelemetryValues.push_back(std::move(telemetry));
                 }
             }
+            if (!pullback.publishPassOutputs(offset, context.error))
+                return VERNON_RHI_STATUS_INTERNAL_ERROR;
             if (!context.captureCheckpoints || !pullback.plan->hasAutodiffCheckpointPlan)
                 return VERNON_RHI_STATUS_OK;
             for (uint32_t resourceIndex : pullback.checkpointResourcesByProducer[offset]) {
@@ -383,10 +433,12 @@ public:
         return status == VERNON_RHI_STATUS_OK;
     }
 
-    bool captureFinalState(std::vector<ResourceSnapshot> &output, uint64_t &bytes, std::string &error) const {
+    bool captureState(const std::vector<uint32_t> &resourceIds, std::vector<ResourceSnapshot> &output, uint64_t &bytes,
+                      std::string &error) const {
         bytes = 0;
         output.clear();
-        for (uint32_t resourceId : plan->autodiffRestorationResources) {
+        output.reserve(resourceIds.size());
+        for (uint32_t resourceId : resourceIds) {
             ResourceSnapshot snapshot;
             if (!captureResource(plan->resourceRecords[resourceId].checkpoint, snapshot, error))
                 return false;
@@ -425,14 +477,22 @@ public:
         return true;
     }
 
-    bool restoreInitialState(std::string &error) const {
-        for (const ResourceSnapshot &snapshot : initialState)
+    bool restoreInitialState(std::string &error) {
+        for (size_t index = 0; index < initialState.size(); ++index) {
+            const ResourceSnapshot &snapshot = initialState[index];
             if (!snapshot.restore(error))
                 return false;
+            if (index >= plan->autodiffInitialResources.size() ||
+                plan->autodiffInitialResources[index] >= currentResourceEpochs.size()) {
+                error = "graph initial-state resource version is invalid";
+                return false;
+            }
+            currentResourceEpochs[plan->autodiffInitialResources[index]] = 0;
+        }
         return true;
     }
 
-    bool restoreCheckpoint(uint32_t cutIndex, std::string &error) const {
+    bool restoreCheckpoint(uint32_t cutIndex, std::string &error) {
         if (cutIndex >= plan->autodiffCheckpointPlan.cuts.size()) {
             error = "checkpoint replay segment has an invalid starting cut";
             return false;
@@ -454,6 +514,11 @@ public:
             const void *source = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
             if (!entry.resource->copyFrom(source, entry.byteSize, error))
                 return false;
+            if (entry.version.resource >= currentResourceEpochs.size()) {
+                error = "checkpoint replay resource version is invalid";
+                return false;
+            }
+            currentResourceEpochs[entry.version.resource] = entry.version.epoch;
         }
         return true;
     }
@@ -503,7 +568,54 @@ public:
         return true;
     }
 
-    bool applySegment(uint32_t begin, uint32_t end, EndpointValues &accumulated, std::string &error) {
+    bool observeBackwardValues(const EndpointValues &accumulated, const EndpointValues *localValues,
+                               const NamedGraphAutodiffValues *namedValues, uint64_t temporaryBytes,
+                               bool includeAccumulationTemporary, std::string &error) {
+        uint64_t valueBytes = 0;
+        std::unordered_set<uintptr_t> identities;
+        const auto add = [&](const std::shared_ptr<GraphAutodiffValue> &value) {
+            if (!value || !identities.insert(value->logicalIdentity()).second)
+                return true;
+            return checkedAdd(valueBytes, value->allocationBytes(), valueBytes);
+        };
+        for (const auto &value : accumulated)
+            if (!add(value.second)) {
+                error = "graph backward value memory accounting overflows";
+                return false;
+            }
+        if (localValues)
+            for (const auto &value : *localValues)
+                if (!add(value.second)) {
+                    error = "graph backward value memory accounting overflows";
+                    return false;
+                }
+        if (namedValues)
+            for (const auto &value : *namedValues)
+                if (!add(value.second)) {
+                    error = "graph backward value memory accounting overflows";
+                    return false;
+                }
+        if (includeAccumulationTemporary && !checkedAdd(valueBytes, valueBytes, valueBytes)) {
+            error = "graph backward value memory accounting overflows";
+            return false;
+        }
+        uint64_t managed = retainedAllocationBytesUnlocked();
+        if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
+            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed) ||
+            !checkedAdd(managed, valueBytes, managed)) {
+            error = "graph backward value memory accounting overflows";
+            return false;
+        }
+        if (plan->hasAutodiffCheckpointPlan && managed > plan->autodiffCheckpointPlan.memoryBudget) {
+            error = "graph autodiff backward values exceed the compiled checkpoint memory budget";
+            return false;
+        }
+        observedPeakRuntimeManagedBytes = std::max(observedPeakRuntimeManagedBytes, managed);
+        return true;
+    }
+
+    bool applySegment(uint32_t begin, uint32_t end, EndpointValues &accumulated, uint64_t temporaryBytes,
+                      std::string &error) {
         std::vector<VernonRhiBuffer> buffers(
             plan->resources.size(), VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         ExecutionResources resources(plan->resources, buffers, bindings);
@@ -551,6 +663,8 @@ public:
             NamedGraphAutodiffValues localGradients;
             if (!tape->second->apply(localCotangents, localGradients, error))
                 return false;
+            if (!observeBackwardValues(accumulated, &localByEndpoint, &localGradients, temporaryBytes, true, error))
+                return false;
             std::unordered_map<std::string, std::shared_ptr<GraphAutodiffValue>> gradientsByPath;
             for (auto &gradient : localGradients)
                 gradientsByPath.emplace(gradient.first, std::move(gradient.second));
@@ -571,6 +685,8 @@ public:
             for (auto &contribution : passContributions)
                 if (!addValue(accumulated, contribution.first, std::move(contribution.second), error))
                     return false;
+            if (!observeBackwardValues(accumulated, nullptr, nullptr, temporaryBytes, false, error))
+                return false;
         }
         return true;
     }
@@ -609,6 +725,7 @@ public:
     AlignedCheckpointStorage checkpointStorage;
     std::vector<CheckpointEntry> checkpointEntries;
     std::vector<std::vector<uint32_t>> checkpointResourcesByProducer;
+    std::vector<uint32_t> currentResourceEpochs;
     std::vector<ResourceSnapshot> initialState;
     uint64_t initialStateBytes{};
     uint64_t observedPeakRuntimeManagedBytes{};
@@ -677,7 +794,7 @@ std::shared_ptr<GraphPullback> CompiledExecutionGraph::vjp(std::shared_ptr<const
             return {};
         }
         uint64_t transactionBytes = 0;
-        if (!impl->captureFinalState(transactionState, transactionBytes, error)) {
+        if (!impl->captureState(state_->autodiffTransactionResources, transactionState, transactionBytes, error)) {
             rollback();
             return {};
         }
@@ -688,7 +805,7 @@ std::shared_ptr<GraphPullback> CompiledExecutionGraph::vjp(std::shared_ptr<const
                 rollback();
                 return {};
             }
-            if (transactionBytes != state_->autodiffCheckpointPlan.restorationBytes) {
+            if (transactionBytes != state_->autodiffCheckpointPlan.transactionBytes) {
                 error = "graph VJP transaction storage does not match its compiled checkpoint plan";
                 rollback();
                 return {};
@@ -759,9 +876,10 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
         }
 
         uint64_t finalStateBytes = 0;
-        if (impl_->plan->hasAutodiffCheckpointPlan) {
+        if (impl_->plan->hasAutodiffCheckpointPlan && impl_->plan->autodiffCheckpointPlan.replaySegments.size() > 1) {
             impl_->resetCheckpointLiveness();
-            if (!impl_->captureFinalState(finalState, finalStateBytes, submission->error_)) {
+            if (!impl_->captureState(impl_->plan->autodiffRestorationResources, finalState, finalStateBytes,
+                                     submission->error_)) {
                 submission->state_ = GraphBackwardSubmission::State::Failed;
                 return submission;
             }
@@ -774,7 +892,7 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
         }
         bool succeeded = true;
         if (!impl_->plan->hasAutodiffCheckpointPlan) {
-            succeeded = impl_->applySegment(0, static_cast<uint32_t>(impl_->plan->schedule.size()), accumulated,
+            succeeded = impl_->applySegment(0, static_cast<uint32_t>(impl_->plan->schedule.size()), accumulated, 0,
                                             submission->error_);
         } else {
             const auto &segments = impl_->plan->autodiffCheckpointPlan.replaySegments;
@@ -792,8 +910,8 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
                     impl_->observeManagedBytes(finalStateBytes);
                 }
                 if (succeeded)
-                    succeeded =
-                        impl_->applySegment(segment.beginStep, segment.endStep, accumulated, submission->error_);
+                    succeeded = impl_->applySegment(segment.beginStep, segment.endStep, accumulated, finalStateBytes,
+                                                    submission->error_);
                 if (succeeded)
                     succeeded = impl_->releaseCheckpoints(segment.releaseCheckpointResources, submission->error_);
                 if (segments.size() > 1) {
@@ -824,12 +942,23 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
         }
         for (const ResourceSnapshot &snapshot : finalState) {
             std::string restoreError;
-            if (!snapshot.restore(restoreError)) {
+            bool restored = false;
+            try {
+                restored = snapshot.restore(restoreError);
+            } catch (const std::exception &exception) {
+                restoreError = std::string("graph final-state restoration threw an exception: ") + exception.what();
+            } catch (...) {
+                restoreError = "graph final-state restoration threw an unknown exception";
+            }
+            if (!restored) {
+                if (restoreError.empty())
+                    restoreError = "graph final-state restoration failed";
                 impl_->retainedTapesAvailable = false;
                 if (succeeded) {
                     succeeded = false;
                     submission->error_ = std::move(restoreError);
-                }
+                } else
+                    submission->error_ += "; final-state restoration failed: " + restoreError;
             }
         }
         if (succeeded) {
@@ -864,9 +993,16 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
     }
     for (const ResourceSnapshot &snapshot : finalState) {
         try {
-            std::string ignored;
-            snapshot.restore(ignored);
+            std::string restoreError;
+            if (!snapshot.restore(restoreError)) {
+                if (restoreError.empty())
+                    restoreError = "graph final-state restoration failed";
+                submission->error_ += "; final-state restoration failed: " + restoreError;
+            }
+        } catch (const std::exception &exception) {
+            submission->error_ += std::string("; final-state restoration threw an exception: ") + exception.what();
         } catch (...) {
+            submission->error_ += "; final-state restoration threw an unknown exception";
         }
     }
     submission->state_ = GraphBackwardSubmission::State::Failed;
@@ -909,6 +1045,11 @@ uint64_t GraphPullback::allocatedTapeBytes() const {
     return result;
 }
 
+uint64_t GraphPullback::retainedAllocationBytes() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->retainedAllocationBytesUnlocked();
+}
+
 uint64_t GraphPullback::checkpointBytes() const {
     std::lock_guard lock(impl_->mutex);
     return impl_->checkpointStorage.size();
@@ -916,7 +1057,7 @@ uint64_t GraphPullback::checkpointBytes() const {
 
 uint64_t GraphPullback::peakRuntimeManagedBytes() const {
     std::lock_guard lock(impl_->mutex);
-    return std::max(impl_->observedPeakRuntimeManagedBytes, impl_->allocatedTapeBytesUnlocked());
+    return std::max(impl_->observedPeakRuntimeManagedBytes, impl_->retainedAllocationBytesUnlocked());
 }
 
 uint64_t GraphPullback::tapeContextLimitBytes() const {

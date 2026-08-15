@@ -45,6 +45,7 @@ struct PullbackMemoryUsage {
     size_t logicalResidualBytes{};
     size_t residentBytes{};
     size_t allocatedBytes{};
+    size_t retainedAllocationBytes{};
 };
 
 class PullbackExecution {

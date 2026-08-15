@@ -7,7 +7,7 @@ from typing import Any, cast
 import numpy as np
 import vernon_dsl as vd
 
-from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph
+from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph, build_smoke_fluid_sequence_graph
 from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_loss
 from examples.autodiff_smoke_mpc import (
     SmokeFluidSimulation,
@@ -333,6 +333,86 @@ class SmokeFluidGraphTests(unittest.TestCase):
                 rtol=4.0e-2,
                 atol=3.0e-3,
             )
+
+    def test_checkpoint_plan_tracks_exact_smoke_versions(self) -> None:
+        vd.init(arch=vd.cpu)
+        size = 4
+        density, velocity, target = self._inputs(size)
+        density_storage = vd.storage.from_numpy(density)
+        velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
+        velocity_storage.copy_from_numpy(velocity)
+        target_storage = vd.storage.from_numpy(target)
+        graph, _ = build_smoke_fluid_sequence_graph(
+            initial_density=density_storage,
+            initial_velocity=velocity_storage,
+            target_density=target_storage,
+            parameters=cast(Any, SmokeFluidParameters)(
+                width=np.int32(size),
+                height=np.int32(size),
+                pressure_iterations=np.int32(1),
+            ),
+            horizon=1,
+            checkpoint_memory_budget=128_000,
+        )
+        plan = graph.autodiff_checkpoint_plan
+        assert plan is not None
+        self.assertGreater(plan["persistent_checkpoint_bytes"], 0)
+        self.assertGreater(plan["logical_residual_bytes"], 0)
+        self.assertGreater(plan["retained_allocation_bytes"], plan["logical_residual_bytes"])
+        checkpoint_versions = {(item["resource"], item["version"]) for item in plan["checkpoint_resources"]}
+        self.assertEqual(len(checkpoint_versions), len(plan["checkpoint_resources"]))
+        self.assertEqual(
+            plan["required_versions"],
+            [
+                {
+                    "consumer": 5,
+                    "path": "primal.objective_target_density",
+                    "producer": None,
+                    "resource": 2,
+                    "source": "initial_state",
+                    "version": 0,
+                },
+                {
+                    "consumer": 5,
+                    "path": "primal.output_density",
+                    "producer": 4,
+                    "resource": 7,
+                    "source": "replay",
+                    "version": 1,
+                },
+            ],
+        )
+
+        pullback = graph.vjp()
+        density_storage.copy_from_numpy(np.zeros_like(density))
+        first = pullback(None)["state_velocity"].to_numpy()
+        second = pullback(None)["state_velocity"].to_numpy()
+        np.testing.assert_allclose(first, second, rtol=0.0, atol=0.0)
+        np.testing.assert_array_equal(density_storage.to_numpy(), np.zeros_like(density))
+        self.assertLessEqual(pullback.peak_runtime_managed_bytes, plan["memory_budget"])
+
+    def test_dynamic_checkpoint_runtime_enforces_physical_budget(self) -> None:
+        size = 4
+        density, velocity, target = self._inputs(size)
+        velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
+        velocity_storage.copy_from_numpy(velocity)
+        graph, _ = build_smoke_fluid_sequence_graph(
+            initial_density=vd.storage.from_numpy(density),
+            initial_velocity=velocity_storage,
+            target_density=vd.storage.from_numpy(target),
+            parameters=cast(Any, SmokeFluidParameters)(
+                width=np.int32(size),
+                height=np.int32(size),
+                pressure_iterations=np.int32(1),
+            ),
+            horizon=1,
+            checkpoint_memory_budget=100_000,
+        )
+        plan = graph.autodiff_checkpoint_plan
+        assert plan is not None
+        self.assertLessEqual(plan["peak_bytes"], plan["memory_budget"])
+        with self.assertRaisesRegex(RuntimeError, "compiled checkpoint memory budget"):
+            graph.vjp()
 
     def test_initial_velocity_optimization_reduces_terminal_objective(self) -> None:
         result = optimize_initial_velocity(

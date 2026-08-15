@@ -1,13 +1,13 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 
 #include <gtest/gtest.h>
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <string>
 
@@ -119,8 +119,7 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(std::numeric_limits<size_t>::max(),
-                                                                                  std::numeric_limits<size_t>::max());
+    auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(0, 0);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, tapePolicy);
     VernonPipelineBundleLoadOptions options{};
     options.struct_size = sizeof(options);
@@ -152,6 +151,11 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
+    const vernon::runtime::AutodiffPullbackMemoryUsage memoryUsage =
+        vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+    EXPECT_EQ(memoryUsage.logicalResidualBytes, 0u);
+    EXPECT_EQ(memoryUsage.residentBytes, 0u);
+    EXPECT_EQ(memoryUsage.allocatedBytes, 0u);
     EXPECT_FLOAT_EQ(loss[0], 26.0f);
     EXPECT_FLOAT_EQ(loss[1], 103.0f);
 
