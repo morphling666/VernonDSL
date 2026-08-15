@@ -104,6 +104,7 @@ struct StructuredVjp {
     }
 
     std::string selectedPolicy() const { return nativeStringView(current().selected_policy); }
+    bool wholeDispatchRetentionPermitted() const { return current().whole_dispatch_retention_permitted != 0; }
 
     nb::dict profiles(const std::string &identity) {
         if (vernonCompilerFinalizePythonStructuredVjp(result.get(), {identity.data(), identity.size()}) !=

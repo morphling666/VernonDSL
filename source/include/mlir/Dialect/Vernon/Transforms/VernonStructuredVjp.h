@@ -26,6 +26,7 @@ struct StructuredVjpResult {
     SmallVector<std::pair<std::string, uint64_t>> sourceKindCounts;
     SmallVector<std::pair<std::string, uint64_t>> costComponents;
     std::string selectedPolicy;
+    bool wholeDispatchRetentionPermitted{};
 };
 
 /// Builds VJP profiles directly from structured primal IR, including

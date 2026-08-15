@@ -191,7 +191,7 @@ struct AutodiffLaunchPlan {
     VernonLaunchSize workgroupSize{1, 1, 1};
 };
 
-struct AutodiffVariant {
+struct AutodiffProfile {
     std::vector<std::string> key;
     std::string primal;
     std::string forwardWithTape;
@@ -202,13 +202,13 @@ struct AutodiffVariant {
     std::map<std::string, uint64_t> sourceKindCounts;
     std::map<std::string, uint64_t> costComponents;
     std::string selectedPolicy;
+    bool wholeDispatchRetentionPermitted{};
     AutodiffLaunchPlan launch;
 };
 
 struct AutodiffManifest {
-    std::string protocol;
     std::vector<AutodiffDerivativeGroup> derivativeGroups;
-    std::vector<AutodiffVariant> variants;
+    std::vector<AutodiffProfile> profiles;
 };
 
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);

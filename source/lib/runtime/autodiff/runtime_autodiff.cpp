@@ -165,7 +165,7 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
     return true;
 }
 
-bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
+bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profiles,
                              VernonLoadedPipeline &pipeline) {
     if (!bundle.context || !bundle.autodiff)
         return false;
@@ -176,16 +176,12 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
         autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
     std::shared_ptr<Executable> executable;
     if (bundle.context->backend != VERNON_RUNTIME_CPU) {
-        invocationDiagnostic(*bundle.context) = "GPU autodiff is unsupported; runtime only supports CPU dynamic_v2";
+        invocationDiagnostic(*bundle.context) = "GPU autodiff is unsupported; runtime only supports CPU autodiff";
         return false;
     }
-    if (bundle.autodiff->protocol != "dynamic_v2") {
-        invocationDiagnostic(*bundle.context) = "CPU autodiff requires the dynamic_v2 protocol";
-        return false;
-    }
-    const bool resolved =
-        createCpuExecutable(*bundle.context, primal, forward, backward, gradientPaths, profiles.staticTapeBytesHint,
-                            profiles.residualStorage, profiles.selectedPolicy, executable);
+    const bool resolved = createCpuExecutable(
+        *bundle.context, primal, forward, backward, gradientPaths, profiles.staticTapeBytesHint,
+        profiles.residualStorage, profiles.selectedPolicy, profiles.wholeDispatchRetentionPermitted, executable);
     if (!resolved)
         return false;
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
@@ -240,6 +236,28 @@ bool vernon::runtime::hasAutodiffStorageObjectives(const VernonLoadedPipeline *p
 
 VernonLaunchSize vernon::runtime::autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline) {
     return pipeline ? pipeline->workgroupSize : VernonLaunchSize{};
+}
+
+std::vector<vernon::runtime::AutodiffWriteFootprint>
+vernon::runtime::autodiffWriteFootprints(const VernonLoadedPipeline *pipeline) {
+    std::vector<AutodiffWriteFootprint> result;
+    if (!pipeline)
+        return result;
+    result.reserve(pipeline->writeFootprints.size());
+    for (const TensorViewWriteFootprint &footprint : pipeline->writeFootprints)
+        result.push_back({footprint.owner, footprint.wholeView, footprint.indices});
+    return result;
+}
+
+std::vector<vernon::runtime::AutodiffWriteFootprint>
+vernon::runtime::autodiffReadFootprints(const VernonLoadedPipeline *pipeline) {
+    std::vector<AutodiffWriteFootprint> result;
+    if (!pipeline)
+        return result;
+    result.reserve(pipeline->readFootprints.size());
+    for (const TensorViewWriteFootprint &footprint : pipeline->readFootprints)
+        result.push_back({footprint.owner, footprint.wholeView, footprint.indices});
+    return result;
 }
 
 vernon::runtime::AutodiffPullbackMemoryUsage

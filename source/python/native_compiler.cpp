@@ -72,6 +72,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("source_kind_counts", &StructuredVjp::sourceKindCounts)
         .def_prop_ro("cost_components", &StructuredVjp::costComponents)
         .def_prop_ro("selected_policy", &StructuredVjp::selectedPolicy)
+        .def_prop_ro("whole_dispatch_retention_permitted", &StructuredVjp::wholeDispatchRetentionPermitted)
         .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
     module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
                nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));
@@ -276,6 +277,8 @@ void bindNativeCompiler(nb::module_ &module) {
             nb::arg("bindings"), nb::arg("grid"))
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
+        .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)
+        .def_prop_ro("write_footprints", &LoadedPipeline::writeFootprints)
         .def_prop_ro("parameters", &LoadedPipeline::parameters)
         .def_prop_ro("outputs", &LoadedPipeline::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);

@@ -2,7 +2,7 @@
 
 > 本文面向第一次接触编译器自动微分的读者。
 >
-> 本文描述当前 CPU `dynamic_v2` VJP、cost-aware residual source、no-Tape、
+> 本文描述当前 CPU structured VJP、cost-aware residual source、no-Tape、
 > ExecutionGraph resource-version replay 和 complete-workgroup bounded replay。
 > GPU/graphics AD 与高阶 AD 会明确标为“尚未实现”，不会把路线图当成现状。
 
@@ -1296,7 +1296,7 @@ Pipeline/graph pullback 暴露的常见指标：
 
 ### 11.1 产品边界
 
-- 只有 CPU `dynamic_v2` 是当前 AD 执行路径；
+- 只有 CPU structured VJP 是当前 AD 执行路径；
 - GPU 和 graphics AD 尚未实现；
 - higher-order AD、JVP、持久 `.grad` 尚未实现；
 - graph VJP 当前是 CPU compute 路径；

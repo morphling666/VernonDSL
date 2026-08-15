@@ -314,9 +314,7 @@ if(TARGET VernonRuntime)
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:balanced_asset"
             vernonRegisterStructuredScalarBalancedAutodiffFixture
             structured_scalar_balanced_autodiff_manifest
-            structured_scalar_balanced_autodiff_fixture_target
-            COOK_SCRIPT
-            "${VERNON_TEST_ROOT}/scripts/cook_balanced_autodiff_fixture.py")
+            structured_scalar_balanced_autodiff_fixture_target)
         vernon_add_cpu_autodiff_fixture(
             structured-dynamic-autodiff
             autodiff_structured_dynamic_fixture
@@ -437,6 +435,7 @@ if(TARGET VernonRuntime)
             PRIVATE
                 VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}"
                 VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST="${structured_scalar_balanced_autodiff_manifest}"
+                VERNON_AUTODIFF_BALANCED_EVIDENCE="${VERNON_REPOSITORY_ROOT}/specs/autodiff_balanced_frontend_evidence.json"
                 VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
                 VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
         if(VERNON_HOST_TAPE_INSTRUMENTATION)

@@ -6,7 +6,6 @@ import unittest
 from pathlib import Path
 
 import vernon_dsl as vd
-from vernon_dsl.ad import ProgramTransformSpec
 from vernon_dsl.bundle import BundlePlan, CpuTargetOptions
 from vernon_dsl.pipeline_assets import PipelineCompileError, parse_python_pipeline_asset
 
@@ -26,14 +25,16 @@ class AutodiffDeclarationTests(unittest.TestCase):
         self.assertEqual(first.transform.output_cotangents, ("loss",))
         self.assertEqual(first.transform.identity, second.transform.identity)
 
-    def test_vjp_rejects_unsupported_protocol(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must be 'dynamic_v2'"):
-            ProgramTransformSpec(
-                "vjp",
-                ("value",),
-                output_cotangents=("loss",),
-                protocol="unsupported_protocol",
-            )
+        balanced = vd.ad.vjp(
+            compute,
+            wrt=("value",),
+            outputs=("loss",),
+            planning_policy="balanced",
+        )
+        self.assertEqual(balanced.transform.planning_policy, "balanced")
+        self.assertNotEqual(first.transform.identity, balanced.transform.identity)
+        with self.assertRaisesRegex(ValueError, "planning policy"):
+            vd.ad.vjp(compute, wrt=("value",), outputs=("loss",), planning_policy="heuristic")
 
     def test_compute_vjp_rejects_missing_or_duplicate_paths(self) -> None:
         @vd.kernel
@@ -53,13 +54,6 @@ class AutodiffDeclarationTests(unittest.TestCase):
             vd.ad.vjp(compute, wrt=("value",))
         with self.assertRaisesRegex(ValueError, "outputs paths must be unique"):
             vd.ad.vjp(compute, wrt=("value",), outputs=("loss", "loss"))
-        with self.assertRaisesRegex(TypeError, "unexpected keyword argument 'protocol'"):
-            vd.ad.vjp(
-                compute,
-                wrt=("value",),
-                outputs=("loss",),
-                protocol="dynamic_v2",  # type: ignore[call-arg]
-            )
 
     def test_graphics_vjp_contract_is_unchanged(self) -> None:
         @vd.vertex
@@ -171,35 +165,6 @@ asset = vd.pipeline_asset(id="compute/vjp", program=vd.ad.vjp(compute, wrt=("val
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(PipelineCompileError, "requires non-empty writable Storage outputs"):
-                parse_python_pipeline_asset(source, "asset")
-
-    def test_pipeline_parser_rejects_protocol_option(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "asset.py"
-            source.write_text(
-                """
-import vernon_dsl as vd
-
-@vd.kernel
-def compute(
-    value: vd.TensorView[vd.f32, (1,), vd.read],
-    loss: vd.TensorView[vd.f32, (1,), vd.write],
-) -> None:
-    loss[0] = value[0]
-
-asset = vd.pipeline_asset(
-    id="compute/vjp",
-    program=vd.ad.vjp(
-        compute,
-        wrt=("value",),
-        outputs=("loss",),
-        protocol="dynamic_v2",
-    ),
-)
-""",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(PipelineCompileError, "unknown vd.ad.vjp argument.*protocol"):
                 parse_python_pipeline_asset(source, "asset")
 
 

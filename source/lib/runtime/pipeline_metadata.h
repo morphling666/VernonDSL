@@ -37,6 +37,7 @@ struct TensorViewDescriptorLayout {
 };
 
 struct ReflectedArgument {
+    std::string sourceName;
     std::string kind;
     std::string builtin;
     PhysicalArgumentLayout physical;
@@ -47,6 +48,14 @@ struct ReflectedArgument {
     uint32_t binding{UINT32_MAX};
     std::vector<ReflectedStorageLeaf> storageLeaves;
     std::optional<TensorViewDescriptorLayout> tensorViewDescriptor;
+    std::vector<int64_t> sourceShape;
+};
+
+struct TensorViewWriteFootprint {
+    uint32_t argument{};
+    std::string owner;
+    bool wholeView{true};
+    std::vector<uint64_t> indices;
 };
 
 struct PackedArgumentsLayout {
@@ -58,6 +67,8 @@ struct ReflectedEntry {
     std::optional<PackedArgumentsLayout> packedArguments;
     uint32_t workgroup[3]{1, 1, 1};
     DispatchContract dispatchContract;
+    std::vector<TensorViewWriteFootprint> readFootprints;
+    std::vector<TensorViewWriteFootprint> writeFootprints;
 };
 
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,

@@ -412,6 +412,16 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                         !parseDispatchContract(entry, stage.dispatchContract, invocationDiagnostic(*context)))
                         return nullptr;
                 }
+                if (stage.stage == "compute") {
+                    ReflectedEntry reflected;
+                    if (!parseReflection(value["reflection"], stage.entry, reflected, context->backend,
+                                         invocationDiagnostic(*context)))
+                        return nullptr;
+                    std::copy_n(reflected.workgroup, 3, stage.workgroup);
+                    stage.dispatchContract = reflected.dispatchContract;
+                    stage.readFootprints = std::move(reflected.readFootprints);
+                    stage.writeFootprints = std::move(reflected.writeFootprints);
+                }
             }
             if (!value.contains("artifact")) {
                 fail(context, "pipeline stage artifact descriptor is missing");
@@ -524,13 +534,13 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
             return nullptr;
         }
         if (bundle->autodiff) {
-            if (bundle->autodiff->variants.size() != bundle->variants.size()) {
+            if (bundle->autodiff->profiles.size() != bundle->variants.size()) {
                 fail(context, "autodiff profiles do not cover every pipeline variant");
                 return nullptr;
             }
             for (size_t index = 0; index < bundle->variants.size(); ++index) {
                 const Variant &variant = bundle->variants[index];
-                const AutodiffVariant &profiles = bundle->autodiff->variants[index];
+                const AutodiffProfile &profiles = bundle->autodiff->profiles[index];
                 auto profileStage = [&](const std::string &id) {
                     const auto found = bundle->stages.find(id);
                     return found != bundle->stages.end() && found->second.stage == "compute";
@@ -682,11 +692,13 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
             const Stage &stage = bundle->stages.at(found->compute);
             pipeline->workgroupSize = {stage.workgroup[0], stage.workgroup[1], stage.workgroup[2]};
             pipeline->dispatchContract = stage.dispatchContract;
+            pipeline->readFootprints = stage.readFootprints;
+            pipeline->writeFootprints = stage.writeFootprints;
         }
         if (bundle->autodiff) {
-            const auto profiles = std::find_if(bundle->autodiff->variants.begin(), bundle->autodiff->variants.end(),
-                                               [&](const AutodiffVariant &candidate) { return candidate.key == key; });
-            if (profiles == bundle->autodiff->variants.end()) {
+            const auto profiles = std::find_if(bundle->autodiff->profiles.begin(), bundle->autodiff->profiles.end(),
+                                               [&](const AutodiffProfile &candidate) { return candidate.key == key; });
+            if (profiles == bundle->autodiff->profiles.end()) {
                 fail(bundle->context, "autodiff profiles have no exact feature variant");
                 return nullptr;
             }

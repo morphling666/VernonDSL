@@ -13,7 +13,7 @@ compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph AP
 - Pipeline 16 unifies cooked compute, graphics, and differentiated assets under
   the canonical `*.pipeline.json` schema. Differentiated manifests use an
   optional root `autodiff` object.
-- CPU automatic differentiation uses one `dynamic_v2` ABI for direct and
+- CPU automatic differentiation uses one structured ABI for direct and
   cooked execution, including dynamic/partially dynamic Storage shapes,
   reusable pullbacks, aggregate leaves, aliases, and zero extents.
 - GPU and graphics automatic differentiation and graph-level pullbacks are

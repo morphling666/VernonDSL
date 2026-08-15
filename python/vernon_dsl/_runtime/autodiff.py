@@ -24,12 +24,11 @@ class _CompiledDirectVjp:
     primal_symbol: str
     forward_symbol: str
     backward_symbol: str
-    forward_protocol: str
-    backward_protocol: str
     derivative_groups: tuple[DerivativeGroup, ...]
     tape_bytes_per_invocation: int
     residual_storage_kind: str
     selected_policy: str
+    whole_dispatch_retention_permitted: bool
     active_operation_count: int
     recomputation_cost: int
     resource_reload_cost: int
@@ -298,11 +297,10 @@ def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
         compiled.forward_symbol,
         compiled.backward,
         compiled.backward_symbol,
-        compiled.forward_protocol,
-        compiled.backward_protocol,
         compiled.tape_bytes_per_invocation,
         compiled.residual_storage_kind,
         compiled.selected_policy,
+        compiled.whole_dispatch_retention_permitted,
         [(group.role, group.declared_path, list(group.leaf_paths)) for group in compiled.derivative_groups],
     )
     compiled.runtime_generation = runtime_state._runtime_generation
@@ -312,8 +310,6 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
     kernel = expression.program
     if not isinstance(kernel, Kernel):
         raise TypeError("direct VJP execution requires one compute Kernel")
-    if expression.transform.protocol != "dynamic_v2":
-        raise RuntimeError("direct structured VJP execution requires protocol='dynamic_v2'")
     runtime_state = _session_state()
     if runtime_state._architecture != runtime_state.cpu:
         raise RuntimeError("direct structured VJP execution currently supports only the CPU runtime")
@@ -361,12 +357,11 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
             primal_symbol=structured.entry.symbol,
             forward_symbol=profiles["forward_with_tape"].symbol,
             backward_symbol=profiles["backward"].symbol,
-            forward_protocol=structured.protocols["forward_with_tape"],
-            backward_protocol=structured.protocols["backward"],
             derivative_groups=derivative_groups,
             tape_bytes_per_invocation=int(structured.plan.tape_bytes),
             residual_storage_kind=structured.residual_storage_kind,
             selected_policy=structured.selected_policy,
+            whole_dispatch_retention_permitted=structured.whole_dispatch_retention_permitted,
             active_operation_count=structured.active_operation_count,
             recomputation_cost=structured.recomputation_cost,
             resource_reload_cost=int(structured.cost_components.get("resource_reload_cost", 0)),

@@ -145,6 +145,16 @@ struct PassPrimalResourceMapping {
     uint32_t resource{};
 };
 
+struct GraphByteRange {
+    uint64_t offset{};
+    uint64_t byteSize{};
+};
+
+struct PassWriteFootprint {
+    uint32_t resource{};
+    std::vector<GraphByteRange> ranges;
+};
+
 class GraphAutodiffValue {
 public:
     virtual ~GraphAutodiffValue() = default;
@@ -191,6 +201,14 @@ public:
         static const std::vector<PassPrimalResourceMapping> empty;
         return empty;
     }
+    virtual const std::vector<PassWriteFootprint> &writeFootprints() const {
+        static const std::vector<PassWriteFootprint> empty;
+        return empty;
+    }
+    virtual const std::vector<PassWriteFootprint> &readFootprints() const {
+        static const std::vector<PassWriteFootprint> empty;
+        return empty;
+    }
     virtual bool forward(ComputeEncoder &encoder, const ExecutionResources &resources,
                          std::unique_ptr<PassPullback> &pullback, std::string &error) = 0;
     virtual bool zeroCotangent(const std::string &path, const ExecutionResources &resources,
@@ -215,6 +233,12 @@ public:
     virtual uint64_t alignment() const { return 1; }
     virtual bool copyTo(void *destination, uint64_t byteSize, std::string &error) const = 0;
     virtual bool copyFrom(const void *source, uint64_t byteSize, std::string &error) = 0;
+    virtual bool copyRangeTo(uint64_t offset, void *destination, uint64_t byteSize, std::string &error) const;
+    virtual bool copyRangeFrom(uint64_t offset, const void *source, uint64_t byteSize, std::string &error);
+    virtual bool copyRangesTo(const std::vector<GraphByteRange> &ranges, void *packedDestination,
+                              std::string &error) const;
+    virtual bool copyRangesFrom(const std::vector<GraphByteRange> &ranges, const void *packedSource,
+                                std::string &error);
 };
 
 class ExecutionBindings {
@@ -502,8 +526,11 @@ private:
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
     std::vector<uint32_t> autodiffInitialResources_;
+    std::vector<std::vector<GraphByteRange>> autodiffInitialRanges_;
     std::vector<uint32_t> autodiffTransactionResources_;
+    std::vector<std::vector<GraphByteRange>> autodiffTransactionRanges_;
     std::vector<uint32_t> autodiffRestorationResources_;
+    std::vector<std::vector<GraphByteRange>> autodiffRestorationRanges_;
     AutodiffDagCheckpointPlan autodiffCheckpointPlan_;
     uint64_t autodiffMemoryBudget_{};
     bool hasAutodiffSchedule_{};

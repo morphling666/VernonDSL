@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "pipeline_bundle.h"
 #include "pipeline_manifest.h"
+#include "pipeline_metadata.h"
 
 #include <cstddef>
 #include <memory>
@@ -111,6 +112,8 @@ struct VernonLoadedPipeline {
     vernon::runtime::Variant variant;
     VernonLaunchSize workgroupSize{1, 1, 1};
     vernon::runtime::DispatchContract dispatchContract;
+    std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
+    std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
     std::optional<VernonLoadedAutodiff> autodiff;
     void *backendState{};
     void (*destroyBackendState)(void *){};

@@ -98,6 +98,92 @@ struct PythonCheckpointResource final : vernon::execution::GraphCheckpointResour
         return valid;
     }
 
+    bool copyRangeTo(uint64_t offset, void *destination, uint64_t rangeByteSize, std::string &error) const override {
+        Py_buffer view{};
+        if (PyObject_GetBuffer(value.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+            error = "checkpoint resource does not expose contiguous bytes";
+            PyErr_Clear();
+            return false;
+        }
+        const uint64_t size = view.len < 0 ? 0 : static_cast<uint64_t>(view.len);
+        const bool valid = offset <= size && rangeByteSize <= size - offset;
+        if (valid && rangeByteSize)
+            std::memcpy(destination, static_cast<const std::byte *>(view.buf) + offset, rangeByteSize);
+        PyBuffer_Release(&view);
+        if (!valid)
+            error = "checkpoint write footprint exceeds the bound resource";
+        return valid;
+    }
+
+    bool copyRangeFrom(uint64_t offset, const void *source, uint64_t rangeByteSize, std::string &error) override {
+        Py_buffer view{};
+        if (PyObject_GetBuffer(value.ptr(), &view, PyBUF_CONTIG | PyBUF_WRITABLE) != 0) {
+            error = "checkpoint resource does not expose writable contiguous bytes";
+            PyErr_Clear();
+            return false;
+        }
+        const uint64_t size = view.len < 0 ? 0 : static_cast<uint64_t>(view.len);
+        const bool valid = offset <= size && rangeByteSize <= size - offset;
+        if (valid && rangeByteSize)
+            std::memcpy(static_cast<std::byte *>(view.buf) + offset, source, rangeByteSize);
+        PyBuffer_Release(&view);
+        if (!valid)
+            error = "checkpoint write footprint exceeds the bound resource";
+        return valid;
+    }
+
+    bool copyRangesTo(const std::vector<vernon::execution::GraphByteRange> &ranges, void *packedDestination,
+                      std::string &error) const override {
+        Py_buffer view{};
+        if (PyObject_GetBuffer(value.ptr(), &view, PyBUF_CONTIG_RO) != 0) {
+            error = "checkpoint resource does not expose contiguous bytes";
+            PyErr_Clear();
+            return false;
+        }
+        const uint64_t size = view.len < 0 ? 0 : static_cast<uint64_t>(view.len);
+        auto *destination = static_cast<std::byte *>(packedDestination);
+        bool valid = true;
+        for (const vernon::execution::GraphByteRange &range : ranges) {
+            if (range.offset > size || range.byteSize > size - range.offset) {
+                valid = false;
+                break;
+            }
+            if (range.byteSize)
+                std::memcpy(destination, static_cast<const std::byte *>(view.buf) + range.offset, range.byteSize);
+            destination += range.byteSize;
+        }
+        PyBuffer_Release(&view);
+        if (!valid)
+            error = "checkpoint write footprint exceeds the bound resource";
+        return valid;
+    }
+
+    bool copyRangesFrom(const std::vector<vernon::execution::GraphByteRange> &ranges, const void *packedSource,
+                        std::string &error) override {
+        Py_buffer view{};
+        if (PyObject_GetBuffer(value.ptr(), &view, PyBUF_CONTIG | PyBUF_WRITABLE) != 0) {
+            error = "checkpoint resource does not expose writable contiguous bytes";
+            PyErr_Clear();
+            return false;
+        }
+        const uint64_t size = view.len < 0 ? 0 : static_cast<uint64_t>(view.len);
+        const auto *source = static_cast<const std::byte *>(packedSource);
+        bool valid = true;
+        for (const vernon::execution::GraphByteRange &range : ranges) {
+            if (range.offset > size || range.byteSize > size - range.offset) {
+                valid = false;
+                break;
+            }
+            if (range.byteSize)
+                std::memcpy(static_cast<std::byte *>(view.buf) + range.offset, source, range.byteSize);
+            source += range.byteSize;
+        }
+        PyBuffer_Release(&view);
+        if (!valid)
+            error = "checkpoint write footprint exceeds the bound resource";
+        return valid;
+    }
+
     nb::object value;
     uint64_t byteAlignment;
 };

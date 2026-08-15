@@ -64,7 +64,7 @@ class ProgramTransformSpec:
     gradient_policy: str = "f16:f32,f32:f32,f64:f64"
     accumulation_policy: str = "fresh"
     tape_policy: str = "bounded"
-    protocol: str = "dynamic_v2"
+    planning_policy: str = "min_memory"
     derivative_rules_version: int = 1
 
     def __post_init__(self) -> None:
@@ -76,8 +76,8 @@ class ProgramTransformSpec:
             raise ValueError("unsupported gradient accumulation policy")
         if self.tape_policy != "bounded":
             raise ValueError("unsupported autodiff tape policy")
-        if self.protocol != "dynamic_v2":
-            raise ValueError("autodiff protocol must be 'dynamic_v2'")
+        if self.planning_policy not in {"min_memory", "balanced", "min_runtime"}:
+            raise ValueError("autodiff planning policy must be 'min_memory', 'balanced', or 'min_runtime'")
         if self.derivative_rules_version != 1:
             raise ValueError("unsupported derivative rules version")
         if (self.rule_set is None) != (self.rule_set_identity is None):
@@ -98,7 +98,7 @@ class ProgramTransformSpec:
             "gradient_policy": self.gradient_policy,
             "accumulation_policy": self.accumulation_policy,
             "tape_policy": self.tape_policy,
-            "protocol": self.protocol,
+            "planning_policy": self.planning_policy,
             "derivative_rules_version": self.derivative_rules_version,
         }
         if self.rule_set is not None:
@@ -139,6 +139,7 @@ def vjp(
     wrt: tuple[str, ...] | list[str],
     outputs: tuple[str, ...] | list[str] | None = None,
     rules: RuleSet | None = None,
+    planning_policy: str = "min_memory",
 ) -> ProgramExpression:
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
@@ -170,6 +171,7 @@ def vjp(
         rule_set=rules.id if rules is not None else None,
         rule_set_identity=rules.digest if rules is not None else None,
         output_cotangents=(_canonical_paths(outputs, label="outputs") if outputs is not None else ()),
+        planning_policy=planning_policy,
     )
     return ProgramExpression(program, spec, rules)
 

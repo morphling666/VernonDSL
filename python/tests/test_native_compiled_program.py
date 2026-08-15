@@ -25,6 +25,7 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
   func.func @increment(
       %values: !vernon.tensor_view<f32, [3], "read_write", "device"> {
         vernon.interface = "resource",
+        vernon.source_name = "values",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       },
@@ -61,6 +62,7 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
   func.func @constant_write(
       %values: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
+        vernon.source_name = "values",
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       }) attributes {
@@ -338,6 +340,10 @@ class CompiledProgramTests(unittest.TestCase):
                 {"kind": "read", "owner": "values", "region": "unknown", "indices": []},
                 {"kind": "write", "owner": "values", "region": "unknown", "indices": []},
             ],
+        )
+        self.assertEqual(
+            reflection["entries"][0]["tensor_view_write_footprints"],
+            [{"version": 1, "owner": "values", "kind": "whole_view", "indices": []}],
         )
 
         vd.init(arch=vd.cpu)

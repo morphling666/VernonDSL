@@ -236,6 +236,7 @@ public:
     uint64_t getMemoryBudgetBytes() const { return memoryBudgetBytes; }
     const AdPlanCostComponents &getCostComponents() const { return costComponents; }
     StringRef getSelectedPolicy() const { return selectedPolicy; }
+    bool permitsWholeDispatchRetention() const { return wholeDispatchRetentionPermitted; }
 
 private:
     friend FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp, const VernonAutodiffAnalysisResult &,
@@ -247,6 +248,7 @@ private:
     AdBufferAssignment bufferAssignment;
     AdPlanCostComponents costComponents;
     std::string selectedPolicy{"min_memory"};
+    bool wholeDispatchRetentionPermitted{};
     uint64_t estimatedPersistentBytes{};
     uint64_t memoryBudgetBytes{};
 };

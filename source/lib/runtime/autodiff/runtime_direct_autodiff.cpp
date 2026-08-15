@@ -14,9 +14,9 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry, VernonStringView primalReflection,
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
-    VernonStringView backwardName, VernonStringView forwardProtocol, VernonStringView backwardProtocol,
-    const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount, uint64_t staticTapeBytesHint,
-    VernonStringView residualStorage, VernonStringView selectedPolicy) {
+    VernonStringView backwardName, const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount,
+    uint64_t staticTapeBytesHint, VernonStringView residualStorage, VernonStringView selectedPolicy,
+    bool wholeDispatchRetentionPermitted) {
     try {
         if (!groupViews || !derivativeGroupCount || !residualStorage.data || !residualStorage.size ||
             !selectedPolicy.data || !selectedPolicy.size) {
@@ -56,11 +56,11 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
         if (!pipeline)
             return nullptr;
         std::shared_ptr<ad::Executable> executable;
-        if (!ad::createCpuEntryExecutable(context, primalEntry, primalReflection, primalName, forwardEntry,
-                                          forwardReflection, forwardName, backwardEntry, backwardReflection,
-                                          backwardName, forwardProtocol, backwardProtocol, paths, staticTapeBytesHint,
-                                          std::string(residualStorage.data, residualStorage.size),
-                                          std::string(selectedPolicy.data, selectedPolicy.size), executable)) {
+        if (!ad::createCpuEntryExecutable(
+                context, primalEntry, primalReflection, primalName, forwardEntry, forwardReflection, forwardName,
+                backwardEntry, backwardReflection, backwardName, paths, staticTapeBytesHint,
+                std::string(residualStorage.data, residualStorage.size),
+                std::string(selectedPolicy.data, selectedPolicy.size), wholeDispatchRetentionPermitted, executable)) {
             std::string error = invocationDiagnostic(context);
             pipeline.reset();
             invocationDiagnostic(context) = std::move(error);

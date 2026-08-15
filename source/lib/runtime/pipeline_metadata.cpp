@@ -4,6 +4,7 @@
 #include "VernonVersions.h"
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <limits>
 #include <string_view>
 #include <utility>
@@ -91,6 +92,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 return false;
             }
             ReflectedArgument argument;
+            argument.sourceName = value.value("vernon.source_name", "");
             argument.kind = value["kind"].get<std::string>();
             if (argument.kind != "scalar" && argument.kind != "tensor_value" && argument.kind != "tensor" &&
                 argument.kind != "image" && argument.kind != "sampler" && argument.kind != "builtin") {
@@ -240,6 +242,14 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 }
             }
             argument.tensorElementSize = elementSize;
+            if (value.contains("source_shape") && value["source_shape"].is_array())
+                for (const nlohmann::json &dimension : value["source_shape"]) {
+                    if (!dimension.is_number_integer()) {
+                        error = "TensorView source shape reflection is invalid";
+                        return false;
+                    }
+                    argument.sourceShape.push_back(dimension.get<int64_t>());
+                }
             if (value.contains("shape") && value["shape"].is_array()) {
                 size_t elements = 1;
                 for (const nlohmann::json &dimension : value["shape"]) {
@@ -268,6 +278,119 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 return false;
             }
             output.arguments.push_back(std::move(argument));
+        }
+        const auto footprintArgument = [&](const std::string &owner) {
+            return std::find_if(output.arguments.begin(), output.arguments.end(),
+                                [&](const ReflectedArgument &candidate) { return candidate.sourceName == owner; });
+        };
+        if (entry.contains("effects")) {
+            const nlohmann::json &effects = entry["effects"];
+            if (!effects.is_array()) {
+                error = "storage-effect reflection is invalid";
+                return false;
+            }
+            for (const nlohmann::json &value : effects) {
+                if (!value.is_object() || !value.contains("kind") || !value["kind"].is_string() ||
+                    !value.contains("owner") || !value["owner"].is_string() || !value.contains("region") ||
+                    !value["region"].is_string() || !value.contains("indices") || !value["indices"].is_array()) {
+                    error = "storage-effect reflection is invalid";
+                    return false;
+                }
+                const std::string kind = value["kind"].get<std::string>();
+                if (kind != "read" && kind != "read_write")
+                    continue;
+                const std::string owner = value["owner"].get<std::string>();
+                const auto argument = footprintArgument(owner);
+                if (argument == output.arguments.end() || argument->kind != "tensor") {
+                    error = "TensorView read footprint names an unknown or non-TensorView argument";
+                    return false;
+                }
+                TensorViewWriteFootprint footprint;
+                footprint.argument = static_cast<uint32_t>(std::distance(output.arguments.begin(), argument));
+                footprint.owner = owner;
+                const std::string region = value["region"].get<std::string>();
+                footprint.wholeView = region == "unknown";
+                if (!footprint.wholeView && region != "element") {
+                    error = "TensorView read footprint has an unsupported region";
+                    return false;
+                }
+                for (const nlohmann::json &index : value["indices"]) {
+                    if (!index.is_number_unsigned()) {
+                        error = "TensorView read footprint has an invalid element index";
+                        return false;
+                    }
+                    footprint.indices.push_back(index.get<uint64_t>());
+                }
+                const size_t rank = argument->tensorViewDescriptor ? argument->tensorViewDescriptor->rank
+                                                                   : argument->sourceShape.size();
+                if ((footprint.wholeView && !footprint.indices.empty()) ||
+                    (!footprint.wholeView && footprint.indices.size() != rank)) {
+                    error = "TensorView read footprint rank does not match its reflected shape";
+                    return false;
+                }
+                for (size_t axis = 0; axis < footprint.indices.size() && axis < argument->sourceShape.size(); ++axis)
+                    if (argument->sourceShape[axis] >= 0 &&
+                        footprint.indices[axis] >= static_cast<uint64_t>(argument->sourceShape[axis])) {
+                        error = "TensorView read footprint exceeds its reflected shape";
+                        return false;
+                    }
+                output.readFootprints.push_back(std::move(footprint));
+            }
+        }
+        if (entry.contains("tensor_view_write_footprints")) {
+            const nlohmann::json &footprints = entry["tensor_view_write_footprints"];
+            if (!footprints.is_array()) {
+                error = "TensorView write-footprint reflection is invalid";
+                return false;
+            }
+            for (const nlohmann::json &value : footprints) {
+                if (!value.is_object() || value.value("version", 0) != 1 || !value.contains("owner") ||
+                    !value["owner"].is_string() || !value.contains("kind") || !value["kind"].is_string() ||
+                    !value.contains("indices") || !value["indices"].is_array()) {
+                    error = "TensorView write-footprint reflection is invalid";
+                    return false;
+                }
+                const std::string owner = value["owner"].get<std::string>();
+                const auto argument = footprintArgument(owner);
+                if (argument == output.arguments.end()) {
+                    error = "TensorView write footprint names an unknown argument";
+                    return false;
+                }
+                if (argument->kind != "tensor") {
+                    error = "TensorView write footprint names a non-TensorView argument";
+                    return false;
+                }
+                TensorViewWriteFootprint footprint;
+                footprint.argument = static_cast<uint32_t>(std::distance(output.arguments.begin(), argument));
+                footprint.owner = owner;
+                const std::string kind = value["kind"].get<std::string>();
+                footprint.wholeView = kind == "whole_view";
+                if (!footprint.wholeView && kind != "exact_element") {
+                    error = "TensorView write footprint has an unsupported kind";
+                    return false;
+                }
+                for (const nlohmann::json &index : value["indices"]) {
+                    if (!index.is_number_unsigned()) {
+                        error = "TensorView write footprint has an invalid element index";
+                        return false;
+                    }
+                    footprint.indices.push_back(index.get<uint64_t>());
+                }
+                const size_t rank = argument->tensorViewDescriptor ? argument->tensorViewDescriptor->rank
+                                                                   : argument->sourceShape.size();
+                if ((footprint.wholeView && !footprint.indices.empty()) ||
+                    (!footprint.wholeView && footprint.indices.size() != rank)) {
+                    error = "TensorView write footprint rank does not match its reflected shape";
+                    return false;
+                }
+                for (size_t axis = 0; axis < footprint.indices.size() && axis < argument->sourceShape.size(); ++axis)
+                    if (argument->sourceShape[axis] >= 0 &&
+                        footprint.indices[axis] >= static_cast<uint64_t>(argument->sourceShape[axis])) {
+                        error = "TensorView write footprint exceeds its reflected shape";
+                        return false;
+                    }
+                output.writeFootprints.push_back(std::move(footprint));
+            }
         }
         return true;
     }

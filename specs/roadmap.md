@@ -165,7 +165,7 @@ permit removing queue waits or letting recorded work outlive its owners.
   explicitly.
 - `vd.ad.vjp` emits deterministic primal, forward-with-tape, and backward
   profiles with checked dynamic tape and explicit Storage objectives.
-- Direct and cooked CPU execution share one `dynamic_v2` executable,
+- Direct and cooked CPU execution share one structured executable,
   derivative-group validation path, and reusable pullback implementation.
 - Recursive Scalar, Tensor, Tuple, and Struct Storage elements use packed
   structural tangent layouts with f16-to-f32 promotion and zero nodes for

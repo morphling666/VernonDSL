@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -24,7 +24,6 @@ class StructuredVjpBuild:
     entry: TypedFunctionInstance
     plan: AutodiffProfilePlan
     profiles: Mapping[str, str]
-    protocols: Mapping[str, str]
     uses_dynamic_tape: bool
     residual_storage_kind: str
     active_operation_count: int
@@ -32,6 +31,7 @@ class StructuredVjpBuild:
     source_kind_counts: Mapping[str, int]
     cost_components: Mapping[str, int]
     selected_policy: str
+    whole_dispatch_retention_permitted: bool
 
 
 def _validate_nonoverlapping_paths(paths: tuple[str, ...], role: str) -> None:
@@ -131,6 +131,15 @@ def build_structured_vjp(
     frontend: FrontendCompileResult,
     transform: ProgramTransformSpec,
 ) -> StructuredVjpBuild:
+    if (
+        frontend.request.program_transform != transform
+        and frontend.request.autodiff_planning_policy != transform.planning_policy
+    ):
+        from .compiler import Compiler
+
+        frontend = Compiler().compile_request(
+            replace(frontend.request, autodiff_planning_policy=transform.planning_policy)
+        )
     entry = next(
         (function for function in frontend.typed_functions if function.symbol == frontend.request.entry),
         None,
@@ -169,6 +178,7 @@ def build_structured_vjp(
         tuple(sorted((str(kind), int(count)) for kind, count in transformed.source_kind_counts.items())),
         tuple(sorted((str(kind), int(cost)) for kind, cost in transformed.cost_components.items())),
         str(transformed.selected_policy),
+        bool(transformed.whole_dispatch_retention_permitted),
         frontend.entry_workgroup_size or (1, 1, 1),
     )
     profiles = MappingProxyType(dict(transformed.profiles(plan.identity)))
@@ -185,7 +195,6 @@ def build_structured_vjp(
         entry,
         plan,
         profiles,
-        MappingProxyType({"forward_with_tape": "dynamic_v2", "backward": "dynamic_v2"}),
         any("!vernon.ad_tape" in module for module in profiles.values()),
         residual_storage_kind,
         int(transformed.active_operation_count),
@@ -193,6 +202,7 @@ def build_structured_vjp(
         MappingProxyType({str(kind): int(count) for kind, count in transformed.source_kind_counts.items()}),
         MappingProxyType({str(kind): int(cost) for kind, cost in transformed.cost_components.items()}),
         str(transformed.selected_policy),
+        bool(transformed.whole_dispatch_retention_permitted),
     )
 
 

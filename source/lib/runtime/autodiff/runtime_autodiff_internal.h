@@ -94,17 +94,17 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
                          const Stage &backward, const std::vector<std::string> &gradientPaths,
                          uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                         const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
+                         const std::string &selectedPolicy, bool wholeDispatchRetentionPermitted,
+                         std::shared_ptr<Executable> &executable);
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry,
                               VernonStringView primalReflection, VernonStringView primalName,
                               VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
                               VernonStringView forwardName, VernonCpuEntryPoint backwardEntry,
                               VernonStringView backwardReflection, VernonStringView backwardName,
-                              VernonStringView forwardProtocol, VernonStringView backwardProtocol,
                               const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                               const std::string &residualStorage, const std::string &selectedPolicy,
-                              std::shared_ptr<Executable> &executable);
-bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
+                              bool wholeDispatchRetentionPermitted, std::shared_ptr<Executable> &executable);
+bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profile,
                              VernonLoadedPipeline &pipeline);
 
 } // namespace vernon::runtime::ad

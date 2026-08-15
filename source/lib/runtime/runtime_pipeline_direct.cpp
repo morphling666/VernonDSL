@@ -228,6 +228,8 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
         return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
+    pipeline->readFootprints = reflection.readFootprints;
+    pipeline->writeFootprints = reflection.writeFootprints;
     CpuKernelState kernel;
     ReflectedEntry loadedReflection;
     if (!loadCpuEntry(entryPoint, reflectionData, reflectionSize, entryData, entrySize, kernel, loadedReflection,
@@ -259,6 +261,8 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
         return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
+    pipeline->readFootprints = reflection.readFootprints;
+    pipeline->writeFootprints = reflection.writeFootprints;
     VernonPipelineBundle bundle;
     bundle.context = &context;
     Stage stage;
@@ -267,6 +271,8 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     stage.reflection.assign(reflectionData, reflectionSize);
     std::copy_n(reflection.workgroup, 3, stage.workgroup);
     stage.dispatchContract = reflection.dispatchContract;
+    stage.readFootprints = reflection.readFootprints;
+    stage.writeFootprints = reflection.writeFootprints;
     if (context.backend == VERNON_RUNTIME_CUDA || context.backend == VERNON_RUNTIME_METAL ||
         isOpenGLBackend(context.backend))
         stage.source.assign(static_cast<const char *>(artifact), artifactSize);

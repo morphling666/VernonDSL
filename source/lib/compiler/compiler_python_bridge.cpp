@@ -74,6 +74,7 @@ struct VernonPythonStructuredVjp {
     std::vector<std::pair<std::string, uint64_t>> costComponents;
     std::vector<VernonPythonNamedMetricView> costComponentViews;
     std::string selectedPolicy;
+    bool wholeDispatchRetentionPermitted{};
 };
 
 extern "C" {
@@ -262,6 +263,7 @@ VernonPythonStructuredVjp *vernonCompilerBuildPythonStructuredVjp(VernonStringVi
     for (const auto &[name, value] : result->costComponents)
         result->costComponentViews.push_back({viewOf(name), value});
     result->selectedPolicy = transformed->selectedPolicy;
+    result->wholeDispatchRetentionPermitted = transformed->wholeDispatchRetentionPermitted;
     auto printProfile = [&](llvm::StringRef keptSymbol, llvm::StringRef removedSymbol,
                             llvm::StringRef profileName) -> mlir::FailureOr<std::string> {
         mlir::OwningOpRef<mlir::ModuleOp> profile(mlir::cast<mlir::ModuleOp>(parsed->clone()));
@@ -356,7 +358,8 @@ VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const Ver
             result->sourceKindCountViews.size(),
             result->costComponentViews.data(),
             result->costComponentViews.size(),
-            viewOf(result->selectedPolicy)};
+            viewOf(result->selectedPolicy),
+            result->wholeDispatchRetentionPermitted ? 1u : 0u};
 }
 
 } // extern "C"

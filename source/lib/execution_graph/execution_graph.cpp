@@ -175,6 +175,46 @@ DeviceExecutionSession::~DeviceExecutionSession() = default;
 DeviceExecutionSession::DeviceExecutionSession(DeviceExecutionSession &&) noexcept = default;
 DeviceExecutionSession &DeviceExecutionSession::operator=(DeviceExecutionSession &&) noexcept = default;
 
+bool GraphCheckpointResource::copyRangeTo(uint64_t offset, void *destination, uint64_t rangeByteSize,
+                                          std::string &error) const {
+    if (offset || rangeByteSize != byteSize()) {
+        error = "checkpoint resource does not support partial copies";
+        return false;
+    }
+    return copyTo(destination, rangeByteSize, error);
+}
+
+bool GraphCheckpointResource::copyRangeFrom(uint64_t offset, const void *source, uint64_t rangeByteSize,
+                                            std::string &error) {
+    if (offset || rangeByteSize != byteSize()) {
+        error = "checkpoint resource does not support partial copies";
+        return false;
+    }
+    return copyFrom(source, rangeByteSize, error);
+}
+
+bool GraphCheckpointResource::copyRangesTo(const std::vector<GraphByteRange> &ranges, void *packedDestination,
+                                           std::string &error) const {
+    auto *destination = static_cast<std::byte *>(packedDestination);
+    for (const GraphByteRange &range : ranges) {
+        if (!copyRangeTo(range.offset, destination, range.byteSize, error))
+            return false;
+        destination += range.byteSize;
+    }
+    return true;
+}
+
+bool GraphCheckpointResource::copyRangesFrom(const std::vector<GraphByteRange> &ranges, const void *packedSource,
+                                             std::string &error) {
+    const auto *source = static_cast<const std::byte *>(packedSource);
+    for (const GraphByteRange &range : ranges) {
+        if (!copyRangeFrom(range.offset, source, range.byteSize, error))
+            return false;
+        source += range.byteSize;
+    }
+    return true;
+}
+
 ExecutionPass::ExecutionPass(std::string name) : name_(std::move(name)) {}
 
 void ExecutionPass::ensureMutable() const {
@@ -547,8 +587,11 @@ bool ExecutionGraph::buildPlan(std::string &error) {
     schedule_.clear();
     scopes_.clear();
     autodiffInitialResources_.clear();
+    autodiffInitialRanges_.clear();
     autodiffTransactionResources_.clear();
+    autodiffTransactionRanges_.clear();
     autodiffRestorationResources_.clear();
+    autodiffRestorationRanges_.clear();
     bool compiled = false;
     struct FailedCompileCleanup {
         std::vector<uint32_t> &schedule;
@@ -678,6 +721,81 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         return false;
     }
     autodiffCheckpointPlan_ = {};
+    std::vector<std::vector<GraphByteRange>> restorationRangesByResource(resourceRecords_.size());
+    std::vector<std::vector<GraphByteRange>> transactionRangesByResource(resourceRecords_.size());
+    std::vector<bool> wholeResourceTransaction(resourceRecords_.size());
+    std::unordered_set<uint32_t> transactionResources;
+    bool transactionCheckpointable = true;
+    for (uint32_t passIndex : schedule_) {
+        auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+        DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+        for (const ResourceUse &use : passes_[passIndex]->uses()) {
+            if (!writes(use.access))
+                continue;
+            transactionResources.insert(use.resource.id);
+            const auto &checkpoint = resourceRecords_[use.resource.id].checkpoint;
+            if (!checkpoint) {
+                transactionCheckpointable = false;
+                continue;
+            }
+            if (wholeResourceTransaction[use.resource.id])
+                continue;
+            bool hasDeclaration = false;
+            if (differentiable)
+                for (const PassWriteFootprint &footprint : differentiable->writeFootprints())
+                    if (footprint.resource == use.resource.id) {
+                        hasDeclaration = true;
+                        if (footprint.ranges.empty()) {
+                            wholeResourceTransaction[use.resource.id] = true;
+                            transactionRangesByResource[use.resource.id].clear();
+                            break;
+                        }
+                        transactionRangesByResource[use.resource.id].insert(
+                            transactionRangesByResource[use.resource.id].end(), footprint.ranges.begin(),
+                            footprint.ranges.end());
+                    }
+            if (!hasDeclaration) {
+                wholeResourceTransaction[use.resource.id] = true;
+                transactionRangesByResource[use.resource.id].clear();
+            }
+        }
+    }
+    uint64_t transactionBytes = 0;
+    for (uint32_t resourceId : transactionResources) {
+        const auto &checkpoint = resourceRecords_[resourceId].checkpoint;
+        if (!checkpoint)
+            continue;
+        auto &ranges = transactionRangesByResource[resourceId];
+        if (wholeResourceTransaction[resourceId]) {
+            ranges = {{0, checkpoint->byteSize()}};
+        } else {
+            for (const GraphByteRange &range : ranges)
+                if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                    range.byteSize > checkpoint->byteSize() - range.offset) {
+                    error = "autodiff transaction footprint exceeds its bound resource";
+                    return false;
+                }
+            std::sort(ranges.begin(), ranges.end(), [](const GraphByteRange &left, const GraphByteRange &right) {
+                return left.offset < right.offset;
+            });
+            std::vector<GraphByteRange> merged;
+            for (const GraphByteRange &range : ranges) {
+                if (!merged.empty() && range.offset <= merged.back().offset + merged.back().byteSize) {
+                    const uint64_t end =
+                        std::max(merged.back().offset + merged.back().byteSize, range.offset + range.byteSize);
+                    merged.back().byteSize = end - merged.back().offset;
+                } else
+                    merged.push_back(range);
+            }
+            ranges = std::move(merged);
+        }
+        for (const GraphByteRange &range : ranges)
+            if (range.byteSize > std::numeric_limits<uint64_t>::max() - transactionBytes) {
+                error = "autodiff transaction snapshot size overflows";
+                return false;
+            } else
+                transactionBytes += range.byteSize;
+    }
     if (hasAutodiffSchedule_) {
         std::vector<detail::AutodiffDagNode> autodiffNodes;
         std::vector<uint32_t> scheduleOffsets(passes_.size(), UINT32_MAX);
@@ -688,6 +806,8 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         std::vector<uint32_t> lastOutput(resourceRecords_.size(), UINT32_MAX);
         std::vector<uint32_t> writeEpochs(resourceRecords_.size());
         std::unordered_set<uint32_t> initialResources;
+        std::vector<bool> wholeInitialRead(resourceRecords_.size());
+        std::vector<std::vector<GraphByteRange>> initialReadRanges(resourceRecords_.size());
         std::unordered_set<DerivativeEndpointKey, DerivativeEndpointHash> backwardValueEndpoints;
         uint64_t backwardValueBytes = 0;
         for (uint32_t offset = 0; offset < schedule_.size(); ++offset) {
@@ -756,9 +876,28 @@ bool ExecutionGraph::buildPlan(std::string &error) {
                     }) == node.inputs.end())
                     node.inputs.push_back(inputVersion);
                 const uint32_t producer = lastWriter[use.resource.id];
-                if (producer == UINT32_MAX)
+                if (producer == UINT32_MAX) {
                     initialResources.insert(use.resource.id);
-                else {
+                    if (!wholeInitialRead[use.resource.id]) {
+                        bool hasDeclaration = false;
+                        for (const PassWriteFootprint &footprint : differentiable->readFootprints())
+                            if (footprint.resource == use.resource.id) {
+                                hasDeclaration = true;
+                                if (footprint.ranges.empty()) {
+                                    wholeInitialRead[use.resource.id] = true;
+                                    initialReadRanges[use.resource.id].clear();
+                                    break;
+                                }
+                                initialReadRanges[use.resource.id].insert(initialReadRanges[use.resource.id].end(),
+                                                                          footprint.ranges.begin(),
+                                                                          footprint.ranges.end());
+                            }
+                        if (!hasDeclaration) {
+                            wholeInitialRead[use.resource.id] = true;
+                            initialReadRanges[use.resource.id].clear();
+                        }
+                    }
+                } else {
                     const uint32_t outputIndex = lastOutput[use.resource.id];
                     if (outputIndex >= autodiffNodes[producer].outputs.size()) {
                         error = "autodiff value producer has an invalid output";
@@ -817,55 +956,99 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         }
         uint64_t initialStateBytes = 0;
         bool initialStateCheckpointable = true;
-        for (uint32_t resourceId = 0; resourceId < resourceRecords_.size(); ++resourceId) {
-            if (initialResources.find(resourceId) == initialResources.end())
-                continue;
-            const auto &checkpoint = resourceRecords_[resourceId].checkpoint;
-            if (!checkpoint) {
-                initialStateCheckpointable = false;
-                continue;
-            }
-            if (checkpoint->byteSize() > std::numeric_limits<uint64_t>::max() - initialStateBytes) {
-                error = "autodiff initial-state checkpoint size overflows";
-                return false;
-            }
-            initialStateBytes += checkpoint->byteSize();
-            autodiffInitialResources_.push_back(resourceId);
-        }
-        uint64_t restorationBytes = 0;
-        bool restorationCheckpointable = initialStateCheckpointable;
+        std::vector<bool> wholeResourceRestoration = std::move(wholeInitialRead);
+        restorationRangesByResource = std::move(initialReadRanges);
+        bool restorationCheckpointable = true;
         std::unordered_set<uint32_t> restorationResources(initialResources.begin(), initialResources.end());
-        restorationBytes = initialStateBytes;
-        uint64_t transactionBytes = 0;
-        bool transactionCheckpointable = true;
-        std::unordered_set<uint32_t> transactionResources;
-        for (uint32_t passIndex : schedule_)
+        for (uint32_t resourceId : initialResources)
+            if (!resourceRecords_[resourceId].checkpoint)
+                restorationCheckpointable = false;
+        for (uint32_t passIndex : schedule_) {
+            auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+            DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
             for (const ResourceUse &use : passes_[passIndex]->uses()) {
                 if (!writes(use.access))
                     continue;
                 const auto &checkpoint = resourceRecords_[use.resource.id].checkpoint;
-                if (transactionResources.insert(use.resource.id).second) {
-                    if (!checkpoint)
-                        transactionCheckpointable = false;
-                    else if (checkpoint->byteSize() > std::numeric_limits<uint64_t>::max() - transactionBytes) {
-                        error = "autodiff transaction snapshot size overflows";
-                        return false;
-                    } else
-                        transactionBytes += checkpoint->byteSize();
-                }
-                if (!restorationResources.insert(use.resource.id).second)
-                    continue;
                 if (!checkpoint) {
                     restorationCheckpointable = false;
                     continue;
                 }
-                const uint64_t byteSize = checkpoint->byteSize();
-                if (byteSize > std::numeric_limits<uint64_t>::max() - restorationBytes) {
+                restorationResources.insert(use.resource.id);
+                if (wholeResourceRestoration[use.resource.id])
+                    continue;
+                bool hasDeclaration = false;
+                if (differentiable)
+                    for (const PassWriteFootprint &footprint : differentiable->writeFootprints())
+                        if (footprint.resource == use.resource.id) {
+                            hasDeclaration = true;
+                            if (footprint.ranges.empty()) {
+                                wholeResourceRestoration[use.resource.id] = true;
+                                restorationRangesByResource[use.resource.id].clear();
+                                break;
+                            }
+                            for (const GraphByteRange &range : footprint.ranges) {
+                                if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                                    range.byteSize > checkpoint->byteSize() - range.offset) {
+                                    error = "autodiff write footprint exceeds its bound resource";
+                                    return false;
+                                }
+                                restorationRangesByResource[use.resource.id].push_back(range);
+                            }
+                        }
+                if (!hasDeclaration) {
+                    wholeResourceRestoration[use.resource.id] = true;
+                    restorationRangesByResource[use.resource.id].clear();
+                    continue;
+                }
+            }
+        }
+        uint64_t restorationBytes = 0;
+        for (uint32_t resourceId : restorationResources) {
+            const auto &checkpoint = resourceRecords_[resourceId].checkpoint;
+            if (!checkpoint)
+                continue;
+            auto &ranges = restorationRangesByResource[resourceId];
+            if (wholeResourceRestoration[resourceId]) {
+                ranges = {{0, checkpoint->byteSize()}};
+            } else {
+                for (const GraphByteRange &range : ranges)
+                    if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                        range.byteSize > checkpoint->byteSize() - range.offset) {
+                        error = "autodiff resource footprint exceeds its bound resource";
+                        return false;
+                    }
+                std::sort(ranges.begin(), ranges.end(), [](const GraphByteRange &left, const GraphByteRange &right) {
+                    return left.offset < right.offset;
+                });
+                std::vector<GraphByteRange> merged;
+                for (const GraphByteRange &range : ranges) {
+                    if (!merged.empty() && range.offset <= merged.back().offset + merged.back().byteSize) {
+                        const uint64_t end =
+                            std::max(merged.back().offset + merged.back().byteSize, range.offset + range.byteSize);
+                        merged.back().byteSize = end - merged.back().offset;
+                    } else
+                        merged.push_back(range);
+                }
+                ranges = std::move(merged);
+            }
+            for (const GraphByteRange &range : ranges)
+                if (range.byteSize > std::numeric_limits<uint64_t>::max() - restorationBytes) {
                     error = "autodiff final-state restoration size overflows";
                     return false;
-                }
-                restorationBytes += byteSize;
+                } else
+                    restorationBytes += range.byteSize;
+            if (initialResources.find(resourceId) != initialResources.end()) {
+                autodiffInitialResources_.push_back(resourceId);
+                autodiffInitialRanges_.push_back(ranges);
+                for (const GraphByteRange &range : ranges)
+                    if (range.byteSize > std::numeric_limits<uint64_t>::max() - initialStateBytes) {
+                        error = "autodiff initial-state checkpoint size overflows";
+                        return false;
+                    } else
+                        initialStateBytes += range.byteSize;
             }
+        }
         if (!detail::planDagAutodiffCheckpoints(autodiffNodes, autodiffMemoryBudget_, autodiffCheckpointPlan_, error,
                                                 initialStateBytes, initialStateCheckpointable, restorationBytes,
                                                 restorationCheckpointable, transactionBytes, transactionCheckpointable,
@@ -947,17 +1130,23 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         std::unordered_set<uint32_t> restorationResources;
         if (hasAutodiffSchedule_ && !autodiffCheckpointPlan_.cuts.empty())
             for (uint32_t resourceId : autodiffInitialResources_)
-                if (restorationResources.insert(resourceId).second)
+                if (restorationResources.insert(resourceId).second) {
                     autodiffRestorationResources_.push_back(resourceId);
-        std::unordered_set<uint32_t> transactionResources;
+                    autodiffRestorationRanges_.push_back(restorationRangesByResource[resourceId]);
+                }
+        std::unordered_set<uint32_t> publishedTransactionResources;
         for (uint32_t passIndex : schedule_)
             for (const ResourceUse &use : passes_[passIndex]->uses())
                 if (writes(use.access)) {
-                    if (transactionResources.insert(use.resource.id).second)
+                    if (publishedTransactionResources.insert(use.resource.id).second) {
                         autodiffTransactionResources_.push_back(use.resource.id);
+                        autodiffTransactionRanges_.push_back(transactionRangesByResource[use.resource.id]);
+                    }
                     if (hasAutodiffSchedule_ && !autodiffCheckpointPlan_.cuts.empty() &&
-                        restorationResources.insert(use.resource.id).second)
+                        restorationResources.insert(use.resource.id).second) {
                         autodiffRestorationResources_.push_back(use.resource.id);
+                        autodiffRestorationRanges_.push_back(restorationRangesByResource[use.resource.id]);
+                    }
                 }
         for (uint32_t resourceId : autodiffTransactionResources_)
             if (!resourceRecords_[resourceId].checkpoint) {

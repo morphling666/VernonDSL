@@ -167,6 +167,8 @@ class VjpComputePass(ComputePass):
         recomputation_cost = 0
         deterministic_reduction_legal = True
         required_primal_resources: list[tuple[str, int]] = []
+        read_footprints: list[tuple[int, list[tuple[int, int]]]] = []
+        write_footprints: list[tuple[int, list[tuple[int, int]]]] = []
         retained_primal_bytes = 0
         replay_snapshot_bytes = 0
         workgroup_invocation_count = 0
@@ -180,6 +182,38 @@ class VjpComputePass(ComputePass):
             resource_reload_cost = compiled.resource_reload_cost * invocation_count
             recomputation_cost = compiled.recomputation_cost * invocation_count
             deterministic_reduction_legal = compiled.deterministic_reduction_legal
+
+            def bound_footprints(reflected: Any, access: str) -> list[tuple[int, list[tuple[int, int]]]]:
+                ranges_by_resource: dict[int, list[tuple[int, int]]] = {}
+                conservative_resources: set[int] = set()
+                for owner_value, whole_view, footprint_indices in reflected:
+                    owner = str(owner_value)
+                    endpoint = self._endpoint_for_path(owner)
+                    if not isinstance(endpoint, GraphResource):
+                        continue
+                    binding = self._bindings.get(_root(owner))
+                    bound = binding.value if isinstance(binding, GraphResource) else binding
+                    if bool(whole_view) or not isinstance(bound, (TensorStorage, TensorView)):
+                        conservative_resources.add(endpoint.id)
+                        continue
+                    indices = tuple(int(index) for index in footprint_indices)
+                    if len(indices) != len(bound.shape) or any(
+                        index < 0 or index >= extent for index, extent in zip(indices, bound.shape, strict=True)
+                    ):
+                        raise ValueError(f"TensorView {access} footprint for {owner!r} exceeds its bound shape")
+                    layout = bound.layout
+                    byte_offset = layout.byte_offset + sum(
+                        index * stride for index, stride in zip(indices, layout.byte_strides, strict=True)
+                    )
+                    ranges_by_resource.setdefault(endpoint.id, []).append((byte_offset, int(bound.dtype.itemsize)))
+                return [
+                    (resource, ranges)
+                    for resource, ranges in sorted(ranges_by_resource.items())
+                    if resource not in conservative_resources
+                ]
+
+            read_footprints = bound_footprints(compiled.pipeline.read_footprints, "read")
+            write_footprints = bound_footprints(compiled.pipeline.write_footprints, "write")
             if max(replay_cost, resource_reload_cost, recomputation_cost) > 2**64 - 1:
                 raise OverflowError("autodiff checkpoint planning metadata exceeds uint64")
             retained_primal_bindings = {
@@ -212,6 +246,8 @@ class VjpComputePass(ComputePass):
             [mapping(path, endpoint) for path, endpoint in self._gradient_endpoints.items()],
             [mapping(path, endpoint) for path, endpoint in self._cotangent_resources.items()],
             required_primal_resources,
+            read_footprints,
+            write_footprints,
             invocation_count,
             tape_stride,
             workgroup_invocation_count,

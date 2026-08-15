@@ -59,6 +59,7 @@ class _FunctionEmitter:
         typed_function: TypedFunctionInstance,
         stage: str | None,
         workgroup_size: tuple[int, int, int] | None,
+        planning_policy: str | None = None,
     ):
         self.context = context
         self.node = typed_function.source
@@ -71,6 +72,7 @@ class _FunctionEmitter:
         self._index_typed_statements(typed_function.body)
         self.stage = stage
         self.workgroup_size = workgroup_size
+        self.planning_policy = planning_policy
         self.lines: list[str] = []
         self.indent = 1
         self.next_value = 0
@@ -304,6 +306,8 @@ class _FunctionEmitter:
         if self.stage:
             function_attributes.append("vernon.entry")
             function_attributes.append(f'vernon.stage = "{self.stage}"')
+            if self.planning_policy is not None:
+                function_attributes.append(f'vernon.ad.planning_policy = "{self.planning_policy}"')
             reflected_effects: list[str] = []
             for effect in self.typed_function.effects:
                 if not isinstance(effect, StorageEffect) or effect.owner.kind is not StorageOwnerKind.PARAMETER:

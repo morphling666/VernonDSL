@@ -89,6 +89,7 @@ def _transform_record(
     outputs: tuple[str, ...],
     rule_set_id: str | None,
     rule_set_identity: str | None,
+    planning_policy: str = "min_memory",
 ) -> dict[str, Any]:
     record: dict[str, Any] = {
         "kind": "vjp",
@@ -97,7 +98,7 @@ def _transform_record(
         "gradient_policy": "f16:f32,f32:f32,f64:f64",
         "accumulation_policy": "fresh",
         "tape_policy": "bounded",
-        "protocol": "dynamic_v2",
+        "planning_policy": planning_policy,
         "derivative_rules_version": 1,
     }
     if rule_set_id is not None:
@@ -214,7 +215,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         if len(program_expression.args) != 1 or any(item.arg is None for item in program_expression.keywords):
             raise PipelineCompileError("vd.ad.vjp requires one program operand and keyword arguments")
         transform_keywords = {item.arg: item.value for item in program_expression.keywords if item.arg is not None}
-        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules"}
+        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules", "planning_policy"}
         if unknown_transform:
             raise PipelineCompileError("unknown vd.ad.vjp argument(s): " + ", ".join(sorted(unknown_transform)))
         wrt_node = transform_keywords.get("wrt")
@@ -253,11 +254,19 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             rule_set_id, rule_names = declared_rule_sets[rules_node.id]
             rule_set_record = {"id": rule_set_id, "rules": list(rule_names)}
             rule_set_identity = hashlib.sha256(canonical_json(rule_set_record).encode("utf-8")).hexdigest()
+        planning_node = transform_keywords.get("planning_policy")
+        try:
+            planning_policy = ast.literal_eval(planning_node) if planning_node is not None else "min_memory"
+        except (ValueError, TypeError, SyntaxError):
+            planning_policy = None
+        if planning_policy not in {"min_memory", "balanced", "min_runtime"}:
+            raise PipelineCompileError("vd.ad.vjp planning_policy must be 'min_memory', 'balanced', or 'min_runtime'")
         transform = _transform_record(
             tuple(sorted(wrt_value)),
             tuple(sorted(outputs_value)),
             rule_set_id,
             rule_set_identity,
+            planning_policy,
         )
         program = program_expression.args[0]
     else:

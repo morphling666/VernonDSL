@@ -243,6 +243,8 @@ class VariantPlan:
     outputs: tuple[Mapping[str, Any], ...]
 
     def __post_init__(self) -> None:
+        if any(not feature for feature in self.key) or tuple(sorted(set(self.key))) != self.key:
+            raise PipelineCompileError("pipeline variant key must contain unique non-empty features in sorted order")
         object.__setattr__(self, "program", frozen_mapping(self.program))
         for name in ("parameters", "internal_parameters", "outputs"):
             values = tuple(frozen_mapping(value) for value in getattr(self, name))
@@ -281,12 +283,29 @@ class BundlePlan:
     def logical_dict(self) -> dict[str, Any]:
         from .requirements import runtime_requirements
 
+        variant_records = [variant.to_dict() for variant in self.variants]
+        variant_keys = [variant.key for variant in self.variants]
+        if len(set(variant_keys)) != len(variant_keys):
+            raise PipelineCompileError("pipeline variants contain duplicate canonical keys")
+        if self.transform is not None:
+            profile_rows = (self.autodiff_profiles or {})["variants"]
+            profile_keys = [tuple(profile["key"]) for profile in profile_rows]
+            if any(any(not feature for feature in key) or tuple(sorted(set(key))) != key for key in profile_keys):
+                raise PipelineCompileError("autodiff profile variant keys are not canonical")
+            if len(set(profile_keys)) != len(profile_keys):
+                raise PipelineCompileError("autodiff profiles contain duplicate variant keys")
+            profiles = {
+                tuple(profile["key"]): {name: value for name, value in profile.items() if name != "key"}
+                for profile in profile_rows
+            }
+            if set(profiles) != {variant.key for variant in self.variants}:
+                raise PipelineCompileError("autodiff profiles do not exactly cover pipeline variants")
         result = {
             "pipeline_version": PIPELINE_VERSION,
             "type": "pipeline",
             "id": self.pipeline_id,
             "target": self.target.spec,
-            "variants": [variant.to_dict() for variant in self.variants],
+            "variants": variant_records,
             "stage_artifacts": {
                 stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
             },
@@ -294,10 +313,16 @@ class BundlePlan:
         if self.transform is not None:
             result["autodiff"] = {
                 "kind": self.transform["kind"],
-                "protocol": self.transform["protocol"],
                 "wrt": list(self.transform["wrt"]),
                 "output_cotangents": list(self.transform["output_cotangents"]),
-                "variants": list((self.autodiff_profiles or {})["variants"]),
+                "profiles": [
+                    {
+                        "variant_key": list(variant.key),
+                        **{name: value for name, value in profiles[variant.key].items() if name != "profiles"},
+                        **profiles[variant.key]["profiles"],
+                    }
+                    for variant in self.variants
+                ],
             }
         requirements = runtime_requirements(self.target.target, self.stages)
         if requirements is not None:

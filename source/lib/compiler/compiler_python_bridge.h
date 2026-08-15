@@ -47,6 +47,7 @@ typedef struct VernonPythonStructuredVjpView {
     const VernonPythonNamedMetricView *cost_components;
     size_t cost_component_count;
     VernonStringView selected_policy;
+    uint32_t whole_dispatch_retention_permitted;
 } VernonPythonStructuredVjpView;
 
 /*

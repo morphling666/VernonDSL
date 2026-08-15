@@ -94,6 +94,7 @@ class AutodiffProfilePlan:
     source_kind_counts: tuple[tuple[str, int], ...] = ()
     cost_components: tuple[tuple[str, int], ...] = ()
     selected_policy: str = "min_memory"
+    whole_dispatch_retention_permitted: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -107,6 +108,7 @@ class AutodiffProfilePlan:
             "source_kind_counts": dict(self.source_kind_counts),
             "cost_components": dict(self.cost_components),
             "selected_policy": self.selected_policy,
+            "whole_dispatch_retention_permitted": self.whole_dispatch_retention_permitted,
         }
 
     @property
@@ -338,6 +340,7 @@ def build_structured_profile_plan(
     source_kind_counts: tuple[tuple[str, int], ...],
     cost_components: tuple[tuple[str, int], ...],
     selected_policy: str,
+    whole_dispatch_retention_permitted: bool,
     workgroup_size: tuple[int, int, int],
 ) -> AutodiffProfilePlan:
     """Build profile metadata without constructing the legacy AD program graph."""
@@ -495,6 +498,7 @@ def build_structured_profile_plan(
         source_kind_counts,
         cost_components,
         selected_policy,
+        whole_dispatch_retention_permitted,
     )
 
 

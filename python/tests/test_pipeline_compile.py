@@ -4,6 +4,7 @@ import hashlib
 import json
 import struct
 import unittest
+from dataclasses import replace
 from types import SimpleNamespace
 
 from vernon_dsl.bundle import (
@@ -314,7 +315,7 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(set(logical["stage_artifacts"]), {stage.id})
         self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
 
-    def test_manifest_v14_autodiff_schema_omits_planning_metadata(self) -> None:
+    def test_manifest_autodiff_profiles_use_canonical_variant_key(self) -> None:
         stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
         profiles = {
             name: {
@@ -331,7 +332,6 @@ class PipelineCompileTests(unittest.TestCase):
             [((), {"compute": stage})],
             {
                 "kind": "vjp",
-                "protocol": "dynamic_v2",
                 "wrt": ["value"],
                 "output_cotangents": ["output"],
                 "gradient_policy": "explicit",
@@ -356,8 +356,30 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertNotIn("autodiff_profiles", logical)
         self.assertEqual(
             set(logical["autodiff"]),
-            {"kind", "protocol", "wrt", "output_cotangents", "variants"},
+            {"kind", "wrt", "output_cotangents", "profiles"},
         )
+        self.assertNotIn("extensions", logical["variants"][0])
+        self.assertEqual(logical["autodiff"]["profiles"][0]["variant_key"], [])
+        for name, profile in profiles.items():
+            self.assertEqual(logical["autodiff"]["profiles"][0][name], profile)
+
+        duplicate_profiles = replace(
+            plan,
+            autodiff_profiles={
+                "identity": "internal-profiles",
+                "tape_bytes": 64,
+                "variants": [
+                    {"key": [], "workgroup_size": [1, 1, 1], "profiles": profiles},
+                    {"key": [], "workgroup_size": [1, 1, 1], "profiles": profiles},
+                ],
+            },
+        )
+        with self.assertRaisesRegex(PipelineCompileError, "duplicate variant keys"):
+            duplicate_profiles.logical_dict()
+
+        duplicate_variants = replace(plan, variants=(plan.variants[0], plan.variants[0]))
+        with self.assertRaisesRegex(PipelineCompileError, "duplicate canonical keys"):
+            duplicate_variants.logical_dict()
         self.assertEqual(
             set(logical["stage_artifacts"][stage.id]),
             {"stage", "entry", "reflection"},

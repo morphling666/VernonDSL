@@ -22,6 +22,7 @@ class FrontendCompileRequest:
     captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
     workgroup_size: tuple[int, int, int] | None = None
     program_transform: ProgramTransformSpec | None = None
+    autodiff_planning_policy: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path).resolve())
@@ -36,6 +37,8 @@ class FrontendCompileRequest:
             "captured_constants",
             tuple(sorted(self.captured_constants, key=lambda value: value[0])),
         )
+        if self.autodiff_planning_policy not in {None, "min_memory", "balanced", "min_runtime"}:
+            raise ValueError("autodiff planning policy must be 'min_memory', 'balanced', or 'min_runtime'")
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,7 @@ class FrontendCompileResult:
             "program_transform": (
                 self.request.program_transform.to_dict() if self.request.program_transform is not None else None
             ),
+            "autodiff_planning_policy": self.request.autodiff_planning_policy,
             "autodiff_profiles": (
                 self.autodiff_profiles.manifest_dict() if self.autodiff_profiles is not None else None
             ),

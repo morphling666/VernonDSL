@@ -1923,6 +1923,7 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
             backward.erase();
     });
     copyProfileFunctionAttrs(primal, backward);
+    backward->removeAttr("vernon.storage_effects");
     SmallVector<DictionaryAttr> backwardArgumentAttrs;
     if (usesTape) {
         backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", "tape", {}, 0));
@@ -2230,7 +2231,8 @@ FailureOr<StructuredVjpResult> buildStructuredVjp(func::FuncOp primal, const Str
                                std::move(requiredPrimalPaths),
                                std::move(sourceKindCounts),
                                std::move(costComponents),
-                               plan->getMemoryPlan().getSelectedPolicy().str()};
+                               plan->getMemoryPlan().getSelectedPolicy().str(),
+                               usesTape && staticResiduals && plan->getMemoryPlan().permitsWholeDispatchRetention()};
 }
 
 std::unique_ptr<Pass> createVernonStructuredVjpPass() { return std::make_unique<VernonStructuredVjpPass>(); }

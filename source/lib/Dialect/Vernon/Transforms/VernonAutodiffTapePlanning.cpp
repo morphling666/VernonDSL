@@ -502,6 +502,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
     VernonAutodiffTapePlan plan;
     plan.memoryPlan.memoryBudgetBytes = memoryBudgetBytes;
     plan.memoryPlan.selectedPolicy = selectedPolicy.str();
+    plan.memoryPlan.wholeDispatchRetentionPermitted = selectedPolicy != "min_memory";
     SmallVector<AdResidualInterval> residuals;
     SmallVector<AdRematerializationRecipe> rematerializations;
     DenseMap<Operation *, uint64_t> operationOrder;

@@ -124,6 +124,62 @@ module {
     }));
 }
 
+TEST_F(VernonAutodiffTapePlanningTest, SelectsMeasuredResidualSourcePriorityForEachPolicy) {
+    OwningOpRef<ModuleOp> module = parse(R"mlir(
+module {
+  func.func @chain(
+      %x: f32 {vernon.source_name = "x", vernon.abi_leaf_dtypes = ["f32"]})
+      -> (f32 {vernon.abi_leaf_dtypes = ["f32"]}) {
+    %square = arith.mulf %x, %x : f32
+    %fourth = arith.mulf %square, %square : f32
+    %result = arith.divf %fourth, %x : f32
+    func.return %result : f32
+  }
+}
+)mlir");
+    ASSERT_TRUE(module);
+    VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
+    func::FuncOp function = module->lookupSymbol<func::FuncOp>("chain");
+    arith::MulFOp fourth;
+    function.walk([&](arith::MulFOp operation) {
+        if (operation.getLhs().getDefiningOp<arith::MulFOp>())
+            fourth = operation;
+    });
+    ASSERT_TRUE(fourth);
+
+    auto selectedForFourth = [&](StringRef policy) {
+        function->setAttr("vernon.ad.planning_policy", StringAttr::get(&context, policy));
+        FailureOr<VernonAutodiffTapePlan> plan = planFunction(*module, "chain", {"x"}, registry);
+        EXPECT_TRUE(succeeded(plan));
+        if (failed(plan))
+            return AdResidualSourceKind::Unsupported;
+        auto selection =
+            llvm::find_if(plan->getMemoryPlan().getSourceSelections(), [&](const AdResidualSourceSelection &candidate) {
+                return candidate.key.value == fourth.getResult();
+            });
+        EXPECT_NE(selection, plan->getMemoryPlan().getSourceSelections().end());
+        if (selection == plan->getMemoryPlan().getSourceSelections().end() ||
+            selection->selectedCandidate >= selection->candidates.size())
+            return AdResidualSourceKind::Unsupported;
+        const auto rematerialized = llvm::find_if(selection->candidates, [](const AdResidualSource &candidate) {
+            return candidate.kind == AdResidualSourceKind::PureRematerialization;
+        });
+        const auto captured = llvm::find_if(selection->candidates, [](const AdResidualSource &candidate) {
+            return candidate.kind == AdResidualSourceKind::StaticCapture;
+        });
+        EXPECT_NE(rematerialized, selection->candidates.end());
+        EXPECT_NE(captured, selection->candidates.end());
+        if (rematerialized != selection->candidates.end() && captured != selection->candidates.end()) {
+            EXPECT_GT(rematerialized->recomputationCost * 8, captured->captureStoreBytes + captured->backwardLoadBytes);
+        }
+        return selection->candidates[selection->selectedCandidate].kind;
+    };
+
+    EXPECT_EQ(selectedForFourth("min_memory"), AdResidualSourceKind::PureRematerialization);
+    EXPECT_EQ(selectedForFourth("balanced"), AdResidualSourceKind::StaticCapture);
+    EXPECT_EQ(selectedForFourth("min_runtime"), AdResidualSourceKind::StaticCapture);
+}
+
 TEST_F(VernonAutodiffTapePlanningTest, NormalizesImplicitDtypesBeforeProvenanceComparison) {
     OwningOpRef<ModuleOp> module = parse(R"mlir(
 module {
@@ -290,6 +346,15 @@ module {
                                             AdResidualSourceKind::DynamicCapture;
                              }),
               1u);
+    for (AdControlSourceKind kind : {AdControlSourceKind::ExecutedCount, AdControlSourceKind::ExitKind}) {
+        auto fallback =
+            llvm::find_if(plan->getMemoryPlan().getSourceSelections(), [&](const AdResidualSourceSelection &selection) {
+                return selection.key.controlOperation == loop.operation && selection.key.controlKind == kind;
+            });
+        ASSERT_NE(fallback, plan->getMemoryPlan().getSourceSelections().end());
+        ASSERT_LT(fallback->selectedCandidate, fallback->candidates.size());
+        EXPECT_EQ(fallback->candidates[fallback->selectedCandidate].kind, AdResidualSourceKind::DynamicCapture);
+    }
 }
 
 TEST_F(VernonAutodiffTapePlanningTest, SelectsExactVersionReloadForRetainedReadOnlyStorage) {

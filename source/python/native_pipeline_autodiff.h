@@ -246,6 +246,22 @@ struct LoadedPipeline {
         return {size.x, size.y, size.z};
     }
 
+    nb::list writeFootprints() const {
+        nb::list result;
+        for (const vernon::runtime::AutodiffWriteFootprint &footprint :
+             vernon::runtime::autodiffWriteFootprints(pipeline))
+            result.append(nb::make_tuple(footprint.owner, footprint.wholeView, footprint.indices));
+        return result;
+    }
+
+    nb::list readFootprints() const {
+        nb::list result;
+        for (const vernon::runtime::AutodiffWriteFootprint &footprint :
+             vernon::runtime::autodiffReadFootprints(pipeline))
+            result.append(nb::make_tuple(footprint.owner, footprint.wholeView, footprint.indices));
+        return result;
+    }
+
     nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner) {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");

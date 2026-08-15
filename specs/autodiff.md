@@ -4,7 +4,7 @@
 > contract 12 and pipeline contract 16 provide deterministic
 > `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
 > checked dynamic tape, explicit accumulation plans, and invocation-time
-> `(x,y,z)` workgroup grids with physical invocation carriers. CPU `dynamic_v2` supports
+> `(x,y,z)` workgroup grids with physical invocation carriers. Structured CPU VJP supports
 > direct and cooked void Kernels with explicit Storage objectives, recursive
 > Scalar/Tensor/Tuple/Struct Storage elements, dynamic and signed-stride
 > TensorViews, mutable scratch versioning, structured branches and loops,
@@ -13,7 +13,7 @@
 > derivative metadata and share one structured CPU executable and pullback
 > implementation.
 >
-> CPU `dynamic_v2` is the only supported autodiff execution and cooking path.
+> Structured CPU VJP is the only supported autodiff execution and cooking path.
 > Execution graphs compose structured CPU pipeline pullbacks in the native C++
 > graph scheduler. Browser wasm32 graph VJP, GPU and graphics autodiff,
 > graphics backward lowering, custom compute VJPs,
@@ -238,7 +238,7 @@ The Runtime stores one canonical typed derivative-group table in
 gradient-then-cotangent order. Direct execution supplies it through POD metadata
 views; cooked execution derives it once from the validated transform and
 backward profile. Both paths validate the same canonical paths, unique group
-ownership, protocol, and executable signature. Python always reads groups from
+ownership and executable signature. Python always reads groups from
 the loaded native pipeline; it does not maintain a second direct or cooked
 grouping model.
 
@@ -286,7 +286,7 @@ CPU primal, `forward_with_tape`, and `backward` profiles all use the ordinary
 range-phase scheduler described by
 [`runtime/design.md`](runtime/design.md#cpu-range-phase-execution). There is no
 AD scalar-entry adapter, worker-local lane identity, fixed-tape execution
-branch, protocol guessing, or serial fallback.
+branch, or serial fallback.
 
 Runtime stores packed argument/result frames in dispatch-level contiguous
 slabs and supplies flattened-global pointer tables to each scheduler range.
@@ -464,7 +464,7 @@ Differentiated assets use the canonical pipeline manifest with one optional
 root `autodiff` object; pipeline-14 transform/profile fields are not aliases in
 the current schema. No
 older manifest is reinterpreted as containing current structured profiles.
-CPU VJP has one structured `dynamic_v2` compiler/runtime path. Differentiated
+CPU VJP has one structured compiler/runtime path. Differentiated
 GPU and graphics assets are not supported.
 
 CPU acceptance covers direct and cooked structured Storage VJP, recursive
@@ -477,4 +477,4 @@ compute and graphics pipelines.
 
 Any missing derivative or custom rule, unbounded tape, unsupported target
 capability, uncertain write conflict, malformed group/cotangent/signature,
-protocol mismatch, or stale contract version fails before execution.
+or stale contract version fails before execution.

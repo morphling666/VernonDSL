@@ -49,6 +49,8 @@ struct Stage {
     std::optional<CpuNativeArtifact> cpuArtifact;
     uint32_t workgroup[3]{1, 1, 1};
     DispatchContract dispatchContract;
+    std::vector<TensorViewWriteFootprint> readFootprints;
+    std::vector<TensorViewWriteFootprint> writeFootprints;
 };
 
 bool validateManifestHash(const nlohmann::json &root, bool required, std::string &error);

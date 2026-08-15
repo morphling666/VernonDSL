@@ -202,6 +202,7 @@ def cook_pipeline_asset(
             gradient_policy=str(transform_values["gradient_policy"]),
             accumulation_policy=str(transform_values["accumulation_policy"]),
             tape_policy=str(transform_values["tape_policy"]),
+            planning_policy=str(transform_values.get("planning_policy", "min_memory")),
             derivative_rules_version=int(transform_values["derivative_rules_version"]),
         )
     for variant in pipeline.variants:
@@ -244,7 +245,7 @@ def cook_pipeline_asset(
             )
             if not is_structured_vjp_abi_eligible(frontend, transform):
                 raise PipelineCompileError(
-                    "dynamic_v2 requires a structured CPU VJP with explicit writable Storage outputs"
+                    "autodiff requires a structured CPU VJP with explicit writable Storage outputs"
                 )
             try:
                 structured = build_structured_vjp(native, frontend, transform)
@@ -307,6 +308,7 @@ def cook_pipeline_asset(
                     "source_kind_counts": dict(profile_plan.source_kind_counts),
                     "cost_components": dict(profile_plan.cost_components),
                     "selected_policy": profile_plan.selected_policy,
+                    "whole_dispatch_retention_permitted": profile_plan.whole_dispatch_retention_permitted,
                     "profiles": {name: profile_programs[name] for name in ("primal", "forward_with_tape", "backward")},
                 }
             )

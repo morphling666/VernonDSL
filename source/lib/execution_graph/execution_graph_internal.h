@@ -19,8 +19,11 @@ struct CompiledExecutionGraph::State {
     std::vector<CompiledScope> scopes;
     AutodiffDagCheckpointPlan autodiffCheckpointPlan;
     std::vector<uint32_t> autodiffInitialResources;
+    std::vector<std::vector<GraphByteRange>> autodiffInitialRanges;
     std::vector<uint32_t> autodiffTransactionResources;
+    std::vector<std::vector<GraphByteRange>> autodiffTransactionRanges;
     std::vector<uint32_t> autodiffRestorationResources;
+    std::vector<std::vector<GraphByteRange>> autodiffRestorationRanges;
     bool hasAutodiffCheckpointPlan{};
     std::vector<NamedDerivativeEndpoint> differentiableInputs;
     std::vector<NamedDerivativeEndpoint> objectives;

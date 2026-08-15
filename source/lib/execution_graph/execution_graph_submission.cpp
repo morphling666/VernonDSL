@@ -50,8 +50,11 @@ std::shared_ptr<CompiledExecutionGraph> ExecutionGraph::compile(std::string &err
     state->scopes = std::move(scopes_);
     state->autodiffCheckpointPlan = std::move(autodiffCheckpointPlan_);
     state->autodiffInitialResources = std::move(autodiffInitialResources_);
+    state->autodiffInitialRanges = std::move(autodiffInitialRanges_);
     state->autodiffTransactionResources = std::move(autodiffTransactionResources_);
+    state->autodiffTransactionRanges = std::move(autodiffTransactionRanges_);
     state->autodiffRestorationResources = std::move(autodiffRestorationResources_);
+    state->autodiffRestorationRanges = std::move(autodiffRestorationRanges_);
     state->hasAutodiffCheckpointPlan = hasAutodiffSchedule_;
     state->differentiableInputs = std::move(differentiableInputs_);
     state->objectives = std::move(objectives_);

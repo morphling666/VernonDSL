@@ -33,6 +33,12 @@ bool checkedAdd(uint64_t left, uint64_t right, uint64_t &result) {
 }
 
 struct ResourceSnapshot {
+    struct Range {
+        uint64_t resourceOffset{};
+        uint64_t storageOffset{};
+        uint64_t byteSize{};
+    };
+
     ResourceSnapshot() = default;
     ~ResourceSnapshot() { reset(); }
     ResourceSnapshot(const ResourceSnapshot &) = delete;
@@ -40,7 +46,7 @@ struct ResourceSnapshot {
     ResourceSnapshot(ResourceSnapshot &&other) noexcept
         : resource(std::move(other.resource)), bytes(std::exchange(other.bytes, nullptr)),
           byteSize(std::exchange(other.byteSize, 0)),
-          alignment(std::exchange(other.alignment, alignof(std::max_align_t))) {}
+          alignment(std::exchange(other.alignment, alignof(std::max_align_t))), ranges(std::move(other.ranges)) {}
     ResourceSnapshot &operator=(ResourceSnapshot &&other) noexcept {
         if (this != &other) {
             reset();
@@ -48,6 +54,7 @@ struct ResourceSnapshot {
             bytes = std::exchange(other.bytes, nullptr);
             byteSize = std::exchange(other.byteSize, 0);
             alignment = std::exchange(other.alignment, alignof(std::max_align_t));
+            ranges = std::move(other.ranges);
         }
         return *this;
     }
@@ -56,8 +63,15 @@ struct ResourceSnapshot {
     std::byte *bytes{};
     uint64_t byteSize{};
     size_t alignment{alignof(std::max_align_t)};
+    std::vector<Range> ranges;
 
-    bool restore(std::string &error) const { return resource->copyFrom(bytes, byteSize, error); }
+    bool restore(std::string &error) const {
+        std::vector<GraphByteRange> resourceRanges;
+        resourceRanges.reserve(ranges.size());
+        for (const Range &range : ranges)
+            resourceRanges.push_back({range.resourceOffset, range.byteSize});
+        return resource->copyRangesFrom(resourceRanges, bytes, error);
+    }
 
 private:
     void reset() {
@@ -69,20 +83,32 @@ private:
 };
 
 bool captureResource(const std::shared_ptr<GraphCheckpointResource> &resource, ResourceSnapshot &snapshot,
-                     std::string &error) {
+                     std::string &error, const std::vector<GraphByteRange> *declaredRanges = nullptr) {
     if (!resource) {
         error = "graph checkpoint resource has no native byte view";
         return false;
     }
     snapshot.resource = resource;
-    const uint64_t byteSize = resource->byteSize();
+    const uint64_t resourceByteSize = resource->byteSize();
     const uint64_t requestedAlignment = resource->alignment();
-    if (byteSize > std::numeric_limits<size_t>::max() || requestedAlignment > std::numeric_limits<size_t>::max() ||
-        !requestedAlignment || (requestedAlignment & (requestedAlignment - 1))) {
+    if (resourceByteSize > std::numeric_limits<size_t>::max() ||
+        requestedAlignment > std::numeric_limits<size_t>::max() || !requestedAlignment ||
+        (requestedAlignment & (requestedAlignment - 1))) {
         error = "graph checkpoint resource has invalid size or alignment";
         return false;
     }
-    snapshot.byteSize = byteSize;
+    uint64_t storageOffset = 0;
+    const std::vector<GraphByteRange> whole{{0, resourceByteSize}};
+    const std::vector<GraphByteRange> &ranges = declaredRanges ? *declaredRanges : whole;
+    for (const GraphByteRange &range : ranges) {
+        if (!range.byteSize || range.offset > resourceByteSize || range.byteSize > resourceByteSize - range.offset ||
+            !checkedAdd(storageOffset, range.byteSize, snapshot.byteSize)) {
+            error = "graph checkpoint resource has an invalid write footprint";
+            return false;
+        }
+        snapshot.ranges.push_back({range.offset, storageOffset, range.byteSize});
+        storageOffset = snapshot.byteSize;
+    }
     snapshot.alignment = std::max<size_t>(requestedAlignment, alignof(std::max_align_t));
     try {
         if (snapshot.byteSize)
@@ -92,7 +118,11 @@ bool captureResource(const std::shared_ptr<GraphCheckpointResource> &resource, R
         error = "cannot allocate graph checkpoint storage";
         return false;
     }
-    return resource->copyTo(snapshot.bytes, snapshot.byteSize, error);
+    std::vector<GraphByteRange> resourceRanges;
+    resourceRanges.reserve(snapshot.ranges.size());
+    for (const ResourceSnapshot::Range &range : snapshot.ranges)
+        resourceRanges.push_back({range.resourceOffset, range.byteSize});
+    return resource->copyRangesTo(resourceRanges, snapshot.bytes, error);
 }
 
 class AlignedCheckpointStorage {
@@ -441,13 +471,20 @@ public:
     }
 
     bool captureState(const std::vector<uint32_t> &resourceIds, std::vector<ResourceSnapshot> &output, uint64_t &bytes,
-                      std::string &error) const {
+                      std::string &error,
+                      const std::vector<std::vector<GraphByteRange>> *declaredRanges = nullptr) const {
+        if (declaredRanges && declaredRanges->size() != resourceIds.size()) {
+            error = "graph restoration footprint table is inconsistent";
+            return false;
+        }
         bytes = 0;
         output.clear();
         output.reserve(resourceIds.size());
-        for (uint32_t resourceId : resourceIds) {
+        for (size_t index = 0; index < resourceIds.size(); ++index) {
+            const uint32_t resourceId = resourceIds[index];
             ResourceSnapshot snapshot;
-            if (!captureResource(plan->resourceRecords[resourceId].checkpoint, snapshot, error))
+            const std::vector<GraphByteRange> *ranges = declaredRanges ? &(*declaredRanges)[index] : nullptr;
+            if (!captureResource(plan->resourceRecords[resourceId].checkpoint, snapshot, error, ranges))
                 return false;
             uint64_t total = 0;
             if (!checkedAdd(bytes, snapshot.byteSize, total)) {
@@ -461,22 +498,11 @@ public:
     }
 
     bool captureInitialState(std::string &error) {
-        initialState.clear();
-        initialStateBytes = 0;
         if (!plan->autodiffCheckpointPlan.initialStateBytes)
             return true;
-        for (uint32_t resourceId : plan->autodiffInitialResources) {
-            ResourceSnapshot snapshot;
-            if (!captureResource(plan->resourceRecords[resourceId].checkpoint, snapshot, error))
-                return false;
-            uint64_t total = 0;
-            if (!checkedAdd(initialStateBytes, snapshot.byteSize, total)) {
-                error = "graph initial-state snapshot size overflows";
-                return false;
-            }
-            initialStateBytes = total;
-            initialState.push_back(std::move(snapshot));
-        }
+        if (!captureState(plan->autodiffInitialResources, initialState, initialStateBytes, error,
+                          &plan->autodiffInitialRanges))
+            return false;
         if (initialStateBytes != plan->autodiffCheckpointPlan.initialStateBytes) {
             error = "compiled graph initial-state checkpoint size does not match runtime resources";
             return false;
@@ -833,7 +859,8 @@ std::shared_ptr<GraphPullback> CompiledExecutionGraph::vjp(std::shared_ptr<const
             return {};
         }
         uint64_t transactionBytes = 0;
-        if (!impl->captureState(state_->autodiffTransactionResources, transactionState, transactionBytes, error)) {
+        if (!impl->captureState(state_->autodiffTransactionResources, transactionState, transactionBytes, error,
+                                &state_->autodiffTransactionRanges)) {
             rollback();
             return {};
         }
@@ -918,7 +945,7 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
         if (impl_->plan->hasAutodiffCheckpointPlan && impl_->plan->autodiffCheckpointPlan.replaySegments.size() > 1) {
             impl_->resetCheckpointLiveness();
             if (!impl_->captureState(impl_->plan->autodiffRestorationResources, finalState, finalStateBytes,
-                                     submission->error_)) {
+                                     submission->error_, &impl_->plan->autodiffRestorationRanges)) {
                 submission->state_ = GraphBackwardSubmission::State::Failed;
                 return submission;
             }

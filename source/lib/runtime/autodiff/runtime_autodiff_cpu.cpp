@@ -2126,7 +2126,7 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &p
                                    std::shared_ptr<CpuKernelState> backwardKernel,
                                    const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                                    const std::string &residualStorage, const std::string &selectedPolicy,
-                                   std::shared_ptr<Executable> &executable) {
+                                   bool wholeDispatchRetentionPermitted, std::shared_ptr<Executable> &executable) {
     HostProfileLayout primal;
     HostProfileLayout forward;
     HostProfileLayout backward;
@@ -2168,6 +2168,11 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &p
     const bool noTape = storage == CpuResidualStorage::None;
     if ((noTape != (staticTapeBytesHint == 0)) || staticTapeBytesHint > std::numeric_limits<size_t>::max()) {
         invocationDiagnostic(context) = "structured CPU autodiff planning metadata is invalid";
+        return false;
+    }
+    if (wholeDispatchRetentionPermitted &&
+        (storage != CpuResidualStorage::Static || policy == CpuPlanningPolicy::MinMemory)) {
+        invocationDiagnostic(context) = "structured CPU autodiff whole-dispatch permission is inconsistent";
         return false;
     }
     const bool validNoTape = noTape && forward.results.empty() && !forward.tapeAllocatorOffset &&
@@ -2264,9 +2269,8 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &p
     } else {
         if (!context.cpuTapePolicy)
             context.cpuTapePolicy = std::make_shared<HostTapeMemoryPolicy>();
-        auto plan = std::make_shared<CpuResidualPlan>(
-            CpuResidualPlan{storage, policy, static_cast<size_t>(staticTapeBytesHint),
-                            storage == CpuResidualStorage::Static && policy != CpuPlanningPolicy::MinMemory});
+        auto plan = std::make_shared<CpuResidualPlan>(CpuResidualPlan{
+            storage, policy, static_cast<size_t>(staticTapeBytesHint), wholeDispatchRetentionPermitted});
         executable = std::make_shared<TapedStructuredCpuExecutable>(context, std::move(program), std::move(plan));
     }
     return true;
@@ -2275,7 +2279,8 @@ bool finishStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &p
 bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &primalStage, const Stage &forwardStage,
                                  const Stage &backwardStage, const std::vector<std::string> &gradientPaths,
                                  uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                                 const std::string &selectedPolicy, std::shared_ptr<Executable> &executable) {
+                                 const std::string &selectedPolicy, bool wholeDispatchRetentionPermitted,
+                                 std::shared_ptr<Executable> &executable) {
     if (!primalStage.cpuArtifact || !forwardStage.cpuArtifact || !backwardStage.cpuArtifact) {
         invocationDiagnostic(context) = "CPU autodiff profiles have no loadable artifacts";
         return false;
@@ -2290,7 +2295,8 @@ bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &pri
         return false;
     return finishStructuredCpuExecutable(context, primalStage, forwardStage, backwardStage, std::move(primalKernel),
                                          std::move(forwardKernel), std::move(backwardKernel), gradientPaths,
-                                         staticTapeBytesHint, residualStorage, selectedPolicy, executable);
+                                         staticTapeBytesHint, residualStorage, selectedPolicy,
+                                         wholeDispatchRetentionPermitted, executable);
 }
 
 bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage &primalStage,
@@ -2298,7 +2304,8 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
                                       VernonCpuEntryPoint forwardEntry, const Stage &backwardStage,
                                       VernonCpuEntryPoint backwardEntry, const std::vector<std::string> &gradientPaths,
                                       uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                                      const std::string &selectedPolicy, std::shared_ptr<Executable> &executable) {
+                                      const std::string &selectedPolicy, bool wholeDispatchRetentionPermitted,
+                                      std::shared_ptr<Executable> &executable) {
     auto primalKernel = std::make_shared<CpuKernelState>();
     auto forwardKernel = std::make_shared<CpuKernelState>();
     auto backwardKernel = std::make_shared<CpuKernelState>();
@@ -2315,7 +2322,8 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
         return false;
     return finishStructuredCpuExecutable(context, primalStage, forwardStage, backwardStage, std::move(primalKernel),
                                          std::move(forwardKernel), std::move(backwardKernel), gradientPaths,
-                                         staticTapeBytesHint, residualStorage, selectedPolicy, executable);
+                                         staticTapeBytesHint, residualStorage, selectedPolicy,
+                                         wholeDispatchRetentionPermitted, executable);
 }
 
 } // namespace
@@ -2323,9 +2331,11 @@ bool loadStructuredCpuEntryExecutable(VernonRuntimeContext &context, const Stage
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primalStage, const Stage &forwardStage,
                          const Stage &backwardStage, const std::vector<std::string> &gradientPaths,
                          uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                         const std::string &selectedPolicy, std::shared_ptr<Executable> &executable) {
+                         const std::string &selectedPolicy, bool wholeDispatchRetentionPermitted,
+                         std::shared_ptr<Executable> &executable) {
     return loadStructuredCpuExecutable(context, primalStage, forwardStage, backwardStage, gradientPaths,
-                                       staticTapeBytesHint, residualStorage, selectedPolicy, executable);
+                                       staticTapeBytesHint, residualStorage, selectedPolicy,
+                                       wholeDispatchRetentionPermitted, executable);
 }
 
 bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry,
@@ -2333,15 +2343,13 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
                               VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
                               VernonStringView forwardName, VernonCpuEntryPoint backwardEntry,
                               VernonStringView backwardReflection, VernonStringView backwardName,
-                              VernonStringView forwardProtocol, VernonStringView backwardProtocol,
                               const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                               const std::string &residualStorage, const std::string &selectedPolicy,
-                              std::shared_ptr<Executable> &executable) {
+                              bool wholeDispatchRetentionPermitted, std::shared_ptr<Executable> &executable) {
     if (!primalEntry || !forwardEntry || !backwardEntry || !primalReflection.data || !primalReflection.size ||
         !forwardReflection.data || !forwardReflection.size || !backwardReflection.data || !backwardReflection.size ||
         !primalName.data || !primalName.size || !forwardName.data || !forwardName.size || !backwardName.data ||
-        !backwardName.size || !forwardProtocol.data || !forwardProtocol.size || !backwardProtocol.data ||
-        !backwardProtocol.size) {
+        !backwardName.size) {
         invocationDiagnostic(context) = "direct CPU autodiff profiles are invalid";
         return false;
     }
@@ -2354,14 +2362,9 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
     Stage backwardStage;
     backwardStage.entry.assign(backwardName.data, backwardName.size);
     backwardStage.reflection.assign(backwardReflection.data, backwardReflection.size);
-    if (std::string_view(forwardProtocol.data, forwardProtocol.size) != "dynamic_v2" ||
-        std::string_view(backwardProtocol.data, backwardProtocol.size) != "dynamic_v2") {
-        invocationDiagnostic(context) = "direct structured CPU autodiff requires explicit dynamic_v2 profiles";
-        return false;
-    }
-    return loadStructuredCpuEntryExecutable(context, primalStage, primalEntry, forwardStage, forwardEntry,
-                                            backwardStage, backwardEntry, gradientPaths, staticTapeBytesHint,
-                                            residualStorage, selectedPolicy, executable);
+    return loadStructuredCpuEntryExecutable(
+        context, primalStage, primalEntry, forwardStage, forwardEntry, backwardStage, backwardEntry, gradientPaths,
+        staticTapeBytesHint, residualStorage, selectedPolicy, wholeDispatchRetentionPermitted, executable);
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION

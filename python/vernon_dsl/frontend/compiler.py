@@ -35,6 +35,7 @@ class Compiler:
         runtime_entry: str | None = None,
         runtime_workgroup_size: tuple[int, int, int] | None = None,
         program_transform: ProgramTransformSpec | None = None,
+        autodiff_planning_policy: str | None = None,
     ) -> str:
         """Compile an already loaded module without entry-specialization caching."""
         try:
@@ -97,6 +98,13 @@ class Compiler:
                 context.typed_functions[node.name],
                 stage,
                 workgroup_size,
+                (
+                    program_transform.planning_policy
+                    if program_transform is not None and node.name == runtime_entry
+                    else autodiff_planning_policy
+                    if node.name == runtime_entry
+                    else None
+                ),
             ).emit()
 
         return emit_mlir_module(
@@ -151,6 +159,7 @@ class Compiler:
             runtime_entry=request.entry,
             runtime_workgroup_size=request.workgroup_size,
             program_transform=request.program_transform,
+            autodiff_planning_policy=request.autodiff_planning_policy,
         )
         result = FrontendCompileResult(
             mlir,

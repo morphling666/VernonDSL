@@ -68,6 +68,7 @@ balanced_asset = vd.pipeline_asset(
         balanced_objective,
         wrt=("x", "y", "z"),
         outputs=("output",),
+        planning_policy="balanced",
     ),
 )
 

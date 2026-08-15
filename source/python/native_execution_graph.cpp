@@ -159,6 +159,12 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     const std::vector<vernon::execution::PassPrimalResourceMapping> &requiredPrimalResources() const override {
         return requiredPrimalResources_;
     }
+    const std::vector<vernon::execution::PassWriteFootprint> &writeFootprints() const override {
+        return writeFootprints_;
+    }
+    const std::vector<vernon::execution::PassWriteFootprint> &readFootprints() const override {
+        return readFootprints_;
+    }
     bool forward(vernon::execution::ComputeEncoder &encoder, const vernon::execution::ExecutionResources &resources,
                  std::unique_ptr<vernon::execution::PassPullback> &pullback, std::string &error) override;
     bool zeroCotangent(const std::string &path, const vernon::execution::ExecutionResources &resources,
@@ -175,9 +181,10 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     bool hasCheckpointPlanningMetadata() const override { return hasCheckpointPlanningMetadata_; }
     bool supportsReplay() const override { return true; }
     void setAutodiff(const nb::list &gradients, const nb::list &cotangents, const nb::list &requiredPrimals,
-                     uint64_t invocationCount, uint64_t tapeStride, uint64_t workgroupInvocationCount,
-                     uint64_t replaySnapshotBytes, uint64_t replayCost, uint64_t resourceReloadCost,
-                     uint64_t recomputationCost, uint64_t retainedPrimalBytes, bool deterministicReductionLegal,
+                     const nb::list &readFootprints, const nb::list &writeFootprints, uint64_t invocationCount,
+                     uint64_t tapeStride, uint64_t workgroupInvocationCount, uint64_t replaySnapshotBytes,
+                     uint64_t replayCost, uint64_t resourceReloadCost, uint64_t recomputationCost,
+                     uint64_t retainedPrimalBytes, bool deterministicReductionLegal,
                      bool hasCheckpointPlanningMetadata) {
         const auto convert = [](const nb::list &values) {
             std::vector<vernon::execution::PassDerivativeMapping> result;
@@ -204,6 +211,28 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
                 throw std::invalid_argument("required primal mappings require path and resource id");
             requiredPrimalResources_.push_back({nb::cast<std::string>(entry[0]), nb::cast<uint32_t>(entry[1])});
         }
+        const auto convertFootprints = [](const nb::list &values, const char *label) {
+            std::vector<vernon::execution::PassWriteFootprint> result;
+            result.reserve(nb::len(values));
+            for (nb::handle value : values) {
+                nb::tuple entry = nb::cast<nb::tuple>(value);
+                if (nb::len(entry) != 2)
+                    throw std::invalid_argument(std::string(label) + " footprints require resource id and byte ranges");
+                vernon::execution::PassWriteFootprint footprint;
+                footprint.resource = nb::cast<uint32_t>(entry[0]);
+                for (nb::handle rangeValue : nb::cast<nb::list>(entry[1])) {
+                    nb::tuple range = nb::cast<nb::tuple>(rangeValue);
+                    if (nb::len(range) != 2)
+                        throw std::invalid_argument(std::string(label) +
+                                                    "-footprint ranges require byte offset and size");
+                    footprint.ranges.push_back({nb::cast<uint64_t>(range[0]), nb::cast<uint64_t>(range[1])});
+                }
+                result.push_back(std::move(footprint));
+            }
+            return result;
+        };
+        readFootprints_ = convertFootprints(readFootprints, "read");
+        writeFootprints_ = convertFootprints(writeFootprints, "write");
         if (invocationCount > std::numeric_limits<size_t>::max() || tapeStride > std::numeric_limits<size_t>::max() ||
             workgroupInvocationCount > std::numeric_limits<size_t>::max())
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
@@ -249,6 +278,8 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     std::vector<vernon::execution::PassDerivativeMapping> gradientMappings_;
     std::vector<vernon::execution::PassDerivativeMapping> cotangentMappings_;
     std::vector<vernon::execution::PassPrimalResourceMapping> requiredPrimalResources_;
+    std::vector<vernon::execution::PassWriteFootprint> readFootprints_;
+    std::vector<vernon::execution::PassWriteFootprint> writeFootprints_;
     uint64_t estimatedResidualBytes_{};
     uint64_t estimatedRetainedAllocationBytes_{};
     uint64_t estimatedForwardPeakBytes_{};

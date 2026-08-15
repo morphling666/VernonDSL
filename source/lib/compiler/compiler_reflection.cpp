@@ -706,6 +706,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         }
 
         llvm::json::Array arguments;
+        std::set<std::string> reflectedTensorViewOwners;
         uint64_t argumentOffset = 0;
         std::map<unsigned, uint32_t> generatedUniformBindings;
         std::map<unsigned, InterfaceExtent> physicalValueLayouts;
@@ -987,6 +988,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         shape.emplace_back(extent);
                     argument["vernon.source_shape"] = std::move(shape);
                 }
+            }
+            if (mlir::isa<mlir::vernon::TensorViewType>(argumentType)) {
+                if (logicalValue && logicalValue->sourcePathExplicit)
+                    reflectedTensorViewOwners.insert(logicalValue->sourcePath);
+                else if (argumentAttrs)
+                    if (auto sourceName = argumentAttrs.getAs<mlir::StringAttr>("vernon.source_name");
+                        sourceName && !sourceName.getValue().empty())
+                        reflectedTensorViewOwners.insert(sourceName.getValue().str());
             }
             if (auto generated = generatedUniformBindings.find(index); generated != generatedUniformBindings.end()) {
                 argument["vernon.set"] = int64_t{0};
@@ -1428,6 +1437,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                                                             {"requires_unit_workgroup", unitWorkgroup.getValue()}};
         }
         llvm::json::Array effects;
+        llvm::json::Array writeFootprints;
         if (auto reflectedEffects = function->getAttrOfType<mlir::ArrayAttr>("vernon.storage_effects")) {
             for (mlir::Attribute reflectedEffect : reflectedEffects) {
                 auto effect = mlir::dyn_cast<mlir::DictionaryAttr>(reflectedEffect);
@@ -1438,6 +1448,12 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 auto region = effect.getAs<mlir::StringAttr>("region");
                 if (!kind || !owner || !region)
                     continue;
+                if (reflectedTensorViewOwners.find(owner.getValue().str()) == reflectedTensorViewOwners.end()) {
+                    function.emitError() << "storage effect owner '" << owner.getValue()
+                                         << "' does not name a reflected TensorView argument";
+                    invalid = true;
+                    return;
+                }
                 llvm::json::Object reflected;
                 reflected["kind"] = kind.getValue().str();
                 reflected["owner"] = owner.getValue().str();
@@ -1450,9 +1466,22 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         indices.emplace_back(index);
                 reflected["indices"] = std::move(indices);
                 effects.emplace_back(std::move(reflected));
+                if (kind.getValue() != "read") {
+                    llvm::json::Object footprint;
+                    footprint["version"] = int64_t{1};
+                    footprint["owner"] = owner.getValue().str();
+                    footprint["kind"] = region.getValue() == "element" ? "exact_element" : "whole_view";
+                    llvm::json::Array footprintIndices;
+                    if (auto values = effect.getAs<mlir::DenseI64ArrayAttr>("indices"))
+                        for (int64_t index : values.asArrayRef())
+                            footprintIndices.emplace_back(index);
+                    footprint["indices"] = std::move(footprintIndices);
+                    writeFootprints.emplace_back(std::move(footprint));
+                }
             }
         }
         entry["effects"] = std::move(effects);
+        entry["tensor_view_write_footprints"] = std::move(writeFootprints);
         entries.emplace_back(std::move(entry));
     });
     if (invalid)

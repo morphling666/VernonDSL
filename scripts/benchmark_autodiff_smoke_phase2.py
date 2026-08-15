@@ -91,7 +91,7 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
     forward_seconds = 0.0
     backward_seconds = 0.0
     rss_samples = [rss_before]
-    tape_samples: list[tuple[int, int, int, int, int]] = []
+    tape_samples: list[tuple[int, int, int, int, int, int]] = []
     pass_telemetry: tuple[dict[str, Any], ...] = ()
     tape_context_limit_bytes = 0
     peak_temporary_tape_bytes = 0
@@ -106,6 +106,7 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
                 pullback.logical_residual_bytes,
                 pullback.resident_tape_bytes,
                 pullback.allocated_tape_bytes,
+                pullback.retained_allocation_bytes,
                 pullback.checkpoint_bytes,
                 pullback.peak_runtime_managed_bytes,
             )
@@ -113,7 +114,7 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
         backward_started = time.perf_counter()
         pullback(_cotangents(grid))
         backward_seconds += time.perf_counter() - backward_started
-        tape_samples[-1] = (*tape_samples[-1][:4], pullback.peak_runtime_managed_bytes)
+        tape_samples[-1] = (*tape_samples[-1][:5], pullback.peak_runtime_managed_bytes)
         tape_context_limit_bytes = pullback.tape_context_limit_bytes
         recomputation_factor = pullback.recomputation_factor
         pass_telemetry = pullback.pass_telemetry
@@ -124,9 +125,23 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
         python_reverse_callback_count = pullback.reverse_python_callback_count
         del pullback
         rss_samples.append(_rss_bytes())
-    logical_bytes, resident_bytes, allocated_bytes, checkpoint_bytes, peak_runtime_managed_bytes = tape_samples[-1]
+    (
+        logical_bytes,
+        resident_bytes,
+        allocated_bytes,
+        retained_allocation_bytes,
+        checkpoint_bytes,
+        peak_runtime_managed_bytes,
+    ) = tape_samples[-1]
     elapsed = forward_seconds + backward_seconds
     rss_after = rss_samples[-1]
+    measured_rss_samples = rss_samples[1:]
+    stable_window_size = max(5, steps // 5)
+    stable_window = measured_rss_samples[-stable_window_size:]
+    stable_tolerance_bytes = max(1024 * 1024, max(stable_window) // 100)
+    rss_stable_high_water_mark = (
+        len(stable_window) == stable_window_size and max(stable_window) - min(stable_window) <= stable_tolerance_bytes
+    )
 
     telemetry_errors = [
         name
@@ -138,7 +153,7 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
                 "min-memory-retained-tape",
                 any(
                     logical != 0 or resident != 0 or allocated != 0
-                    for logical, resident, allocated, _, _ in tape_samples
+                    for logical, resident, allocated, _, _, _ in tape_samples
                 ),
             ),
             ("peak<allocated+checkpoint", peak_runtime_managed_bytes < allocated_bytes + checkpoint_bytes),
@@ -190,17 +205,24 @@ def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]
         "logical_residual_bytes": logical_bytes,
         "resident_bytes": resident_bytes,
         "allocated_bytes": allocated_bytes,
+        "retained_allocation_bytes": retained_allocation_bytes,
         "native_checkpoint_bytes": checkpoint_bytes,
         "peak_runtime_managed_bytes": peak_runtime_managed_bytes,
         "resident_to_logical_ratio": resident_bytes / logical_bytes if logical_bytes else 0.0,
         "rss_bytes": rss_after,
+        "rss_before_bytes": rss_before,
+        "rss_samples_bytes": measured_rss_samples,
         "rss_delta_bytes": max(rss_after - rss_before, 0),
         "rss_growth_bytes": max(rss_samples[-1] - rss_samples[1], 0) if len(rss_samples) > 2 else 0,
+        "rss_stable_high_water_mark": rss_stable_high_water_mark,
+        "rss_stability_window_steps": stable_window_size,
+        "rss_stability_tolerance_bytes": stable_tolerance_bytes,
         "max_logical_residual_bytes": max(sample[0] for sample in tape_samples),
         "max_resident_bytes": max(sample[1] for sample in tape_samples),
         "max_allocated_bytes": max(sample[2] for sample in tape_samples),
-        "max_checkpoint_bytes": max(sample[3] for sample in tape_samples),
-        "max_peak_runtime_managed_bytes": max(sample[4] for sample in tape_samples),
+        "max_retained_allocation_bytes": max(sample[3] for sample in tape_samples),
+        "max_checkpoint_bytes": max(sample[4] for sample in tape_samples),
+        "max_peak_runtime_managed_bytes": max(sample[5] for sample in tape_samples),
         "peak_temporary_tape_bytes": peak_temporary_tape_bytes,
         "elapsed_seconds": elapsed,
         "forward_seconds": forward_seconds,
@@ -223,20 +245,22 @@ def _markdown(results: list[dict[str, Any]]) -> str:
         f"Frozen baseline: {BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL:.1f} logical bytes per active cell; "
         f"compiler Tape hints per lane={BASELINE_COMPILER_TAPE_HINTS}.",
         "",
-        "| Grid | Pressure | Steps | Logical residual | Logical/cell | Resident | Allocated | Temporary Tape peak | "
+        "| Grid | Pressure | Steps | Logical residual | Logical/cell | Resident | Allocated | Retained allocation | "
+        "Temporary Tape peak | "
         "Checkpoint | Peak managed | "
         "Resident/logical | RSS | "
-        "RSS delta | Forward | Backward | Recompute | Python callbacks |",
+        "RSS delta | Stable RSS | Forward | Backward | Recompute | Python callbacks |",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
-        "---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         lines.append(
             "| {grid} | {pressure_iterations} | {steps} | {logical_residual_bytes} | "
             "{logical_bytes_per_active_cell:.3f} | "
-            "{resident_bytes} | {allocated_bytes} | {peak_temporary_tape_bytes} | "
+            "{resident_bytes} | {allocated_bytes} | {retained_allocation_bytes} | {peak_temporary_tape_bytes} | "
             "{native_checkpoint_bytes} | {peak_runtime_managed_bytes} | {resident_to_logical_ratio:.3f} | "
-            "{rss_bytes} | {rss_delta_bytes} | {forward_seconds:.6f}s | {backward_seconds:.6f}s | "
+            "{rss_bytes} | {rss_delta_bytes} | {rss_stable_high_water_mark} | "
+            "{forward_seconds:.6f}s | {backward_seconds:.6f}s | "
             "{recomputation_factor:.3f} | {python_reverse_callback_count} |".format(**result)
         )
     lines.extend(
@@ -248,8 +272,9 @@ def _markdown(results: list[dict[str, Any]]) -> str:
             "process after backward; each grid runs in a fresh process.",
             "",
             "The JSON artifact also records maxima across all measured steps and RSS growth after the first "
-            "measured step, so pressure runs distinguish stable selected residual/checkpoint storage from "
-            "unconditional per-step Tape retention.",
+            "measured step, plus every per-step RSS sample. Stable RSS means the final max(5, steps/5) samples "
+            "fit within max(1 MiB, 1% of that window's high-water mark), so pressure runs distinguish stable "
+            "selected residual/checkpoint storage from unconditional per-step Tape retention.",
             "",
             "Recomputation factor is 1 + compiler-estimated rematerialization cost / active operation count, plus "
             "any graph-checkpoint replay factor.",
@@ -311,7 +336,7 @@ def main() -> None:
         results.append(result)
         print(json.dumps(result, sort_keys=True))
     report = {
-        "schema_version": 2,
+        "schema_version": 3,
         "baseline": {
             "logical_bytes_per_active_cell": BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL,
             "compiler_tape_hints_per_lane": BASELINE_COMPILER_TAPE_HINTS,
