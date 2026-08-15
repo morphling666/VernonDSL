@@ -6,8 +6,8 @@ VernonDSL 0.1.2 is the current stable cross-platform release target. The current
 version axes are:
 
 - release `0.1.2`;
-- compiler contract 11;
-- pipeline contract 15;
+- compiler contract 12;
+- pipeline contract 16;
 - released frontend version 3, with language v4 remaining a future target.
 
 The supported wheel matrix is CPython 3.11–3.14 on Windows x64, Linux x64, and
@@ -185,7 +185,7 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Cooked CPU regression coverage includes f64 primal/cotangent/gradient
   preservation, signed-stride aggregate outputs, strided gradient scatter,
   gather accumulation, and independent multi-output cotangents.
-- Compiler contract 11 and pipeline contract 15 freeze the current unified
+- Compiler contract 12 and pipeline contract 16 freeze the current unified
   autodiff and manifest boundary without compatibility readers.
 
 ## Future work

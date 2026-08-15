@@ -155,16 +155,26 @@ public:
 
 using NamedGraphAutodiffValues = std::vector<std::pair<std::string, std::shared_ptr<GraphAutodiffValue>>>;
 
+struct PassPullbackApplyOptions {
+    uint64_t maximumTemporaryBytes{std::numeric_limits<uint64_t>::max()};
+    uint64_t maximumReusableConstructionBytes{};
+};
+
 class PassPullback {
 public:
     virtual ~PassPullback() = default;
     virtual bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
                        std::string &error) = 0;
+    virtual bool applyWithOptions(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
+                                  const PassPullbackApplyOptions &, std::string &error) {
+        return apply(cotangents, gradients, error);
+    }
     virtual uint64_t estimatedTapeBytes() const = 0;
     virtual uint64_t logicalResidualBytes() const = 0;
     virtual uint64_t residentTapeBytes() const = 0;
     virtual uint64_t allocatedTapeBytes() const = 0;
     virtual uint64_t retainedAllocationBytes() const { return allocatedTapeBytes(); }
+    virtual uint64_t peakTemporaryTapeBytes() const { return 0; }
     virtual uint64_t activeOperationCount() const = 0;
     virtual uint64_t recomputationCost() const = 0;
     virtual uint64_t tapeContextLimitBytes() const = 0;
@@ -574,6 +584,7 @@ struct GraphAutodiffPassTelemetry {
     uint64_t residentTapeBytes{};
     uint64_t allocatedTapeBytes{};
     uint64_t retainedAllocationBytes{};
+    uint64_t peakTemporaryTapeBytes{};
     uint64_t checkpointBytes{};
     uint64_t activeOperationCount{};
     uint64_t recomputationCost{};

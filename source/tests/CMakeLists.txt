@@ -72,6 +72,15 @@ function(
     wrapper_function
     manifest_variable
     target_variable)
+    cmake_parse_arguments(
+        FIXTURE
+        ""
+        "COOK_SCRIPT"
+        ""
+        ${ARGN})
+    if(FIXTURE_UNPARSED_ARGUMENTS)
+        message(FATAL_ERROR "unknown CPU autodiff fixture arguments: ${FIXTURE_UNPARSED_ARGUMENTS}")
+    endif()
     set(_vernon_directory "${VERNON_TEST_BINARY_ROOT}/${directory_stem}")
     set(_vernon_manifest "${_vernon_directory}/${manifest_name}")
     set(_vernon_registration "${_vernon_directory}/autodiff_registration.c")
@@ -86,18 +95,25 @@ function(
                 ""
                 _vernon_asset_source
                 "${asset_reference}")
+    if(FIXTURE_COOK_SCRIPT)
+        set(_vernon_cook_command ${Python_EXECUTABLE} "${FIXTURE_COOK_SCRIPT}" "${asset_reference}"
+                                 "${_vernon_directory}")
+    else()
+        set(_vernon_cook_command ${Python_EXECUTABLE} -m vernon_dsl.pipeline_asset_cli "${asset_reference}" --target
+                                 cpu --output "${_vernon_directory}")
+    endif()
     add_custom_command(
         OUTPUT "${_vernon_manifest}"
                "${_vernon_registration}"
                "${_vernon_wrapper}"
                ${_vernon_objects}
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_directory}"
-        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${ARGN} ${Python_EXECUTABLE} -m
-                vernon_dsl.pipeline_asset_cli "${asset_reference}" --target cpu --output "${_vernon_directory}"
+        COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${_vernon_cook_command}
         COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
                 "${_vernon_manifest}" "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}"
         DEPENDS vernon-dsl-native
                 "${_vernon_asset_source}"
+                ${FIXTURE_COOK_SCRIPT}
                 ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
                 "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
         VERBATIM)
@@ -292,6 +308,16 @@ if(TARGET VernonRuntime)
             structured_scalar_autodiff_manifest
             structured_scalar_autodiff_fixture_target)
         vernon_add_cpu_autodiff_fixture(
+            structured-scalar-balanced-autodiff
+            autodiff_structured_scalar_balanced_fixture
+            autodiff_structured_scalar_balanced_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:balanced_asset"
+            vernonRegisterStructuredScalarBalancedAutodiffFixture
+            structured_scalar_balanced_autodiff_manifest
+            structured_scalar_balanced_autodiff_fixture_target
+            COOK_SCRIPT
+            "${VERNON_TEST_ROOT}/scripts/cook_balanced_autodiff_fixture.py")
+        vernon_add_cpu_autodiff_fixture(
             structured-dynamic-autodiff
             autodiff_structured_dynamic_fixture
             autodiff_structured_dynamic_fixture.pipeline.json
@@ -402,14 +428,17 @@ if(TARGET VernonRuntime)
                     Vernon::Runtime
                     nlohmann_json::nlohmann_json
                     ${structured_scalar_autodiff_fixture_target}
+                    ${structured_scalar_balanced_autodiff_fixture_target}
                     ${structured_dynamic_autodiff_fixture_target}
                     ${structured_f64_autodiff_fixture_target})
         target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
         target_compile_definitions(
             VernonStructuredScalarAutodiffTests
-            PRIVATE VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}"
-                    VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
-                    VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
+            PRIVATE
+                VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}"
+                VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST="${structured_scalar_balanced_autodiff_manifest}"
+                VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
+                VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
         if(VERNON_HOST_TAPE_INSTRUMENTATION)
             target_compile_definitions(VernonStructuredScalarAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
         endif()
@@ -453,6 +482,7 @@ if(TARGET VernonRuntime)
             PRIVATE
                 VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST="${structured_storage_workgroup_autodiff_manifest}"
         )
+        target_include_directories(VernonRuntimeWorkgroupAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
         set_target_properties(VernonRuntimeWorkgroupAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonRuntimeWorkgroupAutodiffTests VernonRuntime)

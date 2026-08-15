@@ -18,6 +18,7 @@ struct AutodiffPullbackMemoryUsage {
     size_t residentBytes{};
     size_t allocatedBytes{};
     size_t retainedAllocationBytes{};
+    size_t peakTemporaryBytes{};
 };
 
 VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
@@ -25,7 +26,8 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
     VernonStringView backwardName, VernonStringView forwardProtocol, VernonStringView backwardProtocol,
-    const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount, uint64_t staticTapeBytesHint);
+    const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount, uint64_t staticTapeBytesHint,
+    VernonStringView residualStorage, VernonStringView selectedPolicy);
 
 VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline);

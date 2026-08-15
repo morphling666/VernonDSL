@@ -388,13 +388,20 @@ public:
                     telemetry.residentTapeBytes = tape->residentTapeBytes();
                     telemetry.allocatedTapeBytes = tape->allocatedTapeBytes();
                     telemetry.retainedAllocationBytes = tape->retainedAllocationBytes();
+                    telemetry.peakTemporaryTapeBytes = tape->peakTemporaryTapeBytes();
                     telemetry.activeOperationCount = tape->activeOperationCount();
                     telemetry.recomputationCost = tape->recomputationCost();
                     pullback.passTelemetryValues.push_back(std::move(telemetry));
                 }
-                if (!pullback.observeTapeAllocation(tape->retainedAllocationBytes(), context.temporaryBytes,
-                                                    context.temporaryBytesAllocated ? context.temporaryBytes : 0,
-                                                    context.error))
+                uint64_t budgetTemporaryBytes = context.temporaryBytes;
+                uint64_t observedTemporaryBytes = context.temporaryBytesAllocated ? context.temporaryBytes : 0;
+                if (!checkedAdd(budgetTemporaryBytes, tape->peakTemporaryTapeBytes(), budgetTemporaryBytes) ||
+                    !checkedAdd(observedTemporaryBytes, tape->peakTemporaryTapeBytes(), observedTemporaryBytes)) {
+                    context.error = "graph pullback temporary Tape telemetry overflows";
+                    return VERNON_RHI_STATUS_INTERNAL_ERROR;
+                }
+                if (!pullback.observeTapeAllocation(tape->retainedAllocationBytes(), budgetTemporaryBytes,
+                                                    observedTemporaryBytes, context.error))
                     return VERNON_RHI_STATUS_INTERNAL_ERROR;
                 if (context.retainTapes)
                     pullback.tapes[offset] = std::move(tape);
@@ -614,6 +621,28 @@ public:
         return true;
     }
 
+    bool pullbackApplyOptions(uint64_t temporaryBytes, PassPullbackApplyOptions &options, std::string &error) const {
+        if (!plan->hasAutodiffCheckpointPlan) {
+            options = {};
+            return true;
+        }
+        uint64_t managed = retainedAllocationBytesUnlocked();
+        if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
+            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed) ||
+            !checkedAdd(managed, plan->autodiffCheckpointPlan.backwardValueBytes, managed)) {
+            error = "graph pullback apply-time budget accounting overflows";
+            return false;
+        }
+        if (managed > plan->autodiffCheckpointPlan.memoryBudget) {
+            error = "graph pullback has no remaining compiled checkpoint budget";
+            return false;
+        }
+        const uint64_t remaining = plan->autodiffCheckpointPlan.memoryBudget - managed;
+        options.maximumTemporaryBytes = remaining;
+        options.maximumReusableConstructionBytes = remaining;
+        return true;
+    }
+
     bool applySegment(uint32_t begin, uint32_t end, EndpointValues &accumulated, uint64_t temporaryBytes,
                       std::string &error) {
         std::vector<VernonRhiBuffer> buffers(
@@ -661,8 +690,18 @@ public:
                 return false;
             }
             NamedGraphAutodiffValues localGradients;
-            if (!tape->second->apply(localCotangents, localGradients, error))
+            PassPullbackApplyOptions applyOptions;
+            if (!pullbackApplyOptions(temporaryBytes, applyOptions, error) ||
+                !tape->second->applyWithOptions(localCotangents, localGradients, applyOptions, error))
                 return false;
+            const uint64_t peakTemporaryTapeBytes = tape->second->peakTemporaryTapeBytes();
+            if (!observeTapeAllocation(0, peakTemporaryTapeBytes, peakTemporaryTapeBytes, error))
+                return false;
+            const auto telemetry =
+                std::find_if(passTelemetryValues.begin(), passTelemetryValues.end(),
+                             [&](const GraphAutodiffPassTelemetry &value) { return value.scheduleOffset == offset; });
+            if (telemetry != passTelemetryValues.end())
+                telemetry->peakTemporaryTapeBytes = std::max(telemetry->peakTemporaryTapeBytes, peakTemporaryTapeBytes);
             if (!observeBackwardValues(accumulated, &localByEndpoint, &localGradients, temporaryBytes, true, error))
                 return false;
             std::unordered_map<std::string, std::shared_ptr<GraphAutodiffValue>> gradientsByPath;

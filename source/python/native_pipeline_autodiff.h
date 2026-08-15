@@ -119,11 +119,17 @@ struct PythonPullback {
     nb::dict apply(const nb::object &cotangent) { return applyImpl(cotangent, false); }
     nb::dict applyLogical(const nb::object &cotangent) { return applyImpl(cotangent, true); }
     nb::dict applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
-                          const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical);
+                          const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical) {
+        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, nullptr);
+    }
+    nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
+                                     const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
+                                     const VernonPullbackApplyOptions *options);
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
     size_t retainedAllocationBytes() const { return memoryUsage().retainedAllocationBytes; }
+    size_t peakTemporaryBytes() const { return memoryUsage().peakTemporaryBytes; }
     size_t tapeContextLimitBytes() const { return vernon::runtime::autodiffHostTapeContextLimit(runtime); }
     const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
@@ -132,7 +138,8 @@ private:
         return vernon::runtime::autodiffPullbackMemoryUsage(handle);
     }
 
-    nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent) {
+    nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent,
+                       const VernonPullbackApplyOptions *options = nullptr) {
         std::deque<PythonAdValue> gradientValues;
         std::vector<VernonAdValue> gradientViews;
         nb::dict result;
@@ -181,7 +188,9 @@ private:
             seedSet = {sizeof(VernonAdValueSet), seedViews.data(), seedViews.size(), {}};
             seedView = &seedSet;
         }
-        if (vernonPullbackApply(handle, seedView, &gradientSet) != VERNON_STATUS_OK)
+        const VernonStatus status = options ? vernonPullbackApplyWithOptions(handle, seedView, &gradientSet, options)
+                                            : vernonPullbackApply(handle, seedView, &gradientSet);
+        if (status != VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
         std::unordered_map<PyObject *, nb::object> gradientsByOwner;

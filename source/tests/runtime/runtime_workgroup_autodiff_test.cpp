@@ -1,7 +1,9 @@
 #include "VernonRuntime.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -52,6 +54,10 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
+    const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+    EXPECT_EQ(memory.logicalResidualBytes, 0u);
+    EXPECT_EQ(memory.residentBytes, 0u);
+    EXPECT_EQ(memory.allocatedBytes, 0u);
     for (size_t lane = 0; lane < laneCount; ++lane) {
         const size_t groupBase = lane / 4 * 4;
         const size_t neighbor = groupBase + (lane + 1) % 4;
@@ -88,6 +94,15 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
         EXPECT_FLOAT_EQ(carrierGradients[lane], 2.0f * scale * weights[consumer]);
         const size_t neighbor = groupBase + (lane + 1) % 4;
         expectedScaleGradient += 2.0f * carriers[neighbor] * weights[lane];
+    }
+    EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
+    std::fill(std::begin(carrierGradients), std::end(carrierGradients), 0.0f);
+    scaleGradient = 0.0f;
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+    for (size_t lane = 0; lane < laneCount; ++lane) {
+        const size_t groupBase = lane / 4 * 4;
+        const size_t consumer = groupBase + (lane + 3) % 4;
+        EXPECT_FLOAT_EQ(carrierGradients[lane], 2.0f * scale * weights[consumer]);
     }
     EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
 

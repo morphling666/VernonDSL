@@ -336,6 +336,17 @@ typedef struct VernonAdDerivativeGroupView {
     uint32_t reserved[4];
 } VernonAdDerivativeGroupView;
 
+#define VERNON_PULLBACK_APPLY_OPTIONS_VERSION 1
+
+typedef struct VernonPullbackApplyOptions {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint64_t maximum_temporary_bytes;
+    uint64_t maximum_reusable_construction_bytes;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonPullbackApplyOptions;
+
 typedef struct VernonPipelineBundleLoadOptions {
     uint32_t struct_size;
     /*
@@ -410,6 +421,10 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroup
     const VernonLoadedPipeline *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(
     const VernonLoadedPipeline *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
+VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback,
+                                                                const VernonAdValueSet *cotangents,
+                                                                VernonAdValueSet *gradients,
+                                                                const VernonPullbackApplyOptions *options);
 VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                                      VernonAdValueSet *gradients);
 VERNON_RUNTIME_CAPI void vernonPullbackDestroy(VernonPullback *pullback);

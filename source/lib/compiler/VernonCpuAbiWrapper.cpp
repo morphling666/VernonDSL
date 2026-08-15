@@ -603,8 +603,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Value *hasLaneResults =
         builder.CreateICmpNE(laneResults, llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(pointerType)));
     llvm::Value *hasLaneTables = builder.CreateOr(hasLaneArguments, hasLaneResults);
-    validRange = builder.CreateAnd(validRange, builder.CreateOr(builder.CreateNot(hasLaneTables),
-                                                                builder.CreateICmpUGE(laneTableCount, globalVolume)));
+    validRange =
+        builder.CreateAnd(validRange, builder.CreateOr(builder.CreateNot(hasLaneTables),
+                                                       builder.CreateICmpUGE(laneTableCount, workgroupVolume)));
     if (metadata.argumentsSize)
         validRange = builder.CreateAnd(
             validRange,
@@ -676,6 +677,8 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Value *globalLinear = builder.CreateAdd(
         global[0],
         builder.CreateMul(globalWidth, builder.CreateAdd(global[1], builder.CreateMul(globalHeight, global[2]))));
+    llvm::Value *laneTableIndex =
+        builder.CreateSelect(builder.CreateICmpULT(laneTableCount, globalVolume), lane, globalLinear);
 
     auto selectLanePointer = [&](llvm::Value *common, llvm::Value *table, llvm::StringRef name) {
         llvm::BasicBlock *commonBlock = llvm::BasicBlock::Create(context, name + ".common", wrapper);
@@ -688,7 +691,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
         builder.CreateBr(joinedBlock);
         builder.SetInsertPoint(tableBlock);
         llvm::Value *lanePointer =
-            builder.CreateLoad(pointerType, builder.CreateGEP(pointerType, table, globalLinear), name);
+            builder.CreateLoad(pointerType, builder.CreateGEP(pointerType, table, laneTableIndex), name);
         builder.CreateBr(joinedBlock);
         builder.SetInsertPoint(joinedBlock);
         llvm::PHINode *selected = builder.CreatePHI(pointerType, 2, name + ".selected");

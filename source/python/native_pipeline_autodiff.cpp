@@ -102,8 +102,9 @@ nb::object storageCotangentLeaf(const nb::object &value, const nb::handle &group
 
 } // namespace
 
-nb::dict PythonPullback::applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
-                                      const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical) {
+nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
+                                                 const nb::object &cotangentGroups, const nb::object &carrierShape,
+                                                 bool logical, const VernonPullbackApplyOptions *options) {
     const size_t cotangentGroupCount = nb::len(cotangentGroups);
     nb::object nativeCotangent = nb::none();
     if (!cotangent.is_none()) {
@@ -155,7 +156,7 @@ nb::dict PythonPullback::applyGrouped(const nb::object &cotangent, const nb::obj
         }
     }
 
-    nb::dict leafResults = applyImpl(nativeCotangent, logical);
+    nb::dict leafResults = applyImpl(nativeCotangent, logical, options);
     nb::dict grouped;
     for (nb::handle group : nb::iter(gradientGroups)) {
         const std::vector<std::string> paths = derivativeGroupLeaves(group);

@@ -325,7 +325,7 @@ compiler-internal ProgramGraph proposed for autodiff.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
-Pipeline 15 records the required texture dimension; format remains
+Pipeline 16 records the required texture dimension; format remains
 unconstrained.
 
 A target is reported as available only after its complete lowering and
@@ -677,7 +677,7 @@ keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
 is part of the stable Apple Silicon macOS compute and offscreen graphics
 subset. DirectX DXIL manifests use the Windows D3D12 runtime backend.
 
-Pipeline 15 defines one canonical `*.pipeline.json` root for every target and
+Pipeline 16 defines one canonical `*.pipeline.json` root for every target and
 for both compute and graphics programs. Primal-only assets omit autodiff
 metadata. Differentiated assets add one optional root `autodiff` object; the
 pipeline-13 transform/profile fields must not be emitted or interpreted as

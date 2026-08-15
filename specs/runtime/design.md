@@ -561,7 +561,7 @@ stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
 
-Pipeline 15 uses one canonical `*.pipeline.json` schema for compute and
+Pipeline 16 uses one canonical `*.pipeline.json` schema for compute and
 graphics. Its optional root `autodiff` object contains differentiated-program
 metadata; it is absent for ordinary primal-only assets. Pipeline-13
 transform/profile fields are not current aliases.
@@ -578,6 +578,24 @@ produces deterministic scheduling and barriers, and fuses adjacent compatible
 render passes. Runtime pipeline invocations encode bindings and draw/dispatch
 commands into the graph-provided typed encoder; attachment ownership and clear
 policy remain outside Runtime.
+
+Graph VJP attaches logical names to differentiable `GraphResource` inputs,
+execution value parameters, and objective resources. `VjpComputePass` adapts a
+direct or cooked structured pipeline VJP: its forward execution records the
+existing Runtime pullback rather than reproducing pipeline tape logic.
+`CompiledExecutionGraph.vjp()`
+returns a pullback that retains the immutable plan, forward submission, primal
+resources, and pass tapes. Applying it traverses scheduled differentiable
+passes in reverse, materializes missing local cotangents as zero, and
+deterministically sums contributions by graph resource identity. An omitted
+cotangent is valid only for one scalar objective. Non-differentiable writes on
+an active reverse path are rejected explicitly.
+
+The pullback's canonical backward operation is `submit()`. CPU and statically
+linked cooked CPU entries may finish that backward submission inline; the
+submission object and ownership boundary remain unchanged when execution moves
+to workers. Its synchronous call form waits and returns the same named gradient
+mapping.
 
 Tensor allocations belong to one runtime generation. Reinitializing the
 runtime invalidates cached native handles. Within a generation, unchanged

@@ -29,6 +29,7 @@ class _CompiledDirectVjp:
     derivative_groups: tuple[DerivativeGroup, ...]
     tape_bytes_per_invocation: int
     residual_storage_kind: str
+    selected_policy: str
     active_operation_count: int
     recomputation_cost: int
     resource_reload_cost: int
@@ -77,6 +78,10 @@ class _StructuredPullback:
     @property
     def allocated_tape_bytes(self) -> int:
         return int(self.native.allocated_bytes)
+
+    @property
+    def peak_temporary_tape_bytes(self) -> int:
+        return int(self.native.peak_temporary_bytes)
 
     @property
     def recomputation_factor(self) -> float:
@@ -296,6 +301,8 @@ def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
         compiled.forward_protocol,
         compiled.backward_protocol,
         compiled.tape_bytes_per_invocation,
+        compiled.residual_storage_kind,
+        compiled.selected_policy,
         [(group.role, group.declared_path, list(group.leaf_paths)) for group in compiled.derivative_groups],
     )
     compiled.runtime_generation = runtime_state._runtime_generation
@@ -359,6 +366,7 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
             derivative_groups=derivative_groups,
             tape_bytes_per_invocation=int(structured.plan.tape_bytes),
             residual_storage_kind=structured.residual_storage_kind,
+            selected_policy=structured.selected_policy,
             active_operation_count=structured.active_operation_count,
             recomputation_cost=structured.recomputation_cost,
             resource_reload_cost=int(structured.cost_components.get("resource_reload_cost", 0)),

@@ -21,7 +21,7 @@ import vernon_dsl as vd  # noqa: E402
 
 from examples.autodiff_smoke_mpc import SmokeFluidSimulation, v_target  # noqa: E402
 
-DEFAULT_GRIDS = (32, 64, 128, 256)
+DEFAULT_GRIDS = (32, 64, 128, 256, 512, 1024)
 BENCHMARK_TAPE_CONTEXT_LIMIT = 256 * 1024 * 1024
 BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL = 469.8
 BASELINE_COMPILER_TAPE_HINTS = {
@@ -72,9 +72,13 @@ def _run_gradient_parity_gate() -> None:
         raise RuntimeError(f"finite-difference gradient parity gate failed:\n{detail}")
 
 
-def _run_grid(grid: int) -> dict[str, Any]:
+def _run_grid(grid: int, pressure_iterations: int, steps: int) -> dict[str, Any]:
     vd.init(arch=vd.cpu)
-    simulation = SmokeFluidSimulation(grid=grid, pressure_iterations=1, differentiable=True)
+    simulation = SmokeFluidSimulation(
+        grid=grid,
+        pressure_iterations=pressure_iterations,
+        differentiable=True,
+    )
     target = v_target(grid)
 
     warmup = simulation.step_vjp(target)
@@ -84,56 +88,120 @@ def _run_grid(grid: int) -> dict[str, Any]:
     gc.collect()
 
     rss_before = _rss_bytes()
-    forward_started = time.perf_counter()
-    pullback = simulation.step_vjp(target)
-    forward_seconds = time.perf_counter() - forward_started
-    logical_bytes = pullback.logical_residual_bytes
-    resident_bytes = pullback.resident_tape_bytes
-    allocated_bytes = pullback.allocated_tape_bytes
-    checkpoint_bytes = pullback.checkpoint_bytes
-    peak_runtime_managed_bytes = pullback.peak_runtime_managed_bytes
-    tape_context_limit_bytes = pullback.tape_context_limit_bytes
-    recomputation_factor = pullback.recomputation_factor
-    pass_telemetry = pullback.pass_telemetry
-    backward_started = time.perf_counter()
-    pullback(_cotangents(grid))
-    backward_seconds = time.perf_counter() - backward_started
-    python_reverse_callback_count = pullback.reverse_python_callback_count
-    elapsed = forward_seconds + backward_seconds
-    rss_after = _rss_bytes()
-
-    if (
-        logical_bytes <= 0
-        or resident_bytes < logical_bytes
-        or allocated_bytes < resident_bytes
-        or peak_runtime_managed_bytes < allocated_bytes + checkpoint_bytes
-        or tape_context_limit_bytes != BENCHMARK_TAPE_CONTEXT_LIMIT
-        or peak_runtime_managed_bytes > tape_context_limit_bytes
-        or forward_seconds <= 0
-        or backward_seconds <= 0
-        or python_reverse_callback_count != 9
-        or sum(int(item["logical_residual_bytes"]) for item in pass_telemetry) != logical_bytes
-        or sum(int(item["resident_tape_bytes"]) for item in pass_telemetry) != resident_bytes
-        or sum(int(item["allocated_tape_bytes"]) for item in pass_telemetry) != allocated_bytes
-        or sum(int(item["checkpoint_bytes"]) for item in pass_telemetry) != checkpoint_bytes
-        or any(
-            item["residual_source_kind"].split("+")[:1] not in [["none"], ["static_capture"], ["dynamic_capture"]]
-            or any(source != "pure_rematerialization" for source in item["residual_source_kind"].split("+")[1:])
-            or item["control_history_kind"] not in {"none", "dynamic_capture"}
-            for item in pass_telemetry
+    forward_seconds = 0.0
+    backward_seconds = 0.0
+    rss_samples = [rss_before]
+    tape_samples: list[tuple[int, int, int, int, int]] = []
+    pass_telemetry: tuple[dict[str, Any], ...] = ()
+    tape_context_limit_bytes = 0
+    peak_temporary_tape_bytes = 0
+    recomputation_factor = 0.0
+    python_reverse_callback_count = 0
+    for _ in range(steps):
+        forward_started = time.perf_counter()
+        pullback = simulation.step_vjp(target)
+        forward_seconds += time.perf_counter() - forward_started
+        tape_samples.append(
+            (
+                pullback.logical_residual_bytes,
+                pullback.resident_tape_bytes,
+                pullback.allocated_tape_bytes,
+                pullback.checkpoint_bytes,
+                pullback.peak_runtime_managed_bytes,
+            )
         )
-    ):
-        raise RuntimeError("smoke VJP reported inconsistent tape memory telemetry")
+        backward_started = time.perf_counter()
+        pullback(_cotangents(grid))
+        backward_seconds += time.perf_counter() - backward_started
+        tape_samples[-1] = (*tape_samples[-1][:4], pullback.peak_runtime_managed_bytes)
+        tape_context_limit_bytes = pullback.tape_context_limit_bytes
+        recomputation_factor = pullback.recomputation_factor
+        pass_telemetry = pullback.pass_telemetry
+        peak_temporary_tape_bytes = max(
+            (int(item["peak_temporary_tape_bytes"]) for item in pass_telemetry),
+            default=0,
+        )
+        python_reverse_callback_count = pullback.reverse_python_callback_count
+        del pullback
+        rss_samples.append(_rss_bytes())
+    logical_bytes, resident_bytes, allocated_bytes, checkpoint_bytes, peak_runtime_managed_bytes = tape_samples[-1]
+    elapsed = forward_seconds + backward_seconds
+    rss_after = rss_samples[-1]
+
+    telemetry_errors = [
+        name
+        for name, invalid in (
+            ("resident<logical", resident_bytes < logical_bytes),
+            ("allocated<resident", allocated_bytes < resident_bytes),
+            ("zero-logical-retains-tape", logical_bytes == 0 and (resident_bytes != 0 or allocated_bytes != 0)),
+            (
+                "min-memory-retained-tape",
+                any(
+                    logical != 0 or resident != 0 or allocated != 0
+                    for logical, resident, allocated, _, _ in tape_samples
+                ),
+            ),
+            ("peak<allocated+checkpoint", peak_runtime_managed_bytes < allocated_bytes + checkpoint_bytes),
+            (
+                "peak<temporary-tape+checkpoint",
+                peak_runtime_managed_bytes < peak_temporary_tape_bytes + checkpoint_bytes,
+            ),
+            ("unexpected-context-limit", tape_context_limit_bytes != BENCHMARK_TAPE_CONTEXT_LIMIT),
+            ("peak>context-limit", peak_runtime_managed_bytes > tape_context_limit_bytes),
+            ("temporary-tape>context-limit", peak_temporary_tape_bytes > tape_context_limit_bytes),
+            (
+                "capture-without-temporary-tape",
+                any(
+                    item["residual_source_kind"].split("+", 1)[0] in {"static_capture", "dynamic_capture"}
+                    and int(item["estimated_tape_bytes"]) > 0
+                    and int(item["peak_temporary_tape_bytes"]) == 0
+                    for item in pass_telemetry
+                ),
+            ),
+            ("nonpositive-forward-time", forward_seconds <= 0),
+            ("nonpositive-backward-time", backward_seconds <= 0),
+            (f"callback-count={python_reverse_callback_count}", python_reverse_callback_count <= 0),
+            (
+                "logical-sum",
+                sum(int(item["logical_residual_bytes"]) for item in pass_telemetry) != logical_bytes,
+            ),
+            ("resident-sum", sum(int(item["resident_tape_bytes"]) for item in pass_telemetry) != resident_bytes),
+            ("allocated-sum", sum(int(item["allocated_tape_bytes"]) for item in pass_telemetry) != allocated_bytes),
+            ("checkpoint-sum", sum(int(item["checkpoint_bytes"]) for item in pass_telemetry) != checkpoint_bytes),
+            (
+                "source-kind",
+                any(
+                    item["residual_source_kind"].split("+")[:1]
+                    not in [["none"], ["static_capture"], ["dynamic_capture"]]
+                    or any(source != "pure_rematerialization" for source in item["residual_source_kind"].split("+")[1:])
+                    or item["control_history_kind"] not in {"none", "dynamic_capture"}
+                    for item in pass_telemetry
+                ),
+            ),
+        )
+        if invalid
+    ]
+    if telemetry_errors:
+        raise RuntimeError(f"smoke VJP reported inconsistent telemetry: {', '.join(telemetry_errors)}")
     return {
         "grid": grid,
+        "pressure_iterations": pressure_iterations,
+        "steps": steps,
         "logical_residual_bytes": logical_bytes,
         "resident_bytes": resident_bytes,
         "allocated_bytes": allocated_bytes,
         "native_checkpoint_bytes": checkpoint_bytes,
         "peak_runtime_managed_bytes": peak_runtime_managed_bytes,
-        "resident_to_logical_ratio": resident_bytes / logical_bytes,
+        "resident_to_logical_ratio": resident_bytes / logical_bytes if logical_bytes else 0.0,
         "rss_bytes": rss_after,
         "rss_delta_bytes": max(rss_after - rss_before, 0),
+        "rss_growth_bytes": max(rss_samples[-1] - rss_samples[1], 0) if len(rss_samples) > 2 else 0,
+        "max_logical_residual_bytes": max(sample[0] for sample in tape_samples),
+        "max_resident_bytes": max(sample[1] for sample in tape_samples),
+        "max_allocated_bytes": max(sample[2] for sample in tape_samples),
+        "max_checkpoint_bytes": max(sample[3] for sample in tape_samples),
+        "max_peak_runtime_managed_bytes": max(sample[4] for sample in tape_samples),
+        "peak_temporary_tape_bytes": peak_temporary_tape_bytes,
         "elapsed_seconds": elapsed,
         "forward_seconds": forward_seconds,
         "backward_seconds": backward_seconds,
@@ -147,23 +215,26 @@ def _run_grid(grid: int) -> dict[str, Any]:
 
 def _markdown(results: list[dict[str, Any]]) -> str:
     lines = [
-        "# Phase 2 smoke autodiff benchmark",
+        "# Cost-aware CPU smoke autodiff benchmark",
         "",
-        "CPU, one warmed forward/backward smoke step per grid, pressure_iterations=1, "
+        "CPU, warmed forward/backward smoke runs. Pressure iterations and measured steps are recorded per row; "
         f"tape context limit={BENCHMARK_TAPE_CONTEXT_LIMIT} bytes.",
         "",
         f"Frozen baseline: {BASELINE_LOGICAL_BYTES_PER_ACTIVE_CELL:.1f} logical bytes per active cell; "
         f"compiler Tape hints per lane={BASELINE_COMPILER_TAPE_HINTS}.",
         "",
-        "| Grid | Logical residual | Logical/cell | Resident | Allocated | Checkpoint | Peak managed | "
+        "| Grid | Pressure | Steps | Logical residual | Logical/cell | Resident | Allocated | Temporary Tape peak | "
+        "Checkpoint | Peak managed | "
         "Resident/logical | RSS | "
         "RSS delta | Forward | Backward | Recompute | Python callbacks |",
-        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
+        "---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         lines.append(
-            "| {grid} | {logical_residual_bytes} | {logical_bytes_per_active_cell:.3f} | "
-            "{resident_bytes} | {allocated_bytes} | "
+            "| {grid} | {pressure_iterations} | {steps} | {logical_residual_bytes} | "
+            "{logical_bytes_per_active_cell:.3f} | "
+            "{resident_bytes} | {allocated_bytes} | {peak_temporary_tape_bytes} | "
             "{native_checkpoint_bytes} | {peak_runtime_managed_bytes} | {resident_to_logical_ratio:.3f} | "
             "{rss_bytes} | {rss_delta_bytes} | {forward_seconds:.6f}s | {backward_seconds:.6f}s | "
             "{recomputation_factor:.3f} | {python_reverse_callback_count} |".format(**result)
@@ -171,16 +242,20 @@ def _markdown(results: list[dict[str, Any]]) -> str:
     lines.extend(
         (
             "",
-            "Logical residual bytes are payload bytes retained by reusable pullbacks. Sealed static batches retain "
-            "only payload; their construction descriptors and lane state are released. Resident and allocated bytes "
-            "also include retained dynamic payload-chunk capacity and compact page metadata. RSS is sampled from the "
-            "worker process after backward; each grid runs in a fresh process.",
+            "Logical residual bytes are payload bytes retained by reusable pullbacks. A no-Tape or bounded-replay "
+            "pullback reports zero retained Tape bytes; checkpoint, retained primal-version, transaction, and "
+            "gradient staging memory remain visible in their separate counters. RSS is sampled from the worker "
+            "process after backward; each grid runs in a fresh process.",
+            "",
+            "The JSON artifact also records maxima across all measured steps and RSS growth after the first "
+            "measured step, so pressure runs distinguish stable selected residual/checkpoint storage from "
+            "unconditional per-step Tape retention.",
             "",
             "Recomputation factor is 1 + compiler-estimated rematerialization cost / active operation count, plus "
             "any graph-checkpoint replay factor.",
             "",
-            "Paging remains required: this phase freezes the immutable in-memory layout and measures its overhead; "
-            "it does not make whole-dispatch storage bounded.",
+            "CPU bounded replay uses complete-workgroup segments. A pure static balanced/min-runtime plan may retain "
+            "whole-dispatch Tape only when its exact construction allocation fits the hard context budget.",
             "",
         )
     )
@@ -188,11 +263,13 @@ def _markdown(results: list[dict[str, Any]]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark Phase 2 static-tape smoke grids")
+    parser = argparse.ArgumentParser(description="Benchmark cost-aware CPU autodiff smoke grids")
     parser.add_argument("--grids", type=int, nargs="+", default=DEFAULT_GRIDS)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--markdown", type=Path)
     parser.add_argument("--worker-grid", type=int)
+    parser.add_argument("--pressure-iterations", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=1)
     parser.add_argument(
         "--skip-gradient-parity",
         action="store_true",
@@ -200,17 +277,31 @@ def main() -> None:
     )
     arguments = parser.parse_args()
     if arguments.worker_grid is not None:
-        print(json.dumps(_run_grid(arguments.worker_grid), sort_keys=True))
+        print(
+            json.dumps(
+                _run_grid(arguments.worker_grid, arguments.pressure_iterations, arguments.steps),
+                sort_keys=True,
+            )
+        )
         return
-    if any(grid <= 0 for grid in arguments.grids):
-        raise ValueError("grid sizes must be positive")
+    if any(grid <= 0 for grid in arguments.grids) or arguments.pressure_iterations < 0 or arguments.steps <= 0:
+        raise ValueError("grids and steps must be positive; pressure iterations must be non-negative")
     if not arguments.skip_gradient_parity:
         _run_gradient_parity_gate()
 
     results: list[dict[str, Any]] = []
     for grid in arguments.grids:
         completed = subprocess.run(
-            (sys.executable, str(Path(__file__).resolve()), "--worker-grid", str(grid)),
+            (
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--worker-grid",
+                str(grid),
+                "--pressure-iterations",
+                str(arguments.pressure_iterations),
+                "--steps",
+                str(arguments.steps),
+            ),
             capture_output=True,
             text=True,
         )
@@ -226,6 +317,8 @@ def main() -> None:
             "compiler_tape_hints_per_lane": BASELINE_COMPILER_TAPE_HINTS,
             "gradient_parity_test": GRADIENT_PARITY_TEST,
         },
+        "pressure_iterations": arguments.pressure_iterations,
+        "steps": arguments.steps,
         "results": results,
     }
     if arguments.output is not None:

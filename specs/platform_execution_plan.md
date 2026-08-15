@@ -10,7 +10,7 @@ This document sequences four post-release tracks:
 4. structured Storage autodiff and composed graph VJP on GPU backends.
 
 It is a planning document, not a released Runtime, compiler, pipeline, or
-language contract. Compiler contract 11 and pipeline contract 15 remain
+language contract. Compiler contract 12 and pipeline contract 16 remain
 unchanged until an intentional release boundary.
 
 ## Recommended order
@@ -202,8 +202,8 @@ initial scope.
 ### Implementation evidence
 
 The `wasm32-unknown-emscripten` compiler and cooker path emits content-addressed
-`.wasm.o` artifacts while preserving compiler contract 11 and pipeline contract
-15. The web Runtime profile uses static entry resolution, metadata-only external
+`.wasm.o` artifacts while preserving compiler contract 12 and pipeline contract
+16. The web Runtime profile uses static entry resolution, metadata-only external
 artifact validation, and the calling-thread policy of the existing CPU
 scheduler. Focused tests cover real WebAssembly object emission, multiple
 filesystem-free static pipelines, and range-phase execution without workers.
@@ -237,7 +237,7 @@ platform-specific native Runtime builds. WebGPU is a separate future backend.
   completion handle.
 - Drain unfinished completions during submission destruction and device
   shutdown.
-- Keep compiler contract 11 and pipeline contract 15 unchanged.
+- Keep compiler contract 12 and pipeline contract 16 unchanged.
 
 This phase does not require concurrent execution. Existing backends may produce
 an already-complete submission while the ownership model and failure semantics
@@ -288,6 +288,30 @@ multiple differentiable inputs, explicit and implicit scalar cotangents,
 structured Storage objectives, graph destruction before pullback application,
 and numerical agreement with pipeline VJP and finite differences on native CPU
 and WebAssembly.
+
+### Implementation evidence
+
+Execution graphs now name differentiable input and objective resources on the
+builder and snapshot that derivative signature into the immutable plan.
+`VjpComputePass` adapts both directly compiled and cooked structured CPU VJPs;
+the graph layer records their existing Runtime pullbacks and does not duplicate
+pipeline tape construction. `CompiledExecutionGraph.vjp()` retains the forward
+submission, plan, resources, and pass tapes. Its pullback builds the reverse
+schedule from the compiled forward schedule, inserts zero cotangents for
+inactive local outputs, and accumulates fan-out contributions deterministically
+by logical resource identity.
+
+The backward operation returns a submission and the synchronous pullback call
+waits for it. Native CPU tests cover multi-pass chains, branched accumulation,
+multiple differentiable inputs, implicit and explicit cotangents,
+differentiable execution parameters, structured Storage gradients,
+finite-difference agreement, and destroying the builder and caller's plan
+handle before pullback application.
+
+The Python/native CPU slice is implemented. Phase 3 is not complete until the
+same transformation is owned by the core C++ execution graph and exercised
+with statically linked wasm32 VJP entries; the browser Runtime cannot use the
+Python-only composition layer.
 
 ## Phase 4: asynchronous multi-submission execution
 

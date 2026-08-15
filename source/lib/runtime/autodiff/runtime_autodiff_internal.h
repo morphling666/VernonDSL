@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -46,12 +47,19 @@ struct PullbackMemoryUsage {
     size_t residentBytes{};
     size_t allocatedBytes{};
     size_t retainedAllocationBytes{};
+    size_t peakTemporaryBytes{};
+};
+
+struct PullbackApplyOptions {
+    size_t maximumTemporaryBytes{std::numeric_limits<size_t>::max()};
+    size_t maximumReusableConstructionBytes{};
 };
 
 class PullbackExecution {
 public:
     virtual ~PullbackExecution() = default;
-    virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) = 0;
+    virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
+                               const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
 };
 
@@ -83,15 +91,19 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature);
 
-bool createCpuExecutable(VernonRuntimeContext &context, const Stage &forward, const Stage &backward,
-                         const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
-                         std::shared_ptr<Executable> &executable);
-bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint forwardEntry,
-                              VernonStringView forwardReflection, VernonStringView forwardName,
-                              VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
-                              VernonStringView backwardName, VernonStringView forwardProtocol,
-                              VernonStringView backwardProtocol, const std::vector<std::string> &gradientPaths,
-                              uint64_t staticTapeBytesHint, std::shared_ptr<Executable> &executable);
+bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
+                         const Stage &backward, const std::vector<std::string> &gradientPaths,
+                         uint64_t staticTapeBytesHint, const std::string &residualStorage,
+                         const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
+bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry,
+                              VernonStringView primalReflection, VernonStringView primalName,
+                              VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
+                              VernonStringView forwardName, VernonCpuEntryPoint backwardEntry,
+                              VernonStringView backwardReflection, VernonStringView backwardName,
+                              VernonStringView forwardProtocol, VernonStringView backwardProtocol,
+                              const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
+                              const std::string &residualStorage, const std::string &selectedPolicy,
+                              std::shared_ptr<Executable> &executable);
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant &profiles,
                              VernonLoadedPipeline &pipeline);
 

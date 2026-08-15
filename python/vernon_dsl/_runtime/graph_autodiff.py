@@ -168,9 +168,12 @@ class VjpComputePass(ComputePass):
         deterministic_reduction_legal = True
         required_primal_resources: list[tuple[str, int]] = []
         retained_primal_bytes = 0
+        replay_snapshot_bytes = 0
+        workgroup_invocation_count = 0
         if isinstance(self._program, ProgramExpression):
             compiled = _compile_direct_vjp(self._program, self._program_arguments(None))
             workgroup = tuple(int(value) for value in compiled.pipeline.workgroup_size)
+            workgroup_invocation_count = math.prod(workgroup)
             invocation_count = math.prod(count * size for count, size in zip(self._grid, workgroup, strict=True))
             tape_stride = compiled.tape_bytes_per_invocation
             replay_cost = compiled.active_operation_count * invocation_count
@@ -187,6 +190,11 @@ class VjpComputePass(ComputePass):
             retained_primal_bytes = _retained_primal_allocation_bytes(
                 retained_primal_bindings, compiled.required_primal_paths
             )
+            replay_snapshot_bytes = _retained_primal_allocation_bytes(
+                retained_primal_bindings, tuple(f"primal.{name}" for name in retained_primal_bindings)
+            )
+            if tape_stride == 0:
+                replay_snapshot_bytes = retained_primal_bytes
             retained_primal_bytes += 8 * sum(
                 isinstance(self._bindings.get(root), ExecutionParameter) for root in required_primal_roots
             )
@@ -206,6 +214,8 @@ class VjpComputePass(ComputePass):
             required_primal_resources,
             invocation_count,
             tape_stride,
+            workgroup_invocation_count,
+            replay_snapshot_bytes,
             replay_cost,
             resource_reload_cost,
             recomputation_cost,

@@ -237,7 +237,8 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"))
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
-        .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes);
+        .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)
+        .def_prop_ro("peak_temporary_bytes", &PythonPullback::peakTemporaryBytes);
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
         .def(

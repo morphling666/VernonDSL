@@ -1,9 +1,11 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
@@ -15,8 +17,10 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 extern "C" VernonStatus vernonRegisterStructuredScalarAutodiffFixture(void);
+extern "C" VernonStatus vernonRegisterStructuredScalarBalancedAutodiffFixture(void);
 extern "C" VernonStatus vernonRegisterStructuredDynamicAutodiffFixture(void);
 extern "C" VernonStatus vernonRegisterStructuredF64AutodiffFixture(void);
 
@@ -246,6 +250,174 @@ TEST(RuntimeStructuredScalarAutodiff, CpuRejectsUnsupportedProtocolAtResolve) {
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDispatchTape) {
+    ASSERT_EQ(vernonRegisterStructuredScalarBalancedAutodiffFixture(), VERNON_STATUS_OK);
+    const std::filesystem::path manifestPath = VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const nlohmann::json manifestJson = nlohmann::json::parse(manifest);
+    ASSERT_EQ(manifestJson.at("autodiff").at("variants").size(), 1u);
+    ASSERT_EQ(manifestJson.at("autodiff").at("variants").front().at("selected_policy"), "balanced");
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonPipelineBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonPipelineBundle *bundle =
+        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    ASSERT_TRUE(bundle->autodiff.has_value());
+    ASSERT_EQ(bundle->autodiff->variants.size(), 1u);
+    const auto &variant = bundle->autodiff->variants.front();
+    ASSERT_EQ(variant.residualStorage, "static");
+    ASSERT_EQ(variant.selectedPolicy, "balanced");
+
+    auto objective = [](double x, double y, double z) {
+        const double linear = x + y;
+        const double difference = x - y;
+        return linear * difference / y - z + std::sin(x) + std::cos(y) + std::exp(z) + std::log(x) + std::sqrt(y) +
+               std::acos(z) + std::atan2(y, x) + std::abs(y - z) + std::pow(x, y);
+    };
+    auto finiteDifference = [&](double x, double y, double z, unsigned argument) {
+        constexpr double epsilon = 1e-4;
+        double positive[] = {x, y, z};
+        double negative[] = {x, y, z};
+        positive[argument] += epsilon;
+        negative[argument] -= epsilon;
+        return (objective(positive[0], positive[1], positive[2]) - objective(negative[0], negative[1], negative[2])) /
+               (2.0 * epsilon);
+    };
+    auto run = [&](VernonLoadedPipeline *pipeline, VernonLaunchSize grid, auto &&verifyAfterForward,
+                   auto &&verifyAfterBackward) {
+        float x = 1.2f;
+        float y = 0.7f;
+        float z = 0.2f;
+        const size_t workgroupCount = static_cast<size_t>(grid.x) * grid.y * grid.z;
+        std::vector<float> output(workgroupCount * 6);
+        const uint64_t outputShape[]{static_cast<uint64_t>(grid.z), static_cast<uint64_t>(grid.y) * 3,
+                                     static_cast<uint64_t>(grid.x) * 2};
+        VernonAdValue inputValues[]{
+            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
+            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+            {sizeof(VernonAdValue),
+             {"output", 6},
+             VERNON_DATA_F32,
+             output.data(),
+             output.size() * sizeof(float),
+             3,
+             outputShape},
+        };
+        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+        VernonPullback *pullback = nullptr;
+        ASSERT_EQ(vernonAdPipelineForward(pipeline, grid, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+            << lastError(context);
+        ASSERT_NE(pullback, nullptr);
+        for (float value : output)
+            EXPECT_NEAR(value, objective(x, y, z), 2e-5);
+        verifyAfterForward(pullback);
+
+        std::vector<float> seeds(output.size(), 1.0f);
+        VernonAdValue seed{sizeof(VernonAdValue),
+                           {"output", 6},
+                           VERNON_DATA_F32,
+                           seeds.data(),
+                           seeds.size() * sizeof(float),
+                           3,
+                           outputShape};
+        VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &seed, 1, {}};
+        float gradientStorage[3]{};
+        VernonAdValue gradientValues[]{
+            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), {}},
+            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), {}},
+            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientStorage[2], sizeof(float), {}},
+        };
+        VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
+        const VernonPullbackApplyOptions applyOptions{sizeof(VernonPullbackApplyOptions),
+                                                      VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                      std::numeric_limits<uint64_t>::max(),
+                                                      std::numeric_limits<uint64_t>::max(),
+                                                      {}};
+        ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
+            << lastError(context);
+        for (unsigned index = 0; index < 3; ++index)
+            EXPECT_NEAR(gradientStorage[index], static_cast<double>(output.size()) * finiteDifference(x, y, z, index),
+                        0.004 * output.size());
+        verifyAfterBackward(pullback);
+        vernonPullbackDestroy(pullback);
+    };
+
+    size_t segmentBytes = 0;
+    ASSERT_TRUE(vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(6, variant.staticTapeBytesHint, segmentBytes));
+    size_t wholeDispatchBytes = 0;
+    ASSERT_TRUE(
+        vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(12, variant.staticTapeBytesHint, wholeDispatchBytes));
+    auto retainedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(segmentBytes, wholeDispatchBytes);
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, retainedPolicy);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    run(
+        pipeline, {2, 1, 1},
+        [&](VernonPullback *pullback) {
+            const vernon::runtime::AutodiffPullbackMemoryUsage afterForward =
+                vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+            EXPECT_GT(afterForward.logicalResidualBytes, 0u);
+            EXPECT_GE(afterForward.residentBytes, afterForward.logicalResidualBytes);
+            EXPECT_GT(afterForward.allocatedBytes, 0u);
+            EXPECT_LT(afterForward.allocatedBytes, wholeDispatchBytes);
+            EXPECT_EQ(afterForward.peakTemporaryBytes, 0u);
+            EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*retainedPolicy),
+                      afterForward.allocatedBytes);
+        },
+        [&](VernonPullback *pullback) {
+            const vernon::runtime::AutodiffPullbackMemoryUsage afterBackward =
+                vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+            EXPECT_GT(afterBackward.allocatedBytes, 0u);
+            EXPECT_LT(afterBackward.allocatedBytes, wholeDispatchBytes);
+            EXPECT_EQ(afterBackward.peakTemporaryBytes, 0u);
+            EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*retainedPolicy),
+                      afterBackward.allocatedBytes);
+        });
+    EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*retainedPolicy), 0u);
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+
+    auto boundedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(segmentBytes, segmentBytes);
+    vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
+    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    for (VernonLaunchSize grid :
+         {VernonLaunchSize{3, 2, 2}, VernonLaunchSize{512, 1, 1}, VernonLaunchSize{1024, 1, 1}}) {
+        run(
+            pipeline, grid,
+            [&](VernonPullback *pullback) {
+                const vernon::runtime::AutodiffPullbackMemoryUsage afterForward =
+                    vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+                EXPECT_EQ(afterForward.logicalResidualBytes, 0u);
+                EXPECT_EQ(afterForward.residentBytes, 0u);
+                EXPECT_EQ(afterForward.allocatedBytes, 0u);
+                EXPECT_EQ(afterForward.peakTemporaryBytes, 0u);
+                EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
+            },
+            [&](VernonPullback *pullback) {
+                const vernon::runtime::AutodiffPullbackMemoryUsage afterBackward =
+                    vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+                EXPECT_EQ(afterBackward.logicalResidualBytes, 0u);
+                EXPECT_EQ(afterBackward.residentBytes, 0u);
+                EXPECT_EQ(afterBackward.allocatedBytes, 0u);
+                EXPECT_GT(afterBackward.peakTemporaryBytes, 0u);
+                EXPECT_LE(afterBackward.peakTemporaryBytes, segmentBytes);
+                EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
+            });
+    }
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
 TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExecutedRecords) {
     ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
@@ -321,7 +493,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
-TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureRollsBackPipelineWrites) {
+TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGradients) {
     ASSERT_EQ(vernonRegisterStructuredDynamicAutodiffFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
@@ -358,8 +530,13 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureRollsBackPipelineW
     ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(calibrationPullback, nullptr);
-    const size_t oneInvocationBytes =
-        vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy);
+    float calibrationGradient = 0.0f;
+    VernonAdValue calibrationGradientValue{sizeof(VernonAdValue),       {"x", 1}, VERNON_DATA_F32, &calibrationGradient,
+                                           sizeof(calibrationGradient), {}};
+    VernonAdValueSet calibrationGradients{sizeof(VernonAdValueSet), &calibrationGradientValue, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(calibrationPullback, nullptr, &calibrationGradients), VERNON_STATUS_OK)
+        << lastError(context);
+    const size_t oneInvocationBytes = calibrationPolicy->usage().peakBytes;
     ASSERT_GT(oneInvocationBytes, 0u);
     vernonPullbackDestroy(calibrationPullback);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
@@ -372,16 +549,23 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureRollsBackPipelineW
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     count = 1500;
     output = -31.0f;
-    VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback),
-              VERNON_STATUS_INTERNAL_ERROR);
-    EXPECT_EQ(rejectedPullback, nullptr);
+    VernonPullback *rejectedPullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(rejectedPullback, nullptr);
+    EXPECT_FLOAT_EQ(output, (1.0f + 2.0f * count) * x);
+    float rejectedGradient = -31.0f;
+    VernonAdValue rejectedGradientValue{sizeof(VernonAdValue),    {"x", 1}, VERNON_DATA_F32, &rejectedGradient,
+                                        sizeof(rejectedGradient), {}};
+    VernonAdValueSet rejectedGradients{sizeof(VernonAdValueSet), &rejectedGradientValue, 1, {}};
+    EXPECT_EQ(vernonPullbackApply(rejectedPullback, nullptr, &rejectedGradients), VERNON_STATUS_INTERNAL_ERROR);
     const std::string rejectionError = lastError(context);
     EXPECT_NE(rejectionError.find("autodiff tape allocator host allocation failed"), std::string::npos)
         << rejectionError;
     EXPECT_NE(rejectionError.find("context limit"), std::string::npos) << rejectionError;
-    EXPECT_FLOAT_EQ(output, -31.0f);
+    EXPECT_FLOAT_EQ(rejectedGradient, -31.0f);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
+    vernonPullbackDestroy(rejectedPullback);
 
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(bundle);

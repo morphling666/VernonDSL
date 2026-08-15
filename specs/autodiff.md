@@ -1,7 +1,7 @@
 # Autodiff design
 
 > **Status:** accepted contract and implemented compute VJP surface. Compiler
-> contract 11 and pipeline contract 15 provide deterministic
+> contract 12 and pipeline contract 16 provide deterministic
 > `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
 > checked dynamic tape, explicit accumulation plans, and invocation-time
 > `(x,y,z)` workgroup grids with physical invocation carriers. CPU `dynamic_v2` supports
@@ -14,11 +14,12 @@
 > implementation.
 >
 > CPU `dynamic_v2` is the only supported autodiff execution and cooking path.
-> GPU and graphics autodiff, graph-level pullbacks, graphics backward
-> lowering, custom compute VJPs, higher-order AD, persistent `.grad`, and
-> multi-kernel temporal differentiation are deferred and unsupported. GPU
-> targets may still compile and run ordinary non-AD compute and graphics
-> pipelines.
+> Execution graphs compose structured CPU pipeline pullbacks in the native C++
+> graph scheduler. Browser wasm32 graph VJP, GPU and graphics autodiff,
+> graphics backward lowering, custom compute VJPs,
+> higher-order AD, persistent `.grad`, and unrestricted temporal
+> differentiation remain deferred. GPU targets may still compile and run
+> ordinary non-AD compute and graphics pipelines.
 
 This document defines Vernon's first public automatic-differentiation model.
 The design uses reverse-mode vector-Jacobian products (VJPs) and preserves the
@@ -260,6 +261,10 @@ dimensions to the primal owner shape. TensorView
 offsets and signed strides apply to the trailing owner dimensions, so
 carrier packing does not erase subview descriptors.
 
+The CPU static tape stride is the fixed compiler/manifest estimate. The Runtime
+does not calibrate later dispatches from maximum observed per-lane usage;
+runtime calibration was removed because it inflated subsequent reservations.
+
 The positive three-dimensional workgroup grid is supplied for each forward invocation;
 it is not part of the pipeline asset, manifest identity, ProgramGraph, profile
 identity, or cooked artifact identity. Each workgroup contains the reflected
@@ -267,10 +272,12 @@ identity, or cooked artifact identity. Each workgroup contains the reflected
 fastest. A pullback retains its forward grid and
 always runs backward over that same logical invocation domain.
 
-A pullback owns immutable saved Values and CPU tape Storage from its forward
-invocation. It may be called sequentially with
+A no-Tape or bounded-replay pullback owns immutable primal inputs/versions and
+launch geometry rather than whole-dispatch Tape. A retained static pullback owns
+immutable CPU Tape only when its selected `balanced`/`min_runtime` plan fits the
+hard context budget. Every form may be called sequentially with
 multiple cotangents; each call returns fresh gradients and does not consume or
-mutate the tape. Destroying the pullback releases the tape. The synchronous
+mutate retained state. Destroying the pullback releases that state. The synchronous
 Runtime contract does not promise concurrent calls on one pullback.
 
 ### CPU range-phase execution
@@ -281,26 +288,36 @@ range-phase scheduler described by
 AD scalar-entry adapter, worker-local lane identity, fixed-tape execution
 branch, protocol guessing, or serial fallback.
 
-For each scheduler range, Runtime lazily prepares the active lanes' packed
-argument/result frames and supplies flattened-global pointer tables to the
-compiled range entry. The generated wrapper invokes the lowered program for
-every lane in the contiguous interval without a Runtime callback per lane.
-Frames persist while a lane is yielded and are released immediately after
-final completion; pointer-table bounds are explicit in `VernonCpuRangeV1`.
+Runtime stores packed argument/result frames in dispatch-level contiguous
+slabs and supplies flattened-global pointer tables to each scheduler range.
+The generated wrapper invokes the lowered program for every lane in the
+contiguous interval without a Runtime callback per lane. Frame storage persists
+while a lane is yielded; completion clears its pointer-table entries without a
+per-lane heap allocation. Pointer-table bounds are explicit in
+`VernonCpuRangeV1`.
 
-Each logical forward invocation owns one `HostDynamicTape`, independent of the
-worker executing its current phase. The allocator registry provides checked
-O(1) descriptor ownership lookup, and each tape serializes its mutable
-metadata. A barrier yield retains the live tape and coroutine frame. Final lane
-completion seals and validates the tape, transfers an immutable
-`HostTapeSnapshot` to the pending pullback, and releases the mutable tape.
-Snapshots retain their memory-policy charge until the pullback releases them.
+One `HostStaticTapeBatch` owns either an admitted complete static dispatch or one
+complete-workgroup replay segment. Straight-line lanes write compiler-assigned
+fixed residual offsets. A lane that opens nested
+control flow promotes into the batch's shared `HostDynamicTapeBatch`, whose
+POD lane state appends to chunked payload, child, region, and record arenas.
+Descriptors carry their batch identity directly, so semantic callbacks do not
+acquire a process-global ownership-registry lock. Final completion validates
+every lane and compacts dynamic metadata into page-layout-v1 arrays; immutable
+readers are range-local views over the retained batch.
 Compiler-generated code sees only the versioned semantic allocator callbacks
 and opaque handles; Runtime alone owns payload, region, record, and index
-representation.
+representation. CPU autodiff lowering also inspects function argument and result
+types, so a logical Tape handle is lowered even when canonicalization leaves no
+operation-level use from which to rediscover it; logical handles never reach the
+CPU ABI wrapper.
 
 Backward execution creates fresh mutable lane/workgroup phase state for each
-pullback application while retaining the immutable forward snapshots. Reverse
+pullback application. The original bounded forward uses the Tape-free primal
+profile and retains one immutable prepared input shadow; it does not construct
+and discard per-workgroup Tape. Bounded replay restores that shadow, replays one
+complete workgroup with its original virtual IDs, applies backward into shared
+transactional gradient destinations, and releases that segment's Tape. Reverse
 barriers are lowered through the same coroutine/yield machinery as primal
 barriers. Invocation-private gradients follow logical lanes across workers;
 workgroup-shared gradients remain in the group arena; atomic-shared updates use
@@ -311,8 +328,8 @@ Before dispatch, checked policy accounting covers tape reservation,
 cotangent carriers, invocation-private or workgroup-shared gradient staging,
 and arithmetic overflow. Forward Storage/output writes use
 `HostEffectTransaction` shadows and commit exactly once only after every lane
-has completed and every snapshot is valid. Failure discards shadows, mutable
-tapes, untransferred snapshots, lane frames, group arenas, staging, and
+has completed and the dispatch batch is valid. Failure discards shadows,
+construction arenas, compact metadata, frame slabs, group arenas, staging, and
 dispatch reservations. Parallel range failures collect diagnostics without
 writing shared invocation state from worker threads.
 
@@ -387,9 +404,34 @@ reflection, and manifests.
 
 ## 9. ExecutionGraph composition
 
-`VernonExecutionGraph` remains ordinary host orchestration and is not a
-differentiation API. Graph-level autodiff and graph pullbacks are deferred and
-unsupported.
+Python `ExecutionGraph` builders may name differentiable resource or execution
+parameter inputs and Storage objective resources. A `VjpComputePass` binds one
+directly compiled or cooked structured CPU VJP to graph resources. Compilation
+snapshots the derivative signature with the immutable execution plan.
+Automatic checkpoint planning currently requires directly compiled passes,
+because the frozen pipeline contract does not expose cooked tape-size and
+replay-cost metadata; cooked graph VJPs remain available without checkpoint
+planning.
+
+`CompiledExecutionGraph.vjp()` calls the native graph VJP entry and returns a
+`GraphPullback` retaining that submission, the plan, resources, checkpoints,
+and required pipeline pullbacks. The C++ graph core traverses scheduled
+differentiable passes in reverse order, replays bounded segments through the
+compiled scheduler, supplies zero cotangents to inactive local outputs, and
+deterministically accumulates contributions by logical graph identity. One
+scalar objective may omit its cotangent; multiple or structured objectives
+must provide an exact name-to-cotangent mapping. A non-differentiable write on
+an active reverse path is an error.
+
+The canonical backward operation is `GraphPullback.submit()`, which returns a
+submission carrying named gradients. Native CPU execution may complete inline;
+calling the pullback directly is the synchronous shorthand. Pullbacks are
+reusable and outlive the builder and caller's compiled-plan handle.
+
+The orchestration core and type-erased cotangent accumulation are native C++.
+Python adapts values at the binding boundary but does not traverse the schedule
+or snapshot graph resources. Statically linked wasm32 structured VJP entries
+remain required before CPU/WebAssembly graph VJP is complete.
 
 ## 10. C and C++ deployment API
 
@@ -417,7 +459,7 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 11 and pipeline contract 15 are the current CPU VJP boundary.
+Compiler contract 12 and pipeline contract 16 are the current CPU VJP boundary.
 Differentiated assets use the canonical pipeline manifest with one optional
 root `autodiff` object; pipeline-14 transform/profile fields are not aliases in
 the current schema. No

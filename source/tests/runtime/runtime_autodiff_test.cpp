@@ -214,6 +214,59 @@ TEST(RuntimeAutodiffTapeAllocator, UsesOneCompactStaticBatchWithoutPerLaneTapes)
     EXPECT_EQ(policy->usage().currentBytes, 0u);
 }
 
+TEST(RuntimeAutodiffTapeAllocator, ReusesStaticReplayConstructionStorageAcrossSegments) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<HostTapeMemoryPolicy>();
+    auto budget = HostTapeDispatchBudget::reserve(policy, policy->contextLimit());
+    ASSERT_NE(budget, nullptr);
+    auto batch = HostStaticTapeBatch::create(2, 16, 1024, policy, budget);
+    ASSERT_NE(batch, nullptr);
+    const size_t constructionBytes = batch->allocatedBytes();
+
+    auto recordSegment = [&](uint32_t base) {
+        for (size_t lane = 0; lane < batch->size(); ++lane) {
+            VernonAdTapeAllocator *allocator = batch->descriptor(lane);
+            ASSERT_NE(allocator, nullptr);
+            VernonAdRegionHandle region = VERNON_AD_INVALID_REGION_HANDLE;
+            VernonAdRecordHandle record = VERNON_AD_INVALID_RECORD_HANDLE;
+            ASSERT_EQ(allocator->reset(allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+            ASSERT_EQ(allocator->begin_region(allocator, VERNON_AD_INVALID_REGION_HANDLE, &region),
+                      VERNON_AD_TAPE_ALLOCATOR_OK);
+            ASSERT_EQ(allocator->reserve_record(allocator, region, sizeof(uint32_t), alignof(uint32_t), 0, &record),
+                      VERNON_AD_TAPE_ALLOCATOR_OK);
+            const uint32_t value = base + static_cast<uint32_t>(lane);
+            ASSERT_EQ(allocator->write_leaf(allocator, record, 0, &value, sizeof(value)), VERNON_AD_TAPE_ALLOCATOR_OK);
+            ASSERT_EQ(allocator->end_region(allocator, region, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+            ASSERT_EQ(allocator->seal(allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+        }
+        ASSERT_TRUE(batch->compact(true));
+        budget->commit();
+    };
+
+    recordSegment(10);
+    EXPECT_EQ(batch->allocatedBytes(), constructionBytes);
+    EXPECT_EQ(policy->usage().currentBytes, constructionBytes);
+    HostStaticTapeBatch::Reader firstReader;
+    ASSERT_TRUE(batch->initializeReader(1, firstReader));
+    uint32_t restored = 0;
+    ASSERT_EQ(firstReader.descriptor()->read_leaf(firstReader.descriptor(), firstReader.rootRegion(), 0, 0, &restored,
+                                                  sizeof(restored)),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(restored, 11u);
+
+    ASSERT_TRUE(batch->markConstructionRecyclable());
+    ASSERT_TRUE(batch->resetRecyclableConstruction());
+    EXPECT_EQ(batch->allocatedBytes(), constructionBytes);
+    recordSegment(20);
+    HostStaticTapeBatch::Reader secondReader;
+    ASSERT_TRUE(batch->initializeReader(1, secondReader));
+    ASSERT_EQ(secondReader.descriptor()->read_leaf(secondReader.descriptor(), secondReader.rootRegion(), 0, 0,
+                                                   &restored, sizeof(restored)),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(restored, 21u);
+    EXPECT_EQ(policy->usage().peakBytes, constructionBytes);
+}
+
 TEST(RuntimeAutodiffTapeAllocator, ResetsFailedCompactLaneWithoutLeakingItsBatchCharge) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();
@@ -287,7 +340,9 @@ TEST(RuntimeAutodiffTapeAllocator, PromotesDynamicLaneIntoSharedImmutableBatch) 
     ASSERT_EQ(staticAllocator->seal(staticAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
 
     EXPECT_EQ(batch->logicalBytes(), 3 * sizeof(uint32_t));
-    ASSERT_TRUE(batch->compact());
+    const size_t constructionBytes = batch->constructionBytes();
+    ASSERT_TRUE(batch->compact(true));
+    budget->commit();
     HostStaticTapeBatch::Reader reader;
     ASSERT_TRUE(batch->initializeReader(0, reader));
     EXPECT_NE(reader.rootRegion(), VERNON_AD_INVALID_REGION_HANDLE);
@@ -304,6 +359,54 @@ TEST(RuntimeAutodiffTapeAllocator, PromotesDynamicLaneIntoSharedImmutableBatch) 
                                                    &restored, sizeof(restored)),
               VERNON_AD_TAPE_ALLOCATOR_OK);
     EXPECT_EQ(restored, staticValue);
+    ASSERT_TRUE(batch->markConstructionRecyclable());
+    ASSERT_TRUE(batch->resetRecyclableConstruction());
+    EXPECT_EQ(batch->constructionState(), HostStaticTapeBatch::ConstructionState::Constructing);
+    EXPECT_GE(batch->constructionBytes(), constructionBytes);
+    EXPECT_NE(batch->descriptor(0), nullptr);
+
+    allocator = batch->descriptor(0);
+    root = child = VERNON_AD_INVALID_REGION_HANDLE;
+    rootRecord = childRecord = VERNON_AD_INVALID_RECORD_HANDLE;
+    ASSERT_EQ(allocator->reset(allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->begin_region(allocator, VERNON_AD_INVALID_REGION_HANDLE, &root), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->reserve_record(allocator, root, sizeof(uint32_t), alignof(uint32_t), 1, &rootRecord),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->begin_region(allocator, root, &child), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->set_child(allocator, rootRecord, 0, child), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->reserve_record(allocator, child, sizeof(uint32_t), alignof(uint32_t), 0, &childRecord),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->write_leaf(allocator, childRecord, 0, &rootValue, sizeof(rootValue)),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->end_region(allocator, child, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->end_region(allocator, root, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(allocator->seal(allocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+
+    staticAllocator = batch->descriptor(1);
+    staticRoot = VERNON_AD_INVALID_REGION_HANDLE;
+    staticRecord = VERNON_AD_INVALID_RECORD_HANDLE;
+    ASSERT_EQ(staticAllocator->reset(staticAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(staticAllocator->begin_region(staticAllocator, VERNON_AD_INVALID_REGION_HANDLE, &staticRoot),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(staticAllocator->reserve_record(staticAllocator, staticRoot, sizeof(uint32_t), alignof(uint32_t), 0,
+                                              &staticRecord),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(staticAllocator->write_leaf(staticAllocator, staticRecord, 0, &staticValue, sizeof(staticValue)),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(staticAllocator->end_region(staticAllocator, staticRoot, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(staticAllocator->seal(staticAllocator), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_TRUE(batch->compact(true));
+    budget->commit();
+    HostStaticTapeBatch::Reader recycledReader;
+    ASSERT_TRUE(batch->initializeReader(0, recycledReader));
+    compactChild = VERNON_AD_INVALID_REGION_HANDLE;
+    ASSERT_EQ(recycledReader.descriptor()->read_child(recycledReader.descriptor(), recycledReader.rootRegion(), 0, 0,
+                                                      &compactChild),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(recycledReader.descriptor()->read_leaf(recycledReader.descriptor(), compactChild, 0, 0, &restored,
+                                                     sizeof(restored)),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    EXPECT_EQ(restored, rootValue);
 }
 
 TEST(RuntimeAutodiffTapeAllocator, SupportsConcurrentDynamicLaneWritersAndReaders) {

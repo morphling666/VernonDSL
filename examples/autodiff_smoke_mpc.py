@@ -15,6 +15,7 @@ from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters
 
 GRID = 128
 PRESSURE_ITERATIONS = 10
+DEFAULT_CHECKPOINT_MEMORY_MIB = 256
 
 
 @dataclass
@@ -220,7 +221,7 @@ def optimize_initial_velocity(
     iterations: int = 240,
     learning_rate: float | None = None,
     pressure_iterations: int = PRESSURE_ITERATIONS,
-    checkpoint_memory_budget: int | None = None,
+    checkpoint_memory_budget: int | None = DEFAULT_CHECKPOINT_MEMORY_MIB * 1024 * 1024,
     initial_density: np.ndarray | None = None,
     initial_velocity: np.ndarray | None = None,
     target: np.ndarray | None = None,
@@ -351,7 +352,8 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-memory-mib",
         type=int,
-        help="hard checkpoint-memory limit; defaults to an automatically measured safe budget",
+        default=DEFAULT_CHECKPOINT_MEMORY_MIB,
+        help=f"hard checkpoint-memory limit (default: {DEFAULT_CHECKPOINT_MEMORY_MIB} MiB)",
     )
     parser.add_argument("--render-size", type=int, default=768)
     parser.add_argument("--headless", action="store_true")
@@ -406,9 +408,7 @@ def main() -> None:
         iterations=arguments.optimization_iterations,
         learning_rate=arguments.learning_rate,
         pressure_iterations=arguments.pressure_iterations,
-        checkpoint_memory_budget=(
-            None if arguments.checkpoint_memory_mib is None else arguments.checkpoint_memory_mib * 1024 * 1024
-        ),
+        checkpoint_memory_budget=arguments.checkpoint_memory_mib * 1024 * 1024,
         verbose=not arguments.quiet,
     )
     try:

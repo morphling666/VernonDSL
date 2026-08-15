@@ -537,11 +537,21 @@ public:
     }
     ~Pullback() { vernonPullbackDestroy(handle_); }
 
-    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) const {
+    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients, uint64_t maximumTemporaryBytes,
+               uint64_t maximumReusableConstructionBytes = 0) const {
         if (!handle_)
             throw std::logic_error("pullback is empty");
-        if (vernonPullbackApply(handle_, cotangents, &gradients) != VERNON_STATUS_OK)
+        const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
+                                                 VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                 maximumTemporaryBytes,
+                                                 maximumReusableConstructionBytes,
+                                                 {}};
+        if (vernonPullbackApplyWithOptions(handle_, cotangents, &gradients, &options) != VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed");
+    }
+
+    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) const {
+        apply(cotangents, gradients, std::numeric_limits<uint64_t>::max());
     }
 
     explicit operator bool() const noexcept { return handle_ != nullptr; }

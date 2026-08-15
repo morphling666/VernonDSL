@@ -175,6 +175,10 @@ public:
         bool hasCapture = false;
         bool hasAutodiffHandles = false;
         bool hasAdjointBuffers = false;
+        for (Type type : function.getArgumentTypes())
+            hasAutodiffHandles = hasAutodiffHandles || containsLogicalAutodiffHandle(type);
+        for (Type type : function.getResultTypes())
+            hasAutodiffHandles = hasAutodiffHandles || containsLogicalAutodiffHandle(type);
         function.walk([&](Operation *operation) {
             hasCapture = hasCapture || isa<AdCaptureOp>(operation);
             hasAdjointBuffers = hasAdjointBuffers || isa<AdAdjointBufferCreateOp>(operation);
@@ -1066,6 +1070,10 @@ struct VernonPrepareCPUAutodiffSignaturesPass final
                 continue;
             bool hasCapture = false;
             bool hasHandles = false;
+            for (Type type : function.getArgumentTypes())
+                hasHandles = hasHandles || containsLogicalAutodiffHandle(type);
+            for (Type type : function.getResultTypes())
+                hasHandles = hasHandles || containsLogicalAutodiffHandle(type);
             function.walk([&](Operation *operation) {
                 hasCapture = hasCapture || isa<AdCaptureOp>(operation);
                 for (Type type : operation->getOperandTypes())

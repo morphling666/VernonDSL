@@ -460,10 +460,10 @@ private:
 
 class RangeJob final : public CompletedJob {
 public:
-    RangeJob(size_t runners, size_t groupCount, size_t workgroupVolume, const uint32_t grid[3],
+    RangeJob(size_t runners, size_t groupBegin, size_t groupCount, size_t workgroupVolume, const uint32_t grid[3],
              const uint32_t workgroup[3], const CpuRangeCallback &callback)
         : CompletedJob(runners), groupCount_(groupCount), workgroupVolume_(workgroupVolume), callback_(callback),
-          tasks_(groupCount < runners ? runners : 0), groupsRemaining_(groupCount) {
+          tasks_(groupCount < runners ? runners : 0), groupsRemaining_(groupCount), groupBegin_(groupBegin) {
         std::copy_n(grid, 3, grid_);
         std::copy_n(workgroup, 3, workgroup_);
         groupRangeMode_ = groupCount_ >= runners;
@@ -478,7 +478,7 @@ public:
         size_t runnerBegin = 0;
         for (size_t slot = 0; slot < activeGroups; ++slot) {
             const size_t chunks = std::min(workgroupVolume_, baseChunks + (slot < extraChunks ? 1 : 0));
-            groups_.push_back(std::make_unique<GroupState>(workgroupVolume_, chunks, slot, runnerBegin));
+            groups_.push_back(std::make_unique<GroupState>(workgroupVolume_, chunks, groupBegin_ + slot, runnerBegin));
             enqueuePhase(slot, 0);
             runnerBegin += chunks;
         }
@@ -618,7 +618,7 @@ private:
 
     void runGroupRanges(size_t runnerOrdinal) noexcept {
         constexpr size_t groupsPerClaim = 8;
-        if (!runWholeGroup(runnerOrdinal))
+        if (!runWholeGroup(groupBegin_ + runnerOrdinal))
             return;
         while (status() == VERNON_STATUS_OK) {
             const size_t begin = nextGroupClaim_.fetch_add(groupsPerClaim, std::memory_order_relaxed);
@@ -626,7 +626,7 @@ private:
                 return;
             const size_t end = std::min(begin + groupsPerClaim, groupCount_);
             for (size_t groupLinear = begin; groupLinear < end && status() == VERNON_STATUS_OK; ++groupLinear)
-                if (!runWholeGroup(groupLinear))
+                if (!runWholeGroup(groupBegin_ + groupLinear))
                     return;
         }
     }
@@ -674,6 +674,7 @@ private:
     std::condition_variable taskAvailable_;
     std::vector<std::deque<Task>> tasks_;
     size_t groupsRemaining_{};
+    size_t groupBegin_{};
     bool groupRangeMode_{};
     std::atomic<size_t> nextGroupClaim_{};
     std::atomic<size_t> nextRunnerOrdinal_{};
@@ -719,7 +720,8 @@ public:
     }
 
     VernonStatus dispatch(const uint32_t grid[3], const uint32_t workgroup[3], const CpuRangeCallback &callback,
-                          bool forceCallingThread) noexcept {
+                          bool forceCallingThread, size_t groupBegin = 0,
+                          size_t requestedGroupCount = std::numeric_limits<size_t>::max()) noexcept {
         try {
             schedulerDiagnostic.clear();
             if (activeWorkgroup)
@@ -735,13 +737,21 @@ public:
             size_t groupCount = 0;
             if (!checkedVolume(workgroup, workgroupVolume) || !checkedVolume(grid, groupCount))
                 return fail("CPU workgroup dispatch volume overflows", VERNON_STATUS_INVALID_ARGUMENT);
+            if (groupBegin > groupCount || (requestedGroupCount != std::numeric_limits<size_t>::max() &&
+                                            requestedGroupCount > groupCount - groupBegin))
+                return fail("CPU workgroup dispatch group range is invalid", VERNON_STATUS_INVALID_ARGUMENT);
+            groupCount = requestedGroupCount == std::numeric_limits<size_t>::max() ? groupCount - groupBegin
+                                                                                   : requestedGroupCount;
+            if (!groupCount)
+                return fail("CPU workgroup dispatch group range is empty", VERNON_STATUS_INVALID_ARGUMENT);
             if (workgroupVolume > config_.maxWorkgroupVolume)
                 return fail("CPU workgroup volume " + std::to_string(workgroupVolume) + " exceeds configured maximum " +
                                 std::to_string(config_.maxWorkgroupVolume),
                             VERNON_STATUS_INVALID_ARGUMENT);
             constexpr size_t inlineInvocationLimit = 64;
             if (groupCount == 1 && workgroupVolume <= inlineInvocationLimit) {
-                auto job = std::make_shared<RangeJob>(1, groupCount, workgroupVolume, grid, workgroup, callback);
+                auto job =
+                    std::make_shared<RangeJob>(1, groupBegin, groupCount, workgroupVolume, grid, workgroup, callback);
                 job->run();
                 if (job->status() != VERNON_STATUS_OK)
                     schedulerDiagnostic = job->diagnostic();
@@ -753,7 +763,8 @@ public:
                     : std::min(config_.threadBudget, groupCount > std::numeric_limits<size_t>::max() / workgroupVolume
                                                          ? config_.threadBudget
                                                          : groupCount * workgroupVolume);
-            auto job = std::make_shared<RangeJob>(runners, groupCount, workgroupVolume, grid, workgroup, callback);
+            auto job =
+                std::make_shared<RangeJob>(runners, groupBegin, groupCount, workgroupVolume, grid, workgroup, callback);
             if (forceCallingThread || config_.executionPolicy == CpuSchedulerExecutionPolicy::CallingThread) {
                 job->run();
             } else {
@@ -933,6 +944,11 @@ VernonStatus CpuWorkgroupScheduler::dispatch(const uint32_t grid[3], const uint3
 VernonStatus CpuWorkgroupScheduler::dispatchInline(const uint32_t grid[3], const uint32_t workgroup[3],
                                                    const CpuRangeCallback &callback) noexcept {
     return impl_->dispatch(grid, workgroup, callback, true);
+}
+
+VernonStatus CpuWorkgroupScheduler::dispatchGroupInline(const uint32_t grid[3], const uint32_t workgroup[3],
+                                                        size_t groupLinear, const CpuRangeCallback &callback) noexcept {
+    return impl_->dispatch(grid, workgroup, callback, true, groupLinear, 1);
 }
 
 const std::string &CpuWorkgroupScheduler::lastDiagnostic() const noexcept { return impl_->lastDiagnostic(); }

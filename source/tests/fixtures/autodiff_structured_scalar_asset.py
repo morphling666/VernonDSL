@@ -37,6 +37,41 @@ asset = vd.pipeline_asset(
 )
 
 
+@vd.kernel(workgroup_size=(2, 3, 1))
+def balanced_objective(
+    x: vd.f32,
+    y: vd.f32,
+    z: vd.f32,
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    linear = x + y
+    difference = x - y
+    output[gid[2], gid[1], gid[0]] = (
+        linear * difference / y
+        - z
+        + vd.sin(x)
+        + vd.cos(y)
+        + vd.exp(z)
+        + vd.log(x)
+        + vd.sqrt(y)
+        + vd.acos(z)
+        + vd.atan2(y, x)
+        + vd.abs(y - z)
+        + x**y
+    )
+
+
+balanced_asset = vd.pipeline_asset(
+    id="compute/structured_scalar_balanced_vjp",
+    program=vd.ad.vjp(
+        balanced_objective,
+        wrt=("x", "y", "z"),
+        outputs=("output",),
+    ),
+)
+
+
 @vd.kernel
 def half_objective(x: vd.f16, y: vd.f16, output: vd.TensorView[vd.f16, (1,), vd.write]) -> None:
     output[0] = x * y + x

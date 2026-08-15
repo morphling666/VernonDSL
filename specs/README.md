@@ -13,16 +13,22 @@ and milestone checklists.
    Tensor, TensorStorage, TensorView, workgroup, projection, and ABI contract.
 3. [`autodiff.md`](autodiff.md) defines the VJP program transform,
    pullback semantics, differentiated asset cooking, and C/C++ deployment API.
-4. [`compiler/design.md`](compiler/design.md) defines compiler boundaries,
+4. [`autodiff_tutorial.md`](autodiff_tutorial.md) explains the implemented
+   Phase 1/2 VJP stack from Tape IR and dynamic control flow through CPU
+   multithreading and ExecutionGraph VJP.
+5. [`autodiff_cost_aware_residual_plan.md`](autodiff_cost_aware_residual_plan.md)
+   records completed Phase 1/2 memory work and the active production-target
+   residual-source, cost-model, and bounded-replay checklist.
+6. [`compiler/design.md`](compiler/design.md) defines compiler boundaries,
    lowering invariants, reflection, target routing, and artifact cooking.
-5. [`runtime/design.md`](runtime/design.md) defines deployment ABI, backend
+7. [`runtime/design.md`](runtime/design.md) defines deployment ABI, backend
    ownership, resource behavior, and execution semantics.
-6. [`runtime/image_resources.md`](runtime/image_resources.md) defines the
+8. [`runtime/image_resources.md`](runtime/image_resources.md) defines the
    long-term Image, ImageView, sampled/storage binding, provider, and RHI
    architecture. It is a future contract rather than 0.1.2 behavior.
-7. [`roadmap.md`](roadmap.md) summarizes completed milestones and current future
+9. [`roadmap.md`](roadmap.md) summarizes completed milestones and current future
    work across language, compiler, Runtime, backends, and release engineering.
-8. [`examples/design.md`](examples/design.md) records non-obvious showcase
+10. [`examples/design.md`](examples/design.md) records non-obvious showcase
    algorithms and third-party design provenance.
 
 Supporting future designs:

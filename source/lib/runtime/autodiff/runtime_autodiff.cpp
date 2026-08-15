@@ -169,6 +169,7 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
                              VernonLoadedPipeline &pipeline) {
     if (!bundle.context || !bundle.autodiff)
         return false;
+    const Stage &primal = bundle.stages.at(profiles.primal);
     const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
     const Stage &backward = bundle.stages.at(profiles.backward);
     const std::vector<std::string> gradientPaths =
@@ -182,8 +183,9 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffVariant
         invocationDiagnostic(*bundle.context) = "CPU autodiff requires the dynamic_v2 protocol";
         return false;
     }
-    const bool resolved = createCpuExecutable(*bundle.context, forward, backward, gradientPaths,
-                                              profiles.staticTapeBytesHint, executable);
+    const bool resolved =
+        createCpuExecutable(*bundle.context, primal, forward, backward, gradientPaths, profiles.staticTapeBytesHint,
+                            profiles.residualStorage, profiles.selectedPolicy, executable);
     if (!resolved)
         return false;
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
@@ -245,7 +247,8 @@ vernon::runtime::autodiffPullbackMemoryUsage(const VernonPullback *pullback) {
     if (!pullback || !pullback->execution)
         return {};
     const ad::PullbackMemoryUsage usage = pullback->execution->memoryUsage();
-    return {usage.logicalResidualBytes, usage.residentBytes, usage.allocatedBytes, usage.retainedAllocationBytes};
+    return {usage.logicalResidualBytes, usage.residentBytes, usage.allocatedBytes, usage.retainedAllocationBytes,
+            usage.peakTemporaryBytes};
 }
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
@@ -373,15 +376,25 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
     }
 }
 
-VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
-                                 VernonAdValueSet *gradients) {
+VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const VernonAdValueSet *cotangents,
+                                            VernonAdValueSet *gradients, const VernonPullbackApplyOptions *options) {
     VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
     try {
         using namespace vernon::runtime::ad;
         vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true))
+        if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true) ||
+            !options || options->struct_size != sizeof(VernonPullbackApplyOptions) ||
+            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
+            std::any_of(std::begin(options->reserved), std::end(options->reserved),
+                        [](uint32_t value) { return value != 0; }))
             return fail(context, "invalid pullback invocation");
-        return pullback->execution->apply(cotangents, *gradients);
+        const auto boundedSize = [](uint64_t value) {
+            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
+                                                              : static_cast<size_t>(value);
+        };
+        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
+                                                  boundedSize(options->maximum_reusable_construction_bytes)};
+        return pullback->execution->apply(cotangents, *gradients, runtimeOptions);
     } catch (const std::bad_alloc &) {
         return fail(context, "cannot allocate pullback state", VERNON_STATUS_INTERNAL_ERROR);
     } catch (const std::length_error &) {
@@ -389,6 +402,16 @@ VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSe
     } catch (...) {
         return fail(context, "unexpected pullback failure", VERNON_STATUS_INTERNAL_ERROR);
     }
+}
+
+VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
+                                 VernonAdValueSet *gradients) {
+    const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
+                                             VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                             std::numeric_limits<uint64_t>::max(),
+                                             0,
+                                             {}};
+    return vernonPullbackApplyWithOptions(pullback, cotangents, gradients, &options);
 }
 
 void vernonPullbackDestroy(VernonPullback *pullback) {

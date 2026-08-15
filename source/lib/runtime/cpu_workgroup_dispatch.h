@@ -48,6 +48,8 @@ public:
                           const CpuRangeCallback &callback) noexcept;
     VernonStatus dispatchInline(const uint32_t grid[3], const uint32_t workgroup[3],
                                 const CpuRangeCallback &callback) noexcept;
+    VernonStatus dispatchGroupInline(const uint32_t grid[3], const uint32_t workgroup[3], size_t groupLinear,
+                                     const CpuRangeCallback &callback) noexcept;
     const std::string &lastDiagnostic() const noexcept;
 
 private:

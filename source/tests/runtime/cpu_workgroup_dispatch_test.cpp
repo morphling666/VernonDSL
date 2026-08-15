@@ -86,6 +86,30 @@ TEST_F(CpuWorkgroupDispatchTest, ExecutesEachInvocationInContiguousGroupRangesAn
     EXPECT_LE(workerPool.size(), 8u);
 }
 
+TEST_F(CpuWorkgroupDispatchTest, DispatchesOneOriginalVirtualGroup) {
+    constexpr uint32_t grid[3]{4, 3, 2};
+    constexpr uint32_t workgroup[3]{4, 2, 1};
+    constexpr size_t selectedGroup = 17;
+    size_t visits = 0;
+    ASSERT_EQ(scheduler_->dispatchGroupInline(grid, workgroup, selectedGroup,
+                                              [&](VernonCpuRangeV1 &range) {
+                                                  EXPECT_EQ(range.group[0], 1u);
+                                                  EXPECT_EQ(range.group[1], 1u);
+                                                  EXPECT_EQ(range.group[2], 1u);
+                                                  return forEachLane(
+                                                      range, [&](const vernon::runtime::CpuLaneCoordinates &lane) {
+                                                          EXPECT_EQ(lane.global[0], 4u + lane.local[0]);
+                                                          EXPECT_EQ(lane.global[1], 2u + lane.local[1]);
+                                                          EXPECT_EQ(lane.global[2], 1u);
+                                                          ++visits;
+                                                          return VERNON_STATUS_OK;
+                                                      });
+                                              }),
+              VERNON_STATUS_OK)
+        << scheduler_->lastDiagnostic();
+    EXPECT_EQ(visits, 8u);
+}
+
 TEST_F(CpuWorkgroupDispatchTest, CallingThreadPolicyReusesRangePhaseEngineWithoutWorkers) {
     std::string error;
     auto scheduler = vernon::runtime::CpuWorkgroupScheduler::create(

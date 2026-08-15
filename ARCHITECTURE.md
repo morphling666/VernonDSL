@@ -544,7 +544,7 @@ artifact，只要其 stage 和 feature 被该 target 支持。
 
 Cooked output 包含：
 
-- 当前 pipeline 15 `PIPELINE_VERSION`，且所有 target 共用唯一 canonical
+- 当前 pipeline 16 `PIPELINE_VERSION`，且所有 target 共用唯一 canonical
   `*.pipeline.json` root schema；
 - pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
@@ -577,7 +577,7 @@ static-registration `.c`/`.h`，而不是可由 Runtime 随意 `dlopen` 的 LLVM
 registration function，并通过 module-hashed wrapper symbol 注册 entry。
 Runtime 验证 manifest 中的 symbol、target triple、object format、size 和
 digest，再解析已注册 entry。已移除的 `vernon-compile --compute-bundle` 和
-`compute.json` 不属于 pipeline 15 部署接口。
+`compute.json` 不属于 pipeline 16 部署接口。
 
 ### 9.5 Load、Resolve 与 Invoke
 
@@ -594,6 +594,19 @@ manifest + artifacts
 
 Manifest parsing、artifact IO 和 pipeline preparation 都不应出现在 hot draw/
 dispatch path。重复 invocation 复用 prepared pipeline、layout 和绑定结构。
+
+CPU structured VJP 在 resolve 时把 profile、kernel、signature 和 required primal
+owners 归一化为共享的 immutable program，并把 residual storage / planning policy
+字符串一次解析为内部 enum plan。Retained whole-dispatch Tape 与 complete-workgroup
+replay 共用同一个 Tape range executor，统一 allocator builtin、lane validation、
+compaction 和 budget commit。Bounded forward 只运行 Tape-free primal；pullback
+反向遍历 workgroup，每次只持有一个 segment Tape，并在所有 segment 成功后一次发布
+staged gradients。静态 segment 在 backward reader 生命周期结束后复用 construction
+storage；compacted Tape 在每个 reader epoch 内保持 immutable。dynamic construction
+cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期输入，Runtime
+不使用固定阈值代替。公开的 no-Tape / retained-Tape pullback 通过 composition 使用
+共享 backward executor，segment replay 则以显式 borrowed-state value 调用它，不暴露
+模糊的 raw-pointer ownership。
 
 ## 10. 版本与兼容性
 

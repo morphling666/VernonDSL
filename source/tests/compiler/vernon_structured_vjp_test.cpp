@@ -109,6 +109,54 @@ TEST_F(VernonStructuredVjpTest, NoTapeProfileUsesExplicitPrimalArguments) {
     EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.x", "primal.y"}));
     EXPECT_GT(result->backward->getAttrOfType<IntegerAttr>("vernon.ad.active_operation_count").getInt(), 0);
     EXPECT_GE(result->backward->getAttrOfType<IntegerAttr>("vernon.ad.recomputation_cost").getInt(), 0);
+    unsigned captures = 0;
+    result->forward.walk([&](AdCaptureOp) { ++captures; });
+    EXPECT_EQ(captures, 0u);
+    EXPECT_TRUE(llvm::none_of(result->forward.getArgumentTypes(), [](Type type) { return isa<AdTapeType>(type); }));
+    EXPECT_TRUE(llvm::none_of(result->forward.getResultTypes(), [](Type type) { return isa<AdTapeType>(type); }));
+    EXPECT_TRUE(llvm::none_of(result->backward.getArgumentTypes(), [](Type type) { return isa<AdTapeType>(type); }));
+}
+
+TEST_F(VernonStructuredVjpTest, StaticCaptureOffsetsMatchWithinCurrentProfileContract) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %x: f32 {vernon.source_name = "x", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      attributes {vernon.entry, vernon.stage = "compute", vernon.ad.planning_policy = "min_runtime"} {
+    %square = arith.mulf %x, %x : f32
+    %fourth = arith.mulf %square, %square : f32
+    %result = arith.divf %fourth, %x : f32
+    "vernon.store"(%result, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x"}, "static_forward", "static_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    EXPECT_TRUE(succeeded(verify(*module)));
+    EXPECT_GT(result->tapeBytes, 0u);
+    EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "static");
+    SmallVector<int64_t> writeOffsets;
+    SmallVector<int64_t> readOffsets;
+    result->forward.walk([&](AdWriteLeafOp operation) {
+        writeOffsets.push_back(operation->getAttrOfType<IntegerAttr>("leaf_offset").getInt());
+    });
+    result->backward.walk([&](AdReadLeafOp operation) {
+        readOffsets.push_back(operation->getAttrOfType<IntegerAttr>("leaf_offset").getInt());
+    });
+    llvm::sort(writeOffsets);
+    llvm::sort(readOffsets);
+    EXPECT_FALSE(writeOffsets.empty());
+    EXPECT_EQ(writeOffsets, readOffsets);
 }
 
 TEST_F(VernonStructuredVjpTest, RematerializedStraightLineValueHasNoTapeTraffic) {
@@ -732,6 +780,18 @@ module {
     result->backward.walk([&](AdReadLeafOp) { ++carriedPrimalReads; });
     EXPECT_EQ(executedCountReads, 1u);
     EXPECT_GT(carriedPrimalReads, 0u);
+    SmallVector<int64_t> writeOffsets;
+    SmallVector<int64_t> readOffsets;
+    result->forward.walk([&](AdWriteLeafOp operation) {
+        writeOffsets.push_back(operation->getAttrOfType<IntegerAttr>("leaf_offset").getInt());
+    });
+    result->backward.walk([&](AdReadLeafOp operation) {
+        readOffsets.push_back(operation->getAttrOfType<IntegerAttr>("leaf_offset").getInt());
+    });
+    llvm::sort(writeOffsets);
+    llvm::sort(readOffsets);
+    EXPECT_FALSE(writeOffsets.empty());
+    EXPECT_EQ(writeOffsets, readOffsets);
 }
 
 TEST_F(VernonStructuredVjpTest, RejectsFunctionReturnComputeObjective) {

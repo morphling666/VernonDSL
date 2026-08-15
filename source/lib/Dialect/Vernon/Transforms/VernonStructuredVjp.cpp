@@ -319,8 +319,7 @@ FailureOr<ResidualRootLayout> buildStaticRootLayout(const VernonAutodiffTapePlan
             return failure();
         result.invocationLeafOffsets.push_back(*offset);
     }
-    result.stride =
-        std::max<uint64_t>(assignment.peakBytesByDomain[static_cast<size_t>(AdMemoryDomain::PersistentResidual)], 1);
+    result.stride = assignment.peakBytesByDomain[static_cast<size_t>(AdMemoryDomain::PersistentResidual)];
     return result.stride <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
                ? FailureOr<ResidualRootLayout>(std::move(result))
                : FailureOr<ResidualRootLayout>(failure());

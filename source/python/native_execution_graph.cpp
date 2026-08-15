@@ -175,7 +175,8 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     bool hasCheckpointPlanningMetadata() const override { return hasCheckpointPlanningMetadata_; }
     bool supportsReplay() const override { return true; }
     void setAutodiff(const nb::list &gradients, const nb::list &cotangents, const nb::list &requiredPrimals,
-                     uint64_t invocationCount, uint64_t tapeStride, uint64_t replayCost, uint64_t resourceReloadCost,
+                     uint64_t invocationCount, uint64_t tapeStride, uint64_t workgroupInvocationCount,
+                     uint64_t replaySnapshotBytes, uint64_t replayCost, uint64_t resourceReloadCost,
                      uint64_t recomputationCost, uint64_t retainedPrimalBytes, bool deterministicReductionLegal,
                      bool hasCheckpointPlanningMetadata) {
         const auto convert = [](const nb::list &values) {
@@ -204,18 +205,19 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
             requiredPrimalResources_.push_back({nb::cast<std::string>(entry[0]), nb::cast<uint32_t>(entry[1])});
         }
         if (invocationCount > std::numeric_limits<size_t>::max() || tapeStride > std::numeric_limits<size_t>::max() ||
-            (tapeStride && invocationCount > std::numeric_limits<uint64_t>::max() / tapeStride))
+            workgroupInvocationCount > std::numeric_limits<size_t>::max())
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
-        size_t forwardPeakBytes = 0;
-        if (tapeStride && !vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
-                              static_cast<size_t>(invocationCount), static_cast<size_t>(tapeStride), forwardPeakBytes))
+        size_t segmentTapeBytes = 0;
+        if (tapeStride && (!workgroupInvocationCount || !vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
+                                                            static_cast<size_t>(workgroupInvocationCount),
+                                                            static_cast<size_t>(tapeStride), segmentTapeBytes)))
             throw std::overflow_error("autodiff checkpoint planning metadata exceeds the host representation");
-        const uint64_t logicalTapeBytes = invocationCount * tapeStride;
-        if (retainedPrimalBytes > std::numeric_limits<uint64_t>::max() - forwardPeakBytes)
-            throw std::overflow_error("autodiff retained allocation estimate overflows");
-        estimatedRetainedAllocationBytes_ = forwardPeakBytes + retainedPrimalBytes;
-        estimatedForwardPeakBytes_ = forwardPeakBytes + retainedPrimalBytes;
-        estimatedResidualBytes_ = logicalTapeBytes;
+        if (replaySnapshotBytes > (std::numeric_limits<uint64_t>::max() - segmentTapeBytes) / 3)
+            throw std::overflow_error("autodiff bounded replay forward estimate overflows");
+        const uint64_t forwardPeakBytes = tapeStride ? segmentTapeBytes + 3 * replaySnapshotBytes : retainedPrimalBytes;
+        estimatedRetainedAllocationBytes_ = std::max(replaySnapshotBytes, retainedPrimalBytes);
+        estimatedForwardPeakBytes_ = std::max(estimatedRetainedAllocationBytes_, forwardPeakBytes);
+        estimatedResidualBytes_ = 0;
         replayCost_ = replayCost;
         resourceReloadCost_ = resourceReloadCost;
         recomputationCost_ = recomputationCost;

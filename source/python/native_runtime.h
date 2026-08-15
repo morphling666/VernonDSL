@@ -53,7 +53,8 @@ struct Runtime {
                                                     const CompiledProgram &backward, const std::string &backwardName,
                                                     const std::string &forwardProtocol,
                                                     const std::string &backwardProtocol, uint64_t staticTapeBytesHint,
-                                                    const nb::list &groupMetadata) {
+                                                    const std::string &residualStorage,
+                                                    const std::string &selectedPolicy, const nb::list &groupMetadata) {
         const CompiledProgram *programs[] = {&primal, &forward, &backward};
         const std::string *names[] = {&primalName, &forwardName, &backwardName};
         VernonCpuEntryPoint entries[3]{};
@@ -102,7 +103,8 @@ struct Runtime {
         VernonLoadedPipeline *pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
             *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
             view(forwardName), entries[2], view(reflections[2]), view(backwardName), view(forwardProtocol),
-            view(backwardProtocol), derivativeGroupViews.data(), derivativeGroupViews.size(), staticTapeBytesHint);
+            view(backwardProtocol), derivativeGroupViews.data(), derivativeGroupViews.size(), staticTapeBytesHint,
+            view(residualStorage), view(selectedPolicy));
         if (!pipeline)
             throw std::runtime_error("cannot load direct CPU autodiff profiles: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));

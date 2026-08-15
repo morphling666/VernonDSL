@@ -165,13 +165,31 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
 
     bool apply(const vernon::execution::NamedGraphAutodiffValues &cotangents,
                vernon::execution::NamedGraphAutodiffValues &gradients, std::string &error) override {
+        return applyImpl(cotangents, gradients, nullptr, error);
+    }
+
+    bool applyWithOptions(const vernon::execution::NamedGraphAutodiffValues &cotangents,
+                          vernon::execution::NamedGraphAutodiffValues &gradients,
+                          const vernon::execution::PassPullbackApplyOptions &options, std::string &error) override {
+        const VernonPullbackApplyOptions runtimeOptions{sizeof(VernonPullbackApplyOptions),
+                                                        VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                        options.maximumTemporaryBytes,
+                                                        options.maximumReusableConstructionBytes,
+                                                        {}};
+        return applyImpl(cotangents, gradients, &runtimeOptions, error);
+    }
+
+    bool applyImpl(const vernon::execution::NamedGraphAutodiffValues &cotangents,
+                   vernon::execution::NamedGraphAutodiffValues &gradients, const VernonPullbackApplyOptions *options,
+                   std::string &error) {
         try {
             nb::dict values;
             for (const auto &cotangent : cotangents)
                 values[cotangent.first.c_str()] = pythonGraphAutodiffValue(cotangent.second);
             if (callbackState)
                 callbackState->recordReverseCallback();
-            nb::dict result = native->applyGrouped(values, gradientGroups, cotangentGroups, carrierShape, true);
+            nb::dict result =
+                native->applyGroupedWithOptions(values, gradientGroups, cotangentGroups, carrierShape, true, options);
             const auto &metadataValues = native->gradientMetadata();
             for (auto item : result) {
                 const std::string path = nb::cast<std::string>(item.first);
@@ -198,6 +216,7 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
     uint64_t residentTapeBytes() const override { return native->residentBytes(); }
     uint64_t allocatedTapeBytes() const override { return native->allocatedBytes(); }
     uint64_t retainedAllocationBytes() const override { return native->retainedAllocationBytes(); }
+    uint64_t peakTemporaryTapeBytes() const override { return native->peakTemporaryBytes(); }
     uint64_t activeOperationCount() const override { return activeOperationCountValue; }
     uint64_t recomputationCost() const override { return recomputationCostValue; }
     uint64_t tapeContextLimitBytes() const override { return native->tapeContextLimitBytes(); }
@@ -348,6 +367,7 @@ void bindExecutionGraphAutodiff(nb::module_ &module) {
                              telemetry["resident_tape_bytes"] = item.residentTapeBytes;
                              telemetry["allocated_tape_bytes"] = item.allocatedTapeBytes;
                              telemetry["retained_allocation_bytes"] = item.retainedAllocationBytes;
+                             telemetry["peak_temporary_tape_bytes"] = item.peakTemporaryTapeBytes;
                              telemetry["checkpoint_bytes"] = item.checkpointBytes;
                              telemetry["active_operation_count"] = item.activeOperationCount;
                              telemetry["recomputation_cost"] = item.recomputationCost;

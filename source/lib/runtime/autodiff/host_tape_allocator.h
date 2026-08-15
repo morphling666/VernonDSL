@@ -161,6 +161,7 @@ public:
     bool reserveTransientBytes(size_t bytes) { return reserveBytes(bytes); }
     void releaseTransientBytes(size_t bytes) { releaseBytes(bytes); }
     void commit();
+    bool beginRecycledConstruction();
 
 private:
     HostTapeDispatchBudget(std::shared_ptr<HostTapeMemoryPolicy> policy, size_t capacity)
@@ -202,7 +203,9 @@ public:
     VernonAdTapeAllocatorStatus status(size_t lane) const;
     size_t requiredBytes(size_t lane) const;
 
-    bool compact();
+    bool compact(bool retainConstructionStorage = false);
+    bool resetCompactedReplay();
+    size_t constructionBytes() const;
     bool isCompacted() const;
     VernonAdRegionHandle rootRegion(size_t lane) const;
     VernonAdTapeAllocatorStatus readLeaf(size_t lane, VernonAdRegionHandle region, size_t recordIndex,
@@ -226,6 +229,8 @@ private:
 /// append to one shared arena and seal into one immutable batch.
 class HostStaticTapeBatch : public std::enable_shared_from_this<HostStaticTapeBatch> {
 public:
+    enum class ConstructionState : uint8_t { Constructing, FrozenReader, Recyclable, Released };
+
     class Reader {
     public:
         Reader() = default;
@@ -274,9 +279,13 @@ public:
     size_t size() const { return laneCount_; }
     VernonAdTapeAllocator *descriptor(size_t lane);
     VernonAdRegionHandle rootRegion(size_t lane) const;
-    bool compact();
+    bool compact(bool retainConstructionStorage = false);
+    bool markConstructionRecyclable();
+    bool resetRecyclableConstruction();
     bool initializeReader(size_t lane, Reader &reader) const;
     bool isCompacted() const { return compacted_; }
+    ConstructionState constructionState() const { return constructionState_; }
+    size_t constructionBytes() const;
     size_t logicalBytes() const;
     size_t residentBytes() const;
     size_t allocatedBytes() const;
@@ -302,6 +311,7 @@ private:
     HostStaticTapeBatch(size_t laneCount, size_t payloadStride, size_t invocationCapacity,
                         std::shared_ptr<HostTapeMemoryPolicy> policy,
                         std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    void initializeDescriptors();
 
     static std::pair<HostStaticTapeBatch *, size_t> owner(VernonAdTapeAllocator *allocator);
     static VernonAdTapeAllocatorStatus reset(VernonAdTapeAllocator *allocator);
@@ -350,6 +360,8 @@ private:
     size_t policyCharge_{};
     size_t compactedLogicalBytes_{};
     bool compacted_{};
+    bool retainsConstructionStorage_{};
+    ConstructionState constructionState_{ConstructionState::Constructing};
 };
 
 } // namespace vernon::runtime::ad
