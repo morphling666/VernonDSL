@@ -233,6 +233,7 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
     const vernon::runtime::AutodiffPullbackMemoryUsage memoryUsage =
         vernon::runtime::autodiffPullbackMemoryUsage(pullback);
     EXPECT_EQ(memoryUsage.logicalResidualBytes, 0u);
+    EXPECT_GT(memoryUsage.retainedAllocationBytes, 0u);
     EXPECT_EQ(memoryUsage.residentBytes, 0u);
     EXPECT_EQ(memoryUsage.allocatedBytes, 0u);
     EXPECT_FLOAT_EQ(loss[0], 26.0f);

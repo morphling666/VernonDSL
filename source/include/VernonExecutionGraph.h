@@ -185,6 +185,12 @@ public:
     virtual uint64_t allocatedTapeBytes() const = 0;
     virtual uint64_t retainedAllocationBytes() const { return allocatedTapeBytes(); }
     virtual uint64_t peakTemporaryTapeBytes() const { return 0; }
+    virtual uint64_t submissionCount() const { return 0; }
+    virtual uint64_t waitCount() const { return 0; }
+    virtual uint64_t readbackCount() const { return 0; }
+    virtual uint64_t atomicPublicationCount() const { return 0; }
+    virtual uint64_t temporaryAllocationTrafficBytes() const { return 0; }
+    virtual uint64_t deviceWaitNanoseconds() const { return 0; }
     virtual uint64_t activeOperationCount() const = 0;
     virtual uint64_t recomputationCost() const = 0;
     virtual uint64_t tapeContextLimitBytes() const = 0;
@@ -496,7 +502,8 @@ public:
                                  bool exported = false);
     GraphBuffer importHostBuffer(uint64_t identity, bool exported = false,
                                  std::shared_ptr<GraphCheckpointResource> checkpoint = {});
-    GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
+    GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false,
+                             std::shared_ptr<GraphCheckpointResource> checkpoint = {});
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, bool exported = false);
     ExecutionParameter parameter(std::string name);
     void setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
@@ -633,6 +640,12 @@ public:
     uint64_t retainedAllocationBytes() const;
     uint64_t checkpointBytes() const;
     uint64_t peakRuntimeManagedBytes() const;
+    uint64_t submissionCount() const;
+    uint64_t waitCount() const;
+    uint64_t readbackCount() const;
+    uint64_t atomicPublicationCount() const;
+    uint64_t temporaryAllocationTrafficBytes() const;
+    uint64_t deviceWaitNanoseconds() const;
     uint64_t tapeContextLimitBytes() const;
     double recomputationFactor() const;
     std::vector<GraphAutodiffPassTelemetry> passTelemetry() const;

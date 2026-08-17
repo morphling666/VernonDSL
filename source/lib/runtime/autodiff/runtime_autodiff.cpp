@@ -175,13 +175,14 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile
     const std::vector<std::string> gradientPaths =
         autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
     std::shared_ptr<Executable> executable;
-    if (bundle.context->backend != VERNON_RUNTIME_CPU) {
-        invocationDiagnostic(*bundle.context) = "GPU autodiff is unsupported; runtime only supports CPU autodiff";
-        return false;
-    }
-    const bool resolved = createCpuExecutable(
-        *bundle.context, primal, forward, backward, gradientPaths, profiles.staticTapeBytesHint,
-        profiles.residualStorage, profiles.selectedPolicy, profiles.wholeDispatchRetentionPermitted, executable);
+    const bool resolved =
+        bundle.context->backend == VERNON_RUNTIME_CPU
+            ? createCpuExecutable(*bundle.context, primal, forward, backward, gradientPaths,
+                                  profiles.staticTapeBytesHint, profiles.residualStorage, profiles.selectedPolicy,
+                                  profiles.wholeDispatchRetentionPermitted, executable)
+            : createGpuExecutable(*bundle.context, primal, forward, backward, gradientPaths,
+                                  profiles.staticTapeBytesHint, profiles.residualStorage, profiles.selectedPolicy,
+                                  executable);
     if (!resolved)
         return false;
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
@@ -269,8 +270,21 @@ vernon::runtime::autodiffPullbackMemoryUsage(const VernonPullback *pullback) {
             usage.peakTemporaryBytes};
 }
 
+vernon::runtime::AutodiffPullbackControlPlaneUsage
+vernon::runtime::autodiffPullbackControlPlaneUsage(const VernonPullback *pullback) {
+    if (!pullback || !pullback->execution)
+        return {};
+    const ad::PullbackControlPlaneUsage usage = pullback->execution->controlPlaneUsage();
+    return {usage.submissions,
+            usage.waits,
+            usage.readbacks,
+            usage.atomicPublications,
+            usage.temporaryAllocationBytes,
+            usage.deviceWaitNanoseconds};
+}
+
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
-    return context && context->cpuTapePolicy ? context->cpuTapePolicy->contextLimit() : 0;
+    return context && context->autodiffMemoryPolicy ? context->autodiffMemoryPolicy->contextLimit() : 0;
 }
 
 extern "C" {
@@ -372,9 +386,7 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
         auto result = std::make_unique<VernonPullback>();
         result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
         std::unique_ptr<PullbackExecution> execution;
-        VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
-        if (auto *host = dynamic_cast<HostExecutable *>(executable))
-            status = host->forward(computeGrid, *inputs, *outputs, execution);
+        const VernonStatus status = executable->forward({}, computeGrid, *inputs, outputs, execution);
         if (status != VERNON_STATUS_OK)
             return status;
         if (!execution)
@@ -390,6 +402,45 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
                     VERNON_STATUS_INTERNAL_ERROR);
     } catch (...) {
         return fail(pipeline ? pipeline->context : nullptr, "unexpected autodiff forward failure",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
+VernonStatus vernonAdPipelineEncodeForward(VernonRuntimeProviderObject encoder, VernonLoadedPipeline *pipeline,
+                                           const VernonPipelineInvocation *invocation, const VernonAdValueSet *inputs,
+                                           VernonPullback **pullback) {
+    try {
+        using namespace vernon::runtime::ad;
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+        if (pullback)
+            *pullback = nullptr;
+        auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+        if (!pipeline || !pullback || !executable || !encoder.value || !invocation ||
+            invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+            invocation->abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation->compute_grid) ||
+            (invocation->argument_count && !invocation->arguments) || !validSet(inputs, true))
+            return fail(pipeline ? pipeline->context : nullptr, "invalid encoded autodiff forward invocation");
+        auto result = std::make_unique<VernonPullback>();
+        result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
+        std::unique_ptr<PullbackExecution> execution;
+        const ForwardExecutionTarget target{encoder, invocation};
+        const VernonStatus status = executable->forward(target, invocation->compute_grid, *inputs, nullptr, execution);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        if (!execution)
+            return fail(pipeline->context, "encoded autodiff forward produced no pullback",
+                        VERNON_STATUS_INTERNAL_ERROR);
+        result->execution = std::move(execution);
+        *pullback = result.release();
+        return VERNON_STATUS_OK;
+    } catch (const std::bad_alloc &) {
+        return fail(pipeline ? pipeline->context : nullptr, "cannot allocate encoded autodiff forward state",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        return fail(pipeline ? pipeline->context : nullptr, "encoded autodiff forward allocation is too large",
+                    VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(pipeline ? pipeline->context : nullptr, "unexpected encoded autodiff forward failure",
                     VERNON_STATUS_INTERNAL_ERROR);
     }
 }

@@ -303,6 +303,19 @@ VernonRhiStatus vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t enc
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus vernon::rhi::recordBufferCopy(VernonRhiDevice device, uint64_t native, VernonRhiBuffer source,
+                                              uint64_t sourceOffset, VernonRhiBuffer destination,
+                                              uint64_t destinationOffset, uint64_t size) {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordBufferCopy)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordBufferCopy(device, native, source, sourceOffset, destination, destinationOffset, size)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 bool vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
                                       uint32_t renderingKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
                                       const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,

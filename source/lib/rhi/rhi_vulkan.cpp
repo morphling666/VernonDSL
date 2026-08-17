@@ -62,9 +62,21 @@ struct VulkanDeviceSlot {
     uint32_t generation{1};
 };
 
+struct VulkanDeviceRegistry {
+    VulkanDeviceRegistry() {
+        // Register the driver destructor before this registry's destructor so
+        // live context-leased devices always shut down before the loader.
+        (void)vernon::rhi::vulkan::driver();
+    }
+
+    std::mutex mutex;
+    std::vector<VulkanDeviceSlot> devices;
+};
+
 constexpr uint32_t vulkanDeviceBit = uint32_t{1} << 30;
-std::vector<VulkanDeviceSlot> vulkanDevices;
-std::mutex deviceMutex;
+VulkanDeviceRegistry vulkanDeviceRegistry;
+std::vector<VulkanDeviceSlot> &vulkanDevices = vulkanDeviceRegistry.devices;
+std::mutex &deviceMutex = vulkanDeviceRegistry.mutex;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
@@ -1620,6 +1632,26 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
     }
 }
 
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    auto *sourceSlot = lookupResourceRecord(device->buffers, resourceKey(source));
+    auto *destinationSlot = lookupResourceRecord(device->buffers, resourceKey(destination));
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->ownedDescriptor.size ||
+        size > sourceSlot->ownedDescriptor.size - sourceOffset ||
+        destinationOffset > destinationSlot->ownedDescriptor.size ||
+        size > destinationSlot->ownedDescriptor.size - destinationOffset)
+        return false;
+    const VkBufferCopy copy{sourceOffset, destinationOffset, size};
+    vernon::rhi::vulkan::driver().cmdCopyBuffer(command, sourceSlot->buffer.buffer, destinationSlot->buffer.buffer, 1,
+                                                &copy);
+    return true;
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1881,6 +1913,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,
+        recordBufferCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

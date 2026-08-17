@@ -182,7 +182,40 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 6 * sizeof(float);
     ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
+    EXPECT_EQ(error, "pipeline Tensor argument requires 36 bytes but its allocation has 24");
+}
+
+TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
+    Variant variant;
+    Parameter parameter = storageF32Parameter(0, 0, "read_write");
+    parameter.shape = {};
+    parameter.uses.front().shape = {};
+    parameter.uses.front().tensorViewDescriptor = TensorViewDescriptorUse{0, 1, {}, {}};
+    variant.parameters = {parameter};
+
+    VernonPipelineArgument supplied{};
+    supplied.slot = 0;
+    supplied.kind = VERNON_PIPELINE_TENSOR;
+    supplied.tensor.struct_size = sizeof(VernonTensorView);
+    supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
+    supplied.tensor.resource = {1, {2}, 0, sizeof(float)};
+    supplied.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    supplied.tensor.access = VERNON_ACCESS_READ_WRITE;
+    supplied.tensor.rank = 0;
+    supplied.tensor.byte_size = sizeof(float);
+    VernonPipelineInvocation invocation{};
+    invocation.arguments = &supplied;
+    invocation.argument_count = 1;
+    invocation.compute_grid = {1, 1, 1};
+
+    PlannedComputeLaunch plan;
+    std::string error;
+    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    ASSERT_EQ(plan.arguments.size(), 1u);
+    const auto &argument = std::get<ComputeTensorArgument>(plan.arguments.front());
+    ASSERT_NE(argument.tensorView, nullptr);
+    EXPECT_EQ(argument.tensorView->rank, 0u);
+    EXPECT_EQ(argument.tensorViewSize, 16u);
 }
 
 TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
@@ -218,7 +251,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     PlannedComputeLaunch plan;
     std::string error;
     ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline Tensor argument does not match layout");
+    EXPECT_EQ(error, "pipeline Tensor argument access does not match reflection");
 }
 
 TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases) {

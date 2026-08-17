@@ -153,11 +153,7 @@ def cook_pipeline_asset(
     target_name = target.target
     if pipeline.transform is not None and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError(
-            "graphics VJP asset cooking is not supported; automatic differentiation requires a CPU compute pipeline"
-        )
-    if pipeline.transform is not None and target_name != "cpu":
-        raise PipelineCompileError(
-            f"VJP asset cooking requires target='cpu'; GPU target '{target_name}' is not supported"
+            "graphics VJP asset cooking is not supported; automatic differentiation requires a compute pipeline"
         )
     if target_name == "cpu" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
@@ -244,9 +240,7 @@ def cook_pipeline_asset(
                 )
             )
             if not is_structured_vjp_abi_eligible(frontend, transform):
-                raise PipelineCompileError(
-                    "autodiff requires a structured CPU VJP with explicit writable Storage outputs"
-                )
+                raise PipelineCompileError("autodiff requires a structured VJP with explicit writable Storage outputs")
             try:
                 structured = build_structured_vjp(native, frontend, transform)
             except ValueError as error:

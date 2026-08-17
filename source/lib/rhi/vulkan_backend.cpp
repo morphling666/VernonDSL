@@ -183,14 +183,21 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
         (VK_API_VERSION_MAJOR(apiVersion) == 1 && VK_API_VERSION_MINOR(apiVersion) >= 2);
     const bool hasDynamicRenderingExtension = hasExtension(extensions, VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
     portabilitySubset = hasExtension(extensions, VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME);
+    const bool hasShaderAtomicFloat = hasExtension(extensions, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
     VkPhysicalDeviceDynamicRenderingFeatures dynamicRenderingFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
     VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilitySubsetFeatures{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT shaderAtomicFloatFeatures{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     const bool canUseDynamicRendering =
         dynamicRenderingIsCore || (dynamicRenderingDependenciesAreCore && hasDynamicRenderingExtension);
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     void *queriedFeatureChain = nullptr;
+    if (hasShaderAtomicFloat) {
+        shaderAtomicFloatFeatures.pNext = queriedFeatureChain;
+        queriedFeatureChain = &shaderAtomicFloatFeatures;
+    }
     if (portabilitySubset) {
         portabilitySubsetFeatures.pNext = queriedFeatureChain;
         queriedFeatureChain = &portabilitySubsetFeatures;
@@ -201,12 +208,19 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     }
     features.pNext = queriedFeatureChain;
     api.getPhysicalDeviceFeatures2(physicalDevice, &features);
+    shaderBufferFloat32AtomicAdd =
+        hasShaderAtomicFloat && shaderAtomicFloatFeatures.shaderBufferFloat32AtomicAdd == VK_TRUE;
     if (canUseDynamicRendering)
         dynamicRendering = dynamicRenderingFeatures.dynamicRendering == VK_TRUE;
     VkPhysicalDeviceFeatures enabledFeatures{};
     deviceInfo.pEnabledFeatures = &enabledFeatures;
     std::vector<const char *> deviceExtensions;
     void *enabledFeatureChain = nullptr;
+    if (shaderBufferFloat32AtomicAdd) {
+        shaderAtomicFloatFeatures.pNext = enabledFeatureChain;
+        enabledFeatureChain = &shaderAtomicFloatFeatures;
+        deviceExtensions.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+    }
     if (portabilitySubset) {
         portabilitySubsetFeatures.pNext = enabledFeatureChain;
         enabledFeatureChain = &portabilitySubsetFeatures;
@@ -359,6 +373,7 @@ void DeviceState::shutdown() {
     maxComputeWorkGroupInvocations = 0;
     descriptorBufferOffsetAlignment = 1;
     dynamicRendering = false;
+    shaderBufferFloat32AtomicAdd = false;
     portabilityEnumeration = false;
     portabilitySubset = false;
     nativeObjectsBorrowed = false;

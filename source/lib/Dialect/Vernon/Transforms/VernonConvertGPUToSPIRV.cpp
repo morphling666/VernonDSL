@@ -16,6 +16,7 @@
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/SPIRVConversion.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -26,6 +27,56 @@
 
 namespace mlir::vernon {
 namespace {
+
+bool isCasBackedF32MemRef(Type type) {
+    auto memref = dyn_cast<MemRefType>(type);
+    if (!memref || !memref.getElementType().isF32())
+        return false;
+    auto storageClass = dyn_cast_or_null<spirv::StorageClassAttr>(memref.getMemorySpace());
+    return storageClass && (storageClass.getValue() == spirv::StorageClass::StorageBuffer ||
+                            storageClass.getValue() == spirv::StorageClass::Workgroup);
+}
+
+struct CasBackedLoadToSPIRVPattern final : OpConversionPattern<memref::LoadOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(memref::LoadOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto memref = dyn_cast<MemRefType>(op.getMemRefType());
+        if (!memref || !isCasBackedF32MemRef(memref))
+            return failure();
+        const auto &converter = *getTypeConverter<SPIRVTypeConverter>();
+        Value pointer =
+            spirv::getElementPtr(converter, memref, adaptor.getMemref(), adaptor.getIndices(), op.getLoc(), rewriter);
+        auto pointerType = dyn_cast_or_null<spirv::PointerType>(pointer.getType());
+        if (!pointerType || !pointerType.getPointeeType().isInteger(32))
+            return failure();
+        Value bits = spirv::LoadOp::create(rewriter, op.getLoc(), pointer);
+        rewriter.replaceOpWithNewOp<spirv::BitcastOp>(op, rewriter.getF32Type(), bits);
+        return success();
+    }
+};
+
+struct CasBackedStoreToSPIRVPattern final : OpConversionPattern<memref::StoreOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(memref::StoreOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto memref = dyn_cast<MemRefType>(op.getMemRefType());
+        if (!memref || !isCasBackedF32MemRef(memref))
+            return failure();
+        const auto &converter = *getTypeConverter<SPIRVTypeConverter>();
+        Value pointer =
+            spirv::getElementPtr(converter, memref, adaptor.getMemref(), adaptor.getIndices(), op.getLoc(), rewriter);
+        auto pointerType = dyn_cast_or_null<spirv::PointerType>(pointer.getType());
+        if (!pointerType || !pointerType.getPointeeType().isInteger(32))
+            return failure();
+        Value bits = spirv::BitcastOp::create(rewriter, op.getLoc(), rewriter.getI32Type(), adaptor.getValue());
+        spirv::StoreOp::create(rewriter, op.getLoc(), pointer, bits);
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
 
 struct Atan2ToSPIRVPattern final : OpConversionPattern<math::Atan2Op> {
     using OpConversionPattern::OpConversionPattern;
@@ -44,13 +95,14 @@ struct Atan2ToSPIRVPattern final : OpConversionPattern<math::Atan2Op> {
     }
 };
 
-struct AtomicExchangeToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> {
-    AtomicExchangeToSPIRVPattern(const SPIRVTypeConverter &converter, MLIRContext *context)
-        : OpConversionPattern(converter, context, PatternBenefit(2)) {}
+struct AtomicRMWToSPIRVPattern final : OpConversionPattern<memref::AtomicRMWOp> {
+    using OpConversionPattern::OpConversionPattern;
 
     LogicalResult matchAndRewrite(memref::AtomicRMWOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        if (op.getKind() != arith::AtomicRMWKind::assign)
+        const bool exchange = op.getKind() == arith::AtomicRMWKind::assign;
+        const bool floatAdd = op.getKind() == arith::AtomicRMWKind::addf && op.getValue().getType().isF32();
+        if (!exchange && !floatAdd)
             return failure();
         auto memref = cast<MemRefType>(op.getMemref().getType());
         auto storageClass = dyn_cast_or_null<spirv::StorageClassAttr>(memref.getMemorySpace());
@@ -70,8 +122,74 @@ struct AtomicExchangeToSPIRVPattern final : OpConversionPattern<memref::AtomicRM
             spirv::getElementPtr(converter, memref, adaptor.getMemref(), adaptor.getIndices(), op.getLoc(), rewriter);
         if (!resultType || !pointer)
             return failure();
-        rewriter.replaceOpWithNewOp<spirv::AtomicExchangeOp>(
-            op, resultType, pointer, *scope, spirv::MemorySemantics::AcquireRelease, adaptor.getValue());
+        if (exchange) {
+            rewriter.replaceOpWithNewOp<spirv::AtomicExchangeOp>(
+                op, resultType, pointer, *scope, spirv::MemorySemantics::AcquireRelease, adaptor.getValue());
+            return success();
+        }
+        auto implementation = op->getAttrOfType<StringAttr>(kAtomicImplementationAttrName);
+        if (floatAdd && !implementation)
+            return op.emitError("floating atomic add reached SPIR-V conversion without a selected implementation");
+        if (floatAdd && implementation.getValue() == kNativeAtomicImplementation) {
+            rewriter.replaceOpWithNewOp<spirv::EXTAtomicFAddOp>(op, resultType, pointer, *scope,
+                                                                spirv::MemorySemantics::None, adaptor.getValue());
+        } else if (floatAdd && implementation.getValue() == kIntegerCasAtomicImplementation) {
+            auto function = op->getParentOfType<spirv::FuncOp>();
+            auto integerPointer = dyn_cast<spirv::PointerType>(pointer.getType());
+            if (!function || !integerPointer || !integerPointer.getPointeeType().isInteger(32))
+                return failure();
+            Type i32 = rewriter.getI32Type();
+            Value zero = spirv::ConstantOp::create(rewriter, op.getLoc(), i32, rewriter.getI32IntegerAttr(0));
+            Value initial = spirv::AtomicCompareExchangeOp::create(rewriter, op.getLoc(), i32, pointer, *scope,
+                                                                   spirv::MemorySemantics::None,
+                                                                   spirv::MemorySemantics::None, zero, zero);
+
+            OpBuilder entryBuilder = OpBuilder::atBlockBegin(&function.front());
+            auto resultPointer = spirv::PointerType::get(i32, spirv::StorageClass::Function);
+            Value result = spirv::VariableOp::create(entryBuilder, op.getLoc(), resultPointer,
+                                                     spirv::StorageClass::Function, nullptr);
+
+            auto loop = spirv::LoopOp::create(rewriter, op.getLoc(), spirv::LoopControl::None);
+            loop.addEntryAndMergeBlock(rewriter);
+            {
+                OpBuilder::InsertionGuard guard(rewriter);
+                Region &body = loop.getBody();
+                Block *entry = loop.getEntryBlock();
+                Block *merge = loop.getMergeBlock();
+                Block *header = rewriter.createBlock(&body, std::prev(body.end()));
+                Block *success = rewriter.createBlock(&body, std::prev(body.end()));
+                Block *retry = rewriter.createBlock(&body, std::prev(body.end()));
+                BlockArgument expected = header->addArgument(i32, op.getLoc());
+                BlockArgument observed = retry->addArgument(i32, op.getLoc());
+
+                OpBuilder headerBuilder = OpBuilder::atBlockBegin(header);
+                Value current = spirv::BitcastOp::create(headerBuilder, op.getLoc(), rewriter.getF32Type(), expected);
+                Value sum = spirv::FAddOp::create(headerBuilder, op.getLoc(), rewriter.getF32Type(), current,
+                                                  adaptor.getValue());
+                Value desired = spirv::BitcastOp::create(headerBuilder, op.getLoc(), i32, sum);
+                Value exchanged = spirv::AtomicCompareExchangeOp::create(
+                    headerBuilder, op.getLoc(), i32, pointer, *scope, spirv::MemorySemantics::None,
+                    spirv::MemorySemantics::None, desired, expected);
+                Value matched =
+                    spirv::IEqualOp::create(headerBuilder, op.getLoc(), rewriter.getI1Type(), exchanged, expected);
+                spirv::BranchConditionalOp::create(headerBuilder, op.getLoc(), matched, success, ValueRange{}, retry,
+                                                   ValueRange{exchanged});
+
+                OpBuilder successBuilder = OpBuilder::atBlockBegin(success);
+                spirv::StoreOp::create(successBuilder, op.getLoc(), result, exchanged);
+                spirv::BranchOp::create(successBuilder, op.getLoc(), merge);
+
+                OpBuilder retryBuilder = OpBuilder::atBlockBegin(retry);
+                spirv::BranchOp::create(retryBuilder, op.getLoc(), header, ValueRange{observed});
+
+                OpBuilder loopEntryBuilder = OpBuilder::atBlockBegin(entry);
+                spirv::BranchOp::create(loopEntryBuilder, op.getLoc(), header, ValueRange{initial});
+            }
+            rewriter.setInsertionPointAfter(loop);
+            Value previousBits = spirv::LoadOp::create(rewriter, op.getLoc(), result);
+            rewriter.replaceOpWithNewOp<spirv::BitcastOp>(op, resultType, previousBits);
+        } else
+            return op.emitError("unsupported floating atomic implementation '") << implementation.getValue() << "'";
         return success();
     }
 };
@@ -169,6 +287,9 @@ LogicalResult materializeStorageImageInterfaceVariables(ModuleOp module) {
 struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, OperationPass<ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ConvertGPUToSPIRVPass)
 
+    ConvertGPUToSPIRVPass() = default;
+    ConvertGPUToSPIRVPass(const ConvertGPUToSPIRVPass &other) : PassWrapper(other) {}
+
     StringRef getArgument() const override { return "vernon-convert-gpu-to-spirv"; }
     StringRef getDescription() const override {
         return "Convert GPU modules to SPIR-V with Vernon atomic exchange support";
@@ -180,10 +301,25 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
         for (gpu::GPUModuleOp gpuModule : gpuModules) {
             OpBuilder builder(gpuModule);
             auto clone = cast<gpu::GPUModuleOp>(builder.clone(*gpuModule.getOperation()));
+            bool usesIntegerCasStorage = false;
+            clone.walk([&](memref::AtomicRMWOp atomic) {
+                auto implementation = atomic->getAttrOfType<StringAttr>(kAtomicImplementationAttrName);
+                usesIntegerCasStorage |= implementation && implementation.getValue() == kIntegerCasAtomicImplementation;
+            });
             spirv::TargetEnvAttr targetEnvironment = spirv::lookupTargetEnvOrDefault(clone);
             std::unique_ptr<ConversionTarget> target = SPIRVConversionTarget::get(targetEnvironment);
             SPIRVTypeConverter typeConverter(targetEnvironment);
             populateMMAToSPIRVCoopMatrixTypeConversion(typeConverter);
+            if (usesIntegerCasStorage) {
+                typeConverter.addConversion([&](MemRefType memref) -> std::optional<Type> {
+                    if (!isCasBackedF32MemRef(memref))
+                        return std::nullopt;
+                    MemRefType integerStorage =
+                        MemRefType::get(memref.getShape(), IntegerType::get(memref.getContext(), 32),
+                                        memref.getLayout(), memref.getMemorySpace());
+                    return typeConverter.convertType(integerStorage);
+                });
+            }
             typeConverter.addConversion([](TextureType texture) -> std::optional<Type> {
                 FailureOr<Type> converted = convertStorageTextureType(texture);
                 return succeeded(converted) ? std::optional<Type>(*converted) : std::nullopt;
@@ -200,8 +336,12 @@ struct ConvertGPUToSPIRVPass final : PassWrapper<ConvertGPUToSPIRVPass, Operatio
             populateFuncToSPIRVPatterns(typeConverter, patterns);
             populateVectorToSPIRVPatterns(typeConverter, patterns);
             patterns.add<Atan2ToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
-            patterns.add<AtomicExchangeToSPIRVPattern>(typeConverter, &getContext());
+            patterns.add<AtomicRMWToSPIRVPattern>(typeConverter, &getContext(), PatternBenefit(2));
             patterns.add<StorageTextureIntrinsicToSPIRVPattern>(typeConverter, &getContext());
+            if (usesIntegerCasStorage) {
+                patterns.add<CasBackedLoadToSPIRVPattern, CasBackedStoreToSPIRVPattern>(typeConverter, &getContext(),
+                                                                                        PatternBenefit(2));
+            }
 
             if (failed(applyFullConversion(clone, *target, std::move(patterns)))) {
                 signalPassFailure();

@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_RUNTIME_AUTODIFF_INTERNAL_H
 
 #include "VernonRuntime.h"
+#include "runtime/autodiff/runtime_autodiff_policy.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 
@@ -50,9 +51,25 @@ struct PullbackMemoryUsage {
     size_t peakTemporaryBytes{};
 };
 
+struct PullbackControlPlaneUsage {
+    uint64_t submissions{};
+    uint64_t waits{};
+    uint64_t readbacks{};
+    uint64_t atomicPublications{};
+    uint64_t temporaryAllocationBytes{};
+    uint64_t deviceWaitNanoseconds{};
+};
+
 struct PullbackApplyOptions {
     size_t maximumTemporaryBytes{std::numeric_limits<size_t>::max()};
     size_t maximumReusableConstructionBytes{};
+};
+
+struct ForwardExecutionTarget {
+    VernonRuntimeProviderObject encoder{};
+    const VernonPipelineInvocation *invocation{};
+
+    bool externalEncoder() const { return encoder.value != 0; }
 };
 
 class PullbackExecution {
@@ -61,18 +78,16 @@ public:
     virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
                                const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
+    virtual PullbackControlPlaneUsage controlPlaneUsage() const { return {}; }
 };
 
 class Executable {
 public:
     virtual ~Executable() = default;
     virtual const Signature &signature() const = 0;
-};
-
-class HostExecutable : public Executable {
-public:
-    virtual VernonStatus forward(VernonLaunchSize computeGrid, const VernonAdValueSet &inputs,
-                                 VernonAdValueSet &outputs, std::unique_ptr<PullbackExecution> &pullback) = 0;
+    virtual VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize computeGrid,
+                                 const VernonAdValueSet &inputs, VernonAdValueSet *outputs,
+                                 std::unique_ptr<PullbackExecution> &pullback) = 0;
 };
 
 size_t dtypeSize(VernonDataType dtype);
@@ -104,6 +119,10 @@ bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint
                               const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
                               const std::string &residualStorage, const std::string &selectedPolicy,
                               bool wholeDispatchRetentionPermitted, std::shared_ptr<Executable> &executable);
+bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
+                         const Stage &backward, const std::vector<std::string> &gradientPaths,
+                         uint64_t staticTapeBytesHint, const std::string &residualStorage,
+                         const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profile,
                              VernonLoadedPipeline &pipeline);
 

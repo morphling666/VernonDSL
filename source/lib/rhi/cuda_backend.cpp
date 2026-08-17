@@ -189,6 +189,13 @@ Result DeviceState::download(void *destination, DevicePointer source, size_t siz
     return status;
 }
 
+Result DeviceState::copy(DevicePointer destination, DevicePointer source, size_t size) {
+    if (!destination || !source || !size)
+        return kInvalidValue;
+    Result status = makeCurrent();
+    return status == kSuccess ? driver().copyDeviceToDeviceAsync(destination, source, size, stream) : status;
+}
+
 Result PreparedFunction::create(DeviceState &device, const void *artifact, size_t artifactSize, const char *entry) {
     if (!artifact || artifactSize == 0 || !entry || !*entry)
         return kInvalidValue;

@@ -27,6 +27,16 @@ bool parseAutodiffResourceRole(const nlohmann::json &argument, AutodiffResourceR
         role = AutodiffResourceRole::Cotangent;
     else if (value == "gradient")
         role = AutodiffResourceRole::Gradient;
+    else if (value == "primal")
+        role = AutodiffResourceRole::Primal;
+    else if (value == "retained_primal")
+        role = AutodiffResourceRole::RetainedPrimal;
+    else if (value == "replay_segment")
+        role = AutodiffResourceRole::ReplaySegment;
+    else if (value == "replay_status")
+        role = AutodiffResourceRole::ReplayStatus;
+    else if (value == "launch_metadata")
+        role = AutodiffResourceRole::LaunchMetadata;
     else {
         error = "compute artifact reflection contains an unknown autodiff resource role";
         return false;
@@ -70,6 +80,7 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         parameter.source = "direct";
         if (!parseAutodiffResourceRole(argument, parameter.autodiffRole, error))
             return false;
+        parameter.autodiffSource = argument.value("vernon.autodiff_source", "");
         if (parameter.kind == "tensor") {
             if (argument.contains("element_layout")) {
                 if (!parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error))
@@ -152,7 +163,7 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
             parsedDescriptor.offsetBinding = descriptor["offset_binding"].get<uint32_t>();
             parsedDescriptor.extentBindings = descriptor["extent_bindings"].get<std::vector<uint32_t>>();
             parsedDescriptor.strideBindings = descriptor["stride_bindings"].get<std::vector<uint32_t>>();
-            if (!parsedDescriptor.rank || parsedDescriptor.extentBindings.size() != parsedDescriptor.rank ||
+            if (parsedDescriptor.extentBindings.size() != parsedDescriptor.rank ||
                 parsedDescriptor.strideBindings.size() != parsedDescriptor.rank ||
                 (!use.shape.empty() && use.shape.size() != parsedDescriptor.rank)) {
                 error = "TensorView descriptor rank does not match shape";
@@ -246,26 +257,40 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
 VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                   size_t artifactSize, const char *reflectionData,
                                                   size_t reflectionSize, const char *entryData, size_t entrySize) {
-    if (!artifact || !artifactSize || !reflectionData || !reflectionSize || !entryData || !entrySize)
-        return nullptr;
-    const nlohmann::json parsed =
-        nlohmann::json::parse(reflectionData, reflectionData + reflectionSize, nullptr, false);
-    if (parsed.is_discarded())
+    Stage stage;
+    Variant variant;
+    ReflectedEntry reflection;
+    if (!buildDirectComputeStage(context, artifact, artifactSize, reflectionData, reflectionSize, entryData, entrySize,
+                                 stage, variant, reflection))
         return nullptr;
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
-    ReflectedEntry reflection;
-    const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, context.backend,
-                                   invocationDiagnostic(context)))
-        return nullptr;
+    pipeline->variant = std::move(variant);
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
     pipeline->readFootprints = reflection.readFootprints;
     pipeline->writeFootprints = reflection.writeFootprints;
     VernonPipelineBundle bundle;
     bundle.context = &context;
-    Stage stage;
+    bundle.stages.emplace(stage.entry, std::move(stage));
+    if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
+        return nullptr;
+    ++context.livePipelines;
+    return pipeline.release();
+}
+
+bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
+                             const char *reflectionData, size_t reflectionSize, const char *entryData, size_t entrySize,
+                             Stage &stage, Variant &variant, ReflectedEntry &reflection) {
+    if (!artifact || !artifactSize || !reflectionData || !reflectionSize || !entryData || !entrySize)
+        return false;
+    const nlohmann::json parsed =
+        nlohmann::json::parse(reflectionData, reflectionData + reflectionSize, nullptr, false);
+    if (parsed.is_discarded())
+        return false;
+    const std::string entry(entryData, entrySize);
+    if (!buildDirectComputeVariant(parsed, entry, variant, reflection, context.backend, invocationDiagnostic(context)))
+        return false;
     stage.stage = "compute";
     stage.entry = entry;
     stage.reflection.assign(reflectionData, reflectionSize);
@@ -279,11 +304,7 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     else
         stage.binary.assign(static_cast<const uint8_t *>(artifact),
                             static_cast<const uint8_t *>(artifact) + artifactSize);
-    bundle.stages.emplace(entry, std::move(stage));
-    if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
-        return nullptr;
-    ++context.livePipelines;
-    return pipeline.release();
+    return true;
 }
 
 } // namespace vernon::runtime

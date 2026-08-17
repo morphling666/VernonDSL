@@ -4,10 +4,46 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
+#include <cstring>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
+
+std::vector<uint32_t> spirvWords(VernonStringView artifact) {
+    if (!artifact.data || artifact.size < 5 * sizeof(uint32_t) || artifact.size % sizeof(uint32_t))
+        return {};
+    std::vector<uint32_t> words(artifact.size / sizeof(uint32_t));
+    std::memcpy(words.data(), artifact.data, artifact.size);
+    return words[0] == 0x07230203u ? words : std::vector<uint32_t>{};
+}
+
+bool spirvContainsOpcode(const std::vector<uint32_t> &words, uint16_t expected) {
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        if (!wordCount || cursor + wordCount > words.size())
+            return false;
+        if (static_cast<uint16_t>(words[cursor]) == expected)
+            return true;
+        cursor += wordCount;
+    }
+    return false;
+}
+
+bool spirvDeclaresCapability(const std::vector<uint32_t> &words, uint32_t expected) {
+    constexpr uint16_t opCapability = 17;
+    for (size_t cursor = 5; cursor < words.size();) {
+        const uint16_t wordCount = static_cast<uint16_t>(words[cursor] >> 16);
+        if (!wordCount || cursor + wordCount > words.size())
+            return false;
+        if (static_cast<uint16_t>(words[cursor]) == opCapability && wordCount == 2 && words[cursor + 1] == expected)
+            return true;
+        cursor += wordCount;
+    }
+    return false;
+}
 
 constexpr std::string_view synchronizationModule = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
@@ -276,6 +312,60 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %previous = "vernon.atomic"(%values, %index, %one) {
       atomic_kind = "add", ordering = "relaxed"
     } : (!vernon.tensor_view<i32, [64], "read_write", "device">, index, i32) -> i32
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view floatStorageAtomicModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @storage_atomic(
+      %values: !vernon.tensor_view<f32, [64], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      })
+      attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 64, 1, 1>
+      } {
+    %index = arith.constant 0 : index
+    %one = arith.constant 1.0 : f32
+    %previous = "vernon.atomic"(%values, %index, %one) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [64], "read_write", "device">, index, f32) -> f32
+    return
+  }
+}
+)mlir";
+
+constexpr std::string_view floatWorkgroupAtomicModule = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @workgroup_atomic(
+      %output: !vernon.tensor_view<f32, [1], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      })
+      attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 64, 1, 1>
+      } {
+    %index = arith.constant 0 : index
+    %one = arith.constant 1.0 : f32
+    %shared = "vernon.workgroup_alloc"()
+        : () -> !vernon.tensor_view<f32, [1], "read_write", "workgroup">
+    %previous = "vernon.atomic"(%shared, %index, %one) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index, f32) -> f32
+    "vernon.barrier"() {ordering = "acquire_release", scope = "workgroup"} : () -> ()
+    %sum = "vernon.load"(%shared, %index)
+        : (!vernon.tensor_view<f32, [1], "read_write", "workgroup">, index) -> f32
+    %published = "vernon.atomic"(%output, %index, %sum) {
+      atomic_kind = "add", ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [1], "write", "device">, index, f32) -> f32
     return
   }
 }
@@ -659,7 +749,10 @@ TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTarge
         ASSERT_NE(position, std::string::npos);
         module.replace(position, sizeof("atomic_kind = \"add\"") - 1,
                        "atomic_kind = \"" + std::string(atomicKind) + "\"");
-        for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN}) {
+        for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
+                                    VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+            if (vernon::tests::unavailableDirectXTarget(compiler, target))
+                continue;
             VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
             ASSERT_TRUE(result);
             const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
@@ -673,17 +766,100 @@ TEST(CompilerSynchronization, LowersStorageTensorViewAtomicsOnlyForVerifiedTarge
             vernonCompileResultDestroy(result);
         }
     }
-    for (VernonTarget target :
-         {VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersF32AtomicAddWithIntegerBackedPortableStorage) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target : {VERNON_TARGET_CPU, VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL,
+                                VERNON_TARGET_OPENGL_ES, VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
         if (vernon::tests::unavailableDirectXTarget(compiler, target))
             continue;
-        VernonCompileResult *result =
-            vernonCompilerCompileMlir(compiler, storageAtomicModule.data(), storageAtomicModule.size(), target);
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, floatStorageAtomicModule.data(),
+                                                                floatStorageAtomicModule.size(), target);
         ASSERT_TRUE(result);
-        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_UNSUPPORTED_TARGET);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        EXPECT_GT(vernonCompileResultGetArtifactCount(result), 0u);
+        if (target == VERNON_TARGET_VULKAN) {
+            const std::vector<uint32_t> words = spirvWords(vernonCompileResultGetArtifactData(result, 0));
+            ASSERT_FALSE(words.empty());
+            constexpr uint16_t opAtomicCompareExchange = 230;
+            constexpr uint32_t atomicFloat32AddExt = 6033;
+            EXPECT_TRUE(spirvContainsOpcode(words, opAtomicCompareExchange));
+            EXPECT_FALSE(spirvDeclaresCapability(words, atomicFloat32AddExt));
+        } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES ||
+                   target == VERNON_TARGET_METAL || target == VERNON_TARGET_DIRECTX) {
+            const VernonStringView artifact = vernonCompileResultGetArtifactData(result, 0);
+            const std::string_view source(artifact.data, artifact.size);
+            EXPECT_EQ(source.find("vernon_atomic_compare_exchange"), std::string_view::npos);
+            EXPECT_EQ(source.find("reinterpret_cast"), std::string_view::npos);
+            if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
+                EXPECT_NE(source.find("atomicCompSwap"), std::string_view::npos);
+                EXPECT_NE(source.find("uintBitsToFloat"), std::string_view::npos);
+                EXPECT_NE(source.find("floatBitsToUint"), std::string_view::npos);
+            } else if (target == VERNON_TARGET_METAL) {
+                EXPECT_NE(source.find("atomic_compare_exchange_weak_explicit"), std::string_view::npos);
+                EXPECT_NE(source.find("as_type<float>"), std::string_view::npos);
+            } else if (target == VERNON_TARGET_DIRECTX) {
+                EXPECT_NE(source.find("InterlockedCompareExchange"), std::string_view::npos);
+                EXPECT_NE(source.find("asfloat"), std::string_view::npos);
+                EXPECT_NE(source.find("asuint"), std::string_view::npos);
+            }
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, LowersWorkgroupF32AtomicAcrossNativeAndPortableProfiles) {
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    for (VernonTarget target : {VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
+                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, floatWorkgroupAtomicModule.data(),
+                                                                floatWorkgroupAtomicModule.size(), target);
+        ASSERT_TRUE(result);
+        const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
+        EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK)
+            << std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size);
+        EXPECT_GT(vernonCompileResultGetArtifactCount(result), 0u);
+        if (target == VERNON_TARGET_VULKAN) {
+            const std::vector<uint32_t> words = spirvWords(vernonCompileResultGetArtifactData(result, 0));
+            constexpr uint16_t opAtomicCompareExchange = 230;
+            constexpr uint32_t atomicFloat32AddExt = 6033;
+            EXPECT_TRUE(spirvContainsOpcode(words, opAtomicCompareExchange));
+            EXPECT_FALSE(spirvDeclaresCapability(words, atomicFloat32AddExt));
+        }
+        vernonCompileResultDestroy(result);
+    }
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerSynchronization, RejectsUnsupportedF64AtomicBeforeGpuArtifactGeneration) {
+    std::string module(floatStorageAtomicModule);
+    for (size_t position = 0; (position = module.find("f32", position)) != std::string::npos; position += 3)
+        module.replace(position, 3, "f64");
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_TRUE(compiler);
+    VernonCompileResult *cpu = vernonCompilerCompileMlir(compiler, module.data(), module.size(), VERNON_TARGET_CPU);
+    ASSERT_TRUE(cpu);
+    EXPECT_EQ(vernonCompileResultGetStatus(cpu), VERNON_STATUS_OK);
+    vernonCompileResultDestroy(cpu);
+    for (VernonTarget target : {VERNON_TARGET_CUDA, VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
+                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
+        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+            continue;
+        VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
+        ASSERT_TRUE(result);
+        EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
         EXPECT_EQ(vernonCompileResultGetArtifactCount(result), 0u);
         const VernonStringView diagnostics = vernonCompileResultGetDiagnostics(result);
-        EXPECT_NE(std::string_view(diagnostics.data, diagnostics.size).find("target storage-atomic capability"),
+        EXPECT_NE(std::string_view(diagnostics.data ? diagnostics.data : "", diagnostics.size).find("unsupported"),
                   std::string_view::npos);
         vernonCompileResultDestroy(result);
     }

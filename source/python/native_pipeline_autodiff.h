@@ -130,12 +130,21 @@ struct PythonPullback {
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
     size_t retainedAllocationBytes() const { return memoryUsage().retainedAllocationBytes; }
     size_t peakTemporaryBytes() const { return memoryUsage().peakTemporaryBytes; }
+    uint64_t submissionCount() const { return controlPlaneUsage().submissions; }
+    uint64_t waitCount() const { return controlPlaneUsage().waits; }
+    uint64_t readbackCount() const { return controlPlaneUsage().readbacks; }
+    uint64_t atomicPublicationCount() const { return controlPlaneUsage().atomicPublications; }
+    uint64_t temporaryAllocationTrafficBytes() const { return controlPlaneUsage().temporaryAllocationBytes; }
+    uint64_t deviceWaitNanoseconds() const { return controlPlaneUsage().deviceWaitNanoseconds; }
     size_t tapeContextLimitBytes() const { return vernon::runtime::autodiffHostTapeContextLimit(runtime); }
     const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
 private:
     vernon::runtime::AutodiffPullbackMemoryUsage memoryUsage() const {
         return vernon::runtime::autodiffPullbackMemoryUsage(handle);
+    }
+    vernon::runtime::AutodiffPullbackControlPlaneUsage controlPlaneUsage() const {
+        return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
     }
 
     nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent,
@@ -262,7 +271,9 @@ struct LoadedPipeline {
         return result;
     }
 
-    nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner) {
+    nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner,
+                  PipelineInvocationBuilder *encodedBuilder = nullptr,
+                  const VernonRhiCommandEncoder *nativeEncoder = nullptr) {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
         const std::vector<PipelineParameterMetadata> metadata = parameters();
@@ -367,12 +378,28 @@ struct LoadedPipeline {
         }
         VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
         VernonPullback *pullback = nullptr;
-        if (vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback) !=
-            VERNON_STATUS_OK)
+        VernonStatus forwardStatus = VERNON_STATUS_OK;
+        if (encodedBuilder || nativeEncoder) {
+            if (!encodedBuilder || !nativeEncoder || encodedBuilder->pipeline != pipeline)
+                throw std::invalid_argument("encoded autodiff invocation belongs to another pipeline");
+            std::vector<VernonPipelineArgument> values;
+            VernonPipelineInvocation invocation = encodedBuilder->invocation(values);
+            if (invocation.compute_grid.x != gridX || invocation.compute_grid.y != gridY ||
+                invocation.compute_grid.z != gridZ)
+                throw std::invalid_argument("encoded autodiff invocation grid does not match the VJP grid");
+            VernonRuntimeProviderObject encoder{};
+            if (vernonRuntimeReferenceRhiCommandEncoder(runtime, *nativeEncoder, &encoder) != VERNON_STATUS_OK)
+                throw std::invalid_argument("command encoder belongs to another Runtime device");
+            forwardStatus = vernonAdPipelineEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
+        } else {
+            forwardStatus = vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
+        }
+        if (forwardStatus != VERNON_STATUS_OK)
             throw std::runtime_error("autodiff forward invocation failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
-        for (PythonAdValue &input : inputValues)
-            input.commit();
+        if (!encodedBuilder)
+            for (PythonAdValue &input : inputValues)
+                input.commit();
 
         std::vector<PythonAdMetadata> gradients;
         const size_t gradientCount = vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline);

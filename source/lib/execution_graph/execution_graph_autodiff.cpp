@@ -1,5 +1,6 @@
 #include "VernonExecutionGraph.h"
 
+#include "autodiff/autodiff_memory_accounting.h"
 #include "execution_graph_internal.h"
 
 #include <algorithm>
@@ -24,12 +25,60 @@ struct DerivativeEndpointHash {
 
 using EndpointValues =
     std::unordered_map<DerivativeEndpointKey, std::shared_ptr<GraphAutodiffValue>, DerivativeEndpointHash>;
+using GraphMemoryAccounting = vernon::autodiff::MemoryAccounting<uint64_t>;
 
 bool checkedAdd(uint64_t left, uint64_t right, uint64_t &result) {
     if (right > std::numeric_limits<uint64_t>::max() - left)
         return false;
     result = left + right;
     return true;
+}
+
+VernonRhiBarrier bufferBarrier(VernonRhiBuffer buffer, VernonRhiResourceState oldState, VernonRhiResourceState newState,
+                               uint32_t sourceStage, uint32_t destinationStage, uint32_t sourceAccess,
+                               uint32_t destinationAccess) {
+    VernonRhiBarrier barrier{};
+    barrier.struct_size = sizeof(barrier);
+    barrier.source_stage_mask = sourceStage;
+    barrier.destination_stage_mask = destinationStage;
+    barrier.source_access = sourceAccess;
+    barrier.destination_access = destinationAccess;
+    barrier.old_state = oldState;
+    barrier.new_state = newState;
+    barrier.buffer = buffer;
+    return barrier;
+}
+
+template <typename Encode>
+bool submitDeviceCommands(VernonRhiDevice device, Encode &&encode, const char *failure, std::string &error) {
+    DeviceExecutionSession session(device);
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder);
+    if (status == VERNON_RHI_STATUS_OK)
+        status = encode(encoder);
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiCommandEncoderFinish(device, encoder);
+    VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiDeviceSubmit(device, encoder, &completion);
+    else if (encoder.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+        (void)vernonRhiDeviceDestroyCommandEncoder(device, encoder);
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiCompletionWait(device, completion);
+    if (completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+        (void)vernonRhiDeviceDestroyCompletion(device, completion);
+    if (status == VERNON_RHI_STATUS_OK)
+        return true;
+    error = failure;
+    const VernonStringView diagnostic = vernonRhiDeviceGetLastError(device);
+    if (diagnostic.data && diagnostic.size) {
+        error += ": ";
+        error.append(diagnostic.data, diagnostic.size);
+    }
+    return false;
 }
 
 struct ResourceSnapshot {
@@ -45,6 +94,12 @@ struct ResourceSnapshot {
     ResourceSnapshot &operator=(const ResourceSnapshot &) = delete;
     ResourceSnapshot(ResourceSnapshot &&other) noexcept
         : resource(std::move(other.resource)), bytes(std::exchange(other.bytes, nullptr)),
+          device(
+              std::exchange(other.device, VernonRhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0})),
+          sourceBuffer(std::exchange(other.sourceBuffer,
+                                     VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0})),
+          storageBuffer(std::exchange(other.storageBuffer,
+                                      VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0})),
           byteSize(std::exchange(other.byteSize, 0)),
           alignment(std::exchange(other.alignment, alignof(std::max_align_t))), ranges(std::move(other.ranges)) {}
     ResourceSnapshot &operator=(ResourceSnapshot &&other) noexcept {
@@ -52,6 +107,12 @@ struct ResourceSnapshot {
             reset();
             resource = std::move(other.resource);
             bytes = std::exchange(other.bytes, nullptr);
+            device =
+                std::exchange(other.device, VernonRhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+            sourceBuffer = std::exchange(other.sourceBuffer,
+                                         VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+            storageBuffer = std::exchange(other.storageBuffer,
+                                          VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
             byteSize = std::exchange(other.byteSize, 0);
             alignment = std::exchange(other.alignment, alignof(std::max_align_t));
             ranges = std::move(other.ranges);
@@ -61,11 +122,42 @@ struct ResourceSnapshot {
 
     std::shared_ptr<GraphCheckpointResource> resource;
     std::byte *bytes{};
+    VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiBuffer sourceBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiBuffer storageBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     uint64_t byteSize{};
     size_t alignment{alignof(std::max_align_t)};
     std::vector<Range> ranges;
 
     bool restore(std::string &error) const {
+        if (storageBuffer.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+            return submitDeviceCommands(
+                device,
+                [&](VernonRhiCommandEncoder encoder) {
+                    const VernonRhiBarrier before[] = {
+                        bufferBarrier(storageBuffer, VERNON_RHI_STATE_TRANSFER_DESTINATION,
+                                      VERNON_RHI_STATE_TRANSFER_SOURCE, 0, 0, VERNON_RHI_ACCESS_TRANSFER_WRITE,
+                                      VERNON_RHI_ACCESS_TRANSFER_READ),
+                        bufferBarrier(sourceBuffer, VERNON_RHI_STATE_SHADER_WRITE,
+                                      VERNON_RHI_STATE_TRANSFER_DESTINATION, VERNON_RHI_STAGE_COMPUTE, 0,
+                                      VERNON_RHI_ACCESS_SHADER_WRITE, VERNON_RHI_ACCESS_TRANSFER_WRITE)};
+                    if (vernonRhiCommandEncoderBarrier(device, encoder, before, 2) != VERNON_RHI_STATUS_OK)
+                        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+                    for (const Range &range : ranges)
+                        if (vernonRhiCommandEncoderCopyBuffer(device, encoder, storageBuffer, range.storageOffset,
+                                                              sourceBuffer, range.resourceOffset,
+                                                              range.byteSize) != VERNON_RHI_STATUS_OK)
+                            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+                    const VernonRhiBarrier after[] = {
+                        bufferBarrier(storageBuffer, VERNON_RHI_STATE_TRANSFER_SOURCE,
+                                      VERNON_RHI_STATE_TRANSFER_DESTINATION, 0, 0, VERNON_RHI_ACCESS_TRANSFER_READ,
+                                      VERNON_RHI_ACCESS_TRANSFER_WRITE),
+                        bufferBarrier(sourceBuffer, VERNON_RHI_STATE_TRANSFER_DESTINATION, VERNON_RHI_STATE_COMMON, 0,
+                                      0, VERNON_RHI_ACCESS_TRANSFER_WRITE, VERNON_RHI_ACCESS_NONE)};
+                    return vernonRhiCommandEncoderBarrier(device, encoder, after, 2);
+                },
+                "device-local graph state restoration failed", error);
+        }
         std::vector<GraphByteRange> resourceRanges;
         resourceRanges.reserve(ranges.size());
         for (const Range &range : ranges)
@@ -75,8 +167,13 @@ struct ResourceSnapshot {
 
 private:
     void reset() {
+        if (device.index != VERNON_RHI_INVALID_HANDLE_INDEX && storageBuffer.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+            (void)vernonRhiDeviceDestroyBuffer(device, storageBuffer);
         if (bytes)
             ::operator delete(bytes, std::align_val_t(alignment));
+        device = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        sourceBuffer = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        storageBuffer = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         bytes = nullptr;
         byteSize = 0;
     }
@@ -125,14 +222,76 @@ bool captureResource(const std::shared_ptr<GraphCheckpointResource> &resource, R
     return resource->copyRangesTo(resourceRanges, snapshot.bytes, error);
 }
 
-class AlignedCheckpointStorage {
-public:
-    ~AlignedCheckpointStorage() { reset(); }
-    AlignedCheckpointStorage() = default;
-    AlignedCheckpointStorage(const AlignedCheckpointStorage &) = delete;
-    AlignedCheckpointStorage &operator=(const AlignedCheckpointStorage &) = delete;
+bool captureDeviceResource(VernonRhiDevice device, VernonRhiBuffer buffer,
+                           const std::shared_ptr<GraphCheckpointResource> &resource, ResourceSnapshot &snapshot,
+                           std::string &error, const std::vector<GraphByteRange> *declaredRanges = nullptr) {
+    if (!resource) {
+        error = "graph checkpoint resource has no device snapshot metadata";
+        return false;
+    }
+    const uint64_t resourceByteSize = resource->byteSize();
+    const uint64_t requestedAlignment = resource->alignment();
+    if (!resourceByteSize || !requestedAlignment || (requestedAlignment & (requestedAlignment - 1))) {
+        error = "graph checkpoint resource has invalid size or alignment";
+        return false;
+    }
+    const std::vector<GraphByteRange> whole{{0, resourceByteSize}};
+    const std::vector<GraphByteRange> &ranges = declaredRanges ? *declaredRanges : whole;
+    uint64_t storageOffset = 0;
+    for (const GraphByteRange &range : ranges) {
+        if (!range.byteSize || range.offset > resourceByteSize || range.byteSize > resourceByteSize - range.offset ||
+            !checkedAdd(storageOffset, range.byteSize, snapshot.byteSize)) {
+            error = "graph checkpoint resource has an invalid write footprint";
+            return false;
+        }
+        snapshot.ranges.push_back({range.offset, storageOffset, range.byteSize});
+        storageOffset = snapshot.byteSize;
+    }
+    VernonRhiBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = snapshot.byteSize;
+    descriptor.alignment = requestedAlignment;
+    descriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION;
+    descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    if (vernonRhiDeviceCreateBuffer(device, &descriptor, &snapshot.storageBuffer) != VERNON_RHI_STATUS_OK) {
+        error = "cannot allocate device-local graph state snapshot";
+        return false;
+    }
+    snapshot.device = device;
+    snapshot.sourceBuffer = buffer;
+    return submitDeviceCommands(
+        device,
+        [&](VernonRhiCommandEncoder encoder) {
+            const VernonRhiBarrier before[] = {
+                bufferBarrier(
+                    buffer, VERNON_RHI_STATE_SHADER_WRITE, VERNON_RHI_STATE_TRANSFER_SOURCE, VERNON_RHI_STAGE_COMPUTE,
+                    0, VERNON_RHI_ACCESS_SHADER_READ | VERNON_RHI_ACCESS_SHADER_WRITE, VERNON_RHI_ACCESS_TRANSFER_READ),
+                bufferBarrier(snapshot.storageBuffer, VERNON_RHI_STATE_COMMON, VERNON_RHI_STATE_TRANSFER_DESTINATION, 0,
+                              0, VERNON_RHI_ACCESS_NONE, VERNON_RHI_ACCESS_TRANSFER_WRITE)};
+            if (vernonRhiCommandEncoderBarrier(device, encoder, before, 2) != VERNON_RHI_STATUS_OK)
+                return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            for (const ResourceSnapshot::Range &range : snapshot.ranges)
+                if (vernonRhiCommandEncoderCopyBuffer(device, encoder, buffer, range.resourceOffset,
+                                                      snapshot.storageBuffer, range.storageOffset,
+                                                      range.byteSize) != VERNON_RHI_STATUS_OK)
+                    return VERNON_RHI_STATUS_INTERNAL_ERROR;
+            const VernonRhiBarrier after =
+                bufferBarrier(buffer, VERNON_RHI_STATE_TRANSFER_SOURCE, VERNON_RHI_STATE_COMMON, 0, 0,
+                              VERNON_RHI_ACCESS_TRANSFER_READ, VERNON_RHI_ACCESS_NONE);
+            return vernonRhiCommandEncoderBarrier(device, encoder, &after, 1);
+        },
+        "device-local graph state capture failed", error);
+}
 
-    bool allocate(uint64_t byteSize, uint64_t requestedAlignment, std::string &error) {
+class CheckpointStorage {
+public:
+    ~CheckpointStorage() { reset(); }
+    CheckpointStorage() = default;
+    CheckpointStorage(const CheckpointStorage &) = delete;
+    CheckpointStorage &operator=(const CheckpointStorage &) = delete;
+
+    bool allocate(detail::ExecutionProvider provider, VernonRhiDevice device, uint64_t byteSize,
+                  uint64_t requestedAlignment, std::string &error) {
         reset();
         if (byteSize > std::numeric_limits<size_t>::max() || requestedAlignment > std::numeric_limits<size_t>::max()) {
             error = "graph checkpoint storage exceeds host address space";
@@ -146,6 +305,21 @@ public:
         alignment_ = std::max<size_t>(static_cast<size_t>(requestedAlignment), alignof(std::max_align_t));
         if (!size_)
             return true;
+        if (provider == detail::ExecutionProvider::Rhi) {
+            VernonRhiBufferDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.size = byteSize;
+            descriptor.alignment = requestedAlignment;
+            descriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION;
+            descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+            if (vernonRhiDeviceCreateBuffer(device, &descriptor, &buffer_) != VERNON_RHI_STATUS_OK) {
+                size_ = 0;
+                error = "cannot allocate device-local graph checkpoint storage";
+                return false;
+            }
+            device_ = device;
+            return true;
+        }
         try {
             data_ = static_cast<std::byte *>(::operator new(size_, std::align_val_t(alignment_)));
         } catch (const std::bad_alloc &) {
@@ -159,16 +333,23 @@ public:
     std::byte *data() { return data_; }
     const std::byte *data() const { return data_; }
     uint64_t size() const { return size_; }
+    VernonRhiBuffer buffer() const { return buffer_; }
 
 private:
     void reset() {
+        if (device_.index != VERNON_RHI_INVALID_HANDLE_INDEX && buffer_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+            (void)vernonRhiDeviceDestroyBuffer(device_, buffer_);
         if (data_)
             ::operator delete(data_, std::align_val_t(alignment_));
+        device_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        buffer_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         data_ = nullptr;
         size_ = 0;
         alignment_ = alignof(std::max_align_t);
     }
 
+    VernonRhiDevice device_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    VernonRhiBuffer buffer_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     std::byte *data_{};
     size_t size_{};
     size_t alignment_{alignof(std::max_align_t)};
@@ -225,7 +406,8 @@ public:
             checkpointEntries.push_back({resource.offset, resource.byteSize, resource.version, checkpoint});
             checkpointResourcesByProducer[resource.producer].push_back(resourceIndex);
         }
-        if (!checkpointStorage.allocate(checkpointPlan.persistentCheckpointBytes, maximumAlignment, error))
+        if (!checkpointStorage.allocate(plan->provider, plan->device, checkpointPlan.persistentCheckpointBytes,
+                                        maximumAlignment, error))
             return false;
         observedPeakRuntimeManagedBytes = checkpointStorage.size();
         return true;
@@ -242,20 +424,36 @@ public:
         return result;
     }
 
+    bool memoryAccounting(uint64_t additionalRetainedBytes, uint64_t temporaryBytes,
+                          GraphMemoryAccounting &accounting) const {
+        accounting = {};
+        if (!checkedAdd(retainedAllocationBytesUnlocked(), additionalRetainedBytes,
+                        accounting.retainedAllocationBytes) ||
+            !checkedAdd(checkpointStorage.size(), initialStateBytes, accounting.checkpointBytes))
+            return false;
+        accounting.peakTemporaryBytes = temporaryBytes;
+        uint64_t budgeted = 0;
+        if (!accounting.budgetedBytes(budgeted))
+            return false;
+        accounting.residentBytes = budgeted;
+        accounting.allocatedBytes = budgeted;
+        return true;
+    }
+
     void observeManagedBytes(uint64_t temporaryBytes = 0) {
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed))
-            managed = std::numeric_limits<uint64_t>::max();
+        GraphMemoryAccounting accounting;
+        uint64_t managed = std::numeric_limits<uint64_t>::max();
+        if (memoryAccounting(0, temporaryBytes, accounting))
+            (void)accounting.budgetedBytes(managed);
         observedPeakRuntimeManagedBytes = std::max(observedPeakRuntimeManagedBytes, managed);
     }
 
     bool observeTapeAllocation(uint64_t additionalTapeBytes, uint64_t budgetTemporaryBytes,
                                uint64_t observedTemporaryBytes, std::string &error) {
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, additionalTapeBytes, managed) ||
-            !checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, budgetTemporaryBytes, managed)) {
+        GraphMemoryAccounting accounting;
+        uint64_t managed = 0;
+        if (!memoryAccounting(additionalTapeBytes, budgetTemporaryBytes, accounting) ||
+            !accounting.budgetedBytes(managed)) {
             error = "graph Runtime-managed memory accounting overflows";
             return false;
         }
@@ -263,25 +461,25 @@ public:
             error = "graph autodiff runtime allocation exceeds the compiled checkpoint memory budget";
             return false;
         }
-        managed -= budgetTemporaryBytes;
-        if (!checkedAdd(managed, observedTemporaryBytes, managed))
+        accounting.peakTemporaryBytes = observedTemporaryBytes;
+        if (!accounting.budgetedBytes(managed))
             managed = std::numeric_limits<uint64_t>::max();
         observedPeakRuntimeManagedBytes = std::max(observedPeakRuntimeManagedBytes, managed);
         return true;
     }
 
     void observeForwardPeak(uint64_t peakTapeBytes, uint64_t observedTemporaryBytes) {
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, peakTapeBytes, managed) || !checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, observedTemporaryBytes, managed))
-            managed = std::numeric_limits<uint64_t>::max();
+        GraphMemoryAccounting accounting;
+        uint64_t managed = std::numeric_limits<uint64_t>::max();
+        if (memoryAccounting(peakTapeBytes, observedTemporaryBytes, accounting))
+            (void)accounting.budgetedBytes(managed);
         observedPeakRuntimeManagedBytes = std::max(observedPeakRuntimeManagedBytes, managed);
     }
 
     bool preflightTapeAllocation(uint64_t peakTapeBytes, uint64_t temporaryBytes, std::string &error) const {
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, peakTapeBytes, managed) || !checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed)) {
+        GraphMemoryAccounting accounting;
+        uint64_t managed = 0;
+        if (!memoryAccounting(peakTapeBytes, temporaryBytes, accounting) || !accounting.budgetedBytes(managed)) {
             error = "graph Runtime-managed memory accounting overflows";
             return false;
         }
@@ -300,7 +498,7 @@ public:
                 ++tape;
     }
 
-    bool captureCheckpoint(uint32_t resourceIndex, std::string &error) {
+    bool captureCheckpoint(uint32_t resourceIndex, ComputeEncoder &encoder, std::string &error) {
         if (resourceIndex >= checkpointEntries.size()) {
             error = "compiled graph checkpoint resource index is invalid";
             return false;
@@ -311,9 +509,36 @@ public:
             error = "graph checkpoint capture does not match the planned resource version";
             return false;
         }
-        void *destination = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
-        if (!entry.resource->copyTo(destination, entry.byteSize, error))
-            return false;
+        if (plan->provider == detail::ExecutionProvider::Rhi) {
+            const auto &record = plan->resourceRecords[entry.version.resource];
+            const VernonRhiBarrier before[] = {
+                bufferBarrier(record.buffer, VERNON_RHI_STATE_SHADER_WRITE, VERNON_RHI_STATE_TRANSFER_SOURCE,
+                              VERNON_RHI_STAGE_COMPUTE, 0, VERNON_RHI_ACCESS_SHADER_WRITE,
+                              VERNON_RHI_ACCESS_TRANSFER_READ),
+                bufferBarrier(checkpointStorage.buffer(),
+                              checkpointStorageInitialized ? VERNON_RHI_STATE_TRANSFER_DESTINATION
+                                                           : VERNON_RHI_STATE_COMMON,
+                              VERNON_RHI_STATE_TRANSFER_DESTINATION, 0, 0,
+                              checkpointStorageInitialized ? VERNON_RHI_ACCESS_TRANSFER_WRITE : VERNON_RHI_ACCESS_NONE,
+                              VERNON_RHI_ACCESS_TRANSFER_WRITE)};
+            const VernonRhiBarrier after = bufferBarrier(
+                record.buffer, VERNON_RHI_STATE_TRANSFER_SOURCE, VERNON_RHI_STATE_SHADER_WRITE, 0,
+                VERNON_RHI_STAGE_COMPUTE, VERNON_RHI_ACCESS_TRANSFER_READ, VERNON_RHI_ACCESS_SHADER_WRITE);
+            if (record.resource.kind != ResourceKind::Buffer ||
+                vernonRhiCommandEncoderBarrier(plan->device, encoder.native(), before, 2) != VERNON_RHI_STATUS_OK ||
+                vernonRhiCommandEncoderCopyBuffer(plan->device, encoder.native(), record.buffer, 0,
+                                                  checkpointStorage.buffer(), entry.offset,
+                                                  entry.byteSize) != VERNON_RHI_STATUS_OK ||
+                vernonRhiCommandEncoderBarrier(plan->device, encoder.native(), &after, 1) != VERNON_RHI_STATUS_OK) {
+                error = "cannot encode device-local graph checkpoint capture";
+                return false;
+            }
+            checkpointStorageInitialized = true;
+        } else {
+            void *destination = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
+            if (!entry.resource->copyTo(destination, entry.byteSize, error))
+                return false;
+        }
         entry.captured = true;
         return true;
     }
@@ -353,10 +578,6 @@ public:
 
     bool executeRange(uint32_t begin, uint32_t end, bool retainTapes, bool captureCheckpoints, std::string &error,
                       bool collectMetrics = false, uint64_t temporaryBytes = 0, bool temporaryBytesAllocated = false) {
-        if (plan->provider != detail::ExecutionProvider::Cpu) {
-            error = "native graph VJP currently requires the CPU execution provider";
-            return false;
-        }
         struct Context {
             Impl &pullback;
             bool retainTapes;
@@ -456,17 +677,73 @@ public:
             if (!context.captureCheckpoints || !pullback.plan->hasAutodiffCheckpointPlan)
                 return VERNON_RHI_STATUS_OK;
             for (uint32_t resourceIndex : pullback.checkpointResourcesByProducer[offset]) {
-                if (!pullback.captureCheckpoint(resourceIndex, context.error))
+                if (!pullback.captureCheckpoint(resourceIndex, encoder, context.error))
                     return VERNON_RHI_STATUS_INTERNAL_ERROR;
             }
             return VERNON_RHI_STATUS_OK;
         };
-        const VernonRhiStatus status = detail::executeCpuScheduleRange(
-            plan->device, plan->resources, plan->passes, plan->schedule, bindings, begin, end, execute, &context);
+        std::vector<VernonRhiBuffer> resourceBuffers(
+            plan->resources.size(), VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        if (plan->provider == detail::ExecutionProvider::Rhi) {
+            for (size_t index = 0; index < plan->resourceRecords.size(); ++index)
+                if (plan->resourceRecords[index].resource.kind == ResourceKind::Buffer)
+                    resourceBuffers[index] = plan->resourceRecords[index].buffer;
+        }
+        VernonRhiStatus status = VERNON_RHI_STATUS_OK;
+        if (plan->provider == detail::ExecutionProvider::Cpu) {
+            status = detail::executeCpuScheduleRange(plan->device, plan->resources, plan->passes, plan->schedule,
+                                                     bindings, begin, end, execute, &context);
+        } else {
+            DeviceExecutionSession session(plan->device);
+            VernonRhiCommandEncoderDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+            VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+            status = vernonRhiDeviceCreateCommandEncoder(plan->device, &descriptor, &native);
+            if (status == VERNON_RHI_STATUS_OK) {
+                ExecutionResources resources(plan->resources, resourceBuffers, bindings);
+                ComputeEncoder encoder(plan->device, native);
+                for (uint32_t offset = begin; offset < end; ++offset) {
+                    auto *compute = dynamic_cast<ComputePass *>(plan->passes[plan->schedule[offset]].get());
+                    if (!compute || offset >= plan->scopes.size() || plan->scopes[offset].passIndices.size() != 1 ||
+                        plan->scopes[offset].passIndices.front() != plan->schedule[offset]) {
+                        status = VERNON_RHI_STATUS_UNSUPPORTED;
+                        break;
+                    }
+                    const CompiledScope &scope = plan->scopes[offset];
+                    if (!scope.barriers.empty()) {
+                        status = vernonRhiCommandEncoderBarrier(plan->device, native, scope.barriers.data(),
+                                                                scope.barriers.size());
+                        if (status != VERNON_RHI_STATUS_OK)
+                            break;
+                    }
+                    status = execute(&context, offset, *compute, encoder, resources);
+                    if (status != VERNON_RHI_STATUS_OK)
+                        break;
+                }
+            }
+            if (status == VERNON_RHI_STATUS_OK)
+                status = vernonRhiCommandEncoderFinish(plan->device, native);
+            VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+            if (status == VERNON_RHI_STATUS_OK)
+                status = vernonRhiDeviceSubmit(plan->device, native, &completion);
+            else if (native.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
+            if (status == VERNON_RHI_STATUS_OK)
+                status = vernonRhiCompletionWait(plan->device, completion);
+            if (completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                (void)vernonRhiDeviceDestroyCompletion(plan->device, completion);
+        }
         if (status == VERNON_RHI_STATUS_UNSUPPORTED && error.empty())
             error = "native graph VJP does not support render passes";
-        else if (status != VERNON_RHI_STATUS_OK && error.empty())
+        else if (status != VERNON_RHI_STATUS_OK && error.empty()) {
             error = "native graph VJP schedule execution failed";
+            const VernonStringView diagnostic = vernonRhiDeviceGetLastError(plan->device);
+            if (diagnostic.data && diagnostic.size) {
+                error += ": ";
+                error.append(diagnostic.data, diagnostic.size);
+            }
+        }
         return status == VERNON_RHI_STATUS_OK;
     }
 
@@ -484,8 +761,17 @@ public:
             const uint32_t resourceId = resourceIds[index];
             ResourceSnapshot snapshot;
             const std::vector<GraphByteRange> *ranges = declaredRanges ? &(*declaredRanges)[index] : nullptr;
-            if (!captureResource(plan->resourceRecords[resourceId].checkpoint, snapshot, error, ranges))
+            const auto &record = plan->resourceRecords[resourceId];
+            const bool captured =
+                plan->provider == detail::ExecutionProvider::Rhi
+                    ? record.resource.kind == ResourceKind::Buffer &&
+                          captureDeviceResource(plan->device, record.buffer, record.checkpoint, snapshot, error, ranges)
+                    : captureResource(record.checkpoint, snapshot, error, ranges);
+            if (!captured) {
+                if (error.empty())
+                    error = "graph state snapshot requires a checkpointable buffer";
                 return false;
+            }
             uint64_t total = 0;
             if (!checkedAdd(bytes, snapshot.byteSize, total)) {
                 error = "graph final-state snapshot size overflows";
@@ -530,28 +816,94 @@ public:
             error = "checkpoint replay segment has an invalid starting cut";
             return false;
         }
+        std::unique_ptr<DeviceExecutionSession> session;
+        VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+        if (plan->provider == detail::ExecutionProvider::Rhi) {
+            session = std::make_unique<DeviceExecutionSession>(plan->device);
+            VernonRhiCommandEncoderDescriptor descriptor{};
+            descriptor.struct_size = sizeof(descriptor);
+            descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+            if (vernonRhiDeviceCreateCommandEncoder(plan->device, &descriptor, &native) != VERNON_RHI_STATUS_OK) {
+                error = "cannot create device-local graph checkpoint restore encoder";
+                return false;
+            }
+        }
+        bool checkpointSourceReady = checkpointStorageInSourceState;
         for (uint32_t resourceIndex : plan->autodiffCheckpointPlan.cuts[cutIndex].checkpointResources) {
             if (resourceIndex >= checkpointEntries.size()) {
                 error = "checkpoint replay resource index is invalid";
+                if (native.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                    (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
                 return false;
             }
             const CheckpointEntry &entry = checkpointEntries[resourceIndex];
             if (!entry.captured) {
                 error = "checkpoint replay resource was not captured during forward execution";
+                if (native.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                    (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
                 return false;
             }
             if (entry.released) {
                 error = "checkpoint replay attempted to read a released resource";
+                if (native.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                    (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
                 return false;
             }
-            const void *source = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
-            if (!entry.resource->copyFrom(source, entry.byteSize, error))
-                return false;
+            if (plan->provider == detail::ExecutionProvider::Rhi) {
+                const auto &record = plan->resourceRecords[entry.version.resource];
+                const VernonRhiBarrier before[] = {
+                    bufferBarrier(checkpointStorage.buffer(),
+                                  checkpointSourceReady ? VERNON_RHI_STATE_TRANSFER_SOURCE
+                                                        : VERNON_RHI_STATE_TRANSFER_DESTINATION,
+                                  VERNON_RHI_STATE_TRANSFER_SOURCE, 0, 0,
+                                  checkpointSourceReady ? VERNON_RHI_ACCESS_TRANSFER_READ
+                                                        : VERNON_RHI_ACCESS_TRANSFER_WRITE,
+                                  VERNON_RHI_ACCESS_TRANSFER_READ),
+                    bufferBarrier(record.buffer, VERNON_RHI_STATE_SHADER_WRITE, VERNON_RHI_STATE_TRANSFER_DESTINATION,
+                                  VERNON_RHI_STAGE_COMPUTE, 0, VERNON_RHI_ACCESS_SHADER_WRITE,
+                                  VERNON_RHI_ACCESS_TRANSFER_WRITE)};
+                const VernonRhiBarrier after = bufferBarrier(
+                    record.buffer, VERNON_RHI_STATE_TRANSFER_DESTINATION, VERNON_RHI_STATE_SHADER_WRITE, 0,
+                    VERNON_RHI_STAGE_COMPUTE, VERNON_RHI_ACCESS_TRANSFER_WRITE, VERNON_RHI_ACCESS_SHADER_WRITE);
+                if (record.resource.kind != ResourceKind::Buffer ||
+                    vernonRhiCommandEncoderBarrier(plan->device, native, before, 2) != VERNON_RHI_STATUS_OK ||
+                    vernonRhiCommandEncoderCopyBuffer(plan->device, native, checkpointStorage.buffer(), entry.offset,
+                                                      record.buffer, 0, entry.byteSize) != VERNON_RHI_STATUS_OK ||
+                    vernonRhiCommandEncoderBarrier(plan->device, native, &after, 1) != VERNON_RHI_STATUS_OK) {
+                    error = "cannot encode device-local graph checkpoint restore";
+                    (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
+                    return false;
+                }
+                checkpointSourceReady = true;
+            } else {
+                const void *source = entry.byteSize ? checkpointStorage.data() + entry.offset : nullptr;
+                if (!entry.resource->copyFrom(source, entry.byteSize, error))
+                    return false;
+            }
             if (entry.version.resource >= currentResourceEpochs.size()) {
                 error = "checkpoint replay resource version is invalid";
+                if (native.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                    (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
                 return false;
             }
             currentResourceEpochs[entry.version.resource] = entry.version.epoch;
+        }
+        if (plan->provider == detail::ExecutionProvider::Rhi) {
+            VernonRhiStatus status = vernonRhiCommandEncoderFinish(plan->device, native);
+            VernonRhiCompletion completion{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+            if (status == VERNON_RHI_STATUS_OK)
+                status = vernonRhiDeviceSubmit(plan->device, native, &completion);
+            else
+                (void)vernonRhiDeviceDestroyCommandEncoder(plan->device, native);
+            if (status == VERNON_RHI_STATUS_OK)
+                status = vernonRhiCompletionWait(plan->device, completion);
+            if (completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+                (void)vernonRhiDeviceDestroyCompletion(plan->device, completion);
+            if (status != VERNON_RHI_STATUS_OK) {
+                error = "device-local graph checkpoint restore failed";
+                return false;
+            }
+            checkpointStorageInSourceState = true;
         }
         return true;
     }
@@ -632,10 +984,11 @@ public:
             error = "graph backward value memory accounting overflows";
             return false;
         }
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed) ||
-            !checkedAdd(managed, valueBytes, managed)) {
+        uint64_t totalTemporaryBytes = 0;
+        GraphMemoryAccounting accounting;
+        uint64_t managed = 0;
+        if (!checkedAdd(temporaryBytes, valueBytes, totalTemporaryBytes) ||
+            !memoryAccounting(0, totalTemporaryBytes, accounting) || !accounting.budgetedBytes(managed)) {
             error = "graph backward value memory accounting overflows";
             return false;
         }
@@ -652,10 +1005,11 @@ public:
             options = {};
             return true;
         }
-        uint64_t managed = retainedAllocationBytesUnlocked();
-        if (!checkedAdd(managed, checkpointStorage.size(), managed) ||
-            !checkedAdd(managed, initialStateBytes, managed) || !checkedAdd(managed, temporaryBytes, managed) ||
-            !checkedAdd(managed, plan->autodiffCheckpointPlan.backwardValueBytes, managed)) {
+        uint64_t totalTemporaryBytes = 0;
+        GraphMemoryAccounting accounting;
+        uint64_t managed = 0;
+        if (!checkedAdd(temporaryBytes, plan->autodiffCheckpointPlan.backwardValueBytes, totalTemporaryBytes) ||
+            !memoryAccounting(0, totalTemporaryBytes, accounting) || !accounting.budgetedBytes(managed)) {
             error = "graph pullback apply-time budget accounting overflows";
             return false;
         }
@@ -720,6 +1074,16 @@ public:
             if (!pullbackApplyOptions(temporaryBytes, applyOptions, error) ||
                 !tape->second->applyWithOptions(localCotangents, localGradients, applyOptions, error))
                 return false;
+            if (!checkedAdd(submissionCount, tape->second->submissionCount(), submissionCount) ||
+                !checkedAdd(waitCount, tape->second->waitCount(), waitCount) ||
+                !checkedAdd(readbackCount, tape->second->readbackCount(), readbackCount) ||
+                !checkedAdd(atomicPublicationCount, tape->second->atomicPublicationCount(), atomicPublicationCount) ||
+                !checkedAdd(temporaryAllocationTrafficBytes, tape->second->temporaryAllocationTrafficBytes(),
+                            temporaryAllocationTrafficBytes) ||
+                !checkedAdd(deviceWaitNanoseconds, tape->second->deviceWaitNanoseconds(), deviceWaitNanoseconds)) {
+                error = "graph pullback control-plane telemetry overflows";
+                return false;
+            }
             const uint64_t peakTemporaryTapeBytes = tape->second->peakTemporaryTapeBytes();
             if (!observeTapeAllocation(0, peakTemporaryTapeBytes, peakTemporaryTapeBytes, error))
                 return false;
@@ -787,7 +1151,7 @@ public:
     std::shared_ptr<const ExecutionBindings> bindings;
     ExecutionSubmission forward;
     std::unordered_map<uint32_t, std::unique_ptr<PassPullback>> tapes;
-    AlignedCheckpointStorage checkpointStorage;
+    CheckpointStorage checkpointStorage;
     std::vector<CheckpointEntry> checkpointEntries;
     std::vector<std::vector<uint32_t>> checkpointResourcesByProducer;
     std::vector<uint32_t> currentResourceEpochs;
@@ -796,8 +1160,16 @@ public:
     uint64_t observedPeakRuntimeManagedBytes{};
     uint64_t totalActiveOperationCount{};
     uint64_t totalBaseRecomputationCost{};
+    uint64_t submissionCount{};
+    uint64_t waitCount{};
+    uint64_t readbackCount{};
+    uint64_t atomicPublicationCount{};
+    uint64_t temporaryAllocationTrafficBytes{};
+    uint64_t deviceWaitNanoseconds{};
     std::vector<GraphAutodiffPassTelemetry> passTelemetryValues;
     bool retainedTapesAvailable{true};
+    bool checkpointStorageInitialized{};
+    bool checkpointStorageInSourceState{};
     mutable std::mutex mutex;
 };
 
@@ -915,6 +1287,12 @@ std::shared_ptr<GraphBackwardSubmission> GraphPullback::submit(const NamedGraphA
             submission->state_ = GraphBackwardSubmission::State::Failed;
             return submission;
         }
+        impl_->submissionCount = 0;
+        impl_->waitCount = 0;
+        impl_->readbackCount = 0;
+        impl_->atomicPublicationCount = 0;
+        impl_->temporaryAllocationTrafficBytes = 0;
+        impl_->deviceWaitNanoseconds = 0;
         EndpointValues accumulated;
         if (implicit) {
             if (!impl_->implicitObjective(accumulated, submission->error_)) {
@@ -1124,6 +1502,36 @@ uint64_t GraphPullback::checkpointBytes() const {
 uint64_t GraphPullback::peakRuntimeManagedBytes() const {
     std::lock_guard lock(impl_->mutex);
     return std::max(impl_->observedPeakRuntimeManagedBytes, impl_->retainedAllocationBytesUnlocked());
+}
+
+uint64_t GraphPullback::submissionCount() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->submissionCount;
+}
+
+uint64_t GraphPullback::waitCount() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->waitCount;
+}
+
+uint64_t GraphPullback::readbackCount() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->readbackCount;
+}
+
+uint64_t GraphPullback::atomicPublicationCount() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->atomicPublicationCount;
+}
+
+uint64_t GraphPullback::temporaryAllocationTrafficBytes() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->temporaryAllocationTrafficBytes;
+}
+
+uint64_t GraphPullback::deviceWaitNanoseconds() const {
+    std::lock_guard lock(impl_->mutex);
+    return impl_->deviceWaitNanoseconds;
 }
 
 uint64_t GraphPullback::tapeContextLimitBytes() const {

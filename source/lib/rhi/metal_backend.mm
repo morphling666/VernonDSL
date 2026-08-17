@@ -588,6 +588,28 @@ bool DeviceState::beginCommands(uint64_t &native, std::string &error) {
     return true;
 }
 
+bool DeviceState::copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset,
+                             const Buffer &destination, uint64_t destinationOffset, uint64_t size,
+                             std::string &error) {
+    if (!native || !source.buffer || !destination.buffer || !size) {
+        error = "Metal buffer copy arguments are invalid";
+        return false;
+    }
+    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (!blit) {
+        error = "Metal blit command encoder creation failed";
+        return false;
+    }
+    [blit copyFromBuffer:source.buffer
+            sourceOffset:sourceOffset
+                toBuffer:destination.buffer
+       destinationOffset:destinationOffset
+                    size:size];
+    [blit endEncoding];
+    return true;
+}
+
 bool DeviceState::submitCommands(uint64_t native, std::string &error) {
     if (!native) {
         error = "Metal command buffer is invalid";

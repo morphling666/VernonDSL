@@ -140,6 +140,44 @@ def objective(
         self.assertNotIn("scf.while", forward)
         self.assertNotIn("scf.while", backward)
 
+    def test_disjoint_no_tape_profile_compiles_for_gpu_targets(self) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        transform = vd.ad.ProgramTransformSpec(
+            "vjp",
+            ("values",),
+            output_cotangents=("loss",),
+        )
+        result = self.compile_source(
+            """
+from typing import Annotated
+import vernon_dsl as vd
+
+@vd.kernel(workgroup_size=(4, 1, 1))
+def objective(
+    values: vd.TensorView[vd.f32, (4,), vd.read],
+    loss: vd.TensorView[vd.f32, (4,), vd.write],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    loss[gid[0]] = values[gid[0]] * values[gid[0]]
+""",
+            transform=transform,
+        )
+        structured = build_structured_vjp(_native, result, transform)
+        self.assertEqual(structured.residual_storage_kind, "none")
+        for target in (
+            _native.Target.CUDA,
+            _native.Target.VULKAN,
+            _native.Target.METAL,
+            _native.Target.OPENGL,
+        ):
+            with self.subTest(target=target.name):
+                compiled = _native.Compiler().compile_program_result(
+                    structured.profiles["backward"],
+                    target,
+                )
+                self.assertTrue(compiled.ok, compiled.diagnostics)
+
     def test_non_void_compute_kernel_is_rejected(self) -> None:
         with self.assertRaisesRegex(CompileError, "must return None"):
             self.compile_source(

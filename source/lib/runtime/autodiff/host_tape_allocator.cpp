@@ -261,7 +261,7 @@ VernonStatus withHostTapeTraversalMetrics(HostTapeTraversalMetrics *destination,
 }
 #endif
 
-bool HostTapeMemoryPolicy::reserveContext(size_t additionalBytes) {
+bool AutodiffMemoryPolicy::reserveContext(size_t additionalBytes) {
     std::lock_guard lock(mutex_);
     size_t contextBytes = 0;
     if (!checkedAdd(contextBytes_, additionalBytes, contextBytes) || contextBytes > contextLimit_)
@@ -271,14 +271,35 @@ bool HostTapeMemoryPolicy::reserveContext(size_t additionalBytes) {
     return true;
 }
 
-void HostTapeMemoryPolicy::release(size_t bytes) {
+void AutodiffMemoryPolicy::release(size_t bytes) {
     std::lock_guard lock(mutex_);
     contextBytes_ = bytes > contextBytes_ ? 0 : contextBytes_ - bytes;
 }
 
-HostTapeMemoryUsage HostTapeMemoryPolicy::usage() const {
+HostTapeMemoryUsage AutodiffMemoryPolicy::usage() const {
     std::lock_guard lock(mutex_);
     return {contextBytes_, peakContextBytes_};
+}
+
+std::shared_ptr<AutodiffMemoryReservation>
+AutodiffMemoryReservation::reserve(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes) {
+    if (!policy)
+        return {};
+    if (!bytes)
+        return std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(std::move(policy), 0));
+    if (!policy->reserveContext(bytes))
+        return {};
+    try {
+        return std::shared_ptr<AutodiffMemoryReservation>(new AutodiffMemoryReservation(std::move(policy), bytes));
+    } catch (...) {
+        policy->release(bytes);
+        return {};
+    }
+}
+
+AutodiffMemoryReservation::~AutodiffMemoryReservation() {
+    if (policy_ && bytes_)
+        policy_->release(bytes_);
 }
 
 std::shared_ptr<HostTapeDispatchBudget> HostTapeDispatchBudget::reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,

@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 
 #include <limits>
 
@@ -102,7 +103,8 @@ inline FailureOr<Value> projectTensorViewIndex(Operation *operation, TensorViewT
     Value storage = isa<StoreOp>(operation) ? operation->getOperand(1) : operation->getOperand(0);
     if (view.getAddressSpace() == "device") {
         auto argument = dyn_cast<BlockArgument>(storage);
-        auto function = argument ? dyn_cast_or_null<func::FuncOp>(argument.getOwner()->getParentOp()) : func::FuncOp{};
+        auto function = argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp())
+                                 : FunctionOpInterface{};
         if (!function)
             return failure();
         unsigned descriptorBase = 0;

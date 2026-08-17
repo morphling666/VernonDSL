@@ -20,8 +20,9 @@ VERNON_DSL_CAPI bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t
 namespace vernon::compiler {
 
 class PreparedModule;
+struct TargetProfile;
 
-bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
+bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
                   std::string &reflection, std::string &diagnostics);
 
 } // namespace vernon::compiler

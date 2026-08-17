@@ -61,6 +61,7 @@ struct BackendDispatch {
     void (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);
+    bool (*recordBufferCopy)(VernonRhiDevice, uint64_t, VernonRhiBuffer, uint64_t, VernonRhiBuffer, uint64_t, uint64_t);
     bool (*endRendering)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t, uint32_t, const uint64_t *,
                          size_t, uint64_t, uint64_t);
     bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t, uint32_t,

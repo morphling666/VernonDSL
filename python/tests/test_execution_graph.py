@@ -40,6 +40,34 @@ def graph_square(
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
+def graph_strided_square_sum(
+    source: vd.TensorView[vd.f32, (2,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * source[0] + source[1] * source[1]
+
+
+@vd.struct
+class GraphParticle:
+    velocity: vd.Vector[vd.f32, 2]
+    mass: vd.f32
+    tag: vd.i32
+
+
+@vd.kernel
+def graph_aggregate_storage_objective(
+    particles: vd.TensorView[GraphParticle, (1,), vd.read],
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    particle = particles[0]
+    loss[0] = (
+        particle.velocity.x * particle.velocity.x
+        + particle.velocity.y * particle.velocity.y
+        + particle.mass * particle.mass
+    )
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
 def graph_heavy_square(
     source: vd.TensorView[vd.f32, (1,), vd.read],
     output: vd.TensorView[vd.f32, (1,), vd.write],
@@ -90,6 +118,12 @@ def graph_scale(
 
 
 graph_square_vjp = vd.ad.vjp(graph_square, wrt=("source",), outputs=("output",))
+graph_strided_square_sum_vjp = vd.ad.vjp(graph_strided_square_sum, wrt=("source",), outputs=("output",))
+graph_aggregate_storage_objective_vjp = vd.ad.vjp(
+    graph_aggregate_storage_objective,
+    wrt=("particles",),
+    outputs=("loss",),
+)
 graph_heavy_square_vjp = vd.ad.vjp(graph_heavy_square, wrt=("source",), outputs=("output",))
 graph_checkpoint_product_vjp = vd.ad.vjp(graph_checkpoint_product, wrt=("source",), outputs=("output",))
 graph_cube_vjp = vd.ad.vjp(graph_cube, wrt=("source",), outputs=("output",))
@@ -766,6 +800,70 @@ class RecordingRenderPass(vd.RenderPass):
         self.events.append(self.name)
         if self.invocation is not None:
             self.invocation.encode(encoder, resources)
+
+
+class GpuExecutionGraphAutodiffTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        for architecture in (vd.metal, vd.vulkan, vd.opengl):
+            try:
+                if architecture == vd.opengl:
+                    vd.init(arch=architecture, api_version=(4, 3))
+                else:
+                    vd.init(arch=architecture)
+                return
+            except RuntimeUnavailableError:
+                pass
+        raise unittest.SkipTest("no GPU compute runtime is available")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        vd.init(arch=vd.cpu)
+
+    def test_gpu_graph_vjp_retains_non_contiguous_tensor_view_layout(self) -> None:
+        owner = vd.storage.from_numpy(np.array([10.0, 2.0, 20.0, 3.0], dtype=np.float32))
+        source = owner.view(shape=(2,), strides=(-2,), offset=3, access="read")
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        output_resource = graph.objective("output", output)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "strided-square-sum",
+                graph_strided_square_sum_vjp,
+                {"source": source_resource, "output": output_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        gradient = graph.compile().vjp()(None)["source"]
+
+        np.testing.assert_array_equal(output.to_numpy(), np.array([13.0], dtype=np.float32))
+        np.testing.assert_array_equal(gradient.to_numpy(), np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32))
+
+    def test_gpu_graph_vjp_preserves_structured_storage_gradients(self) -> None:
+        particles = vd.storage.zeros(dtype=GraphParticle, shape=(1,))
+        values = particles.to_numpy()
+        values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float16)
+        values["mass"][0] = np.float32(4.0)
+        particles.copy_from_numpy(values)
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        particles_resource = graph.differentiable_input("particles", particles)
+        loss_resource = graph.objective("loss", loss)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "aggregate",
+                graph_aggregate_storage_objective_vjp,
+                {"particles": particles_resource, "loss": loss_resource},
+                grid=(1, 1, 1),
+            )
+        )
+
+        gradient = graph.compile().vjp()(None)["particles"]
+
+        np.testing.assert_array_equal(gradient["velocity"].to_numpy(), np.array([[4.0, -6.0]], dtype=np.float32))
+        np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
 
 
 class ExecutionGraphTests(unittest.TestCase):

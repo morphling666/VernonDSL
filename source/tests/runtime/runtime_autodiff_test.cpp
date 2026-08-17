@@ -1,5 +1,6 @@
 #include "runtime/autodiff/host_effect_transaction.h"
 #include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/runtime_autodiff_policy.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
@@ -562,9 +563,40 @@ TEST(RuntimeAutodiffTapeAllocator, DispatchReservationsDoNotPessimisticallyCharg
     EXPECT_EQ(replacement->capacity(), 10u);
 }
 
-TEST(RuntimeAutodiff, CpuTapePolicyIsLazyForOrdinaryRuntimeContexts) {
+TEST(RuntimeAutodiffTapeAllocator, BackendNeutralReservationsChargeAndReleaseContextBudget) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<AutodiffMemoryPolicy>(64, 64);
+    std::shared_ptr<AutodiffMemoryReservation> retained = AutodiffMemoryReservation::reserve(policy, 24);
+    ASSERT_NE(retained, nullptr);
+    EXPECT_EQ(retained->bytes(), 24u);
+    EXPECT_EQ(policy->usage().currentBytes, 24u);
+    EXPECT_EQ(AutodiffMemoryReservation::reserve(policy, 41), nullptr);
+    {
+        std::shared_ptr<AutodiffMemoryReservation> temporary = AutodiffMemoryReservation::reserve(policy, 40);
+        ASSERT_NE(temporary, nullptr);
+        EXPECT_EQ(policy->usage().currentBytes, 64u);
+    }
+    EXPECT_EQ(policy->usage().currentBytes, 24u);
+    retained.reset();
+    EXPECT_EQ(policy->usage().currentBytes, 0u);
+    EXPECT_EQ(policy->usage().peakBytes, 64u);
+}
+
+TEST(RuntimeAutodiff, ParsesBackendNeutralPlanningPolicies) {
+    using namespace vernon::runtime::ad;
+    PlanningPolicy policy{};
+    EXPECT_TRUE(parsePlanningPolicy("min_memory", policy));
+    EXPECT_EQ(policy, PlanningPolicy::MinMemory);
+    EXPECT_TRUE(parsePlanningPolicy("balanced", policy));
+    EXPECT_EQ(policy, PlanningPolicy::Balanced);
+    EXPECT_TRUE(parsePlanningPolicy("min_runtime", policy));
+    EXPECT_EQ(policy, PlanningPolicy::MinRuntime);
+    EXPECT_FALSE(parsePlanningPolicy("heuristic", policy));
+}
+
+TEST(RuntimeAutodiff, AutodiffMemoryPolicyIsLazyForOrdinaryRuntimeContexts) {
     VernonRuntimeContext context;
-    EXPECT_EQ(context.cpuTapePolicy, nullptr);
+    EXPECT_EQ(context.autodiffMemoryPolicy, nullptr);
 }
 
 TEST(RuntimeAutodiff, ReplacesStaleInvocationDiagnosticAtPublicBoundary) {

@@ -461,13 +461,19 @@ VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &de
     return VERNON_RHI_STATUS_OK;
 }
 
-GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
+GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported,
+                                         std::shared_ptr<GraphCheckpointResource> checkpoint) {
     if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
     if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
         detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
         record.exported = record.exported || exported;
+        if (checkpoint) {
+            if (record.checkpoint && record.checkpoint != checkpoint)
+                return {};
+            record.checkpoint = std::move(checkpoint);
+        }
         GraphBuffer result;
         result.id = found->second;
         result.kind = ResourceKind::Buffer;
@@ -499,6 +505,7 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
     resourceRecords_.push_back({result, exported});
     resourceRecords_.back().buffer = buffer;
     resourceRecords_.back().resourceKey = resourceKey;
+    resourceRecords_.back().checkpoint = std::move(checkpoint);
     dirty_ = true;
     return result;
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
 
 import vernon_dsl as vd
@@ -16,38 +17,22 @@ from examples.autodiff_smoke_fluid_kernels import (
     transport_density,
 )
 
-_SMOKE_VJPS = {
-    advect_velocity: vd.ad.vjp(
-        advect_velocity,
-        wrt=("state_velocity",),
-        outputs=("advected_velocity",),
-    ),
-    initialize_pressure: vd.ad.vjp(
-        initialize_pressure,
-        wrt=("advected_velocity",),
-        outputs=("divergence",),
-    ),
-    jacobi_pressure: vd.ad.vjp(
-        jacobi_pressure,
-        wrt=("divergence", "pressure_input"),
-        outputs=("pressure_output",),
-    ),
-    project_velocity: vd.ad.vjp(
-        project_velocity,
-        wrt=("advected_velocity", "pressure"),
-        outputs=("output_velocity",),
-    ),
-    transport_density: vd.ad.vjp(
-        transport_density,
-        wrt=("state_density", "projected_velocity"),
-        outputs=("output_density",),
-    ),
-    smoke_loss: vd.ad.vjp(
-        smoke_loss,
-        wrt=("output_density",),
-        outputs=("output_loss",),
-    ),
+_SMOKE_VJP_SIGNATURES = {
+    advect_velocity: (("state_velocity",), ("advected_velocity",)),
+    initialize_pressure: (("advected_velocity",), ("divergence",)),
+    jacobi_pressure: (("divergence", "pressure_input"), ("pressure_output",)),
+    project_velocity: (("advected_velocity", "pressure"), ("output_velocity",)),
+    transport_density: (("state_density", "projected_velocity"), ("output_density",)),
+    smoke_loss: (("output_density",), ("output_loss",)),
 }
+
+
+@lru_cache(maxsize=3)
+def _smoke_vjps(planning_policy: str) -> dict[Any, Any]:
+    return {
+        kernel: vd.ad.vjp(kernel, wrt=wrt, outputs=outputs, planning_policy=planning_policy)
+        for kernel, (wrt, outputs) in _SMOKE_VJP_SIGNATURES.items()
+    }
 
 
 class SmokeDispatch(vd.ComputePass):
@@ -91,6 +76,7 @@ class SmokeFluidGraph:
         output_velocity: vd.TensorStorage | None = None,
         output_loss: vd.TensorStorage | None = None,
         differentiable: bool = False,
+        planning_policy: str = "min_memory",
     ):
         width = int(parameters.width)
         height = int(parameters.height)
@@ -102,6 +88,7 @@ class SmokeFluidGraph:
 
         self.parameters = parameters
         self.differentiable = differentiable
+        self._vjp_expressions = _smoke_vjps(planning_policy) if differentiable else {}
         self.state_density = state_density
         self.state_velocity = state_velocity
         self.objective_target_density = objective_target_density
@@ -242,7 +229,7 @@ class SmokeFluidGraph:
             parameter_names = tuple(name for name in inspect.signature(kernel._function).parameters if name != "gid")
             execution_pass = vd.VjpComputePass(
                 name,
-                _SMOKE_VJPS[kernel],
+                self._vjp_expressions[kernel],
                 dict(zip(parameter_names, arguments, strict=True)),
                 grid=dispatch_grid,
             )
@@ -279,6 +266,7 @@ def build_smoke_fluid_graph(
     output_velocity: vd.TensorStorage | None = None,
     output_loss: vd.TensorStorage | None = None,
     differentiable: bool = False,
+    planning_policy: str = "min_memory",
 ) -> SmokeFluidGraph:
     return SmokeFluidGraph(
         state_density=state_density,
@@ -289,6 +277,7 @@ def build_smoke_fluid_graph(
         output_velocity=output_velocity,
         output_loss=output_loss,
         differentiable=differentiable,
+        planning_policy=planning_policy,
     )
 
 
@@ -300,6 +289,7 @@ def build_smoke_fluid_sequence_graph(
     parameters: SmokeFluidParameters,
     horizon: int,
     checkpoint_memory_budget: int | None = None,
+    planning_policy: str = "min_memory",
 ) -> tuple[vd.CompiledExecutionGraph, vd.TensorStorage]:
     """Compile a temporal smoke rollout as one native differentiable graph."""
     if horizon <= 0:
@@ -314,6 +304,7 @@ def build_smoke_fluid_sequence_graph(
     builder.import_resource(target_density)
     state_density = initial_density
     state_velocity = initial_velocity
+    vjp_expressions = _smoke_vjps(planning_policy)
     previous: vd.ExecutionPass | None = None
 
     def add_dispatch(name: str, kernel: Any, arguments: tuple[Any, ...], *, scalar: bool = False) -> None:
@@ -321,7 +312,7 @@ def build_smoke_fluid_sequence_graph(
         parameter_names = tuple(name for name in inspect.signature(kernel._function).parameters if name != "gid")
         execution_pass = vd.VjpComputePass(
             name,
-            _SMOKE_VJPS[kernel],
+            vjp_expressions[kernel],
             dict(zip(parameter_names, arguments, strict=True)),
             grid=(1, 1, 1) if scalar else dispatch_grid,
         )

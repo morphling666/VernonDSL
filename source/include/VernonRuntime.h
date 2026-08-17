@@ -404,6 +404,11 @@ VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize compute_grid,
                                                          const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                                          VernonPullback **pullback);
+VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineEncodeForward(VernonRuntimeProviderObject encoder,
+                                                               VernonLoadedPipeline *pipeline,
+                                                               const VernonPipelineInvocation *invocation,
+                                                               const VernonAdValueSet *inputs,
+                                                               VernonPullback **pullback);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdOutputCount(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputByIndex(const VernonLoadedPipeline *pipeline,
                                                                                size_t index,

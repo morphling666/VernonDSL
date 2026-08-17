@@ -816,21 +816,55 @@ asset = vd.pipeline_asset(
                     target="cpu",
                 )
 
-    def test_gpu_vjp_is_rejected_before_compilation(self) -> None:
-        source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_native_f16_asset.py"
+    def test_gpu_no_tape_vjp_cooks_compute_profiles(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_no_tape_asset.py"
         with tempfile.TemporaryDirectory() as directory:
-            with (
-                mock.patch(
-                    "vernon_dsl._shader_assets.cooking._native_module",
-                    side_effect=AssertionError("native compiler loaded"),
-                ),
-                self.assertRaisesRegex(PipelineCompileError, "GPU target 'vulkan' is not supported"),
-            ):
-                cook_pipeline_asset(
-                    pipeline_asset=f"{source}:asset",
-                    output=directory,
-                    target="vulkan",
-                )
+            manifest = cook_pipeline_asset(
+                pipeline_asset=f"{source}:asset",
+                output=directory,
+                target="vulkan",
+            )
+            bundle = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(bundle["target"]["kind"], "vulkan")
+            self.assertEqual(bundle["autodiff"]["profiles"][0]["residual_storage"], "none")
+
+    def test_gpu_captured_tape_vjp_cooks_static_and_dynamic_profiles(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        from vernon_dsl._shader_assets.cooking import _native_module
+
+        native = _native_module()
+        source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_tape_asset.py"
+        targets = {
+            "cuda": native.Target.CUDA,
+            "vulkan": native.Target.VULKAN,
+            "directx": native.Target.DIRECTX,
+            "metal": native.Target.METAL,
+            "opengl": native.Target.OPENGL,
+        }
+        for descriptor, expected_storage in (
+            ("static_asset", "static"),
+            ("dynamic_asset", "dynamic"),
+        ):
+            for target, native_target in targets.items():
+                with (
+                    self.subTest(descriptor=descriptor, target=target),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    if not native.target_available(native_target):
+                        continue
+                    manifest = cook_pipeline_asset(
+                        pipeline_asset=f"{source}:{descriptor}",
+                        output=directory,
+                        target=target,
+                    )
+                    bundle = json.loads(manifest.read_text(encoding="utf-8"))
+                    self.assertEqual(bundle["target"]["kind"], target)
+                    profile = bundle["autodiff"]["profiles"][0]
+                    self.assertEqual(profile["residual_storage"], expected_storage)
+                    self.assertGreater(profile["static_tape_bytes_hint"], 0)
 
     def test_four_variants_share_unchanged_fragment(self) -> None:
         root = Path(__file__).parents[2]

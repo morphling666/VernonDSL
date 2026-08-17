@@ -1,5 +1,6 @@
 #include "compiler_cuda.h"
 
+#include "compiler_dispatch.h"
 #include "compiler_frontend.h"
 #include "compiler_reflection.h"
 
@@ -40,8 +41,8 @@ struct KeepGpuModulesPass : public mlir::PassWrapper<KeepGpuModulesPass, mlir::O
 
 } // namespace
 
-bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std::string &reflection,
-                 std::string &diagnostics) {
+bool compileCuda(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
+                 std::string &reflection, std::string &diagnostics) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
@@ -50,12 +51,14 @@ bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std
     if (mlir::failed(preparedTarget))
         return false;
     mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    if (moduleUsesF16(module.get())) {
+        diagnostics = "GPU targets do not currently support f16";
+        return false;
+    }
     {
         mlir::PassManager passManager(&context);
-        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(
-            mlir::vernon::AccumulationTargetCapabilities{/*supportsF32AtomicAdd=*/true,
-                                                         /*supportsF64AtomicAdd=*/false,
-                                                         mlir::vernon::AggregateGradientStorage::Shared}));
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(profile.accumulation));
+        passManager.addPass(mlir::vernon::createVernonVerifyGeneratedAccumulationPass(profile.accumulation));
         if (mlir::failed(passManager.run(*module)))
             return false;
     }

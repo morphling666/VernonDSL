@@ -539,8 +539,8 @@ bool parseUse(const nlohmann::json &value, ParameterUse &use, std::string &error
             }
             parsed.strideBindings.push_back(parsedBinding);
         }
-        if (!parsed.rank || parsed.extentBindings.size() != parsed.rank ||
-            parsed.strideBindings.size() != parsed.rank || (!use.shape.empty() && use.shape.size() != parsed.rank)) {
+        if (parsed.extentBindings.size() != parsed.rank || parsed.strideBindings.size() != parsed.rank ||
+            (!use.shape.empty() && use.shape.size() != parsed.rank)) {
             error = "TensorView descriptor rank does not match shape";
             return false;
         }

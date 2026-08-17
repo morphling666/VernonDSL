@@ -35,6 +35,45 @@ struct PythonGraphResource {
     bool isImage{};
 };
 
+struct RhiBufferCheckpointResource final : vernon::execution::GraphCheckpointResource {
+    explicit RhiBufferCheckpointResource(const RhiBuffer &buffer)
+        : host(buffer.host), handle(buffer.handle), size(buffer.size) {}
+
+    uint64_t byteSize() const override { return size; }
+    uint64_t alignment() const override { return 4; }
+
+    bool copyTo(void *destination, uint64_t byteSize, std::string &error) const override {
+        return copyRangeTo(0, destination, byteSize, error);
+    }
+
+    bool copyFrom(const void *source, uint64_t byteSize, std::string &error) override {
+        return copyRangeFrom(0, source, byteSize, error);
+    }
+
+    bool copyRangeTo(uint64_t offset, void *destination, uint64_t byteSize, std::string &error) const override {
+        if (!destination || offset > size || byteSize > size - offset ||
+            vernonRhiDeviceDownloadBuffer(host->device, handle, offset, destination, byteSize) !=
+                VERNON_RHI_STATUS_OK) {
+            error = "cannot download RHI graph checkpoint range";
+            return false;
+        }
+        return true;
+    }
+
+    bool copyRangeFrom(uint64_t offset, const void *source, uint64_t byteSize, std::string &error) override {
+        if (!source || offset > size || byteSize > size - offset ||
+            vernonRhiDeviceUploadBuffer(host->device, handle, offset, source, byteSize) != VERNON_RHI_STATUS_OK) {
+            error = "cannot upload RHI graph checkpoint range";
+            return false;
+        }
+        return true;
+    }
+
+    std::shared_ptr<RhiHostState> host;
+    VernonRhiBuffer handle{};
+    uint64_t size{};
+};
+
 struct PythonExecutionParameter {
     explicit PythonExecutionParameter(vernon::execution::ExecutionParameter value) : parameter(value) {}
     vernon::execution::ExecutionParameter parameter;
@@ -520,7 +559,8 @@ struct PythonExecutionGraph {
     PythonGraphResource importBuffer(RhiBuffer &buffer, bool exported) {
         if (buffer.host != host)
             throw std::invalid_argument("buffer belongs to another execution graph device");
-        return PythonGraphResource(graph.importBuffer(buffer.handle, exported));
+        auto checkpoint = std::make_shared<RhiBufferCheckpointResource>(buffer);
+        return PythonGraphResource(graph.importBuffer(buffer.handle, exported, std::move(checkpoint)));
     }
 
     PythonGraphResource importHostBuffer(uint64_t identity, const nb::object &checkpointBytes, bool exported) {
@@ -631,7 +671,7 @@ VernonRhiStatus PythonComputePass::execute(vernon::execution::ComputeEncoder &en
     }
 }
 
-bool PythonComputePass::forward(vernon::execution::ComputeEncoder &,
+bool PythonComputePass::forward(vernon::execution::ComputeEncoder &encoder,
                                 const vernon::execution::ExecutionResources &resources,
                                 std::unique_ptr<vernon::execution::PassPullback> &pullback, std::string &error) {
     try {
@@ -640,9 +680,9 @@ bool PythonComputePass::forward(vernon::execution::ComputeEncoder &,
         if (resources.hasBindings()) {
             PythonExecutionBindingsView bindings(resources);
             result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(
-                nb::cast(&bindings, nb::rv_policy::reference));
+                nb::cast(encoder), nb::cast(&bindings, nb::rv_policy::reference));
         } else {
-            result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(nb::none());
+            result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(nb::cast(encoder), nb::none());
         }
         pullback = makePythonPassPullback(std::move(result), callbackState);
         return true;

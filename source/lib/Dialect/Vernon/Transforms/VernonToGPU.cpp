@@ -5,20 +5,159 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
+#include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAggregateStorage.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#include <limits>
+
 namespace mlir::vernon {
 namespace {
+
+LogicalResult publishWorkgroupReduction(ReduceSumOp reduce, OpBuilder &builder, Value storage, ValueRange indices,
+                                        Value reduced) {
+    Value zero = arith::ConstantIndexOp::create(builder, reduce.getLoc(), 0);
+    Value leader;
+    for (gpu::Dimension dimension : {gpu::Dimension::x, gpu::Dimension::y, gpu::Dimension::z}) {
+        Value thread = gpu::ThreadIdOp::create(builder, reduce.getLoc(), dimension);
+        Value component = arith::CmpIOp::create(builder, reduce.getLoc(), arith::CmpIPredicate::eq, thread, zero);
+        leader = leader ? arith::AndIOp::create(builder, reduce.getLoc(), leader, component).getResult() : component;
+    }
+    scf::IfOp publish = scf::IfOp::create(builder, reduce.getLoc(), leader, false);
+    OpBuilder publishBuilder(publish.getThenRegion().front().getTerminator());
+    OperationState state(reduce.getLoc(), AtomicOp::getOperationName());
+    state.addOperands(storage);
+    state.addOperands(indices);
+    state.addOperands(reduced);
+    state.addTypes(reduced.getType());
+    state.addAttribute("atomic_kind", publishBuilder.getStringAttr("add"));
+    state.addAttribute("ordering", publishBuilder.getStringAttr("relaxed"));
+    if (Attribute implementation = reduce->getAttr(kAtomicImplementationAttrName))
+        state.addAttribute(kAtomicImplementationAttrName, implementation);
+    publishBuilder.create(state);
+    return success();
+}
+
+LogicalResult lowerWorkgroupReduction(ReduceSumOp reduce, OpBuilder &builder, IRMapping &mapping,
+                                      bool useSpirvWorkgroupReduction) {
+    auto strategy = reduce->getAttrOfType<StringAttr>(kAccumulationStrategyAttrName);
+    if (!strategy || strategy.getValue() != kWorkgroupReductionAccumulationStrategy)
+        return failure();
+    Value value = mapping.lookupOrNull(reduce.getValue());
+    Value storage = mapping.lookupOrNull(reduce.getStorage());
+    SmallVector<Value> indices;
+    for (Value index : reduce.getIndices()) {
+        Value mapped = mapping.lookupOrNull(index);
+        if (!mapped)
+            return reduce.emitError("workgroup reduction index is not mapped");
+        indices.push_back(mapped);
+    }
+    if (!value || !storage)
+        return reduce.emitError("workgroup reduction operands are not mapped");
+    if (!useSpirvWorkgroupReduction) {
+        auto add = gpu::AllReduceOperationAttr::get(builder.getContext(), gpu::AllReduceOperation::ADD);
+        Value reduced = gpu::AllReduceOp::create(builder, reduce.getLoc(), value, add, /*uniform=*/true).getResult();
+        return publishWorkgroupReduction(reduce, builder, storage, indices, reduced);
+    }
+
+    auto kernel = dyn_cast<gpu::GPUFuncOp>(builder.getInsertionBlock()->getParentOp());
+    DenseI32ArrayAttr workgroup = kernel ? kernel.getKnownBlockSizeAttr() : DenseI32ArrayAttr{};
+    if (!kernel || !workgroup || workgroup.size() != 3)
+        return reduce.emitError("workgroup reduction requires a statically sized GPU kernel");
+    uint64_t laneCount = 1;
+    for (int32_t extent : workgroup.asArrayRef()) {
+        if (extent <= 0)
+            return reduce.emitError("workgroup reduction requires positive workgroup dimensions");
+        if (laneCount > std::numeric_limits<uint64_t>::max() / static_cast<uint32_t>(extent))
+            return reduce.emitError("workgroup reduction lane count overflows");
+        laneCount *= static_cast<uint32_t>(extent);
+    }
+    if (laneCount > std::numeric_limits<unsigned>::max())
+        return reduce.emitError("workgroup reduction lane count exceeds the SPIR-V array limit");
+    gpu::GPUModuleOp gpuModule = kernel->getParentOfType<gpu::GPUModuleOp>();
+    if (!gpuModule)
+        return reduce.emitError("workgroup reduction has no enclosing GPU module");
+    if (!isa<FloatType>(value.getType()))
+        return reduce.emitError("workgroup reduction requires a floating-point value");
+    const unsigned elementBytes = value.getType().getIntOrFloatBitWidth() / 8;
+    auto arrayType = spirv::ArrayType::get(value.getType(), static_cast<unsigned>(laneCount), elementBytes);
+    auto pointerType = spirv::PointerType::get(arrayType, spirv::StorageClass::Workgroup);
+    const std::string globalName =
+        (Twine("__vernon_workgroup_reduce_") + kernel.getName() + "_f" + Twine(value.getType().getIntOrFloatBitWidth()))
+            .str();
+    spirv::GlobalVariableOp global;
+    for (spirv::GlobalVariableOp candidate : gpuModule.getOps<spirv::GlobalVariableOp>())
+        if (candidate.getSymName() == globalName) {
+            global = candidate;
+            break;
+        }
+    if (global && global.getType() != pointerType)
+        return reduce.emitError("reused workgroup reduction scratch has an incompatible type");
+    if (!global) {
+        OpBuilder globalBuilder(kernel);
+        global = spirv::GlobalVariableOp::create(globalBuilder, reduce.getLoc(), pointerType, globalName,
+                                                 FlatSymbolRefAttr(), IntegerAttr(), IntegerAttr(), IntegerAttr(),
+                                                 StringAttr(), spirv::LinkageAttributesAttr());
+    }
+    Value buffer = spirv::AddressOfOp::create(builder, reduce.getLoc(), global);
+    auto load = [&](OpBuilder &loadBuilder, Value index) -> Value {
+        Value converted = arith::IndexCastUIOp::create(loadBuilder, reduce.getLoc(), loadBuilder.getI32Type(), index);
+        Value pointer = spirv::AccessChainOp::create(loadBuilder, reduce.getLoc(), buffer, ValueRange{converted});
+        return spirv::LoadOp::create(loadBuilder, reduce.getLoc(), pointer);
+    };
+    auto store = [&](OpBuilder &storeBuilder, Value stored, Value index) {
+        Value converted = arith::IndexCastUIOp::create(storeBuilder, reduce.getLoc(), storeBuilder.getI32Type(), index);
+        Value pointer = spirv::AccessChainOp::create(storeBuilder, reduce.getLoc(), buffer, ValueRange{converted});
+        spirv::StoreOp::create(storeBuilder, reduce.getLoc(), pointer, stored);
+    };
+    Value threadX = gpu::ThreadIdOp::create(builder, reduce.getLoc(), gpu::Dimension::x);
+    Value threadY = gpu::ThreadIdOp::create(builder, reduce.getLoc(), gpu::Dimension::y);
+    Value threadZ = gpu::ThreadIdOp::create(builder, reduce.getLoc(), gpu::Dimension::z);
+    Value linear = arith::AddIOp::create(
+        builder, reduce.getLoc(), threadX,
+        arith::MulIOp::create(
+            builder, reduce.getLoc(),
+            arith::AddIOp::create(builder, reduce.getLoc(), threadY,
+                                  arith::MulIOp::create(builder, reduce.getLoc(), threadZ,
+                                                        arith::ConstantIndexOp::create(builder, reduce.getLoc(),
+                                                                                       workgroup.asArrayRef()[1]))),
+            arith::ConstantIndexOp::create(builder, reduce.getLoc(), workgroup.asArrayRef()[0])));
+    store(builder, value, linear);
+    gpu::BarrierOp::create(builder, reduce.getLoc());
+    uint64_t span = 1;
+    while (span < laneCount)
+        span *= 2;
+    for (uint64_t offset = span / 2; offset; offset /= 2) {
+        Value offsetValue = arith::ConstantIndexOp::create(builder, reduce.getLoc(), offset);
+        Value peer = arith::AddIOp::create(builder, reduce.getLoc(), linear, offsetValue);
+        Value active = arith::AndIOp::create(
+            builder, reduce.getLoc(),
+            arith::CmpIOp::create(builder, reduce.getLoc(), arith::CmpIPredicate::ult, linear, offsetValue),
+            arith::CmpIOp::create(builder, reduce.getLoc(), arith::CmpIPredicate::ult, peer,
+                                  arith::ConstantIndexOp::create(builder, reduce.getLoc(), laneCount)));
+        scf::IfOp accumulate = scf::IfOp::create(builder, reduce.getLoc(), active, false);
+        OpBuilder accumulateBuilder(accumulate.getThenRegion().front().getTerminator());
+        Value left = load(accumulateBuilder, linear);
+        Value right = load(accumulateBuilder, peer);
+        Value sum = arith::AddFOp::create(accumulateBuilder, reduce.getLoc(), left, right);
+        store(accumulateBuilder, sum, linear);
+        gpu::BarrierOp::create(builder, reduce.getLoc());
+    }
+    Value reduced = load(builder, arith::ConstantIndexOp::create(builder, reduce.getLoc(), 0));
+    return publishWorkgroupReduction(reduce, builder, storage, indices, reduced);
+}
 
 Type convertStorageLeaf(Type type, bool useSpirvStorage) {
     if (!useSpirvStorage)
@@ -84,8 +223,11 @@ struct PhysicalAtomicConversion final : OpConversionPattern<PhysicalAtomicOp> {
             : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
             : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
                                            : arith::AtomicRMWKind::assign;
-        rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, adaptor.getValue().front(),
-                                                         adaptor.getStorage().front(), adaptor.getIndex().front());
+        auto replacement = memref::AtomicRMWOp::create(rewriter, op.getLoc(), kind, adaptor.getValue().front(),
+                                                       adaptor.getStorage().front(), adaptor.getIndex().front());
+        if (Attribute implementation = op->getAttr(kAtomicImplementationAttrName))
+            replacement->setAttr(kAtomicImplementationAttrName, implementation);
+        rewriter.replaceOp(op, replacement.getResult());
         return success();
     }
 };
@@ -94,14 +236,17 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonToGPUPass)
 
     VernonToGPUPass() = default;
-    explicit VernonToGPUPass(bool useSpirvStorage) : useSpirvStorage(useSpirvStorage) {}
-    VernonToGPUPass(const VernonToGPUPass &other) : PassWrapper(other), useSpirvStorage(other.useSpirvStorage) {}
+    VernonToGPUPass(bool useSpirvStorage, bool useSpirvWorkgroupReduction) : VernonToGPUPass() {
+        this->useSpirvStorage = useSpirvStorage;
+        this->useSpirvWorkgroupReduction = useSpirvWorkgroupReduction;
+    }
+    VernonToGPUPass(const VernonToGPUPass &other) : PassWrapper(other) {}
 
     StringRef getArgument() const final { return "vernon-to-gpu"; }
     StringRef getDescription() const final { return "Outline Vernon compute entries as MLIR GPU kernels"; }
     void getDependentDialects(DialectRegistry &registry) const override {
-        registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect, spirv::SPIRVDialect,
-                        tensor::TensorDialect>();
+        registry.insert<arith::ArithDialect, gpu::GPUDialect, memref::MemRefDialect, scf::SCFDialect,
+                        spirv::SPIRVDialect, tensor::TensorDialect>();
     }
 
     void runOnOperation() override {
@@ -241,6 +386,27 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             auto functionType = moduleBuilder.getFunctionType(kernelArgumentTypes, TypeRange{});
             auto kernel = gpu::GPUFuncOp::create(moduleBuilder, source.getLoc(), source.getSymName(), functionType);
             kernel->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), moduleBuilder.getUnitAttr());
+            for (const auto &[sourceIndex, range] : sourceArgumentRanges)
+                for (StringRef name : {"vernon.autodiff_role", "vernon.autodiff_source"})
+                    if (Attribute value = source.getArgAttr(sourceIndex, name))
+                        for (unsigned offset = 0; offset < range.second; ++offset)
+                            kernel.setArgAttr(range.first + offset, name, value);
+            for (unsigned sourceIndex = 0; sourceIndex < source.getNumArguments(); ++sourceIndex) {
+                auto component = source.getArgAttrOfType<StringAttr>(sourceIndex, kTensorDescriptorComponentAttrName);
+                auto range = sourceArgumentRanges.find(sourceIndex);
+                if (!component || range == sourceArgumentRanges.end() || range->second.second != 1)
+                    continue;
+                const unsigned kernelIndex = range->second.first;
+                auto owner = source.getArgAttrOfType<IntegerAttr>(sourceIndex, kTensorDescriptorOwnerAttrName);
+                auto ownerRange = owner ? sourceArgumentRanges.find(owner.getInt()) : sourceArgumentRanges.end();
+                if (!owner || ownerRange == sourceArgumentRanges.end())
+                    return signalPassFailure();
+                kernel.setArgAttr(kernelIndex, kTensorDescriptorOwnerAttrName,
+                                  moduleBuilder.getI64IntegerAttr(ownerRange->second.first));
+                kernel.setArgAttr(kernelIndex, kTensorDescriptorComponentAttrName, component);
+                if (auto dimension = source.getArgAttr(sourceIndex, kTensorDescriptorDimensionAttrName))
+                    kernel.setArgAttr(kernelIndex, kTensorDescriptorDimensionAttrName, dimension);
+            }
             if (auto workgroup = source->getAttrOfType<DenseI32ArrayAttr>(kWorkgroupSizeAttrName)) {
                 kernel.setKnownBlockSizeAttr(workgroup);
                 kernel->setAttr(spirv::getEntryPointABIAttrName(),
@@ -360,8 +526,16 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     gpu::ReturnOp::create(bodyBuilder, operation.getLoc());
                     continue;
                 }
+                if (auto reduce = dyn_cast<ReduceSumOp>(operation);
+                    reduce && reduce->hasAttr(kAccumulationStrategyAttrName)) {
+                    if (failed(lowerWorkgroupReduction(reduce, bodyBuilder, mapping, useSpirvWorkgroupReduction)))
+                        return signalPassFailure();
+                    continue;
+                }
                 bodyBuilder.clone(operation, mapping);
             }
+            if (failed(materializeTensorViewProjections(kernel)))
+                return signalPassFailure();
 
             TypeConverter storageConverter;
             storageConverter.addConversion([](Type type) { return type; });
@@ -381,7 +555,14 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 populateFunctionOpInterfaceTypeConversionPattern<gpu::GPUFuncOp>(storagePatterns, storageConverter);
 
                 ConversionTarget storageTarget(*module.getContext());
-                auto isNonResourceStorage = [](Value storage) { return !isa<BlockArgument>(storage); };
+                auto isNonResourceStorage = [](Value storage) {
+                    while (auto cast = storage.getDefiningOp<UnrealizedConversionCastOp>()) {
+                        if (cast.getInputs().size() != 1)
+                            break;
+                        storage = cast.getInputs().front();
+                    }
+                    return !isa<BlockArgument>(storage);
+                };
                 storageTarget.addDynamicallyLegalOp<PhysicalLoadOp>(
                     [&](PhysicalLoadOp op) { return isNonResourceStorage(op.getStorage()); });
                 storageTarget.addDynamicallyLegalOp<PhysicalStoreOp>(
@@ -442,13 +623,17 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
         }
     }
 
-    bool useSpirvStorage{false};
+    Option<bool> useSpirvStorage{*this, "use-spirv-storage", llvm::cl::desc("Use SPIR-V storage-buffer ABI types"),
+                                 llvm::cl::init(false)};
+    Option<bool> useSpirvWorkgroupReduction{
+        *this, "use-spirv-workgroup-reduction",
+        llvm::cl::desc("Lower workgroup reductions to explicit SPIR-V shared-memory trees"), llvm::cl::init(false)};
 };
 
 } // namespace
 
-std::unique_ptr<Pass> createVernonToGPUPass(bool useSpirvStorage) {
-    return std::make_unique<VernonToGPUPass>(useSpirvStorage);
+std::unique_ptr<Pass> createVernonToGPUPass(bool useSpirvStorage, bool useSpirvWorkgroupReduction) {
+    return std::make_unique<VernonToGPUPass>(useSpirvStorage, useSpirvWorkgroupReduction);
 }
 
 void registerVernonToGPUPass() { PassRegistration<VernonToGPUPass>(); }

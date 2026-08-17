@@ -7,7 +7,12 @@ from typing import Any, Mapping
 import numpy as np
 
 from ..ad import ProgramExpression
-from .autodiff import CookedVjpPipeline, _compile_direct_vjp, _retained_primal_allocation_bytes
+from .autodiff import (
+    CookedVjpPipeline,
+    _compile_direct_vjp,
+    _invoke_structured_pipeline,
+    _retained_primal_allocation_bytes,
+)
 from .execution_graph import (
     CompiledExecutionGraph,
     ComputeEncoder,
@@ -17,7 +22,8 @@ from .execution_graph import (
     GraphResource,
     SubmissionState,
 )
-from .resources import TensorStorage, TensorView
+from .kernel import _session_state
+from .resources import TensorStorage, TensorView, _NativeBindingCache
 
 _DerivativeEndpoint = GraphResource | ExecutionParameter
 
@@ -78,6 +84,7 @@ class VjpComputePass(ComputePass):
         self._manages_borrows = True
         self._gradient_endpoints: dict[str, _DerivativeEndpoint] = {}
         self._cotangent_resources: dict[str, GraphResource] = {}
+        self._binding_cache = _NativeBindingCache()
 
     def _paths(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
         if isinstance(self._program, ProgramExpression):
@@ -260,19 +267,43 @@ class VjpComputePass(ComputePass):
             isinstance(self._program, ProgramExpression),
         )
 
-    def _native_vjp_forward(self, native_bindings: Any | None) -> Any:
+    def _native_vjp_forward(self, native_encoder: Any, native_bindings: Any | None) -> Any:
         if self._graph is None:
             raise RuntimeError("differentiable pass requires a compiled execution graph")
+        encoder = ComputeEncoder(native_encoder)
         resources = ExecutionResources(self._graph, native_bindings)
-        if isinstance(self._program, ProgramExpression):
-            _, pullback = self._program(*self._program_arguments(resources), grid=self._grid)
-        else:
+        try:
+            state = _session_state()
+            encoded = state._architecture != state.cpu
             resolved = {
                 name: resources.resolve(value) if isinstance(value, (GraphResource, ExecutionParameter)) else value
                 for name, value in self._bindings.items()
             }
-            _, pullback = self._program.vjp(resolved, self._grid)
-        return pullback
+            if isinstance(self._program, ProgramExpression):
+                compiled = _compile_direct_vjp(self._program, self._program_arguments(resources))
+                _, pullback = _invoke_structured_pipeline(
+                    compiled.pipeline,
+                    resolved,
+                    self._grid,
+                    compiled.tape_bytes_per_invocation,
+                    compiled.active_operation_count,
+                    compiled.recomputation_cost,
+                    compiled.residual_storage_kind,
+                    encoder=encoder if encoded else None,
+                    binding_cache=self._binding_cache if encoded else None,
+                )
+            else:
+                self._program._load()
+                _, pullback = _invoke_structured_pipeline(
+                    self._program._native,
+                    resolved,
+                    self._grid,
+                    encoder=encoder if encoded else None,
+                    binding_cache=self._binding_cache if encoded else None,
+                )
+            return pullback
+        finally:
+            encoder._native = None
 
     def _native_graph_cotangent(self, path: str, implicit: bool, native_bindings: Any | None) -> Any:
         if path not in self._cotangent_resources or self._graph is None:
@@ -282,18 +313,29 @@ class VjpComputePass(ComputePass):
         return _implicit_cotangent(primal) if implicit else _zero_cotangent(primal)
 
     def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
-        del encoder
         if isinstance(self._program, ProgramExpression):
             kernel = self._program.program
             if not callable(kernel):
                 raise TypeError("graph VJP currently supports one compute Kernel")
-            kernel(*self._program_arguments(resources), grid=self._grid)
+            state = _session_state()
+            native_kernel: Any = kernel
+            native_kernel._invoke_direct(
+                self._program_arguments(resources),
+                self._grid,
+                encoder=None if state._architecture == state.cpu else encoder,
+            )
             return
         resolved = {
             name: resources.resolve(value) if isinstance(value, (GraphResource, ExecutionParameter)) else value
             for name, value in self._bindings.items()
         }
-        self._program.primal(resolved, self._grid)
+        self._program._load()
+        parameters = tuple(self._program._native.parameters)
+        with self._binding_cache.invocation(self._program._native) as builder:
+            for parameter in parameters:
+                self._binding_cache.bind_argument(builder, self._program._native, parameter, resolved[parameter.name])
+            builder.grid(*self._grid)
+            builder.encode(encoder._native)
 
 
 class _ForwardSubmission:
@@ -362,6 +404,30 @@ class GraphPullback:
     @property
     def peak_runtime_managed_bytes(self) -> int:
         return int(self._native.peak_runtime_managed_bytes)
+
+    @property
+    def submission_count(self) -> int:
+        return int(self._native.submission_count)
+
+    @property
+    def wait_count(self) -> int:
+        return int(self._native.wait_count)
+
+    @property
+    def readback_count(self) -> int:
+        return int(self._native.readback_count)
+
+    @property
+    def atomic_publication_count(self) -> int:
+        return int(self._native.atomic_publication_count)
+
+    @property
+    def temporary_allocation_traffic_bytes(self) -> int:
+        return int(self._native.temporary_allocation_traffic_bytes)
+
+    @property
+    def device_wait_nanoseconds(self) -> int:
+        return int(self._native.device_wait_nanoseconds)
 
     @property
     def tape_context_limit_bytes(self) -> int:

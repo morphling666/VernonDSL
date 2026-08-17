@@ -4,7 +4,7 @@
 >
 > 本文描述当前 CPU structured VJP、cost-aware residual source、no-Tape、
 > ExecutionGraph resource-version replay 和 complete-workgroup bounded replay。
-> GPU/graphics AD 与高阶 AD 会明确标为“尚未实现”，不会把路线图当成现状。
+> Compute GPU AD 已实现；graphics AD 与高阶 AD 会明确标为“尚未实现”，不会把路线图当成现状。
 
 ## 0. 先建立一张全局地图
 
@@ -870,9 +870,9 @@ static + balanced/min_runtime + whole dispatch fits:
 - Graph checkpoint 处理 pass 之间的 resource state；
 - 两者位于不同层级。
 
-### 8.3 CPU bounded replay 与 GPU 待办
+### 8.3 CPU/GPU bounded replay
 
-CPU 已实现 bounded replay segments：
+CPU 与 compute GPU backend 已实现 bounded replay segments：
 
 ```text
 retain resource-version dependencies
@@ -887,11 +887,11 @@ checkpoint dependencies、Tape budget 和 completion lifetime。CPU host buffer�
 buffer、unified memory 等 physical storage 由 backend 决定；公共语义不包含 host readback
 或 file spill。
 
-每个 segment 必须包含完整 workgroups，并保留原 dispatch 的 virtual global ID、grid size、
+每个 segment 包含完整 workgroups，并保留原 dispatch 的 virtual global ID、grid size、
 barrier、resource version 和 gradient ownership 语义。若单个 workgroup 的 dynamic history
 已经超过预算，Runtime 必须选择 specialized VJP、其它 checkpoint/rematerialization 边界或
-明确失败，不能假设执行中的 GPU workgroup 可以暂停并 spill。CPU 已执行这些约束；
-CUDA、Vulkan、DirectX 12、Metal 和 OpenGL 的 backend-local 实现尚未完成。
+明确失败，不能假设执行中的 GPU workgroup 可以暂停并 spill。GPU static/dynamic capture
+通过固定 lane-status 返回 required bytes，整组恢复并重放；Runtime 不读取 Tape payload。
 
 ### 8.4 更大的优化：在 operator/pass 层定义 VJP
 
@@ -1296,13 +1296,12 @@ Pipeline/graph pullback 暴露的常见指标：
 
 ### 11.1 产品边界
 
-- 只有 CPU structured VJP 是当前 AD 执行路径；
-- GPU 和 graphics AD 尚未实现；
+- CPU 与 compute GPU structured VJP 均可执行；graphics AD 尚未实现；
 - higher-order AD、JVP、持久 `.grad` 尚未实现；
-- graph VJP 当前是 CPU compute 路径；
+- graph VJP 支持 CPU 与 RHI compute resource checkpoint/replay；
 - cooked VJP 可以参与 graph VJP，但当前缺少自动 checkpoint planning 所需的完整 metadata；
-- CPU complete-workgroup bounded replay 已实现；CUDA、Vulkan、DirectX 12、Metal 和
-  OpenGL 的 backend-local segments 尚未实现，路线不包含通用 backing/spill phase。
+- CPU、CUDA、Vulkan、DirectX 12、Metal 和 OpenGL 已实现 complete-workgroup
+  backend-local bounded replay，路线不包含通用 backing/spill phase。
 
 ### 11.2 工程注意事项
 
@@ -1345,15 +1344,15 @@ array-program AD 执行能力仍有明显距离。
 
 | 物理模拟/Graphics 相关维度 | VernonDSL 当前状态 | JAX 作为 AD substrate 的能力 |
 | --- | --- | --- |
-| 单 Kernel Reverse VJP | CPU typed structured VJP | 成熟的 `vjp/grad` 变换组合 |
+| 单 Kernel Reverse VJP | CPU/GPU typed structured VJP | 成熟的 `vjp/grad` 变换组合 |
 | Static residual | 已实现固定 offset 与 lifetime reuse | 与编译器 buffer assignment 深度结合 |
 | Dynamic control flow | if/while execution-history Tape | 成熟 staged control-flow 与优化 |
 | Rematerialization | 有限 pure-op recipe | `jax.checkpoint/remat` policy 与 XLA 优化 |
-| 单 pass 大 dispatch | CPU complete-workgroup bounded replay；GPU 尚缺 | 更成熟的 buffer scheduling；仍可能 OOM |
+| 单 pass 大 dispatch | CPU/GPU complete-workgroup bounded replay | 更成熟的 buffer scheduling；仍可能 OOM |
 | 多 pass Graph VJP | Native reverse、resource checkpoint/replay | 整个 staged array program 可一起优化 |
 | 长时间步 simulation | 无 graph-level loop/subgraph primitive，通常需要展开或放入 Kernel | `scan/while`、transpose 与 remat 组合更成熟 |
 | CPU grid/stencil 性能 | AOT/JIT range scheduler | XLA fusion、vectorization 和 buffer reuse 更成熟 |
-| GPU compute AD | 尚未实现 | GPU 上 forward/backward 与 residual 可保持 device-resident |
+| GPU compute AD | no-Tape 与 captured Tape VJP；bounded Tape 保持 device-resident | GPU 上 forward/backward 与 residual 可保持 device-resident |
 | Differentiable graphics | 尚无 rasterization/visibility/texture custom VJP | JAX 本身也不是 renderer，但可作为成熟 array AD substrate |
 | Async Graph VJP | submission API 存在，但 CPU AD 通常同步 | accelerator arrays 可异步排队和依赖 |
 
@@ -1378,7 +1377,7 @@ VernonDSL 已经避免了一些明显低效：
 2. 成熟 CPU vectorization 和 architecture-specific tuning；
 3. stencil、scatter/gather、reduction 等 simulation 热点的系统优化；
 4. graph-level loop/subgraph 表达与跨 timestep 优化；
-5. GPU AD 与 device-resident forward/backward；
+5. GPU AD 的大规模性能优化与更少的 host API 边界；
 6. 真正异步的 host/device pipeline；
 7. 多个 simulation step/submission 的 overlap；
 8. 大规模 profile-guided performance work。
@@ -1420,7 +1419,7 @@ resource versions 仍有独立内存成本；它不声称总 simulation state �
 - static layout 和 rematerialization 继续降低每 segment 的常数项；
 - graph checkpoint 减少 pass 间 retained tapes；
 - CPU generic 大 dispatch 不再要求 whole-dispatch Tape；
-- GPU AD 尚未实现，因此 GPU backend-local bounded replay 仍是待办。
+- GPU compute AD 使用 backend-local complete-workgroup bounded replay；graphics AD 仍是待办。
 
 对于时间积分模拟还存在第二个维度：
 
@@ -1454,12 +1453,12 @@ device execution 和 Graph VJP 足够成熟。VernonDSL 仍需要自己的 named
 1. 修完 Phase 1/2 correctness 和 physical memory accounting；
 2. 建立 pass/operator-level specialized VJP 与 resource-version requirements；
 3. 增加 graph-level loop/subgraph 与 timestep checkpoint schedule；
-4. 实现跨后端 Phase 3 bounded replay segments；
+4. 扩展并压测已实现的跨后端 Phase 3 bounded replay segments；
 5. 让 residual、checkpoint、gradient staging、effect shadow 进入统一真实内存账本；
 6. 用 grid、particle、stencil 和长时间积分 benchmark 推进 fusion、vectorization 和 scheduler；
 7. 实现真正 asynchronous submission/lifetime；
-8. 实现窄范围 GPU compute pipeline AD；
-9. 实现 GPU Graph VJP，使 state、Tape、checkpoint 和 gradients 保持 backend-local；
+8. 扩展已实现的 GPU compute pipeline AD 覆盖范围；
+9. 优化已实现的 GPU Graph VJP checkpoint 和 backend-local lifetime；
 10. 最后增加 graphics custom VJP，从明确的小范围 primitive 开始。
 
 VernonDSL 的目标应是把 typed DSL、Storage effects、workgroup semantics、

@@ -1047,6 +1047,22 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
     return false;
 }
 
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupDevice(handle);
+    if (!device || native != reinterpret_cast<uintptr_t>(&device->state) || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    BufferSlot *sourceSlot = lookupBuffer(*device, source);
+    BufferSlot *destinationSlot = lookupBuffer(*device, destination);
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->descriptor.size ||
+        size > sourceSlot->descriptor.size - sourceOffset || destinationOffset > destinationSlot->descriptor.size ||
+        size > destinationSlot->descriptor.size - destinationOffset)
+        return false;
+    return device->state.copyBuffer(sourceSlot->buffer, static_cast<size_t>(sourceOffset), destinationSlot->buffer,
+                                    static_cast<size_t>(destinationOffset), static_cast<size_t>(size), device->error);
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1309,6 +1325,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,
+        recordBufferCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

@@ -48,25 +48,28 @@ struct Runtime {
                                                 std::vector<SharedCompileResult>{program.result});
     }
 
-    std::unique_ptr<LoadedPipeline>
-    loadCpuAutodiff(const CompiledProgram &primal, const std::string &primalName, const CompiledProgram &forward,
-                    const std::string &forwardName, const CompiledProgram &backward, const std::string &backwardName,
-                    uint64_t staticTapeBytesHint, const std::string &residualStorage, const std::string &selectedPolicy,
-                    bool wholeDispatchRetentionPermitted, const nb::list &groupMetadata) {
+    std::unique_ptr<LoadedPipeline> loadAutodiff(const CompiledProgram &primal, const std::string &primalName,
+                                                 const CompiledProgram &forward, const std::string &forwardName,
+                                                 const CompiledProgram &backward, const std::string &backwardName,
+                                                 uint64_t staticTapeBytesHint, const std::string &residualStorage,
+                                                 const std::string &selectedPolicy,
+                                                 bool wholeDispatchRetentionPermitted, const nb::list &groupMetadata) {
         const CompiledProgram *programs[] = {&primal, &forward, &backward};
         const std::string *names[] = {&primalName, &forwardName, &backwardName};
         VernonCpuEntryPoint entries[3]{};
         std::string reflections[3];
         for (size_t index = 0; index < 3; ++index) {
             programs[index]->requireSuccess();
-            if (programs[index]->target != VERNON_TARGET_CPU)
-                throw std::runtime_error("direct autodiff profiles require CPU compiled programs");
+            if (programs[index]->target != primal.target)
+                throw std::runtime_error("direct autodiff profiles must use one target");
             if (names[index]->empty())
                 throw std::runtime_error("direct autodiff profile entry names must not be empty");
-            entries[index] = vernonCompileResultGetCpuEntry(programs[index]->result.get(), names[index]->data(),
-                                                            names[index]->size());
-            if (!entries[index])
-                throw std::runtime_error("direct autodiff profile entry '" + *names[index] + "' was not found");
+            if (primal.target == VERNON_TARGET_CPU) {
+                entries[index] = vernonCompileResultGetCpuEntry(programs[index]->result.get(), names[index]->data(),
+                                                                names[index]->size());
+                if (!entries[index])
+                    throw std::runtime_error("direct autodiff profile entry '" + *names[index] + "' was not found");
+            }
             reflections[index] = programs[index]->reflection();
         }
         auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
@@ -98,13 +101,33 @@ struct Runtime {
                 leaves.push_back(view(leaf));
             derivativeGroupViews.push_back({group.role, view(group.declaredPath), leaves.data(), leaves.size()});
         }
-        VernonLoadedPipeline *pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
-            *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
-            view(forwardName), entries[2], view(reflections[2]), view(backwardName), derivativeGroupViews.data(),
-            derivativeGroupViews.size(), staticTapeBytesHint, view(residualStorage), view(selectedPolicy),
-            wholeDispatchRetentionPermitted);
+        VernonLoadedPipeline *pipeline = nullptr;
+        if (primal.target == VERNON_TARGET_CPU) {
+            pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
+                *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
+                view(forwardName), entries[2], view(reflections[2]), view(backwardName), derivativeGroupViews.data(),
+                derivativeGroupViews.size(), staticTapeBytesHint, view(residualStorage), view(selectedPolicy),
+                wholeDispatchRetentionPermitted);
+        } else {
+            VernonStringView artifacts[3]{};
+            for (size_t index = 0; index < 3; ++index) {
+                if (vernonCompileResultGetArtifactCount(programs[index]->result.get()) != 1)
+                    throw std::runtime_error("direct GPU autodiff profile must produce exactly one artifact");
+                artifacts[index] = vernonCompileResultGetArtifactData(programs[index]->result.get(), 0);
+                if (!artifacts[index].data || !artifacts[index].size)
+                    throw std::runtime_error("direct GPU autodiff profile artifact is empty");
+            }
+            const vernon::runtime::AutodiffGpuStageView stages[3]{
+                {artifacts[0].data, artifacts[0].size, view(reflections[0]), view(primalName)},
+                {artifacts[1].data, artifacts[1].size, view(reflections[1]), view(forwardName)},
+                {artifacts[2].data, artifacts[2].size, view(reflections[2]), view(backwardName)},
+            };
+            pipeline = vernon::runtime::loadBackendGpuAutodiffPipeline(
+                *handle, stages[0], stages[1], stages[2], derivativeGroupViews.data(), derivativeGroupViews.size(),
+                staticTapeBytesHint, view(residualStorage), view(selectedPolicy));
+        }
         if (!pipeline)
-            throw std::runtime_error("cannot load direct CPU autodiff profiles: " +
+            throw std::runtime_error("cannot load direct autodiff profiles: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
         return std::make_unique<LoadedPipeline>(
             this, handle, nullptr, pipeline,

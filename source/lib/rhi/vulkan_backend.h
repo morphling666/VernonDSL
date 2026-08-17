@@ -105,6 +105,7 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t maxComputeWorkGroupSize[3]{};
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
+    bool shaderBufferFloat32AtomicAdd{};
     bool portabilityEnumeration{};
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};

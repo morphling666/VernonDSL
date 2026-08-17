@@ -109,6 +109,42 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
               VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
+TEST(RuntimeMetal, CopiesBufferEntirelyOnDevice) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    constexpr std::array<uint32_t, 4> source{3u, 5u, 8u, 13u};
+    VernonRhiBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = sizeof(source);
+    descriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer sourceBuffer{}, destinationBuffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &sourceBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &destinationBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, sourceBuffer, 0, source.data(), sizeof(source)),
+              VERNON_RHI_STATUS_OK);
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderCopyBuffer(device, encoder, sourceBuffer, 0, destinationBuffer, 0, sizeof(source)),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    std::array<uint32_t, source.size()> destination{};
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, destinationBuffer, 0, destination.data(), sizeof(destination)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, sourceBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, destinationBuffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
 TEST(RuntimeMetal, ValidatesMslHostVersionAndComputeLimitsWithSpecificErrors) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);

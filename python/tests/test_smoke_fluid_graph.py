@@ -172,6 +172,42 @@ class SmokeFluidGraphTests(unittest.TestCase):
                 np.testing.assert_allclose(actual_velocity, expected_velocity, rtol=3.0e-5, atol=3.0e-6)
                 np.testing.assert_allclose(actual_loss, expected_loss, rtol=3.0e-5, atol=3.0e-6)
 
+    def test_available_gpu_backends_validate_optimistic_static_tape_hints(self) -> None:
+        size = 4
+        density, velocity, target = self._inputs(size)
+
+        def gradient(architecture: Any) -> np.ndarray:
+            vd.init(arch=architecture)
+            simulation = SmokeFluidSimulation(
+                grid=size,
+                pressure_iterations=1,
+                differentiable=True,
+                planning_policy="min_runtime",
+            )
+            simulation.set_state(density, velocity)
+            pullback = simulation.step_vjp(target)
+            result = pullback(
+                {
+                    "density": np.zeros((size, size), dtype=np.float32),
+                    "velocity": vd.storage.tangent_zeros(
+                        dtype=vd.Vector[vd.f32, 2],
+                        shape=(size, size),
+                    ),
+                    "loss": np.ones((1,), dtype=np.float32),
+                }
+            )
+            return result["state_velocity"].to_numpy()
+
+        expected = gradient(vd.cpu)
+        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
+            try:
+                actual = gradient(architecture)
+            except RuntimeError:
+                continue
+            with self.subTest(backend=architecture.name):
+                self.assertTrue(np.isfinite(actual).all())
+                np.testing.assert_allclose(actual, expected, rtol=3.0e-4, atol=3.0e-6)
+
     def test_loss_is_single_invocation_serial_kernel(self) -> None:
         self.assertEqual(cast(Any, smoke_loss).__vernon_dsl__[1]["workgroup_size"], (1, 1, 1))
         _, _, _, graph, _ = self._run(vd.cpu, 6, pressure_iterations=4)

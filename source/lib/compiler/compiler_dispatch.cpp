@@ -12,6 +12,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <cstring>
 #include <string>
@@ -22,6 +23,14 @@ namespace {
 
 std::string copyStringView(VernonStringView value) {
     return value.data && value.size ? std::string(value.data, value.size) : std::string();
+}
+
+bool containsBackendLocalTapeHandle(mlir::Type type) {
+    if (mlir::isa<mlir::vernon::AdTapeType, mlir::vernon::AdRegionHeaderType>(type))
+        return true;
+    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type))
+        return llvm::any_of(tuple.getTypes(), containsBackendLocalTapeHandle);
+    return false;
 }
 
 VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
@@ -40,13 +49,14 @@ VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
     case VERNON_TARGET_OPENGL_ES:
     case VERNON_TARGET_METAL:
     case VERNON_TARGET_DIRECTX:
-        return {1, 1, 1, 0, 0};
+        return {1, 1, 1, 1, 0};
     }
     return {};
 }
 
-bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
+bool validateTargetCapabilities(PreparedModule &prepared, const TargetProfile &profile, std::string &diagnostics) {
     mlir::ModuleOp module = prepared.logicalModule();
+    const VernonTarget target = profile.target;
     const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
     bool usesDeviceAtomics = false;
     bool usesFloatDeviceAtomics = false;
@@ -73,8 +83,9 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
             cpuSynchronizationUnsupported = true;
         }
     });
-    if (usesFloatDeviceAtomics && !capabilities.supports_f32_device_atomic_add) {
-        diagnostics = "device-scope f32 atomic add requires a target float-atomic capability";
+    if (usesFloatDeviceAtomics &&
+        profile.accumulation.device.f32 == mlir::vernon::AtomicAddImplementation::Unsupported) {
+        diagnostics = "device-scope f32 atomic add has no legal implementation in the target profile";
         return false;
     }
     if (usesDeviceAtomics && !capabilities.supports_device_storage_atomics) {
@@ -100,7 +111,8 @@ bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, s
                 return false;
             }
             for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-                if (function.getArgAttrDict(index).get("vernon.builtin"))
+                if (function.getArgAttrDict(index).get("vernon.builtin") ||
+                    containsBackendLocalTapeHandle(function.getArgumentTypes()[index]))
                     continue;
                 mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
                     function.getArgumentTypes()[index], module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
@@ -154,6 +166,31 @@ VernonTarget compileTargetKind(const CompileOptions &options) {
     if (std::holds_alternative<DirectXCompileOptions>(options))
         return VERNON_TARGET_DIRECTX;
     return VERNON_TARGET_CUDA;
+}
+
+TargetProfile resolveTargetProfile(const CompileOptions &options) {
+    using mlir::vernon::AggregateGradientStorage;
+    using mlir::vernon::AtomicAddImplementation;
+    TargetProfile profile;
+    profile.target = compileTargetKind(options);
+    profile.accumulation.aggregateGradientStorage = AggregateGradientStorage::InvocationPrivateStaging;
+    if (std::holds_alternative<CpuCodegenOptions>(options)) {
+        profile.accumulation.device = {AtomicAddImplementation::Native, AtomicAddImplementation::Native};
+        profile.accumulation.workgroup = {AtomicAddImplementation::Native, AtomicAddImplementation::Native};
+        return profile;
+    }
+    if (std::holds_alternative<CudaCompileOptions>(options)) {
+        profile.accumulation.device = {AtomicAddImplementation::Native, AtomicAddImplementation::Unsupported};
+        profile.accumulation.workgroup = {AtomicAddImplementation::Native, AtomicAddImplementation::Unsupported};
+        profile.accumulation.supportsWorkgroupReduction = true;
+        return profile;
+    }
+    profile.accumulation.device = {AtomicAddImplementation::IntegerCompareExchange,
+                                   AtomicAddImplementation::Unsupported};
+    profile.accumulation.workgroup = {AtomicAddImplementation::IntegerCompareExchange,
+                                      AtomicAddImplementation::Unsupported};
+    profile.accumulation.supportsWorkgroupReduction = true;
+    return profile;
 }
 
 VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options,
@@ -210,9 +247,10 @@ VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOpti
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
                            std::string &reflection, std::string &diagnostics,
                            const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
-    const VernonTarget target = compileTargetKind(options);
+    const TargetProfile profile = resolveTargetProfile(options);
+    const VernonTarget target = profile.target;
     diagnostics.clear();
-    if (!validateTargetCapabilities(module, target, diagnostics)) {
+    if (!validateTargetCapabilities(module, profile, diagnostics)) {
         artifacts.clear();
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     }
@@ -246,7 +284,7 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
                                                       ? std::get<MetalCompileOptions>(options).platform
                                                       : VERNON_METAL_PLATFORM_MACOS;
         std::vector<TargetResourceSlot> targetResourceSlots;
-        if (!compileSpirv(module, target, artifacts, reflection, diagnostics)) {
+        if (!compileSpirv(module, profile, artifacts, reflection, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -275,7 +313,7 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
-        if (!compileCuda(module, artifacts, reflection, diagnostics)) {
+        if (!compileCuda(module, profile, artifacts, reflection, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }

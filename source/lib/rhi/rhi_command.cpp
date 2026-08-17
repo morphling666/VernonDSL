@@ -449,6 +449,40 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
     return recordStatus;
 }
 
+extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                             VernonRhiBuffer source, uint64_t sourceOffset,
+                                                             VernonRhiBuffer destination, uint64_t destinationOffset,
+                                                             uint64_t size) {
+    auto slot = lookup(device, encoder);
+    if (!slot || !validHandle(source) || !validHandle(destination) || !size)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
+    const uint64_t sourceResource = logicalResourceKey(source);
+    const uint64_t destinationResource = logicalResourceKey(destination);
+    if (!vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Buffer, sourceResource) ||
+        !vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Buffer, destinationResource))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        slot->busy = true;
+        native = slot->native;
+    }
+    const VernonRhiStatus recordStatus =
+        vernon::rhi::recordBufferCopy(device, native, source, sourceOffset, destination, destinationOffset, size);
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        slot->busy = false;
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Buffer, destinationResource});
+        else
+            slot->failed = true;
+    }
+    return recordStatus;
+}
+
 extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
                                                                  VernonRhiCommandEncoder encoder,
                                                                  const VernonRhiRenderingDescriptor *descriptor) {

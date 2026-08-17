@@ -576,8 +576,8 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {
-        std::vector<VernonPipelineArgument> values;
+    VernonPipelineInvocation invocation(std::vector<VernonPipelineArgument> &values) const {
+        values.clear();
         values.reserve(arguments.size());
         for (const PreparedPipelineArgument *argument : arguments)
             values.push_back(argument->value);
@@ -596,6 +596,12 @@ struct PipelineInvocationBuilder {
         invocation.compute_grid = computeGrid;
         std::memcpy(invocation.viewport, viewport, sizeof(viewport));
         std::memcpy(invocation.scissor, scissor, sizeof(scissor));
+        return invocation;
+    }
+
+    std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {
+        std::vector<VernonPipelineArgument> values;
+        VernonPipelineInvocation invocation = this->invocation(values);
         if (encoder) {
             if (vernonRuntimePipelineEncode(*encoder, pipeline, &invocation) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline encoding failed: " +

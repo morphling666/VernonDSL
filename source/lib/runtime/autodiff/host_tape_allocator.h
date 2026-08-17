@@ -121,9 +121,9 @@ class HostDynamicTapeBatch;
 class HostStaticTapeBatch;
 bool hostStaticTapeBatchPureStaticBytes(size_t laneCount, size_t payloadStride, size_t &result);
 
-class HostTapeMemoryPolicy {
+class AutodiffMemoryPolicy {
 public:
-    HostTapeMemoryPolicy(size_t invocationLimit = kDefaultHostTapeInvocationLimit,
+    AutodiffMemoryPolicy(size_t invocationLimit = kDefaultHostTapeInvocationLimit,
                          size_t contextLimit = kDefaultHostTapeContextLimit)
         : invocationLimit_(invocationLimit), contextLimit_(contextLimit) {}
 
@@ -132,11 +132,12 @@ public:
     HostTapeMemoryUsage usage() const;
 
 private:
+    friend class AutodiffMemoryReservation;
     friend class HostDynamicTapeBatch;
     friend class HostStaticTapeBatch;
     friend class HostTapeDispatchBudget;
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
-    friend size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy);
+    friend size_t hostTapeMemoryPolicyChargedBytesForTesting(AutodiffMemoryPolicy &policy);
 #endif
 
     bool reserveContext(size_t additionalBytes);
@@ -147,6 +148,24 @@ private:
     size_t contextLimit_;
     size_t contextBytes_{};
     size_t peakContextBytes_{};
+};
+
+using HostTapeMemoryPolicy = AutodiffMemoryPolicy;
+
+class AutodiffMemoryReservation {
+public:
+    static std::shared_ptr<AutodiffMemoryReservation> reserve(std::shared_ptr<AutodiffMemoryPolicy> policy,
+                                                              size_t bytes);
+    ~AutodiffMemoryReservation();
+
+    size_t bytes() const { return bytes_; }
+
+private:
+    AutodiffMemoryReservation(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes)
+        : policy_(std::move(policy)), bytes_(bytes) {}
+
+    std::shared_ptr<AutodiffMemoryPolicy> policy_;
+    size_t bytes_{};
 };
 
 class HostTapeDispatchBudget {

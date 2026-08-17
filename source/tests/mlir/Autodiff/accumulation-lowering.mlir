@@ -1,11 +1,12 @@
 // RUN: %vernon-opt \
-// RUN:   --vernon-lower-accumulation="supports-atomic-f32=true" \
+// RUN:   --vernon-lower-accumulation="f32-device-atomic=native" \
 // RUN:   %s -o %t
 // RUN: %FileCheck %s --check-prefix=CHECK --input-file=%t
 // RUN: %FileCheck %s --check-prefix=ABSENT --input-file=%t
 //
-// CHECK-DAG: vernon.physical_atomic
-// CHECK-DAG: vernon.physical_store
+// CHECK: vernon.physical_store
+// CHECK: "vernon.physical_atomic"{{.*}}vernon.atomic_implementation = "native"
+// CHECK: "vernon.physical_atomic"{{.*}}vernon.atomic_implementation = "native"
 //
 // ABSENT: module
 // ABSENT-NOT: vernon.reduce_sum
@@ -37,6 +38,15 @@ module attributes {vernon.ad_profile = "backward"} {
     "vernon.reduce_sum"(%value, %gradient, %index) {
       deterministic = false
     } : (f32, !vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> ()
+    return
+  }
+
+  func.func @explicit_atomic(%gradient: !vernon.tensor_view<f32, [-1], "read_write", "device">,
+                             %value: f32, %index: index) {
+    %old = "vernon.atomic"(%gradient, %index, %value) {
+      atomic_kind = "add",
+      ordering = "relaxed"
+    } : (!vernon.tensor_view<f32, [-1], "read_write", "device">, index, f32) -> f32
     return
   }
 }

@@ -21,6 +21,8 @@ constexpr Enum kArrayBuffer = 0x8892;
 constexpr Enum kElementArrayBuffer = 0x8893;
 constexpr Enum kUniformBuffer = 0x8A11;
 constexpr Enum kShaderStorageBuffer = 0x90D2;
+constexpr Enum kCopyReadBuffer = 0x8F36;
+constexpr Enum kCopyWriteBuffer = 0x8F37;
 constexpr Enum kDynamicCopy = 0x88EA;
 constexpr Bitfield kMapReadBit = 0x0001;
 constexpr Enum kVertexShader = 0x8B31;
@@ -102,6 +104,7 @@ struct Driver {
     void(VERNON_GL_CALL *bindBuffer)(Enum, Uint){};
     void(VERNON_GL_CALL *bufferData)(Enum, SizePtr, const void *, Enum){};
     void(VERNON_GL_CALL *bufferSubData)(Enum, IntPtr, SizePtr, const void *){};
+    void(VERNON_GL_CALL *copyBufferSubData)(Enum, Enum, IntPtr, IntPtr, SizePtr){};
     void *(VERNON_GL_CALL *mapBufferRange)(Enum, IntPtr, SizePtr, Bitfield){};
     Boolean(VERNON_GL_CALL *unmapBuffer)(Enum) {};
     void(VERNON_GL_CALL *bindBufferBase)(Enum, Uint, Uint){};

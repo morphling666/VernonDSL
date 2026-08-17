@@ -377,10 +377,17 @@ Backend capability does not change the frontend derivative graph.
 
 ## 8. Deferred graphics and custom VJP rules
 
-GPU and graphics autodiff are unsupported in the current implementation. A
-future design must account for the fact that differentiating vertex and
-fragment functions independently does not define a differentiable graphics
-pipeline. The Pipeline ProgramGraph would model varying
+Compute GPU autodiff supports no-Tape and captured static/dynamic Storage
+pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured profiles use
+complete-workgroup bounded replay with original virtual IDs, device-local Tape,
+fixed lane-status readback, transactional gradient publication, and no
+GPU-to-host Tape payload readback. RHI graph resources provide checkpoint
+snapshots for graph replay. Inputs and final gradients cross the host API
+boundary; derivative execution and temporary Tape/gradient storage remain
+backend-local. Graphics autodiff remains unsupported. Graphics support must
+account for the fact that
+differentiating vertex and fragment functions independently does not define a
+differentiable graphics pipeline. The Pipeline ProgramGraph would model varying
 interpolation, rasterization, visibility, depth, blending, and texture
 sampling as versioned stage-boundary primitives.
 

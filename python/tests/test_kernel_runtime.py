@@ -493,6 +493,15 @@ def global_atomic_operations(values: vd.TensorView[vd.i32, (vd.dyn,), vd.read_wr
     vd.atomic_max(values, 3, 9)
 
 
+@vd.kernel(workgroup_size=(1, 1, 1))
+def floating_atomic_add(
+    values: vd.TensorView[vd.f32, (1,), vd.read_write],
+    additions: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    vd.atomic_add(values, 0, additions[gid[0]])
+
+
 @vd.kernel(workgroup_size=(4, 1, 1))
 def workgroup_atomic_lanes(
     output: vd.TensorView[vd.i32, (vd.dyn,), vd.read_write],
@@ -625,6 +634,39 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 operations = vd.storage.from_numpy(np.array([0, 10, 10, 1], dtype=np.int32))
                 global_atomic_operations(operations)
                 np.testing.assert_array_equal(operations.to_numpy(), np.array([5, 22, 7, 9], dtype=np.int32))
+
+    def test_floating_atomic_nan_signed_zero_and_contention(self) -> None:
+        backends = [
+            architecture
+            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.metal, vd.opengl, vd.directx)
+            if self._runtime_available(architecture)
+        ]
+        for backend in backends:
+            with self.subTest(backend=backend.name):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                nan_value = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
+                floating_atomic_add(
+                    nan_value,
+                    vd.storage.from_numpy(np.array([np.nan], dtype=np.float32)),
+                    grid=(1, 1, 1),
+                )
+                self.assertTrue(np.isnan(nan_value.to_numpy()[0]))
+
+                negative_zero = vd.storage.from_numpy(np.array([-0.0], dtype=np.float32))
+                floating_atomic_add(
+                    negative_zero,
+                    vd.storage.from_numpy(np.array([-0.0], dtype=np.float32)),
+                    grid=(1, 1, 1),
+                )
+                self.assertTrue(np.signbit(negative_zero.to_numpy()[0]))
+
+                contended = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
+                floating_atomic_add(
+                    contended,
+                    vd.storage.from_numpy(np.ones(256, dtype=np.float32)),
+                    grid=(256, 1, 1),
+                )
+                self.assertEqual(contended.to_numpy()[0], 256.0)
 
     def test_workgroup_atomic_lane_backend_parity(self) -> None:
         backends = [

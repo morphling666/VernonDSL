@@ -24,6 +24,9 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
 VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                   size_t artifactSize, const char *reflection, size_t reflectionSize,
                                                   const char *entry, size_t entrySize);
+bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
+                             const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
+                             Stage &stage, Variant &variant, ReflectedEntry &reflectedEntry);
 bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backend, Variant &variant,
                                   std::string &error);
 

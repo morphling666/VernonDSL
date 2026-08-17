@@ -64,6 +64,37 @@ function(
 endfunction()
 
 function(
+    vernon_add_gpu_tape_test_bundles
+    architecture
+    output_stem
+    static_manifest_variable
+    dynamic_manifest_variable
+    targets_variable)
+    vernon_add_pipeline_test_bundle(
+        "gpu-autodiff-${architecture}-static"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset"
+        "autodiff_gpu_${output_stem}_static_fixture"
+        _vernon_static_manifest)
+    vernon_add_pipeline_test_bundle(
+        "gpu-autodiff-${architecture}-dynamic"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset"
+        "autodiff_gpu_${output_stem}_dynamic_fixture"
+        _vernon_dynamic_manifest)
+    set(${static_manifest_variable}
+        "${_vernon_static_manifest}"
+        PARENT_SCOPE)
+    set(${dynamic_manifest_variable}
+        "${_vernon_dynamic_manifest}"
+        PARENT_SCOPE)
+    set(${targets_variable}
+        ${${targets_variable}} "vernon-gpu-autodiff-${architecture}-static-test-bundle"
+        "vernon-gpu-autodiff-${architecture}-dynamic-test-bundle"
+        PARENT_SCOPE)
+endfunction()
+
+function(
     vernon_add_cpu_autodiff_fixture
     name
     directory_stem
@@ -275,6 +306,116 @@ if(TARGET VernonRuntime)
         vernon_discover_gtests(VernonCompilerRuntimeIntegrationTests)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
+        set(gpu_autodiff_fixture_targets)
+        if(VERNON_ENABLE_VULKAN_RUNTIME)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-vulkan
+                vulkan
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
+                autodiff_gpu_vulkan_fixture
+                gpu_autodiff_vulkan_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-vulkan-non-power-of-two
+                vulkan
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
+                autodiff_gpu_vulkan_non_power_of_two_fixture
+                gpu_autodiff_vulkan_non_power_of_two_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-non-power-of-two-test-bundle)
+            vernon_add_gpu_tape_test_bundles(
+                vulkan
+                vulkan
+                gpu_autodiff_vulkan_static_manifest
+                gpu_autodiff_vulkan_dynamic_manifest
+                gpu_autodiff_fixture_targets)
+        endif()
+        if(VERNON_ENABLE_CUDA_RUNTIME)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-cuda
+                cuda
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
+                autodiff_gpu_cuda_fixture
+                gpu_autodiff_cuda_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-cuda-non-power-of-two
+                cuda
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
+                autodiff_gpu_cuda_non_power_of_two_fixture
+                gpu_autodiff_cuda_non_power_of_two_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-non-power-of-two-test-bundle)
+            vernon_add_gpu_tape_test_bundles(
+                cuda
+                cuda
+                gpu_autodiff_cuda_static_manifest
+                gpu_autodiff_cuda_dynamic_manifest
+                gpu_autodiff_fixture_targets)
+        endif()
+        if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-directx
+                directx
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
+                autodiff_gpu_directx_fixture
+                gpu_autodiff_directx_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-directx-non-power-of-two
+                directx
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
+                autodiff_gpu_directx_non_power_of_two_fixture
+                gpu_autodiff_directx_non_power_of_two_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-non-power-of-two-test-bundle)
+            vernon_add_gpu_tape_test_bundles(
+                directx
+                directx
+                gpu_autodiff_directx_static_manifest
+                gpu_autodiff_directx_dynamic_manifest
+                gpu_autodiff_fixture_targets)
+        endif()
+        if(VERNON_ENABLE_METAL_RUNTIME)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-metal
+                metal
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
+                autodiff_gpu_metal_fixture
+                gpu_autodiff_metal_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                gpu-autodiff-metal-non-power-of-two
+                metal
+                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
+                autodiff_gpu_metal_non_power_of_two_fixture
+                gpu_autodiff_metal_non_power_of_two_manifest)
+            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-non-power-of-two-test-bundle)
+            vernon_add_gpu_tape_test_bundles(
+                metal
+                metal
+                gpu_autodiff_metal_static_manifest
+                gpu_autodiff_metal_dynamic_manifest
+                gpu_autodiff_fixture_targets)
+        endif()
+        vernon_add_pipeline_test_bundle(
+            gpu-autodiff-opengl
+            opengl
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
+            autodiff_gpu_opengl_fixture
+            gpu_autodiff_opengl_manifest)
+        list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-test-bundle)
+        vernon_add_pipeline_test_bundle(
+            gpu-autodiff-opengl-non-power-of-two
+            opengl
+            "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
+            autodiff_gpu_opengl_non_power_of_two_fixture
+            gpu_autodiff_opengl_non_power_of_two_manifest)
+        list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-non-power-of-two-test-bundle)
+        vernon_add_gpu_tape_test_bundles(
+            opengl
+            opengl
+            gpu_autodiff_opengl_static_manifest
+            gpu_autodiff_opengl_dynamic_manifest
+            gpu_autodiff_fixture_targets)
+
         vernon_add_cpu_autodiff_fixture(
             cooked-autodiff
             autodiff_cooked_fixture
@@ -419,6 +560,60 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2MixedAliasFixture
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
+        if(gpu_autodiff_fixture_targets)
+            add_executable(VernonGpuAutodiffTests runtime/runtime_gpu_autodiff_test.cpp)
+            target_include_directories(VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+            target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
+            add_dependencies(VernonGpuAutodiffTests ${gpu_autodiff_fixture_targets})
+            if(VERNON_ENABLE_VULKAN_RUNTIME)
+                target_compile_definitions(
+                    VernonGpuAutodiffTests
+                    PRIVATE
+                        VERNON_GPU_AUTODIFF_VULKAN_MANIFEST="${gpu_autodiff_vulkan_manifest}"
+                        VERNON_GPU_AUTODIFF_VULKAN_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_vulkan_non_power_of_two_manifest}"
+                        VERNON_GPU_AUTODIFF_VULKAN_STATIC_MANIFEST="${gpu_autodiff_vulkan_static_manifest}"
+                        VERNON_GPU_AUTODIFF_VULKAN_DYNAMIC_MANIFEST="${gpu_autodiff_vulkan_dynamic_manifest}")
+            endif()
+            if(VERNON_ENABLE_CUDA_RUNTIME)
+                target_compile_definitions(
+                    VernonGpuAutodiffTests
+                    PRIVATE
+                        VERNON_GPU_AUTODIFF_CUDA_MANIFEST="${gpu_autodiff_cuda_manifest}"
+                        VERNON_GPU_AUTODIFF_CUDA_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_cuda_non_power_of_two_manifest}"
+                        VERNON_GPU_AUTODIFF_CUDA_STATIC_MANIFEST="${gpu_autodiff_cuda_static_manifest}"
+                        VERNON_GPU_AUTODIFF_CUDA_DYNAMIC_MANIFEST="${gpu_autodiff_cuda_dynamic_manifest}")
+            endif()
+            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+                target_compile_definitions(
+                    VernonGpuAutodiffTests
+                    PRIVATE
+                        VERNON_GPU_AUTODIFF_DIRECTX_MANIFEST="${gpu_autodiff_directx_manifest}"
+                        VERNON_GPU_AUTODIFF_DIRECTX_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_directx_non_power_of_two_manifest}"
+                        VERNON_GPU_AUTODIFF_DIRECTX_STATIC_MANIFEST="${gpu_autodiff_directx_static_manifest}"
+                        VERNON_GPU_AUTODIFF_DIRECTX_DYNAMIC_MANIFEST="${gpu_autodiff_directx_dynamic_manifest}")
+            endif()
+            if(VERNON_ENABLE_METAL_RUNTIME)
+                target_compile_definitions(
+                    VernonGpuAutodiffTests
+                    PRIVATE
+                        VERNON_GPU_AUTODIFF_METAL_MANIFEST="${gpu_autodiff_metal_manifest}"
+                        VERNON_GPU_AUTODIFF_METAL_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_metal_non_power_of_two_manifest}"
+                        VERNON_GPU_AUTODIFF_METAL_STATIC_MANIFEST="${gpu_autodiff_metal_static_manifest}"
+                        VERNON_GPU_AUTODIFF_METAL_DYNAMIC_MANIFEST="${gpu_autodiff_metal_dynamic_manifest}")
+            endif()
+            target_compile_definitions(
+                VernonGpuAutodiffTests
+                PRIVATE
+                    VERNON_GPU_AUTODIFF_OPENGL_MANIFEST="${gpu_autodiff_opengl_manifest}"
+                    VERNON_GPU_AUTODIFF_OPENGL_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_opengl_non_power_of_two_manifest}"
+                    VERNON_GPU_AUTODIFF_OPENGL_STATIC_MANIFEST="${gpu_autodiff_opengl_static_manifest}"
+                    VERNON_GPU_AUTODIFF_OPENGL_DYNAMIC_MANIFEST="${gpu_autodiff_opengl_dynamic_manifest}")
+            set_target_properties(VernonGpuAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                    "${CMAKE_BINARY_DIR}/source")
+            vernon_stage_target_files(VernonGpuAutodiffTests VernonRuntime VernonRHI)
+            vernon_discover_gtests(VernonGpuAutodiffTests)
+        endif()
+
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
         target_link_libraries(
             VernonStructuredScalarAutodiffTests
@@ -843,17 +1038,25 @@ if(TARGET VernonDSLCompiler)
         add_test(NAME vernon-python-autodiff-phase2-benchmark
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_autodiff_smoke_phase2.py"
                          --grids 32 64 --output "${VERNON_TEST_BINARY_ROOT}/autodiff_phase2_benchmark_ci.json")
+        add_test(
+            NAME vernon-python-atomic-reduction-benchmark
+            COMMAND
+                ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_atomic_reduction.py" --architectures
+                cpu --patterns one_bin workgroup_publication --invocations 128 --iterations 2 --output
+                "${VERNON_TEST_BINARY_ROOT}/atomic_reduction_benchmark_ci.json" --markdown
+                "${VERNON_TEST_BINARY_ROOT}/atomic_reduction_benchmark_ci.md")
         set_tests_properties(
             vernon-python-test_storage_vjp_contract
             vernon-python-smoke-fluid-graph
             vernon-python-execution-graph
             vernon-python-autodiff-phase2-benchmark
+            vernon-python-atomic-reduction-benchmark
             PROPERTIES ENVIRONMENT
                        "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python"
                        WORKING_DIRECTORY
                        "${VERNON_REPOSITORY_ROOT}")
         set_tests_properties(
-            vernon-python-autodiff-phase2-benchmark
+            vernon-python-autodiff-phase2-benchmark vernon-python-atomic-reduction-benchmark
             PROPERTIES TIMEOUT
                        300
                        LABELS

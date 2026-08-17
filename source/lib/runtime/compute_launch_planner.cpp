@@ -22,8 +22,9 @@ bool fail(std::string &error, const char *message) {
 }
 
 bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_t> &storage) {
-    if (!valueLayoutValid(tensor.element_layout) || !tensor.element_layout.byte_size || !tensor.rank || !tensor.shape ||
-        !tensor.byte_strides || tensor.byte_offset % tensor.element_layout.byte_size)
+    if (!valueLayoutValid(tensor.element_layout) || !tensor.element_layout.byte_size ||
+        (tensor.rank && (!tensor.shape || !tensor.byte_strides)) ||
+        tensor.byte_offset % tensor.element_layout.byte_size)
         return false;
     storage.assign(8 * (2 + 2 * tensor.rank), 0);
     const uint64_t pointer = tensor.storage == VERNON_TENSOR_HOST
@@ -233,12 +234,22 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
                                       : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
                                       : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
                                                                     : tensor.access == VERNON_ACCESS_READ_WRITE;
-        if (tensor.struct_size < sizeof(VernonTensorView) ||
-            !valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
-            tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible ||
-            (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-            !tensorFitsAllocation(tensor))
-            return fail(error, "pipeline Tensor argument does not match layout");
+        if (tensor.struct_size < sizeof(VernonTensorView))
+            return fail(error, "pipeline Tensor argument structure is incomplete");
+        if (!valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)))
+            return fail(error, "pipeline Tensor argument element layout does not match reflection");
+        if (tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible)
+            return fail(error, "pipeline Tensor argument access does not match reflection");
+        if (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
+            return fail(error, "pipeline Tensor argument storage kind is invalid");
+        if (!tensorFitsAllocation(tensor)) {
+            size_t requiredSpan = 0;
+            if (!tensorRequiredSpan(tensor, requiredSpan))
+                return fail(error, "pipeline Tensor argument byte layout is invalid");
+            error = "pipeline Tensor argument requires " + std::to_string(requiredSpan) +
+                    " bytes but its allocation has " + std::to_string(tensor.byte_size);
+            return false;
+        }
         if (tensor.access != VERNON_ACCESS_READ && !tensorByteLayoutInjective(tensor))
             return fail(error, "writable pipeline Tensor argument must have an injective byte layout");
         for (const ParameterUse &use : parameter.uses) {

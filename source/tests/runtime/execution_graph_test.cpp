@@ -178,6 +178,8 @@ public:
     uint64_t alignment() const override { return expectedAlignment_; }
     void expectAlignment(uint64_t alignment) { expectedAlignment_ = alignment; }
     void failRestoreWithoutError(bool value = true) { failRestoreWithoutError_ = value; }
+    uint32_t hostCopyToCount() const { return hostCopyToCount_; }
+    uint32_t hostCopyFromCount() const { return hostCopyFromCount_; }
     float floatValue() const {
         float value = 0;
         std::memcpy(&value, bytes_.data(), sizeof(value));
@@ -186,6 +188,7 @@ public:
     void setFloatValue(float value) { std::memcpy(bytes_.data(), &value, sizeof(value)); }
 
     bool copyTo(void *destination, uint64_t byteSize, std::string &error) const override {
+        ++hostCopyToCount_;
         if (byteSize != bytes_.size() || reinterpret_cast<uintptr_t>(destination) % expectedAlignment_ != 0) {
             error = "test checkpoint copy size mismatch";
             return false;
@@ -195,6 +198,7 @@ public:
     }
 
     bool copyFrom(const void *source, uint64_t byteSize, std::string &error) override {
+        ++hostCopyFromCount_;
         if (failRestoreWithoutError_)
             return false;
         if (byteSize != bytes_.size() || reinterpret_cast<uintptr_t>(source) % expectedAlignment_ != 0) {
@@ -206,6 +210,7 @@ public:
     }
 
     bool copyRangeTo(uint64_t offset, void *destination, uint64_t byteSize, std::string &error) const override {
+        ++hostCopyToCount_;
         if (offset > bytes_.size() || byteSize > bytes_.size() - offset) {
             error = "test checkpoint range exceeds resource";
             return false;
@@ -215,6 +220,7 @@ public:
     }
 
     bool copyRangeFrom(uint64_t offset, const void *source, uint64_t byteSize, std::string &error) override {
+        ++hostCopyFromCount_;
         if (failRestoreWithoutError_)
             return false;
         if (offset > bytes_.size() || byteSize > bytes_.size() - offset) {
@@ -229,6 +235,8 @@ private:
     std::vector<uint8_t> bytes_;
     uint64_t expectedAlignment_;
     bool failRestoreWithoutError_{};
+    mutable uint32_t hostCopyToCount_{};
+    uint32_t hostCopyFromCount_{};
 };
 
 GraphBuffer importCheckpointBuffer(ExecutionGraph &graph, uint64_t identity, bool exported = false) {
@@ -1739,6 +1747,59 @@ TEST(ExecutionGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplicati
     }
     EXPECT_GE(pullback->peakRuntimeManagedBytes(), pullback->allocatedTapeBytes() + pullback->checkpointBytes());
     EXPECT_GT(pullback->recomputationFactor(), 1.0);
+}
+
+TEST(ExecutionGraphAutodiff, MetalSnapshotsAndCheckpointsRemainDeviceLocal) {
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = VERNON_RHI_BACKEND_METAL;
+    VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Metal device is unavailable";
+
+    std::vector<VernonRhiBuffer> buffers;
+    std::vector<std::shared_ptr<ByteCheckpointResource>> states;
+    std::string error;
+    {
+        ExecutionGraph graph(device);
+        std::vector<GraphBuffer> resources;
+        VernonRhiBufferDescriptor bufferDescriptor{};
+        bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+        bufferDescriptor.size = sizeof(float);
+        bufferDescriptor.alignment = alignof(float);
+        bufferDescriptor.usage =
+            VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+        bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+        for (uint32_t index = 0; index < 5; ++index) {
+            VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+            ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
+            buffers.push_back(buffer);
+            auto state = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
+            states.push_back(state);
+            resources.push_back(graph.importBuffer(buffer, index == 4, std::move(state)));
+        }
+        for (uint32_t index = 0; index < 4; ++index)
+            graph.emplacePass<ScalarDifferentiablePass>("step" + std::to_string(index), resources[index],
+                                                        resources[index + 1], 2.0, false, false, nullptr, UINT32_MAX,
+                                                        100);
+        graph.setAutodiffEndpoints({{"input", {DerivativeEndpointKind::Resource, resources.front().id}}},
+                                   {{"objective", {DerivativeEndpointKind::Resource, resources.back().id}}});
+        graph.planAutodiffCheckpoints(250);
+        auto compiled = graph.compile(error);
+        ASSERT_TRUE(compiled) << error;
+        auto pullback = compiled->vjp({}, error);
+        ASSERT_TRUE(pullback) << error;
+        ASSERT_GT(pullback->checkpointBytes(), 0u);
+        auto backward = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
+        ASSERT_TRUE(backward->wait(error)) << error;
+        for (const auto &state : states) {
+            EXPECT_EQ(state->hostCopyToCount(), 0u);
+            EXPECT_EQ(state->hostCopyFromCount(), 0u);
+        }
+    }
+    for (VernonRhiBuffer buffer : buffers)
+        EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
 }
 
 TEST(ExecutionGraphAutodiff, PlansDeclaredDirtyRangesAndKeepsUnknownFootprintsConservative) {

@@ -31,6 +31,19 @@ module {
 // -----
 
 module {
+  func.func @f64_device_needs_atomic(
+      %gradient: !vernon.tensor_view<f64, [1], "read_write", "device">,
+      %value: f64, %index: index) {
+    // expected-error @+1 {{shared scalar accumulation requires a supported atomic add}}
+    "vernon.reduce_sum"(%value, %gradient, %index) {deterministic = false} :
+      (f64, !vernon.tensor_view<f64, [1], "read_write", "device">, index) -> ()
+    return
+  }
+}
+
+// -----
+
+module {
   func.func @shaped_needs_proven_private_staging(
       %gradient: !vernon.tensor_view<tensor<2xf32>, [1], "read_write", "device">,
       %value: tensor<2xf32>, %index: index) {

@@ -1509,6 +1509,33 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
     }
 }
 
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands || commands != device->state.commandList() || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    DirectX12BufferSlot *sourceSlot = lookupDirectX12Slot(device->buffers, source);
+    DirectX12BufferSlot *destinationSlot = lookupDirectX12Slot(device->buffers, destination);
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->ownedDescriptor.size ||
+        size > sourceSlot->ownedDescriptor.size - sourceOffset ||
+        destinationOffset > destinationSlot->ownedDescriptor.size ||
+        size > destinationSlot->ownedDescriptor.size - destinationOffset)
+        return false;
+    vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+    vernon::rhi::directx12::transition(commands, destinationSlot->buffer.resource, destinationSlot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COPY_DEST);
+    commands->CopyBufferRegion(destinationSlot->buffer.resource, destinationOffset, sourceSlot->buffer.resource,
+                               sourceOffset, size);
+    vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COMMON);
+    vernon::rhi::directx12::transition(commands, destinationSlot->buffer.resource, destinationSlot->buffer.state,
+                                       D3D12_RESOURCE_STATE_COMMON);
+    return true;
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1771,6 +1798,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,
+        recordBufferCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

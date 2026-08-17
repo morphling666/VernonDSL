@@ -56,8 +56,8 @@ VernonRhiStatus executeCpuScheduleRange(VernonRhiDevice device, const std::vecto
                                         const std::vector<std::unique_ptr<ExecutionPass>> &passes,
                                         const std::vector<uint32_t> &schedule,
                                         std::shared_ptr<const ExecutionBindings> bindings, uint32_t beginOffset,
-                                        uint32_t endOffset, CpuPassExecutor executor = nullptr,
-                                        void *context = nullptr);
+                                        uint32_t endOffset, CpuPassExecutor executor = nullptr, void *context = nullptr,
+                                        const std::vector<VernonRhiBuffer> *resourceBuffers = nullptr);
 
 } // namespace detail
 

@@ -24,10 +24,26 @@ struct AutodiffPullbackMemoryUsage {
     size_t peakTemporaryBytes{};
 };
 
+struct AutodiffPullbackControlPlaneUsage {
+    uint64_t submissions{};
+    uint64_t waits{};
+    uint64_t readbacks{};
+    uint64_t atomicPublications{};
+    uint64_t temporaryAllocationBytes{};
+    uint64_t deviceWaitNanoseconds{};
+};
+
 struct AutodiffWriteFootprint {
     std::string owner;
     bool wholeView{true};
     std::vector<uint64_t> indices;
+};
+
+struct AutodiffGpuStageView {
+    const void *artifact{};
+    size_t artifactSize{};
+    VernonStringView reflection;
+    VernonStringView entry;
 };
 
 VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
@@ -38,11 +54,19 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     uint64_t staticTapeBytesHint, VernonStringView residualStorage, VernonStringView selectedPolicy,
     bool wholeDispatchRetentionPermitted);
 
+VERNON_RUNTIME_CAPI VernonLoadedPipeline *
+loadBackendGpuAutodiffPipeline(VernonRuntimeContext &context, const AutodiffGpuStageView &primal,
+                               const AutodiffGpuStageView &forward, const AutodiffGpuStageView &backward,
+                               const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount,
+                               uint64_t staticTapeBytesHint, VernonStringView residualStorage,
+                               VernonStringView selectedPolicy);
+
 VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffReadFootprints(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffWriteFootprints(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
+VERNON_RUNTIME_CAPI AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);
 
 } // namespace vernon::runtime

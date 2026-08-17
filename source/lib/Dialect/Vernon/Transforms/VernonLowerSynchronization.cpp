@@ -7,6 +7,7 @@
 #include "mlir/Dialect/SPIRV/IR/SPIRVDialect.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -136,8 +137,11 @@ struct LowerGpuSynchronizationPass final : PassWrapper<LowerGpuSynchronizationPa
                                         : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
                                                                        : arith::AtomicRMWKind::assign;
             rewriter.setInsertionPoint(op);
-            rewriter.replaceOpWithNewOp<memref::AtomicRMWOp>(op, kind, op.getValue(),
-                                                             loweredStorage.lookup(op.getStorage()), op.getIndex());
+            auto replacement = memref::AtomicRMWOp::create(rewriter, op.getLoc(), kind, op.getValue(),
+                                                           loweredStorage.lookup(op.getStorage()), op.getIndex());
+            if (Attribute implementation = op->getAttr(kAtomicImplementationAttrName))
+                replacement->setAttr(kAtomicImplementationAttrName, implementation);
+            rewriter.replaceOp(op, replacement.getResult());
         }
         for (WorkgroupAllocOp op : allocations)
             rewriter.eraseOp(op);

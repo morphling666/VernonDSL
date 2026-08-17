@@ -15,7 +15,7 @@
 
 namespace vernon::runtime::ad {
 class Executable;
-class HostTapeMemoryPolicy;
+class AutodiffMemoryPolicy;
 } // namespace vernon::runtime::ad
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
@@ -27,7 +27,7 @@ struct VernonRuntimeContext {
     void (*destroyBackendState)(void *){};
     bool borrowedRhiDevice{};
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    std::shared_ptr<vernon::runtime::ad::HostTapeMemoryPolicy> cpuTapePolicy;
+    std::shared_ptr<vernon::runtime::ad::AutodiffMemoryPolicy> autodiffMemoryPolicy;
 };
 
 namespace vernon::runtime {

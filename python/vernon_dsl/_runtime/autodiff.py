@@ -115,8 +115,8 @@ class CookedVjpPipeline:
 
     def _load(self) -> None:
         state = _session_state()
-        if state._architecture != state.cpu or state._native_runtime is None:
-            raise RuntimeError("cooked structured VJP assets require the CPU runtime")
+        if state._native_runtime is None:
+            raise RuntimeError("cooked structured VJP assets require the native runtime")
         if self._native is not None and self._runtime_generation == state._runtime_generation:
             return
         native = state._native_runtime.load_pipeline_asset(
@@ -208,6 +208,9 @@ def _invoke_structured_pipeline(
     active_operation_count: int = 0,
     recomputation_cost: int = 0,
     residual_storage_kind: str = "unknown",
+    *,
+    encoder: Any | None = None,
+    binding_cache: _NativeBindingCache | None = None,
 ) -> tuple[Any, _StructuredPullback]:
     _validate_grid(grid)
     derivative_groups = _pipeline_derivative_groups(pipeline)
@@ -223,8 +226,24 @@ def _invoke_structured_pipeline(
         for name, value in bindings.items()
         if name in access_by_name and isinstance(value, (TensorStorage, TensorView))
     ]
-    with _dispatch_borrow_scope(borrows):
-        output, pullback = pipeline.vjp(bindings, grid)
+    if encoder is None:
+        with _dispatch_borrow_scope(borrows):
+            output, pullback = pipeline.vjp(bindings, grid)
+    else:
+        if binding_cache is None:
+            raise RuntimeError("encoded VJP requires a binding cache")
+        parameters = tuple(pipeline.parameters)
+        if set(bindings) != {parameter.name for parameter in parameters}:
+            raise ValueError("encoded VJP bindings do not match pipeline parameters")
+        with binding_cache.invocation(pipeline) as builder:
+            for parameter in parameters:
+                binding_cache.bind_argument(builder, pipeline, parameter, bindings[parameter.name])
+            builder.grid(*grid)
+            output, pullback = pipeline.vjp_encode(builder, encoder._native, bindings, grid)
+        for parameter in parameters:
+            value = bindings[parameter.name]
+            if parameter.access != state._native.ACCESS_READ and isinstance(value, (TensorStorage, TensorView)):
+                value._mark_device_dirty()
     workgroup = tuple(pipeline.workgroup_size)
     extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
     carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
@@ -289,8 +308,8 @@ def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
     if compiled.pipeline is not None and compiled.runtime_generation == runtime_state._runtime_generation:
         return
     if runtime_state._native_runtime is None:
-        raise RuntimeError("CPU VJP execution requires the native runtime")
-    compiled.pipeline = runtime_state._native_runtime.load_cpu_autodiff(
+        raise RuntimeError("VJP execution requires the native runtime")
+    compiled.pipeline = runtime_state._native_runtime.load_autodiff(
         compiled.primal,
         compiled.primal_symbol,
         compiled.forward,
@@ -311,11 +330,25 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
     if not isinstance(kernel, Kernel):
         raise TypeError("direct VJP execution requires one compute Kernel")
     runtime_state = _session_state()
-    if runtime_state._architecture != runtime_state.cpu:
-        raise RuntimeError("direct structured VJP execution currently supports only the CPU runtime")
     if runtime_state._native is None or runtime_state._native_runtime is None:
-        raise RuntimeError("CPU VJP execution requires the native compiler and runtime")
-    options = make_target_options("cpu")
+        raise RuntimeError("VJP execution requires the native compiler and runtime")
+    target = {
+        runtime_state.cpu: runtime_state._native.Target.CPU,
+        runtime_state.cuda: runtime_state._native.Target.CUDA,
+        runtime_state.vulkan: runtime_state._native.Target.VULKAN,
+        runtime_state.directx: runtime_state._native.Target.DIRECTX,
+        runtime_state.metal: runtime_state._native.Target.METAL,
+        runtime_state.opengl: runtime_state._native.Target.OPENGL,
+        runtime_state.opengles: runtime_state._native.Target.OPENGL_ES,
+    }.get(runtime_state._architecture)
+    if target is None:
+        raise RuntimeError(f"unsupported VJP architecture {runtime_state._architecture.name!r}")
+    options = make_target_options(
+        runtime_state._architecture.name,
+        {"version": runtime_state._interactive_glsl_version()}
+        if runtime_state._architecture in {runtime_state.opengl, runtime_state.opengles}
+        else {},
+    )
     key = kernel._dispatch_key(
         arguments,
         (),
@@ -335,16 +368,21 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
             expression.transform,
         )
         profiles = {profile.name: profile for profile in structured.plan.profiles}
-        programs = runtime_state._native._compile_cpu_program_results(
-            [
-                frontend.mlir,
-                structured.profiles["forward_with_tape"],
-                structured.profiles["backward"],
-            ],
-            options.native_options["options"],
-        )
+        modules = [
+            frontend.mlir,
+            structured.profiles["forward_with_tape"],
+            structured.profiles["backward"],
+        ]
+        if runtime_state._architecture == runtime_state.cpu:
+            programs = runtime_state._native._compile_cpu_program_results(
+                modules,
+                options.native_options["options"],
+            )
+        else:
+            compiler = runtime_state._native.Compiler()
+            programs = [compiler.compile_program_result(module, target, **options.native_options) for module in modules]
         if len(programs) != 3:
-            raise RuntimeError("CPU VJP profile compilation returned an invalid result count")
+            raise RuntimeError("VJP profile compilation returned an invalid result count")
         for program in programs:
             if not program.ok:
                 raise RuntimeError(program.diagnostics)

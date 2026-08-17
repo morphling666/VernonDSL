@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "frontend_planning_policy": "balanced",
+  "compiler_whole_dispatch_retention_permitted": true,
+  "static_tape_bytes_per_invocation": 16,
+  "evidence_source": "RuntimeStructuredScalarAutodiff.BalancedRetainsOnlyExactlyAdmittedWholeDispatchTape",
+  "cases": [
+    {
+      "grid": 512,
+      "runtime_budget": "whole_dispatch_exact",
+      "retained_whole_dispatch_tape": true,
+      "bounded_replay": false,
+      "retained_allocation_bytes_positive": true,
+      "peak_temporary_tape_bytes": 0
+    },
+    {
+      "grid": 512,
+      "runtime_budget": "single_workgroup",
+      "retained_whole_dispatch_tape": false,
+      "bounded_replay": true,
+      "retained_allocation_bytes": 12324,
+      "temporary_tape_bounded_by_single_workgroup": true
+    },
+    {
+      "grid": 1024,
+      "runtime_budget": "whole_dispatch_exact",
+      "retained_whole_dispatch_tape": true,
+      "bounded_replay": false,
+      "retained_allocation_bytes_positive": true,
+      "peak_temporary_tape_bytes": 0
+    },
+    {
+      "grid": 1024,
+      "runtime_budget": "single_workgroup",
+      "retained_whole_dispatch_tape": false,
+      "bounded_replay": true,
+      "retained_allocation_bytes": 24612,
+      "temporary_tape_bounded_by_single_workgroup": true
+    }
+  ]
+}

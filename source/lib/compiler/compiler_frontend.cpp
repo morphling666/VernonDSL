@@ -2,10 +2,13 @@
 
 #include "compiler_reflection.h"
 
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGPUProfileABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
 #include "mlir/IR/AsmState.h"
@@ -18,11 +21,11 @@
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Target/LLVMIR/Dialect/All.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
-#include <map>
 #include <mutex>
 #include <new>
 #include <string>
@@ -35,6 +38,18 @@ namespace {
 constexpr llvm::StringLiteral kLogicalArgumentOriginAttr = "vernon.internal.logical_argument_origin";
 constexpr llvm::StringLiteral kLogicalResultOriginAttr = "vernon.internal.logical_result_origin";
 
+bool containsF16(mlir::Type type) {
+    if (type.isF16())
+        return true;
+    if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
+        return containsF16(shaped.getElementType());
+    if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
+        return containsF16(view.getElementType());
+    if (auto function = mlir::dyn_cast<mlir::FunctionType>(type))
+        return llvm::any_of(function.getInputs(), containsF16) || llvm::any_of(function.getResults(), containsF16);
+    return false;
+}
+
 const LogicalEntryModel *findLogicalEntry(const LogicalReflectionModel &logical, llvm::StringRef name) {
     for (const LogicalEntryModel &entry : logical.entries)
         if (entry.name == name)
@@ -43,6 +58,29 @@ const LogicalEntryModel *findLogicalEntry(const LogicalReflectionModel &logical,
 }
 
 } // namespace
+
+bool moduleUsesF16(mlir::ModuleOp module) {
+    bool usesF16 = false;
+    for (mlir::vernon::StructDeclOp declaration : module.getOps<mlir::vernon::StructDeclOp>())
+        for (mlir::Attribute fieldAttribute : declaration.getFields()) {
+            llvm::StringRef spelling = mlir::cast<mlir::StringAttr>(fieldAttribute).getValue();
+            const size_t separator = spelling.find(':');
+            mlir::Type fieldType = separator == llvm::StringRef::npos
+                                       ? mlir::Type{}
+                                       : mlir::parseType(spelling.drop_front(separator + 1), module.getContext());
+            if (fieldType && containsF16(fieldType))
+                return true;
+        }
+    module.walk([&](mlir::Operation *operation) {
+        usesF16 = usesF16 || llvm::any_of(operation->getOperandTypes(), containsF16) ||
+                  llvm::any_of(operation->getResultTypes(), containsF16);
+        for (mlir::Region &region : operation->getRegions())
+            for (mlir::Block &block : region)
+                usesF16 = usesF16 || llvm::any_of(block.getArgumentTypes(), containsF16);
+        return usesF16 ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
+    });
+    return usesF16;
+}
 
 class CompilerFrontend {
 public:
@@ -177,8 +215,11 @@ mlir::FailureOr<std::vector<PhysicalEntryProvenance>> TargetPreparationProvenanc
 }
 
 mlir::LogicalResult preparePortableTargetModule(mlir::ModuleOp module, TargetPreparationProvenance &) {
+    if (mlir::failed(mlir::vernon::materializeGPUAutodiffProfileBindings(module)))
+        return mlir::failure();
     mlir::PassManager passManager(module.getContext());
     passManager.addPass(mlir::vernon::createVernonInlineHelpersPass());
+    passManager.addPass(mlir::vernon::createVernonLowerGPUAutodiffPass());
     if (mlir::failed(passManager.run(module)))
         return mlir::failure();
     return mlir::vernon::materializeTensorViewProjections(module);

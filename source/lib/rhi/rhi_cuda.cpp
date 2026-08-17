@@ -36,9 +36,21 @@ struct CudaDeviceSlot {
     uint32_t generation{1};
 };
 
+struct CudaDeviceRegistry {
+    CudaDeviceRegistry() {
+        // Register the driver destructor before this registry's destructor so
+        // context-leased devices always release CUDA objects before the loader.
+        (void)vernon::rhi::cuda::driver();
+    }
+
+    std::mutex mutex;
+    std::vector<CudaDeviceSlot> devices;
+};
+
 constexpr uint32_t cudaDeviceBit = uint32_t{1} << 29;
-std::vector<CudaDeviceSlot> cudaDevices;
-std::mutex deviceMutex;
+CudaDeviceRegistry cudaDeviceRegistry;
+std::vector<CudaDeviceSlot> &cudaDevices = cudaDeviceRegistry.devices;
+std::mutex &deviceMutex = cudaDeviceRegistry.mutex;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
@@ -325,6 +337,26 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
     return static_cast<bool>(lookupCudaDevice(handle)) && native != 0;
 }
 
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupCudaDevice(handle);
+    if (!device || native != reinterpret_cast<uintptr_t>(&device->state) || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    CudaBufferSlot *sourceSlot = lookupCudaBuffer(*device, source);
+    CudaBufferSlot *destinationSlot = lookupCudaBuffer(*device, destination);
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->descriptor.size ||
+        size > sourceSlot->descriptor.size - sourceOffset || destinationOffset > destinationSlot->descriptor.size ||
+        size > destinationSlot->descriptor.size - destinationOffset)
+        return false;
+    const auto status =
+        device->state.copy(destinationSlot->pointer + destinationOffset, sourceSlot->pointer + sourceOffset, size);
+    if (status == vernon::rhi::cuda::kSuccess)
+        return true;
+    device->error = vernon::rhi::cuda::describeResult(status, "cuMemcpyDtoDAsync");
+    return false;
+}
+
 uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupCudaDevice(handle);
     if (!device) {
@@ -426,6 +458,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         nullptr,
         nullptr,
         recordBarriers,
+        recordBufferCopy,
         nullptr,
         nullptr,
         nullptr,

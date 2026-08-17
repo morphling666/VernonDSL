@@ -664,11 +664,14 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonTargetCapabilities opengl = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
     VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
     VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);
-    ASSERT_TRUE(!opengl.supports_device_storage_atomics && !opengles.supports_device_storage_atomics &&
-                !metal.supports_device_storage_atomics);
+    ASSERT_TRUE(opengl.supports_device_storage_atomics && opengles.supports_device_storage_atomics &&
+                metal.supports_device_storage_atomics);
+    ASSERT_TRUE(!opengl.supports_f32_device_atomic_add && !opengles.supports_f32_device_atomic_add &&
+                !metal.supports_f32_device_atomic_add);
     VernonTargetCapabilities directx = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_DIRECTX);
     if (directx.available)
-        ASSERT_TRUE(directx.supports_graphics && directx.supports_compute);
+        ASSERT_TRUE(directx.supports_graphics && directx.supports_compute && directx.supports_device_storage_atomics &&
+                    !directx.supports_f32_device_atomic_add);
 
     VernonCompileResult *validation = vernonCompilerValidateMlir(context, module, strlen(module));
     ASSERT_TRUE(validation != NULL);
@@ -816,8 +819,15 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         vernonCompilerCompileMlir(context, vulkan_f16_module.data(), vulkan_f16_module.size(), VERNON_TARGET_VULKAN);
     ASSERT_TRUE(vulkan_f16_compile != NULL);
     ASSERT_TRUE(vernonCompileResultGetStatus(vulkan_f16_compile) == VERNON_STATUS_INTERNAL_ERROR);
-    ASSERT_TRUE(view_contains(vernonCompileResultGetDiagnostics(vulkan_f16_compile), "shaderFloat16"));
+    ASSERT_TRUE(view_contains(vernonCompileResultGetDiagnostics(vulkan_f16_compile), "do not currently support f16"));
     vernonCompileResultDestroy(vulkan_f16_compile);
+
+    VernonCompileResult *cuda_f16_compile =
+        vernonCompilerCompileMlir(context, vulkan_f16_module.data(), vulkan_f16_module.size(), VERNON_TARGET_CUDA);
+    ASSERT_TRUE(cuda_f16_compile != NULL);
+    ASSERT_TRUE(vernonCompileResultGetStatus(cuda_f16_compile) == VERNON_STATUS_INTERNAL_ERROR);
+    ASSERT_TRUE(view_contains(vernonCompileResultGetDiagnostics(cuda_f16_compile), "do not currently support f16"));
+    vernonCompileResultDestroy(cuda_f16_compile);
 
     VernonCompileResult *cuda_compile =
         vernonCompilerCompileMlir(context, cpu_compute_module, strlen(cpu_compute_module), VERNON_TARGET_CUDA);

@@ -45,6 +45,7 @@ class SmokeFluidSimulation:
         grid: int = GRID,
         pressure_iterations: int = PRESSURE_ITERATIONS,
         differentiable: bool = False,
+        planning_policy: str = "min_memory",
     ) -> None:
         self.grid = grid
         self.density = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
@@ -71,6 +72,7 @@ class SmokeFluidSimulation:
                 output_velocity=alternate_velocity,
                 output_loss=self.output_loss,
                 differentiable=differentiable,
+                planning_policy=planning_policy,
             ),
             build_smoke_fluid_graph(
                 state_density=alternate_density,
@@ -81,12 +83,23 @@ class SmokeFluidSimulation:
                 output_velocity=self.velocity,
                 output_loss=self.output_loss,
                 differentiable=differentiable,
+                planning_policy=planning_policy,
             ),
         )
         self._next_graph = 0
 
     def set_target(self, target: np.ndarray) -> None:
         self.target.copy_from_numpy(np.ascontiguousarray(target, dtype=np.float32))
+
+    def set_state(self, density: np.ndarray, velocity: np.ndarray) -> None:
+        density_value = np.ascontiguousarray(density, dtype=np.float32)
+        velocity_value = np.ascontiguousarray(velocity, dtype=np.float32)
+        if density_value.shape != (self.grid, self.grid) or velocity_value.shape != (self.grid, self.grid, 2):
+            raise ValueError("smoke state shape does not match the simulation grid")
+        for state in self._density_states:
+            state.copy_from_numpy(density_value)
+        for state in self._velocity_states:
+            state.copy_from_numpy(velocity_value)
 
     def step(self, target: np.ndarray | None = None) -> None:
         if target is not None:

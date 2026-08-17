@@ -3,12 +3,16 @@
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonGPUProfileABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/Pass/PassManager.h"
 
 #include <gtest/gtest.h>
 
@@ -115,6 +119,77 @@ TEST_F(VernonStructuredVjpTest, NoTapeProfileUsesExplicitPrimalArguments) {
     EXPECT_TRUE(llvm::none_of(result->forward.getArgumentTypes(), [](Type type) { return isa<AdTapeType>(type); }));
     EXPECT_TRUE(llvm::none_of(result->forward.getResultTypes(), [](Type type) { return isa<AdTapeType>(type); }));
     EXPECT_TRUE(llvm::none_of(result->backward.getArgumentTypes(), [](Type type) { return isa<AdTapeType>(type); }));
+
+    const unsigned forwardArguments = result->forward.getNumArguments();
+    const unsigned backwardArguments = result->backward.getNumArguments();
+    result->backward->setAttr("vernon.workgroup_size", DenseI32ArrayAttr::get(&context, {1, 1, 1}));
+    PassManager manager(&context);
+    manager.addPass(createVernonLowerGPUAutodiffPass());
+    ASSERT_TRUE(succeeded(manager.run(*module)));
+    EXPECT_EQ(result->forward.getNumArguments(), forwardArguments);
+    EXPECT_EQ(result->backward.getNumArguments(), backwardArguments + 4);
+    EXPECT_EQ(result->backward.getNumResults(), 0u);
+    EXPECT_EQ(
+        std::distance(result->backward.getOps<ReduceSumOp>().begin(), result->backward.getOps<ReduceSumOp>().end()), 2);
+    unsigned launchMetadata = 0;
+    unsigned physicalGlobalIds = 0;
+    for (unsigned index = backwardArguments + 2; index < result->backward.getNumArguments(); ++index) {
+        if (auto role = result->backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_role");
+            role && role.getValue() == "launch_metadata")
+            ++launchMetadata;
+        if (auto builtin = result->backward.getArgAttrOfType<StringAttr>(index, "vernon.builtin");
+            builtin && builtin.getValue() == "global_invocation_id" &&
+            isa<RankedTensorType>(result->backward.getArgument(index).getType()))
+            ++physicalGlobalIds;
+    }
+    EXPECT_EQ(launchMetadata, 1u);
+    EXPECT_EQ(physicalGlobalIds, 1u);
+    EXPECT_TRUE(llvm::none_of(result->forward.getArguments(), [&](BlockArgument argument) {
+        auto source = result->forward.getArgAttrOfType<StringAttr>(argument.getArgNumber(), "vernon.source_name");
+        return source && source.getValue().starts_with("__vernon_ad_");
+    }));
+
+    const unsigned loweredBackwardArguments = result->backward.getNumArguments();
+    SmallVector<Type> loweredBackwardTypes(result->backward.getArgumentTypes());
+    PassManager secondManager(&context);
+    secondManager.addPass(createVernonLowerGPUAutodiffPass());
+    ASSERT_TRUE(succeeded(secondManager.run(*module)));
+    EXPECT_EQ(result->backward.getNumArguments(), loweredBackwardArguments);
+    EXPECT_EQ(result->backward.getArgumentTypes(), ArrayRef<Type>(loweredBackwardTypes));
+}
+
+TEST_F(VernonStructuredVjpTest, GPUProfileBindingsAreMaterializedAfterLogicalVjp) {
+    OwningOpRef<ModuleOp> module = parseStorageObjective("arith.mulf");
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x", "y"}, "gpu_forward", "gpu_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+
+    SmallVector<unsigned> viewArguments;
+    for (auto [index, type] : llvm::enumerate(result->backward.getArgumentTypes())) {
+        if (!isa<TensorViewType>(type))
+            continue;
+        viewArguments.push_back(index);
+        DictionaryAttr attrs = result->backward.getArgAttrDict(index);
+        EXPECT_EQ(attrs.getAs<StringAttr>("vernon.interface").getValue(), "input");
+        EXPECT_TRUE(attrs.get("vernon.location"));
+        EXPECT_FALSE(attrs.get("vernon.set"));
+        EXPECT_FALSE(attrs.get("vernon.binding"));
+        if (attrs.getAs<StringAttr>("vernon.source_name").getValue() == "loss")
+            EXPECT_EQ(attrs.getAs<StringAttr>("vernon.autodiff_role").getValue(), "cotangent");
+    }
+    ASSERT_FALSE(viewArguments.empty());
+
+    (*module)->setAttr("vernon.ad_profile", StringAttr::get(&context, "backward"));
+    ASSERT_TRUE(succeeded(materializeGPUAutodiffProfileBindings(*module)));
+    for (unsigned index : viewArguments) {
+        DictionaryAttr attrs = result->backward.getArgAttrDict(index);
+        EXPECT_EQ(attrs.getAs<StringAttr>("vernon.interface").getValue(), "resource");
+        EXPECT_FALSE(attrs.get("vernon.location"));
+        EXPECT_EQ(attrs.getAs<IntegerAttr>("vernon.set").getInt(), 0);
+        EXPECT_EQ(attrs.getAs<IntegerAttr>("vernon.binding").getInt(), index);
+    }
 }
 
 TEST_F(VernonStructuredVjpTest, StaticCaptureOffsetsMatchWithinCurrentProfileContract) {
@@ -157,6 +232,126 @@ module {
     llvm::sort(readOffsets);
     EXPECT_FALSE(writeOffsets.empty());
     EXPECT_EQ(writeOffsets, readOffsets);
+
+    DenseI32ArrayAttr workgroup = DenseI32ArrayAttr::get(&context, {8, 1, 1});
+    result->forward->setAttr("vernon.workgroup_size", workgroup);
+    result->backward->setAttr("vernon.workgroup_size", workgroup);
+    (*module)->setAttr("vernon.ad_profile", StringAttr::get(&context, "static"));
+    ASSERT_TRUE(succeeded(materializeGPUAutodiffProfileBindings(*module)));
+    PassManager manager(&context);
+    manager.addPass(createVernonLowerGPUAutodiffPass());
+    ASSERT_TRUE(succeeded(manager.run(*module)));
+    ASSERT_TRUE(succeeded(verify(*module)));
+    EXPECT_EQ(result->backward.getNumResults(), 0u);
+    unsigned gradientResources = 0;
+    unsigned carriedCotangents = 0;
+    for (unsigned index = 0; index < result->backward.getNumArguments(); ++index) {
+        auto role = result->backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_role");
+        auto view = dyn_cast<TensorViewType>(result->backward.getArgument(index).getType());
+        if (!role || !view)
+            continue;
+        if (role.getValue() == "gradient") {
+            ++gradientResources;
+            EXPECT_TRUE(view.getShape().empty());
+            EXPECT_EQ(result->backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_source").getValue(), "x");
+        } else if (role.getValue() == "cotangent") {
+            ++carriedCotangents;
+            EXPECT_EQ(view.getShape(), (ArrayRef<int64_t>{-1, 1}));
+        }
+    }
+    EXPECT_EQ(gradientResources, 1u);
+    EXPECT_EQ(carriedCotangents, 1u);
+    EXPECT_EQ(
+        std::distance(result->backward.getOps<ReduceSumOp>().begin(), result->backward.getOps<ReduceSumOp>().end()), 1);
+    for (LoadOp load : result->backward.getOps<LoadOp>())
+        if (auto role = dyn_cast<BlockArgument>(load.getStorage())
+                            ? result->backward.getArgAttrOfType<StringAttr>(
+                                  cast<BlockArgument>(load.getStorage()).getArgNumber(), "vernon.autodiff_role")
+                            : StringAttr{};
+            role && role.getValue() == "cotangent")
+            EXPECT_EQ(load.getIndices().size(), 2u);
+    for (func::FuncOp function : {result->forward, result->backward}) {
+        EXPECT_TRUE(llvm::none_of(function.getArgumentTypes(), containsLogicalAutodiffHandle));
+        bool hasLogicalTape = false;
+        function.walk([&](Operation *operation) {
+            hasLogicalTape =
+                hasLogicalTape ||
+                isa<AdCaptureOp, AdBeginRegionOp, AdReserveRecordOp, AdReadLeafOp, AdReadNestedRegionOp>(operation);
+        });
+        EXPECT_FALSE(hasLogicalTape);
+    }
+}
+
+TEST_F(VernonStructuredVjpTest, LowersCapturedProfilesToReflectedGpuTapeResources) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %x: f32 {vernon.source_name = "x", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %loss: !vernon.tensor_view<f32, [1], "write", "device">
+          {vernon.source_name = "loss", vernon.abi_leaf_dtypes = ["f32"]},
+      %gid: index {vernon.builtin = "global_invocation_id"})
+      attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 8, 1, 1>,
+        vernon.ad.planning_policy = "min_runtime"
+      } {
+    %square = arith.mulf %x, %x : f32
+    %fourth = arith.mulf %square, %square : f32
+    %result = arith.divf %fourth, %x : f32
+    "vernon.store"(%result, %loss, %gid)
+        : (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    FailureOr<StructuredVjpResult> result =
+        buildStructuredVjp(module->lookupSymbol<func::FuncOp>("primal"),
+                           StructuredVjpOptions{{"x"}, "gpu_tape_forward", "gpu_tape_backward", {"loss"}});
+    ASSERT_TRUE(succeeded(result));
+    ASSERT_GT(result->tapeBytes, 0u);
+    (*module)->setAttr("vernon.ad_profile", StringAttr::get(&context, "captured"));
+    ASSERT_TRUE(succeeded(materializeGPUAutodiffProfileBindings(*module)));
+
+    PassManager manager(&context);
+    manager.addPass(createVernonLowerGPUAutodiffPass());
+    ASSERT_TRUE(succeeded(manager.run(*module)));
+    ASSERT_TRUE(succeeded(verify(*module)));
+
+    for (StringRef name : {"gpu_tape_forward", "gpu_tape_backward"}) {
+        func::FuncOp function = module->lookupSymbol<func::FuncOp>(name);
+        ASSERT_TRUE(function);
+        unsigned tapeResources = 0;
+        unsigned segmentResources = 0;
+        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+            auto resource = function.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+            if (!resource || !resource.getValue().starts_with("__vernon_ad_"))
+                continue;
+            EXPECT_TRUE(isa<TensorViewType>(function.getArgumentTypes()[index]));
+            StringRef expectedRole = resource.getValue() == "__vernon_ad_tape"      ? "tape"
+                                     : resource.getValue() == "__vernon_ad_segment" ? "replay_segment"
+                                                                                    : "replay_status";
+            EXPECT_EQ(function.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_role").getValue(), expectedRole);
+            tapeResources += resource.getValue() == "__vernon_ad_tape";
+            segmentResources += resource.getValue() == "__vernon_ad_segment";
+        }
+        EXPECT_EQ(tapeResources, 1u);
+        EXPECT_EQ(segmentResources, 1u);
+        EXPECT_TRUE(llvm::none_of(function.getArgumentTypes(), containsLogicalAutodiffHandle));
+        bool hasLogicalOperation = false;
+        function.walk([&](Operation *operation) {
+            hasLogicalOperation =
+                hasLogicalOperation || isa<AdCaptureOp, AdBeginInvocationOp, AdBeginRegionOp, AdReserveRecordOp,
+                                           AdWriteLeafOp, AdReadLeafOp, AdReadNestedRegionOp>(operation);
+        });
+        EXPECT_FALSE(hasLogicalOperation);
+        unsigned physicalLoads = 0;
+        function.walk([&](PhysicalLoadOp) { ++physicalLoads; });
+        EXPECT_GT(physicalLoads, 0u);
+    }
 }
 
 TEST_F(VernonStructuredVjpTest, RematerializedStraightLineValueHasNoTapeTraffic) {
@@ -792,6 +987,26 @@ module {
     llvm::sort(readOffsets);
     EXPECT_FALSE(writeOffsets.empty());
     EXPECT_EQ(writeOffsets, readOffsets);
+
+    DenseI32ArrayAttr workgroup = DenseI32ArrayAttr::get(&context, {8, 1, 1});
+    result->forward->setAttr("vernon.workgroup_size", workgroup);
+    result->backward->setAttr("vernon.workgroup_size", workgroup);
+    (*module)->setAttr("vernon.ad_profile", StringAttr::get(&context, "dynamic"));
+    ASSERT_TRUE(succeeded(materializeGPUAutodiffProfileBindings(*module)));
+    PassManager manager(&context);
+    manager.addPass(createVernonLowerGPUAutodiffPass());
+    ASSERT_TRUE(succeeded(manager.run(*module)));
+    ASSERT_TRUE(succeeded(verify(*module)));
+    for (func::FuncOp function : {result->forward, result->backward}) {
+        EXPECT_TRUE(llvm::none_of(function.getArgumentTypes(), containsLogicalAutodiffHandle));
+        bool hasLogicalTape = false;
+        function.walk([&](Operation *operation) {
+            hasLogicalTape =
+                hasLogicalTape ||
+                isa<AdCaptureOp, AdBeginRegionOp, AdReserveRecordOp, AdReadLeafOp, AdReadNestedRegionOp>(operation);
+        });
+        EXPECT_FALSE(hasLogicalTape);
+    }
 }
 
 TEST_F(VernonStructuredVjpTest, RejectsFunctionReturnComputeObjective) {
@@ -986,6 +1201,92 @@ TEST_F(VernonStructuredVjpTest, ReversesWorkgroupAtomicAddWithSharedAdjointSynch
     EXPECT_GE(sharedBuffers, 1u);
     EXPECT_GE(peeks, 1u);
     EXPECT_EQ(barriers, 3u);
+}
+
+TEST_F(VernonStructuredVjpTest, AccumulationPolicyUsesMeasuredContentionCrossover) {
+    const auto run = [&](int32_t workgroupSize, AtomicAddImplementation implementation) {
+        std::string source = (Twine(R"mlir(module {
+  func.func @accumulate(
+      %value: f32,
+      %storage: !vernon.tensor_view<f32, [1], "read_write", "device">)
+      attributes {vernon.entry, vernon.stage = "compute", vernon.workgroup_size = array<i32: )mlir") +
+                              Twine(workgroupSize) + R"mlir(, 1, 1>} {
+    %zero = arith.constant 0 : index
+    "vernon.reduce_sum"(%value, %storage, %zero) {deterministic = false}
+        : (f32, !vernon.tensor_view<f32, [1], "read_write", "device">, index) -> ()
+    return
+  }
+})mlir")
+                                 .str();
+        OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(source, ParserConfig(&context));
+        EXPECT_TRUE(module);
+        if (!module)
+            return std::pair<unsigned, unsigned>{0, 0};
+        AccumulationTargetCapabilities capabilities;
+        capabilities.device.f32 = implementation;
+        capabilities.supportsWorkgroupReduction = true;
+        capabilities.costModel.nativeAtomicReductionCrossover = 64;
+        capabilities.costModel.integerCasReductionCrossover = 64;
+        PassManager manager(&context);
+        manager.addPass(createVernonLowerAccumulationPass(capabilities));
+        EXPECT_TRUE(succeeded(manager.run(*module)));
+        unsigned reductions = 0;
+        unsigned atomics = 0;
+        module->walk([&](Operation *operation) {
+            if (auto reduce = dyn_cast<ReduceSumOp>(operation)) {
+                auto strategy = reduce->getAttrOfType<StringAttr>(kAccumulationStrategyAttrName);
+                reductions += strategy && strategy.getValue() == kWorkgroupReductionAccumulationStrategy;
+            }
+            if (isa<AtomicOp, PhysicalAtomicOp>(operation)) {
+                auto strategy = operation->getAttrOfType<StringAttr>(kAccumulationStrategyAttrName);
+                auto selected = operation->getAttrOfType<StringAttr>(kAtomicImplementationAttrName);
+                StringRef expected = implementation == AtomicAddImplementation::Native
+                                         ? kNativeAtomicImplementation
+                                         : kIntegerCasAtomicImplementation;
+                atomics += strategy && strategy.getValue() == kAtomicAccumulationStrategy && selected &&
+                           selected.getValue() == expected;
+            }
+        });
+        return std::pair{reductions, atomics};
+    };
+
+    for (AtomicAddImplementation implementation :
+         {AtomicAddImplementation::Native, AtomicAddImplementation::IntegerCompareExchange}) {
+        EXPECT_EQ(run(32, implementation), (std::pair<unsigned, unsigned>{0, 1}));
+        EXPECT_EQ(run(64, implementation), (std::pair<unsigned, unsigned>{1, 0}));
+    }
+}
+
+TEST_F(VernonStructuredVjpTest, AccumulationPolicyRejectsDeterministicAndUnsupportedSharedSums) {
+    const auto rejected = [&](bool deterministic, AtomicAddImplementation implementation) {
+        OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+            (Twine(R"mlir(module {
+  func.func @accumulate(
+      %value: f64,
+      %storage: !vernon.tensor_view<f64, [1], "read_write", "device">)
+      attributes {vernon.entry, vernon.stage = "compute", vernon.workgroup_size = array<i32: 64, 1, 1>} {
+    %zero = arith.constant 0 : index
+    "vernon.reduce_sum"(%value, %storage, %zero) {deterministic = )mlir") +
+             (deterministic ? "true" : "false") +
+             R"mlir(} : (f64, !vernon.tensor_view<f64, [1], "read_write", "device">, index) -> ()
+    return
+  }
+})mlir")
+                .str(),
+            ParserConfig(&context));
+        EXPECT_TRUE(module);
+        if (!module)
+            return false;
+        AccumulationTargetCapabilities capabilities;
+        capabilities.device.f64 = implementation;
+        capabilities.supportsWorkgroupReduction = true;
+        PassManager manager(&context);
+        manager.addPass(createVernonLowerAccumulationPass(capabilities));
+        return failed(manager.run(*module));
+    };
+
+    EXPECT_TRUE(rejected(true, AtomicAddImplementation::Native));
+    EXPECT_TRUE(rejected(false, AtomicAddImplementation::Unsupported));
 }
 
 } // namespace

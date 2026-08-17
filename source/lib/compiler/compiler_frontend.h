@@ -22,6 +22,8 @@ namespace vernon::compiler {
 
 class CompilerFrontend;
 
+bool moduleUsesF16(mlir::ModuleOp module);
+
 struct LogicalStructLayout {
     std::string name;
     uint64_t size{};

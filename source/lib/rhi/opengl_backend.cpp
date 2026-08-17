@@ -122,6 +122,23 @@ bool DeviceState::downloadBuffer(const Buffer &buffer, size_t offset, void *dest
     return true;
 }
 
+bool DeviceState::copyBuffer(const Buffer &source, size_t sourceOffset, const Buffer &destination,
+                             size_t destinationOffset, size_t size, std::string &error) {
+    if (!source.name || !destination.name || !size || !driver.copyBufferSubData ||
+        sourceOffset > static_cast<size_t>(std::numeric_limits<IntPtr>::max()) ||
+        destinationOffset > static_cast<size_t>(std::numeric_limits<IntPtr>::max()) ||
+        size > static_cast<size_t>(std::numeric_limits<SizePtr>::max())) {
+        error = "invalid OpenGL buffer copy";
+        return false;
+    }
+    makeCurrent();
+    driver.bindBuffer(kCopyReadBuffer, source.name);
+    driver.bindBuffer(kCopyWriteBuffer, destination.name);
+    driver.copyBufferSubData(kCopyReadBuffer, kCopyWriteBuffer, static_cast<IntPtr>(sourceOffset),
+                             static_cast<IntPtr>(destinationOffset), static_cast<SizePtr>(size));
+    return true;
+}
+
 bool DeviceState::createImage2D(Image &image, Int internalFormat, Size width, Size height, Enum externalFormat,
                                 Enum type, std::string &error) {
     if (width <= 0 || height <= 0) {

@@ -595,6 +595,11 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDe
                                                                      VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
                                                                const VernonRhiBarrier *barriers, size_t barrier_count);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice device,
+                                                                  VernonRhiCommandEncoder encoder,
+                                                                  VernonRhiBuffer source, uint64_t source_offset,
+                                                                  VernonRhiBuffer destination,
+                                                                  uint64_t destination_offset, uint64_t size);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
                                                                       VernonRhiCommandEncoder encoder,
                                                                       const VernonRhiRenderingDescriptor *descriptor);

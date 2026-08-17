@@ -184,11 +184,17 @@ VernonRhiStatus detail::executeCpuScheduleRange(VernonRhiDevice device, const st
                                                 const std::vector<std::unique_ptr<ExecutionPass>> &passes,
                                                 const std::vector<uint32_t> &schedule,
                                                 std::shared_ptr<const ExecutionBindings> bindings, uint32_t beginOffset,
-                                                uint32_t endOffset, CpuPassExecutor executor, void *context) {
+                                                uint32_t endOffset, CpuPassExecutor executor, void *context,
+                                                const std::vector<VernonRhiBuffer> *resourceBuffers) {
     if (beginOffset > endOffset || endOffset > schedule.size())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::vector<VernonRhiBuffer> buffers(resources.size(),
                                          VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    if (resourceBuffers) {
+        if (resourceBuffers->size() != buffers.size())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        buffers = *resourceBuffers;
+    }
     ExecutionResources executionResources(resources, buffers, std::move(bindings));
     ComputeEncoder encoder(device, {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     for (uint32_t offset = beginOffset; offset < endOffset; ++offset) {

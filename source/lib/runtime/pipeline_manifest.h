@@ -121,6 +121,11 @@ enum class AutodiffResourceRole {
     Tape,
     Cotangent,
     Gradient,
+    Primal,
+    RetainedPrimal,
+    ReplaySegment,
+    ReplayStatus,
+    LaunchMetadata,
 };
 
 struct Parameter {
@@ -138,6 +143,7 @@ struct Parameter {
     std::string sampleResultClass;
     std::string exactStorageFormat;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
+    std::string autodiffSource;
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;
 };

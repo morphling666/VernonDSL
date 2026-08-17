@@ -388,6 +388,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
                 const vernon::runtime::AutodiffPullbackMemoryUsage afterForward =
                     vernon::runtime::autodiffPullbackMemoryUsage(pullback);
                 EXPECT_EQ(afterForward.logicalResidualBytes, 0u);
+                EXPECT_GT(afterForward.retainedAllocationBytes, 0u);
                 EXPECT_EQ(afterForward.residentBytes, 0u);
                 EXPECT_EQ(afterForward.allocatedBytes, 0u);
                 EXPECT_EQ(afterForward.peakTemporaryBytes, 0u);
@@ -398,6 +399,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
                     vernon::runtime::autodiffPullbackMemoryUsage(pullback);
                 boundedUsage = afterBackward;
                 EXPECT_EQ(afterBackward.logicalResidualBytes, 0u);
+                EXPECT_GT(afterBackward.retainedAllocationBytes, 0u);
                 EXPECT_EQ(afterBackward.residentBytes, 0u);
                 EXPECT_EQ(afterBackward.allocatedBytes, 0u);
                 EXPECT_GT(afterBackward.peakTemporaryBytes, 0u);

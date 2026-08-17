@@ -816,6 +816,22 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const Ver
     return true;
 }
 
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupMetalDevice(handle);
+    if (!device || !native || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalBufferSlot *sourceSlot = lookupResourceRecord(device->buffers, resourceKey(source));
+    MetalBufferSlot *destinationSlot = lookupResourceRecord(device->buffers, resourceKey(destination));
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->descriptor.size ||
+        size > sourceSlot->descriptor.size - sourceOffset || destinationOffset > destinationSlot->descriptor.size ||
+        size > destinationSlot->descriptor.size - destinationOffset)
+        return false;
+    return device->state.copyBuffer(native, sourceSlot->native, sourceOffset, destinationSlot->native,
+                                    destinationOffset, size, device->error);
+}
+
 bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, int32_t x, int32_t y,
                       uint32_t width, uint32_t height, uint32_t layers, int32_t colorLocation,
                       const float *clearColor, float clearDepth, uint32_t clearStencil, uint32_t aspects) {
@@ -1013,6 +1029,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,
+        recordBufferCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

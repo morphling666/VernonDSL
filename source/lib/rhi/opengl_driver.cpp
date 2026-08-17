@@ -43,6 +43,8 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(bindBuffer, "glBindBuffer");
     LOAD(bufferData, "glBufferData");
     LOAD(bufferSubData, "glBufferSubData");
+    driver.copyBufferSubData = reinterpret_cast<decltype(driver.copyBufferSubData)>(
+        callbacks.get_proc_address(callbacks.user_data, "glCopyBufferSubData"));
     LOAD(mapBufferRange, "glMapBufferRange");
     LOAD(unmapBuffer, "glUnmapBuffer");
     LOAD(bindBufferBase, "glBindBufferBase");

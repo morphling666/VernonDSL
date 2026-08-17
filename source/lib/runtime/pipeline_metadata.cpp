@@ -220,8 +220,7 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
                 layout.offsetBinding = descriptor["offset_binding"].get<uint32_t>();
                 layout.extentBindings = descriptor["extent_bindings"].get<std::vector<uint32_t>>();
                 layout.strideBindings = descriptor["stride_bindings"].get<std::vector<uint32_t>>();
-                if (!layout.rank || layout.extentBindings.size() != layout.rank ||
-                    layout.strideBindings.size() != layout.rank) {
+                if (layout.extentBindings.size() != layout.rank || layout.strideBindings.size() != layout.rank) {
                     error = "TensorView descriptor rank does not match its binding sequence";
                     return false;
                 }

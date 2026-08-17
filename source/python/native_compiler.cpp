@@ -156,7 +156,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
-        .def("load_cpu_autodiff", &Runtime::loadCpuAutodiff, nb::keep_alive<0, 1>())
+        .def("load_autodiff", &Runtime::loadAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("create_execution_graph", &Runtime::createExecutionGraph);
@@ -239,7 +239,13 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
         .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)
-        .def_prop_ro("peak_temporary_bytes", &PythonPullback::peakTemporaryBytes);
+        .def_prop_ro("peak_temporary_bytes", &PythonPullback::peakTemporaryBytes)
+        .def_prop_ro("submission_count", &PythonPullback::submissionCount)
+        .def_prop_ro("wait_count", &PythonPullback::waitCount)
+        .def_prop_ro("readback_count", &PythonPullback::readbackCount)
+        .def_prop_ro("atomic_publication_count", &PythonPullback::atomicPublicationCount)
+        .def_prop_ro("temporary_allocation_traffic_bytes", &PythonPullback::temporaryAllocationTrafficBytes)
+        .def_prop_ro("device_wait_nanoseconds", &PythonPullback::deviceWaitNanoseconds);
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
         .def(
@@ -275,6 +281,25 @@ void bindNativeCompiler(nb::module_ &module) {
                 return pipeline.vjp(x, y, z, bindings, nb::cast(&pipeline, nb::rv_policy::reference));
             },
             nb::arg("bindings"), nb::arg("grid"))
+        .def(
+            "vjp_encode",
+            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder, vernon::execution::ComputeEncoder &encoder,
+               const nb::dict &bindings, const nb::tuple &grid) {
+                if (grid.size() != 3)
+                    throw std::invalid_argument("autodiff grid must contain three dimensions");
+                const auto dimension = [&](size_t index) {
+                    if (PyBool_Check(grid[index].ptr()))
+                        throw std::invalid_argument("autodiff grid dimensions must be positive integers");
+                    const uint64_t value = nb::cast<uint64_t>(grid[index]);
+                    if (!value || value > UINT32_MAX)
+                        throw std::invalid_argument("autodiff grid dimensions must be positive uint32 values");
+                    return static_cast<uint32_t>(value);
+                };
+                const VernonRhiCommandEncoder native = encoder.native();
+                return pipeline.vjp(dimension(0), dimension(1), dimension(2), bindings,
+                                    nb::cast(&pipeline, nb::rv_policy::reference), &builder, &native);
+            },
+            nb::arg("builder"), nb::arg("encoder"), nb::arg("bindings"), nb::arg("grid"))
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
         .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)

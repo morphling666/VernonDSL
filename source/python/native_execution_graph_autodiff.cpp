@@ -303,6 +303,12 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
     uint64_t allocatedTapeBytes() const override { return native->allocatedBytes(); }
     uint64_t retainedAllocationBytes() const override { return native->retainedAllocationBytes(); }
     uint64_t peakTemporaryTapeBytes() const override { return native->peakTemporaryBytes(); }
+    uint64_t submissionCount() const override { return native->submissionCount(); }
+    uint64_t waitCount() const override { return native->waitCount(); }
+    uint64_t readbackCount() const override { return native->readbackCount(); }
+    uint64_t atomicPublicationCount() const override { return native->atomicPublicationCount(); }
+    uint64_t temporaryAllocationTrafficBytes() const override { return native->temporaryAllocationTrafficBytes(); }
+    uint64_t deviceWaitNanoseconds() const override { return native->deviceWaitNanoseconds(); }
     uint64_t activeOperationCount() const override { return activeOperationCountValue; }
     uint64_t recomputationCost() const override { return recomputationCostValue; }
     uint64_t tapeContextLimitBytes() const override { return native->tapeContextLimitBytes(); }
@@ -434,6 +440,16 @@ void bindExecutionGraphAutodiff(nb::module_ &module) {
                      [](const PythonGraphPullback &value) { return value.pullback->checkpointBytes(); })
         .def_prop_ro("peak_runtime_managed_bytes",
                      [](const PythonGraphPullback &value) { return value.pullback->peakRuntimeManagedBytes(); })
+        .def_prop_ro("submission_count",
+                     [](const PythonGraphPullback &value) { return value.pullback->submissionCount(); })
+        .def_prop_ro("wait_count", [](const PythonGraphPullback &value) { return value.pullback->waitCount(); })
+        .def_prop_ro("readback_count", [](const PythonGraphPullback &value) { return value.pullback->readbackCount(); })
+        .def_prop_ro("atomic_publication_count",
+                     [](const PythonGraphPullback &value) { return value.pullback->atomicPublicationCount(); })
+        .def_prop_ro("temporary_allocation_traffic_bytes",
+                     [](const PythonGraphPullback &value) { return value.pullback->temporaryAllocationTrafficBytes(); })
+        .def_prop_ro("device_wait_nanoseconds",
+                     [](const PythonGraphPullback &value) { return value.pullback->deviceWaitNanoseconds(); })
         .def_prop_ro("tape_context_limit_bytes",
                      [](const PythonGraphPullback &value) { return value.pullback->tapeContextLimitBytes(); })
         .def_prop_ro("recomputation_factor",
