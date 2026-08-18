@@ -60,23 +60,6 @@ bool usesOverlap(const ResourceUse &left, const ResourceUse &right) {
            intervalsOverlap(a.base_array_layer, a.array_layer_count, b.base_array_layer, b.array_layer_count);
 }
 
-VernonRhiImageSubresourceRange intersection(const VernonRhiImageSubresourceRange &left,
-                                            const VernonRhiImageSubresourceRange &right) {
-    const auto interval = [](uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
-        const uint64_t begin = std::max(leftBase, rightBase);
-        const uint64_t leftEnd = leftCount == UINT32_MAX ? UINT64_MAX : uint64_t{leftBase} + leftCount;
-        const uint64_t rightEnd = rightCount == UINT32_MAX ? UINT64_MAX : uint64_t{rightBase} + rightCount;
-        const uint64_t end = std::min(leftEnd, rightEnd);
-        return std::pair{static_cast<uint32_t>(begin),
-                         end == UINT64_MAX ? UINT32_MAX : static_cast<uint32_t>(end - begin)};
-    };
-    const auto [baseMip, mipCount] =
-        interval(left.base_mip_level, left.mip_level_count, right.base_mip_level, right.mip_level_count);
-    const auto [baseLayer, layerCount] =
-        interval(left.base_array_layer, left.array_layer_count, right.base_array_layer, right.array_layer_count);
-    return {baseMip, mipCount, baseLayer, layerCount, left.aspects & right.aspects};
-}
-
 uint64_t handleKey(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(generation) << 32u) | index; }
 
 std::atomic<uint64_t> nextGraphIdentity{1};
@@ -92,23 +75,6 @@ std::shared_ptr<std::recursive_mutex> executionSession(VernonRhiDevice device) {
     auto created = std::make_shared<std::recursive_mutex>();
     executionSessions[key] = created;
     return created;
-}
-
-uint32_t accessBits(const ResourceUse &use) {
-    const bool reads = use.access != AccessMode::Write;
-    const bool writesResource = use.access != AccessMode::Read;
-    if (use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_COLOR_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_COLOR_WRITE : 0);
-    if (use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_DEPTH_STENCIL_READ : 0) |
-               (writesResource ? VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE : 0);
-    if (use.state == VERNON_RHI_STATE_TRANSFER_SOURCE)
-        return VERNON_RHI_ACCESS_TRANSFER_READ;
-    if (use.state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
-        return VERNON_RHI_ACCESS_TRANSFER_WRITE;
-    if (use.state == VERNON_RHI_STATE_SHADER_READ || use.state == VERNON_RHI_STATE_SHADER_WRITE)
-        return (reads ? VERNON_RHI_ACCESS_SHADER_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_SHADER_WRITE : 0);
-    return VERNON_RHI_ACCESS_NONE;
 }
 
 bool sameView(const GraphImage &left, const GraphImage &right) {
@@ -163,7 +129,12 @@ bool compatible(const RenderPass &left, const RenderPass &right) {
 
 class DeviceExecutionSession::Impl {
 public:
-    explicit Impl(VernonRhiDevice device) : mutex(executionSession(device)), lock(*mutex) {}
+    explicit Impl(VernonRhiDevice device) {
+        if (vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandIndependentRecording)
+            return;
+        mutex = executionSession(device);
+        lock = std::unique_lock<std::recursive_mutex>(*mutex);
+    }
 
 private:
     std::shared_ptr<std::recursive_mutex> mutex;
@@ -1186,62 +1157,24 @@ bool ExecutionGraph::buildPlan(std::string &error) {
         }
         scopes_.push_back({render != nullptr, {passIndex}});
     }
-    std::vector<std::vector<ResourceUse>> lastUses(resources_.size());
+    std::vector<uint32_t> passScopes(passes_.size(), UINT32_MAX);
+    for (uint32_t scopeIndex = 0; scopeIndex < scopes_.size(); ++scopeIndex)
+        for (uint32_t passIndex : scopes_[scopeIndex].passIndices)
+            passScopes[passIndex] = scopeIndex;
+    for (uint32_t predecessor = 0; predecessor < passes_.size(); ++predecessor)
+        for (uint32_t dependent = 0; dependent < passes_.size(); ++dependent) {
+            if (!edges[predecessor][dependent])
+                continue;
+            const uint32_t predecessorScope = passScopes[predecessor];
+            const uint32_t dependentScope = passScopes[dependent];
+            if (predecessorScope == UINT32_MAX || dependentScope == UINT32_MAX || predecessorScope == dependentScope)
+                continue;
+            scopes_[dependentScope].predecessors.push_back(predecessorScope);
+        }
     for (CompiledScope &scope : scopes_) {
-        std::vector<std::vector<ResourceUse>> firstUses(resources_.size());
-        std::vector<std::vector<ResourceUse>> finalUses(resources_.size());
-        for (uint32_t passIndex : scope.passIndices) {
-            const uint32_t stageMask = dynamic_cast<ComputePass *>(passes_[passIndex].get())
-                                           ? VERNON_RHI_STAGE_COMPUTE
-                                           : VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
-            for (const ResourceUse &use : passes_[passIndex]->uses_) {
-                ResourceUse effective = use;
-                if (!effective.stageMask && (effective.state == VERNON_RHI_STATE_SHADER_READ ||
-                                             effective.state == VERNON_RHI_STATE_SHADER_WRITE))
-                    effective.stageMask = stageMask;
-                auto &current = finalUses[use.resource.id];
-                if (std::none_of(current.begin(), current.end(),
-                                 [&](const ResourceUse &prior) { return usesOverlap(prior, effective); }))
-                    firstUses[use.resource.id].push_back(effective);
-                current.erase(std::remove_if(current.begin(), current.end(),
-                                             [&](const ResourceUse &prior) { return usesOverlap(prior, effective); }),
-                              current.end());
-                current.push_back(effective);
-            }
-        }
-        for (uint32_t resourceId = 0; resourceId < firstUses.size(); ++resourceId) {
-            for (const ResourceUse &use : firstUses[resourceId])
-                for (const ResourceUse &previous : lastUses[resourceId]) {
-                    if (!usesOverlap(previous, use) ||
-                        (previous.state == use.state && !writes(previous.access) && !writes(use.access)))
-                        continue;
-                    VernonRhiBarrier barrier{};
-                    barrier.struct_size = sizeof(barrier);
-                    barrier.source_stage_mask = previous.stageMask;
-                    barrier.destination_stage_mask = use.stageMask;
-                    barrier.source_access = accessBits(previous);
-                    barrier.destination_access = accessBits(use);
-                    barrier.old_state = previous.state;
-                    barrier.new_state = use.state;
-                    const detail::ExecutionResourceRecord &record = resourceRecords_[resourceId];
-                    barrier.is_image = record.resource.kind == ResourceKind::Image;
-                    if (barrier.is_image) {
-                        barrier.image = record.image;
-                        barrier.image_subresources = intersection(previous.imageSubresources, use.imageSubresources);
-                    } else {
-                        barrier.buffer = record.buffer;
-                    }
-                    scope.barriers.push_back(barrier);
-                }
-        }
-        for (uint32_t resourceId = 0; resourceId < finalUses.size(); ++resourceId)
-            for (const ResourceUse &use : finalUses[resourceId]) {
-                auto &previous = lastUses[resourceId];
-                previous.erase(std::remove_if(previous.begin(), previous.end(),
-                                              [&](const ResourceUse &prior) { return usesOverlap(prior, use); }),
-                               previous.end());
-                previous.push_back(use);
-            }
+        std::sort(scope.predecessors.begin(), scope.predecessors.end());
+        scope.predecessors.erase(std::unique(scope.predecessors.begin(), scope.predecessors.end()),
+                                 scope.predecessors.end());
     }
     if (!validateDeclarations(error))
         return false;

@@ -35,10 +35,13 @@ DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, size_t size) : context
         handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
+DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, VernonRhiBuffer handle, size_t size)
+    : context_(&context), handle_(handle), size_(size), owned_(false) {}
+
 DeviceBuffer::DeviceBuffer(DeviceBuffer &&other) noexcept
     : context_(std::exchange(other.context_, nullptr)),
       handle_(std::exchange(other.handle_, VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0})),
-      size_(std::exchange(other.size_, 0)) {}
+      size_(std::exchange(other.size_, 0)), owned_(std::exchange(other.owned_, true)) {}
 
 DeviceBuffer &DeviceBuffer::operator=(DeviceBuffer &&other) noexcept {
     if (this == &other)
@@ -47,6 +50,7 @@ DeviceBuffer &DeviceBuffer::operator=(DeviceBuffer &&other) noexcept {
     context_ = std::exchange(other.context_, nullptr);
     handle_ = std::exchange(other.handle_, VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     size_ = std::exchange(other.size_, 0);
+    owned_ = std::exchange(other.owned_, true);
     return *this;
 }
 
@@ -60,6 +64,18 @@ bool DeviceBuffer::valid() const {
 bool DeviceBuffer::upload(const void *source, size_t size) const {
     return valid() && size == size_ && !injectFailure(FailureBoundary::Upload) &&
            vernonRhiDeviceUploadBuffer(context_->rhiDevice, handle_, 0, source, size) == VERNON_RHI_STATUS_OK;
+}
+
+bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, const void *source, size_t size) const {
+    return valid() && size == size_ && !injectFailure(FailureBoundary::Upload) &&
+           vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, 0, source, size) ==
+               VERNON_RHI_STATUS_OK;
+}
+
+bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, size_t offset, const void *source, size_t size) const {
+    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Upload) &&
+           vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, offset, source, size) ==
+               VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::upload(size_t offset, const void *source, size_t size) const {
@@ -94,11 +110,12 @@ bool DeviceBuffer::reference(size_t offset, size_t size, VernonRuntimeProviderRe
 }
 
 void DeviceBuffer::reset() {
-    if (context_ && handle_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+    if (owned_ && context_ && handle_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
         (void)vernonRhiDeviceDestroyBuffer(context_->rhiDevice, handle_);
     context_ = nullptr;
     handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     size_ = 0;
+    owned_ = true;
 }
 
 DeviceValue::DeviceValue(VernonRuntimeContext &context, const VernonAdValue &value)
@@ -115,6 +132,29 @@ DeviceValue::DeviceValue(VernonRuntimeContext &context, const VernonAdValue &val
             strides.clear();
             return;
         }
+    }
+}
+
+DeviceValue::DeviceValue(VernonRuntimeContext &context, const VernonAdDeviceValue &value)
+    : buffer(context, value.buffer, static_cast<size_t>(value.buffer_size)), dtype(value.dtype),
+      byteOffset(static_cast<size_t>(value.offset)), physicalLayout(true) {
+    if (value.rank)
+        shape.assign(value.shape, value.shape + value.rank);
+    if (value.rank)
+        strides.assign(value.byte_strides, value.byte_strides + value.rank);
+}
+
+DeviceValue::DeviceValue(VernonRuntimeContext &context, std::shared_ptr<DeviceBuffer> owner,
+                         const VernonAdDeviceValue &value)
+    : retainedBuffer(std::move(owner)),
+      buffer(context,
+             retainedBuffer ? retainedBuffer->handle()
+                            : VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0},
+             retainedBuffer ? retainedBuffer->size() : 0),
+      dtype(value.dtype), byteOffset(static_cast<size_t>(value.offset)), physicalLayout(true) {
+    if (value.rank) {
+        shape.assign(value.shape, value.shape + value.rank);
+        strides.assign(value.byte_strides, value.byte_strides + value.rank);
     }
 }
 

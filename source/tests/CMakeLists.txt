@@ -246,8 +246,10 @@ if(TARGET VernonRuntime)
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
         runtime/directx_command_state_test.cpp
+        runtime/execution_command_model_test.cpp
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
+        runtime/operator_model_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp

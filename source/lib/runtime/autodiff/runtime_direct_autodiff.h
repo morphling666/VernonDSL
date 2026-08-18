@@ -68,6 +68,7 @@ VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffWriteFootprints(
 VERNON_RUNTIME_CAPI AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);
+VERNON_RUNTIME_CAPI VernonRhiDevice autodiffRhiDevice(const VernonRuntimeContext *context);
 
 } // namespace vernon::runtime
 

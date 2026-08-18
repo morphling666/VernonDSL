@@ -1,6 +1,7 @@
 #include "native_execution_graph.h"
 
 #include "VernonExecutionGraph.h"
+#include "execution_graph/execution_graph_internal.h"
 #include "native_execution_graph_autodiff.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 
@@ -204,7 +205,8 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     const std::vector<vernon::execution::PassWriteFootprint> &readFootprints() const override {
         return readFootprints_;
     }
-    bool forward(vernon::execution::ComputeEncoder &encoder, const vernon::execution::ExecutionResources &resources,
+    bool forward(vernon::execution::ComputeEncoder *encoder, const vernon::execution::ExecutionResources &resources,
+                 vernon::execution::detail::RhiCommandExecutionPlan *plan,
                  std::unique_ptr<vernon::execution::PassPullback> &pullback, std::string &error) override;
     bool zeroCotangent(const std::string &path, const vernon::execution::ExecutionResources &resources,
                        std::shared_ptr<vernon::execution::GraphAutodiffValue> &value, std::string &error) override;
@@ -671,24 +673,40 @@ VernonRhiStatus PythonComputePass::execute(vernon::execution::ComputeEncoder &en
     }
 }
 
-bool PythonComputePass::forward(vernon::execution::ComputeEncoder &encoder,
+bool PythonComputePass::forward(vernon::execution::ComputeEncoder *encoder,
                                 const vernon::execution::ExecutionResources &resources,
+                                vernon::execution::detail::RhiCommandExecutionPlan *commands,
                                 std::unique_ptr<vernon::execution::PassPullback> &pullback, std::string &error) {
     try {
         callbackState->recordReverseCallback();
         nb::object result;
-        if (resources.hasBindings()) {
-            PythonExecutionBindingsView bindings(resources);
-            result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(
-                nb::cast(encoder), nb::cast(&bindings, nb::rv_policy::reference));
+        if (commands) {
+            if (encoder)
+                throw std::invalid_argument("differentiable pass forward cannot encode immediately and plan");
+            nb::object plan = nb::cast(commands, nb::rv_policy::reference);
+            if (resources.hasBindings()) {
+                PythonExecutionBindingsView bindings(resources);
+                result = nb::borrow<nb::object>(owner).attr("_native_vjp_plan")(
+                    plan, nb::cast(&bindings, nb::rv_policy::reference));
+            } else {
+                result = nb::borrow<nb::object>(owner).attr("_native_vjp_plan")(plan, nb::none());
+            }
         } else {
-            result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(nb::cast(encoder), nb::none());
+            if (!encoder)
+                throw std::invalid_argument("differentiable pass forward requires an encoder or command plan");
+            if (resources.hasBindings()) {
+                PythonExecutionBindingsView bindings(resources);
+                result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(
+                    nb::cast(*encoder), nb::cast(&bindings, nb::rv_policy::reference));
+            } else {
+                result = nb::borrow<nb::object>(owner).attr("_native_vjp_forward")(nb::cast(*encoder), nb::none());
+            }
         }
         pullback = makePythonPassPullback(std::move(result), callbackState);
         return true;
     } catch (...) {
         callbackState->captureException(std::current_exception());
-        error = "differentiable pass '" + name() + "' forward failed";
+        error = "differentiable pass '" + name() + (commands ? "' forward planning failed" : "' forward failed");
         return false;
     }
 }

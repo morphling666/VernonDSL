@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import unittest
-from typing import Annotated
+from typing import Annotated, Any, cast
 from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl._runtime.autodiff import _StructuredPullback
+from vernon_dsl._runtime.operators.gradient_expression import materialize as materialize_gradient_expression
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 
 from python.tests.storage_vjp_direct_fixture import Particle, aggregate_storage_objective_vjp
@@ -297,8 +298,8 @@ class CpuExecutionGraphTests(unittest.TestCase):
         intermediate = vd.storage.zeros(dtype=vd.f32, shape=(4,))
         output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
         graph = vd.ExecutionGraph()
-        graph.add_pass(InvocationComputePass("first", graph_increment.invocation(intermediate, source)))
-        graph.add_pass(InvocationComputePass("second", graph_increment.invocation(output, intermediate)))
+        graph.add_pass(InvocationComputePass("first", cast(Any, graph_increment).invocation(intermediate, source)))
+        graph.add_pass(InvocationComputePass("second", cast(Any, graph_increment).invocation(output, intermediate)))
 
         plan = graph.compile()
         plan.submit().wait()
@@ -311,7 +312,7 @@ class CpuExecutionGraphTests(unittest.TestCase):
         output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
         graph = vd.ExecutionGraph()
         amount = graph.parameter("amount")
-        invocation = graph_add_parameter.invocation(output, source, amount)
+        invocation = cast(Any, graph_add_parameter).invocation(output, source, amount)
         graph.add_pass(
             InvocationComputePass(
                 "parameterized",
@@ -362,12 +363,12 @@ class CpuExecutionGraphTests(unittest.TestCase):
 
         self.assertIsNot(values[0], values[1])
         self.assertIs(constant_values[0], constant_values[1])
-        np.testing.assert_array_equal(first, np.array([1.0], dtype=np.float32))
+        np.testing.assert_array_equal(cast(Any, first), np.array([1.0], dtype=np.float32))
         constant_value[0] = 99.0
         bindings.update({dynamic: np.array([3.0], dtype=np.float32)})
         plan.submit(bindings).wait()
-        np.testing.assert_array_equal(values[-1], np.array([3.0], dtype=np.float32))
-        np.testing.assert_array_equal(constant_values[-1], np.array([7.0], dtype=np.float32))
+        np.testing.assert_array_equal(cast(Any, values[-1]), np.array([3.0], dtype=np.float32))
+        np.testing.assert_array_equal(cast(Any, constant_values[-1]), np.array([7.0], dtype=np.float32))
 
     def test_compiled_plan_and_bindings_reject_runtime_reinitialization(self) -> None:
         graph = vd.ExecutionGraph()
@@ -606,7 +607,7 @@ class CpuExecutionGraphTests(unittest.TestCase):
                     self.assertEqual(inner_pullback.reverse_python_callback_count, 3)
                 finally:
                     applying_inner = False
-            return add_gradients(left, right)
+            return add_gradients(cast(vd.TensorStorage, left), cast(Any, right))
 
         with mock.patch.object(vd.TensorStorage, "_add_gradients", side_effect=accumulate_with_nested_pullback):
             outer_pullback(
@@ -766,7 +767,7 @@ class CpuExecutionGraphTests(unittest.TestCase):
     def test_texture_view_rejects_incompatible_reinterpretations(self) -> None:
         texture = vd.Texture.zeros(shape=(4, 4))
         with self.assertRaisesRegex(ValueError, "format is incompatible"):
-            texture.view(format=vd.r16_float)
+            texture.view(format=cast(Any, vd.r16_float))
         with self.assertRaisesRegex(ValueError, "dimension is incompatible"):
             texture.view(dimension="3d")
         with self.assertRaisesRegex(ValueError, "aspects are incompatible"):
@@ -841,6 +842,86 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
         np.testing.assert_array_equal(output.to_numpy(), np.array([13.0], dtype=np.float32))
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32))
 
+    def test_gpu_graph_vjp_allows_unrelated_non_differentiable_compute_pass(self) -> None:
+        unrelated_source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        unrelated_output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        graph.add_pass(
+            InvocationComputePass(
+                "unrelated", cast(Any, graph_increment).invocation(unrelated_output, unrelated_source)
+            )
+        )
+        source_resource = graph.differentiable_input("source", source)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square",
+                graph_square_vjp,
+                {"source": source_resource, "output": graph.objective("output", output)},
+                grid=(1, 1, 1),
+            )
+        )
+
+        gradient = graph.compile().vjp()(None)["source"]
+
+        np.testing.assert_array_equal(unrelated_output.to_numpy(), np.array([4.0], dtype=np.float32))
+        np.testing.assert_array_equal(gradient.to_numpy(), np.array([4.0], dtype=np.float32))
+
+    def test_gpu_graph_vjp_lowers_branch_fan_in_to_device_operator(self) -> None:
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        square = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        cube = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        source_resource = graph.differentiable_input("source", source)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "square",
+                graph_square_vjp,
+                {"source": source_resource, "output": graph.objective("square", square)},
+                grid=(1, 1, 1),
+            )
+        )
+        graph.add_pass(
+            vd.VjpComputePass(
+                "cube",
+                graph_cube_vjp,
+                {"source": source_resource, "output": graph.objective("cube", cube)},
+                grid=(1, 1, 1),
+            )
+        )
+        pullback = graph.compile().vjp()
+        from vernon_dsl._runtime.operators.elementwise import _add_f32_rank1
+
+        operator_kernel = cast(Any, _add_f32_rank1)
+        with (
+            mock.patch.object(vd.TensorStorage, "_add_gradients", side_effect=AssertionError("host fallback")),
+            mock.patch.object(vd.TensorStorage, "synchronize", side_effect=AssertionError("host synchronization")),
+            mock.patch.object(
+                vd.TensorStorage, "_upload_dirty_ranges", side_effect=AssertionError("synchronous planned upload")
+            ),
+            mock.patch.object(vd.ExecutionGraph, "compile", side_effect=AssertionError("temporary operator graph")),
+        ):
+            gradient = pullback(
+                {
+                    "square": np.array([1.0], dtype=np.float32),
+                    "cube": np.array([2.0], dtype=np.float32),
+                }
+            )["source"]
+            first_compile_count = operator_kernel.compile_count
+            pullback(
+                {
+                    "square": np.array([1.0], dtype=np.float32),
+                    "cube": np.array([2.0], dtype=np.float32),
+                }
+            )
+            self.assertEqual(operator_kernel.compile_count, first_compile_count)
+
+        self.assertGreater(pullback.submission_count, 0)
+        self.assertEqual(pullback.wait_count, pullback.submission_count)
+        self.assertEqual(pullback.readback_count, 0)
+        np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
+
     def test_gpu_graph_vjp_preserves_structured_storage_gradients(self) -> None:
         particles = vd.storage.zeros(dtype=GraphParticle, shape=(1,))
         values = particles.to_numpy()
@@ -864,6 +945,130 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
 
         np.testing.assert_array_equal(gradient["velocity"].to_numpy(), np.array([[4.0, -6.0]], dtype=np.float32))
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
+
+    def test_gpu_graph_vjp_fans_in_aggregate_leaves_on_device(self) -> None:
+        particles = vd.storage.zeros(dtype=GraphParticle, shape=(1,))
+        values = particles.to_numpy()
+        values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float16)
+        values["mass"][0] = np.float32(4.0)
+        particles.copy_from_numpy(values)
+        first_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        second_loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        graph = vd.ExecutionGraph()
+        particles_resource = graph.differentiable_input("particles", particles)
+        graph.add_pass(
+            vd.VjpComputePass(
+                "first",
+                graph_aggregate_storage_objective_vjp,
+                {"particles": particles_resource, "loss": graph.objective("first_loss", first_loss)},
+                grid=(1, 1, 1),
+            )
+        )
+        graph.add_pass(
+            vd.VjpComputePass(
+                "second",
+                graph_aggregate_storage_objective_vjp,
+                {"particles": particles_resource, "loss": graph.objective("second_loss", second_loss)},
+                grid=(1, 1, 1),
+            )
+        )
+        pullback = graph.compile().vjp()
+        with mock.patch.object(vd.TensorStorage, "_add_gradients", side_effect=AssertionError("host fallback")):
+            gradient = pullback(
+                {
+                    "first_loss": np.ones((1,), dtype=np.float32),
+                    "second_loss": np.ones((1,), dtype=np.float32),
+                }
+            )["particles"]
+
+        np.testing.assert_array_equal(gradient["velocity"].to_numpy(), np.array([[8.0, -12.0]], dtype=np.float32))
+        np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([16.0], dtype=np.float32))
+
+    def test_operator_uses_explicit_deterministic_host_fallback(self) -> None:
+        left = vd.TensorStorage(np.array([1.0, 2.0], dtype=np.float64))
+        right = vd.TensorStorage(np.array([3.0, 4.0], dtype=np.float64))
+        with mock.patch.object(
+            vd.TensorStorage,
+            "_add_gradients",
+            wraps=vd.TensorStorage._add_gradients,
+        ) as fallback:
+            result = materialize_gradient_expression([("leaf", left), ("leaf", right), ("add", 0, 1)])
+
+        fallback.assert_called_once_with(left, right)
+        np.testing.assert_array_equal(cast(vd.TensorStorage, result).to_numpy(), np.array([4.0, 6.0], dtype=np.float64))
+
+    def test_gradient_expression_rejects_invalid_nodes(self) -> None:
+        value = vd.TensorStorage(np.array([1.0], dtype=np.float32))
+        with self.assertRaisesRegex(ValueError, "invalid node"):
+            materialize_gradient_expression([("leaf", value), ("add", 0, 1)])
+        with self.assertRaisesRegex(ValueError, "invalid node"):
+            materialize_gradient_expression([("unknown", value)])
+        with self.assertRaisesRegex(ValueError, "invalid node"):
+            materialize_gradient_expression([("leaf", value), ("add", False, 0)])
+
+    def test_operator_lowers_consistently_across_available_backends(self) -> None:
+        from vernon_dsl._runtime import session
+
+        original_architecture = session._architecture
+        tested: list[str] = []
+        try:
+            for architecture in (vd.metal, vd.vulkan, vd.directx, vd.cuda, vd.opengl):
+                try:
+                    if architecture == vd.opengl:
+                        vd.init(arch=architecture, api_version=(4, 3))
+                    else:
+                        vd.init(arch=architecture)
+                except RuntimeUnavailableError:
+                    continue
+                left = vd.TensorStorage(np.array([1.0, 2.0], dtype=np.float32))
+                right = vd.TensorStorage(np.array([3.0, 4.0], dtype=np.float32))
+                third = vd.TensorStorage(np.array([5.0, 6.0], dtype=np.float32))
+                expression = [
+                    ("leaf", left),
+                    ("leaf", right),
+                    ("add", 0, 1),
+                    ("leaf", third),
+                    ("add", 2, 3),
+                ]
+                with mock.patch.object(
+                    vd.TensorStorage,
+                    "_add_gradients",
+                    side_effect=AssertionError("GPU operator path unexpectedly fell back to host"),
+                ):
+                    accumulated = materialize_gradient_expression(expression)
+                self.assertIsInstance(accumulated, vd.TensorStorage)
+                np.testing.assert_array_equal(
+                    cast(vd.TensorStorage, accumulated).to_numpy(),
+                    np.array([9.0, 12.0], dtype=np.float32),
+                )
+                tested.append(str(architecture))
+        finally:
+            vd.init(arch=original_architecture)
+        self.assertGreaterEqual(len(tested), 1)
+
+    def test_device_operator_failure_does_not_mutate_inputs(self) -> None:
+        left = vd.TensorStorage(np.array([1.0, 2.0], dtype=np.float32))
+        right = vd.TensorStorage(np.array([3.0, 4.0], dtype=np.float32))
+        with mock.patch(
+            "vernon_dsl._runtime.operators.gradient_expression.append_add",
+            side_effect=ValueError("injected operator failure"),
+        ):
+            with self.assertRaisesRegex(ValueError, "injected operator failure"):
+                materialize_gradient_expression([("leaf", left), ("leaf", right), ("add", 0, 1)])
+
+        np.testing.assert_array_equal(left.to_numpy(), np.array([1.0, 2.0], dtype=np.float32))
+        np.testing.assert_array_equal(right.to_numpy(), np.array([3.0, 4.0], dtype=np.float32))
+
+    def test_rank_zero_gradient_expression_uses_device_operator(self) -> None:
+        left = vd.TensorStorage(np.array(1.0, dtype=np.float32))
+        right = vd.TensorStorage(np.array(2.0, dtype=np.float32))
+        with mock.patch.object(
+            vd.TensorStorage,
+            "_add_gradients",
+            side_effect=AssertionError("rank-zero operator unexpectedly fell back to host"),
+        ):
+            result = materialize_gradient_expression([("leaf", left), ("leaf", right), ("add", 0, 1)])
+        self.assertEqual(cast(vd.TensorStorage, result).to_numpy()[()], 3.0)
 
 
 class ExecutionGraphTests(unittest.TestCase):
@@ -898,7 +1103,7 @@ class ExecutionGraphTests(unittest.TestCase):
         graph = vd.ExecutionGraph()
         events: list[str] = []
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, color).attach_depth()
+        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, cast(Any, color)).attach_depth()
         depth = target.depth_texture
         writer = RecordingRenderPass("shadow", events, target)
         reader = RecordingComputePass("sample", events, read=depth)
@@ -968,7 +1173,7 @@ class ExecutionGraphTests(unittest.TestCase):
         graph = vd.ExecutionGraph()
         events: list[str] = []
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
         graph.add_pass(RecordingRenderPass("first", events, target))
         graph.add_pass(RecordingRenderPass("second", events, target))
         compute = RecordingComputePass("compute", events)
@@ -983,7 +1188,7 @@ class ExecutionGraphTests(unittest.TestCase):
     def test_no_merge_splits_matching_render_targets(self) -> None:
         graph = vd.ExecutionGraph()
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
         first = RecordingRenderPass("first", [], target)
         second = RecordingRenderPass("second", [], target)
         second.no_merge = True
@@ -1015,7 +1220,7 @@ class ExecutionGraphTests(unittest.TestCase):
     def test_unified_pipeline_invocation_checks_encoder_kind(self) -> None:
         invocation = vd.PipelineInvocation("compute", lambda encoder, resources: None)
         color = vd.Texture.zeros(shape=(4, 4))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, color)
+        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
         render_pass = RecordingRenderPass("render", [], target, invocation)
         graph = vd.ExecutionGraph()
         graph.add_pass(render_pass)

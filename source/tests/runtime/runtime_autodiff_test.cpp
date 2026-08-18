@@ -570,13 +570,17 @@ TEST(RuntimeAutodiffTapeAllocator, BackendNeutralReservationsChargeAndReleaseCon
     ASSERT_NE(retained, nullptr);
     EXPECT_EQ(retained->bytes(), 24u);
     EXPECT_EQ(policy->usage().currentBytes, 24u);
-    EXPECT_EQ(AutodiffMemoryReservation::reserve(policy, 41), nullptr);
+    EXPECT_FALSE(retained->shrink(25));
+    EXPECT_TRUE(retained->shrink(16));
+    EXPECT_EQ(retained->bytes(), 16u);
+    EXPECT_EQ(policy->usage().currentBytes, 16u);
+    EXPECT_EQ(AutodiffMemoryReservation::reserve(policy, 49), nullptr);
     {
-        std::shared_ptr<AutodiffMemoryReservation> temporary = AutodiffMemoryReservation::reserve(policy, 40);
+        std::shared_ptr<AutodiffMemoryReservation> temporary = AutodiffMemoryReservation::reserve(policy, 48);
         ASSERT_NE(temporary, nullptr);
         EXPECT_EQ(policy->usage().currentBytes, 64u);
     }
-    EXPECT_EQ(policy->usage().currentBytes, 24u);
+    EXPECT_EQ(policy->usage().currentBytes, 16u);
     retained.reset();
     EXPECT_EQ(policy->usage().currentBytes, 0u);
     EXPECT_EQ(policy->usage().peakBytes, 64u);

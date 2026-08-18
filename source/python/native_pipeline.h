@@ -238,6 +238,23 @@ struct PythonRuntimeSubmission {
 };
 
 struct PreparedPipelineArgument {
+    PreparedPipelineArgument() = default;
+    PreparedPipelineArgument(const PreparedPipelineArgument &other)
+        : value(other.value), shape(other.shape), strides(other.strides), layoutHash(other.layoutHash),
+          elementLeaves(other.elementLeaves), owner(other.owner) {
+        refreshViews();
+    }
+    PreparedPipelineArgument &operator=(const PreparedPipelineArgument &) = delete;
+
+    void refreshViews() {
+        if (value.kind != VERNON_PIPELINE_TENSOR)
+            return;
+        value.tensor.shape = shape.empty() ? nullptr : shape.data();
+        value.tensor.byte_strides = strides.empty() ? nullptr : strides.data();
+        value.tensor.element_layout.layout_hash = {layoutHash.data(), layoutHash.size()};
+        value.tensor.element_layout.leaves = elementLeaves.empty() ? nullptr : elementLeaves.data();
+    }
+
     VernonPipelineArgument value{};
     std::vector<uint64_t> shape;
     std::vector<int64_t> strides;
@@ -427,8 +444,8 @@ struct PipelineInvocationBuilder {
     std::unique_ptr<PreparedPipelineArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
                                                                uint32_t access, const std::vector<uint64_t> &shape,
                                                                const std::vector<int64_t> &strides, size_t offset) {
-        if (!buffer || shape.size() != strides.size() || shape.empty())
-            throw std::invalid_argument("RHI Tensor shape and strides must have equal non-zero rank");
+        if (!buffer || shape.size() != strides.size())
+            throw std::invalid_argument("RHI Tensor shape and strides must have equal rank");
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         auto prepared = createArgument(parameter, VERNON_PIPELINE_TENSOR);
         PreparedPipelineArgument &argument = *prepared;
@@ -442,8 +459,8 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("RHI buffer belongs to another Runtime device");
         argument.value.tensor.access = static_cast<VernonValueAccess>(access);
         argument.value.tensor.rank = static_cast<uint32_t>(shape.size());
-        argument.value.tensor.shape = argument.shape.data();
-        argument.value.tensor.byte_strides = argument.strides.data();
+        argument.value.tensor.shape = argument.shape.empty() ? nullptr : argument.shape.data();
+        argument.value.tensor.byte_strides = argument.strides.empty() ? nullptr : argument.strides.data();
         argument.value.tensor.byte_offset = offset;
         argument.value.tensor.byte_size = buffer->size;
         if (argument.value.tensor.access != VERNON_ACCESS_READ &&

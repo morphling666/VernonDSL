@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +19,7 @@ class DeviceBuffer {
 public:
     DeviceBuffer() = default;
     DeviceBuffer(VernonRuntimeContext &context, size_t size);
+    DeviceBuffer(VernonRuntimeContext &context, VernonRhiBuffer handle, size_t size);
     DeviceBuffer(DeviceBuffer &&other) noexcept;
     DeviceBuffer &operator=(DeviceBuffer &&other) noexcept;
     DeviceBuffer(const DeviceBuffer &) = delete;
@@ -26,6 +28,8 @@ public:
 
     bool valid() const;
     bool upload(const void *source, size_t size) const;
+    bool upload(VernonRhiCommandEncoder encoder, const void *source, size_t size) const;
+    bool upload(VernonRhiCommandEncoder encoder, size_t offset, const void *source, size_t size) const;
     bool upload(size_t offset, const void *source, size_t size) const;
     bool uploadRanges(const std::vector<VernonRhiBufferUploadRange> &ranges) const;
     bool download(void *destination, size_t size) const;
@@ -41,9 +45,11 @@ private:
     VernonRuntimeContext *context_{};
     VernonRhiBuffer handle_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     size_t size_{};
+    bool owned_{true};
 };
 
 struct DeviceValue {
+    std::shared_ptr<DeviceBuffer> retainedBuffer;
     DeviceBuffer buffer;
     VernonDataType dtype{};
     std::vector<uint64_t> shape;
@@ -52,6 +58,8 @@ struct DeviceValue {
     bool physicalLayout{};
 
     DeviceValue(VernonRuntimeContext &context, const VernonAdValue &value);
+    DeviceValue(VernonRuntimeContext &context, const VernonAdDeviceValue &value);
+    DeviceValue(VernonRuntimeContext &context, std::shared_ptr<DeviceBuffer> owner, const VernonAdDeviceValue &value);
     DeviceValue(VernonRuntimeContext &context, size_t allocationSize, VernonDataType dtype, std::vector<uint64_t> shape,
                 std::vector<int64_t> strides, size_t byteOffset);
 };

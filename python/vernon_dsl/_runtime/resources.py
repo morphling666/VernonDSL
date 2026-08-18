@@ -5,7 +5,7 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated, Any, get_args, get_origin
+from typing import Annotated, Any, get_args, get_origin
 
 import numpy as np
 
@@ -411,6 +411,49 @@ def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[
     return _coalesced_byte_ranges(ranges)
 
 
+class _PlannedTensorState:
+    def __init__(self, owner: TensorStorage, mode: str):
+        self._owner: TensorStorage | None = owner
+        self._mode = mode
+        self._buffer = owner._native_buffer
+        self._generation = owner._native_generation
+        self._device_dirty = owner._device_dirty
+        self._dirty_ranges = owner._dirty_ranges.ranges
+        if mode == "write":
+            owner._planned_device_writes += 1
+
+    def __del__(self) -> None:
+        self._rollback_planned_state()
+
+    def _commit_planned_state(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        self._owner = None
+        if self._mode == "write":
+            owner._planned_device_writes -= 1
+        owner._dirty_ranges.clear()
+        owner._device_dirty = self._mode == "write"
+
+    def _rollback_planned_state(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        self._owner = None
+        if self._mode == "write":
+            owner._planned_device_writes -= 1
+            owner._native_buffer = None
+            owner._native_generation = -1
+            owner._device_dirty = False
+            owner._dirty_ranges.mark_all()
+            return
+        owner._native_buffer = self._buffer
+        owner._native_generation = self._generation
+        owner._device_dirty = self._device_dirty
+        owner._dirty_ranges.clear()
+        owner._dirty_ranges.mark(list(self._dirty_ranges), allow_full=False)
+
+
 class TensorStorage:
     """Host owner of a dense row-major allocation with one canonical element layout."""
 
@@ -433,6 +476,7 @@ class TensorStorage:
         self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
         self._native_buffer: Any | None = None
         self._native_generation = -1
+        self._planned_device_writes = 0
         self._dirty_ranges = _DirtyRangeSet(array.nbytes, dirty=True)
         self._device_dirty = False
         self._borrow_lock = threading.RLock()
@@ -655,6 +699,39 @@ class TensorStorage:
         return self._array
 
     @staticmethod
+    def _gradient_layout(left: TensorStorage, right: TensorStorage) -> TangentLayout | None:
+        if left.shape != right.shape:
+            raise ValueError("graph cotangent contributions have incompatible shapes")
+        left_layout = left._element_layout
+        right_layout = right._element_layout
+        if left_layout is None and right_layout is None:
+            return None
+        if (
+            not isinstance(left_layout, TangentLayout)
+            or not isinstance(right_layout, TangentLayout)
+            or left_layout.layout_hash != right_layout.layout_hash
+        ):
+            raise ValueError("graph cotangent contributions have incompatible tangent layouts")
+        return left_layout
+
+    @staticmethod
+    def _empty_gradient_like(value: TensorStorage) -> TensorStorage:
+        if isinstance(value._element_layout, TangentLayout):
+            return TensorStorage._tangent_zeros(value._element_layout, value.shape)
+        if value._element_layout is not None:
+            raise ValueError("graph gradients require scalar or tangent TensorStorage")
+        return TensorStorage(np.zeros(value.shape, dtype=value.dtype, order="C"))
+
+    @staticmethod
+    def _gradient_add_views(
+        output: TensorStorage, left: TensorStorage, right: TensorStorage
+    ) -> list[tuple[TensorStorage | TensorView, TensorStorage | TensorView, TensorStorage | TensorView]]:
+        layout = TensorStorage._gradient_layout(left, right)
+        if layout is None:
+            return [(output, left, right)]
+        return [(output[leaf.path], left[leaf.path], right[leaf.path]) for leaf in layout.leaves]
+
+    @staticmethod
     def _add_gradients(left: TensorStorage, right: TensorStorage | np.ndarray) -> TensorStorage:
         if not isinstance(left, TensorStorage):
             raise TypeError("graph gradient accumulation requires TensorStorage")
@@ -663,22 +740,14 @@ class TensorStorage:
         if isinstance(right, TensorStorage):
             right._ensure_host_read_allowed()
             right.synchronize()
-            if left.shape != right.shape:
-                raise ValueError("graph cotangent contributions have incompatible shapes")
-            if (left._element_layout is None) != (right._element_layout is None):
-                raise ValueError("graph cotangent contributions have incompatible tangent layouts")
-            if left._element_layout is not None:
-                if (
-                    right._element_layout is None
-                    or left._element_layout.layout_hash != right._element_layout.layout_hash
-                ):
-                    raise ValueError("graph cotangent contributions have incompatible tangent layouts")
-                result = TensorStorage._tangent_zeros(left._element_layout, left.shape)
-                for leaf in left._element_layout.leaves:
+            layout = TensorStorage._gradient_layout(left, right)
+            if layout is not None:
+                result = TensorStorage._empty_gradient_like(left)
+                for output, left_view, right_view in TensorStorage._gradient_add_views(result, left, right):
                     np.add(
-                        left[leaf.path]._native_host_array(),
-                        right[leaf.path]._native_host_array(),
-                        out=result[leaf.path]._native_host_array(),
+                        left_view._native_host_array(),
+                        right_view._native_host_array(),
+                        out=output._native_host_array(),
                     )
                 return result
             right_array = right._native_host_array()
@@ -709,6 +778,15 @@ class TensorStorage:
             raise ValueError("shared-owner gradient leaves require matching shapes and dtypes")
         np.add(target, gradient, out=target)
         return destination
+
+    def _gradient_device_view(
+        self,
+        path: str,
+        destination: TensorStorage,
+        gradient_shape: tuple[int, ...],
+    ) -> TensorView:
+        gradient_shape = tuple(gradient_shape)
+        return self._full_view("read")._gradient_device_view(path, destination, gradient_shape)
 
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._ensure_host_mutation_allowed()
@@ -882,6 +960,8 @@ class TensorStorage:
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None:
             raise RuntimeError("device TensorStorage residency requires a GPU RHI host")
+        if self._planned_device_writes:
+            return self._planned_buffer()
         if self._native_buffer is None or self._native_generation != state._runtime_generation:
             if self._native_buffer is not None and self._device_dirty:
                 self.synchronize()
@@ -894,9 +974,53 @@ class TensorStorage:
             self._upload_dirty_ranges()
         return self._native_buffer
 
+    def _begin_planned_upload(self) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
+        state = _session_state()
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("planned TensorStorage residency requires a GPU RHI host")
+        if self._native_buffer is not None and self._device_dirty:
+            raise RuntimeError("cannot replace device-dirty TensorStorage residency")
+        if self._planned_device_writes:
+            raise RuntimeError("cannot upload TensorStorage while a planned device write is pending")
+        transaction = _PlannedTensorState(self, "upload")
+        if self._native_buffer is None or self._native_generation != state._runtime_generation:
+            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
+            self._native_generation = state._runtime_generation
+            self._dirty_ranges.mark_all()
+        bytes_view = self._array.reshape(-1).view(np.uint8)
+        uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
+        return self._native_buffer, transaction, uploads
+
+    def _begin_planned_device_write(self) -> _PlannedTensorState:
+        if self._device_dirty:
+            raise RuntimeError("cannot overwrite device-dirty TensorStorage in a planned command program")
+        if self._planned_device_writes:
+            raise RuntimeError("TensorStorage already has a pending planned device write")
+        state = _session_state()
+        if state._native_runtime is None or state._rhi_host is None:
+            raise RuntimeError("planned TensorStorage write requires a GPU RHI host")
+        transaction = _PlannedTensorState(self, "write")
+        if self._native_buffer is None or self._native_generation != state._runtime_generation:
+            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
+            self._native_generation = state._runtime_generation
+        return transaction
+
+    def _planned_buffer(self) -> Any:
+        state = _session_state()
+        if (
+            self._native_buffer is None
+            or state._rhi_host is None
+            or self._native_generation != state._runtime_generation
+        ):
+            raise RuntimeError("planned TensorStorage buffer was not prepared")
+        return self._native_buffer
+
+    def _planned_device_write_pending(self) -> bool:
+        return self._planned_device_writes != 0
+
     def _upload_dirty_ranges(self) -> None:
         assert self._native_buffer is not None
-        bytes_view = self._array.view(np.uint8).reshape(-1)
+        bytes_view = self._array.reshape(-1).view(np.uint8)
         uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
         self._native_buffer.upload_ranges(uploads)
         self._dirty_ranges.clear()
@@ -1103,11 +1227,27 @@ class TensorView:
             arguments = (arguments,)
         return TypeExpr("TensorView", arguments)
 
-    if TYPE_CHECKING:
+    def __getitem__(self, index: Any) -> Any:
+        if self.access == "write":
+            raise PermissionError("cannot read from a write-only TensorView")
+        return self._borrowed_array()[index]
 
-        def __getitem__(self, index: Any) -> Any: ...
-
-        def __setitem__(self, index: Any, value: Any) -> None: ...
+    def __setitem__(self, index: Any, value: Any) -> None:
+        self._owner._ensure_host_mutation_allowed()
+        if self.access == "read":
+            raise PermissionError("cannot write through a read-only TensorView")
+        if not isinstance(self._owner, TensorStorage):
+            self._owner.synchronize()
+        target = self._native_host_array()
+        ranges = _array_byte_ranges(target, self._owner._array) if isinstance(self._owner, TensorStorage) else []
+        if isinstance(self._owner, TensorStorage):
+            self._owner._prepare_partial_host_write(ranges)
+        target[index] = value
+        if isinstance(self._owner, TensorStorage):
+            self._owner._mark_host_dirty(ranges, host_complete=False)
+        else:
+            self._owner._host_version += 1
+            self._owner._device_dirty = False
 
     @property
     def owner(self) -> TensorStorage | RawBuffer:
@@ -1139,6 +1279,26 @@ class TensorView:
             self._strides,
             self._offset,
         )
+
+    def _with_access(self, access: str) -> TensorView:
+        access = _checked_access(access)
+        if access in {"read", "read_write"} and self.access == "write":
+            raise ValueError("TensorView does not permit reads")
+        if access in {"write", "read_write"} and self.access == "read":
+            raise ValueError("TensorView does not permit writes")
+        if access == self.access:
+            return self
+        result = TensorView(
+            self.owner,
+            self.shape,
+            self._strides,
+            self._offset,
+            access,
+            dtype=self.dtype,
+            element_type=self.element_type,
+        )
+        result._components = self._components
+        return result
 
     def to_numpy(self) -> np.ndarray:
         if self.access == "write":
@@ -1235,6 +1395,47 @@ class TensorView:
         np.add(target, gradient, out=target)
         return destination
 
+    def _gradient_device_view(
+        self,
+        path: str,
+        destination: TensorStorage,
+        gradient_shape: tuple[int, ...],
+    ) -> TensorView:
+        gradient_shape = tuple(gradient_shape)
+        if self._element_type is not None and not isinstance(self._element_type, _Scalar):
+            layout = tangent_layout(self._element_type)
+            root = path.split(".", 1)[0]
+            leaf_path = path[len(root) + 1 :] if path != root else ""
+            leaf = layout.project(leaf_path)
+            if gradient_shape != (*self.shape, *leaf.shape):
+                raise ValueError("logical gradient shape does not match its aggregate device leaf")
+            return destination._tangent_view(
+                leaf_path,
+                shape=self.shape,
+                strides=self._strides,
+                offset=self._offset,
+                access="read_write",
+            )
+        trailing_shape = gradient_shape[len(self.shape) :]
+        if gradient_shape[: len(self.shape)] != self.shape:
+            raise ValueError("logical gradient shape does not match its device TensorView")
+        scalar_count = int(np.prod(trailing_shape, dtype=np.int64)) if trailing_shape else 1
+        inner_strides: list[int] = []
+        stride = 1
+        for extent in reversed(trailing_shape):
+            inner_strides.append(stride)
+            stride *= extent
+        inner_strides.reverse()
+        return destination.view(
+            shape=gradient_shape,
+            strides=(
+                *(value * scalar_count for value in self._strides),
+                *inner_strides,
+            ),
+            offset=self._offset * scalar_count,
+            access="read_write",
+        )
+
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._owner._ensure_host_mutation_allowed()
         if self.access == "read":
@@ -1261,6 +1462,15 @@ class TensorView:
 
     def _resident_buffer(self) -> Any:
         return self._owner._resident_buffer()
+
+    def _begin_planned_upload(self) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
+        return self._owner._begin_planned_upload()
+
+    def _planned_buffer(self) -> Any:
+        return self._owner._planned_buffer()
+
+    def _planned_device_write_pending(self) -> bool:
+        return self._owner._planned_device_write_pending()
 
     def _mark_device_dirty(self) -> None:
         self._owner._mark_device_dirty()

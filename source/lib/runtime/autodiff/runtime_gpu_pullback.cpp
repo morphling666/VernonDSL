@@ -1,5 +1,7 @@
 #include "runtime_gpu_pullback.h"
 
+#include "execution_graph/execution_graph_internal.h"
+#include "rhi/rhi_internal.h"
 #include "runtime/runtime_state.h"
 #include "runtime_autodiff_memory_usage.h"
 #include "runtime_gpu_argument_binding.h"
@@ -37,6 +39,19 @@ bool checkedAdd(size_t left, size_t right, size_t &result) {
     return true;
 }
 
+bool isMemoryBudgetFailure(const std::string &error) {
+    return error.find("budget") != std::string::npos || error.find("reserve") != std::string::npos;
+}
+
+bool flushForMemoryRetry(VernonRuntimeContext &context, execution::detail::RhiCommandPlanSink &sink) {
+    if (sink.flush() != VERNON_RHI_STATUS_OK) {
+        invocationDiagnostic(context) = "GPU pullback cannot flush pending commands for memory pressure";
+        return false;
+    }
+    invocationDiagnostic(context).clear();
+    return true;
+}
+
 bool isReplaySegment(const Parameter &parameter) {
     return parameter.autodiffRole == AutodiffResourceRole::ReplaySegment;
 }
@@ -58,7 +73,7 @@ const Parameter *findTape(const Variant &variant) {
     return found == variant.parameters.end() ? nullptr : &*found;
 }
 
-class NoTapePullback final : public PullbackExecution {
+class NoTapePullback final : public DevicePullbackExecution {
 public:
     NoTapePullback(VernonRuntimeContext &context, std::shared_ptr<const Signature> signature,
                    std::shared_ptr<OwnedPipeline> backward, std::shared_ptr<const BindingSpecPlan> bindingSpecs,
@@ -88,6 +103,67 @@ public:
         if (!derivatives.prepare(context_, *signature_, cotangents, gradients, *bindingSpecs_, extent,
                                  3 * sizeof(uint32_t), temporaryLimit, derivativeError))
             return fail(context_, std::move(derivativeError), derivatives.failureStatus);
+        return applyPrepared(derivatives, derivativeError, false);
+    }
+
+    VernonStatus applyDevice(const VernonAdDeviceValueSet *cotangents, VernonAdDeviceValueSet &gradients,
+                             const PullbackApplyOptions &options,
+                             execution::detail::RhiCommandPlanSink *sink) override {
+        VernonLaunchSize extent{};
+        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+            return fail(context_, "GPU device pullback invocation extent overflows");
+        for (bool retry = sink != nullptr;; retry = false) {
+            control_ = {};
+            size_t temporaryLimit = 0;
+            std::shared_ptr<AutodiffMemoryReservation> applyReservation =
+                reserveApplyMemory(context_, options.maximumTemporaryBytes, temporaryLimit);
+            if (!applyReservation) {
+                if (retry) {
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return fail(context_, "GPU device pullback cannot reserve apply-time memory budget");
+            }
+            PreparedDerivativeValues derivatives;
+            std::string derivativeError;
+            if (!derivatives.prepareDevice(context_, *signature_, cotangents, gradients, *bindingSpecs_, extent,
+                                           3 * sizeof(uint32_t), temporaryLimit, derivativeError)) {
+                if (retry && isMemoryBudgetFailure(derivativeError)) {
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return fail(context_, std::move(derivativeError), derivatives.failureStatus);
+            }
+            size_t actualTemporaryBytes = 0;
+            const VernonStatus status = applyPrepared(derivatives, derivativeError, true, sink, &actualTemporaryBytes);
+            if (status != VERNON_STATUS_OK) {
+                if (retry && isMemoryBudgetFailure(invocationDiagnostic(context_))) {
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return status;
+            }
+            if (!applyReservation->shrink(actualTemporaryBytes))
+                return fail(context_, "GPU device pullback reservation accounting failed",
+                            VERNON_STATUS_INTERNAL_ERROR);
+            if (sink) {
+                sink->retain(std::make_shared<PreparedDerivativeValues>(std::move(derivatives)));
+                sink->retain(std::move(applyReservation));
+            }
+            return VERNON_STATUS_OK;
+        }
+    }
+
+    PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
+    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
+
+private:
+    VernonStatus applyPrepared(PreparedDerivativeValues &derivatives, std::string &derivativeError,
+                               bool deviceGradients, execution::detail::RhiCommandPlanSink *sink = nullptr,
+                               size_t *actualTemporaryBytes = nullptr) {
         control_.temporaryAllocationBytes = derivatives.temporaryBytes;
 
         DeviceValues working;
@@ -101,8 +177,8 @@ public:
         const uint32_t launchData[3]{grid_.x, grid_.y, grid_.z};
         DeviceBuffer launchBuffer(context_, sizeof(launchData));
         InternalBufferView launchView;
-        if (!launchBuffer.upload(launchData, sizeof(launchData)))
-            return fail(context_, "cannot upload GPU pullback launch metadata", VERNON_STATUS_INTERNAL_ERROR);
+        if (!launchBuffer.valid())
+            return fail(context_, "cannot allocate GPU pullback launch metadata", VERNON_STATUS_INTERNAL_ERROR);
         for (const Binding &binding : bindings) {
             const Parameter &parameter = *binding.parameter;
             if (binding.source == BindingSource::Launch) {
@@ -114,22 +190,38 @@ public:
             if (!appendBindingArgument(binding, arguments))
                 return fail(context_, "cannot bind GPU pullback argument", VERNON_STATUS_INTERNAL_ERROR);
         }
-        VernonStatus status = submitAndWait(**backward_, grid_, arguments, &control_);
+        std::vector<DeviceBufferCopy> publicationCopies;
+        const std::vector<DeviceBufferUpload> uploads{{launchBuffer.handle(), 0, launchData, sizeof(launchData)}};
+        if (deviceGradients && (!derivatives.devicePublicationCopies(publicationCopies, derivativeError) ||
+                                injectFailure(FailureBoundary::Publication)))
+            return fail(context_,
+                        derivativeError.empty() ? "cannot publish GPU device gradients" : std::move(derivativeError),
+                        VERNON_STATUS_INTERNAL_ERROR);
+        VernonStatus status =
+            deviceGradients
+                ? executePipelineCommandDagAndWait(context_, {}, uploads, **backward_, arguments, grid_,
+                                                   publicationCopies, execution::detail::CommandNodeKind::Derivative,
+                                                   &control_, sink)
+                : executePipelineCommandDagAndWait(**backward_, grid_, arguments, uploads,
+                                                   execution::detail::CommandNodeKind::Derivative, &control_, sink);
         if (status != VERNON_STATUS_OK)
             return status;
-        if (!derivatives.stageGradients(*signature_, derivativeError))
-            return fail(context_, std::move(derivativeError), VERNON_STATUS_INTERNAL_ERROR);
-        control_.readbacks += signature_->gradients.size();
-        if (!derivatives.publishGradients())
-            return fail(context_, "cannot publish GPU pullback gradients", VERNON_STATUS_INTERNAL_ERROR);
+        if (!deviceGradients) {
+            if (!derivatives.stageGradients(*signature_, derivativeError))
+                return fail(context_, std::move(derivativeError), VERNON_STATUS_INTERNAL_ERROR);
+            control_.readbacks += signature_->gradients.size();
+            if (!derivatives.publishGradients())
+                return fail(context_, "cannot publish GPU pullback gradients", VERNON_STATUS_INTERNAL_ERROR);
+        }
+        if (sink) {
+            sink->retain(std::make_shared<DeviceValues>(std::move(working)));
+            sink->retain(std::make_shared<DeviceBuffer>(std::move(launchBuffer)));
+        }
+        if (actualTemporaryBytes)
+            *actualTemporaryBytes = derivatives.temporaryBytes;
         memory_.observeTemporary(derivatives.temporaryBytes);
         return VERNON_STATUS_OK;
     }
-
-    PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
-    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
-
-private:
     VernonRuntimeContext &context_;
     std::shared_ptr<const Signature> signature_;
     std::shared_ptr<OwnedPipeline> backward_;
@@ -142,19 +234,21 @@ private:
     PullbackControlPlaneUsage control_;
 };
 
-class TapePullback final : public PullbackExecution {
+class TapePullback final : public DevicePullbackExecution {
 public:
     TapePullback(VernonRuntimeContext &context, std::shared_ptr<const Signature> signature,
                  std::shared_ptr<OwnedPipeline> forward, std::shared_ptr<OwnedPipeline> backward,
                  std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
                  std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs, VernonLaunchSize grid,
                  DeviceValues retainedDevices, HostValues retainedHosts, size_t staticTapeBytesHint,
-                 PlanningPolicy planningPolicy)
+                 std::shared_ptr<std::atomic<size_t>> learnedTapeStride, PlanningPolicy planningPolicy,
+                 bool requiresTapeStatus)
         : context_(context), signature_(std::move(signature)), forward_(std::move(forward)),
           backward_(std::move(backward)), forwardBindingSpecs_(std::move(forwardBindingSpecs)),
           backwardBindingSpecs_(std::move(backwardBindingSpecs)), grid_(grid),
           retainedDevices_(std::move(retainedDevices)), retainedHosts_(std::move(retainedHosts)),
-          staticTapeBytesHint_(staticTapeBytesHint), planningPolicy_(planningPolicy) {
+          staticTapeBytesHint_(staticTapeBytesHint), learnedTapeStride_(std::move(learnedTapeStride)),
+          planningPolicy_(planningPolicy), requiresTapeStatus_(requiresTapeStatus) {
         retainedReservation_ =
             reserveRetainedValues(context_, retainedDevices_, retainedHosts_, memory_.retainedAllocationBytes);
     }
@@ -177,6 +271,73 @@ public:
         if (!derivatives.prepare(context_, *signature_, cotangents, gradients, *backwardBindingSpecs_, extent,
                                  3 * sizeof(uint32_t), temporaryLimit, derivativeError))
             return fail(context_, std::move(derivativeError), derivatives.failureStatus);
+        return applyPrepared(derivatives, derivativeError, temporaryLimit, false);
+    }
+
+    VernonStatus applyDevice(const VernonAdDeviceValueSet *cotangents, VernonAdDeviceValueSet &gradients,
+                             const PullbackApplyOptions &options,
+                             execution::detail::RhiCommandPlanSink *sink) override {
+        VernonLaunchSize extent{};
+        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+            return fail(context_, "GPU device pullback invocation extent overflows");
+        uint64_t retryReadbacks = 0;
+        for (bool retry = sink != nullptr;; retry = false) {
+            control_ = {};
+            size_t temporaryLimit = 0;
+            std::shared_ptr<AutodiffMemoryReservation> applyReservation =
+                reserveApplyMemory(context_, options.maximumTemporaryBytes, temporaryLimit);
+            if (!applyReservation) {
+                if (retry) {
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return fail(context_, "GPU bounded replay cannot reserve device apply-time memory budget");
+            }
+            PreparedDerivativeValues derivatives;
+            std::string derivativeError;
+            if (!derivatives.prepareDevice(context_, *signature_, cotangents, gradients, *backwardBindingSpecs_, extent,
+                                           3 * sizeof(uint32_t), temporaryLimit, derivativeError)) {
+                if (retry && isMemoryBudgetFailure(derivativeError)) {
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return fail(context_, std::move(derivativeError), derivatives.failureStatus);
+            }
+            size_t actualTemporaryBytes = 0;
+            const VernonStatus status =
+                applyPrepared(derivatives, derivativeError, temporaryLimit, true, sink, &actualTemporaryBytes);
+            if (status != VERNON_STATUS_OK) {
+                if (retry && isMemoryBudgetFailure(invocationDiagnostic(context_))) {
+                    retryReadbacks = control_.readbacks;
+                    if (!flushForMemoryRetry(context_, *sink))
+                        return VERNON_STATUS_INTERNAL_ERROR;
+                    continue;
+                }
+                return status;
+            }
+            if (retryReadbacks > std::numeric_limits<uint64_t>::max() - control_.readbacks)
+                return fail(context_, "GPU bounded-replay readback telemetry overflows", VERNON_STATUS_INTERNAL_ERROR);
+            control_.readbacks += retryReadbacks;
+            if (!applyReservation->shrink(actualTemporaryBytes))
+                return fail(context_, "GPU bounded-replay reservation accounting failed", VERNON_STATUS_INTERNAL_ERROR);
+            if (sink) {
+                sink->retain(std::make_shared<PreparedDerivativeValues>(std::move(derivatives)));
+                sink->retain(std::move(applyReservation));
+            }
+            return VERNON_STATUS_OK;
+        }
+    }
+
+    PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
+    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
+
+private:
+    VernonStatus applyPrepared(PreparedDerivativeValues &derivatives, std::string &derivativeError,
+                               size_t temporaryLimit, bool deviceGradients,
+                               execution::detail::RhiCommandPlanSink *sink = nullptr,
+                               size_t *actualTemporaryBytes = nullptr) {
         control_.temporaryAllocationBytes = derivatives.temporaryBytes;
 
         DeviceValues working;
@@ -196,7 +357,7 @@ public:
             if (!ok)
                 return fail(context_, "cannot index GPU replay primal shadow", VERNON_STATUS_INTERNAL_ERROR);
             initialCopies.push_back(
-                {retained.buffer.handle(), inserted->second.buffer.handle(), 0, retained.buffer.size()});
+                {retained.buffer.handle(), inserted->second.buffer.handle(), 0, 0, retained.buffer.size()});
         }
         BindingPlan forwardBindings;
         BindingPlan backwardBindings;
@@ -213,7 +374,7 @@ public:
             if (!checkedMultiply(workgroupVolume, static_cast<size_t>(extent), workgroupVolume))
                 return fail(context_, "GPU bounded-replay workgroup volume overflows", VERNON_STATUS_INTERNAL_ERROR);
         constexpr size_t statusBytes = sizeof(BatchSummary);
-        size_t tapeStride = staticTapeBytesHint_;
+        size_t tapeStride = std::max(staticTapeBytesHint_, learnedTapeStride_->load(std::memory_order_relaxed));
         if (!normalizeTapeStride(tapeStride, tapeStride))
             return fail(context_, "GPU bounded-replay Tape size overflows", VERNON_STATUS_INTERNAL_ERROR);
         size_t groupTapeBytes = 0;
@@ -226,7 +387,7 @@ public:
                 return fail(context_, "GPU bounded-replay group count overflows", VERNON_STATUS_INTERNAL_ERROR);
         BatchBudget batchBudget;
         if (!planBatchBudget(planningPolicy_, derivatives.temporaryBytes, temporaryLimit, groupCount, groupTapeBytes,
-                             statusBytes, batchBudget))
+                             statusBytes, batchBudget, requiresTapeStatus_))
             return fail(context_, "GPU bounded-replay temporary memory exceeds the apply-time budget");
         size_t batchCapacity = batchBudget.capacity;
         size_t tapeBytes = batchBudget.tapeBytes;
@@ -244,8 +405,7 @@ public:
         DeviceBuffer replayStatus(context_, statusBufferBytes);
         const uint32_t launchData[3]{grid_.x, grid_.y, grid_.z};
         DeviceBuffer launch(context_, sizeof(launchData));
-        if (!tape.valid() || !segment.valid() || !replayStatus.valid() ||
-            !launch.upload(launchData, sizeof(launchData)))
+        if (!tape.valid() || !segment.valid() || !replayStatus.valid() || !launch.valid())
             return fail(context_, "cannot allocate GPU bounded-replay resources", VERNON_STATUS_INTERNAL_ERROR);
         control_.temporaryAllocationBytes += tapeBytes + segmentBytes + statusBufferBytes + sizeof(launchData);
 
@@ -255,6 +415,97 @@ public:
         ReverseBatchScheduler scheduler(groupCount, batchCapacity);
         if (!scheduler.valid())
             return fail(context_, "GPU replay scheduler has zero batch capacity", VERNON_STATUS_INTERNAL_ERROR);
+        std::vector<DeviceBufferCopy> publicationCopies;
+        if (deviceGradients && (!derivatives.devicePublicationCopies(publicationCopies, derivativeError) ||
+                                injectFailure(FailureBoundary::Publication)))
+            return fail(context_,
+                        derivativeError.empty() ? "cannot publish GPU replay device gradients"
+                                                : std::move(derivativeError),
+                        VERNON_STATUS_INTERNAL_ERROR);
+        const bool canChainStaticReplay = vernon::rhi::deviceCommandCapabilities(context_.rhiDevice) &
+                                          vernon::rhi::BackendCommandExplicitComputeDependencies;
+        if (!requiresTapeStatus_ && canChainStaticReplay) {
+            ReverseBatchScheduler staticScheduler(groupCount, batchCapacity);
+            execution::detail::RhiCommandExecutionPlan staticPlan;
+            bool firstBatch = true;
+            while (!staticScheduler.empty()) {
+                const BatchRange batch = staticScheduler.current();
+                std::vector<Segment> metadata(batch.count);
+                for (size_t index = 0; index < batch.count; ++index)
+                    if (!initializeBatchSegment(grid_, (*forward_)->workgroupSize, batch.begin + index, index,
+                                                tapeStride, workgroupVolume, tapeBytes, metadata[index]))
+                        return fail(context_, "cannot build static GPU replay segment metadata",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                if (!firstBatch && !planReplayRestoreCopies(**forward_, working, retainedDevices_, pendingCopies))
+                    return fail(context_, "cannot restore static GPU replay primal shadow",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                const BatchSummary emptySummary{};
+                std::vector<DeviceBufferUpload> uploads{
+                    {segment.handle(), 0, metadata.data(), metadata.size() * sizeof(Segment)},
+                    {replayStatus.handle(), 0, &emptySummary, sizeof(emptySummary)}};
+                if (firstBatch)
+                    uploads.push_back({launch.handle(), 0, launchData, sizeof(launchData)});
+                std::vector<VernonPipelineArgument> arguments;
+                ReplayArgumentViews views;
+                if (!appendReplayArguments(context_, forwardBindings, tape, tapeBytes, segment, segmentBytes,
+                                           replayStatus, statusBufferBytes, launch, sizeof(launchData), views,
+                                           arguments, failedParameter))
+                    return fail(context_, "cannot bind static GPU replay forward resource '" + failedParameter + "'",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                execution::detail::RhiCommandExecutionPlan forwardPlan;
+                if (const VernonStatus status =
+                        buildPipelineCommandPlan(context_, pendingCopies, uploads, **forward_, arguments,
+                                                 {static_cast<uint32_t>(batch.count), 1, 1}, {},
+                                                 execution::detail::CommandNodeKind::Replay, forwardPlan);
+                    status != VERNON_STATUS_OK)
+                    return status;
+                std::string compositionError;
+                if (!execution::detail::appendRhiCommandExecutionPlan(staticPlan, std::move(forwardPlan), true,
+                                                                      compositionError))
+                    return fail(context_, std::move(compositionError), VERNON_STATUS_INTERNAL_ERROR);
+                arguments.clear();
+                views = {};
+                if (!appendReplayArguments(context_, backwardBindings, tape, tapeBytes, segment, segmentBytes,
+                                           replayStatus, statusBufferBytes, launch, sizeof(launchData), views,
+                                           arguments, failedParameter))
+                    return fail(context_, "cannot bind static GPU replay backward resource '" + failedParameter + "'",
+                                VERNON_STATUS_INTERNAL_ERROR);
+                execution::detail::RhiCommandExecutionPlan backwardPlan;
+                const std::vector<DeviceBufferCopy> &copiesAfter =
+                    deviceGradients && batch.begin == 0 ? publicationCopies : std::vector<DeviceBufferCopy>{};
+                if (const VernonStatus status = buildPipelineCommandPlan(
+                        context_, {}, {}, **backward_, arguments, {static_cast<uint32_t>(batch.count), 1, 1},
+                        copiesAfter, execution::detail::CommandNodeKind::Derivative, backwardPlan);
+                    status != VERNON_STATUS_OK)
+                    return status;
+                if (!execution::detail::appendRhiCommandExecutionPlan(staticPlan, std::move(backwardPlan), true,
+                                                                      compositionError))
+                    return fail(context_, std::move(compositionError), VERNON_STATUS_INTERNAL_ERROR);
+                pendingCopies.clear();
+                firstBatch = false;
+                staticScheduler.commit();
+            }
+            const VernonStatus staticStatus = executeCommandPlanAndWait(context_, staticPlan, &control_, sink);
+            if (staticStatus != VERNON_STATUS_OK)
+                return staticStatus;
+            if (sink) {
+                sink->retain(std::make_shared<DeviceValues>(std::move(working)));
+                sink->retain(std::make_shared<DeviceBuffer>(std::move(tape)));
+                sink->retain(std::make_shared<DeviceBuffer>(std::move(segment)));
+                sink->retain(std::make_shared<DeviceBuffer>(std::move(replayStatus)));
+                sink->retain(std::make_shared<DeviceBuffer>(std::move(launch)));
+            } else if (!deviceGradients) {
+                if (!derivatives.stageGradients(*signature_, derivativeError))
+                    return fail(context_, std::move(derivativeError), VERNON_STATUS_INTERNAL_ERROR);
+                control_.readbacks += signature_->gradients.size();
+                if (!derivatives.publishGradients())
+                    return fail(context_, "cannot publish static GPU pullback gradients", VERNON_STATUS_INTERNAL_ERROR);
+            }
+            if (actualTemporaryBytes)
+                *actualTemporaryBytes = peakTemporaryBytes;
+            memory_.observeTemporary(peakTemporaryBytes);
+            return VERNON_STATUS_OK;
+        }
         while (!scheduler.empty()) {
             BatchRange batch = scheduler.current();
             size_t batchGroups = batch.count;
@@ -269,11 +520,11 @@ public:
                     if (!initializeBatchSegment(grid_, (*forward_)->workgroupSize, batchBegin + index, index,
                                                 tapeStride, workgroupVolume, tapeBytes, metadata[index]))
                         return fail(context_, "cannot initialize GPU replay segment", VERNON_STATUS_INTERNAL_ERROR);
-                if (!segment.upload(0, metadata.data(), metadata.size() * sizeof(Segment)))
-                    return fail(context_, "cannot upload GPU replay segment", VERNON_STATUS_INTERNAL_ERROR);
                 const BatchSummary emptySummary{};
-                if (!replayStatus.upload(0, &emptySummary, sizeof(emptySummary)))
-                    return fail(context_, "cannot clear GPU replay batch summary", VERNON_STATUS_INTERNAL_ERROR);
+                const std::vector<DeviceBufferUpload> uploads{
+                    {segment.handle(), 0, metadata.data(), metadata.size() * sizeof(Segment)},
+                    {replayStatus.handle(), 0, &emptySummary, sizeof(emptySummary)},
+                    {launch.handle(), 0, launchData, sizeof(launchData)}};
                 std::vector<VernonPipelineArgument> arguments;
                 ReplayArgumentViews forwardViews;
                 if (!appendReplayArguments(context_, forwardBindings, tape, tapeBytes, segment, segmentBytes,
@@ -281,20 +532,27 @@ public:
                                            arguments, failedParameter))
                     return fail(context_, "cannot bind GPU replay forward resource '" + failedParameter + "'",
                                 VERNON_STATUS_INTERNAL_ERROR);
-                VernonStatus status =
-                    pendingCopies.empty()
-                        ? submitAndWait(**forward_, {static_cast<uint32_t>(batchGroups), 1, 1}, arguments, &control_)
-                        : submitWithCopiesAndWait(context_, pendingCopies, **forward_, arguments,
-                                                  {static_cast<uint32_t>(batchGroups), 1, 1}, &control_);
+                BatchSummary summary{};
+                struct StatusContext {
+                    const DeviceBuffer &buffer;
+                    BatchSummary &summary;
+                } statusContext{replayStatus, summary};
+                const auto readStatus = [](void *opaque) {
+                    auto &state = *static_cast<StatusContext *>(opaque);
+                    return state.buffer.download(0, &state.summary, sizeof(state.summary))
+                               ? VERNON_RHI_STATUS_OK
+                               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+                };
+                VernonStatus status = executePipelineStatusCommandDagAndWait(
+                    context_, pendingCopies, **forward_, arguments, {static_cast<uint32_t>(batchGroups), 1, 1}, uploads,
+                    replayStatus.handle(), 0, sizeof(summary), readStatus, &statusContext,
+                    execution::detail::CommandNodeKind::Replay, &control_, sink);
                 if (status != VERNON_STATUS_OK)
                     return status;
                 pendingCopies.clear();
                 size_t batchLanes = 0;
                 if (!checkedMultiply(batchGroups, workgroupVolume, batchLanes))
                     return fail(context_, "GPU replay batch lane count overflows", VERNON_STATUS_INTERNAL_ERROR);
-                BatchSummary summary{};
-                if (!replayStatus.download(0, &summary, sizeof(summary)))
-                    return fail(context_, "cannot read GPU replay batch summary", VERNON_STATUS_INTERNAL_ERROR);
                 ++control_.readbacks;
                 size_t requiredStride = 0;
                 size_t required = 0;
@@ -308,11 +566,16 @@ public:
                     return fail(context_, "GPU Tape construction failed", VERNON_STATUS_INTERNAL_ERROR);
                 if (!normalizeTapeStride(requiredStride, requiredStride))
                     return fail(context_, "GPU dynamic Tape stride overflows", VERNON_STATUS_INTERNAL_ERROR);
+                size_t learnedStride = learnedTapeStride_->load(std::memory_order_relaxed);
+                while (learnedStride < requiredStride &&
+                       !learnedTapeStride_->compare_exchange_weak(learnedStride, requiredStride,
+                                                                  std::memory_order_relaxed)) {
+                }
                 size_t requiredGroupBytes = 0;
                 BatchBudget replacementBudget;
                 if (!checkedMultiply(requiredStride, workgroupVolume, requiredGroupBytes) ||
                     !planBatchBudget(planningPolicy_, derivatives.temporaryBytes, temporaryLimit, groupCount,
-                                     requiredGroupBytes, statusBytes, replacementBudget))
+                                     requiredGroupBytes, statusBytes, replacementBudget, requiresTapeStatus_))
                     return fail(context_, "GPU dynamic Tape required bytes exceed the apply-time budget");
                 if (injectFailure(FailureBoundary::Resize))
                     return fail(context_, "injected GPU dynamic replay resize failure", VERNON_STATUS_INTERNAL_ERROR);
@@ -354,26 +617,38 @@ public:
                                        failedParameter))
                 return fail(context_, "cannot bind GPU replay backward resource '" + failedParameter + "'",
                             VERNON_STATUS_INTERNAL_ERROR);
+            const VernonLaunchSize backwardGrid{static_cast<uint32_t>(batchGroups), 1, 1};
             VernonStatus status =
-                submitAndWait(**backward_, {static_cast<uint32_t>(batchGroups), 1, 1}, arguments, &control_);
+                deviceGradients && batch.begin == 0
+                    ? executePipelineCommandDagAndWait(context_, {}, {}, **backward_, arguments, backwardGrid,
+                                                       publicationCopies,
+                                                       execution::detail::CommandNodeKind::Derivative, &control_, sink)
+                    : executePipelineCommandDagAndWait(**backward_, backwardGrid, arguments, {},
+                                                       execution::detail::CommandNodeKind::Derivative, &control_, sink);
             if (status != VERNON_STATUS_OK)
                 return status;
             scheduler.commit();
         }
 
-        if (!derivatives.stageGradients(*signature_, derivativeError))
-            return fail(context_, std::move(derivativeError), VERNON_STATUS_INTERNAL_ERROR);
-        control_.readbacks += signature_->gradients.size();
-        if (!derivatives.publishGradients())
-            return fail(context_, "cannot publish GPU pullback gradients", VERNON_STATUS_INTERNAL_ERROR);
+        if (!deviceGradients) {
+            if (!derivatives.stageGradients(*signature_, derivativeError))
+                return fail(context_, std::move(derivativeError), VERNON_STATUS_INTERNAL_ERROR);
+            control_.readbacks += signature_->gradients.size();
+            if (!derivatives.publishGradients())
+                return fail(context_, "cannot publish GPU pullback gradients", VERNON_STATUS_INTERNAL_ERROR);
+        }
+        if (sink) {
+            sink->retain(std::make_shared<DeviceValues>(std::move(working)));
+            sink->retain(std::make_shared<DeviceBuffer>(std::move(tape)));
+            sink->retain(std::make_shared<DeviceBuffer>(std::move(segment)));
+            sink->retain(std::make_shared<DeviceBuffer>(std::move(replayStatus)));
+            sink->retain(std::make_shared<DeviceBuffer>(std::move(launch)));
+        }
+        if (actualTemporaryBytes)
+            *actualTemporaryBytes = peakTemporaryBytes;
         memory_.observeTemporary(peakTemporaryBytes);
         return VERNON_STATUS_OK;
     }
-
-    PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
-    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
-
-private:
     VernonRuntimeContext &context_;
     std::shared_ptr<const Signature> signature_;
     std::shared_ptr<OwnedPipeline> forward_;
@@ -386,7 +661,9 @@ private:
     std::shared_ptr<AutodiffMemoryReservation> retainedReservation_;
     MemoryAccounting memory_;
     size_t staticTapeBytesHint_{};
+    std::shared_ptr<std::atomic<size_t>> learnedTapeStride_;
     PlanningPolicy planningPolicy_{};
+    bool requiresTapeStatus_{true};
     PullbackControlPlaneUsage control_;
 };
 
@@ -406,11 +683,12 @@ std::unique_ptr<PullbackExecution> createTapePullback(
     VernonRuntimeContext &context, std::shared_ptr<const Signature> signature, std::shared_ptr<OwnedPipeline> forward,
     std::shared_ptr<OwnedPipeline> backward, std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
     std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs, VernonLaunchSize grid, DeviceValues retainedDevices,
-    HostValues retainedHosts, size_t staticTapeBytesHint, PlanningPolicy planningPolicy) {
-    auto pullback = std::make_unique<TapePullback>(context, std::move(signature), std::move(forward),
-                                                   std::move(backward), std::move(forwardBindingSpecs),
-                                                   std::move(backwardBindingSpecs), grid, std::move(retainedDevices),
-                                                   std::move(retainedHosts), staticTapeBytesHint, planningPolicy);
+    HostValues retainedHosts, size_t staticTapeBytesHint, std::shared_ptr<std::atomic<size_t>> learnedTapeStride,
+    PlanningPolicy planningPolicy, bool requiresTapeStatus) {
+    auto pullback = std::make_unique<TapePullback>(
+        context, std::move(signature), std::move(forward), std::move(backward), std::move(forwardBindingSpecs),
+        std::move(backwardBindingSpecs), grid, std::move(retainedDevices), std::move(retainedHosts),
+        staticTapeBytesHint, std::move(learnedTapeStride), planningPolicy, requiresTapeStatus);
     return pullback->valid() ? std::move(pullback) : nullptr;
 }
 

@@ -13,11 +13,20 @@ enum CommandRenderingKind : uint32_t {
     CommandRenderingRenderPass = 2,
     CommandRenderingStateless = 3
 };
+enum BackendCommandCapabilityBits : uint32_t {
+    BackendCommandIndependentRecording = 1u << 0,
+    BackendCommandConcurrentSubmission = 1u << 1,
+    BackendCommandTimelineCompletion = 1u << 2,
+    BackendCommandGpuTimestamps = 1u << 3,
+    BackendCommandExplicitComputeDependencies = 1u << 4,
+};
 
 struct BackendDispatch {
     // Optional operations are null when the backend does not expose that
     // resource or command capability; the entry layer reports unsupported.
     VernonRhiBackend backend;
+    uint32_t commandCapabilities;
+    uint32_t (*commandCapabilitiesForDevice)(VernonRhiDevice);
     bool (*ownsDevice)(VernonRhiDevice);
     VernonRhiDevice (*createOwnedDevice)(const VernonRhiOwnedDeviceDescriptor *);
     void (*destroyDevice)(VernonRhiDevice);
@@ -58,7 +67,8 @@ struct BackendDispatch {
 
     bool (*beginCommands)(VernonRhiDevice, uint64_t &, VernonRhiBackend &);
     bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &, bool &);
-    void (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
+    bool (*pollCommands)(VernonRhiDevice, uint64_t, bool &, bool &);
+    bool (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);
     bool (*recordBufferCopy)(VernonRhiDevice, uint64_t, VernonRhiBuffer, uint64_t, VernonRhiBuffer, uint64_t, uint64_t);

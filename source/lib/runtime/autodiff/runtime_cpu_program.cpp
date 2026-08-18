@@ -249,7 +249,7 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
                 }
                 shape.push_back(extent);
             }
-            if (shape.empty() || argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()) ||
+            if (argument.size != sizeof(uint64_t) * (2 + 2 * shape.size()) ||
                 (access != "read" && access != "write" && access != "read_write")) {
                 error = "autodiff TensorView argument has an invalid host descriptor";
                 return false;

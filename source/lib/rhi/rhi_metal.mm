@@ -17,6 +17,7 @@
 
 namespace vernon::rhi {
 uint32_t metalTexturePixelFormat(VernonTextureFormat format);
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
 }
 
 namespace {
@@ -295,6 +296,11 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+        vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level Metal upload cannot execute while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     return device->state.uploadBuffer(slot->native, offset, source, size, device->error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -311,6 +317,11 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
     MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+        vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level Metal upload cannot execute while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
@@ -770,16 +781,24 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool, bool &complet
     if (!device)
         return false;
     std::lock_guard<std::mutex> guard(device->mutex);
-    completed = device->state.submitCommands(native, device->error);
-    return completed;
+    completed = false;
+    return device->state.submitCommands(native, device->error);
 }
 
-void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+bool pollCommands(VernonRhiDevice handle, uint64_t native, bool &completed, bool &succeeded) {
     auto device = lookupMetalDevice(handle);
-    if (device) {
-        std::lock_guard<std::mutex> guard(device->mutex);
-        device->state.completeCommands(native);
-    }
+    if (!device)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return device->state.pollCommands(native, completed, succeeded, device->error);
+}
+
+bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+    auto device = lookupMetalDevice(handle);
+    if (!device)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    return device->state.completeCommands(native, device->error);
 }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
@@ -992,6 +1011,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
     using namespace metal_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_METAL,
+        BackendCommandIndependentRecording | BackendCommandConcurrentSubmission,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         destroyDevice,
@@ -1026,6 +1047,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
+        pollCommands,
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,

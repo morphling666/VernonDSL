@@ -21,6 +21,10 @@
 #include <utility>
 #include <vector>
 
+namespace vernon::rhi {
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
+}
+
 namespace {
 struct VulkanBufferSlot : vernon::rhi::LogicalResourceRecord {
     vernon::rhi::vulkan::Buffer buffer;
@@ -778,7 +782,8 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0)
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     VulkanBufferSlot &slot = allocateVulkanSlot(device->buffers, *output);
@@ -796,10 +801,28 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
     const VkDeviceSize allocationSize = (descriptor->size + 3) & ~VkDeviceSize{3};
-    if (!device->state.createBuffer(slot.buffer, allocationSize, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                    device->error)) {
+    const VkMemoryPropertyFlags requiredMemory =
+        descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE
+            ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+            : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const VkMemoryPropertyFlags preferredMemory =
+        descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE ? 0 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    if (!device->state.createBuffer(slot.buffer, allocationSize, usage, requiredMemory, device->error,
+                                    preferredMemory)) {
         releaseVulkanSlot(slot);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    if (descriptor->memory_class != VERNON_RHI_MEMORY_DEVICE) {
+        void *mapped = nullptr;
+        const VkResult mapResult = vernon::rhi::vulkan::driver().mapMemory(device->state.device, slot.buffer.memory, 0,
+                                                                           allocationSize, 0, &mapped);
+        if (mapResult != VK_SUCCESS) {
+            device->error = "vkMapMemory failed with Vulkan error " + std::to_string(static_cast<int>(mapResult));
+            device->state.destroyBuffer(slot.buffer);
+            releaseVulkanSlot(slot);
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        slot.buffer.mapped = static_cast<uint8_t *>(mapped);
     }
     slot.ownedDescriptor = *descriptor;
     return VERNON_RHI_STATUS_OK;
@@ -825,6 +848,22 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
     VulkanBufferSlot *slot = lookupVulkanSlot(device->buffers, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
+        if (!slot->buffer.mapped)
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        for (size_t index = 0; index < rangeCount; ++index) {
+            const VernonRhiBufferUploadRange &range = ranges[index];
+            if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+                range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            std::memcpy(slot->buffer.mapped + range.offset, range.source, static_cast<size_t>(range.size));
+        }
+        return VERNON_RHI_STATUS_OK;
+    }
+    if (vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level Vulkan upload cannot submit while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     std::vector<VkBufferCopy> copies;
     copies.reserve(rangeCount);
     VkDeviceSize packedSize = 0;
@@ -1495,7 +1534,7 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     return submitted;
 }
 
-void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {}
+bool completeBorrowedCommands(VernonRhiDevice, uint64_t) { return true; }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
     auto device = lookupVulkanDevice(handle);
@@ -1503,12 +1542,7 @@ void abandonCommands(VernonRhiDevice handle, uint64_t native) {
         return;
 
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (!device->state.nativeObjectsBorrowed) {
-        const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
-        if (command)
-            vernon::rhi::vulkan::driver().endCommandBuffer(command);
-    }
-    return;
+    device->state.abandonCommands(vulkanHandle<VkCommandBuffer>(native));
 }
 
 bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, const VernonRhiBarrier *barriers,
@@ -1876,6 +1910,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
     using namespace vulkan_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_VULKAN,
+        BackendCommandIndependentRecording,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         vulkan_api::destroyDevice,
@@ -1910,6 +1946,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
+        nullptr,
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,

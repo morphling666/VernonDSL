@@ -13,8 +13,10 @@ VERNON_RHI_CAPI void destroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView deviceLastError(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonRhiStatus synchronizeDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI bool deviceExists(VernonRhiDevice device);
+VERNON_RHI_CAPI uint32_t deviceCommandCapabilities(VernonRhiDevice device);
 VERNON_RHI_CAPI bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
 VERNON_RHI_CAPI void drainDeviceCompletions(VernonRhiDevice device);
+VERNON_RHI_CAPI void forgetDeviceCommandLimits(VernonRhiDevice device);
 VERNON_RHI_CAPI void *deviceState(VernonRhiDevice device, VernonRhiBackend backend);
 VERNON_RHI_CAPI uint64_t bufferResource(VernonRhiDevice device, VernonRhiBuffer buffer);
 VERNON_RHI_CAPI uint64_t imageResource(VernonRhiDevice device, VernonRhiImage image);
@@ -29,7 +31,8 @@ VERNON_RHI_CAPI bool describeImageViewResource(VernonRhiDevice device, uint64_t 
 VERNON_RHI_CAPI bool beginCommandRecording(VernonRhiDevice device, uint64_t &native, VernonRhiBackend &backend);
 VERNON_RHI_CAPI bool submitCommandRecording(VernonRhiDevice device, uint64_t native, bool compute_writes,
                                             bool &completed, bool &external_completion);
-VERNON_RHI_CAPI void completeBorrowedCommandRecording(VernonRhiDevice device, uint64_t native);
+VERNON_RHI_CAPI bool pollCommandRecording(VernonRhiDevice device, uint64_t native, bool &completed, bool &succeeded);
+VERNON_RHI_CAPI bool completeCommandRecording(VernonRhiDevice device, uint64_t native);
 VERNON_RHI_CAPI void abandonCommandRecording(VernonRhiDevice device, uint64_t native);
 VERNON_RHI_CAPI VernonRhiStatus recordBarriers(VernonRhiDevice device, uint64_t encoder_key, uint64_t native,
                                                const VernonRhiBarrier *barriers, size_t barrier_count);

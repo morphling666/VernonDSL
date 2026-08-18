@@ -210,6 +210,7 @@ def _invoke_structured_pipeline(
     residual_storage_kind: str = "unknown",
     *,
     encoder: Any | None = None,
+    command_plan: Any | None = None,
     binding_cache: _NativeBindingCache | None = None,
 ) -> tuple[Any, _StructuredPullback]:
     _validate_grid(grid)
@@ -226,10 +227,12 @@ def _invoke_structured_pipeline(
         for name, value in bindings.items()
         if name in access_by_name and isinstance(value, (TensorStorage, TensorView))
     ]
-    if encoder is None:
+    if encoder is None and command_plan is None:
         with _dispatch_borrow_scope(borrows):
             output, pullback = pipeline.vjp(bindings, grid)
     else:
+        if encoder is not None and command_plan is not None:
+            raise RuntimeError("VJP cannot use an encoder and command plan together")
         if binding_cache is None:
             raise RuntimeError("encoded VJP requires a binding cache")
         parameters = tuple(pipeline.parameters)
@@ -239,7 +242,12 @@ def _invoke_structured_pipeline(
             for parameter in parameters:
                 binding_cache.bind_argument(builder, pipeline, parameter, bindings[parameter.name])
             builder.grid(*grid)
-            output, pullback = pipeline.vjp_encode(builder, encoder._native, bindings, grid)
+            if command_plan is None:
+                if encoder is None:
+                    raise RuntimeError("encoded VJP requires a command encoder")
+                output, pullback = pipeline.vjp_encode(builder, encoder._native, bindings, grid)
+            else:
+                output, pullback = pipeline.vjp_plan(builder, command_plan, bindings, grid)
         for parameter in parameters:
             value = bindings[parameter.name]
             if parameter.access != state._native.ACCESS_READ and isinstance(value, (TensorStorage, TensorView)):

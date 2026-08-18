@@ -192,6 +192,35 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile
     return true;
 }
 
+VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
+                                               const VernonPipelineInvocation &invocation,
+                                               const VernonAdValueSet &inputs,
+                                               execution::detail::RhiCommandExecutionPlan &plan,
+                                               VernonPullback *&pullback) {
+    pullback = nullptr;
+    auto *executable = pipeline.autodiff ? pipeline.autodiff->executable.get() : nullptr;
+    if (!executable || invocation.struct_size < sizeof(VernonPipelineInvocation) ||
+        invocation.abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation.compute_grid) ||
+        (invocation.argument_count && !invocation.arguments) || !validSet(&inputs, true)) {
+        invocationDiagnostic(*pipeline.context) = "invalid deferred autodiff forward invocation";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    auto result = std::make_unique<VernonPullback>();
+    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
+    std::unique_ptr<PullbackExecution> execution;
+    const ForwardExecutionTarget target{{}, &invocation, &plan};
+    const VernonStatus status = executable->forward(target, invocation.compute_grid, inputs, nullptr, execution);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    if (!execution) {
+        invocationDiagnostic(*pipeline.context) = "deferred autodiff forward produced no pullback";
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
+    result->execution = std::move(execution);
+    pullback = result.release();
+    return VERNON_STATUS_OK;
+}
+
 } // namespace vernon::runtime::ad
 
 namespace {
@@ -208,6 +237,50 @@ VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
 
 const vernon::runtime::ad::Executable *autodiffExecutable(const VernonLoadedPipeline *pipeline) {
     return pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+}
+
+bool validDeviceFootprint(const VernonAdDeviceValue &value) {
+    const size_t scalarBytes = vernon::runtime::ad::dtypeSize(value.dtype);
+    if (!scalarBytes || !value.buffer_size || value.buffer_size > std::numeric_limits<size_t>::max() ||
+        value.offset > value.buffer_size || value.size > value.buffer_size || (value.rank && !value.byte_strides))
+        return false;
+    uint64_t before = 0;
+    uint64_t after = 0;
+    for (uint32_t dimension = 0; dimension < value.rank; ++dimension) {
+        if (!value.shape[dimension])
+            return false;
+        const int64_t stride = value.byte_strides[dimension];
+        const uint64_t magnitude =
+            stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
+        const uint64_t count = value.shape[dimension] - 1;
+        if (count && magnitude > std::numeric_limits<uint64_t>::max() / count)
+            return false;
+        const uint64_t span = magnitude * count;
+        uint64_t &side = stride < 0 ? before : after;
+        if (span > std::numeric_limits<uint64_t>::max() - side)
+            return false;
+        side += span;
+    }
+    return before <= value.offset && after <= value.buffer_size - value.offset &&
+           scalarBytes <= value.buffer_size - value.offset - after;
+}
+
+bool validDeviceSet(const VernonAdDeviceValueSet *set, bool required) {
+    if (!set)
+        return !required;
+    if (set->struct_size < sizeof(*set) || (set->value_count && !set->values) ||
+        std::any_of(std::begin(set->reserved), std::end(set->reserved), [](uint32_t value) { return value != 0; }))
+        return false;
+    for (size_t index = 0; index < set->value_count; ++index) {
+        const VernonAdDeviceValue &value = set->values[index];
+        if (value.struct_size < sizeof(value) || !value.path.data || !value.path.size || !value.size ||
+            value.buffer.index == VERNON_RHI_INVALID_HANDLE_INDEX || (value.rank && !value.shape) ||
+            !validDeviceFootprint(value) ||
+            std::any_of(
+                std::begin(value.reserved), std::end(value.reserved), [](uint32_t reserved) { return reserved != 0; }))
+            return false;
+    }
+    return true;
 }
 
 } // namespace
@@ -285,6 +358,10 @@ vernon::runtime::autodiffPullbackControlPlaneUsage(const VernonPullback *pullbac
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
     return context && context->autodiffMemoryPolicy ? context->autodiffMemoryPolicy->contextLimit() : 0;
+}
+
+VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *context) {
+    return context ? context->rhiDevice : VernonRhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
 extern "C" {
@@ -473,6 +550,38 @@ VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const Vern
     }
 }
 
+VernonStatus vernonPullbackApplyDeviceWithOptions(VernonPullback *pullback, const VernonAdDeviceValueSet *cotangents,
+                                                  VernonAdDeviceValueSet *gradients,
+                                                  const VernonPullbackApplyOptions *options) {
+    VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
+    try {
+        using namespace vernon::runtime::ad;
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
+        auto *deviceExecution = pullback && pullback->execution
+                                    ? dynamic_cast<DevicePullbackExecution *>(pullback->execution.get())
+                                    : nullptr;
+        if (!deviceExecution || !validDeviceSet(cotangents, false) || !validDeviceSet(gradients, true) || !options ||
+            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
+            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
+            std::any_of(std::begin(options->reserved), std::end(options->reserved),
+                        [](uint32_t value) { return value != 0; }))
+            return fail(context, "invalid device pullback invocation");
+        const auto boundedSize = [](uint64_t value) {
+            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
+                                                              : static_cast<size_t>(value);
+        };
+        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
+                                                  boundedSize(options->maximum_reusable_construction_bytes)};
+        return deviceExecution->applyDevice(cotangents, *gradients, runtimeOptions);
+    } catch (const std::bad_alloc &) {
+        return fail(context, "cannot allocate device pullback state", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        return fail(context, "device pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(context, "unexpected device pullback failure", VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
 VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                  VernonAdValueSet *gradients) {
     const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
@@ -490,3 +599,35 @@ void vernonPullbackDestroy(VernonPullback *pullback) {
 }
 
 } // extern "C"
+
+VernonStatus vernon::runtime::ad::applyPullbackDeviceWithPlanSink(VernonPullback &pullback,
+                                                                  const VernonAdDeviceValueSet *cotangents,
+                                                                  VernonAdDeviceValueSet &gradients,
+                                                                  const VernonPullbackApplyOptions *options,
+                                                                  execution::detail::RhiCommandPlanSink &sink) {
+    VernonRuntimeContext *context = pullback.contextLease ? &pullback.contextLease->get() : nullptr;
+    try {
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
+        auto *deviceExecution =
+            pullback.execution ? dynamic_cast<DevicePullbackExecution *>(pullback.execution.get()) : nullptr;
+        if (!deviceExecution || !validDeviceSet(cotangents, false) || !validDeviceSet(&gradients, true) || !options ||
+            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
+            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
+            std::any_of(std::begin(options->reserved), std::end(options->reserved),
+                        [](uint32_t value) { return value != 0; }))
+            return fail(context, "invalid planned device pullback invocation");
+        const auto boundedSize = [](uint64_t value) {
+            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
+                                                              : static_cast<size_t>(value);
+        };
+        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
+                                                  boundedSize(options->maximum_reusable_construction_bytes)};
+        return deviceExecution->applyDevice(cotangents, gradients, runtimeOptions, &sink);
+    } catch (const std::bad_alloc &) {
+        return fail(context, "cannot allocate planned device pullback state", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (const std::length_error &) {
+        return fail(context, "planned device pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
+    } catch (...) {
+        return fail(context, "unexpected planned device pullback failure", VERNON_STATUS_INTERNAL_ERROR);
+    }
+}

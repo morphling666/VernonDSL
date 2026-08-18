@@ -184,8 +184,8 @@ def tangent_schema(annotation: Any, active_structs: frozenset[type[Any]] = froze
             shape = tuple(annotation.arguments[1 : rank + 1])
         else:
             raise TypeError(f"{annotation.name} has no tangent schema")
-        if not shape or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
-            raise TypeError("Tensor tangent requires a positive static shape")
+        if any(not isinstance(extent, int) or extent <= 0 for extent in shape):
+            raise TypeError("Tensor tangent requires static positive extents")
         return TangentTensor(shape, tangent_schema(element, active_structs))
     if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
         if annotation in active_structs:
@@ -430,8 +430,8 @@ def _consume_native_layout(
             shape = tuple(annotation.arguments[1 : rank + 1])
         else:
             raise TypeError(f"{annotation.name} has no canonical host ABI")
-        if not shape or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
-            raise TypeError("Tensor host ABI requires a positive static shape")
+        if any(not isinstance(extent, int) or extent <= 0 for extent in shape):
+            raise TypeError("Tensor host ABI requires static positive extents")
         element_layout = _consume_native_layout(element, nodes, active_structs)
         if node.element_stride != element_layout.size:
             raise RuntimeError("NumPy cannot represent the native canonical Tensor element stride")
@@ -478,8 +478,8 @@ def _native_value_abi_plan(annotation: Any) -> tuple[_NativeLayoutNode, ...]:
                 shape = tuple(value.arguments[1 : rank + 1])
             else:
                 raise TypeError(f"{value.name} has no canonical host ABI")
-            if not shape or any(not isinstance(extent, int) or extent <= 0 for extent in shape):
-                raise TypeError("Tensor host ABI requires a positive static shape")
+            if any(not isinstance(extent, int) or extent <= 0 for extent in shape):
+                raise TypeError("Tensor host ABI requires static positive extents")
             element_spelling, element_dtypes = describe(element, active)
             dimensions = "x".join(str(extent) for extent in shape)
             element_base = _base_annotation(element)
@@ -643,7 +643,6 @@ def _shape_and_dtype(annotation: TypeExpr) -> tuple[tuple[int, ...], Any] | None
         if (
             isinstance(scalar, _Scalar)
             and isinstance(shape, tuple)
-            and shape
             and all(isinstance(dimension, int) and dimension > 0 for dimension in shape)
         ):
             return (shape, _DTYPES[scalar.name])

@@ -44,7 +44,8 @@ def Vernon_TensorType : TypeDef<Vernon_Dialect, "Tensor"> {
     TypeParameter<"::mlir::Type", "element type">:$elementType,
     ArrayRefParameter<"int64_t", "static shape">:$shape
   );
-  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `>`";
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
@@ -57,7 +58,7 @@ def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
     StringRefParameter<"device, workgroup, or private address space">:$addressSpace
   );
   let genVerifyDecl = 1;
-  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `,` $access `,` $addressSpace `>`";
+  let hasCustomAssemblyFormat = 1;
 }
 
 def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {

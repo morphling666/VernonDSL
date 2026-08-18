@@ -312,6 +312,27 @@ typedef struct VernonAdValueSet {
     uint32_t reserved[4];
 } VernonAdValueSet;
 
+typedef struct VernonAdDeviceValue {
+    uint32_t struct_size;
+    VernonStringView path;
+    VernonDataType dtype;
+    VernonRhiBuffer buffer;
+    uint64_t offset;
+    uint64_t buffer_size;
+    uint64_t size;
+    uint32_t rank;
+    const uint64_t *shape;
+    const int64_t *byte_strides;
+    uint32_t reserved[4];
+} VernonAdDeviceValue;
+
+typedef struct VernonAdDeviceValueSet {
+    uint32_t struct_size;
+    VernonAdDeviceValue *values;
+    size_t value_count;
+    uint32_t reserved[4];
+} VernonAdDeviceValueSet;
+
 typedef struct VernonAdValueMetadataView {
     uint32_t struct_size;
     VernonStringView path;
@@ -430,6 +451,10 @@ VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApplyWithOptions(VernonPullback *
                                                                 const VernonAdValueSet *cotangents,
                                                                 VernonAdValueSet *gradients,
                                                                 const VernonPullbackApplyOptions *options);
+VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApplyDeviceWithOptions(VernonPullback *pullback,
+                                                                      const VernonAdDeviceValueSet *cotangents,
+                                                                      VernonAdDeviceValueSet *gradients,
+                                                                      const VernonPullbackApplyOptions *options);
 VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                                      VernonAdValueSet *gradients);
 VERNON_RUNTIME_CAPI void vernonPullbackDestroy(VernonPullback *pullback);

@@ -101,6 +101,8 @@ class LanguageVersionTests(unittest.TestCase):
             ),
             ("f32", "f64", "f32", "f64"),
         )
+        rank_zero = value_leaves(ConcreteType("tensor", "Tensor", (f32,)), fields.__getitem__)
+        self.assertEqual([(leaf.dtype, leaf.scalar_count, leaf.shape) for leaf in rank_zero], [("f32", 1, ())])
 
         output = compile_source(
             "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
@@ -655,6 +657,19 @@ class LanguageVersionTests(unittest.TestCase):
                 BarrierEffect(MemoryOrdering.ACQUIRE_RELEASE, EffectScope.DEVICE),
             ],
         )
+
+    def test_rank_zero_workgroup_storage_models_one_scalar(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def scalar_shared(output: TensorView[f32, (), write]) -> None:\n"
+            "    value = workgroup_storage(f32, shape=())\n"
+            "    value[()] = 3.0\n"
+            "    workgroup_barrier()\n"
+            "    output[()] = value[()]\n",
+            "rank_zero_workgroup.py",
+        )
+        self.assertIn('!vernon.tensor_view<f32, [], "read_write", "workgroup">', output)
 
     def test_rank_two_aggregate_workgroup_storage_uses_typed_tensor_view_ops(self) -> None:
         output = compile_source(
@@ -1599,6 +1614,16 @@ class NumericInferenceTests(unittest.TestCase):
         )
         self.assertIn("tensor<2x2x1xf64>", output)
         self.assertIn('name = "construct"', output)
+
+        scalar = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def scalar_tensor(value: f64) -> Tensor[f64, ()]:\n"
+            "    return Tensor(value)\n",
+            "rank_zero_tensor_constructor.py",
+        )
+        self.assertIn("tensor<f64>", scalar)
+        self.assertIn('name = "construct"', scalar)
 
         with self.assertRaisesRegex(CompileError, "non-empty rectangular"):
             compile_source(

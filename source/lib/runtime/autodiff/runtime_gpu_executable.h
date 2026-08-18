@@ -14,13 +14,12 @@ std::shared_ptr<Executable> createNoTapeExecutable(VernonRuntimeContext &context
                                                    std::shared_ptr<Signature> signature,
                                                    std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs);
 
-std::shared_ptr<Executable> createTapeExecutable(VernonRuntimeContext &context, std::shared_ptr<OwnedPipeline> primal,
-                                                 std::shared_ptr<OwnedPipeline> forward,
-                                                 std::shared_ptr<OwnedPipeline> backward,
-                                                 std::shared_ptr<Signature> signature,
-                                                 std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
-                                                 std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs,
-                                                 size_t staticTapeBytesHint, PlanningPolicy planningPolicy);
+std::shared_ptr<Executable>
+createTapeExecutable(VernonRuntimeContext &context, std::shared_ptr<OwnedPipeline> primal,
+                     std::shared_ptr<OwnedPipeline> forward, std::shared_ptr<OwnedPipeline> backward,
+                     std::shared_ptr<Signature> signature, std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
+                     std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs, size_t staticTapeBytesHint,
+                     PlanningPolicy planningPolicy, bool requiresTapeStatus);
 
 } // namespace vernon::runtime::ad::gpu
 

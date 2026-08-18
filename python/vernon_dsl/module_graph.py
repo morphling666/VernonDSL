@@ -899,8 +899,6 @@ class ModuleGraph:
             dimensions = arguments[1:]
         if rank is not None and len(dimensions) != rank:
             raise ValueError(f"{constructor} requires {rank} static dimension(s)")
-        if not dimensions:
-            raise ValueError(f"{constructor} interface Value requires a positive static shape")
         shape: list[int] = []
         for dimension in dimensions:
             value = self._constant_int(module, dimension)

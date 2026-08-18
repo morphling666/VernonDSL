@@ -106,10 +106,12 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
             "cannot load GPU autodiff primal stage '" + primal.entry + "': " + invocationDiagnostic(context);
         return false;
     }
+    // The current artifact contract exposes only a hint: even "static" profiles may
+    // report a larger required stride at runtime, so every Tape profile must inspect status.
     executable = gpu::createTapeExecutable(context, std::move(primalPipeline), std::move(forwardPipeline),
                                            std::move(backwardPipeline), std::move(signature),
                                            std::move(forwardBindingSpecs), std::move(backwardBindingSpecs),
-                                           static_cast<size_t>(staticTapeBytesHint), planningPolicy);
+                                           static_cast<size_t>(staticTapeBytesHint), planningPolicy, true);
     return true;
 }
 

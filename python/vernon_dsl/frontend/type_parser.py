@@ -85,8 +85,8 @@ class TypeParser:
                 raise self.context.error(node, "TensorView requires an element type, shape, and access mode")
             element = self.parse_type(items[0])
             self._require_storage_element(items[0], element, "TensorView")
-            if not isinstance(items[1], ast.Tuple) or not items[1].elts:
-                raise self.context.error(items[1], "TensorView shape must be a non-empty tuple")
+            if not isinstance(items[1], ast.Tuple):
+                raise self.context.error(items[1], "TensorView shape must be a tuple")
             shape = tuple(self._tensor_view_extent(item) for item in items[1].elts)
             access = self._string_or_name(items[2], "TensorView access")
             if access not in {"read", "write", "read_write"}:

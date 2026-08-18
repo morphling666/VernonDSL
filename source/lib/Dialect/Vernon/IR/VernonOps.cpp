@@ -210,8 +210,8 @@ LogicalResult WorkgroupAllocOp::verify() {
         return emitOpError("result must use the workgroup address space");
     if (type.getAccess() != "read_write")
         return emitOpError("result must be a read_write TensorView");
-    if (type.getShape().empty() || llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
-        return emitOpError("requires a positive static shape");
+    if (llvm::any_of(type.getShape(), [](int64_t extent) { return extent <= 0; }))
+        return emitOpError("requires positive static dimensions");
     ModuleOp module = (*this)->getParentOfType<ModuleOp>();
     if (!module)
         return emitOpError("must be nested in a module");

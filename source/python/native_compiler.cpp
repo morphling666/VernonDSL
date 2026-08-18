@@ -1,9 +1,14 @@
 #include "native_compiler.h"
 
 #include "VernonExecutionGraph.h"
+#include "execution_graph/execution_graph_internal.h"
+#include "native_operator.h"
 #include "native_runtime.h"
 
 void bindNativeCompiler(nb::module_ &module) {
+    nb::class_<vernon::execution::detail::RhiCommandExecutionPlan>(module, "_CommandPlan").def(nb::init<>());
+    nb::class_<vernon::execution::detail::RhiCommandPlanSink>(module, "_CommandPlanSink")
+        .def("_retain_completion", &retainPythonCommandCompletion, nb::arg("transaction"));
     module.def("target_available", &targetAvailable, nb::arg("target"));
     module.def("target_capabilities", &targetCapabilities, nb::arg("target"));
     nb::enum_<VernonStatus>(module, "Status")
@@ -188,6 +193,11 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("state", &PythonRuntimeSubmission::state);
     nb::class_<PreparedPipelineArgument>(module, "_PreparedPipelineArgument");
+    nb::class_<PythonOperatorDagBuilder>(module, "OperatorDagBuilder")
+        .def("add_elementwise_add", &PythonOperatorDagBuilder::addElementwiseAdd, nb::arg("invocation"),
+             nb::arg("output"), nb::arg("left"), nb::arg("right"), nb::keep_alive<1, 2>())
+        .def("execute", &PythonOperatorDagBuilder::execute, nb::arg("command_sink") = nullptr,
+             nb::arg("retained") = nb::none());
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("prepare_host_tensor", &PipelineInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
@@ -230,6 +240,7 @@ void bindNativeCompiler(nb::module_ &module) {
                           const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
         .def("encode", [](PipelineInvocationBuilder &builder,
                           const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
+        .def("operator_dag", &createPythonOperatorDagBuilder, nb::keep_alive<0, 1>())
         .def("submit", [](PipelineInvocationBuilder &builder) { return builder.submit(); });
     nb::class_<PythonPullback>(module, "Pullback")
         .def("__call__", &PythonPullback::apply, nb::arg("cotangent") = nb::none())
@@ -300,6 +311,25 @@ void bindNativeCompiler(nb::module_ &module) {
                                     nb::cast(&pipeline, nb::rv_policy::reference), &builder, &native);
             },
             nb::arg("builder"), nb::arg("encoder"), nb::arg("bindings"), nb::arg("grid"))
+        .def(
+            "vjp_plan",
+            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder,
+               vernon::execution::detail::RhiCommandExecutionPlan &plan, const nb::dict &bindings,
+               const nb::tuple &grid) {
+                if (grid.size() != 3)
+                    throw std::invalid_argument("autodiff grid must contain three dimensions");
+                const auto dimension = [&](size_t index) {
+                    if (PyBool_Check(grid[index].ptr()))
+                        throw std::invalid_argument("autodiff grid dimensions must be positive integers");
+                    const uint64_t value = nb::cast<uint64_t>(grid[index]);
+                    if (!value || value > UINT32_MAX)
+                        throw std::invalid_argument("autodiff grid dimensions must be positive uint32 values");
+                    return static_cast<uint32_t>(value);
+                };
+                return pipeline.vjp(dimension(0), dimension(1), dimension(2), bindings,
+                                    nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
+            },
+            nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
         .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)
@@ -335,6 +365,7 @@ void bindNativeCompiler(nb::module_ &module) {
     module.attr("GRAPH_PASS_NEVER_CULL") = static_cast<uint32_t>(vernon::execution::PassNeverCull);
     module.attr("GRAPH_PASS_NO_MERGE") = static_cast<uint32_t>(vernon::execution::PassNoMerge);
     module.attr("GRAPH_PASS_SIDE_EFFECT") = static_cast<uint32_t>(vernon::execution::PassSideEffect);
+    module.attr("GRAPH_PASS_DERIVATIVE") = static_cast<uint32_t>(vernon::execution::PassDerivative);
     module.attr("TOPOLOGY_LINE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
     module.attr("TOPOLOGY_POINT_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
     module.def("runtime_available",

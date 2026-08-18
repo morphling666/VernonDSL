@@ -31,6 +31,13 @@ def _load_fractal() -> ModuleType:
 fractal = _load_fractal()
 
 
+@vd.kernel(workgroup_size=(1, 1, 1))
+def rank_zero_round_trip(
+    value: vd.TensorView[vd.f32, (), vd.read_write],
+) -> None:
+    value[()] = value[()] * 2.0
+
+
 @vd.kernel(workgroup_size=(4, 2, 1))
 def tensor_operators(
     output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn, vd.dyn), vd.write],
@@ -560,6 +567,15 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             if self._runtime_available(architecture):
                 backends.append(architecture)
         return backends
+
+    def test_rank_zero_tensor_view_backend_parity(self) -> None:
+        for backend in self._available_compute_backends():
+            with self.subTest(backend=backend):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                value = vd.storage.from_numpy(np.array(3.0, dtype=np.float32))
+                rank_zero_round_trip(value)
+                self.assertEqual(value.to_numpy()[()], 6.0)
+        vd.init(arch=vd.cpu)
 
     def test_storage_texture_backend_parity(self) -> None:
         backends = [

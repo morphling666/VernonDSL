@@ -89,8 +89,6 @@ class Tensor(np.ndarray[Any, Any]):
 
     def __new__(cls, values: Any) -> Tensor:
         shape, components = cls._shape_and_values(values)
-        if not shape:
-            raise TypeError("Tensor requires a non-empty rectangular sequence")
         return cls._from_components(components, shape)
 
     def __array_finalize__(self, source: np.ndarray[Any, Any] | None) -> None:

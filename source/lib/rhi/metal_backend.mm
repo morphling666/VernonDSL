@@ -617,22 +617,35 @@ bool DeviceState::submitCommands(uint64_t native, std::string &error) {
     }
     id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
     [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    if (commandBuffer.status == MTLCommandBufferStatusCompleted) {
-        CFBridgingRelease(reinterpret_cast<void *>(native));
-        return true;
-    }
-    setCommandError(error, commandBuffer, "Metal command buffer failed");
-    CFBridgingRelease(reinterpret_cast<void *>(native));
-    return false;
+    return true;
 }
 
-void DeviceState::completeCommands(uint64_t native) {
-    if (!native)
-        return;
+bool DeviceState::pollCommands(uint64_t native, bool &completed, bool &succeeded, std::string &error) {
+    if (!native) {
+        error = "Metal command buffer is invalid";
+        return false;
+    }
+    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
+    completed = commandBuffer.status == MTLCommandBufferStatusCompleted ||
+                commandBuffer.status == MTLCommandBufferStatusError;
+    succeeded = commandBuffer.status == MTLCommandBufferStatusCompleted;
+    if (completed && !succeeded)
+        setCommandError(error, commandBuffer, "Metal command buffer failed");
+    return true;
+}
+
+bool DeviceState::completeCommands(uint64_t native, std::string &error) {
+    if (!native) {
+        error = "Metal command buffer is invalid";
+        return false;
+    }
     id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
     [commandBuffer waitUntilCompleted];
+    const bool succeeded = commandBuffer.status == MTLCommandBufferStatusCompleted;
+    if (!succeeded)
+        setCommandError(error, commandBuffer, "Metal command buffer failed");
     CFBridgingRelease(reinterpret_cast<void *>(native));
+    return succeeded;
 }
 
 void DeviceState::abandonCommands(uint64_t native) {

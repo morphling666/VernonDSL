@@ -5,6 +5,7 @@
 #include "runtime_gpu_pullback.h"
 
 #include <algorithm>
+#include <atomic>
 #include <string>
 #include <utility>
 #include <vector>
@@ -40,11 +41,12 @@ public:
                    std::shared_ptr<OwnedPipeline> forward, std::shared_ptr<OwnedPipeline> backward,
                    std::shared_ptr<Signature> signature, std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
                    std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs, size_t staticTapeBytesHint,
-                   PlanningPolicy planningPolicy)
+                   PlanningPolicy planningPolicy, bool requiresTapeStatus)
         : context_(context), primal_(std::move(primal)), forward_(std::move(forward)), backward_(std::move(backward)),
           signature_(std::move(signature)), forwardBindingSpecs_(std::move(forwardBindingSpecs)),
           backwardBindingSpecs_(std::move(backwardBindingSpecs)), staticTapeBytesHint_(staticTapeBytesHint),
-          planningPolicy_(planningPolicy),
+          learnedTapeStride_(std::make_shared<std::atomic<size_t>>(staticTapeBytesHint)),
+          planningPolicy_(planningPolicy), requiresTapeStatus_(requiresTapeStatus),
           retainedNames_(retainedNames(*forwardBindingSpecs_, backwardBindingSpecs_.get())) {}
 
     const Signature &signature() const override { return *signature_; }
@@ -62,10 +64,11 @@ public:
             return status;
         auto candidate = createTapePullback(context_, prepared.signature, forward_, backward_, forwardBindingSpecs_,
                                             backwardBindingSpecs_, computeGrid, std::move(prepared.retainedDevices),
-                                            std::move(prepared.retainedHosts), staticTapeBytesHint_, planningPolicy_);
+                                            std::move(prepared.retainedHosts), staticTapeBytesHint_, learnedTapeStride_,
+                                            planningPolicy_, requiresTapeStatus_);
         if (!candidate)
             return fail(context_, "GPU autodiff retained values exceed the context memory budget");
-        if (!target.externalEncoder()) {
+        if (!target.encodedInvocation()) {
             if (!outputs)
                 return fail(context_, "standalone GPU autodiff forward has no outputs");
             PreparedForwardPublication publication;
@@ -86,7 +89,9 @@ private:
     std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs_;
     std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs_;
     size_t staticTapeBytesHint_{};
+    std::shared_ptr<std::atomic<size_t>> learnedTapeStride_;
     PlanningPolicy planningPolicy_{};
+    bool requiresTapeStatus_{true};
     std::vector<std::string> retainedNames_;
 };
 
@@ -117,7 +122,7 @@ public:
                                  std::move(prepared.retainedDevices), std::move(prepared.retainedHosts));
         if (!candidate)
             return fail(context_, "GPU autodiff retained values exceed the context memory budget");
-        if (!target.externalEncoder()) {
+        if (!target.encodedInvocation()) {
             if (!outputs)
                 return fail(context_, "standalone GPU autodiff forward has no outputs");
             PreparedForwardPublication publication;
@@ -149,16 +154,16 @@ std::shared_ptr<Executable> createNoTapeExecutable(VernonRuntimeContext &context
                                               std::move(backwardBindingSpecs));
 }
 
-std::shared_ptr<Executable> createTapeExecutable(VernonRuntimeContext &context, std::shared_ptr<OwnedPipeline> primal,
-                                                 std::shared_ptr<OwnedPipeline> forward,
-                                                 std::shared_ptr<OwnedPipeline> backward,
-                                                 std::shared_ptr<Signature> signature,
-                                                 std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
-                                                 std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs,
-                                                 size_t staticTapeBytesHint, PlanningPolicy planningPolicy) {
+std::shared_ptr<Executable>
+createTapeExecutable(VernonRuntimeContext &context, std::shared_ptr<OwnedPipeline> primal,
+                     std::shared_ptr<OwnedPipeline> forward, std::shared_ptr<OwnedPipeline> backward,
+                     std::shared_ptr<Signature> signature, std::shared_ptr<const BindingSpecPlan> forwardBindingSpecs,
+                     std::shared_ptr<const BindingSpecPlan> backwardBindingSpecs, size_t staticTapeBytesHint,
+                     PlanningPolicy planningPolicy, bool requiresTapeStatus) {
     return std::make_shared<TapeExecutable>(context, std::move(primal), std::move(forward), std::move(backward),
                                             std::move(signature), std::move(forwardBindingSpecs),
-                                            std::move(backwardBindingSpecs), staticTapeBytesHint, planningPolicy);
+                                            std::move(backwardBindingSpecs), staticTapeBytesHint, planningPolicy,
+                                            requiresTapeStatus);
 }
 
 } // namespace vernon::runtime::ad::gpu

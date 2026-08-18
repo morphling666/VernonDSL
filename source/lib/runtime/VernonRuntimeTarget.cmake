@@ -172,11 +172,18 @@ function(vernon_add_runtime)
 
     add_library(
         VernonExecutionGraph STATIC
+        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_model.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_checkpoint_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_submission.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/elementwise_operator.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_execution.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_lowering.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_model.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_validation.cpp)
     add_library(Vernon::ExecutionGraph ALIAS VernonExecutionGraph)
     set_target_properties(VernonExecutionGraph PROPERTIES EXPORT_NAME ExecutionGraph POSITION_INDEPENDENT_CODE ON)
     target_include_directories(

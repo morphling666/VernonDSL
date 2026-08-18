@@ -75,6 +75,7 @@ TensorView[element_type, shape, access]
 Examples:
 
 ```python
+TensorView[f32, (), read_write]
 TensorView[f32, (4, 4), read]
 TensorView[f32, (vd.dyn, 4), read]
 TensorView[Particle, (vd.dyn,), read_write]
@@ -86,6 +87,14 @@ TensorView[Particle, (vd.dyn,), read_write]
 TensorView dimension. It is not callable. Every static extent is a positive
 integer; a runtime extent resolving `vd.dyn` is non-negative. Rank is explicit
 because every dimension occupies one shape entry.
+
+The empty shape `()` is the canonical rank-zero form. It models one scalar
+storage cell rather than an empty collection. Device code loads and stores it
+with `view[()]`; host code uses the same `view[()]` spelling or NumPy's 0-d
+`array[()]`/`item()` APIs. Its runtime descriptor has rank zero, null
+shape/stride arrays, and still carries the storage offset. Rank-zero
+`workgroup_storage` remains invalid because workgroup allocation requires an
+explicit positive physical extent.
 
 Shape is part of the source TensorView contract. Strides and offset are
 concrete view-layout metadata and do not participate in core source type

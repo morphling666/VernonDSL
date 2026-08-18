@@ -6,7 +6,7 @@ import hashlib
 import importlib
 import inspect
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -551,6 +551,36 @@ class Kernel:
         self._load_native(cached, state, self._entry)
         return cached
 
+    def _bind_direct_arguments(
+        self,
+        compiled: _CompiledKernel,
+        builder: Any,
+        arguments: tuple[Any, ...],
+        user_parameters: list[str],
+        binding_cache: _NativeBindingCache,
+        binding_tokens: tuple[int | None, ...] | None = None,
+    ) -> None:
+        state = _session_state()
+        static_tensor_names = {
+            argument.arg
+            for argument in compiled.function.args.args
+            if self._is_static_tensor_annotation(argument.annotation)
+        }
+        annotations = inspect.get_annotations(self._function, eval_str=True)
+        tokens = binding_tokens or (None,) * len(arguments)
+        for user_name, parameter, value, binding_token in zip(
+            user_parameters, compiled.native.parameters, arguments, tokens, strict=True
+        ):
+            binding_cache.bind_argument(
+                builder,
+                compiled.native,
+                parameter,
+                value,
+                host_value=state._architecture == state.cuda and user_name in static_tensor_names,
+                annotation=annotations.get(user_name),
+                binding_token=binding_token,
+            )
+
     def _invoke_direct(
         self,
         arguments: tuple[Any, ...],
@@ -579,8 +609,8 @@ class Kernel:
             if len(writable_shapes) != 1:
                 raise ValueError("all writable Tensor arguments must have the same shape")
             shape = next(iter(writable_shapes))
-            if not 1 <= len(shape) <= 3:
-                raise ValueError("inferred compute grids require Tensor rank one through three")
+            if len(shape) > 3:
+                raise ValueError("inferred compute grids require Tensor rank zero through three")
             extent = tuple(reversed(shape)) + (1,) * (3 - len(shape))
             grid = tuple((value + size - 1) // size for value, size in zip(extent, self._workgroup_size, strict=True))
         if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
@@ -599,25 +629,9 @@ class Kernel:
         lease = _DispatchBorrowLease(dispatch_borrows) if return_submission else None
         try:
             with binding_cache.invocation(compiled.native) as builder:
-                static_tensor_names = {
-                    argument.arg
-                    for argument in compiled.function.args.args
-                    if self._is_static_tensor_annotation(argument.annotation)
-                }
-                annotations = inspect.get_annotations(self._function, eval_str=True)
-                tokens = binding_tokens or (None,) * len(arguments)
-                for user_name, parameter, value, binding_token in zip(
-                    user_parameters, compiled.native.parameters, arguments, tokens, strict=True
-                ):
-                    binding_cache.bind_argument(
-                        builder,
-                        compiled.native,
-                        parameter,
-                        value,
-                        host_value=state._architecture == state.cuda and user_name in static_tensor_names,
-                        annotation=annotations.get(user_name),
-                        binding_token=binding_token,
-                    )
+                self._bind_direct_arguments(
+                    compiled, builder, arguments, user_parameters, binding_cache, binding_tokens
+                )
                 builder.grid(*grid)
                 if encoder is None:
                     submission = builder.submit()
@@ -646,6 +660,42 @@ class Kernel:
         *arguments: Any,
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
+    ) -> None:
+        self._submit_direct(arguments, grid, features)
+
+    def _append_operator(
+        self,
+        operator_dag: Any | None,
+        *arguments: Any,
+        grid: tuple[int, int, int],
+        append: Callable[[Any, Any], None],
+        features: tuple[str, ...] = (),
+    ) -> Any:
+        state = _session_state()
+        compiled = self._compile(arguments, features)
+        if compiled.native is None or state._native_runtime is None:
+            raise RuntimeError("operator kernel is not loaded")
+        user_parameters = [
+            argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
+        ]
+        cache_key = (
+            features,
+            tuple(self._argument_signature(value) for value in arguments),
+        )
+        binding_cache = self._direct_binding_caches.setdefault(cache_key, _NativeBindingCache())
+        with binding_cache.invocation(compiled.native) as builder:
+            self._bind_direct_arguments(compiled, builder, arguments, user_parameters, binding_cache)
+            builder.grid(*grid)
+            if operator_dag is None:
+                operator_dag = builder.operator_dag()
+            append(operator_dag, builder)
+        return operator_dag
+
+    def _submit_direct(
+        self,
+        arguments: tuple[Any, ...],
+        grid: tuple[int, int, int] | None,
+        features: tuple[str, ...],
     ) -> None:
         cache_key = (
             features,

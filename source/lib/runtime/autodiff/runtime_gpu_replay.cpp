@@ -7,7 +7,11 @@
 namespace vernon::runtime::ad::gpu {
 namespace {
 
-constexpr size_t kMaximumReplayBatches = 64;
+// A submission followed by a fixed-size status readback costs substantially
+// more than a few MiB of transient device memory on every supported backend.
+// Expressing that latency as an equivalent byte cost lets the planner trade
+// memory against control-plane work without imposing a fixed batch count.
+constexpr long double kControlPlaneEquivalentBytes = 256.0L * 1024.0L * 1024.0L;
 
 bool multiply(size_t left, size_t right, size_t &result) {
     if (left && right > std::numeric_limits<size_t>::max() / left)
@@ -23,10 +27,37 @@ bool add(size_t left, size_t right, size_t &result) {
     return true;
 }
 
+size_t divideCeil(size_t value, size_t divisor) { return value / divisor + static_cast<size_t>(value % divisor != 0); }
+
+size_t costModelCapacity(PlanningPolicy policy, size_t groupCount, size_t maximumCapacity, size_t perGroupBytes) {
+    if (policy == PlanningPolicy::MinRuntime)
+        return maximumCapacity;
+    const long double memoryWeight = policy == PlanningPolicy::MinMemory ? 2.0L : 1.0L;
+    const long double stationary = std::sqrt(static_cast<long double>(groupCount) * kControlPlaneEquivalentBytes /
+                                             (memoryWeight * static_cast<long double>(perGroupBytes)));
+    const size_t center = std::clamp(static_cast<size_t>(std::max(stationary, 1.0L)), size_t{1}, maximumCapacity);
+    const size_t candidates[]{
+        size_t{1},       center > 1 ? center - 1 : center, center, center < maximumCapacity ? center + 1 : center,
+        maximumCapacity,
+    };
+    size_t selected = 1;
+    long double selectedCost = std::numeric_limits<long double>::infinity();
+    for (size_t capacity : candidates) {
+        const long double cost =
+            memoryWeight * static_cast<long double>(capacity) * static_cast<long double>(perGroupBytes) +
+            static_cast<long double>(divideCeil(groupCount, capacity)) * kControlPlaneEquivalentBytes;
+        if (cost < selectedCost || (cost == selectedCost && capacity > selected)) {
+            selected = capacity;
+            selectedCost = cost;
+        }
+    }
+    return selected;
+}
+
 } // namespace
 
 bool planBatchBudget(PlanningPolicy policy, size_t fixedBytes, size_t maximumBytes, size_t groupCount,
-                     size_t groupTapeBytes, size_t summaryBytes, BatchBudget &budget) {
+                     size_t groupTapeBytes, size_t summaryBytes, BatchBudget &budget, bool preferWholeDispatch) {
     budget = {};
     if (!groupCount || !groupTapeBytes)
         return false;
@@ -39,21 +70,16 @@ bool planBatchBudget(PlanningPolicy policy, size_t fixedBytes, size_t maximumByt
         return false;
     const size_t maximumCapacity = std::min({groupCount, (maximumBytes - fixedManagedBytes) / perGroupBytes,
                                              static_cast<size_t>(std::numeric_limits<uint32_t>::max())});
-    if (policy == PlanningPolicy::MinMemory) {
-        // Minimize memory subject to a bounded control-plane cost. A one-group
-        // batch made submissions and fixed-size summary readbacks scale with
-        // the workgroup count, which is unusable for large dispatches.
-        const size_t controlPlaneFloor =
-            groupCount / kMaximumReplayBatches + static_cast<size_t>(groupCount % kMaximumReplayBatches != 0);
-        budget.capacity = std::min(maximumCapacity, std::max(controlPlaneFloor, size_t{1}));
-    } else if (policy == PlanningPolicy::Balanced) {
-        budget.capacity = static_cast<size_t>(std::sqrt(static_cast<long double>(maximumCapacity)));
-        if (budget.capacity && (budget.capacity < maximumCapacity / budget.capacity ||
-                                budget.capacity * budget.capacity < maximumCapacity))
-            ++budget.capacity;
-        budget.capacity = std::max(budget.capacity, size_t{1});
-    } else
-        budget.capacity = maximumCapacity;
+    if (!maximumCapacity)
+        return false;
+    // Dynamic validation benefits from one atomic transaction when the whole
+    // pass fits. Proven-static replay can use the policy-selected capacity and
+    // still chain every batch into one command plan without status readbacks.
+    budget.capacity = preferWholeDispatch && maximumCapacity == groupCount
+                          ? groupCount
+                          : costModelCapacity(policy, groupCount, maximumCapacity, perGroupBytes);
+    budget.wholeDispatch = budget.capacity == groupCount;
+    budget.batchCount = divideCeil(groupCount, budget.capacity);
     if (!budget.capacity || !multiply(groupTapeBytes, budget.capacity, budget.tapeBytes) ||
         !multiply(sizeof(Segment), budget.capacity, budget.segmentBytes)) {
         budget = {};

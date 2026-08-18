@@ -186,8 +186,8 @@ def _value_leaves(
         if not isinstance(element, ConcreteType):
             raise ValueError("Tensor element type is not concrete")
         dimensions = value_type.arguments[1:]
-        if not dimensions or any(not isinstance(extent, int) or extent <= 0 for extent in dimensions):
-            raise ValueError("Tensor ABI layout requires a positive static shape")
+        if any(not isinstance(extent, int) or extent <= 0 for extent in dimensions):
+            raise ValueError("Tensor ABI layout requires positive static shape dimensions")
         count = 1
         for dimension in dimensions:
             assert isinstance(dimension, int)

@@ -58,6 +58,7 @@ function(vernon_add_python_bindings package_directory source_directory)
         "${source_directory}/python/native_module.cpp"
         "${source_directory}/python/native_execution_graph.cpp"
         "${source_directory}/python/native_execution_graph_autodiff.cpp"
+        "${source_directory}/python/native_operator.cpp"
         "${source_directory}/python/native_pipeline.cpp"
         "${source_directory}/python/native_pipeline_autodiff.cpp"
         "${source_directory}/python/native_rhi.cpp"

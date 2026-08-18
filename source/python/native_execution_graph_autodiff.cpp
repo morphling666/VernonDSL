@@ -1,15 +1,101 @@
 #include "native_execution_graph_autodiff.h"
 
+#include "execution_graph/execution_graph_internal.h"
+#include "native_operator.h"
 #include "native_pipeline_autodiff.h"
 
 #include <nanobind/stl/unique_ptr.h>
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
+#include <vector>
 
 namespace {
+
+nb::object plannedDeviceValue(nb::object value, vernon::execution::detail::RhiCommandPlanSink &sink) {
+    if (nb::hasattr(value, "_planned_device_write_pending") &&
+        nb::cast<bool>(value.attr("_planned_device_write_pending")()))
+        return value;
+    if (nb::hasattr(value, "_device_dirty") && nb::cast<bool>(value.attr("_device_dirty")))
+        return value;
+    nb::object storage;
+    nb::object result;
+    if (nb::hasattr(value, "_begin_planned_upload") && nb::hasattr(value, "_planned_buffer")) {
+        storage = value;
+        result = value;
+    } else if (nb::hasattr(value, "_resident_buffer")) {
+        throw std::runtime_error("planned graph cotangent does not support transactional residency");
+    } else {
+        nb::object array = nb::module_::import_("numpy").attr("ascontiguousarray")(value);
+        storage = nb::module_::import_("vernon_dsl").attr("storage").attr("from_numpy")(array);
+        result = storage;
+    }
+    nb::tuple residency = nb::cast<nb::tuple>(storage.attr("_begin_planned_upload")());
+    if (residency.size() != 3)
+        throw std::runtime_error("planned graph cotangent residency transaction is invalid");
+    nb::object bufferObject = nb::borrow<nb::object>(residency[0]);
+    nb::object transaction = nb::borrow<nb::object>(residency[1]);
+    auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+    if (!buffer || !buffer->host)
+        throw std::runtime_error("cannot allocate planned graph cotangent buffer");
+    struct UploadContext {
+        VernonRhiDevice device{};
+        VernonRhiBuffer buffer{};
+        std::vector<std::pair<uint64_t, std::string>> uploads;
+    };
+    auto context = std::make_shared<UploadContext>();
+    context->device = buffer->host->device;
+    context->buffer = buffer->handle;
+    for (nb::handle item : nb::cast<nb::list>(residency[2])) {
+        nb::tuple upload = nb::cast<nb::tuple>(item);
+        if (upload.size() != 2)
+            throw std::runtime_error("planned graph cotangent upload range is invalid");
+        const uint64_t offset = nb::cast<uint64_t>(upload[0]);
+        nb::bytes raw = nb::cast<nb::bytes>(upload[1]);
+        if (offset > buffer->size || raw.size() > buffer->size - offset)
+            throw std::runtime_error("planned graph cotangent upload range exceeds its buffer");
+        context->uploads.emplace_back(offset, std::string(raw.c_str(), raw.size()));
+    }
+    const auto encode = [](void *opaque, VernonRhiCommandEncoder encoder) {
+        auto &state = *static_cast<UploadContext *>(opaque);
+        for (const auto &[offset, bytes] : state.uploads) {
+            const VernonRhiStatus status = vernonRhiCommandEncoderUploadBuffer(state.device, encoder, state.buffer,
+                                                                               offset, bytes.data(), bytes.size());
+            if (status != VERNON_RHI_STATUS_OK)
+                return status;
+        }
+        return VERNON_RHI_STATUS_OK;
+    };
+    if (!context->uploads.empty()) {
+        vernon::execution::detail::RhiCommandExecutionPlan plan;
+        vernon::execution::detail::CommandNode upload;
+        upload.kind = vernon::execution::detail::CommandNodeKind::Transfer;
+        upload.queue = vernon::execution::detail::CommandQueueClass::Transfer;
+        for (const auto &[offset, bytes] : context->uploads)
+            upload.accesses.push_back(vernon::execution::detail::rhiBufferAccess(
+                buffer->handle, offset, bytes.size(), vernon::execution::AccessMode::Write,
+                VERNON_RHI_STATE_TRANSFER_DESTINATION));
+        plan.commands.nodes.push_back(std::move(upload));
+        plan.encoders.push_back({encode, context.get()});
+        plan.retainedContexts.push_back(std::move(context));
+        vernon::execution::detail::appendRhiBufferBinding(plan.bindings, buffer->handle);
+        if (sink.append(std::move(plan)) != VERNON_RHI_STATUS_OK) {
+            transaction.attr("_rollback_planned_state")();
+            throw std::runtime_error("cannot append planned graph cotangent upload");
+        }
+    }
+    try {
+        retainPythonCommandCompletion(sink, transaction);
+    } catch (...) {
+        transaction.attr("_rollback_planned_state")();
+        throw;
+    }
+    return result;
+}
 
 uint64_t metadataBytes(const PythonAdMetadata &metadata) {
     uint64_t scalarBytes = 0;
@@ -189,16 +275,97 @@ struct PythonCheckpointResource final : vernon::execution::GraphCheckpointResour
 };
 
 struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
+    struct AddExpression {
+        std::shared_ptr<PythonGraphAutodiffValue> left;
+        std::shared_ptr<PythonGraphAutodiffValue> right;
+    };
+
     PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState)
         : value(std::move(value)), allocationBytesValue(pythonValueAllocationBytes(this->value)),
-          callbackState(std::move(callbackState)) {}
+          valueBytesValue(allocationBytesValue), callbackState(std::move(callbackState)) {}
 
     PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState,
                              uint64_t allocationBytes)
-        : value(std::move(value)), allocationBytesValue(allocationBytes), callbackState(std::move(callbackState)) {}
+        : value(std::move(value)), allocationBytesValue(allocationBytes), valueBytesValue(allocationBytes),
+          callbackState(std::move(callbackState)) {}
 
-    uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(value.ptr()); }
+    PythonGraphAutodiffValue(std::shared_ptr<AddExpression> expression,
+                             std::shared_ptr<PythonGraphCallbackState> callbackState, uint64_t allocationBytes,
+                             uint64_t valueBytes)
+        : expression(std::move(expression)), allocationBytesValue(allocationBytes), valueBytesValue(valueBytes),
+          callbackState(std::move(callbackState)) {}
+
+    uintptr_t logicalIdentity() const override {
+        return expression ? reinterpret_cast<uintptr_t>(expression.get()) : reinterpret_cast<uintptr_t>(value.ptr());
+    }
     uint64_t allocationBytes() const override { return allocationBytesValue; }
+
+    bool materialize(vernon::execution::detail::RhiCommandPlanSink *sink, std::string &error) override {
+        try {
+            materialize(sink);
+            return true;
+        } catch (const std::exception &exception) {
+            error = exception.what();
+        } catch (...) {
+            error = "planned graph autodiff value materialization failed";
+        }
+        return false;
+    }
+
+    std::shared_ptr<PythonGraphAutodiffValue> clone() const {
+        return expression ? std::make_shared<PythonGraphAutodiffValue>(expression, callbackState, allocationBytesValue,
+                                                                       valueBytesValue)
+                          : std::make_shared<PythonGraphAutodiffValue>(value, callbackState, allocationBytesValue);
+    }
+
+    nb::object materialize(vernon::execution::detail::RhiCommandPlanSink *sink = nullptr) const {
+        if (!expression) {
+            if (sink)
+                value = plannedDeviceValue(std::move(value), *sink);
+            return value;
+        }
+        nb::list nodes;
+        appendExpression(nodes, sink);
+        nb::object materialize =
+            nb::module_::import_("vernon_dsl._runtime.operators.gradient_expression").attr("materialize");
+        value = sink ? materialize(nodes, nb::cast(sink, nb::rv_policy::reference)) : materialize(nodes);
+        expression.reset();
+        allocationBytesValue = valueBytesValue;
+        return value;
+    }
+
+    size_t appendExpression(nb::list &nodes, vernon::execution::detail::RhiCommandPlanSink *sink) const {
+        struct Frame {
+            const PythonGraphAutodiffValue *value;
+            bool expanded;
+        };
+        std::vector<Frame> frames{{this, false}};
+        std::vector<size_t> indices;
+        while (!frames.empty()) {
+            const Frame frame = frames.back();
+            frames.pop_back();
+            if (!frame.value->expression) {
+                if (sink)
+                    frame.value->value = plannedDeviceValue(std::move(frame.value->value), *sink);
+                nodes.append(nb::make_tuple("leaf", frame.value->value));
+                indices.push_back(nodes.size() - 1);
+                continue;
+            }
+            if (!frame.expanded) {
+                frames.push_back({frame.value, true});
+                frames.push_back({frame.value->expression->right.get(), false});
+                frames.push_back({frame.value->expression->left.get(), false});
+                continue;
+            }
+            const size_t right = indices.back();
+            indices.pop_back();
+            const size_t left = indices.back();
+            indices.pop_back();
+            nodes.append(nb::make_tuple("add", left, right));
+            indices.push_back(nodes.size() - 1);
+        }
+        return indices.back();
+    }
 
     std::shared_ptr<vernon::execution::GraphAutodiffValue> add(const vernon::execution::GraphAutodiffValue &other,
                                                                std::string &error) const override {
@@ -210,20 +377,19 @@ struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
         try {
             if (callbackState)
                 callbackState->recordReverseCallback();
-            nb::object numpy = nb::module_::import_("numpy");
-            nb::object tensorStorageType = nb::module_::import_("vernon_dsl._runtime.resources").attr("TensorStorage");
-            const bool leftStorage = nb::isinstance(value, tensorStorageType);
-            const bool rightStorage = nb::isinstance(python->value, tensorStorageType);
-            nb::object result;
-            if (leftStorage || rightStorage)
-                result = tensorStorageType.attr("_add_gradients")(leftStorage ? value : python->value,
-                                                                  leftStorage ? python->value : value);
-            else {
-                nb::object sum = numpy.attr("asarray")(value).attr("__add__")(numpy.attr("asarray")(python->value));
-                result = numpy.attr("ascontiguousarray")(sum);
+            auto node = std::make_shared<AddExpression>();
+            node->left = clone();
+            node->right = python->clone();
+            const uint64_t resultBytes = std::max(valueBytesValue, python->valueBytesValue);
+            if (python->allocationBytesValue > std::numeric_limits<uint64_t>::max() - allocationBytesValue ||
+                resultBytes >
+                    std::numeric_limits<uint64_t>::max() - allocationBytesValue - python->allocationBytesValue) {
+                error = "graph cotangent accumulation size overflows";
+                return {};
             }
             return std::make_shared<PythonGraphAutodiffValue>(
-                std::move(result), callbackState, std::max(allocationBytesValue, python->allocationBytesValue));
+                std::move(node), callbackState, allocationBytesValue + python->allocationBytesValue + resultBytes,
+                resultBytes);
         } catch (...) {
             if (callbackState)
                 callbackState->captureException(std::current_exception());
@@ -232,8 +398,10 @@ struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
         }
     }
 
-    nb::object value;
-    uint64_t allocationBytesValue;
+    mutable nb::object value;
+    mutable std::shared_ptr<AddExpression> expression;
+    mutable uint64_t allocationBytesValue;
+    uint64_t valueBytesValue;
     std::shared_ptr<PythonGraphCallbackState> callbackState;
 };
 
@@ -250,32 +418,43 @@ struct PythonPassPullback final : vernon::execution::PassPullback {
           callbackState(std::move(callbackState)) {}
 
     bool apply(const vernon::execution::NamedGraphAutodiffValues &cotangents,
-               vernon::execution::NamedGraphAutodiffValues &gradients, std::string &error) override {
-        return applyImpl(cotangents, gradients, nullptr, error);
-    }
-
-    bool applyWithOptions(const vernon::execution::NamedGraphAutodiffValues &cotangents,
-                          vernon::execution::NamedGraphAutodiffValues &gradients,
-                          const vernon::execution::PassPullbackApplyOptions &options, std::string &error) override {
+               vernon::execution::NamedGraphAutodiffValues &gradients,
+               const vernon::execution::PassPullbackApplyOptions &options,
+               vernon::execution::detail::RhiCommandPlanSink *sink, std::string &error) override {
         const VernonPullbackApplyOptions runtimeOptions{sizeof(VernonPullbackApplyOptions),
                                                         VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
                                                         options.maximumTemporaryBytes,
                                                         options.maximumReusableConstructionBytes,
                                                         {}};
-        return applyImpl(cotangents, gradients, &runtimeOptions, error);
+        return applyImpl(cotangents, gradients, &runtimeOptions, error, sink);
     }
 
     bool applyImpl(const vernon::execution::NamedGraphAutodiffValues &cotangents,
                    vernon::execution::NamedGraphAutodiffValues &gradients, const VernonPullbackApplyOptions *options,
-                   std::string &error) {
+                   std::string &error, vernon::execution::detail::RhiCommandPlanSink *sink = nullptr) {
         try {
             nb::dict values;
-            for (const auto &cotangent : cotangents)
-                values[cotangent.first.c_str()] = pythonGraphAutodiffValue(cotangent.second);
+            for (const auto &cotangent : cotangents) {
+                auto python = std::dynamic_pointer_cast<PythonGraphAutodiffValue>(cotangent.second);
+                if (!python)
+                    throw std::runtime_error("graph autodiff value has an incompatible native type");
+                values[cotangent.first.c_str()] = python->materialize(sink);
+            }
             if (callbackState)
                 callbackState->recordReverseCallback();
-            nb::dict result =
-                native->applyGroupedWithOptions(values, gradientGroups, cotangentGroups, carrierShape, true, options);
+            nb::dict result;
+            const bool appliedOnDevice =
+                sink ? native->applyGroupedDevicePlanned(values, gradientGroups, cotangentGroups, carrierShape, true,
+                                                         options, *sink, result)
+                     : native->applyGroupedDeviceWithOptions(values, gradientGroups, cotangentGroups, carrierShape,
+                                                             true, options, result);
+            if (!appliedOnDevice && sink)
+                throw std::runtime_error("planned graph pullback requires device-resident Runtime AD lowering");
+            if (!appliedOnDevice)
+                result = native->applyGroupedWithOptions(values, gradientGroups, cotangentGroups, carrierShape, true,
+                                                         options);
+            else if (sink)
+                sink->retain(std::make_shared<nb::object>(value));
             const auto &metadataValues = native->gradientMetadata();
             for (auto item : result) {
                 const std::string path = nb::cast<std::string>(item.first);
@@ -343,7 +522,7 @@ nb::object pythonGraphAutodiffValue(const std::shared_ptr<vernon::execution::Gra
     auto python = std::dynamic_pointer_cast<PythonGraphAutodiffValue>(value);
     if (!python)
         throw std::runtime_error("graph autodiff value has an incompatible native type");
-    return python->value;
+    return python->materialize();
 }
 
 std::unique_ptr<vernon::execution::PassPullback>

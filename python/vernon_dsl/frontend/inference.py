@@ -1281,8 +1281,8 @@ class _Inference:
             if not is_abi_stable_value(element, lambda struct: tuple(value for _, value in self.structs[struct])):
                 raise self.error(node.args[0], "workgroup_storage element must be an ABI-stable Value")
             shape_node = node.keywords[0].value
-            if not isinstance(shape_node, ast.Tuple) or not shape_node.elts:
-                raise self.error(shape_node, "workgroup_storage shape must be a non-empty tuple")
+            if not isinstance(shape_node, ast.Tuple):
+                raise self.error(shape_node, "workgroup_storage shape must be a tuple")
             shape: list[int] = []
             for extent in shape_node.elts:
                 if (
@@ -1561,6 +1561,12 @@ class _Inference:
                 )
                 self._constrain_literal(source, expected)
             return ConcreteType("tensor", "Tensor", (element, count))
+        if name == "Tensor" and not isinstance(node.args[0], (ast.List, ast.Tuple)):
+            element = default_type(self._expression(node.args[0], environment))
+            if not is_abi_stable_value(element):
+                raise self.error(node, "Tensor element has an incompatible type")
+            self._constrain_literal(node.args[0], element)
+            return ConcreteType("tensor", "Tensor", (element,))
         literal = rectangular_literal(node.args[0])
         if literal is None:
             raise self.error(node, f"{name} requires a non-empty rectangular sequence literal")

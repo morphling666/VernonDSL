@@ -146,9 +146,13 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 continue;
             const VernonPipelineArgument &argument = *argumentIt->second;
             if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
-                !argument.tensor.rank || !argument.tensor.shape)
+                (argument.tensor.rank && !argument.tensor.shape))
                 continue;
             const uint32_t rank = argument.tensor.rank;
+            if (!rank) {
+                plan.grid = {1, 1, 1};
+                break;
+            }
             const uint32_t gridDimensions = rank < 3 ? rank : 3;
             for (uint32_t dimension = 0; dimension < gridDimensions; ++dimension) {
                 if (!argument.tensor.shape[rank - 1 - dimension] ||

@@ -93,9 +93,7 @@ bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter
         if (!checkedMultiply(staticElements, static_cast<size_t>(extent), staticElements))
             return false;
     }
-    if (view.shape.empty()) {
-        view.shape.push_back(1);
-    } else if (dynamicDimensions == 1) {
+    if (dynamicDimensions == 1) {
         if (logicalBytes % elementBytes != 0 || logicalBytes / elementBytes % staticElements != 0)
             return false;
         const uint64_t dynamicExtent = logicalBytes / elementBytes / staticElements;

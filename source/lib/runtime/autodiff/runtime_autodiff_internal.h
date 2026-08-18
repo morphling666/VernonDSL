@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_policy.h"
+#include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 
@@ -14,6 +15,11 @@
 #include <vector>
 
 struct VernonRuntimeContext;
+
+namespace vernon::execution::detail {
+class RhiCommandPlanSink;
+struct RhiCommandExecutionPlan;
+} // namespace vernon::execution::detail
 
 namespace vernon::runtime {
 class ContextLease;
@@ -68,8 +74,11 @@ struct PullbackApplyOptions {
 struct ForwardExecutionTarget {
     VernonRuntimeProviderObject encoder{};
     const VernonPipelineInvocation *invocation{};
+    execution::detail::RhiCommandExecutionPlan *commandPlan{};
 
     bool externalEncoder() const { return encoder.value != 0; }
+    bool deferredCommandPlan() const { return commandPlan != nullptr; }
+    bool encodedInvocation() const { return externalEncoder() || deferredCommandPlan(); }
 };
 
 class PullbackExecution {
@@ -79,6 +88,13 @@ public:
                                const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
     virtual PullbackControlPlaneUsage controlPlaneUsage() const { return {}; }
+};
+
+class DevicePullbackExecution : public PullbackExecution {
+public:
+    virtual VernonStatus applyDevice(const VernonAdDeviceValueSet *cotangents, VernonAdDeviceValueSet &gradients,
+                                     const PullbackApplyOptions &options,
+                                     execution::detail::RhiCommandPlanSink *sink = nullptr) = 0;
 };
 
 class Executable {

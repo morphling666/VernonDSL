@@ -93,7 +93,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset, const Buffer &destination,
                     uint64_t destinationOffset, uint64_t size, std::string &error);
     bool submitCommands(uint64_t native, std::string &error);
-    void completeCommands(uint64_t native);
+    bool pollCommands(uint64_t native, bool &completed, bool &succeeded, std::string &error);
+    bool completeCommands(uint64_t native, std::string &error);
     void abandonCommands(uint64_t native);
 
     id<MTLDevice> device;

@@ -552,6 +552,25 @@ def _performance_acceptance(
                     "failure_reason": result["failure_reason"],
                 }
             )
+        if result.get("skipped") or result.get("failed") or result["architecture"] == "cpu":
+            continue
+        steps = int(result["steps"])
+        pass_count = len(result["pass_telemetry"])
+        maximum_control_events = 3 * pass_count * steps
+        for metric in ("submission_count", "wait_count", "readback_count"):
+            measured = int(result[metric])
+            checks.append(
+                {
+                    "name": "bounded_gpu_replay_control_plane",
+                    "metric": metric,
+                    "planning_policy": result["planning_policy"],
+                    "architecture": result["architecture"],
+                    "grid": result["grid"],
+                    "measured": measured,
+                    "maximum": maximum_control_events,
+                    "passed": measured <= maximum_control_events,
+                }
+            )
     for comparison in comparisons:
         if comparison.get("skipped") or comparison.get("failed") or comparison["grid"] < 256:
             continue

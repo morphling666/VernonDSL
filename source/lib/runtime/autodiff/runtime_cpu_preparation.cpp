@@ -45,7 +45,9 @@ bool materializeTensorViewShape(const HostArgument &argument, const VernonAdValu
         if (!value || value->dtype != leaf.dtype || value->rank != view.shape.size() + layoutLeaf.shape.size() ||
             (value->rank && !value->shape))
             return false;
-        std::vector<uint64_t> candidate(value->shape, value->shape + view.shape.size());
+        std::vector<uint64_t> candidate;
+        if (!view.shape.empty())
+            candidate.assign(value->shape, value->shape + view.shape.size());
         for (size_t dimension = 0; dimension < view.shape.size(); ++dimension)
             if (view.shape[dimension] >= 0 && candidate[dimension] != static_cast<uint64_t>(view.shape[dimension]))
                 return false;
@@ -69,7 +71,7 @@ bool materializeTensorViewShape(const HostArgument &argument, const VernonAdValu
         else if (shape != candidate)
             return false;
     }
-    return !shape.empty();
+    return true;
 }
 
 bool appendStorageRange(const void *data, size_t size, bool writable, std::vector<StorageRange> &ranges) {

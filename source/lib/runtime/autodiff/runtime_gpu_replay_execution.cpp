@@ -75,7 +75,7 @@ bool planReplayRestoreCopies(const VernonLoadedPipeline &forward, DeviceValues &
         }
         if (!declared || wholeView) {
             copies.push_back(
-                {source->second.buffer.handle(), current->second.buffer.handle(), 0, current->second.buffer.size()});
+                {source->second.buffer.handle(), current->second.buffer.handle(), 0, 0, current->second.buffer.size()});
             continue;
         }
         size_t elements = 1;
@@ -90,8 +90,8 @@ bool planReplayRestoreCopies(const VernonLoadedPipeline &forward, DeviceValues &
         for (size_t index : linearIndices) {
             if (index >= elements)
                 return false;
-            copies.push_back(
-                {source->second.buffer.handle(), current->second.buffer.handle(), index * elementBytes, elementBytes});
+            copies.push_back({source->second.buffer.handle(), current->second.buffer.handle(), index * elementBytes,
+                              index * elementBytes, elementBytes});
         }
     }
     return true;

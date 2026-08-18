@@ -1,5 +1,6 @@
 #include "VernonExecutionGraph.h"
 #include "execution_graph/execution_graph_checkpoint_planner_internal.h"
+#include "execution_graph/execution_graph_internal.h"
 
 #include <gtest/gtest.h>
 
@@ -165,6 +166,11 @@ struct ScalarAutodiffValue final : GraphAutodiffValue {
         }
         return std::make_shared<ScalarAutodiffValue>(value + scalar->value);
     }
+    bool materialize(detail::RhiCommandPlanSink *sink, std::string &error) override {
+        (void)sink;
+        (void)error;
+        return true;
+    }
 
     double value;
 };
@@ -252,7 +258,7 @@ public:
           remainingFailures_(std::move(remainingFailures)) {}
 
     bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
-               std::string &error) override {
+               const PassPullbackApplyOptions &, detail::RhiCommandPlanSink *sink, std::string &error) override {
         uint32_t remaining = remainingFailures_ ? remainingFailures_->load() : 0;
         const bool oneShotFailure =
             remainingFailures_ && remaining &&
@@ -272,6 +278,18 @@ public:
         }
         for (const PassDerivativeMapping &gradient : gradients_)
             gradients.emplace_back(gradient.path, std::make_shared<ScalarAutodiffValue>(total * scale_));
+        if (sink) {
+            detail::RhiCommandExecutionPlan plan;
+            detail::CommandNode node;
+            node.kind = detail::CommandNodeKind::Derivative;
+            node.queue = detail::CommandQueueClass::Compute;
+            plan.commands.nodes.push_back(std::move(node));
+            plan.encoders.push_back({[](void *, VernonRhiCommandEncoder) { return VERNON_RHI_STATUS_OK; }, nullptr});
+            if (sink->append(std::move(plan)) != VERNON_RHI_STATUS_OK) {
+                error = "cannot append scalar test pullback plan";
+                return false;
+            }
+        }
         return true;
     }
 
@@ -333,8 +351,8 @@ public:
     bool hasCheckpointPlanningMetadata() const override { return true; }
     bool supportsReplay() const override { return supportsReplay_; }
 
-    bool forward(ComputeEncoder &, const ExecutionResources &, std::unique_ptr<PassPullback> &pullback,
-                 std::string &error) override {
+    bool forward(ComputeEncoder *encoder, const ExecutionResources &, detail::RhiCommandExecutionPlan *plan,
+                 std::unique_ptr<PassPullback> &pullback, std::string &error) override {
         if (throwForward_)
             throw std::runtime_error("test forward exception");
         const bool countedFailure = forwardCount_ && forwardCount_->fetch_add(1) >= failForwardAfter_;
@@ -344,6 +362,20 @@ public:
         }
         pullback = std::make_unique<ScalarPassPullback>(gradients_, scale_, failBackward_, actualTapeBytes_,
                                                         remainingBackwardFailures_);
+        if (plan) {
+            if (encoder) {
+                error = "scalar test pass received both an encoder and command plan";
+                return false;
+            }
+            detail::CommandNode node;
+            node.kind = detail::CommandNodeKind::Derivative;
+            node.queue = detail::CommandQueueClass::Compute;
+            plan->commands.nodes.push_back(std::move(node));
+            plan->encoders.push_back({[](void *, VernonRhiCommandEncoder) { return VERNON_RHI_STATUS_OK; }, nullptr});
+        } else if (!encoder) {
+            error = "scalar test pass requires an encoder or command plan";
+            return false;
+        }
         return true;
     }
 
@@ -382,7 +414,11 @@ private:
 class AliasedGradientPullback final : public PassPullback {
 public:
     bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
-               std::string &error) override {
+               const PassPullbackApplyOptions &, detail::RhiCommandPlanSink *sink, std::string &error) override {
+        if (sink) {
+            error = "aliased test pullback does not support planned apply";
+            return false;
+        }
         if (cotangents.size() != 1) {
             error = "aliased test pullback requires one cotangent";
             return false;
@@ -430,8 +466,12 @@ public:
     bool hasCheckpointPlanningMetadata() const override { return true; }
     bool supportsReplay() const override { return true; }
 
-    bool forward(ComputeEncoder &, const ExecutionResources &, std::unique_ptr<PassPullback> &pullback,
-                 std::string &) override {
+    bool forward(ComputeEncoder *encoder, const ExecutionResources &, detail::RhiCommandExecutionPlan *plan,
+                 std::unique_ptr<PassPullback> &pullback, std::string &error) override {
+        if (!encoder || plan) {
+            error = "aliased test pass does not support planned forward";
+            return false;
+        }
         pullback = std::make_unique<AliasedGradientPullback>();
         return true;
     }
@@ -483,10 +523,14 @@ public:
     bool hasCheckpointPlanningMetadata() const override { return true; }
     bool supportsReplay() const override { return true; }
 
-    bool forward(ComputeEncoder &encoder, const ExecutionResources &resources, std::unique_ptr<PassPullback> &pullback,
-                 std::string &) override {
+    bool forward(ComputeEncoder *encoder, const ExecutionResources &resources, detail::RhiCommandExecutionPlan *plan,
+                 std::unique_ptr<PassPullback> &pullback, std::string &error) override {
+        if (!encoder || plan) {
+            error = "resource-square test pass does not support planned forward";
+            return false;
+        }
         const float value = inputState_->floatValue();
-        execute(encoder, resources);
+        execute(*encoder, resources);
         pullback = std::make_unique<ScalarPassPullback>(gradients_, 2.0 * value, false, estimatedResidualBytes());
         return true;
     }

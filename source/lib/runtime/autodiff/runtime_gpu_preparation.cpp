@@ -1,10 +1,10 @@
 #include "runtime_gpu_preparation.h"
 
+#include "execution_graph/execution_graph_internal.h"
 #include "runtime_gpu_argument_binding.h"
 #include "runtime_gpu_commands.h"
 #include "runtime_gpu_failure_injection.h"
 
-#include "rhi/logical_resource_record.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/runtime_state.h"
@@ -283,7 +283,8 @@ bool appendDeviceArgument(const Parameter &parameter, DeviceValue &device,
 
 bool buildForwardArguments(VernonRuntimeContext &context, const Variant &variant, const VernonAdValueSet &inputs,
                            DeviceValues &working, DeviceValues &retainedDevices, HostValues &retainedHosts,
-                           std::vector<VernonPipelineArgument> &arguments, bool retainStorageHostCopy) {
+                           std::vector<VernonPipelineArgument> &arguments, std::vector<DeviceBufferUpload> &uploads,
+                           bool retainStorageHostCopy) {
     arguments.reserve(variant.parameters.size());
     for (const Parameter &parameter : variant.parameters) {
         if (isAutodiffInternal(parameter))
@@ -304,11 +305,11 @@ bool buildForwardArguments(VernonRuntimeContext &context, const Variant &variant
             continue;
         }
         DeviceValue current(context, *value);
-        if (!current.buffer.upload(value->data, value->size))
-            return false;
         DeviceValue original(context, *value);
-        if (!original.buffer.upload(value->data, value->size))
+        if (!current.buffer.valid() || !original.buffer.valid())
             return false;
+        uploads.push_back({current.buffer.handle(), 0, value->data, value->size});
+        uploads.push_back({original.buffer.handle(), 0, value->data, value->size});
         auto [workingIt, inserted] = working.emplace(parameter.name, std::move(current));
         auto [retainedIt, retainedInserted] = retainedDevices.emplace(parameter.name, std::move(original));
         const bool hostRetained =
@@ -434,18 +435,21 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     if (!materializeRuntimeSignature(*signature, inputs, *prepared.signature))
         return fail(context, "GPU autodiff values cannot be materialized from reflection");
     std::vector<VernonPipelineArgument> arguments;
-    if (!target.externalEncoder()) {
+    std::vector<DeviceBufferUpload> uploads;
+    std::vector<DeviceBufferCopy> copies;
+    VernonRhiCommandEncoder nativeEncoder{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (!target.encodedInvocation()) {
         if (!buildForwardArguments(context, pipeline->variant, inputs, prepared.working, prepared.retainedDevices,
-                                   prepared.retainedHosts, arguments, false))
+                                   prepared.retainedHosts, arguments, uploads, false))
             return fail(context, std::string("cannot prepare GPU autodiff ") + resourceName + " resources",
                         VERNON_STATUS_INTERNAL_ERROR);
     } else {
         if (!target.invocation)
             return fail(context, "encoded GPU autodiff forward has no invocation");
         const VernonPipelineInvocation &invocation = *target.invocation;
-        VernonRhiCommandEncoder nativeEncoder{};
-        if (!decodeResourceHandle(target.encoder.value, nativeEncoder) ||
-            vernon::rhi::commandEncoderKey(context.rhiDevice, nativeEncoder) != target.encoder.value)
+        if (target.externalEncoder() &&
+            (!decodeResourceHandle(target.encoder.value, nativeEncoder) ||
+             vernon::rhi::commandEncoderKey(context.rhiDevice, nativeEncoder) != target.encoder.value))
             return fail(context, "GPU autodiff command encoder belongs to another Runtime device");
         if (invocation.argument_count)
             arguments.assign(invocation.arguments, invocation.arguments + invocation.argument_count);
@@ -495,12 +499,39 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
                 strides.assign(tensor.byte_strides, tensor.byte_strides + tensor.rank);
             }
             DeviceValue retained(context, span, value->dtype, std::move(shape), std::move(strides), before);
-            if (!retained.buffer.valid() ||
-                vernonRhiCommandEncoderCopyBuffer(context.rhiDevice, nativeEncoder, source,
+            if (!retained.buffer.valid())
+                return fail(context, "cannot allocate GPU autodiff retained Value", VERNON_STATUS_INTERNAL_ERROR);
+            if (target.deferredCommandPlan()) {
+                copies.push_back({source, retained.buffer.handle(), tensor.resource.offset + sourceOffset, 0, span});
+                if (!prepared.retainedDevices.emplace(parameter.name, std::move(retained)).second)
+                    return fail(context, "cannot retain GPU autodiff Value", VERNON_STATUS_INTERNAL_ERROR);
+                continue;
+            }
+            if (vernonRhiCommandEncoderCopyBuffer(context.rhiDevice, nativeEncoder, source,
                                                   tensor.resource.offset + sourceOffset, retained.buffer.handle(), 0,
-                                                  span) != VERNON_RHI_STATUS_OK ||
-                !prepared.retainedDevices.emplace(parameter.name, std::move(retained)).second)
+                                                  span) != VERNON_RHI_STATUS_OK)
                 return fail(context, "cannot encode GPU autodiff retained Value copy", VERNON_STATUS_INTERNAL_ERROR);
+            VernonRhiBarrier sourceBarrier{};
+            sourceBarrier.struct_size = sizeof(sourceBarrier);
+            sourceBarrier.destination_stage_mask = VERNON_RHI_STAGE_COMPUTE;
+            sourceBarrier.source_access = VERNON_RHI_ACCESS_TRANSFER_READ;
+            sourceBarrier.destination_access = VERNON_RHI_ACCESS_SHADER_READ | VERNON_RHI_ACCESS_SHADER_WRITE;
+            sourceBarrier.old_state = VERNON_RHI_STATE_TRANSFER_SOURCE;
+            sourceBarrier.new_state = VERNON_RHI_STATE_SHADER_WRITE;
+            sourceBarrier.buffer = source;
+            VernonRhiBarrier retainedBarrier{};
+            retainedBarrier.struct_size = sizeof(retainedBarrier);
+            retainedBarrier.destination_stage_mask = VERNON_RHI_STAGE_COMPUTE;
+            retainedBarrier.source_access = VERNON_RHI_ACCESS_TRANSFER_WRITE;
+            retainedBarrier.destination_access = VERNON_RHI_ACCESS_SHADER_READ;
+            retainedBarrier.old_state = VERNON_RHI_STATE_TRANSFER_DESTINATION;
+            retainedBarrier.new_state = VERNON_RHI_STATE_SHADER_READ;
+            retainedBarrier.buffer = retained.buffer.handle();
+            const VernonRhiBarrier barriers[]{sourceBarrier, retainedBarrier};
+            if (vernonRhiCommandEncoderBarrier(context.rhiDevice, nativeEncoder, barriers, std::size(barriers)) !=
+                    VERNON_RHI_STATUS_OK ||
+                !prepared.retainedDevices.emplace(parameter.name, std::move(retained)).second)
+                return fail(context, "cannot order GPU autodiff retained Value copy", VERNON_STATUS_INTERNAL_ERROR);
         }
     }
     const uint32_t launchData[3]{computeGrid.x, computeGrid.y, computeGrid.z};
@@ -509,13 +540,44 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     for (const Parameter &parameter : pipeline->variant.parameters) {
         if (parameter.autodiffRole != AutodiffResourceRole::LaunchMetadata)
             continue;
-        if (!launchBuffer.valid() || !launchBuffer.upload(launchData, sizeof(launchData)) ||
-            !appendInternalBufferArgument(context, parameter, launchBuffer, sizeof(launchData), launchView, arguments))
+        if (!launchBuffer.valid())
+            return fail(context, std::string("cannot bind GPU autodiff ") + resourceName + " launch metadata",
+                        VERNON_STATUS_INTERNAL_ERROR);
+        if (target.externalEncoder()) {
+            if (!launchBuffer.upload(nativeEncoder, launchData, sizeof(launchData)))
+                return fail(context, std::string("cannot encode GPU autodiff ") + resourceName + " launch metadata",
+                            VERNON_STATUS_INTERNAL_ERROR);
+        } else {
+            uploads.push_back({launchBuffer.handle(), 0, launchData, sizeof(launchData)});
+        }
+        if (target.externalEncoder()) {
+            VernonRhiBarrier barrier{};
+            barrier.struct_size = sizeof(barrier);
+            barrier.destination_stage_mask = VERNON_RHI_STAGE_COMPUTE;
+            barrier.source_access = VERNON_RHI_ACCESS_TRANSFER_WRITE;
+            barrier.destination_access = VERNON_RHI_ACCESS_SHADER_READ;
+            barrier.old_state = VERNON_RHI_STATE_TRANSFER_DESTINATION;
+            barrier.new_state = VERNON_RHI_STATE_SHADER_READ;
+            barrier.buffer = launchBuffer.handle();
+            if (vernonRhiCommandEncoderBarrier(context.rhiDevice, nativeEncoder, &barrier, 1) != VERNON_RHI_STATUS_OK)
+                return fail(context, std::string("cannot order GPU autodiff ") + resourceName + " launch metadata",
+                            VERNON_STATUS_INTERNAL_ERROR);
+        }
+        if (!appendInternalBufferArgument(context, parameter, launchBuffer, sizeof(launchData), launchView, arguments))
             return fail(context, std::string("cannot bind GPU autodiff ") + resourceName + " launch metadata",
                         VERNON_STATUS_INTERNAL_ERROR);
     }
+    if (target.deferredCommandPlan()) {
+        const VernonStatus status =
+            buildPipelineCommandPlan(context, copies, uploads, *pipeline, arguments, computeGrid, {},
+                                     execution::detail::CommandNodeKind::Derivative, *target.commandPlan);
+        if (status == VERNON_STATUS_OK)
+            target.commandPlan->retainedContexts.push_back(std::make_shared<DeviceBuffer>(std::move(launchBuffer)));
+        return status;
+    }
     if (!target.externalEncoder())
-        return submitAndWait(*pipeline, computeGrid, arguments);
+        return executePipelineCommandDagAndWait(*pipeline, computeGrid, arguments, uploads,
+                                                execution::detail::CommandNodeKind::Derivative);
     VernonPipelineInvocation encoded = *target.invocation;
     encoded.arguments = arguments.empty() ? nullptr : arguments.data();
     encoded.argument_count = arguments.size();

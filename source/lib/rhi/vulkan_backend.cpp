@@ -250,26 +250,30 @@ bool DeviceState::initialize(uint32_t deviceIndex, std::string &error) {
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     poolInfo.queueFamilyIndex = queueFamily;
-    if (!check(api.createCommandPool(device, &poolInfo, nullptr, &commandPool), "vkCreateCommandPool", error)) {
+    CommandFrame initialFrame;
+    if (!check(api.createCommandPool(device, &poolInfo, nullptr, &initialFrame.pool), "vkCreateCommandPool", error)) {
         shutdown();
         return false;
     }
     VkCommandBufferAllocateInfo commandAllocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    commandAllocation.commandPool = commandPool;
+    commandAllocation.commandPool = initialFrame.pool;
     commandAllocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     commandAllocation.commandBufferCount = 1;
-    if (!check(api.allocateCommandBuffers(device, &commandAllocation, &frame.command), "vkAllocateCommandBuffers",
-               error)) {
+    if (!check(api.allocateCommandBuffers(device, &commandAllocation, &initialFrame.command),
+               "vkAllocateCommandBuffers", error)) {
+        api.destroyCommandPool(device, initialFrame.pool, nullptr);
         shutdown();
         return false;
     }
     ++commandBufferAllocations;
     VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (!check(api.createFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence", error)) {
+    if (!check(api.createFence(device, &fenceInfo, nullptr, &initialFrame.fence), "vkCreateFence", error)) {
+        api.destroyCommandPool(device, initialFrame.pool, nullptr);
         shutdown();
         return false;
     }
+    availableCommandFrames.push_back(initialFrame);
     const VkDescriptorPoolSize descriptorSizes[] = {
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1024},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 256},
@@ -350,17 +354,24 @@ void DeviceState::shutdown() {
         destroySampler(defaultImplicitSampler);
         if (descriptorPool && api.destroyDescriptorPool)
             api.destroyDescriptorPool(device, descriptorPool, nullptr);
-        if (frame.fence && api.destroyFence)
-            api.destroyFence(device, frame.fence, nullptr);
-        frame = {};
-        if (commandPool && api.destroyCommandPool)
-            api.destroyCommandPool(device, commandPool, nullptr);
+        const auto destroyFrame = [&](CommandFrame &frame) {
+            if (frame.fence && api.destroyFence)
+                api.destroyFence(device, frame.fence, nullptr);
+            if (frame.pool && api.destroyCommandPool)
+                api.destroyCommandPool(device, frame.pool, nullptr);
+            frame = {};
+        };
+        for (CommandFrame &frame : availableCommandFrames)
+            destroyFrame(frame);
+        for (auto &entry : activeCommandFrames)
+            destroyFrame(entry.second);
+        availableCommandFrames.clear();
+        activeCommandFrames.clear();
         if (api.destroyDevice)
             api.destroyDevice(device, nullptr);
     }
     if (instance && !nativeObjectsBorrowed && api.destroyInstance)
         api.destroyInstance(instance, nullptr);
-    commandPool = VK_NULL_HANDLE;
     descriptorPool = VK_NULL_HANDLE;
     queue = VK_NULL_HANDLE;
     device = VK_NULL_HANDLE;
@@ -395,41 +406,91 @@ bool DeviceState::beginCommands(VkCommandBuffer &command, std::string &error) {
         return command != VK_NULL_HANDLE;
     }
     Driver &api = driver();
-    if (frame.submitted &&
-        !check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error))
-        return false;
+    CommandFrame frame;
+    if (!availableCommandFrames.empty()) {
+        frame = availableCommandFrames.back();
+        availableCommandFrames.pop_back();
+    } else {
+        VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolInfo.queueFamilyIndex = queueFamily;
+        VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocation.commandBufferCount = 1;
+        VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        if (!check(api.createCommandPool(device, &poolInfo, nullptr, &frame.pool), "vkCreateCommandPool", error)) {
+            return false;
+        }
+        allocation.commandPool = frame.pool;
+        if (!check(api.allocateCommandBuffers(device, &allocation, &frame.command), "vkAllocateCommandBuffers",
+                   error) ||
+            !check(api.createFence(device, &fenceInfo, nullptr, &frame.fence), "vkCreateFence", error)) {
+            if (frame.fence && api.destroyFence)
+                api.destroyFence(device, frame.fence, nullptr);
+            if (frame.pool && api.destroyCommandPool)
+                api.destroyCommandPool(device, frame.pool, nullptr);
+            return false;
+        }
+        ++commandBufferAllocations;
+    }
     if (!check(api.resetFences(device, 1, &frame.fence), "vkResetFences", error) ||
-        !check(api.resetCommandBuffer(frame.command, 0), "vkResetCommandBuffer", error))
+        !check(api.resetCommandBuffer(frame.command, 0), "vkResetCommandBuffer", error)) {
+        availableCommandFrames.push_back(frame);
         return false;
-    frame.submitted = false;
+    }
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     command = frame.command;
-    return check(api.beginCommandBuffer(command, &begin), "vkBeginCommandBuffer", error);
+    if (!check(api.beginCommandBuffer(command, &begin), "vkBeginCommandBuffer", error)) {
+        availableCommandFrames.push_back(frame);
+        return false;
+    }
+    if (!activeCommandFrames.emplace(reinterpret_cast<uintptr_t>(command), frame).second) {
+        error = "Vulkan command buffer is already recording";
+        availableCommandFrames.push_back(frame);
+        return false;
+    }
+    return true;
 }
 
 bool DeviceState::submitCommands(VkCommandBuffer command, std::string &error) {
     if (nativeObjectsBorrowed)
         return command == borrowedCommandBuffer;
     Driver &api = driver();
-    if (command != frame.command) {
-        error = "Vulkan command buffer does not belong to the active frame";
+    const auto found = activeCommandFrames.find(reinterpret_cast<uintptr_t>(command));
+    if (found == activeCommandFrames.end()) {
+        error = "Vulkan command buffer does not belong to an active recording";
         return false;
     }
+    const CommandFrame frame = found->second;
     const bool recorded = check(api.endCommandBuffer(command), "vkEndCommandBuffer", error);
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &command;
-    if (!recorded || !check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error))
-        return false;
-    frame.submitted = true;
-    if (!check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error))
+    const bool submitted = recorded && check(api.queueSubmit(queue, 1, &submit, frame.fence), "vkQueueSubmit", error);
+    const bool completed =
+        submitted && check(api.waitForFences(device, 1, &frame.fence, VK_TRUE, UINT64_MAX), "vkWaitForFences", error);
+    activeCommandFrames.erase(found);
+    availableCommandFrames.push_back(frame);
+    if (!completed)
         return false;
     // RuntimeCore caches binding sets across invocations. Resetting the shared
     // pool here would invalidate those live descriptor-set handles.
     uploadRing.cursor = 0;
     readbackRing.cursor = 0;
     return true;
+}
+
+void DeviceState::abandonCommands(VkCommandBuffer command) {
+    if (nativeObjectsBorrowed || !command)
+        return;
+    const auto found = activeCommandFrames.find(reinterpret_cast<uintptr_t>(command));
+    if (found == activeCommandFrames.end())
+        return;
+    (void)driver().resetCommandBuffer(command, 0);
+    availableCommandFrames.push_back(found->second);
+    activeCommandFrames.erase(found);
 }
 
 std::optional<uint32_t> DeviceState::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
@@ -480,6 +541,8 @@ bool DeviceState::createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageF
 
 void DeviceState::destroyBuffer(Buffer &buffer) {
     if (buffer.owned) {
+        if (buffer.mapped && buffer.memory)
+            driver().unmapMemory(device, buffer.memory);
         if (buffer.buffer)
             driver().destroyBuffer(device, buffer.buffer, nullptr);
         if (buffer.memory)
@@ -603,6 +666,7 @@ bool DeviceState::allocateDescriptorSet(VkDescriptorSetLayout layout, VkDescript
         error = "Vulkan descriptor allocation state is incomplete";
         return false;
     }
+    std::lock_guard<std::mutex> guard(descriptorMutex);
     VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
     allocation.descriptorPool = descriptorPool;
     allocation.descriptorSetCount = 1;
@@ -615,6 +679,7 @@ bool DeviceState::freeDescriptorSet(VkDescriptorSet set, std::string &error) {
         error = "Vulkan descriptor release state is incomplete";
         return false;
     }
+    std::lock_guard<std::mutex> guard(descriptorMutex);
     return check(driver().freeDescriptorSets(device, descriptorPool, 1, &set), "vkFreeDescriptorSets", error);
 }
 

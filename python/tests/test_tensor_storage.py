@@ -159,6 +159,62 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(uploads, [(4, 4), (24, 4)])
         np.testing.assert_array_equal(result, np.array([2.0, 3.0, 2.0, 2.0, 2.0, 2.0, 4.0, 2.0], dtype=np.float32))
 
+    def test_planned_upload_commits_only_after_completion(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        native_buffer = mock.Mock()
+        state = mock.Mock()
+        state._native_runtime = object()
+        state._rhi_host.create_buffer.return_value = native_buffer
+        state._runtime_generation = 7
+
+        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+            buffer, transaction, uploads = storage._begin_planned_upload()
+            self.assertIs(buffer, native_buffer)
+            self.assertEqual(uploads, [(0, bytes(storage._array.nbytes))])
+            self.assertTrue(storage._dirty_ranges)
+            self.assertFalse(storage._device_dirty)
+            transaction._commit_planned_state()
+
+        self.assertFalse(storage._dirty_ranges)
+        self.assertFalse(storage._device_dirty)
+        self.assertIs(storage._native_buffer, native_buffer)
+
+    def test_failed_planned_write_invalidates_unpublished_device_state(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        native_buffer = mock.Mock()
+        state = mock.Mock()
+        state._native_runtime = object()
+        state._rhi_host.create_buffer.return_value = native_buffer
+        state._runtime_generation = 7
+
+        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+            _, upload, _ = storage._begin_planned_upload()
+            upload._commit_planned_state()
+            write = storage._begin_planned_device_write()
+            write._rollback_planned_state()
+
+        self.assertIsNone(storage._native_buffer)
+        self.assertEqual(storage._native_generation, -1)
+        self.assertFalse(storage._device_dirty)
+        self.assertEqual(storage._dirty_ranges.ranges, ((0, storage._array.nbytes),))
+
+    def test_pending_planned_write_never_uploads_host_state(self) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
+        native_buffer = mock.Mock()
+        state = mock.Mock()
+        state._native_runtime = object()
+        state._rhi_host.create_buffer.return_value = native_buffer
+        state._runtime_generation = 7
+
+        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+            write = storage._begin_planned_device_write()
+            self.assertTrue(storage._planned_device_write_pending())
+            self.assertIs(storage._resident_buffer(), native_buffer)
+            native_buffer.upload_ranges.assert_not_called()
+            write._rollback_planned_state()
+
+        self.assertFalse(storage._planned_device_write_pending())
+
     def test_fragmented_view_update_preserves_gpu_written_gaps(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
         backing = bytearray(1024 * np.dtype(np.float32).itemsize)
@@ -252,6 +308,19 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(interleaved.layout.byte_strides, (16, 4))
         self.assertEqual(interleaved.layout.byte_offset, 4)
 
+    def test_rank_zero_view_round_trips_scalar_storage(self) -> None:
+        storage = vd.TensorStorage.from_numpy(np.array(3.0, dtype=np.float32))
+        view = storage.view(shape=(), strides=())
+
+        self.assertEqual(view.shape, ())
+        self.assertEqual(view.layout.byte_strides, ())
+        self.assertEqual(view.to_numpy().shape, ())
+        self.assertEqual(view.to_numpy()[()], 3.0)
+        self.assertEqual(view[()], 3.0)
+
+        view[()] = 7.0
+        self.assertEqual(storage.to_numpy()[()], 7.0)
+
     def test_view_validation_rejects_out_of_bounds_and_defers_injectivity(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.i32, shape=(8,))
 
@@ -307,6 +376,10 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             _DispatchBorrowLease([("reader", reader, "write")])
         with self.assertRaisesRegex(ValueError, "does not permit reads"):
             _DispatchBorrowLease([("writer", writer, "read")])
+        with self.assertRaisesRegex(ValueError, "does not permit writes"):
+            reader._with_access("write")
+        with self.assertRaisesRegex(ValueError, "does not permit reads"):
+            writer._with_access("read")
 
     def test_dispatch_scope_blocks_host_access_until_completion(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
@@ -580,25 +653,30 @@ class TensorViewFrontendTests(unittest.TestCase):
         self.assertNotIn("storage", parameters[0])
         self.assertEqual(parameters[1]["access"], "read")
 
-    def test_tensor_view_accepts_static_dynamic_and_mixed_shapes(self) -> None:
+    def test_tensor_view_accepts_rank_zero_static_dynamic_and_mixed_shapes(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
             "@kernel\n"
             "def shapes(\n"
+            "    scalar: TensorView[f32, (), read_write],\n"
             "    static: TensorView[f32, (4, 8), read],\n"
             "    dynamic: TensorView[f32, (dyn,), read],\n"
             "    mixed: TensorView[f32, (dyn, 4), read],\n"
             ") -> None:\n"
-            "    pass\n",
+            "    scalar[()] = scalar[()] + 1.0\n",
             "tensor_view_shapes.py",
         )
 
+        self.assertIn(
+            '!vernon.tensor_view<f32, [], "read_write", "device">',
+            output,
+        )
         self.assertIn(
             '!vernon.tensor_view<f32, [4, 8], "read", "device">',
             output,
         )
         self.assertFalse(callable(vd.dyn))
-        with self.assertRaisesRegex(CompileError, "shape must be a non-empty tuple"):
+        with self.assertRaisesRegex(CompileError, "shape must be a tuple"):
             compile_source(
                 "from vernon_dsl import *\n@kernel\ndef removed(value: TensorView[f32, 1, read]) -> None:\n    pass\n",
                 "removed_tensor_view_rank.py",

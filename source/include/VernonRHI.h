@@ -25,7 +25,8 @@ typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_OK = 0,
     VERNON_RHI_STATUS_INVALID_ARGUMENT = 1,
     VERNON_RHI_STATUS_UNSUPPORTED = 2,
-    VERNON_RHI_STATUS_INTERNAL_ERROR = 3
+    VERNON_RHI_STATUS_INTERNAL_ERROR = 3,
+    VERNON_RHI_STATUS_RESOURCE_EXHAUSTED = 4
 } VernonRhiStatus;
 
 typedef enum VernonRhiCompletionState {
@@ -477,6 +478,15 @@ typedef struct VernonRhiCommandEncoderDescriptor {
     uint32_t reserved[4];
 } VernonRhiCommandEncoderDescriptor;
 
+typedef struct VernonRhiCommandLimits {
+    uint32_t struct_size;
+    uint32_t max_active_recordings;
+    uint32_t max_in_flight_submissions;
+    uint32_t max_live_completions;
+    uint64_t max_upload_bytes;
+    uint64_t reserved[3];
+} VernonRhiCommandLimits;
+
 typedef struct VernonRhiBarrier {
     uint32_t struct_size;
     uint32_t source_stage_mask;
@@ -588,6 +598,9 @@ VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLCo
                                                             uint32_t embedded_profile);
 VERNON_RHI_CAPI void vernonRhiDestroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
+                                                                const VernonRhiCommandLimits *limits);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice device, VernonRhiCommandLimits *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
                                                                     const VernonRhiCommandEncoderDescriptor *descriptor,
                                                                     VernonRhiCommandEncoder *output);
@@ -600,6 +613,11 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevic
                                                                   VernonRhiBuffer source, uint64_t source_offset,
                                                                   VernonRhiBuffer destination,
                                                                   uint64_t destination_offset, uint64_t size);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice device,
+                                                                    VernonRhiCommandEncoder encoder,
+                                                                    VernonRhiBuffer destination,
+                                                                    uint64_t destination_offset, const void *source,
+                                                                    uint64_t size);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
                                                                       VernonRhiCommandEncoder encoder,
                                                                       const VernonRhiRenderingDescriptor *descriptor);

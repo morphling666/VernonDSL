@@ -201,9 +201,10 @@ class SmokeFluidGraphTests(unittest.TestCase):
         expected = gradient(vd.cpu)
         for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
             try:
-                actual = gradient(architecture)
+                vd.init(arch=architecture)
             except RuntimeError:
                 continue
+            actual = gradient(architecture)
             with self.subTest(backend=architecture.name):
                 self.assertTrue(np.isfinite(actual).all())
                 np.testing.assert_allclose(actual, expected, rtol=3.0e-4, atol=3.0e-6)

@@ -302,6 +302,15 @@ AutodiffMemoryReservation::~AutodiffMemoryReservation() {
         policy_->release(bytes_);
 }
 
+bool AutodiffMemoryReservation::shrink(size_t bytes) {
+    if (bytes > bytes_)
+        return false;
+    if (policy_ && bytes < bytes_)
+        policy_->release(bytes_ - bytes);
+    bytes_ = bytes;
+    return true;
+}
+
 std::shared_ptr<HostTapeDispatchBudget> HostTapeDispatchBudget::reserve(std::shared_ptr<HostTapeMemoryPolicy> policy,
                                                                         size_t capacity) {
     if (!policy || !capacity)

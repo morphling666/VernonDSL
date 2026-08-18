@@ -24,7 +24,9 @@ class GraphPullback;
 class GraphBackwardSubmission;
 namespace detail {
 struct ExecutionGraphTestAccess;
-}
+struct RhiCommandExecutionPlan;
+class RhiCommandPlanSink;
+} // namespace detail
 
 enum class ResourceKind : uint8_t { Buffer, Image };
 enum class AccessMode : uint8_t { Read, Write, ReadWrite };
@@ -50,7 +52,13 @@ struct GraphImage : GraphResource {
     VernonRhiImageSubresourceRange subresources{0, UINT32_MAX, 0, UINT32_MAX, VERNON_RHI_IMAGE_ASPECT_COLOR};
 };
 
-enum PassFlagBits : uint32_t { PassNone = 0, PassNeverCull = 1u << 0, PassNoMerge = 1u << 1, PassSideEffect = 1u << 2 };
+enum PassFlagBits : uint32_t {
+    PassNone = 0,
+    PassNeverCull = 1u << 0,
+    PassNoMerge = 1u << 1,
+    PassSideEffect = 1u << 2,
+    PassDerivative = 1u << 3,
+};
 
 enum class ImageUseRole : uint8_t { None, Sampled, Storage, ColorAttachment, DepthAttachment, Transfer };
 
@@ -161,6 +169,7 @@ public:
     virtual uintptr_t logicalIdentity() const = 0;
     virtual uint64_t allocationBytes() const = 0;
     virtual std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const = 0;
+    virtual bool materialize(detail::RhiCommandPlanSink *sink, std::string &error) = 0;
 };
 
 using NamedGraphAutodiffValues = std::vector<std::pair<std::string, std::shared_ptr<GraphAutodiffValue>>>;
@@ -174,11 +183,8 @@ class PassPullback {
 public:
     virtual ~PassPullback() = default;
     virtual bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
+                       const PassPullbackApplyOptions &options, detail::RhiCommandPlanSink *sink,
                        std::string &error) = 0;
-    virtual bool applyWithOptions(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
-                                  const PassPullbackApplyOptions &, std::string &error) {
-        return apply(cotangents, gradients, error);
-    }
     virtual uint64_t estimatedTapeBytes() const = 0;
     virtual uint64_t logicalResidualBytes() const = 0;
     virtual uint64_t residentTapeBytes() const = 0;
@@ -215,8 +221,9 @@ public:
         static const std::vector<PassWriteFootprint> empty;
         return empty;
     }
-    virtual bool forward(ComputeEncoder &encoder, const ExecutionResources &resources,
-                         std::unique_ptr<PassPullback> &pullback, std::string &error) = 0;
+    virtual bool forward(ComputeEncoder *encoder, const ExecutionResources &resources,
+                         detail::RhiCommandExecutionPlan *plan, std::unique_ptr<PassPullback> &pullback,
+                         std::string &error) = 0;
     virtual bool zeroCotangent(const std::string &path, const ExecutionResources &resources,
                                std::shared_ptr<GraphAutodiffValue> &value, std::string &error) = 0;
     virtual bool implicitCotangent(const std::string &path, const ExecutionResources &resources,
@@ -370,6 +377,7 @@ struct CompiledScope {
     bool rendering{};
     std::vector<uint32_t> passIndices;
     std::vector<VernonRhiBarrier> barriers;
+    std::vector<uint32_t> predecessors;
 };
 
 struct AutodiffReplaySegment {

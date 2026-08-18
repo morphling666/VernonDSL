@@ -159,6 +159,7 @@ public:
     ~AutodiffMemoryReservation();
 
     size_t bytes() const { return bytes_; }
+    bool shrink(size_t bytes);
 
 private:
     AutodiffMemoryReservation(std::shared_ptr<AutodiffMemoryPolicy> policy, size_t bytes)

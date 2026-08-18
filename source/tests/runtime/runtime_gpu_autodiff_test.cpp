@@ -127,25 +127,41 @@ TEST(RuntimeGpuAutodiff, ReplayBudgetUsesSharedPlanningPolicy) {
     vernon::runtime::ad::gpu::BatchBudget minMemory;
     vernon::runtime::ad::gpu::BatchBudget balanced;
     vernon::runtime::ad::gpu::BatchBudget minRuntime;
-    ASSERT_TRUE(
-        vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::MinMemory, 100, 1000, 10, 100, 20, minMemory));
-    ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::Balanced, 100, 1000, 10, 100, 20, balanced));
-    ASSERT_TRUE(
-        vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::MinRuntime, 100, 1000, 10, 100, 20, minRuntime));
-    EXPECT_EQ(minMemory.capacity, 1u);
-    EXPECT_EQ(balanced.capacity, 2u);
-    EXPECT_EQ(minRuntime.capacity, 3u);
+    constexpr size_t groupCount = 1000000;
+    constexpr size_t maximumBytes = 600 * 1024 * 1024;
+    ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::MinMemory, 0, maximumBytes, groupCount, 1024,
+                                                          sizeof(BatchSummary), minMemory));
+    ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::Balanced, 0, maximumBytes, groupCount, 1024,
+                                                          sizeof(BatchSummary), balanced));
+    ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(PlanningPolicy::MinRuntime, 0, maximumBytes, groupCount, 1024,
+                                                          sizeof(BatchSummary), minRuntime));
+    EXPECT_LT(minMemory.capacity, balanced.capacity);
+    EXPECT_LE(balanced.capacity, minRuntime.capacity);
     EXPECT_LT(minMemory.memory.peakTemporaryBytes, balanced.memory.peakTemporaryBytes);
-    EXPECT_LT(balanced.memory.peakTemporaryBytes, minRuntime.memory.peakTemporaryBytes);
+    EXPECT_LE(balanced.memory.peakTemporaryBytes, minRuntime.memory.peakTemporaryBytes);
+    EXPECT_GT(minMemory.batchCount, balanced.batchCount);
+    EXPECT_GE(balanced.batchCount, minRuntime.batchCount);
 }
 
-TEST(RuntimeGpuAutodiff, MinMemoryReplayBoundsControlPlaneBatchCount) {
+TEST(RuntimeGpuAutodiff, MinMemoryReplayUsesOneTransactionWhenWholePassFits) {
     vernon::runtime::ad::gpu::BatchBudget budget;
     constexpr size_t groupCount = 4096;
     ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(vernon::runtime::ad::PlanningPolicy::MinMemory, 0,
                                                           1024 * 1024, groupCount, 64, sizeof(BatchSummary), budget));
-    EXPECT_EQ(budget.capacity, 64u);
-    EXPECT_LE((groupCount + budget.capacity - 1) / budget.capacity, 64u);
+    EXPECT_EQ(budget.capacity, groupCount);
+    EXPECT_EQ(budget.batchCount, 1u);
+    EXPECT_TRUE(budget.wholeDispatch);
+}
+
+TEST(RuntimeGpuAutodiff, ProvenStaticReplayUsesPolicyCapacityWhenWholePassFits) {
+    vernon::runtime::ad::gpu::BatchBudget budget;
+    constexpr size_t groupCount = 1000000;
+    ASSERT_TRUE(vernon::runtime::ad::gpu::planBatchBudget(vernon::runtime::ad::PlanningPolicy::MinMemory, 0,
+                                                          2ull * 1024 * 1024 * 1024, groupCount, 1024,
+                                                          sizeof(BatchSummary), budget, false));
+    EXPECT_LT(budget.capacity, groupCount);
+    EXPECT_GT(budget.batchCount, 1u);
+    EXPECT_FALSE(budget.wholeDispatch);
 }
 
 TEST(RuntimeGpuAutodiff, ReplaySegmentPreservesVirtualCoordinates) {
@@ -319,6 +335,88 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     gradient.fill(0.0f);
     ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
+
+    VernonRhiBufferDescriptor deviceValueDescriptor{};
+    deviceValueDescriptor.struct_size = sizeof(deviceValueDescriptor);
+    std::array<float, 8> deviceCotangentStorage{};
+    deviceCotangentStorage[1] = 1.0f;
+    deviceCotangentStorage[2] = 1.0f;
+    deviceCotangentStorage[5] = 1.0f;
+    deviceCotangentStorage[6] = 1.0f;
+    deviceValueDescriptor.size = sizeof(deviceCotangentStorage);
+    deviceValueDescriptor.alignment = alignof(float);
+    deviceValueDescriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    deviceValueDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer deviceCotangent{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer deviceGradient{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &deviceValueDescriptor, &deviceCotangent),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &deviceValueDescriptor, &deviceGradient),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), deviceCotangent, 0, deviceCotangentStorage.data(),
+                                          sizeof(deviceCotangentStorage)),
+              VERNON_RHI_STATUS_OK);
+    std::array<float, 8> unpublished{};
+    unpublished.fill(-19.0f);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), deviceGradient, 0, unpublished.data(), sizeof(unpublished)),
+              VERNON_RHI_STATUS_OK);
+    constexpr int64_t deviceShapeStrides[]{4 * sizeof(float), sizeof(float)};
+    VernonAdDeviceValue deviceCotangentValue{sizeof(VernonAdDeviceValue),
+                                             {"loss", 4},
+                                             VERNON_DATA_F32,
+                                             deviceCotangent,
+                                             sizeof(float),
+                                             sizeof(deviceCotangentStorage),
+                                             sizeof(cotangent),
+                                             2,
+                                             shape,
+                                             deviceShapeStrides,
+                                             {}};
+    VernonAdDeviceValueSet deviceCotangents{sizeof(VernonAdDeviceValueSet), &deviceCotangentValue, 1, {}};
+    VernonAdDeviceValue deviceGradientValue{sizeof(VernonAdDeviceValue),
+                                            {"values", 6},
+                                            VERNON_DATA_F32,
+                                            deviceGradient,
+                                            sizeof(float),
+                                            sizeof(unpublished),
+                                            sizeof(gradient),
+                                            2,
+                                            shape,
+                                            deviceShapeStrides,
+                                            {}};
+    VernonAdDeviceValueSet deviceGradients{sizeof(VernonAdDeviceValueSet), &deviceGradientValue, 1, {}};
+    applyOptions.maximum_temporary_bytes = 2 * sizeof(unpublished) + 3 * sizeof(uint32_t);
+    constexpr int64_t invalidDeviceShapeStrides[]{8 * sizeof(float), sizeof(float)};
+    deviceGradientValue.byte_strides = invalidDeviceShapeStrides;
+    EXPECT_EQ(vernonPullbackApplyDeviceWithOptions(pullback, &deviceCotangents, &deviceGradients, &applyOptions),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    deviceGradientValue.byte_strides = deviceShapeStrides;
+    for (FailureBoundary boundary : {FailureBoundary::Copy, FailureBoundary::Publication}) {
+        vernon::runtime::ad::gpu::setFailureInjectionForTesting(boundary);
+        EXPECT_NE(vernonPullbackApplyDeviceWithOptions(pullback, &deviceCotangents, &deviceGradients, &applyOptions),
+                  VERNON_STATUS_OK);
+        vernon::runtime::ad::gpu::clearFailureInjectionForTesting();
+        std::array<float, 8> unchanged{};
+        ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), deviceGradient, 0, unchanged.data(), sizeof(unchanged)),
+                  VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(unchanged, unpublished);
+    }
+    ASSERT_EQ(vernonPullbackApplyDeviceWithOptions(pullback, &deviceCotangents, &deviceGradients, &applyOptions),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    std::array<float, 8> deviceResult{};
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadBuffer(owned.device(), deviceGradient, 0, deviceResult.data(), sizeof(deviceResult)),
+        VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(deviceResult, (std::array<float, 8>{0.0f, 4.0f, 6.0f, 0.0f, 0.0f, 10.0f, 14.0f, 0.0f}));
+    const vernon::runtime::AutodiffPullbackControlPlaneUsage deviceControl =
+        vernon::runtime::autodiffPullbackControlPlaneUsage(pullback);
+    EXPECT_EQ(deviceControl.readbacks, 0u);
+    EXPECT_EQ(deviceControl.submissions, 1u);
+    EXPECT_EQ(deviceControl.waits, 1u);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceGradient), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceCotangent), VERNON_RHI_STATUS_OK);
 
     vernonPullbackDestroy(pullback);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
@@ -514,6 +612,85 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     gradientStorage.fill(0.0f);
     ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
+
+    VernonRhiBufferDescriptor seedDescriptor{};
+    seedDescriptor.struct_size = sizeof(seedDescriptor);
+    seedDescriptor.size = sizeof(sharedSeeds);
+    seedDescriptor.alignment = alignof(float);
+    seedDescriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    seedDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer deviceSeed{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &seedDescriptor, &deviceSeed), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), deviceSeed, 0, sharedSeeds.data(), sizeof(sharedSeeds)),
+              VERNON_RHI_STATUS_OK);
+    VernonRhiBufferDescriptor scalarDescriptor = seedDescriptor;
+    std::array<float, 4> deviceGradientOwner{};
+    deviceGradientOwner.fill(-29.0f);
+    scalarDescriptor.size = sizeof(deviceGradientOwner);
+    VernonRhiBuffer deviceGradientBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    const size_t deviceGradientCount = dynamic ? 1 : 2;
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &scalarDescriptor, &deviceGradientBuffer),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), deviceGradientBuffer, 0, deviceGradientOwner.data(),
+                                          sizeof(deviceGradientOwner)),
+              VERNON_RHI_STATUS_OK);
+    constexpr int64_t deviceSeedStrides[]{sizeof(float)};
+    VernonAdDeviceValue deviceSeedValue{sizeof(VernonAdDeviceValue),
+                                        {"output", 6},
+                                        VERNON_DATA_F32,
+                                        deviceSeed,
+                                        0,
+                                        sizeof(sharedSeeds),
+                                        sizeof(sharedSeeds),
+                                        1,
+                                        outputShape,
+                                        deviceSeedStrides,
+                                        {}};
+    VernonAdDeviceValueSet deviceSeeds{sizeof(VernonAdDeviceValueSet), &deviceSeedValue, 1, {}};
+    std::array<VernonAdDeviceValue, 2> deviceGradientValues{VernonAdDeviceValue{sizeof(VernonAdDeviceValue),
+                                                                                {"x", 1},
+                                                                                VERNON_DATA_F32,
+                                                                                deviceGradientBuffer,
+                                                                                0,
+                                                                                sizeof(deviceGradientOwner),
+                                                                                sizeof(float),
+                                                                                0,
+                                                                                nullptr,
+                                                                                nullptr,
+                                                                                {}},
+                                                            VernonAdDeviceValue{sizeof(VernonAdDeviceValue),
+                                                                                {"y", 1},
+                                                                                VERNON_DATA_F32,
+                                                                                deviceGradientBuffer,
+                                                                                2 * sizeof(float),
+                                                                                sizeof(deviceGradientOwner),
+                                                                                sizeof(float),
+                                                                                0,
+                                                                                nullptr,
+                                                                                nullptr,
+                                                                                {}}};
+    VernonAdDeviceValueSet deviceGradientSet{
+        sizeof(VernonAdDeviceValueSet), deviceGradientValues.data(), deviceGradientCount, {}};
+    const VernonPullbackApplyOptions deviceOptions{sizeof(VernonPullbackApplyOptions),
+                                                   VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                   std::numeric_limits<uint64_t>::max(),
+                                                   0,
+                                                   {}};
+    ASSERT_EQ(vernonPullbackApplyDeviceWithOptions(pullback, &deviceSeeds, &deviceGradientSet, &deviceOptions),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    std::array<float, 4> deviceGradientResult{};
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), deviceGradientBuffer, 0, deviceGradientResult.data(),
+                                            sizeof(deviceGradientResult)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_NEAR(deviceGradientResult[0], dynamic ? 104.0f : 24.0f, 1e-4f);
+    if (!dynamic)
+        EXPECT_NEAR(deviceGradientResult[2], -26.0f, 1e-4f);
+    EXPECT_FLOAT_EQ(deviceGradientResult[1], 0.0f);
+    EXPECT_FLOAT_EQ(deviceGradientResult[3], 0.0f);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceGradientBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceSeed), VERNON_RHI_STATUS_OK);
 
     vernonPullbackDestroy(pullback);
     vernonRuntimeLoadedPipelineDestroy(pipeline);

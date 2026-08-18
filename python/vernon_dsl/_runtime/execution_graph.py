@@ -207,6 +207,7 @@ class ExecutionPass:
         self._never_cull = False
         self._side_effect = False
         self._no_merge = False
+        self._derivative = False
         self._dependencies: list[ExecutionPass] = []
         self._graph_ref: weakref.ReferenceType[Any] | None = None
         self._native_pass: Any | None = None
@@ -248,6 +249,14 @@ class ExecutionPass:
     def no_merge(self, value: bool) -> None:
         self._set_flag("_no_merge", value)
 
+    @property
+    def derivative(self) -> bool:
+        return self._derivative
+
+    @derivative.setter
+    def derivative(self, value: bool) -> None:
+        self._set_flag("_derivative", value)
+
     def _set_flag(self, field: str, value: bool) -> None:
         if not isinstance(value, bool):
             raise TypeError("execution pass flags must be bool")
@@ -270,6 +279,8 @@ class ExecutionPass:
             flags |= native.GRAPH_PASS_NO_MERGE
         if self._side_effect:
             flags |= native.GRAPH_PASS_SIDE_EFFECT
+        if self._derivative:
+            flags |= native.GRAPH_PASS_DERIVATIVE
         self._native_pass.set_flags(flags)
 
     def declare(self) -> None:
@@ -725,7 +736,12 @@ class CompiledExecutionGraph:
             raise ValueError("execution bindings do not belong to this compiled execution graph")
         if bindings is None and self._parameters:
             raise ValueError("compiled execution graph requires parameter bindings")
-        return GraphPullback(native.vjp(None if bindings is None else bindings._native), self)
+        native_bindings = None if bindings is None else bindings._native
+        for execution_pass in self._schedule:
+            prepare = getattr(execution_pass, "_prepare_vjp_recording", None)
+            if prepare is not None:
+                prepare(native_bindings)
+        return GraphPullback(native.vjp(native_bindings), self)
 
 
 class ExecutionGraph:

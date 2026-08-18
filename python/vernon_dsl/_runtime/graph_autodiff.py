@@ -39,6 +39,17 @@ def _storage_owner(value: TensorStorage | TensorView) -> TensorStorage:
     return owner
 
 
+def _materialize_recording_value(value: Any) -> None:
+    if isinstance(value, (TensorStorage, TensorView)):
+        _storage_owner(value)._resident_buffer()
+    elif isinstance(value, Mapping):
+        for member in value.values():
+            _materialize_recording_value(member)
+    elif isinstance(value, (tuple, list)):
+        for member in value:
+            _materialize_recording_value(member)
+
+
 def _zero_cotangent(primal: Any) -> Any:
     if isinstance(primal, (TensorStorage, TensorView)):
         owner = _storage_owner(primal)
@@ -267,10 +278,33 @@ class VjpComputePass(ComputePass):
             isinstance(self._program, ProgramExpression),
         )
 
-    def _native_vjp_forward(self, native_encoder: Any, native_bindings: Any | None) -> Any:
+    def _prepare_vjp_recording(self, native_bindings: Any | None) -> None:
         if self._graph is None:
             raise RuntimeError("differentiable pass requires a compiled execution graph")
-        encoder = ComputeEncoder(native_encoder)
+        state = _session_state()
+        if state._architecture == state.cpu:
+            return
+        resources = ExecutionResources(self._graph, native_bindings)
+        for value in self._bindings.values():
+            resolved = resources.resolve(value) if isinstance(value, (GraphResource, ExecutionParameter)) else value
+            _materialize_recording_value(resolved)
+
+    def _native_vjp_forward(self, native_encoder: Any, native_bindings: Any | None) -> Any:
+        return self._native_vjp_command(native_bindings, native_encoder=native_encoder)
+
+    def _native_vjp_plan(self, command_plan: Any, native_bindings: Any | None) -> Any:
+        return self._native_vjp_command(native_bindings, command_plan=command_plan)
+
+    def _native_vjp_command(
+        self,
+        native_bindings: Any | None,
+        *,
+        native_encoder: Any | None = None,
+        command_plan: Any | None = None,
+    ) -> Any:
+        if self._graph is None:
+            raise RuntimeError("differentiable pass requires a compiled execution graph")
+        encoder = None if native_encoder is None else ComputeEncoder(native_encoder)
         resources = ExecutionResources(self._graph, native_bindings)
         try:
             state = _session_state()
@@ -290,6 +324,7 @@ class VjpComputePass(ComputePass):
                     compiled.recomputation_cost,
                     compiled.residual_storage_kind,
                     encoder=encoder if encoded else None,
+                    command_plan=command_plan if encoded else None,
                     binding_cache=self._binding_cache if encoded else None,
                 )
             else:
@@ -299,11 +334,13 @@ class VjpComputePass(ComputePass):
                     resolved,
                     self._grid,
                     encoder=encoder if encoded else None,
+                    command_plan=command_plan if encoded else None,
                     binding_cache=self._binding_cache if encoded else None,
                 )
             return pullback
         finally:
-            encoder._native = None
+            if encoder is not None:
+                encoder._native = None
 
     def _native_graph_cotangent(self, path: str, implicit: bool, native_bindings: Any | None) -> Any:
         if path not in self._cotangent_resources or self._graph is None:

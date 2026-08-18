@@ -93,8 +93,10 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
     ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
     VernonRhiCompletionState completionState{};
     ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_SUCCEEDED);
+    EXPECT_TRUE(completionState == VERNON_RHI_COMPLETION_PENDING || completionState == VERNON_RHI_COMPLETION_SUCCEEDED);
     ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_SUCCEEDED);
     ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 
@@ -107,6 +109,80 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
     vernonRhiDestroyDevice(device);
     EXPECT_EQ(vernonRhiCompletionGetState(device, shutdownCompletion, &completionState),
               VERNON_RHI_STATUS_INVALID_ARGUMENT);
+}
+
+TEST(RuntimeMetal, RecordsIndependentCommandEncoders) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    EXPECT_NE(vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandIndependentRecording, 0u);
+
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder first{}, second{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &first), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &second), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, second), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, first), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCompletion firstCompletion{}, secondCompletion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, second, &secondCompletion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, first, &firstCompletion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCompletionWait(device, firstCompletion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCompletionWait(device, secondCompletion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, firstCompletion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, secondCompletion), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(RuntimeMetal, BoundsInFlightSubmissionsUntilCompletionObservation) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    std::vector<VernonRhiCompletion> completions;
+    VernonRhiCommandEncoder blocked{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiStatus status = VERNON_RHI_STATUS_OK;
+    for (size_t attempt = 0; attempt < 64 && status == VERNON_RHI_STATUS_OK; ++attempt) {
+        VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+        ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+        VernonRhiCompletion completion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+        status = vernonRhiDeviceSubmit(device, encoder, &completion);
+        if (status == VERNON_RHI_STATUS_OK)
+            completions.push_back(completion);
+        else
+            blocked = encoder;
+    }
+    ASSERT_EQ(status, VERNON_RHI_STATUS_RESOURCE_EXHAUSTED);
+    ASSERT_GT(completions.size(), 1u);
+    ASSERT_LT(completions.size(), 64u);
+    ASSERT_NE(blocked.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completions.front()), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion replacement{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    EXPECT_EQ(vernonRhiDeviceSubmit(device, blocked, &replacement), VERNON_RHI_STATUS_OK);
+    if (replacement.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+        completions.push_back(replacement);
+    for (VernonRhiCompletion completion : completions)
+        EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(RuntimeMetal, KeepsDeviceAliveWhileIndependentEncoderIsRecording) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+
+    vernonRhiDestroyDevice(device);
+    EXPECT_TRUE(vernon::rhi::deviceExists(device));
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+    EXPECT_FALSE(vernon::rhi::deviceExists(device));
 }
 
 TEST(RuntimeMetal, CopiesBufferEntirelyOnDevice) {
@@ -762,6 +838,11 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
     bindingDescriptor.value_count = values.size();
     VernonRuntimeProviderObject bindings{};
     ASSERT_EQ(provider->create_binding_set(provider->user_data, &bindingDescriptor, &bindings), VERNON_STATUS_OK);
+    VernonRhiBuffer replacement{};
+    const uint32_t replacementValue = 1000;
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &replacement), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, replacement, 0, &replacementValue, sizeof(replacementValue)),
+              VERNON_RHI_STATUS_OK);
 
     VernonRhiCommandEncoderDescriptor commandDescriptor{};
     commandDescriptor.struct_size = sizeof(commandDescriptor);
@@ -776,11 +857,6 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
     dispatch.bindings = bindings;
     dispatch.group_count[0] = dispatch.group_count[1] = dispatch.group_count[2] = 1;
     ASSERT_EQ(provider->encode_dispatch(provider->user_data, providerCommand, &dispatch), VERNON_STATUS_OK);
-    VernonRhiBuffer replacement{};
-    const uint32_t replacementValue = 1000;
-    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &replacement), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, replacement, 0, &replacementValue, sizeof(replacementValue)),
-              VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, replacement, 0, sizeof(replacementValue),
                                                      &values.back().payload.buffer.resource),
               VERNON_STATUS_OK);
@@ -1077,6 +1153,19 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &depthView), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference depthReference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, depthView, &depthReference), VERNON_STATUS_OK);
+    constexpr std::array<uint32_t, 3> indices{0, 1, 2};
+    VernonRhiBufferDescriptor indexDescriptor{};
+    indexDescriptor.struct_size = sizeof(indexDescriptor);
+    indexDescriptor.size = sizeof(indices);
+    indexDescriptor.usage = VERNON_RHI_BUFFER_INDEX;
+    indexDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer indexBuffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &indexDescriptor, &indexBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, indexBuffer, 0, indices.data(), sizeof(indices)),
+              VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference indexReference{};
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, indexBuffer, 0, sizeof(indices), &indexReference),
+              VERNON_STATUS_OK);
 
     VernonRhiCommandEncoderDescriptor commandDescriptor{};
     commandDescriptor.struct_size = sizeof(commandDescriptor);
@@ -1109,19 +1198,6 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     rendering.layers = 1;
     VernonRuntimeProviderObject providerCommand{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceCommandEncoder(adapter, command, &providerCommand), VERNON_STATUS_OK);
-    constexpr std::array<uint32_t, 3> indices{0, 1, 2};
-    VernonRhiBufferDescriptor indexDescriptor{};
-    indexDescriptor.struct_size = sizeof(indexDescriptor);
-    indexDescriptor.size = sizeof(indices);
-    indexDescriptor.usage = VERNON_RHI_BUFFER_INDEX;
-    indexDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
-    VernonRhiBuffer indexBuffer{};
-    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &indexDescriptor, &indexBuffer), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, indexBuffer, 0, indices.data(), sizeof(indices)),
-              VERNON_RHI_STATUS_OK);
-    VernonRuntimeProviderResourceReference indexReference{};
-    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, indexBuffer, 0, sizeof(indices), &indexReference),
-              VERNON_STATUS_OK);
     VernonRuntimeProviderDispatchDescriptor invalidDispatch{};
     invalidDispatch.struct_size = sizeof(invalidDispatch);
     invalidDispatch.pipeline = pipeline;

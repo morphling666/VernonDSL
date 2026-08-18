@@ -54,6 +54,27 @@ module {
     MLIRContext context;
 };
 
+TEST_F(VernonStructuredVjpTest, RankZeroTensorViewModelsScalarStorage) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @value(%tensor: !vernon.tensor<f32, []>) {
+    func.return
+  }
+  func.func @accumulate(
+      %gradient: !vernon.tensor_view<f32, [], "read_write", "device">) {
+    %value = arith.constant 1.0 : f32
+    "vernon.reduce_sum"(%value, %gradient) {deterministic = false}
+        : (f32, !vernon.tensor_view<f32, [], "read_write", "device">) -> ()
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    EXPECT_TRUE(succeeded(verify(*module)));
+}
+
 TEST_F(VernonStructuredVjpTest, GeneratesStorageObjectiveProfilesForScalarRules) {
     const std::pair<StringRef, StringRef> cases[] = {
         {"arith.addf", "%x, %y"}, {"arith.subf", "%x, %y"}, {"arith.mulf", "%x, %y"}, {"arith.divf", "%x, %y"},

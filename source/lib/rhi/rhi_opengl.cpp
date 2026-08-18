@@ -21,6 +21,10 @@
 #include <variant>
 #include <vector>
 
+namespace vernon::rhi {
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
+}
+
 namespace {
 
 using vernon::rhi::opengl::DeviceState;
@@ -375,7 +379,9 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
                              VernonRhiBuffer *output) {
 
     auto device = lookupDevice(handle);
-    if (!device || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0)
+    if (!device || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     uint32_t index = 0;
@@ -403,6 +409,8 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     BufferSlot *slot = lookupBuffer(*device, buffer);
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
         return fail(*device, "OpenGL RHI buffer upload range is invalid");
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD && vernon::rhi::deviceHasActiveCommandEncoder(handle))
+        return fail(*device, "device-level OpenGL upload cannot execute while a command encoder is recording");
     return device->state.uploadBuffer(slot->buffer, static_cast<size_t>(offset), source, static_cast<size_t>(size),
                                       device->error)
                ? VERNON_RHI_STATUS_OK
@@ -418,6 +426,8 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
     BufferSlot *slot = lookupBuffer(*device, buffer);
     if (!slot)
         return fail(*device, "OpenGL RHI buffer upload handle is invalid");
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD && vernon::rhi::deviceHasActiveCommandEncoder(handle))
+        return fail(*device, "device-level OpenGL upload cannot execute while a command encoder is recording");
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
@@ -968,10 +978,11 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     return false;
 }
 
-void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
 
     (void)handle;
     (void)native;
+    return true;
 }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
@@ -1288,6 +1299,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
     using namespace opengl_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_OPENGL,
+        0,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         destroyDevice,
@@ -1322,6 +1335,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
+        nullptr,
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,

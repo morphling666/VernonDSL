@@ -31,9 +31,11 @@ static_assert(sizeof(Segment) == 80);
 
 struct BatchBudget {
     size_t capacity{};
+    size_t batchCount{};
     size_t tapeBytes{};
     size_t segmentBytes{};
     size_t statusBytes{};
+    bool wholeDispatch{};
     MemoryAccounting memory;
 };
 
@@ -64,7 +66,7 @@ private:
 };
 
 bool planBatchBudget(PlanningPolicy policy, size_t fixedBytes, size_t maximumBytes, size_t groupCount,
-                     size_t groupTapeBytes, size_t summaryBytes, BatchBudget &budget);
+                     size_t groupTapeBytes, size_t summaryBytes, BatchBudget &budget, bool preferWholeDispatch = true);
 bool normalizeTapeStride(size_t requestedBytes, size_t &stride);
 
 inline bool initializeSegment(VernonLaunchSize grid, VernonLaunchSize workgroup, size_t linearGroup, size_t tapeStride,

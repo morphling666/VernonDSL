@@ -151,6 +151,15 @@ class NumpyTensorRuntimeTests(unittest.TestCase):
         self.assertFalse(tensor.flags.writeable)
         self.assertFalse(matrix.flags.writeable)
 
+    def test_rank_zero_tensor_is_distinct_from_its_scalar_value(self) -> None:
+        tensor = vd.Tensor(3.0)
+
+        self.assertIsInstance(tensor, vd.Tensor)
+        self.assertEqual(tensor.shape, ())
+        self.assertEqual(tensor[()], 3.0)
+        self.assertEqual(tensor.item(), 3.0)
+        self.assertFalse(tensor.flags.writeable)
+
     @staticmethod
     def _initialize_compute_backend(architecture: object) -> bool:
         target = {

@@ -23,6 +23,10 @@
 #include <utility>
 #include <vector>
 
+namespace vernon::rhi {
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
+}
+
 namespace {
 struct DirectX12BufferSlot : vernon::rhi::LogicalResourceRecord {
     vernon::rhi::directx12::Buffer buffer;
@@ -589,13 +593,23 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0)
+    if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     DirectX12BufferSlot &slot = allocateDirectX12Slot(device->buffers, *output);
-    const bool unorderedAccess = (descriptor->usage & VERNON_RHI_BUFFER_STORAGE) != 0;
-    if (!device->state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), unorderedAccess,
-                                    D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, device->error)) {
+    const bool unorderedAccess =
+        descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE && (descriptor->usage & VERNON_RHI_BUFFER_STORAGE) != 0;
+    const D3D12_HEAP_TYPE heapType = descriptor->memory_class == VERNON_RHI_MEMORY_UPLOAD     ? D3D12_HEAP_TYPE_UPLOAD
+                                     : descriptor->memory_class == VERNON_RHI_MEMORY_READBACK ? D3D12_HEAP_TYPE_READBACK
+                                                                                              : D3D12_HEAP_TYPE_DEFAULT;
+    const D3D12_RESOURCE_STATES initialState =
+        descriptor->memory_class == VERNON_RHI_MEMORY_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+        : descriptor->memory_class == VERNON_RHI_MEMORY_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                                 : D3D12_RESOURCE_STATE_COMMON;
+    if (!device->state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), unorderedAccess, heapType,
+                                    initialState, device->error)) {
         releaseDirectX12Slot(slot);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -616,6 +630,22 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
+        const D3D12_RANGE readRange{0, 0};
+        void *mapped = nullptr;
+        if (FAILED(slot->buffer.resource->Map(0, &readRange, &mapped))) {
+            device->error = "DirectX 12 upload-buffer mapping failed";
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        std::memcpy(static_cast<uint8_t *>(mapped) + offset, source, static_cast<size_t>(size));
+        const D3D12_RANGE writtenRange{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + size)};
+        slot->buffer.resource->Unmap(0, &writtenRange);
+        return VERNON_RHI_STATUS_OK;
+    }
+    if (vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level DirectX 12 upload cannot submit while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     ID3D12Resource *upload = nullptr;
     size_t uploadOffset = 0;
     uint8_t *mapped = nullptr;
@@ -644,6 +674,34 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
     DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
+        uint64_t writtenBegin = slot->ownedDescriptor.size;
+        uint64_t writtenEnd = 0;
+        for (size_t index = 0; index < rangeCount; ++index) {
+            const VernonRhiBufferUploadRange &range = ranges[index];
+            if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+                range.offset > slot->ownedDescriptor.size || range.size > slot->ownedDescriptor.size - range.offset)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            writtenBegin = std::min(writtenBegin, range.offset);
+            writtenEnd = std::max(writtenEnd, range.offset + range.size);
+        }
+        const D3D12_RANGE readRange{0, 0};
+        void *mapped = nullptr;
+        if (FAILED(slot->buffer.resource->Map(0, &readRange, &mapped))) {
+            device->error = "DirectX 12 upload-buffer mapping failed";
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        for (size_t index = 0; index < rangeCount; ++index)
+            std::memcpy(static_cast<uint8_t *>(mapped) + ranges[index].offset, ranges[index].source,
+                        static_cast<size_t>(ranges[index].size));
+        const D3D12_RANGE writtenRange{static_cast<SIZE_T>(writtenBegin), static_cast<SIZE_T>(writtenEnd)};
+        slot->buffer.resource->Unmap(0, &writtenRange);
+        return VERNON_RHI_STATUS_OK;
+    }
+    if (vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level DirectX 12 upload cannot submit while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     std::vector<size_t> packedOffsets;
     packedOffsets.reserve(rangeCount);
     size_t packedSize = 0;
@@ -1341,14 +1399,15 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     return submitted;
 }
 
-void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
-        return;
+        return false;
 
     std::lock_guard<std::mutex> guard(device->mutex);
     if (device->state.nativeObjectsBorrowed && native == reinterpret_cast<uintptr_t>(device->state.commandList()))
         device->state.recycleCommandStorage();
+    return true;
 }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
@@ -1523,14 +1582,16 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
         destinationOffset > destinationSlot->ownedDescriptor.size ||
         size > destinationSlot->ownedDescriptor.size - destinationOffset)
         return false;
-    vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
-                                       D3D12_RESOURCE_STATE_COPY_SOURCE);
+    if (sourceSlot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_DEVICE)
+        vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
+                                           D3D12_RESOURCE_STATE_COPY_SOURCE);
     vernon::rhi::directx12::transition(commands, destinationSlot->buffer.resource, destinationSlot->buffer.state,
                                        D3D12_RESOURCE_STATE_COPY_DEST);
     commands->CopyBufferRegion(destinationSlot->buffer.resource, destinationOffset, sourceSlot->buffer.resource,
                                sourceOffset, size);
-    vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
-                                       D3D12_RESOURCE_STATE_COMMON);
+    if (sourceSlot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_DEVICE)
+        vernon::rhi::directx12::transition(commands, sourceSlot->buffer.resource, sourceSlot->buffer.state,
+                                           D3D12_RESOURCE_STATE_COMMON);
     vernon::rhi::directx12::transition(commands, destinationSlot->buffer.resource, destinationSlot->buffer.state,
                                        D3D12_RESOURCE_STATE_COMMON);
     return true;
@@ -1761,6 +1822,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
     using namespace directx12_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_DIRECTX12,
+        0,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         destroyDevice,
@@ -1795,6 +1858,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
+        nullptr,
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,

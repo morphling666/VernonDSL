@@ -71,6 +71,7 @@ void vernon::rhi::destroyDevice(VernonRhiDevice device) {
     drainDeviceCompletions(device);
     if (const BackendDispatch *backend = dispatch(device))
         backend->destroyDevice(device);
+    forgetDeviceCommandLimits(device);
 }
 
 VernonStringView vernon::rhi::deviceLastError(VernonRhiDevice device) {
@@ -272,6 +273,14 @@ bool vernon::rhi::beginCommandRecording(VernonRhiDevice device, uint64_t &native
     return backend && backend->beginCommands && backend->beginCommands(device, native, backendKind);
 }
 
+uint32_t vernon::rhi::deviceCommandCapabilities(VernonRhiDevice device) {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return 0;
+    return backend->commandCapabilitiesForDevice ? backend->commandCapabilitiesForDevice(device)
+                                                 : backend->commandCapabilities;
+}
+
 bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native, bool computeWrites, bool &completed,
                                          bool &externalCompletion) {
     const BackendDispatch *backend = dispatch(device);
@@ -279,10 +288,14 @@ bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native
            backend->submitCommands(device, native, computeWrites, completed, externalCompletion);
 }
 
-void vernon::rhi::completeBorrowedCommandRecording(VernonRhiDevice device, uint64_t native) {
-    if (const BackendDispatch *backend = dispatch(device))
-        if (backend->completeBorrowedCommands)
-            backend->completeBorrowedCommands(device, native);
+bool vernon::rhi::pollCommandRecording(VernonRhiDevice device, uint64_t native, bool &completed, bool &succeeded) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->pollCommands && backend->pollCommands(device, native, completed, succeeded);
+}
+
+bool vernon::rhi::completeCommandRecording(VernonRhiDevice device, uint64_t native) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->completeBorrowedCommands && backend->completeBorrowedCommands(device, native);
 }
 
 void vernon::rhi::abandonCommandRecording(VernonRhiDevice device, uint64_t native) {

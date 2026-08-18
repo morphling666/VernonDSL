@@ -4,6 +4,7 @@
 #include "VernonRHI.h"
 #include "vulkan_driver.h"
 
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -28,6 +29,7 @@ inline VkImageAspectFlags imagePrimaryCopyAspectMask(VkFormat format) {
 struct Buffer {
     VkBuffer buffer{};
     VkDeviceMemory memory{};
+    uint8_t *mapped{};
     bool owned{true};
 };
 
@@ -55,9 +57,9 @@ struct Sampler {
 
 struct VERNON_RHI_CAPI DeviceState {
     struct CommandFrame {
+        VkCommandPool pool{};
         VkCommandBuffer command{};
         VkFence fence{};
-        bool submitted{};
     };
 
     struct StagingRing {
@@ -77,6 +79,7 @@ struct VERNON_RHI_CAPI DeviceState {
     bool synchronize(std::string &error);
     bool beginCommands(VkCommandBuffer &command, std::string &error);
     bool submitCommands(VkCommandBuffer command, std::string &error);
+    void abandonCommands(VkCommandBuffer command);
     std::optional<uint32_t> findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred = 0) const;
     bool createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -110,9 +113,10 @@ struct VERNON_RHI_CAPI DeviceState {
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};
     VkCommandBuffer borrowedCommandBuffer{};
-    VkCommandPool commandPool{};
-    CommandFrame frame;
+    std::vector<CommandFrame> availableCommandFrames;
+    std::unordered_map<uintptr_t, CommandFrame> activeCommandFrames;
     VkDescriptorPool descriptorPool{};
+    std::mutex descriptorMutex;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     Sampler defaultImplicitSampler;
     size_t defaultImplicitSamplerCreations{};

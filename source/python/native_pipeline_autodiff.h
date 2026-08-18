@@ -1,10 +1,13 @@
 #ifndef VERNON_PYTHON_NATIVE_PIPELINE_AUTODIFF_H
 #define VERNON_PYTHON_NATIVE_PIPELINE_AUTODIFF_H
 
+#include "native_operator.h"
 #include "native_pipeline.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_forward_plan.h"
 
 #include <deque>
+#include <limits>
 #include <unordered_map>
 
 struct PythonAdViewDescriptor {
@@ -101,6 +104,17 @@ struct PythonAdMetadata {
     std::vector<uint64_t> shape;
 };
 
+inline size_t pythonAdMetadataBytes(const PythonAdMetadata &metadata) {
+    size_t bytes = autodiffDtypeSize(metadata.dtype);
+    for (uint64_t extent : metadata.shape) {
+        if (extent > std::numeric_limits<size_t>::max() ||
+            (extent && bytes > std::numeric_limits<size_t>::max() / static_cast<size_t>(extent)))
+            throw std::length_error("Python autodiff metadata byte size overflows");
+        bytes *= static_cast<size_t>(extent);
+    }
+    return bytes;
+}
+
 PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
                                      size_t leafIndex, VernonPipelineValueLeafView *reflected = nullptr);
 
@@ -125,6 +139,17 @@ struct PythonPullback {
     nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
                                      const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
                                      const VernonPullbackApplyOptions *options);
+    bool applyGroupedDeviceWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
+                                       const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
+                                       const VernonPullbackApplyOptions *options, nb::dict &result,
+                                       vernon::execution::detail::RhiCommandPlanSink *sink = nullptr);
+    bool applyGroupedDevicePlanned(const nb::object &cotangent, const nb::object &gradientGroups,
+                                   const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
+                                   const VernonPullbackApplyOptions *options,
+                                   vernon::execution::detail::RhiCommandPlanSink &sink, nb::dict &result) {
+        return applyGroupedDeviceWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, options,
+                                             result, &sink);
+    }
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
@@ -145,6 +170,164 @@ private:
     }
     vernon::runtime::AutodiffPullbackControlPlaneUsage controlPlaneUsage() const {
         return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
+    }
+
+    bool applyDeviceImpl(const nb::object &cotangent, bool logicalCotangent, const VernonPullbackApplyOptions *options,
+                         nb::dict &result, vernon::execution::detail::RhiCommandPlanSink *sink = nullptr) {
+        std::vector<nb::object> retainedBuffers;
+        std::vector<nb::object> retainedViews;
+        std::vector<std::vector<uint64_t>> retainedShapes;
+        std::vector<std::vector<int64_t>> retainedStrides;
+        retainedShapes.reserve(cotangents.size());
+        retainedStrides.reserve(cotangents.size() + gradients.size());
+        std::vector<VernonAdDeviceValue> seeds;
+        seeds.reserve(cotangents.size());
+        VernonAdDeviceValueSet seedSet{};
+        const VernonAdDeviceValueSet *seedView = nullptr;
+        if (!cotangent.is_none()) {
+            nb::dict supplied;
+            if (cotangents.size() == 1 && !nb::isinstance<nb::dict>(cotangent))
+                supplied[nb::str(cotangents.front().path.c_str())] = cotangent;
+            else if (nb::isinstance<nb::dict>(cotangent))
+                supplied = nb::cast<nb::dict>(cotangent);
+            else
+                return false;
+            if (supplied.size() != cotangents.size())
+                return false;
+            for (const PythonAdMetadata &sourceMetadata : cotangents) {
+                PythonAdMetadata metadata = sourceMetadata;
+                if (logicalCotangent && hasCarrierDimensions) {
+                    if (metadata.shape.size() < 3)
+                        throw std::runtime_error("autodiff cotangent has no invocation carrier dimensions");
+                    metadata.shape.erase(metadata.shape.begin(), metadata.shape.begin() + 3);
+                }
+                nb::str path(sourceMetadata.path.c_str());
+                if (!supplied.contains(path))
+                    return false;
+                nb::object value = nb::borrow<nb::object>(supplied[path]);
+                if (!nb::hasattr(value, "_resident_buffer") || !nb::hasattr(value, "layout") ||
+                    nb::cast<std::vector<uint64_t>>(value.attr("shape")) != metadata.shape)
+                    return false;
+                nb::object bufferObject = sink ? value.attr("_planned_buffer")() : value.attr("_resident_buffer")();
+                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+                nb::object layout = value.attr("layout");
+                std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
+                const size_t offset = nb::cast<size_t>(layout.attr("byte_offset"));
+                const size_t bytes = pythonAdMetadataBytes(metadata);
+                if (!buffer || strides.size() != metadata.shape.size() || offset > buffer->size)
+                    return false;
+                retainedBuffers.push_back(std::move(bufferObject));
+                retainedViews.push_back(std::move(value));
+                retainedStrides.push_back(std::move(strides));
+                retainedShapes.push_back(std::move(metadata.shape));
+                seeds.push_back({sizeof(VernonAdDeviceValue),
+                                 {sourceMetadata.path.data(), sourceMetadata.path.size()},
+                                 metadata.dtype,
+                                 buffer->handle,
+                                 offset,
+                                 buffer->size,
+                                 bytes,
+                                 static_cast<uint32_t>(retainedShapes.back().size()),
+                                 retainedShapes.back().data(),
+                                 retainedStrides.back().data(),
+                                 {}});
+            }
+            seedSet = {sizeof(VernonAdDeviceValueSet), seeds.data(), seeds.size(), {}};
+            seedView = &seedSet;
+        }
+
+        std::unordered_map<PyObject *, nb::object> gradientsByOwner;
+        std::unordered_map<PyObject *, nb::object> plannedWritesByOwner;
+        std::vector<nb::object> plannedWrites;
+        struct PlannedWriteRollback {
+            std::vector<nb::object> &transactions;
+            bool released{};
+            ~PlannedWriteRollback() {
+                if (released)
+                    return;
+                for (nb::object &transaction : transactions)
+                    try {
+                        transaction.attr("_rollback_planned_state")();
+                    } catch (...) {
+                    }
+            }
+        } plannedWriteRollback{plannedWrites};
+        std::vector<nb::object> materializedGradients;
+        std::vector<VernonAdDeviceValue> gradientViews;
+        materializedGradients.reserve(gradients.size());
+        gradientViews.reserve(gradients.size());
+        for (const PythonAdMetadata &gradient : gradients) {
+            nb::str bindingPath(gradient.binding.c_str());
+            nb::object binding =
+                bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
+            if (binding.is_none() || !nb::hasattr(binding, "_materialize_gradient") ||
+                !nb::hasattr(binding, "_gradient_device_view"))
+                return false;
+            nb::object owner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
+            auto existing = gradientsByOwner.find(owner.ptr());
+            nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
+                gradient.shape, nb::module_::import_("numpy").attr(numpyDtypeName(gradient.dtype)));
+            nb::object materialized =
+                existing == gradientsByOwner.end()
+                    ? binding.attr("_materialize_gradient")(zeros, gradient.path)
+                    : binding.attr("_materialize_gradient")(zeros, gradient.path, existing->second);
+            if (existing == gradientsByOwner.end())
+                gradientsByOwner.emplace(owner.ptr(), materialized);
+            nb::object deviceView = binding.attr("_gradient_device_view")(gradient.path, materialized, gradient.shape);
+            if (sink && plannedWritesByOwner.find(owner.ptr()) == plannedWritesByOwner.end()) {
+                nb::object transaction = materialized.attr("_begin_planned_device_write")();
+                plannedWritesByOwner.emplace(owner.ptr(), transaction);
+                plannedWrites.push_back(std::move(transaction));
+            }
+            nb::object bufferObject =
+                sink ? deviceView.attr("_planned_buffer")() : deviceView.attr("_resident_buffer")();
+            auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+            nb::object layout = deviceView.attr("layout");
+            std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
+            const size_t offset = nb::cast<size_t>(layout.attr("byte_offset"));
+            const size_t bytes = pythonAdMetadataBytes(gradient);
+            if (!buffer || strides.size() != gradient.shape.size() || offset > buffer->size)
+                return false;
+            retainedBuffers.push_back(std::move(bufferObject));
+            retainedViews.push_back(std::move(deviceView));
+            materializedGradients.push_back(materialized);
+            retainedStrides.push_back(std::move(strides));
+            gradientViews.push_back({sizeof(VernonAdDeviceValue),
+                                     {gradient.path.data(), gradient.path.size()},
+                                     gradient.dtype,
+                                     buffer->handle,
+                                     offset,
+                                     buffer->size,
+                                     bytes,
+                                     static_cast<uint32_t>(gradient.shape.size()),
+                                     gradient.shape.data(),
+                                     retainedStrides.back().data(),
+                                     {}});
+        }
+        VernonAdDeviceValueSet gradientSet{
+            sizeof(VernonAdDeviceValueSet), gradientViews.data(), gradientViews.size(), {}};
+        const VernonStatus status =
+            sink ? vernon::runtime::ad::applyPullbackDeviceWithPlanSink(*handle, seedView, gradientSet, options, *sink)
+                 : vernonPullbackApplyDeviceWithOptions(handle, seedView, &gradientSet, options);
+        if (status != VERNON_STATUS_OK) {
+            throw std::runtime_error("device pullback application failed: " +
+                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
+        }
+        if (sink) {
+            for (const nb::object &buffer : retainedBuffers)
+                retainPythonObject(*sink, buffer);
+            for (const nb::object &view : retainedViews)
+                retainPythonObject(*sink, view);
+            for (nb::object &transaction : plannedWrites)
+                retainPythonCommandCompletion(*sink, transaction);
+            plannedWriteRollback.released = true;
+        }
+        for (size_t index = 0; index < gradients.size(); ++index) {
+            if (!sink)
+                materializedGradients[index].attr("_mark_device_dirty")();
+            result[nb::str(gradients[index].path.c_str())] = materializedGradients[index];
+        }
+        return true;
     }
 
     nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent,
@@ -273,7 +456,8 @@ struct LoadedPipeline {
 
     nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner,
                   PipelineInvocationBuilder *encodedBuilder = nullptr,
-                  const VernonRhiCommandEncoder *nativeEncoder = nullptr) {
+                  const VernonRhiCommandEncoder *nativeEncoder = nullptr,
+                  vernon::execution::detail::RhiCommandExecutionPlan *commandPlan = nullptr) {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
         const std::vector<PipelineParameterMetadata> metadata = parameters();
@@ -379,18 +563,24 @@ struct LoadedPipeline {
         VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
         VernonPullback *pullback = nullptr;
         VernonStatus forwardStatus = VERNON_STATUS_OK;
-        if (encodedBuilder || nativeEncoder) {
-            if (!encodedBuilder || !nativeEncoder || encodedBuilder->pipeline != pipeline)
+        if (encodedBuilder || nativeEncoder || commandPlan) {
+            if (!encodedBuilder || (nativeEncoder == nullptr) == (commandPlan == nullptr) ||
+                encodedBuilder->pipeline != pipeline)
                 throw std::invalid_argument("encoded autodiff invocation belongs to another pipeline");
             std::vector<VernonPipelineArgument> values;
             VernonPipelineInvocation invocation = encodedBuilder->invocation(values);
             if (invocation.compute_grid.x != gridX || invocation.compute_grid.y != gridY ||
                 invocation.compute_grid.z != gridZ)
                 throw std::invalid_argument("encoded autodiff invocation grid does not match the VJP grid");
-            VernonRuntimeProviderObject encoder{};
-            if (vernonRuntimeReferenceRhiCommandEncoder(runtime, *nativeEncoder, &encoder) != VERNON_STATUS_OK)
-                throw std::invalid_argument("command encoder belongs to another Runtime device");
-            forwardStatus = vernonAdPipelineEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
+            if (commandPlan) {
+                forwardStatus = vernon::runtime::ad::preparePipelineForwardCommandPlan(*pipeline, invocation, inputSet,
+                                                                                       *commandPlan, pullback);
+            } else {
+                VernonRuntimeProviderObject encoder{};
+                if (vernonRuntimeReferenceRhiCommandEncoder(runtime, *nativeEncoder, &encoder) != VERNON_STATUS_OK)
+                    throw std::invalid_argument("command encoder belongs to another Runtime device");
+                forwardStatus = vernonAdPipelineEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
+            }
         } else {
             forwardStatus = vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
         }

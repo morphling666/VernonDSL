@@ -55,7 +55,7 @@ class ConcreteType:
                 shape = ", ".join(str(value) for value in self.arguments[1:])
                 return f"!vernon.tensor<{element.mlir}, [{shape}]>"
             dimensions = "x".join(str(value) for value in self.arguments[1:])
-            return f"tensor<{dimensions}x{element.mlir}>"
+            return f"tensor<{dimensions + 'x' if dimensions else ''}{element.mlir}>"
         if self.kind == "tuple":
             elements = self.arguments
             assert all(isinstance(element, ConcreteType) for element in elements)

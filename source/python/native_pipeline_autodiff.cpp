@@ -100,6 +100,34 @@ nb::object storageCotangentLeaf(const nb::object &value, const nb::handle &group
     return projection.attr("to_numpy")();
 }
 
+nb::object storageCotangentDeviceLeaf(const nb::object &value, const nb::handle &group, const std::string &leafPath,
+                                      const std::vector<uint64_t> &carrierShape, const nb::dict &bindings, bool logical,
+                                      bool aggregate) {
+    if (!aggregate)
+        return value;
+    const std::string root = nb::cast<std::string>(group.attr("parameter_root"));
+    const std::string suffix = leafPath == root ? std::string{} : leafPath.substr(root.size() + 1);
+    nb::object primal = nb::borrow<nb::object>(bindings[nb::str(root.c_str())]);
+    nb::object tensorViewType = nb::module_::import_("vernon_dsl._runtime.resources").attr("TensorView");
+    if (!nb::isinstance(primal, tensorViewType))
+        return value.attr("__getitem__")(suffix);
+
+    std::vector<uint64_t> shape = logical ? std::vector<uint64_t>{} : carrierShape;
+    const std::vector<uint64_t> primalShape = nb::cast<std::vector<uint64_t>>(primal.attr("shape"));
+    shape.insert(shape.end(), primalShape.begin(), primalShape.end());
+    std::vector<int64_t> strides;
+    if (!logical) {
+        const std::vector<int64_t> byteStrides = nb::cast<std::vector<int64_t>>(value.attr("_array").attr("strides"));
+        const int64_t elementSize = nb::cast<int64_t>(value.attr("element_layout").attr("size"));
+        for (size_t index = 0; index < carrierShape.size(); ++index)
+            strides.push_back(byteStrides[index] / elementSize);
+    }
+    const std::vector<int64_t> primalStrides = nb::cast<std::vector<int64_t>>(primal.attr("_strides"));
+    strides.insert(strides.end(), primalStrides.begin(), primalStrides.end());
+    return value.attr("_tangent_view")(suffix, nb::arg("shape") = shape, nb::arg("strides") = strides,
+                                       nb::arg("offset") = primal.attr("_offset"), nb::arg("access") = "read");
+}
+
 } // namespace
 
 nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
@@ -170,6 +198,73 @@ nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, co
         grouped[nb::str(declaredPath.c_str())] = std::move(first);
     }
     return grouped;
+}
+
+bool PythonPullback::applyGroupedDeviceWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
+                                                   const nb::object &cotangentGroups, const nb::object &carrierShape,
+                                                   bool logical, const VernonPullbackApplyOptions *options,
+                                                   nb::dict &grouped,
+                                                   vernon::execution::detail::RhiCommandPlanSink *sink) {
+    if (vernon::runtime::autodiffRhiDevice(runtime).index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return false;
+    const size_t cotangentGroupCount = nb::len(cotangentGroups);
+    nb::object nativeCotangent = nb::none();
+    if (!cotangent.is_none()) {
+        nb::dict supplied;
+        if (nb::isinstance<nb::dict>(cotangent))
+            supplied = nb::cast<nb::dict>(cotangent);
+        else {
+            if (cotangentGroupCount != 1)
+                return false;
+            nb::object group = cotangentGroups.attr("__getitem__")(0);
+            supplied[nb::str(nb::cast<std::string>(group.attr("declared_path")).c_str())] = cotangent;
+        }
+        if (supplied.size() != cotangentGroupCount)
+            return false;
+
+        const std::vector<uint64_t> carrier = nb::cast<std::vector<uint64_t>>(carrierShape);
+        nb::object tensorStorageType = nb::module_::import_("vernon_dsl._runtime.resources").attr("TensorStorage");
+        nb::object tangentLayoutType = nb::module_::import_("vernon_dsl.host_values").attr("TangentLayout");
+        nb::dict leaves;
+        for (nb::handle group : nb::iter(cotangentGroups)) {
+            const std::string declaredPath = nb::cast<std::string>(group.attr("declared_path"));
+            nb::str declaredKey(declaredPath.c_str());
+            if (!supplied.contains(declaredKey))
+                return false;
+            nb::object value = nb::borrow<nb::object>(supplied[declaredKey]);
+            const std::vector<std::string> paths = derivativeGroupLeaves(group);
+            const bool storage = nb::isinstance(value, tensorStorageType);
+            const bool aggregate = storage && nb::isinstance(value.attr("element_layout"), tangentLayoutType);
+            if (!storage)
+                return false;
+            for (const std::string &path : paths)
+                leaves[nb::str(path.c_str())] =
+                    storageCotangentDeviceLeaf(value, group, path, carrier, bindings, logical, aggregate);
+        }
+        if (leaves.size() == 1)
+            for (auto item : leaves) {
+                nativeCotangent = nb::borrow<nb::object>(item.second);
+                break;
+            }
+        else
+            nativeCotangent = std::move(leaves);
+    }
+
+    nb::dict leafResults;
+    if (!applyDeviceImpl(nativeCotangent, logical, options, leafResults, sink))
+        return false;
+    for (nb::handle group : nb::iter(gradientGroups)) {
+        const std::vector<std::string> paths = derivativeGroupLeaves(group);
+        if (paths.empty())
+            throw std::runtime_error("gradient group has no derivative leaves");
+        nb::object first = nb::borrow<nb::object>(leafResults[nb::str(paths.front().c_str())]);
+        for (size_t index = 1; index < paths.size(); ++index)
+            if (leafResults[nb::str(paths[index].c_str())].ptr() != first.ptr())
+                throw std::runtime_error("gradient leaves did not materialize into one owner");
+        const std::string declaredPath = nb::cast<std::string>(group.attr("declared_path"));
+        grouped[nb::str(declaredPath.c_str())] = std::move(first);
+    }
+    return true;
 }
 
 PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,

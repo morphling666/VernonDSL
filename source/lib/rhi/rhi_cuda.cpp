@@ -18,6 +18,10 @@
 #include <utility>
 #include <vector>
 
+namespace vernon::rhi {
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
+}
+
 namespace {
 struct CudaBufferSlot : vernon::rhi::LogicalResourceRecord {
     vernon::rhi::cuda::DevicePointer pointer{};
@@ -175,7 +179,8 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
     }
 
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
-        descriptor->size > (std::numeric_limits<size_t>::max)())
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     uint32_t index = 0;
@@ -208,6 +213,11 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+        vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level CUDA upload cannot execute while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     const auto status = device->state.upload(slot->pointer + offset, source, static_cast<size_t>(size));
     if (status == vernon::rhi::cuda::kSuccess)
         return VERNON_RHI_STATUS_OK;
@@ -226,6 +236,11 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
     CudaBufferSlot *slot = lookupCudaBuffer(*device, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+        vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
+        device->error = "device-level CUDA upload cannot execute while a command encoder is recording";
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
     size_t stagingSize = 0;
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
@@ -421,6 +436,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
     using namespace cuda_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_CUDA,
+        0,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         destroyDevice,
@@ -455,6 +472,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         releaseResource,
         beginCommands,
         submitCommands,
+        nullptr,
         nullptr,
         nullptr,
         recordBarriers,
