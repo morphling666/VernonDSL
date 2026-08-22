@@ -10,7 +10,10 @@ from typing import Any, cast
 import numpy as np
 import vernon_dsl as vd
 
-from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph, build_smoke_fluid_sequence_graph
+from examples.autodiff_smoke_fluid_graph import (
+    SmokeFluidModule,
+    SmokeFluidRolloutModule,
+)
 from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters
 
 GRID = 128
@@ -58,35 +61,22 @@ class SmokeFluidSimulation:
             np.int32(grid),
             np.int32(pressure_iterations),
         )
-        alternate_density = vd.storage.zeros(dtype=vd.f32, shape=(grid, grid))
-        alternate_velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(grid, grid))
-        self._density_states = (self.density, alternate_density)
-        self._velocity_states = (self.velocity, alternate_velocity)
-        self._graphs = (
-            build_smoke_fluid_graph(
-                state_density=self.density,
-                state_velocity=self.velocity,
-                objective_target_density=self.target,
-                parameters=self.parameters,
-                output_density=alternate_density,
-                output_velocity=alternate_velocity,
-                output_loss=self.output_loss,
-                differentiable=differentiable,
-                planning_policy=planning_policy,
-            ),
-            build_smoke_fluid_graph(
-                state_density=alternate_density,
-                state_velocity=alternate_velocity,
-                objective_target_density=self.target,
-                parameters=self.parameters,
-                output_density=self.density,
-                output_velocity=self.velocity,
-                output_loss=self.output_loss,
-                differentiable=differentiable,
-                planning_policy=planning_policy,
-            ),
+        self._module = SmokeFluidModule(
+            self.parameters,
+            planning_policy=planning_policy,
         )
-        self._next_graph = 0
+        self._module_vjp = (
+            vd.ad.vjp(
+                self._module,
+                wrt=("state_density", "state_velocity"),
+                outputs=("density", "velocity", "loss"),
+                planning_policy=planning_policy,
+            )
+            if differentiable
+            else None
+        )
+        self._density_states = (self.density,)
+        self._velocity_states = (self.velocity,)
 
     def set_target(self, target: np.ndarray) -> None:
         self.target.copy_from_numpy(np.ascontiguousarray(target, dtype=np.float32))
@@ -104,21 +94,18 @@ class SmokeFluidSimulation:
     def step(self, target: np.ndarray | None = None) -> None:
         if target is not None:
             self.set_target(target)
-        outputs = self._graphs[self._next_graph].execute()
-        self._next_graph ^= 1
+        outputs = self._module(self.density, self.velocity, self.target)
         self.density = outputs.density
         self.velocity = outputs.velocity
         self.output_loss = outputs.loss
 
-    def step_vjp(self, target: np.ndarray | None = None) -> vd.GraphPullback:
+    def step_vjp(self, target: np.ndarray | None = None) -> Any:
         if not self.differentiable:
             raise RuntimeError("smoke simulation was not created for differentiation")
         if target is not None:
             self.set_target(target)
-        graph = self._graphs[self._next_graph]
-        pullback = graph.vjp()
-        self._next_graph ^= 1
-        outputs = graph.outputs
+        assert self._module_vjp is not None
+        outputs, pullback = self._module_vjp(self.density, self.velocity, self.target)
         self.density = outputs.density
         self.velocity = outputs.velocity
         self.output_loss = outputs.loss
@@ -132,7 +119,6 @@ class SmokeFluidSimulation:
         for velocity in self._velocity_states:
             velocity.copy_from_numpy(zero_velocity)
         self.output_loss.copy_from_numpy(np.zeros((1,), dtype=np.float32))
-        self._next_graph = 0
         self.density = self._density_states[0]
         self.velocity = self._velocity_states[0]
 
@@ -206,17 +192,17 @@ def evaluate_initial_velocity(
     velocity = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=grid_shape)
     velocity.copy_from_numpy(np.ascontiguousarray(initial_velocity, dtype=np.float32))
     target_storage = vd.storage.from_numpy(np.ascontiguousarray(target, dtype=np.float32))
-    graph, loss = build_smoke_fluid_sequence_graph(
-        initial_density=density,
-        initial_velocity=velocity,
-        target_density=target_storage,
-        parameters=simulation.parameters,
+    rollout = SmokeFluidRolloutModule(
+        simulation.parameters,
         horizon=horizon,
         checkpoint_memory_budget=checkpoint_memory_budget,
     )
-    pullback = graph.vjp()
+    loss, pullback = vd.ad.vjp(
+        rollout,
+        wrt=("initial_velocity",),
+    )(density, velocity, target_storage)
     gradients = pullback(None)
-    return float(loss.to_numpy()[0]), cast(Any, gradients["state_velocity"]).to_numpy()
+    return float(loss.to_numpy()[0]), cast(Any, gradients["initial_velocity"]).to_numpy()
 
 
 def checkerboard_smoke(grid: int) -> np.ndarray:

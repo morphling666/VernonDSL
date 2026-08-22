@@ -8,6 +8,10 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
+#include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramExecutable.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramImplementation.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramVjp.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Verifier.h"
@@ -27,6 +31,7 @@ protected:
         context.getOrLoadDialect<math::MathDialect>();
         context.getOrLoadDialect<scf::SCFDialect>();
         context.getOrLoadDialect<VernonDialect>();
+        context.getOrLoadDialect<program::VernonProgramDialect>();
     }
 
     OwningOpRef<ModuleOp> parseStorageObjective(StringRef operation, StringRef arguments = "%x, %y") {
@@ -53,6 +58,124 @@ module {
 
     MLIRContext context;
 };
+
+TEST_F(VernonStructuredVjpTest, ProgramVjpConsumesRetainedValuesWithoutCloningPrimalWork) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %left: tensor<4xf32> {vernon.source_name = "left"},
+      %right: tensor<4xf32> {vernon.source_name = "right"})
+      -> tensor<4xf32>
+      attributes {vernon_program.graph = "primal"} {
+    %product = arith.mulf %left, %right : tensor<4xf32>
+    func.return %product : tensor<4xf32>
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    ASSERT_TRUE(primal);
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0, 1}, "forward", "backward"})));
+    EXPECT_FALSE(module->lookupSymbol<func::FuncOp>("primal"));
+    auto backward = module->lookupSymbol<func::FuncOp>("backward");
+    ASSERT_TRUE(backward);
+    ASSERT_EQ(backward.getNumArguments(), 3u);
+    for (unsigned index = 0; index < 2; ++index) {
+        auto capture = backward.getArgAttrOfType<IntegerAttr>(index, program::kCaptureForwardValueAttr);
+        ASSERT_TRUE(capture);
+        EXPECT_EQ(capture.getInt(), index);
+    }
+    EXPECT_FALSE(backward.getArgAttrOfType<IntegerAttr>(2, program::kCaptureForwardValueAttr));
+    EXPECT_EQ(backward.getBody().front().getOperations().size(), 3u);
+}
+
+TEST_F(VernonStructuredVjpTest, ProgramVjpMaterializesFanInAccumulation) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(%input: tensor<4xf32> {vernon.source_name = "input"})
+      -> tensor<4xf32>
+      attributes {vernon_program.graph = "primal"} {
+    %sum = arith.addf %input, %input : tensor<4xf32>
+    func.return %sum : tensor<4xf32>
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    auto backward = module->lookupSymbol<func::FuncOp>("backward");
+    ASSERT_TRUE(backward);
+    SmallVector<arith::AddFOp> accumulations;
+    backward.walk([&](arith::AddFOp operation) { accumulations.push_back(operation); });
+    ASSERT_EQ(accumulations.size(), 1u);
+    ASSERT_EQ(backward.getNumArguments(), 1u);
+    EXPECT_EQ(accumulations.front().getLhs(), backward.getArgument(0));
+    EXPECT_EQ(accumulations.front().getRhs(), backward.getArgument(0));
+}
+
+TEST_F(VernonStructuredVjpTest, ProgramVjpScalarizesCanonicalAggregateDerivativeLeaves) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  "vernon.struct"() {
+    sym_name = "Pair",
+    fields = ["left:f32", "right:f32"],
+    abi_leaf_dtypes = ["f32", "f32"]
+  } : () -> ()
+  func.func @primal(
+      %input: !vernon.tensor<!vernon.struct<"Pair">, [2]>
+          {vernon.source_name = "input", vernon.abi_leaf_dtypes = ["f32", "f32"]})
+      -> !vernon.tensor<!vernon.struct<"Pair">, [2]>
+      attributes {vernon_program.graph = "primal"} {
+    %left = "vernon_program.compute"(%input) {
+      callee = "left", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["input"], result_names = ["output"]
+    } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>) ->
+        (!vernon.tensor<!vernon.struct<"Pair">, [2]>)
+    %right = "vernon_program.compute"(%input) {
+      callee = "right", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["input"], result_names = ["output"]
+    } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>) ->
+        (!vernon.tensor<!vernon.struct<"Pair">, [2]>)
+    %output = "vernon_program.compute"(%left, %right) {
+      callee = "merge", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["left", "right"], result_names = ["output"]
+    } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>,
+         !vernon.tensor<!vernon.struct<"Pair">, [2]>) ->
+        (!vernon.tensor<!vernon.struct<"Pair">, [2]>)
+    func.return %output : !vernon.tensor<!vernon.struct<"Pair">, [2]>
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    auto backward = module->lookupSymbol<func::FuncOp>("backward");
+    ASSERT_TRUE(backward);
+    auto derivative = dyn_cast<TupleType>(backward.getResultTypes().front());
+    ASSERT_TRUE(derivative);
+    ASSERT_EQ(derivative.size(), 4u);
+    for (Type leaf : derivative.getTypes())
+        EXPECT_EQ(leaf, Float32Type::get(&context));
+    unsigned adds = 0;
+    unsigned tupleCreates = 0;
+    backward.walk([&](Operation *operation) {
+        adds += isa<arith::AddFOp>(operation);
+        tupleCreates += isa<TupleCreateOp>(operation);
+    });
+    EXPECT_EQ(adds, 4u);
+    EXPECT_GE(tupleCreates, 1u);
+    EXPECT_TRUE(succeeded(verify(*module)));
+    PassManager executable(&context);
+    executable.addPass(program::createVernonProgramSelectImplementationsPass());
+    executable.addPass(program::createVernonProgramBuildExecutablePass());
+    EXPECT_TRUE(succeeded(executable.run(*module)));
+}
 
 TEST_F(VernonStructuredVjpTest, RankZeroTensorViewModelsScalarStorage) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
@@ -673,6 +796,21 @@ module {
     EXPECT_TRUE(succeeded(verify(*module)));
     EXPECT_EQ(result->tapeBytes, 0u);
     EXPECT_EQ(result->requiredPrimalPaths, (SmallVector<std::string>{"primal.count"}));
+    bool foundRetainedCount = false;
+    for (unsigned index = 0; index < result->backward.getNumArguments(); ++index) {
+        auto sourceName = result->backward.getArgAttrOfType<StringAttr>(index, "vernon.source_name");
+        if (!sourceName || sourceName.getValue() != "primal.count")
+            continue;
+        foundRetainedCount = true;
+        auto dtype = result->backward.getArgAttrOfType<StringAttr>(index, "vernon.dtype");
+        auto dtypes = result->backward.getArgAttrOfType<ArrayAttr>(index, "vernon.abi_leaf_dtypes");
+        ASSERT_TRUE(dtype);
+        ASSERT_TRUE(dtypes);
+        EXPECT_EQ(dtype.getValue(), "i32");
+        ASSERT_EQ(dtypes.size(), 1u);
+        EXPECT_EQ(cast<StringAttr>(dtypes[0]).getValue(), "i32");
+    }
+    EXPECT_TRUE(foundRetainedCount);
     EXPECT_EQ(result->forward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
     EXPECT_EQ(result->backward->getAttrOfType<StringAttr>("vernon.ad.residual_storage").getValue(), "none");
     unsigned dynamicRegions = 0;

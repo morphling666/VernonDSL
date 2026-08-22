@@ -68,9 +68,8 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
     if (!variant.compute.empty()) {
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
-        const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_DIRECTX12,
-                                                      invocationDiagnostic(*bundle.context))) {
+        if (!resolveStageReflection(stage, VERNON_RUNTIME_DIRECTX12, reflection,
+                                    invocationDiagnostic(*bundle.context))) {
             delete pipelineState;
             return false;
         }
@@ -227,15 +226,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
             candidate.binding.externalSlot = parameter.slot;
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                use.transport == "storage_buffer" && parameter.elementLayout.byteSize && use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.binding;
-                candidate.layout.set = use.descriptorSet;
-                candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_STORAGE;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t valueCount = 1;
@@ -255,8 +246,9 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     supported = false;
                     break;
                 }
-                candidate.layout.kind = use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                          : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 const uint64_t physicalSize = use.interfacePlan->root->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
                     (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX)) {
@@ -278,7 +270,9 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
                 const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
                 std::optional<TensorCopyPlan> packing =
-                    compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
+                    parameter.valueLayout
+                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
                 if (!packing || packing->elementSize != elementSize) {
                     supported = false;
                     break;

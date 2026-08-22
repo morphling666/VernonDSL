@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "autodiff_metadata.h"
 
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -71,5 +72,10 @@ VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeConte
 VERNON_RUNTIME_CAPI VernonRhiDevice autodiffRhiDevice(const VernonRuntimeContext *context);
 
 } // namespace vernon::runtime
+
+namespace vernon::runtime::ad {
+std::optional<size_t> programAdParameterIndex(const VernonLoadedPipeline *pipeline, VernonProgramAdBoundary boundary,
+                                              size_t boundaryIndex);
+}
 
 #endif

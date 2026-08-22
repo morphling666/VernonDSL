@@ -220,7 +220,9 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
       },
       %id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "global_invocation_id"
+        vernon.builtin = "global_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",

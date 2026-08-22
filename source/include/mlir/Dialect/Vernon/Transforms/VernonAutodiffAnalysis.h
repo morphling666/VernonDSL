@@ -29,6 +29,7 @@ enum class AutodiffEffectKind {
 struct AutodiffLeaf {
     Value value;
     unsigned abiLeafIndex{};
+    std::string rootPath;
     std::string path;
     Type primalType;
     Type derivativeType;
@@ -186,7 +187,6 @@ FailureOr<VernonAutodiffAnalysisResult> analyzeAutodiffFunction(func::FuncOp fun
                                                                 const VernonAutodiffRuleRegistry &registry);
 
 bool isDifferentiableAutodiffLeaf(Type scalarType, StringRef logicalDtype = {});
-FailureOr<Type> getAutodiffDerivativeType(Type scalarType);
 AutodiffEffectKind classifyAutodiffEffect(Operation *operation);
 StringRef stringifyAutodiffEffect(AutodiffEffectKind effect);
 

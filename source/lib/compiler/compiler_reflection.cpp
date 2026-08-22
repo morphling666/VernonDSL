@@ -1,5 +1,7 @@
 #include "compiler_reflection.h"
 
+#include "compiler_program_reflection.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -31,12 +33,7 @@ namespace vernon::compiler {
 
 mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::ModuleOp module) {
     LogicalReflectionModel model;
-    auto contract = module->getAttrOfType<mlir::IntegerAttr>("vernon.compiler_contract_version");
-    if (!contract || contract.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
-        module.emitError("cannot reflect a module with a missing or unsupported compiler contract version");
-        return mlir::failure();
-    }
-    model.compilerContractVersion = contract.getInt();
+    model.compilerContractVersion = VERNON_COMPILER_CONTRACT_VERSION;
     const auto collectValue = [](unsigned index, mlir::Type type, mlir::DictionaryAttr attributes, bool result) {
         LogicalValueModel value;
         value.index = index;
@@ -51,6 +48,15 @@ mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::Module
                 value.dtypeExplicit = true;
                 value.dtype = dtype.getValue().str();
             }
+        if (attributes)
+            if (auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
+                for (mlir::Attribute dtype : dtypes)
+                    if (auto string = mlir::dyn_cast<mlir::StringAttr>(dtype))
+                        value.leafDtypes.push_back(string.getValue().str());
+        if (value.leafDtypes.empty() && !value.dtype.empty())
+            value.leafDtypes.push_back(value.dtype);
+        if (value.dtype.empty() && value.leafDtypes.size() == 1)
+            value.dtype = value.leafDtypes.front();
         if (value.dtype.empty()) {
             mlir::Type scalar = type;
             if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
@@ -67,16 +73,9 @@ mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::Module
                 value.dtype = "f64";
             else if (scalar.isInteger(1))
                 value.dtype = "bool";
-            else if (auto integer = mlir::dyn_cast<mlir::IntegerType>(scalar))
-                value.dtype = integer.isUnsigned() ? "u32" : "i32";
             else if (scalar.isIndex())
                 value.dtype = "index";
         }
-        if (attributes)
-            if (auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
-                for (mlir::Attribute dtype : dtypes)
-                    if (auto string = mlir::dyn_cast<mlir::StringAttr>(dtype))
-                        value.leafDtypes.push_back(string.getValue().str());
         if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
             for (int64_t extent : shaped.getShape())
                 value.shape.push_back(extent);
@@ -438,6 +437,52 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
 
 } // namespace
 
+mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
+                                                                llvm::ArrayRef<llvm::StringRef> logicalDtypes) {
+    mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned =
+        mlir::vernon::getValueAbiLayout(type, module, logicalDtypes);
+    if (mlir::failed(planned))
+        return mlir::failure();
+    std::string logicalType;
+    llvm::raw_string_ostream typeStream(logicalType);
+    type.print(typeStream);
+    typeStream.flush();
+    llvm::json::Object reflected = reflectCanonicalValueLayout(*planned, logicalType);
+    if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type))
+        reflected["struct_name"] = structure.getName().str();
+    return reflected;
+}
+
+llvm::json::Object reflectCanonicalValueLayout(const mlir::vernon::ValueAbiLayout &layout,
+                                               llvm::StringRef logicalType) {
+    llvm::json::Object reflected;
+    reflected["logical_type"] = logicalType.str();
+    reflected["byte_size"] = static_cast<int64_t>(layout.size);
+    reflected["alignment"] = static_cast<int64_t>(layout.alignment);
+    reflected["layout_hash"] = layout.layoutHash;
+    llvm::json::Array leaves;
+    for (const mlir::vernon::ValueAbiLeaf &leaf : layout.leaves) {
+        llvm::json::Object reflectedLeaf;
+        llvm::json::Array path;
+        for (const mlir::vernon::ValueAbiPathComponent &component : leaf.path)
+            if (component.field)
+                path.emplace_back(*component.field);
+            else
+                path.emplace_back(static_cast<int64_t>(component.index));
+        reflectedLeaf["path"] = std::move(path);
+        reflectedLeaf["dtype"] = leaf.dtype;
+        reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
+        reflectedLeaf["scalar_count"] = static_cast<int64_t>(leaf.scalarCount);
+        llvm::json::Array shape;
+        for (uint64_t extent : leaf.shape)
+            shape.emplace_back(static_cast<int64_t>(extent));
+        reflectedLeaf["shape"] = std::move(shape);
+        leaves.emplace_back(std::move(reflectedLeaf));
+    }
+    reflected["leaves"] = std::move(leaves);
+    return reflected;
+}
+
 mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const LogicalReflectionModel &logical,
                                              const std::vector<PhysicalEntryModel> &physicalEntries,
                                              const std::vector<PhysicalEntryProvenance> &provenance) {
@@ -456,78 +501,15 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             module.emitError() << "duplicate logical-to-physical provenance for '" << entry.name << "'";
             return mlir::failure();
         }
-    auto scalarDtype = [](mlir::Type type) -> std::string {
-        if (type.isF16())
-            return "f16";
-        if (type.isF32())
-            return "f32";
-        if (type.isF64())
-            return "f64";
-        if (type.isInteger(1))
-            return "bool";
-        if (auto integer = mlir::dyn_cast<mlir::IntegerType>(type))
-            return integer.isUnsigned() ? "u32" : "i32";
-        if (type.isIndex())
-            return "index";
+    const auto languageDtype = [](llvm::ArrayRef<llvm::StringRef> leaves, mlir::StringAttr sugar) -> std::string {
+        if (leaves.size() == 1)
+            return leaves.front().str();
+        if (sugar && !sugar.getValue().empty() && leaves.empty())
+            return sugar.getValue().str();
         return "";
     };
-    llvm::DenseMap<mlir::Type, mlir::vernon::ValueAbiLayout> logicalPlanCache;
-    auto reflectValueLayout =
-        [&](mlir::Type type,
-            llvm::ArrayRef<llvm::StringRef> logicalDtypes = {}) -> mlir::FailureOr<llvm::json::Object> {
-        mlir::vernon::ValueAbiLayout planned;
-        if (logicalDtypes.empty()) {
-            if (auto found = logicalPlanCache.find(type); found != logicalPlanCache.end()) {
-                planned = found->second;
-            } else {
-                mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout = mlir::vernon::getValueAbiLayout(type, module);
-                if (mlir::failed(layout))
-                    return mlir::failure();
-                planned = *layout;
-                logicalPlanCache.try_emplace(type, planned);
-            }
-        } else {
-            mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
-                mlir::vernon::getValueAbiLayout(type, module, logicalDtypes);
-            if (mlir::failed(layout))
-                return mlir::failure();
-            planned = std::move(*layout);
-        }
-        const mlir::vernon::ValueAbiLayout &layout = planned;
-        llvm::json::Object reflected;
-        std::string logicalType;
-        llvm::raw_string_ostream typeStream(logicalType);
-        type.print(typeStream);
-        typeStream.flush();
-        reflected["logical_type"] = std::move(logicalType);
-        if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type))
-            reflected["struct_name"] = structure.getName().str();
-        reflected["byte_size"] = static_cast<int64_t>(layout.size);
-        reflected["alignment"] = static_cast<int64_t>(layout.alignment);
-        reflected["layout_hash"] = layout.layoutHash;
-        llvm::json::Array leaves;
-        for (const mlir::vernon::ValueAbiLeaf &leaf : layout.leaves) {
-            llvm::json::Object reflectedLeaf;
-            llvm::json::Array path;
-            for (const mlir::vernon::ValueAbiPathComponent &component : leaf.path) {
-                if (component.field)
-                    path.emplace_back(*component.field);
-                else
-                    path.emplace_back(static_cast<int64_t>(component.index));
-            }
-            reflectedLeaf["path"] = std::move(path);
-            reflectedLeaf["dtype"] = leaf.dtype;
-            reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
-            reflectedLeaf["scalar_count"] = static_cast<int64_t>(leaf.scalarCount);
-            llvm::json::Array shape;
-            for (uint64_t extent : leaf.shape)
-                shape.emplace_back(static_cast<int64_t>(extent));
-            reflectedLeaf["shape"] = std::move(shape);
-            leaves.emplace_back(std::move(reflectedLeaf));
-        }
-        reflected["leaves"] = std::move(leaves);
-        return reflected;
-    };
+    auto reflectValueLayout = [&](mlir::Type type, llvm::ArrayRef<llvm::StringRef> logicalDtypes = {})
+        -> mlir::FailureOr<llvm::json::Object> { return reflectCanonicalValueLayout(module, type, logicalDtypes); };
     std::function<llvm::json::Object(const mlir::vernon::ByteTransportNode &)> reflectTransportNode;
     reflectTransportNode = [&](const mlir::vernon::ByteTransportNode &node) {
         llvm::StringRef kind = node.kind == mlir::vernon::ByteTransportNodeKind::Scalar    ? "scalar"
@@ -618,16 +600,19 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
     std::array<llvm::DenseMap<mlir::Type, mlir::vernon::BackendInterfaceAbiPlan>,
                static_cast<size_t>(mlir::vernon::PhysicalAbiProfile::Count)>
         physicalPlanCache;
-    auto physicalPlan =
-        [&](mlir::Type type,
-            mlir::vernon::PhysicalAbiProfile profile) -> mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> {
+    auto physicalPlan = [&](mlir::Type type, mlir::vernon::PhysicalAbiProfile profile,
+                            llvm::ArrayRef<llvm::StringRef> logicalDtypes = {})
+        -> mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> {
         auto &cache = physicalPlanCache[static_cast<size_t>(profile)];
-        if (auto found = cache.find(type); found != cache.end())
-            return found->second;
+        if (logicalDtypes.empty())
+            if (auto found = cache.find(type); found != cache.end())
+                return found->second;
         mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> planned =
-            mlir::vernon::getBackendInterfaceAbiPlan(type, module, profile);
+            mlir::vernon::getBackendInterfaceAbiPlan(type, module, profile, logicalDtypes);
         if (mlir::failed(planned))
             return mlir::failure();
+        if (!logicalDtypes.empty())
+            return planned;
         auto inserted = cache.try_emplace(type, std::move(*planned));
         return inserted.first->second;
     };
@@ -635,9 +620,9 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         uint64_t size;
         uint64_t alignment;
     };
-    auto physicalLayout = [&](mlir::Type type,
-                              mlir::vernon::PhysicalAbiProfile profile) -> mlir::FailureOr<InterfaceExtent> {
-        mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = physicalPlan(type, profile);
+    auto physicalLayout = [&](mlir::Type type, mlir::vernon::PhysicalAbiProfile profile,
+                              llvm::ArrayRef<llvm::StringRef> logicalDtypes = {}) -> mlir::FailureOr<InterfaceExtent> {
+        mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = physicalPlan(type, profile, logicalDtypes);
         if (mlir::failed(plan))
             return mlir::failure();
         if (const auto *bytes = std::get_if<mlir::vernon::ByteTransportPlan>(&*plan))
@@ -719,8 +704,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (!interfaceKind || interfaceKind.getValue() != "uniform")
                 continue;
             mlir::Type type = function.getArgumentTypes()[index];
+            llvm::SmallVector<llvm::StringRef> uniformDtypes;
+            if (auto dtypes = attrs.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
+                for (mlir::Attribute dtype : dtypes)
+                    if (auto value = mlir::dyn_cast<mlir::StringAttr>(dtype))
+                        uniformDtypes.push_back(value.getValue());
+            if (uniformDtypes.empty())
+                if (auto sugar = attrs.getAs<mlir::StringAttr>("vernon.dtype"); sugar && !sugar.getValue().empty())
+                    uniformDtypes.push_back(sugar.getValue());
             mlir::FailureOr<InterfaceExtent> layout =
-                physicalLayout(type, mlir::vernon::PhysicalAbiProfile::VulkanPushConstant);
+                physicalLayout(type, mlir::vernon::PhysicalAbiProfile::VulkanPushConstant, uniformDtypes);
             if (mlir::failed(layout)) {
                 function.emitError() << "cannot plan graphics uniform layout for argument #" << index;
                 invalid = true;
@@ -730,9 +723,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
                 requiresBuffer = tensor.getRank() > 2;
             if (attrs.get("vernon.binding")) {
-                layout = physicalLayout(type, mlir::isa<mlir::vernon::TensorType>(type)
-                                                  ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
-                                                  : mlir::vernon::PhysicalAbiProfile::VulkanStd140UniformBuffer);
+                layout = physicalLayout(type,
+                                        mlir::isa<mlir::vernon::TensorType>(type)
+                                            ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
+                                            : mlir::vernon::PhysicalAbiProfile::VulkanStd140UniformBuffer,
+                                        uniformDtypes);
                 if (mlir::failed(layout)) {
                     function.emitError() << "cannot plan descriptor-backed uniform layout for argument #" << index;
                     invalid = true;
@@ -745,9 +740,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             requiresBuffer = requiresBuffer || offset > 128 || layout->size > 128 - std::min<uint64_t>(offset, 128);
             if (requiresBuffer) {
                 generatedUniformBindings[index] = nextGeneratedBinding++;
-                layout = physicalLayout(type, mlir::isa<mlir::vernon::TensorType>(type)
-                                                  ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
-                                                  : mlir::vernon::PhysicalAbiProfile::VulkanStd140UniformBuffer);
+                layout = physicalLayout(type,
+                                        mlir::isa<mlir::vernon::TensorType>(type)
+                                            ? mlir::vernon::PhysicalAbiProfile::VulkanStd430StorageBuffer
+                                            : mlir::vernon::PhysicalAbiProfile::VulkanStd140UniformBuffer,
+                                        uniformDtypes);
                 if (mlir::failed(layout)) {
                     function.emitError() << "cannot plan generated uniform buffer layout for argument #" << index;
                     invalid = true;
@@ -769,13 +766,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 computeBindings[index] = flattenedBinding;
                 size_t leafCount = 1;
                 mlir::Type storageElement;
-                if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(function.getArgumentTypes()[index]))
-                    storageElement = tensor.getElementType();
-                else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index]))
+                if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(function.getArgumentTypes()[index]))
                     storageElement = view.getElementType();
                 if (storageElement) {
                     mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
-                        mlir::vernon::getValueAbiLayout(storageElement, module);
+                        mlir::vernon::getValueStorageLayout(storageElement, module);
                     if (mlir::failed(layout)) {
                         function.emitError("cannot assign flattened compute bindings");
                         invalid = true;
@@ -887,11 +882,17 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 return values;
             };
             llvm::SmallVector<llvm::StringRef> valueLogicalDtypes = leafDtypes("vernon.abi_leaf_dtypes");
+            if (valueLogicalDtypes.empty())
+                if (auto sugar = argumentAttrs ? argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype") : nullptr;
+                    sugar && !sugar.getValue().empty())
+                    valueLogicalDtypes.push_back(sugar.getValue());
             if (valueLogicalDtypes.empty() && logicalValue)
                 for (const std::string &dtype : logicalValue->leafDtypes)
                     valueLogicalDtypes.push_back(dtype);
-            const llvm::SmallVector<llvm::StringRef> explicitElementLogicalDtypes =
+            llvm::SmallVector<llvm::StringRef> explicitElementLogicalDtypes =
                 leafDtypes("vernon.element_abi_leaf_dtypes");
+            if (explicitElementLogicalDtypes.empty() && valueLogicalDtypes.size() == 1)
+                explicitElementLogicalDtypes = valueLogicalDtypes;
             const llvm::ArrayRef<llvm::StringRef> interfaceLogicalDtypes =
                 mlir::isa<mlir::vernon::TensorViewType>(argumentType)
                     ? llvm::ArrayRef<llvm::StringRef>(explicitElementLogicalDtypes)
@@ -923,7 +924,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     mlir::vernon::getBackendInterfaceAbiPlan(
                         argumentType, module, mlir::vernon::PhysicalAbiProfile::HostValue, interfaceLogicalDtypes);
                 mlir::FailureOr<InterfaceExtent> cpuLayout =
-                    physicalLayout(argumentType, mlir::vernon::PhysicalAbiProfile::HostValue);
+                    physicalLayout(argumentType, mlir::vernon::PhysicalAbiProfile::HostValue, interfaceLogicalDtypes);
                 if (mlir::succeeded(cpuPlan) && mlir::succeeded(cpuLayout)) {
                     hostAlignment = cpuLayout->alignment;
                     argumentOffset = llvm::alignTo(argumentOffset, cpuLayout->alignment);
@@ -1079,11 +1080,12 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 argument["attribute_leaves"] = std::move(leaves);
             }
             if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(argumentType)) {
-                const std::string dtype = argumentAttrs && argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype")
-                                              ? argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype").getValue().str()
-                                              : scalarDtype(tensor.getElementType());
+                const std::string dtype =
+                    languageDtype(valueLogicalDtypes,
+                                  argumentAttrs ? argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype") : nullptr);
                 argument["kind"] = "tensor_value";
-                argument["dtype"] = dtype;
+                if (!dtype.empty())
+                    argument["dtype"] = dtype;
                 llvm::json::Array shape;
                 for (int64_t extent : tensor.getShape())
                     shape.emplace_back(extent);
@@ -1092,7 +1094,11 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             }
             if (auto vector = mlir::dyn_cast<mlir::VectorType>(argumentType)) {
                 argument["kind"] = "tensor_value";
-                argument["dtype"] = scalarDtype(vector.getElementType());
+                const std::string dtype =
+                    languageDtype(valueLogicalDtypes,
+                                  argumentAttrs ? argumentAttrs.getAs<mlir::StringAttr>("vernon.dtype") : nullptr);
+                if (!dtype.empty())
+                    argument["dtype"] = dtype;
                 llvm::json::Array shape;
                 for (int64_t extent : vector.getShape())
                     shape.emplace_back(extent);
@@ -1101,7 +1107,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             }
             if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(argumentType)) {
                 mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
-                    mlir::vernon::getValueAbiLayout(argumentType, module);
+                    mlir::vernon::getValueAbiLayout(argumentType, module, valueLogicalDtypes);
                 if (mlir::failed(layout)) {
                     function.emitError() << "cannot reflect canonical layout for static aggregate Tensor argument #"
                                          << index;
@@ -1155,33 +1161,19 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 } else if (mlir::isa<mlir::vernon::TextureType, mlir::vernon::SamplerType>(argumentType)) {
                     // Resource kind and binding metadata are emitted above.
                 } else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(argumentType)) {
-                    argument["kind"] = "tensor";
+                    argument["kind"] = "tensor_value";
                     argument["access"] = "read";
-                    mlir::FailureOr<mlir::vernon::ValueAbiLayout> storageLayout =
-                        mlir::vernon::getValueAbiLayout(tensor.getElementType(), module);
-                    if (mlir::failed(storageLayout)) {
-                        function.emitError("cannot reflect aggregate Tensor storage layout");
+                    mlir::FailureOr<mlir::vernon::ValueAbiLayout> valueLayout =
+                        mlir::vernon::getValueAbiLayout(tensor, module, valueLogicalDtypes);
+                    if (mlir::failed(valueLayout)) {
+                        function.emitError("cannot reflect aggregate Tensor value layout");
                         invalid = true;
                         return;
                     }
-                    argument["alignment"] = static_cast<int64_t>(storageLayout->alignment);
-                    if (computeBindings[index]) {
-                        const uint32_t firstBinding = *computeBindings[index];
-                        llvm::json::Array storageLeaves;
-                        for (auto [leafIndex, leaf] : llvm::enumerate(storageLayout->leaves)) {
-                            llvm::json::Object reflectedLeaf;
-                            reflectedLeaf["element_size"] = static_cast<int64_t>(
-                                std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1));
-                            reflectedLeaf["byte_offset"] = static_cast<int64_t>(leaf.byteOffset);
-                            reflectedLeaf["binding"] = static_cast<int64_t>(firstBinding + leafIndex);
-                            storageLeaves.emplace_back(std::move(reflectedLeaf));
-                        }
-                        argument["storage_leaves"] = std::move(storageLeaves);
-                    }
+                    argument["alignment"] = static_cast<int64_t>(valueLayout->alignment);
                 } else if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(argumentType)) {
                     argument["kind"] = "tensor";
-                    const std::string dtype =
-                        sourceDtype ? sourceDtype.getValue().str() : scalarDtype(view.getElementType());
+                    const std::string dtype = languageDtype(interfaceLogicalDtypes, sourceDtype);
                     if (!dtype.empty())
                         argument["dtype"] = dtype;
                     argument["access"] = view.getAccess().str();
@@ -1192,7 +1184,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         sourceShape.emplace_back(extent);
                     argument["source_shape"] = std::move(sourceShape);
                     mlir::FailureOr<mlir::vernon::ValueAbiLayout> storageLayout =
-                        mlir::vernon::getValueAbiLayout(view.getElementType(), module);
+                        mlir::vernon::getValueStorageLayout(view.getElementType(), module);
                     if (mlir::failed(storageLayout)) {
                         function.emitError("cannot reflect aggregate TensorView storage layout");
                         invalid = true;
@@ -1238,7 +1230,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     argument["tensor_view_descriptor"] = std::move(descriptor);
                 } else if (!mlir::isa<mlir::RankedTensorType, mlir::VectorType>(argumentType)) {
                     argument["kind"] = "scalar";
-                    argument["dtype"] = sourceDtype ? sourceDtype.getValue().str() : scalarDtype(argumentType);
+                    if (const std::string dtype = languageDtype(valueLogicalDtypes, sourceDtype); !dtype.empty())
+                        argument["dtype"] = dtype;
                     argument["alignment"] = static_cast<int64_t>(hostAlignment);
                 }
             }
@@ -1306,6 +1299,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                         auto value = mlir::dyn_cast<mlir::StringAttr>(dtype);
                         logicalDtypes.push_back(value ? value.getValue() : llvm::StringRef());
                     }
+            if (logicalDtypes.empty())
+                if (auto sugar = resultAttrs ? resultAttrs.getAs<mlir::StringAttr>("vernon.dtype") : nullptr;
+                    sugar && !sugar.getValue().empty())
+                    logicalDtypes.push_back(sugar.getValue());
             if (logicalDtypes.empty() && logicalValue)
                 for (const std::string &dtype : logicalValue->leafDtypes)
                     logicalDtypes.push_back(dtype);
@@ -1335,7 +1332,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     mlir::vernon::getBackendInterfaceAbiPlan(
                         resultType, module, mlir::vernon::PhysicalAbiProfile::HostValue, logicalDtypes);
                 mlir::FailureOr<InterfaceExtent> cpuLayout =
-                    physicalLayout(resultType, mlir::vernon::PhysicalAbiProfile::HostValue);
+                    physicalLayout(resultType, mlir::vernon::PhysicalAbiProfile::HostValue, logicalDtypes);
                 if (mlir::succeeded(cpuPlan) && mlir::succeeded(cpuLayout)) {
                     resultSize = llvm::alignTo(resultSize, cpuLayout->alignment);
                     llvm::json::Object reflected = reflectPhysicalPlan(*cpuPlan, "host_value");
@@ -1490,11 +1487,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
     llvm::json::Object root;
     root["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
     root["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
-    if (logical.compilerContractVersion != VERNON_COMPILER_CONTRACT_VERSION) {
-        module.emitError("cannot reflect a logical model with an unsupported compiler contract version");
-        return mlir::failure();
-    }
     root["entries"] = std::move(entries);
+    mlir::FailureOr<std::optional<ProgramReflection>> programReflection = buildProgramReflection(module);
+    if (mlir::failed(programReflection))
+        return mlir::failure();
+    if (*programReflection) {
+        root["execution"] = std::move((*programReflection)->execution);
+        root["kernel_compile_requests"] = std::move((*programReflection)->kernelCompileRequests);
+    }
     root["artifacts"] = llvm::json::Array();
     llvm::json::Array reflectedStructs;
     for (const LogicalStructLayout &planned : logical.structLayouts) {

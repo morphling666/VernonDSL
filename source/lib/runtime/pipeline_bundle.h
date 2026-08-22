@@ -40,11 +40,26 @@ enum class ArtifactResolution {
     MetadataOnly,
 };
 
+struct NativeResourceSlot {
+    std::string entry;
+    std::string stage;
+    std::string kind;
+    std::string name;
+    uint32_t set{};
+    uint32_t binding{};
+    uint32_t argumentBufferIndex{UINT32_MAX};
+    uint32_t memberId{UINT32_MAX};
+    uint32_t directBufferIndex{UINT32_MAX};
+    uint32_t count{1};
+};
+
 struct Stage {
     std::string stage;
     std::string entry;
     std::string source;
     std::string reflection;
+    std::optional<ReflectedEntry> reflected;
+    std::vector<NativeResourceSlot> nativeSlots;
     std::vector<uint8_t> binary;
     std::optional<CpuNativeArtifact> cpuArtifact;
     uint32_t workgroup[3]{1, 1, 1};

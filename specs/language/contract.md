@@ -39,6 +39,8 @@ semantics.
 
 `bool`, `i32`, `u32`, `f16`, `f32`, and `f64` are scalar Values. Python `int`
 and `float` are annotation and explicit-cast aliases for `i32` and `f32`.
+Language `u32` is ABI metadata; MLIR storage is signless `i32`. See
+[compiler design](../compiler/design.md#mlir-storage-vs-language-abi-dtype).
 
 Integer and floating literals remain contextual until constraints are solved.
 Unconstrained literals default to `i32` and `f32`. Safe implicit conversions

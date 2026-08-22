@@ -21,7 +21,7 @@ bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, Ve
     auto state = std::make_unique<CpuPipelineState>();
     CpuKernelState kernel;
     ReflectedEntry reflection;
-    if (!loadCpuNativeArtifact(*bundle.stages.at(variant.compute).cpuArtifact, kernel, reflection,
+    if (!loadCpuNativeArtifact(*bundle.context, *bundle.stages.at(variant.compute).cpuArtifact, kernel, reflection,
                                invocationDiagnostic(*bundle.context)) ||
         !prepareCpuComputePipeline(*bundle.context, std::move(kernel), std::move(reflection), *state))
         return false;

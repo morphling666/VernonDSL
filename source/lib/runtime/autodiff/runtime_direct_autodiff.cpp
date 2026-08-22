@@ -84,7 +84,11 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
         }
         if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
             return nullptr;
-        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable), derivativeGroups};
+        if (!pipeline->topology) {
+            invocationDiagnostic(context) = "direct CPU pipeline has no normalized execution topology";
+            return nullptr;
+        }
+        pipeline->topology->differentiated = VernonDifferentiatedPipeline{std::move(executable), derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {
@@ -143,7 +147,11 @@ VernonLoadedPipeline *loadBackendGpuAutodiffPipeline(
         }
         if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
             return nullptr;
-        pipeline->autodiff = VernonLoadedAutodiff{std::move(executable), derivativeGroups};
+        if (!pipeline->topology) {
+            invocationDiagnostic(context) = "direct GPU pipeline has no normalized execution topology";
+            return nullptr;
+        }
+        pipeline->topology->differentiated = VernonDifferentiatedPipeline{std::move(executable), derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {

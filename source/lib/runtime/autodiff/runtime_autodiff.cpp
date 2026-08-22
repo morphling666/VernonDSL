@@ -1,6 +1,7 @@
 #include "runtime_autodiff_internal.h"
 
 #include "host_tape_allocator.h"
+#include "runtime/pipeline_metadata.h"
 #include "runtime/runtime_state.h"
 #include "runtime_direct_autodiff.h"
 
@@ -13,6 +14,20 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+namespace {
+
+VernonDifferentiatedPipeline *differentiatedPipeline(VernonLoadedPipeline *pipeline) {
+    return pipeline && pipeline->topology && pipeline->topology->differentiated ? &*pipeline->topology->differentiated
+                                                                                : nullptr;
+}
+
+const VernonDifferentiatedPipeline *differentiatedPipeline(const VernonLoadedPipeline *pipeline) {
+    return pipeline && pipeline->topology && pipeline->topology->differentiated ? &*pipeline->topology->differentiated
+                                                                                : nullptr;
+}
+
+} // namespace
 
 namespace vernon::runtime::ad {
 
@@ -32,6 +47,54 @@ size_t dtypeSize(VernonDataType dtype) {
     default:
         return 0;
     }
+}
+
+bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
+                             std::string &error) {
+    const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+    if (layout.leaves.empty())
+        return error = "autodiff parameter has no canonical Value layout", false;
+    size_t elementCount = 1;
+    bool dynamicShape = false;
+    for (uint64_t extent : parameter.shape) {
+        if (!extent) {
+            dynamicShape = true;
+            continue;
+        }
+        if (elementCount > std::numeric_limits<size_t>::max() / static_cast<size_t>(extent))
+            return error = "autodiff parameter shape overflows", false;
+        elementCount *= static_cast<size_t>(extent);
+    }
+    for (const ValueLeaf &leaf : layout.leaves) {
+        const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
+        size_t bytes = dtype ? dtypeSize(*dtype) : 0;
+        if (!bytes || !leaf.scalarCount ||
+            bytes > std::numeric_limits<size_t>::max() / static_cast<size_t>(leaf.scalarCount))
+            return error = "autodiff parameter leaf ABI is invalid", false;
+        bytes *= static_cast<size_t>(leaf.scalarCount);
+        if (!dynamicShape) {
+            if (elementCount && bytes > std::numeric_limits<size_t>::max() / elementCount)
+                return error = "autodiff parameter leaf byte size overflows", false;
+            bytes *= elementCount;
+        }
+        std::string path = rootPath;
+        for (const ValuePathComponent &component : leaf.path) {
+            path.push_back('.');
+            path += component.field ? *component.field : std::to_string(component.index);
+        }
+        std::vector<uint64_t> shape = parameter.shape;
+        shape.insert(shape.end(), leaf.shape.begin(), leaf.shape.end());
+        ValueAbi candidate{std::move(path), *dtype, bytes, std::max<size_t>(layout.alignment, 1), std::move(shape)};
+        const auto existing = std::find_if(values.begin(), values.end(),
+                                           [&](const ValueAbi &value) { return value.path == candidate.path; });
+        if (existing != values.end()) {
+            if (!sameValueAbi(*existing, candidate))
+                return error = "autodiff parameters define conflicting ABI values for '" + candidate.path + "'", false;
+        } else {
+            values.push_back(std::move(candidate));
+        }
+    }
+    return true;
 }
 
 bool validLaunchSize(VernonLaunchSize grid) { return grid.x != 0 && grid.y != 0 && grid.z != 0; }
@@ -167,7 +230,7 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profiles,
                              VernonLoadedPipeline &pipeline) {
-    if (!bundle.context || !bundle.autodiff)
+    if (!bundle.context || !bundle.autodiff || !pipeline.topology)
         return false;
     const Stage &primal = bundle.stages.at(profiles.primal);
     const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
@@ -188,7 +251,8 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
                                                   executable->signature()))
         return false;
-    pipeline.autodiff = VernonLoadedAutodiff{std::move(executable), bundle.autodiff->derivativeGroups};
+    pipeline.topology->differentiated =
+        VernonDifferentiatedPipeline{std::move(executable), bundle.autodiff->derivativeGroups};
     return true;
 }
 
@@ -198,7 +262,8 @@ VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
                                                execution::detail::RhiCommandExecutionPlan &plan,
                                                VernonPullback *&pullback) {
     pullback = nullptr;
-    auto *executable = pipeline.autodiff ? pipeline.autodiff->executable.get() : nullptr;
+    const auto *differentiated = differentiatedPipeline(&pipeline);
+    auto *executable = differentiated ? differentiated->executable.get() : nullptr;
     if (!executable || invocation.struct_size < sizeof(VernonPipelineInvocation) ||
         invocation.abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation.compute_grid) ||
         (invocation.argument_count && !invocation.arguments) || !validSet(&inputs, true)) {
@@ -236,7 +301,8 @@ VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
 }
 
 const vernon::runtime::ad::Executable *autodiffExecutable(const VernonLoadedPipeline *pipeline) {
-    return pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+    const auto *differentiated = differentiatedPipeline(pipeline);
+    return differentiated ? differentiated->executable.get() : nullptr;
 }
 
 bool validDeviceFootprint(const VernonAdDeviceValue &value) {
@@ -299,6 +365,15 @@ bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size
                  value.logicalShape.empty() ? nullptr : value.logicalShape.data(),
                  {}};
     return true;
+}
+
+const vernon::runtime::ExecutableProgram *programExecution(const VernonLoadedPipeline *pipeline) {
+    if (!pipeline || !pipeline->topology || !pipeline->topology->differentiated)
+        return nullptr;
+    const auto backward =
+        std::find_if(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
+                     [](const vernon::runtime::ProgramGraph &graph) { return graph.direction == "backward"; });
+    return backward == pipeline->topology->execution.graphs.end() ? nullptr : &pipeline->topology->execution;
 }
 
 } // namespace
@@ -364,7 +439,98 @@ VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *c
     return context ? context->rhiDevice : VernonRhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
+std::optional<size_t> vernon::runtime::ad::programAdParameterIndex(const VernonLoadedPipeline *pipeline,
+                                                                   VernonProgramAdBoundary boundary,
+                                                                   size_t boundaryIndex) {
+    const ExecutableProgram *execution = programExecution(pipeline);
+    if (!execution || boundary != VERNON_PROGRAM_AD_INPUT || boundaryIndex >= execution->adSignature.inputs.size())
+        return std::nullopt;
+    const uint32_t value = execution->adSignature.inputs[boundaryIndex].value;
+    if (value >= execution->values.size())
+        return std::nullopt;
+    const std::string &name = execution->values[value].name;
+    const auto parameter = std::find_if(pipeline->variant.parameters.begin(), pipeline->variant.parameters.end(),
+                                        [&](const Parameter &candidate) { return candidate.name == name; });
+    return parameter == pipeline->variant.parameters.end()
+               ? std::nullopt
+               : std::optional<size_t>(static_cast<size_t>(parameter - pipeline->variant.parameters.begin()));
+}
+
 extern "C" {
+
+uint8_t vernonRuntimeLoadedPipelineHasProgramAutodiff(const VernonLoadedPipeline *pipeline) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    return programExecution(pipeline) ? 1 : 0;
+}
+
+size_t vernonRuntimeLoadedPipelineGetProgramAdValueCount(const VernonLoadedPipeline *pipeline,
+                                                         VernonProgramAdBoundary boundary) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const vernon::runtime::ExecutableProgram *execution = programExecution(pipeline);
+    if (!execution)
+        return 0;
+    switch (boundary) {
+    case VERNON_PROGRAM_AD_INPUT:
+        return execution->adSignature.inputs.size();
+    case VERNON_PROGRAM_AD_OUTPUT:
+        return execution->adSignature.outputs.size();
+    case VERNON_PROGRAM_AD_COTANGENT:
+        return execution->adSignature.cotangents.size();
+    case VERNON_PROGRAM_AD_GRADIENT:
+        return execution->adSignature.gradients.size();
+    case VERNON_PROGRAM_AD_CAPTURE:
+        return execution->adSignature.captures.size();
+    default:
+        return 0;
+    }
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoadedPipeline *pipeline,
+                                                                 VernonProgramAdBoundary boundary, size_t index,
+                                                                 VernonProgramAdValueView *view) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const vernon::runtime::ExecutableProgram *execution = programExecution(pipeline);
+    if (!execution || !view || view->struct_size < sizeof(*view))
+        return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
+    const vernon::runtime::ProgramAdSignatureBinding *binding = nullptr;
+    uint32_t capture = UINT32_MAX;
+    switch (boundary) {
+    case VERNON_PROGRAM_AD_INPUT:
+        if (index < execution->adSignature.inputs.size())
+            binding = &execution->adSignature.inputs[index];
+        break;
+    case VERNON_PROGRAM_AD_OUTPUT:
+        if (index < execution->adSignature.outputs.size())
+            binding = &execution->adSignature.outputs[index];
+        break;
+    case VERNON_PROGRAM_AD_COTANGENT:
+        if (index < execution->adSignature.cotangents.size())
+            binding = &execution->adSignature.cotangents[index];
+        break;
+    case VERNON_PROGRAM_AD_GRADIENT:
+        if (index < execution->adSignature.gradients.size())
+            binding = &execution->adSignature.gradients[index];
+        break;
+    case VERNON_PROGRAM_AD_CAPTURE:
+        if (index < execution->adSignature.captures.size())
+            capture = execution->adSignature.captures[index];
+        break;
+    default:
+        break;
+    }
+    const uint32_t valueId = binding ? binding->value : capture;
+    if (valueId >= execution->values.size())
+        return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
+    const vernon::runtime::ProgramValueSlot &slot = execution->values[valueId];
+    const std::string &path = binding ? binding->path : slot.name;
+    *view = {sizeof(*view),
+             {path.data(), path.size()},
+             valueId,
+             static_cast<uint8_t>(slot.external),
+             static_cast<uint8_t>(slot.output),
+             {}};
+    return VERNON_STATUS_OK;
+}
 
 size_t vernonRuntimeLoadedPipelineGetAdOutputCount(const VernonLoadedPipeline *pipeline) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
@@ -413,17 +579,19 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdGradientByIndex(const VernonLoadedP
 
 size_t vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(const VernonLoadedPipeline *pipeline) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    return pipeline && pipeline->autodiff ? pipeline->autodiff->derivativeGroups.size() : 0;
+    const auto *differentiated = differentiatedPipeline(pipeline);
+    return differentiated ? differentiated->derivativeGroups.size() : 0;
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(const VernonLoadedPipeline *pipeline,
                                                                     size_t groupIndex,
                                                                     VernonAdDerivativeGroupView *view) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !pipeline->autodiff || !view || view->struct_size < sizeof(*view) ||
-        groupIndex >= pipeline->autodiff->derivativeGroups.size())
+    const auto *differentiated = differentiatedPipeline(pipeline);
+    if (!differentiated || !view || view->struct_size < sizeof(*view) ||
+        groupIndex >= differentiated->derivativeGroups.size())
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group query");
-    const vernon::runtime::AutodiffDerivativeGroup &group = pipeline->autodiff->derivativeGroups[groupIndex];
+    const vernon::runtime::AutodiffDerivativeGroup &group = differentiated->derivativeGroups[groupIndex];
     *view = {sizeof(*view),
              group.role == vernon::runtime::AutodiffDerivativeRole::Gradient ? VERNON_AD_DERIVATIVE_GRADIENT
                                                                              : VERNON_AD_DERIVATIVE_COTANGENT,
@@ -437,10 +605,11 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(const VernonLoa
                                                                  size_t groupIndex, size_t leafIndex,
                                                                  VernonStringView *leafPath) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !pipeline->autodiff || !leafPath || groupIndex >= pipeline->autodiff->derivativeGroups.size()) {
+    const auto *differentiated = differentiatedPipeline(pipeline);
+    if (!differentiated || !leafPath || groupIndex >= differentiated->derivativeGroups.size()) {
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group leaf query");
     }
-    const vernon::runtime::AutodiffDerivativeGroup &group = pipeline->autodiff->derivativeGroups[groupIndex];
+    const vernon::runtime::AutodiffDerivativeGroup &group = differentiated->derivativeGroups[groupIndex];
     if (leafIndex >= group.leafPaths.size())
         return fail(pipeline->context, "invalid autodiff derivative group leaf query");
     const std::string &path = group.leafPaths[leafIndex];
@@ -456,7 +625,8 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
         vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
         if (pullback)
             *pullback = nullptr;
-        auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+        const auto *differentiated = differentiatedPipeline(pipeline);
+        auto *executable = differentiated ? differentiated->executable.get() : nullptr;
         if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||
             !validSet(outputs, true))
             return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff forward invocation");
@@ -491,7 +661,8 @@ VernonStatus vernonAdPipelineEncodeForward(VernonRuntimeProviderObject encoder, 
         vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
         if (pullback)
             *pullback = nullptr;
-        auto *executable = pipeline && pipeline->autodiff ? pipeline->autodiff->executable.get() : nullptr;
+        const auto *differentiated = differentiatedPipeline(pipeline);
+        auto *executable = differentiated ? differentiated->executable.get() : nullptr;
         if (!pipeline || !pullback || !executable || !encoder.value || !invocation ||
             invocation->struct_size < sizeof(VernonPipelineInvocation) ||
             invocation->abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation->compute_grid) ||

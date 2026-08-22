@@ -108,7 +108,7 @@ LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, 
     if (!elementType.isF32())
         return emitError() << "current storage Texture formats require f32 shader elements";
     if (!llvm::is_contained(ArrayRef<StringRef>{"r8_unorm", "r16_float", "r32_float", "rg8_unorm", "rgba8_unorm",
-                                                "rgba16_float", "rgba32_float"},
+                                                "rgba16_float", "rgba32_float", "d32_float"},
                             format))
         return emitError() << "unsupported storage Texture format " << format;
     return success();

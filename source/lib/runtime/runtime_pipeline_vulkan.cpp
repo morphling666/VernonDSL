@@ -67,9 +67,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
     if (!variant.compute.empty()) {
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
-        const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_VULKAN,
-                                                      invocationDiagnostic(*bundle.context))) {
+        if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection, invocationDiagnostic(*bundle.context))) {
             delete state;
             return false;
         }
@@ -239,15 +237,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 }
                 return true;
             }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                use.transport == "storage_buffer" && parameter.elementLayout.byteSize && use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.binding = use.binding;
-                candidate.layout.set = use.descriptorSet;
-                candidate.binding.source = VulkanPipelineState::Binding::EXTERNAL_STORAGE;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t count = 1;
@@ -261,11 +251,14 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                 const size_t elementSize = dataTypeSize(*dtype);
                 if (!use.interfacePlan || !use.interfacePlan->root)
                     return false;
-                candidate.layout.kind = use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                          : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 const uint64_t physicalSize = use.interfacePlan->root->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
-                    (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX))
+                    ((candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                      candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) &&
+                     use.binding == UINT32_MAX))
                     return false;
                 candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
@@ -281,9 +274,15 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                                                     : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
                 const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
                 std::optional<TensorCopyPlan> packing =
-                    compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
-                if (!packing || packing->elementSize != elementSize)
+                    parameter.valueLayout
+                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
+                if (!packing || packing->elementSize != canonical.byteSize) {
+                    invocationDiagnostic(*bundle.context) =
+                        !packing ? "Vulkan graphics value packing is incompatible with the canonical layout"
+                                 : "Vulkan graphics value packing scalar size does not match its dtype";
                     return false;
+                }
                 candidate.binding.packing = std::move(*packing);
                 candidate.binding.storage.resize(candidate.layout.element_size);
             } else if (parameter.kind == "tensor" && use.interfaceKind == "input" && use.stage == "vertex" &&
@@ -333,8 +332,15 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     break;
                 }
         if (!supported) {
-            invocationDiagnostic(*bundle.context) =
-                "Vulkan RuntimeCore graphics path does not support this parameter layout";
+            std::string &diagnostic = invocationDiagnostic(*bundle.context);
+            if (diagnostic.empty())
+                diagnostic = "Vulkan RuntimeCore graphics path does not support this parameter layout";
+            for (const Parameter &parameter : variant.parameters)
+                for (const ParameterUse &use : parameter.uses)
+                    diagnostic += " [" + parameter.name + ": kind=" + parameter.kind +
+                                  ", interface=" + use.interfaceKind + ", stage=" + use.stage + ", dtype=" + use.dtype +
+                                  ", transport=" + use.transport +
+                                  ", plan=" + (use.interfacePlan && use.interfacePlan->root ? "yes" : "no") + "]";
             delete state;
             return false;
         }

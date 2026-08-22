@@ -1,7 +1,9 @@
 #include "VernonCpuWorkgroupABI.h"
+#include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/content_hash.h"
+#include "runtime/runtime_dispatch.h"
 #include "runtime_rhi_test_utils.h"
-#include "vernon-c/Runtime.h"
 
 #include <nlohmann/json.hpp>
 
@@ -263,6 +265,11 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
+    ASSERT_NE(pipeline->topology, nullptr);
+    EXPECT_TRUE(pipeline->topology->directDispatch);
+    ASSERT_EQ(pipeline->topology->execution.graphs.size(), 1u);
+    EXPECT_EQ(pipeline->topology->execution.graphs.front().direction, "forward");
+    EXPECT_FALSE(pipeline->topology->differentiated.has_value());
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
@@ -305,6 +312,44 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(output[0] == 0.0f && output[3] == 3.0f);
     ASSERT_TRUE(output[4] == 10.0f && output[15] == 113.0f);
 
+    nlohmann::json explicitTopologyBundle = nlohmann::json::parse(bundle);
+    explicitTopologyBundle["variants"][0]["execution"] = {
+        {"values", nlohmann::json::array({{{"id", 0},
+                                           {"name", "output"},
+                                           {"type", "!vernon.tensor_view<f32, [16], \"write\", \"device\">"},
+                                           {"dtype", "f32"},
+                                           {"shape", {16}},
+                                           {"external", true},
+                                           {"output", true}}})},
+        {"graphs", nlohmann::json::array(
+                       {{{"name", "forward"},
+                         {"direction", "forward"},
+                         {"arguments", {0}},
+                         {"results", {0}},
+                         {"nodes", nlohmann::json::array(
+                                       {{{"id", 0},
+                                         {"name", "fill"},
+                                         {"kind", "compute"},
+                                         {"stage", "compute"},
+                                         {"operands", {0}},
+                                         {"results", nlohmann::json::array()},
+                                         {"dependencies", nlohmann::json::array()},
+                                         {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 0}}})},
+                                         {"resources", nlohmann::json::array({{{"value", 0}, {"access", "write"}}})},
+                                         {"grid", {1, 1, 1}}}})}}})}};
+    VernonPipelineBundle *explicitTopologyLoaded =
+        loadWithDirectory(runtime, withContentHash(explicitTopologyBundle), directoryUtf8);
+    ASSERT_NE(explicitTopologyLoaded, nullptr);
+    VernonLoadedPipeline *explicitTopology = vernonRuntimeResolvePipeline(explicitTopologyLoaded, {nullptr, 0});
+    ASSERT_NE(explicitTopology, nullptr);
+    ASSERT_NE(explicitTopology->topology, nullptr);
+    EXPECT_TRUE(explicitTopology->topology->directDispatch);
+    std::fill(std::begin(output), std::end(output), -1.0f);
+    invocation.compute_grid = {2, 1, 2};
+    ASSERT_EQ(vernon::tests::completeSubmission(explicitTopology, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(output[0], 0.0f);
+    EXPECT_EQ(output[15], 113.0f);
+
     nlohmann::json constantWriteBundle = nlohmann::json::parse(bundle);
     nlohmann::json &constantEntry = constantWriteBundle["stage_artifacts"]["fill"]["reflection"]["entries"][0];
     constantEntry["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}}, {"requires_unit_workgroup", true}};
@@ -323,9 +368,292 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     vernonRuntimeLoadedPipelineDestroy(constantPipeline);
     vernonRuntimePipelineBundleDestroy(constantLoaded);
+    vernonRuntimeLoadedPipelineDestroy(explicitTopology);
+    vernonRuntimePipelineBundleDestroy(explicitTopologyLoaded);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+}
+
+TEST(RuntimeCpuPipeline, MaterializesExecutableProgramIntoExecutionGraph) {
+    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
+    const std::string directoryUtf8 = directory.u8string();
+    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.pipeline.json"));
+    nlohmann::json &variant = bundle["variants"][0];
+    variant["program"] = {{"forward:0", "fill"}, {"forward:1", "fill"}};
+    nlohmann::json internal = variant["parameters"][0];
+    internal.erase("slot");
+    internal["name"] = "temporary";
+    internal["source"] = "program_value";
+    internal["uses"][0]["stage"] = "forward:0";
+    variant["internal_parameters"] = nlohmann::json::array({std::move(internal)});
+    variant["parameters"][0]["uses"][0]["stage"] = "forward:1";
+    variant["execution"] = {
+        {"values", nlohmann::json::array({{{"id", 0},
+                                           {"name", "temporary"},
+                                           {"type", "tensor<16xf32>"},
+                                           {"dtype", "f32"},
+                                           {"shape", {16}},
+                                           {"external", false},
+                                           {"output", false}},
+                                          {{"id", 1},
+                                           {"name", "output"},
+                                           {"type", "tensor<16xf32>"},
+                                           {"dtype", "f32"},
+                                           {"shape", {16}},
+                                           {"external", true},
+                                           {"output", true}}})},
+        {"graphs",
+         nlohmann::json::array(
+             {{{"name", "forward"},
+               {"direction", "forward"},
+               {"arguments", nlohmann::json::array()},
+               {"results", {1}},
+               {"nodes", nlohmann::json::array(
+                             {{{"id", 0},
+                               {"name", "fill temporary"},
+                               {"kind", "compute"},
+                               {"stage", "forward:0"},
+                               {"operands", nlohmann::json::array()},
+                               {"results", {0}},
+                               {"dependencies", nlohmann::json::array()},
+                               {"bindings", nlohmann::json::array({{{"parameter", "temporary"}, {"value", 0}}})},
+                               {"resources", nlohmann::json::array({{{"value", 0}, {"access", "write"}}})},
+                               {"grid", {2, 1, 2}}},
+                              {{"id", 1},
+                               {"name", "fill output"},
+                               {"kind", "compute"},
+                               {"stage", "forward:1"},
+                               {"operands", nlohmann::json::array()},
+                               {"results", {1}},
+                               {"dependencies", {0}},
+                               {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 1}}})},
+                               {"resources", nlohmann::json::array({{{"value", 1}, {"access", "write"}}})},
+                               {"grid", {2, 1, 2}}}})}}})}};
+
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    VernonPipelineBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
+    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
+    ASSERT_NE(loaded, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
+    ASSERT_NE(pipeline, nullptr) << std::string(resolveError.data ? resolveError.data : "", resolveError.size);
+    ASSERT_NE(pipeline->topology, nullptr);
+    EXPECT_FALSE(pipeline->topology->directDispatch);
+    EXPECT_EQ(pipeline->topology->stages.size(), 2u);
+
+    VernonPipelineParameterView parameter{};
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter), VERNON_STATUS_OK);
+    float output[16]{};
+    const uint64_t shape[] = {16};
+    const int64_t strides[] = {sizeof(float)};
+    VernonPipelineArgument argument{};
+    argument.slot = parameter.slot;
+    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = output;
+    argument.tensor.element_layout = parameter.element_layout;
+    argument.tensor.access = VERNON_ACCESS_WRITE;
+    argument.tensor.rank = 1;
+    argument.tensor.shape = shape;
+    argument.tensor.byte_strides = strides;
+    argument.tensor.byte_size = sizeof(output);
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.arguments = &argument;
+    invocation.argument_count = 1;
+    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
+    EXPECT_EQ(output[0], 0.0f);
+    EXPECT_EQ(output[3], 3.0f);
+    EXPECT_EQ(output[4], 10.0f);
+    EXPECT_EQ(output[15], 113.0f);
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimePipelineBundleDestroy(loaded);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
+    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
+    const std::string directoryUtf8 = directory.u8string();
+    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.pipeline.json"));
+    nlohmann::json &variant = bundle["variants"][0];
+    nlohmann::json gradient = variant["parameters"][0];
+    gradient["slot"] = 1;
+    gradient["name"] = "gradient";
+    gradient["uses"][0]["stage"] = "backward:0";
+    nlohmann::json residual = variant["parameters"][0];
+    residual["slot"] = 2;
+    residual["name"] = "residual";
+    residual["uses"][0]["stage"] = "forward:residual";
+    variant["parameters"][0]["uses"][0]["stage"] = "forward:0";
+    nlohmann::json captureUse = variant["parameters"][0]["uses"][0];
+    captureUse["stage"] = "backward:capture_output";
+    variant["parameters"][0]["uses"].push_back(std::move(captureUse));
+    nlohmann::json residualCaptureUse = residual["uses"][0];
+    residualCaptureUse["stage"] = "backward:capture_residual";
+    residual["uses"].push_back(std::move(residualCaptureUse));
+    variant["parameters"].push_back(std::move(gradient));
+    variant["parameters"].push_back(std::move(residual));
+    variant["program"] = {{"forward:residual", "fill"},
+                          {"forward:0", "fill"},
+                          {"backward:capture_output", "fill"},
+                          {"backward:capture_residual", "fill"},
+                          {"backward:0", "fill"}};
+    const auto value = [](uint32_t id, const char *name) {
+        return nlohmann::json{{"id", id},       {"name", name},  {"type", "tensor<16xf32>"},
+                              {"dtype", "f32"}, {"shape", {16}}, {"external", true},
+                              {"output", true}};
+    };
+    const auto node = [](uint32_t id, const char *name, const char *stage, uint32_t result, const char *parameter,
+                         nlohmann::json dependencies) {
+        return nlohmann::json{{"id", id},
+                              {"name", name},
+                              {"kind", "compute"},
+                              {"stage", stage},
+                              {"operands", nlohmann::json::array()},
+                              {"results", {result}},
+                              {"dependencies", std::move(dependencies)},
+                              {"bindings", nlohmann::json::array({{{"parameter", parameter}, {"value", result}}})},
+                              {"resources", nlohmann::json::array({{{"value", result}, {"access", "write"}}})},
+                              {"grid", {2, 1, 2}}};
+    };
+    variant["execution"] = {
+        {"values", nlohmann::json::array({value(0, "output"), value(1, "gradient"), value(2, "residual")})},
+        {"graphs",
+         nlohmann::json::array(
+             {{{"name", "forward"},
+               {"direction", "forward"},
+               {"arguments", nlohmann::json::array()},
+               {"results", {0}},
+               {"nodes", nlohmann::json::array(
+                             {node(0, "fill residual", "forward:residual", 2, "residual", nlohmann::json::array()),
+                              node(1, "fill output", "forward:0", 0, "output", {0})})}},
+              {{"name", "backward"},
+               {"direction", "backward"},
+               {"arguments", nlohmann::json::array()},
+               {"results", {1}},
+               {"nodes", nlohmann::json::array(
+                             {{{"id", 0},
+                               {"name", "consume output capture"},
+                               {"kind", "compute"},
+                               {"stage", "backward:capture_output"},
+                               {"operands", {0}},
+                               {"results", nlohmann::json::array()},
+                               {"dependencies", nlohmann::json::array()},
+                               {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 0}}})},
+                               {"resources", nlohmann::json::array({{{"value", 0}, {"access", "read_write"}}})},
+                               {"grid", {2, 1, 2}}},
+                              {{"id", 1},
+                               {"name", "consume residual capture"},
+                               {"kind", "compute"},
+                               {"stage", "backward:capture_residual"},
+                               {"operands", {2}},
+                               {"results", nlohmann::json::array()},
+                               {"dependencies", {0}},
+                               {"bindings", nlohmann::json::array({{{"parameter", "residual"}, {"value", 2}}})},
+                               {"resources", nlohmann::json::array({{{"value", 2}, {"access", "read_write"}}})},
+                               {"grid", {2, 1, 2}}},
+                              {{"id", 2},
+                               {"name", "fill gradient"},
+                               {"kind", "compute"},
+                               {"stage", "backward:0"},
+                               {"operands", nlohmann::json::array()},
+                               {"results", {1}},
+                               {"dependencies", {1}},
+                               {"bindings", nlohmann::json::array({{{"parameter", "gradient"}, {"value", 1}}})},
+                               {"resources", nlohmann::json::array({{{"value", 1}, {"access", "write"}}})},
+                               {"grid", {2, 1, 2}}}})}}})}};
+
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    VernonPipelineBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
+    ASSERT_NE(loaded, nullptr);
+    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    const VernonStringView error = vernonRuntimeGetLastError(runtime);
+    ASSERT_NE(pipeline, nullptr) << std::string(error.data ? error.data : "", error.size);
+    ASSERT_TRUE(vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline));
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_INPUT), 0u);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_OUTPUT), 1u);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_COTANGENT), 0u);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_GRADIENT), 1u);
+    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_CAPTURE), 2u);
+    VernonProgramAdValueView reflectedGradient{};
+    reflectedGradient.struct_size = sizeof(reflectedGradient);
+    ASSERT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(pipeline, VERNON_PROGRAM_AD_GRADIENT, 0,
+                                                                  &reflectedGradient),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(std::string(reflectedGradient.path.data, reflectedGradient.path.size), "gradient");
+    EXPECT_EQ(reflectedGradient.value_id, 1u);
+    ASSERT_NE(pipeline->topology, nullptr);
+    ASSERT_EQ(pipeline->topology->stages.size(), 5u);
+    EXPECT_EQ(pipeline->topology->residualValues, std::vector<uint32_t>({0, 2}));
+    const auto backward =
+        std::find_if(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
+                     [](const vernon::runtime::ProgramGraph &graph) { return graph.direction == "backward"; });
+    ASSERT_NE(backward, pipeline->topology->execution.graphs.end());
+
+    float output[16]{};
+    float gradients[16]{};
+    float residualStorage[16]{};
+    const uint64_t shape[] = {16};
+    const int64_t strides[] = {sizeof(float)};
+    std::vector<VernonPipelineArgument> values(3);
+    for (auto [index, storage] : {std::pair{0u, output}, std::pair{1u, gradients}, std::pair{2u, residualStorage}}) {
+        VernonPipelineParameterView parameter{};
+        ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &parameter), VERNON_STATUS_OK);
+        VernonPipelineArgument &argument = values[index];
+        argument.slot = index;
+        argument.kind = VERNON_PIPELINE_TENSOR;
+        argument.tensor.struct_size = sizeof(VernonTensorView);
+        argument.tensor.storage = VERNON_TENSOR_HOST;
+        argument.tensor.host_data = storage;
+        argument.tensor.element_layout = parameter.element_layout;
+        argument.tensor.access = VERNON_ACCESS_WRITE;
+        argument.tensor.rank = 1;
+        argument.tensor.shape = shape;
+        argument.tensor.byte_strides = strides;
+        argument.tensor.byte_size = sizeof(output);
+    }
+    ASSERT_EQ(vernon::runtime::executePipelineProgramGraph(*pipeline, *backward, values), VERNON_STATUS_OK);
+    EXPECT_EQ(gradients[0], 0.0f);
+    EXPECT_EQ(gradients[15], 113.0f);
+
+    std::fill(std::begin(output), std::end(output), -1.0f);
+    pipeline->context->autodiffMemoryPolicy =
+        std::make_shared<vernon::runtime::ad::AutodiffMemoryPolicy>(sizeof(output), sizeof(output));
+    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output, sizeof(output), 1, shape};
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK);
+    ASSERT_NE(pullback, nullptr);
+    EXPECT_EQ(output[15], 113.0f);
+    const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
+    EXPECT_EQ(memory.logicalResidualBytes, 2 * sizeof(output));
+    EXPECT_EQ(memory.residentBytes, sizeof(output));
+
+    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    std::fill(std::begin(gradients), std::end(gradients), -1.0f);
+    VernonAdValue gradientValue{
+        sizeof(VernonAdValue), {"gradient", 8}, VERNON_DATA_F32, gradients, sizeof(gradients), 1, shape};
+    VernonAdValueSet gradientSet{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
+    const VernonPullbackApplyOptions noTemporaryMemory{
+        sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, 0, {}};
+    ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, nullptr, &gradientSet, &noTemporaryMemory),
+              VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(gradients[15], -1.0f);
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradientSet), VERNON_STATUS_OK);
+    EXPECT_EQ(gradients[15], 113.0f);
+    std::fill(std::begin(gradients), std::end(gradients), -1.0f);
+    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradientSet), VERNON_STATUS_OK);
+    EXPECT_EQ(gradients[15], 113.0f);
+    vernonPullbackDestroy(pullback);
+    vernonRuntimePipelineBundleDestroy(loaded);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 #endif
 

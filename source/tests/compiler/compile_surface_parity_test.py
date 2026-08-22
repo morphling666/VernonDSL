@@ -179,17 +179,6 @@ def _artifact_bytes(bundle: dict[str, object], stage_id: str, root: Path | None 
     return artifact["data"].encode("utf-8")
 
 
-def _logical_stage(bundle: dict[str, object], stage_id: str) -> dict[str, object]:
-    stage = dict(bundle["stage_artifacts"][stage_id])  # type: ignore[index]
-    artifact = stage["artifact"]  # type: ignore[index]
-    stage["artifact"] = {
-        "format": artifact["format"],
-        "size": artifact["size"],
-        "sha256": artifact["sha256"],
-    }
-    return stage
-
-
 def _assert_content_hash(test: unittest.TestCase, bundle: dict[str, object]) -> None:
     unhashed = dict(bundle)
     digest = unhashed.pop("content_hash")
@@ -302,15 +291,25 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
                 class PipelineCapture:
                     def __init__(self) -> None:
-                        self.bundles: list[tuple[bytes, tuple[str, ...]]] = []
+                        self.loads: list[tuple[bytes, bytes]] = []
 
-                    def load_pipeline(self, data: bytes, features: list[str]) -> object:
-                        self.bundles.append((bytes(data), tuple(features)))
+                    def load_canonical_program(
+                        self,
+                        program: bytes,
+                        artifacts: bytes,
+                        directory: str,
+                        stage_bindings: object,
+                        compiled_stages: object,
+                    ) -> object:
+                        del directory, stage_bindings, compiled_stages
+                        self.loads.append((bytes(program), bytes(artifacts)))
                         return object()
 
                 capture = PipelineCapture()
                 runtime_module.Pipeline._cache.clear()
                 pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
+                position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
+                target = vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(16, 16)))
                 with mock.patch.multiple(
                     runtime_module,
                     _architecture=architecture,
@@ -318,12 +317,15 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     _api_version=api_version,
                     _runtime_generation=101,
                 ):
-                    compiled = pipeline._compile({})
-                    repeated = pipeline._compile({})
+                    compiled = pipeline._compile({"position": position}, target)
+                    repeated = pipeline._compile({"position": position}, target)
                 self.assertIs(compiled, repeated)
                 self.assertEqual(pipeline.compile_count, 1)
-                interactive = json.loads(compiled.bundle)
-                self.assertEqual(capture.bundles, [(compiled.bundle, ("OFFSET",))])
+                self.assertEqual(compiled.bundle, b"")
+                self.assertTrue(compiled.canonical_program)
+                self.assertTrue(compiled.canonical_artifact_system)
+                self.assertEqual(capture.loads, [(compiled.canonical_program, compiled.canonical_artifact_system)])
+                interactive_artifacts = json.loads(compiled.canonical_artifact_system)
 
                 compile_calls = 0
 
@@ -375,34 +377,21 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
                 self.assertNotIn("features", cooked)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
-                interactive_variant = interactive["variants"][0]
-                self.assertEqual(interactive_variant["key"], ["OFFSET"])
-                self.assertEqual(interactive_variant["parameters"], selected["parameters"])
-                self.assertEqual(interactive_variant["outputs"], selected["outputs"])
-                self.assertEqual(interactive_variant["program"], selected["program"])
                 self.assertEqual(
                     [(row["name"], row["slot"], row["kind"]) for row in selected["parameters"]],
                     [(row["name"], row["slot"], row["kind"]) for row in GOLDEN["graphics"]["parameters"]],
                 )
                 self.assertEqual(selected["outputs"], GOLDEN["graphics"]["outputs"])
                 program = selected["program"]
-                interactive_program = interactive_variant["program"]
-                self.assertEqual(program, interactive_program)
+                cooked_digests = []
                 for stage_name in ("vertex", "fragment"):
                     stage_id = program[stage_name]
-                    self.assertEqual(
-                        _logical_stage(cooked, stage_id),
-                        _logical_stage(interactive, stage_id),
-                    )
                     cooked_bytes = _artifact_bytes(cooked, stage_id, cooked_dir)
-                    interactive_bytes = _artifact_bytes(interactive, stage_id)
-                    self.assertEqual(cooked_bytes, interactive_bytes)
-                    self.assertEqual(
-                        hashlib.sha256(cooked_bytes).hexdigest(),
-                        cooked["stage_artifacts"][stage_id]["artifact"]["sha256"],
-                    )
+                    digest = hashlib.sha256(cooked_bytes).hexdigest()
+                    self.assertEqual(digest, cooked["stage_artifacts"][stage_id]["artifact"]["sha256"])
+                    cooked_digests.append(digest)
+                self.assertEqual(sorted(interactive_artifacts["blobs"]), sorted(cooked_digests))
                 _assert_content_hash(self, cooked)
-                _assert_content_hash(self, interactive)
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)

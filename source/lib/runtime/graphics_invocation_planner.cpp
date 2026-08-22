@@ -167,8 +167,9 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             return fail(error, "pipeline argument kind does not match layout");
         const VernonPipelineArgument &argument = *found->second;
         if (argument.kind == VERNON_PIPELINE_TENSOR) {
-            const ValueLayout &expectedLayout =
-                parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+            const ValueLayout &expectedLayout = !parameter.elementLayout.leaves.empty() ? parameter.elementLayout
+                                                : parameter.valueLayout                 ? *parameter.valueLayout
+                                                                                        : parameter.elementLayout;
             if (!valueLayoutsEqual(argument.tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
                 !validTensor(argument.tensor))
                 return fail(error, "pipeline Tensor argument does not match layout");

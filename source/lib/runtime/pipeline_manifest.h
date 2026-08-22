@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "autodiff/autodiff_metadata.h"
+#include "program_manifest.h"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -186,6 +187,7 @@ struct Variant {
     std::vector<Parameter> internalParameters;
     std::vector<Output> outputs;
     std::map<std::string, std::string> program;
+    std::optional<ExecutableProgram> executable;
     std::string compute;
     std::string vertex;
     std::string fragment;
@@ -222,6 +224,7 @@ std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &form
 
 bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
 bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);
+bool normalizeLegacySingleComputeExecution(const Variant &variant, ExecutableProgram &execution, std::string &error);
 bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);

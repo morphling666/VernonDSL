@@ -1,6 +1,10 @@
 add_subdirectory("${VERNON_SOURCE_DIR}/include/mlir/Dialect/Vernon"
                  "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Dialect/Vernon")
 add_subdirectory("${VERNON_SOURCE_DIR}/lib/Dialect/Vernon" "${CMAKE_CURRENT_BINARY_DIR}/lib/Dialect/Vernon")
+add_subdirectory("${VERNON_SOURCE_DIR}/include/mlir/Dialect/VernonProgram"
+                 "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Dialect/VernonProgram")
+add_subdirectory("${VERNON_SOURCE_DIR}/lib/Dialect/VernonProgram"
+                 "${CMAKE_CURRENT_BINARY_DIR}/lib/Dialect/VernonProgram")
 include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeDxc.cmake")
 
 add_library(
@@ -11,7 +15,11 @@ add_library(
     compiler_dispatch.cpp
     compiler_dxc.cpp
     compiler_frontend.cpp
+    compiler_graphics_bootstrap.cpp
     compiler_internal.cpp
+    compiler_kernel_bootstrap.cpp
+    compiler_program_finalization.cpp
+    compiler_program_reflection.cpp
     compiler_reflection.cpp
     compiler_spirv.cpp
     VernonCompiler.cpp
@@ -51,6 +59,8 @@ target_link_libraries(
             MLIRControlFlowToLLVM
             MLIRConvertToLLVMPass
             MLIRVernonDialect
+            MLIRVernonProgramDialect
+            MLIRVernonProgramTransforms
             MLIRVernonTransforms
             MLIRFuncDialect
             MLIRFuncToLLVM

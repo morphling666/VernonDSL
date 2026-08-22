@@ -107,7 +107,7 @@ provider adapter.
 `VernonOpenGLContextCallbacks` is the single context contract for Python and
 Engine owners; backend behavior never branches on context origin.
 
-## Vulkan graphics bundles
+## Vulkan graphics bundles (shipped pre-breaking format)
 
 The current `PIPELINE_VERSION` format stores each SPIR-V stage as a content-addressed
 external `.spv` artifact. The manifest records its relative path, byte size,
@@ -141,6 +141,11 @@ paired sampler binds instead of treating a `-1` location as a malformed
 artifact. D3D12 sampled depth uses an R32 typeless allocation with a D32 DSV
 and R32 float SRV; Vulkan and OpenGL use their native D32 sampled depth
 formats.
+
+This section records Pipeline 16 only. The coordinated Program release replaces
+the per-shader records with one graphics StageArtifact per Program node,
+containing ordered vertex and fragment modules as specified by
+`program_execution_manifest.md`.
 
 ## Python native module
 
@@ -211,9 +216,9 @@ default.
 
 Runtime implementation is separated by responsibility:
 `runtime_backend_dispatch` handles CPU contexts and borrowed RHI adapters,
-`runtime_pipeline_direct` adapts direct compute artifacts and CPU entries into
-synthetic compute pipelines, and `runtime_pipeline_dispatch` routes
-PipelineAsset resolution plus compute/graphics invocation. Pipeline
+the Program resolver validates artifact-system endpoints and constructs the
+immutable resolved Program, and Program dispatch routes all standalone and
+Module compute/graphics invocation. Pipeline
 preparation, destruction, and invocation live in the CPU, CUDA, Vulkan, D3D12,
 and OpenGL pipeline translation units; the dispatch file contains only backend
 routing. There is no Runtime Kernel handle or kernel
@@ -259,10 +264,14 @@ barriers for same-state write hazards.
 ExecutionGraph resource identity combines the owning graph with the RHI
 resource kind, slot, and generation. Re-importing one RHI image through
 different views shares one hazard identity while each attachment retains its
-view metadata. Render-pass fusion requires identical attachment geometry and
-read-only policy. An intermediate clear is encoded explicitly inside the
-scope; an intermediate discard, or preserve after a discarded store, splits
-the scope because retaining the attachment would change observable contents.
+view metadata. Render-pass fusion follows attachment continuity: compatible
+views and geometry, legal load/store/resolve transitions, and no intervening
+resource hazard. An intermediate clear is encoded explicitly inside the scope;
+an intermediate discard, preserve after a discarded store, or
+attachment-to-sampling hazard splits the scope because retaining the attachment
+would change observable contents. `RenderState` equality is not a fusion
+condition; compatible backends may change blend, depth/stencil, raster, write
+mask, or multisample state between draws in one native render pass.
 Culled passes never record encoder references, and failed compilation discards
 its partial schedule and scopes before any command encoder is created.
 
@@ -544,6 +553,10 @@ padded-row and sliced-batch layouts.
 
 ## Pipeline runtime boundary
 
+The following paragraphs record the shipped pre-breaking implementation only;
+they are not an alternate target architecture. The coordinated Program release
+removes these artifact shapes and handles rather than normalizing them.
+
 `VernonLoadedPipeline` is the only Runtime program handle. It represents either
 one compute stage or a validated tuple of graphics stages; compute and graphics
 entries are never combined in one pipeline. A persistent PipelineAsset resolves
@@ -579,15 +592,13 @@ render passes. Runtime pipeline invocations encode bindings and draw/dispatch
 commands into the graph-provided typed encoder; attachment ownership and clear
 policy remain outside Runtime.
 
-Graph VJP attaches logical names to differentiable `GraphResource` inputs,
-execution value parameters, and objective resources. `VjpComputePass` adapts a
-direct or cooked structured pipeline VJP: its forward execution records the
-existing Runtime pullback rather than reproducing pipeline tape logic.
-`CompiledExecutionGraph.vjp()`
-returns a pullback that retains the immutable plan, forward submission, primal
-resources, and pass tapes. Applying it traverses scheduled differentiable
-passes in reverse, materializes missing local cotangents as zero, and
-deterministically sums contributions by graph resource identity. An omitted
+Graph VJP composes resolved differentiated Programs. Each Program contributes
+its explicit forward graph, backward graph, residual contract, public
+cotangent/gradient boundary, and resource-version effects to the native
+ExecutionGraph planner. `CompiledExecutionGraph.vjp()` returns a pullback that
+retains the immutable resolved plans, forward submission, primal resources, and
+Program-owned residual state. Applying it schedules the declared backward
+graphs and deterministic fan-in by graph resource identity. An omitted
 cotangent is valid only for one scalar objective. Non-differentiable writes on
 an active reverse path are rejected explicitly.
 
@@ -602,12 +613,76 @@ runtime invalidates cached native handles. Within a generation, unchanged
 host data is not uploaded again, shader writes remain device-resident, and
 `to_numpy()` is the synchronization point that downloads device-dirty data.
 
-## Graphics invocation state
+## Target unified Program invocation
 
-Index buffers remain ordinary resident `u32` Tensors, but `indices` is a
-host-only draw argument and never enters a shader interface. Primitive topology
-is likewise host draw state so one specialized shader can render triangle,
-line, or point lists.
+This section defines the coordinated breaking Program architecture. Current
+contract numbers remain unchanged until that release. After it, Runtime does
+not load the shipped manifest/profile forms described above and has no
+compatibility normalizer.
+
+Standalone compute, standalone graphics, and Module inputs all produce one
+Program object and follow `ResolveProgram` then `ExecuteProgram`. Standalone
+inputs are one-node Programs. The object directly contains `stages`,
+`parameters`, `storages`, `values`, `graphs`, and `signature`; there is no
+profile manifest, name-binding table, direct topology, `structural_inputs`,
+`configure`, or `graphics_config` channel. The target Program graphs are static
+compute/graphics DAGs. Transfer nodes and deployment control-flow nodes are not
+accepted.
+Program `stages` are portable contracts. The enclosing cooked variant
+`stage_bindings` selects target StageArtifacts; native API binding locations
+are derived by the backend and never serialized in Program reflection.
+
+Compute and graphics nodes use one resolved endpoint-binding path. Source and
+Program IR may expose typed
+`RenderTarget`, `Attachment`, and `RenderState` builtins, but final manifest
+normalization removes those aggregates and records only:
+
+```text
+graphics node
+  attachments
+  state
+  draw
+```
+
+An `Attachment` owns its image view/use, `load` (`load`, `clear`, or `discard`),
+the clear value required by `clear`, `store` (`store` or `discard`), and an
+optional resolve target. A `RenderTarget` is source convenience that internally
+allocates textures and aggregates attachments; it is not a public
+resource-aggregate ABI. `RenderState` owns blend, depth/stencil, raster, color
+write mask, and multisample state. Clear is attachment policy, never
+`RenderState`.
+
+Resolve always overwrites its destination, so destination load is implicit
+discard. Source and resolve destination have independent store policy: a
+discarded multisample source may still publish a stored single-sample resolve.
+
+`draw` carries an optional `index_buffer: TensorView`, `instance_count` with
+default one, and an explicit required `vertex_count` for direct draws.
+Deployment never infers draw count from vertex inputs. There is no `DrawArgs`.
+Primitive topology is static
+pipeline/artifact specialization and therefore participates in artifact
+identity rather than runtime draw binding.
+
+Shader-visible Texture/ImageView/typed-byte-storage/Sampler resources are independent
+Program Values and cannot be nested inside ABI-stable structs. Graphics calls
+do not return replacement Texture handles. The compiler lowers each read/write
+use of one stable Texture to exact Program Value versions within one Storage;
+Runtime never infers version order from pointer equality or latest allocation
+contents.
+
+Each bound ImageView normalizes before graph compilation to its parent Texture
+Storage plus an exact `!vernon.texture`-typed alias Value and
+aspect/mip/layer descriptor; it is never a separate dialect type or second
+Storage root. A sampled Texture type uses `format = "unknown"`; its concrete
+allocation format is carried by the image `StorageDescriptor`. Only storage-texture
+`read`/`write`/`read_write` types carry a concrete format. A stored terminal
+attachment version becomes visible to
+later graph uses or extraction only after its Program completes. Discarded
+attachment versions are not consumable or extractable.
+
+Graphics remains outside the active VJP. A requested derivative path through a
+graphics node fails closed; graphics nodes unrelated to the active
+differentiable subgraph remain valid forward effects and create no captures.
 
 Named fragment struct fields are flattened before SPIR-V lowering. Their
 reflected source names and locations route `targets` independently of mapping
@@ -615,11 +690,13 @@ iteration order. Feature specialization runs before the vertex/fragment
 interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
-`PIPELINE_VERSION` covers the invocation carrying index bindings, attachment
-operations, topology, viewport, scissor, compute workgroup grid, an optional active
-encoder, and reflected argument slots.
-Backend-specific command encoding consumes this common invocation without
-exposing legacy program/draw entry points.
+The target contract carries normalized index binding, attachment operations,
+viewport/scissor, compute workgroup grid, an optional active encoder, and
+reflected argument slots as entry control metadata. This metadata supplies only
+the selected node entry and never owns a resource, defines a resource extent,
+or overrides a `StorageDescriptor`. Topology is already selected by the
+graphics artifact. Backend-specific command encoding consumes this common
+invocation.
 
 Runtime planning separates the two pipeline kinds before backend dispatch.
 The compute grid stores workgroup counts; total invocation extent is the
@@ -629,7 +706,17 @@ validation, argument packing, and grid inference produce one
 and draw-state validation produce one `PlannedGraphicsInvocation`. Backends
 consume the corresponding plan and do not repeat frontend invocation planning.
 
-## Compiler-generated graphics values
+For Program graphics nodes, the immutable resolved node directly contains the
+normalized attachment, state, and draw fields. Shader-visible sampled/storage
+resources use normal resolved endpoint bindings. Color/depth attachments are
+not shader arguments; their attachment transitions map fragment output
+locations/aspects to exact image Storage before/after versions. ExecutionGraph
+combines these semantic edges with load/store/clear/resolve policy, performs
+subresource hazard analysis by parent image plus aspect/mip/layer range, and
+may fuse adjacent draws when attachment continuity is preserved and no hazard
+intervenes. Fusion does not require `RenderState` equality.
+
+## Compiler-generated graphics entry values
 
 Compiler reflection marks generated entry arguments with
 `vernon.implicit`. An implicit sampler carries
@@ -638,13 +725,18 @@ its existing `sampled_texture_bindings` relation identifies every concrete
 texture descriptor it samples. A generated resolution argument carries
 `vernon.implicit = "resolution"` and has type `tensor<2xf32>`.
 
-The cooker removes these arguments from the external `parameters`
-table and records them in `internal_parameters`. Each internal record has
-`source: "implicit_sampler"` or `source: "system_value"`; resolution also has
-`system_value: "resolution"`. Stage uses retain concrete uniform names,
-argument indices, descriptor set/binding values, and sampled-texture
-relations. This is the backend ABI: public parameter enumeration and
-invocation slots expose only source parameters.
+The cooker records generated resolution and default-sampler inputs as
+StageArtifact `system` endpoints, not Program Parameters or Values. Resolution
+is supplied from the validated graphics render area and attachment extent;
+the default sampler is Runtime-owned immutable target state. It does not emit
+an `internal_parameters` table or copied stage `uses` authority.
+Artifact-system reflection supplies the immutable endpoint ABI;
+`ResolveProgram` validates ordinary Program endpoint bindings against it once.
+It serializes only portable ABI slots and sampled-resource endpoint relations.
+Concrete uniform names, descriptor set/binding values, root parameters,
+argument-buffer indices, and GL locations are deterministic backend lowering
+facts validated from authenticated code, not manifest fields or a second
+Program binding model.
 
 An explicitly declared sampler is not compiler-generated and remains an
 external sampler slot, overriding implicit sampler generation.
@@ -654,8 +746,10 @@ object, while Vulkan combines it with the reflected texture descriptor. A null
 field uses the backend runtime default: OpenGL sampler object zero or the
 runtime-context-owned cached Vulkan linear/repeat sampler. Explicit sampler
 parameters ignore the texture-view field.
-The runtime supplies resolution as `(width, height)` from a non-empty
-invocation viewport, falling back to the common color-attachment extent.
+The runtime supplies resolution as `(width, height)` from an entry-only resolved
+draw-extent descriptor. Its resource extent components must agree with the
+authoritative attachment `StorageDescriptor`; Runtime does not infer a resource
+extent through parameter names or stage metadata.
 Generated resolution is an OpenGL uniform, Vulkan push constant, or DirectX 12
 root constant according to its reflected stage use. All three graphics runtime
 paths represent `source: "system_value"` in their binding plans and upload the
@@ -690,3 +784,126 @@ byte offsets; an instance divisor changes only fetch rate. OpenGL, Vulkan, and
 DirectX consume this common list and reject formats or location spans that the
 actual device cannot represent rather than applying rank or scalar-count
 limits.
+
+## Program manifest resolution and value arena
+
+The normative serialized schema and resolve checks are defined by
+[`../program_execution_manifest.md`](../program_execution_manifest.md).
+The breaking Program object directly contains `stages`, `parameters`,
+`storages`, `values`, `graphs`, and `signature`. `ResolveProgram` is the only
+loader/binder and resolves every stage through the artifact system; it does not
+accept old manifests, synthesize Programs from direct artifacts, or bind by
+name. `ExecuteProgram` accepts only the resulting immutable resolved Program.
+Any single-node fast path is selected after resolution.
+
+The ArtifactSystem supplies one strict target, authenticated Blobs, and
+content-addressed artifacts. Each StageArtifact carries its own Runtime
+requirements; each selected variant carries their reachable aggregate and
+maps each logical Program stage to one StageArtifact with exact code modules
+and entry points: CPU
+relocatable object, PTX, SPIR-V, GLSL/GLES, MSL, or DXIL. Compute has one
+compute module; graphics has ordered vertex and fragment modules. Runtime
+never infers a filename, extension, symbol, fallback format, or cross-target
+implementation.
+Runtime selects the requested variant first, validates its aggregate
+requirements, and loads only code Blobs reachable from that variant. Other
+emitted variants remain unopened.
+
+Resolution constructs one immutable native stage plan per Program node,
+containing the backend stage, stage-local ABI, endpoint-to-Program-value
+or ResourceAccess bindings, optional canonical leaf indices, launch contract,
+shape guards, and storage-version transitions. It derives producer and
+overlapping-resource RAW/WAR/WAW edges from Value SSA, access versions, and
+view ranges. Node order must be topological, every Storage version chain must
+be non-branching, and no serialized dependency list is accepted. These plans
+are runtime state, not serialized topology.
+
+`StorageDescriptor` is the sole resource authority for allocation identity,
+physical layout, extent, lifetime, and ownership. Entry control metadata may
+select launch/draw behavior but cannot create resource authority or override a
+descriptor. Resource values, including caller-visible buffers and textures,
+are published through ordinary `signature.outputs`; Runtime has no separate
+resource-output ownership channel.
+
+The target Program resolver accepts only static DAGs whose nodes are compute or
+graphics. It rejects transfer nodes and deployment control-flow nodes. Local
+structured control flow inside a compiled compute stage remains stage
+implementation behavior.
+
+ProgramValueArena materializes roots by origin: arguments reference validated
+invocation values; constants reference immutable payloads; initialized
+resources allocate according to Storage lifetime; allocated resources create
+invocation-lifetime storage with no readable contents until a complete
+clear/discard or resolve write; views reference one exact storage version; and
+node results allocate or receive stage-produced storage/descriptors.
+In the target contract there are no `StructuralArgument` roots. Graphics
+resources arrive through ordinary Program Value bindings; normalized attachment
+node fields reference exact Texture-typed image-view aliases, which retain
+parent Storage version and aspect/mip/layer range. Image hazards are never
+represented as byte ranges.
+View chains are flattened to their final storage base as required by the manifest;
+node-result TensorViews receive their complete descriptor from the producing
+stage.
+
+Storage ID is stable allocation identity. Program value ID is an SSA position
+in the executable template; a concrete value instance also carries graph
+invocation identity and, for pipeline state, committed storage generation.
+ResourceTransition resolves one physical endpoint to distinct before/after
+logical instances. Runtime may execute it in place only inside a transaction
+that preserves rollback and capture semantics.
+Attachment transitions also create distinct semantic versions, but their
+physical visibility, extraction, and failure behavior belong to
+ExecutionGraph. A single physical write cannot be declared in both effect
+domains.
+
+For a differentiated invocation, successful forward execution creates one
+PullbackState. For every Capture in `program.residual_contract.captures`, the
+state records the exact concrete forward value instance and storage generation
+required by backward, plus every required shape-symbol binding.
+The residual planner may satisfy that requirement through retention, immutable
+reference, versioned resource snapshot, checkpoint restoration, or
+deterministic replay permitted by the Capture's ReplayContract. Later mutation
+of a pipeline resource must never change the version observed by that
+pullback.
+
+Before backward scheduling, PullbackState materializes every capture into the
+ProgramValueArena. Captures are initial backward availability, not public graph
+arguments and not cotangent slots. If a required version cannot be retained or
+reconstructed within policy, pullback application fails before publishing any
+gradient. Repeated sequential applications of one pullback reuse the same
+logical captured versions and publish fresh gradients. A failed application
+returns the PullbackState to ready only after proving all retained state is
+unchanged; otherwise the state is poisoned and rejects later applications.
+
+Manifest value IDs are version positions; Storage IDs are allocation
+identities. Observable mutation follows an explicit before/after transition
+within one storage. PullbackState therefore retains or reconstructs a specific
+concrete value instance and generation, never the allocation's latest
+contents.
+
+Kernel tape crosses this boundary as a first-class `!vernon.ad_tape` Program
+Value backed by an opaque `StorageDescriptor`. The forward stage produces the
+handle, the residual contract captures it, and the backward stage consumes it
+through a whole-root binding. Runtime owns its allocator, dynamic capacity,
+status, overflow handling, and destruction. Before stage creation, Runtime
+recomputes the canonical opaque contract hash reflected by both endpoints and
+requires it to match the Storage descriptor contract hash. No stage-local
+residual side channel is permitted.
+
+Leaf projection preserves Storage identity and exact version. Element-scope
+projections combine root shape/strides with leaf offset and internal shape.
+Value-scope projections use the canonical complete-leaf shape and strides. An
+array-of-struct field is not presented as dense unless it is actually dense;
+the stage must accept a strided TensorView or the compiler must insert an
+explicit packing node. Leaves of one aggregate root never become independent
+storages.
+
+Forward outputs, state updates, and gradients are published transactionally
+only after terminal dependencies and opaque status succeed. Failure discards
+transaction shadows, uncommitted versions, replay temporaries, and fresh
+gradients. Shape constraints are checked at entry or immediately after their
+captured forward witnesses become available at backward entry; node-produced
+control symbols are not representable. Derived inference never overrides
+manifest authority. If rollback cannot restore every caller-visible entry
+version, the loaded pipeline instance becomes terminally failed and requires
+destruction and reload.

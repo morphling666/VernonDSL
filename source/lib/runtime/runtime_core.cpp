@@ -45,6 +45,20 @@ namespace {
 
 constexpr bool present(VernonRuntimeProviderObject object) { return object.value != 0; }
 
+bool packedUniformBytes(const VernonRuntimeProviderBindingLayoutEntry &layout) {
+    return layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
+           layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+           (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+            layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM);
+}
+
+const VernonRuntimeProviderBindingLayoutEntry *layoutForSlot(const VernonRuntimeCorePipeline &pipeline, uint32_t slot) {
+    const auto found =
+        std::find_if(pipeline.bindings.begin(), pipeline.bindings.end(),
+                     [slot](const VernonRuntimeProviderBindingLayoutEntry &layout) { return layout.slot == slot; });
+    return found == pipeline.bindings.end() ? nullptr : &*found;
+}
+
 const VernonRuntimeProviderResourceReference *bindingResource(const VernonRuntimeProviderBindingValue &value) {
     switch (value.kind) {
     case VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER:
@@ -153,24 +167,27 @@ void releaseResources(const VernonRuntimeDeviceProvider &provider,
         provider.release_resource(provider.user_data, *resource);
 }
 
-VernonStatus retainResources(const VernonRuntimeDeviceProvider &provider,
-                             const VernonRuntimeProviderBindingValue *values, size_t valueCount,
-                             std::vector<VernonRuntimeProviderResourceReference> &resources) {
+VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const VernonRuntimeProviderBindingValue *values,
+                             size_t valueCount, std::vector<VernonRuntimeProviderResourceReference> &resources) {
+    const VernonRuntimeDeviceProvider &provider = pipeline.provider;
     if (valueCount != 0 && !values)
         return VERNON_STATUS_INVALID_ARGUMENT;
     size_t resourceCount = 0;
-    for (size_t index = 0; index < valueCount; ++index)
-        resourceCount += values[index].kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-                         values[index].kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto *layout = layoutForSlot(pipeline, values[index].slot);
+        resourceCount += layout && !packedUniformBytes(*layout) &&
                          (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0;
+    }
     try {
         resources.reserve(resourceCount);
     } catch (const std::bad_alloc &) {
         return VERNON_STATUS_INTERNAL_ERROR;
     }
     for (size_t index = 0; index < valueCount; ++index) {
-        if (values[index].kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            values[index].kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        const auto *layout = layoutForSlot(pipeline, values[index].slot);
+        if (!layout)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        if (packedUniformBytes(*layout)) {
             if (!values[index].payload.inline_value.data || values[index].payload.inline_value.size == 0) {
                 releaseResources(provider, resources);
                 resources.clear();
@@ -440,7 +457,7 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     VernonStatus status = validateImageBindings(*pipeline, values, valueCount);
     if (status != VERNON_STATUS_OK)
         return status;
-    status = retainResources(pipeline->provider, values, valueCount, bindings->resources);
+    status = retainResources(*pipeline, values, valueCount, bindings->resources);
     if (status != VERNON_STATUS_OK)
         return status;
     const VernonRuntimeProviderBindingSetDescriptor descriptor{
@@ -452,9 +469,10 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     }
     try {
         size_t resourceSlotCount = 0;
-        for (size_t index = 0; index < valueCount; ++index)
-            resourceSlotCount += values[index].kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-                                 values[index].kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+        for (size_t index = 0; index < valueCount; ++index) {
+            const auto *layout = layoutForSlot(*pipeline, values[index].slot);
+            resourceSlotCount += layout && !packedUniformBytes(*layout);
+        }
         bindings->resources.reserve(resourceSlotCount);
         bindings->pendingResources.reserve(resourceSlotCount);
     } catch (const std::bad_alloc &) {
@@ -476,7 +494,7 @@ extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBinding
     VernonStatus status = validateImageBindings(*bindings->pipeline, values, valueCount);
     if (status != VERNON_STATUS_OK)
         return status;
-    status = retainResources(bindings->pipeline->provider, values, valueCount, bindings->pendingResources);
+    status = retainResources(*bindings->pipeline, values, valueCount, bindings->pendingResources);
     if (status != VERNON_STATUS_OK)
         return status;
     status = bindings->pipeline->provider.update_binding_set(bindings->pipeline->provider.user_data, bindings->handle,

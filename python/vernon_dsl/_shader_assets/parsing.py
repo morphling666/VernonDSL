@@ -272,11 +272,22 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
     else:
         program = program_expression
     stage_functions: dict[str, str] = {}
+    program_kind = "stages"
     if isinstance(program, ast.Name):
-        stage, entry = entry_stage(program)
-        if stage != "compute":
-            raise PipelineCompileError("single-entry pipeline_asset program must be a compute Kernel")
-        stage_functions[stage] = entry
+        try:
+            stage, entry = entry_stage(program)
+        except PipelineCompileError as error:
+            if not any(
+                marker in str(error) for marker in ("is not a function", "must have exactly one entry-stage decorator")
+            ):
+                raise
+            program_kind = "module"
+        else:
+            if stage != "compute":
+                raise PipelineCompileError("single-entry pipeline_asset program must be a compute Kernel")
+            stage_functions[stage] = entry
+    elif isinstance(program, ast.Call):
+        program_kind = "module"
     elif isinstance(program, ast.Tuple):
         if not program.elts:
             raise PipelineCompileError("graphics pipeline_asset program must contain at least one stage")
@@ -296,10 +307,10 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError(message) from None
     else:
         raise PipelineCompileError(
-            "pipeline_asset program must be one compute Kernel or a tuple of graphics entry functions"
+            "pipeline_asset program must be one compute Kernel, one Module, or a tuple of graphics entry functions"
         )
     if transform is not None:
-        graphics = set(stage_functions) != {"compute"}
+        graphics = program_kind == "stages" and set(stage_functions) != {"compute"}
         if graphics and "rule_set" not in transform:
             raise PipelineCompileError("graphics VJP requires a named custom rule set")
         if not graphics and "rule_set" in transform:
@@ -346,6 +357,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         "source": source_path.name,
         "name": descriptor_name,
         "id": pipeline_id,
+        "program_kind": program_kind,
         "stages": stage_functions,
         "variants": [list(key) for key in variants],
     }
@@ -362,6 +374,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         encoded,
         {module_id: module},
         transform,
+        program_kind,
     )
 
 

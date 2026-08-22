@@ -49,6 +49,9 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     ASSERT_NE(bundle, nullptr) << lastError(context);
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
+    ASSERT_NE(pipeline->topology, nullptr);
+    EXPECT_TRUE(pipeline->topology->directDispatch);
+    EXPECT_TRUE(pipeline->topology->differentiated.has_value());
 
     auto objective = [](double x, double y, double z) {
         const double linear = x + y;

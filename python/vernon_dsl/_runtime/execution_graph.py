@@ -461,6 +461,20 @@ class RenderPass(ExecutionPass):
             encoder._native = None
 
 
+class GraphicsInvocationPass(RenderPass):
+    def __init__(self, name: str, invocation: PipelineInvocation, target: RenderTarget):
+        super().__init__(name)
+        self._invocation = invocation
+        self._pass_target = target
+
+    def declare(self) -> None:
+        self._invocation.declare(self)
+        self.attachments(self._pass_target)
+
+    def execute(self, encoder: GraphicsEncoder, resources: ExecutionResources) -> None:
+        self._invocation.encode(encoder, resources)
+
+
 class ComputePass(ExecutionPass):
     def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
         raise NotImplementedError
@@ -473,6 +487,30 @@ class ComputePass(ExecutionPass):
             self.execute(encoder, ExecutionResources(self._graph, native_bindings))
         finally:
             encoder._native = None
+
+
+class _NativePipelineComputePass(ComputePass):
+    """Internal C++-executed pipeline pass with no Python execute callback."""
+
+    def __init__(
+        self,
+        name: str,
+        pipeline: Any,
+        parameters: tuple[ExecutionParameter, ...],
+        grid: tuple[int, int, int],
+    ):
+        super().__init__(name)
+        self.pipeline = pipeline
+        self.parameters = parameters
+        self.grid = grid
+        self.side_effect = True
+
+    def declare(self) -> None:
+        pass
+
+    def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
+        del encoder, resources
+        raise RuntimeError("native pipeline passes execute only in C++")
 
 
 def _checked_clear_color(value: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -728,6 +766,29 @@ class CompiledExecutionGraph:
         submission._release_if_complete()
         return submission
 
+    def _submit_pipeline_bindings(
+        self,
+        initial: Mapping[ExecutionParameter, Any],
+        borrows: list[tuple[str, Any, str]],
+    ) -> ExecutionSubmission:
+        native = self._ensure_current()
+        if len(initial) != len(self._parameters) or any(parameter not in initial for parameter in self._parameters):
+            raise ValueError("native pipeline bindings must bind every parameter exactly once")
+        for parameter in initial:
+            self._validate_parameter(parameter)
+        native_bindings = native.create_pipeline_bindings(
+            [(parameter._native, initial[parameter]) for parameter in self._parameters]
+        )
+        lease = _DispatchBorrowLease(borrows)
+        try:
+            native_submission = native.submit(native_bindings)
+        except Exception:
+            lease.release()
+            raise
+        submission = ExecutionSubmission(native_submission, self, lease)
+        submission._release_if_complete()
+        return submission
+
     def vjp(self, bindings: ExecutionBindings | None = None) -> Any:
         from .graph_autodiff import GraphPullback
 
@@ -852,6 +913,24 @@ class ExecutionGraph:
             raise ValueError("autodiff checkpoint memory budget must be a non-negative integer")
         native_graph.plan_autodiff_checkpoints(memory_budget)
 
+    def set_explicit_reverse_command_dag(
+        self,
+        nodes: tuple[tuple[int, tuple[int, ...], int, int, int], ...],
+    ) -> None:
+        native_graph = self._ensure_current()
+        native_graph.set_explicit_reverse_command_dag(
+            [
+                (
+                    node,
+                    list(dependencies),
+                    residual_bytes,
+                    temporary_bytes,
+                    replay_cost,
+                )
+                for node, dependencies, residual_bytes, temporary_bytes, replay_cost in nodes
+            ]
+        )
+
     def add_pass(self, execution_pass: ExecutionPass) -> ExecutionPass:
         native_graph = self._ensure_current()
         if not isinstance(execution_pass, ExecutionPass):
@@ -859,7 +938,16 @@ class ExecutionGraph:
         if execution_pass in self._passes or execution_pass._graph not in {None, self}:
             raise ValueError("execution pass already belongs to a graph")
         execution_pass._graph = self
-        if isinstance(execution_pass, RenderPass):
+        if isinstance(execution_pass, _NativePipelineComputePass):
+            for parameter in execution_pass.parameters:
+                self._validate_parameter(parameter)
+            execution_pass._native_pass = native_graph.add_native_compute_pass(
+                execution_pass.name,
+                execution_pass.pipeline,
+                [parameter._native for parameter in execution_pass.parameters],
+                execution_pass.grid,
+            )
+        elif isinstance(execution_pass, RenderPass):
             execution_pass._native_pass = native_graph.add_render_pass(execution_pass.name, execution_pass)
         elif isinstance(execution_pass, ComputePass):
             execution_pass._native_pass = native_graph.add_compute_pass(execution_pass.name, execution_pass)
@@ -964,6 +1052,7 @@ __all__ = [
     "ExecutionSubmission",
     "GraphResource",
     "GraphicsEncoder",
+    "GraphicsInvocationPass",
     "LoadOperation",
     "PipelineInvocation",
     "RenderPass",

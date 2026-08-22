@@ -31,7 +31,9 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
       },
       %id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "global_invocation_id"
+        vernon.builtin = "global_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -167,8 +169,78 @@ module attributes {
 }
 """)
 
+PROGRAM_MODULE = r"""
+module {
+  func.func @forward(%source: f32 {vernon.source_name = "source"})
+      -> (f32 {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.source"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %result = "vernon_program.compute"(%source) {
+      callee = "Module.square",
+      grid = array<i64: 1, 1, 1>,
+      features = [],
+      operand_names = ["source"],
+      result_names = ["output"]
+    } : (f32) -> f32
+    func.return %result : f32
+  }
+}
+"""
+
+DIRECT_KERNEL_MODULE = r"""
+module {
+  func.func @increment(
+      %values: !vernon.tensor_view<f32, [16], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "values",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 8, 1, 1>
+      } {
+    return
+  }
+}
+"""
+
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_program_planner_returns_kernel_compile_requests(self) -> None:
+        plan = native.Compiler().plan_program_result(PROGRAM_MODULE)
+        self.assertTrue(plan.ok, plan.diagnostics)
+        reflection = json.loads(plan.reflection)
+        self.assertEqual(len(reflection["kernel_compile_requests"]), 1)
+        request = reflection["kernel_compile_requests"][0]
+        self.assertEqual(request["id"], "forward:0")
+        self.assertEqual(request["implementation_hint"], "Module.square")
+        self.assertEqual(request["kind"], "compute")
+        self.assertIn("vernon_program.compute", request["region_mlir"])
+        self.assertEqual(reflection["execution"]["graphs"][0]["nodes"][0]["stage"], "forward:0")
+
+    def test_kernel_planner_bootstraps_explicit_dispatch_controls(self) -> None:
+        plan = native.Compiler().plan_kernel_result(DIRECT_KERNEL_MODULE)
+        self.assertTrue(plan.ok, plan.diagnostics)
+        reflection = json.loads(plan.reflection)
+        request = reflection["kernel_compile_requests"][0]
+        node = reflection["execution"]["graphs"][0]["nodes"][0]
+        self.assertEqual(
+            node["grid"],
+            [
+                {"control": {"argument": 1}},
+                {"control": {"argument": 2}},
+                {"control": {"argument": 3}},
+            ],
+        )
+        self.assertEqual(request["grid"], node["grid"])
+        self.assertEqual(request["bindings"], [{"parameter": "values", "value": 0}])
+        self.assertEqual(node["resources"], [{"value": 0, "access": "read_write", "after": 4}])
+        self.assertIn("func.func @increment", request["region_mlir"])
+
     def test_target_available_reports_compiler_capabilities(self) -> None:
         self.assertTrue(native.target_available(native.Target.CPU))
         for target in (

@@ -168,7 +168,6 @@ public:
     virtual ~GraphAutodiffValue() = default;
     virtual uintptr_t logicalIdentity() const = 0;
     virtual uint64_t allocationBytes() const = 0;
-    virtual std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const = 0;
     virtual bool materialize(detail::RhiCommandPlanSink *sink, std::string &error) = 0;
 };
 
@@ -458,6 +457,14 @@ struct AutodiffDagCheckpointPlan {
     std::string selectedPolicy{"balanced"};
 };
 
+struct ExplicitReverseCommandNode {
+    uint32_t id{};
+    std::vector<uint32_t> dependencies;
+    uint64_t residualBytes{};
+    uint64_t temporaryBytes{};
+    uint64_t replayCost{};
+};
+
 namespace detail {
 enum class ExecutionProvider : uint8_t { Cpu, Rhi };
 
@@ -516,6 +523,7 @@ public:
     ExecutionParameter parameter(std::string name);
     void setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
                               std::vector<NamedDerivativeEndpoint> objectives);
+    void setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes);
     void planAutodiffCheckpoints(uint64_t memoryBudget);
     std::shared_ptr<CompiledExecutionGraph> compile(std::string &error);
     bool validate(std::string &error);
@@ -551,6 +559,7 @@ private:
     bool hasAutodiffSchedule_{};
     std::vector<NamedDerivativeEndpoint> differentiableInputs_;
     std::vector<NamedDerivativeEndpoint> objectives_;
+    std::vector<ExplicitReverseCommandNode> explicitReverseNodes_;
     bool dirty_{true};
     bool compiled_{};
 };

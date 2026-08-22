@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from ..language.stage_registry import STAGES
 from .types import PipelineCompileError
 
 
@@ -75,10 +74,8 @@ def reflected_parameters(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[dict[str, Any]]]]:
     external: dict[str, list[dict[str, Any]]] = {}
     internal: dict[str, list[dict[str, Any]]] = {}
-    for stage in (definition.kind for definition in STAGES):
-        record = records.get(stage)
-        if record is None:
-            continue
+    for stage, record in records.items():
+        stage_kind = record.get("stage", stage)
         interface = record.get("interface", {})
         if not isinstance(interface, Mapping):
             raise PipelineCompileError(f"{stage} stage interface must be an object")
@@ -138,32 +135,32 @@ def reflected_parameters(
                     None,
                 )
             compute_static_tensor_value = (
-                stage == "compute"
+                stage_kind == "compute"
                 and row.get("kind") == "tensor"
                 and isinstance(compute_plan, Mapping)
                 and compute_plan.get("kind") in {"cpu_call", "kernel_parameter"}
             )
             packed_value = interface_name == "uniform" or (
-                stage == "compute"
+                stage_kind == "compute"
                 and (row["kind"] not in {"tensor", "image", "sampler"} or compute_static_tensor_value)
             )
-            if packed_value and stage == "compute":
+            if packed_value and stage_kind == "compute":
                 use["interface"] = "value"
-            elif stage == "compute" and row.get("kind") == "tensor":
+            elif stage_kind == "compute" and row.get("kind") == "tensor":
                 use["interface"] = "storage"
             dtype = row.get("dtype") or row.get("vernon.dtype") or inferred_dtype
             if dtype is not None:
                 use["dtype"] = dtype
             element_layout = row.get("element_layout")
+            value_layout = row.get("value_layout")
             if isinstance(element_layout, Mapping):
                 use["element_layout"] = dict(element_layout)
-            elif row.get("kind") not in {"image", "sampler"}:
-                value_layout = row.get("value_layout")
-                if not isinstance(value_layout, Mapping):
-                    raise PipelineCompileError(f"{stage} value argument is missing canonical value_layout")
+            if isinstance(value_layout, Mapping):
                 use["value_layout"] = dict(value_layout)
-            if isinstance(row.get("value_layout"), Mapping):
-                use["value_layout"] = dict(row["value_layout"])
+            elif isinstance(element_layout, Mapping):
+                use["value_layout"] = dict(element_layout)
+            elif row.get("kind") not in {"image", "sampler"}:
+                raise PipelineCompileError(f"{stage} value argument is missing canonical value_layout")
             if packed_value:
                 profile, transport = _physical_value_profile(record.get("target"), row.get("value_transport"))
                 selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
@@ -251,8 +248,6 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
     )
     element_layout = representative.get("element_layout")
     value_layout = representative.get("value_layout")
-    for use in normalized:
-        use.pop("element_layout", None)
     access_values = {str(use.get("access", "read")) for use in normalized}
     tensor_view = kind == "tensor" and any(
         str(use.get("type", "")).startswith("!vernon.tensor_view<") for use in normalized
@@ -281,7 +276,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
     if kind == "tensor":
         if element_layout is not None:
             parameter["element_layout"] = element_layout
-        elif value_layout is not None:
+        if value_layout is not None:
             parameter["value_layout"] = value_layout
     else:
         parameter["dtype"] = representative.get("dtype")
@@ -299,6 +294,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
             "internal_source",
             "system_value",
             "location_span",
+            "element_layout",
         ):
             use.pop(key, None)
     return {key: value for key, value in parameter.items() if value is not None}
@@ -316,12 +312,13 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
         if values != {"resolution"}:
             raise PipelineCompileError(f"inconsistent resolution system value {name!r}")
         parameter["system_value"] = "resolution"
-        leaves = parameter.get("element_layout", {}).get("leaves", [])
+        leaves = parameter.get("value_layout", {}).get("leaves", [])
         if (
             parameter.get("shape") != [2]
             or len(leaves) != 1
             or leaves[0].get("dtype") != "f32"
-            or leaves[0].get("scalar_count") != 1
+            or leaves[0].get("scalar_count") != 2
+            or leaves[0].get("shape") != [2]
         ):
             raise PipelineCompileError("resolution system value must have reflected type tensor<2xf32>")
         if any(use.get("sampled_image_bindings") for use in uses):

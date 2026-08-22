@@ -383,6 +383,26 @@ VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint
     return inserted || found->second == entry ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
+bool findRegisteredCpuEntry(VernonRuntimeContext &context, const std::string &symbol, VernonCpuEntryPoint &entry,
+                            std::string &error) {
+    {
+        std::lock_guard<std::mutex> lock(context.cpuEntriesMutex);
+        const auto found = context.cpuEntries.find(symbol);
+        if (found != context.cpuEntries.end())
+            entry = found->second.first;
+    }
+    if (!entry) {
+        std::lock_guard<std::mutex> lock(staticEntriesMutex());
+        const auto found = staticEntries().find(symbol);
+        if (found != staticEntries().end())
+            entry = found->second;
+    }
+    if (entry)
+        return true;
+    error = "CPU AOT object symbol '" + symbol + "' was not statically registered";
+    return false;
+}
+
 bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t reflectionSize, const char *entryName,
                   size_t entryNameSize, CpuKernelState &state, ReflectedEntry &metadata, std::string &error) {
     try {
@@ -398,18 +418,14 @@ bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t refl
     }
 }
 
-bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &state, ReflectedEntry &metadata,
-                           std::string &error) {
+bool loadCpuNativeArtifact(VernonRuntimeContext &context, const CpuNativeArtifact &artifact, CpuKernelState &state,
+                           ReflectedEntry &metadata, std::string &error) {
     std::filesystem::path libraryPath;
     if (!resolveCpuNativeArtifact(artifact, libraryPath, &metadata, error))
         return false;
     if (artifact.format == "relocatable_object") {
-        {
-            std::lock_guard<std::mutex> lock(staticEntriesMutex());
-            const auto found = staticEntries().find(artifact.symbol);
-            if (found != staticEntries().end())
-                state.entry = found->second;
-        }
+        if (!findRegisteredCpuEntry(context, artifact.symbol, state.entry, error))
+            return false;
     } else {
         const std::string nativePath = libraryPath.u8string();
         if (!state.nativeLibrary.open(nativePath.c_str(), error))
@@ -418,9 +434,7 @@ bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &st
     }
     if (state.entry)
         return true;
-    error = artifact.format == "relocatable_object"
-                ? "CPU AOT object symbol '" + artifact.symbol + "' was not statically registered"
-                : "CPU AOT library does not export symbol '" + artifact.symbol + "'";
+    error = "CPU AOT library does not export symbol '" + artifact.symbol + "'";
     return false;
 }
 

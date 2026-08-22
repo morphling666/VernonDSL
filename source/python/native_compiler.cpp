@@ -2,7 +2,7 @@
 
 #include "VernonExecutionGraph.h"
 #include "execution_graph/execution_graph_internal.h"
-#include "native_operator.h"
+#include "native_command_retention.h"
 #include "native_runtime.h"
 
 void bindNativeCompiler(nb::module_ &module) {
@@ -83,6 +83,13 @@ void bindNativeCompiler(nb::module_ &module) {
                nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
+        .def("analyze_program_result", &analyzeProgramResult, nb::arg("mlir"))
+        .def("plan_program_result", &planProgramResult, nb::arg("program"))
+        .def("plan_kernel_result", &planKernelResult, nb::arg("kernel"))
+        .def("plan_graphics_result", &planGraphicsResult, nb::arg("stages"), nb::arg("topology"), nb::arg("features"),
+             nb::arg("attachment_types"), nb::arg("color_count"), nb::arg("operands"))
+        .def("finalize_program_result", &finalizeProgramResult, nb::arg("plan"), nb::arg("kernels"),
+             nb::arg("shape_facts") = std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>>{})
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),
              nb::arg("options") = nb::dict());
     module.def("_compile_cpu_program_results", &compileCpuProgramResults, nb::arg("modules"),
@@ -164,6 +171,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_autodiff", &Runtime::loadAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
+        .def("load_program_pipeline_asset", &Runtime::loadProgramPipelineAsset, nb::keep_alive<0, 1>())
+        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::keep_alive<0, 1>())
         .def("create_execution_graph", &Runtime::createExecutionGraph);
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
@@ -193,11 +202,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("state", &PythonRuntimeSubmission::state);
     nb::class_<PreparedPipelineArgument>(module, "_PreparedPipelineArgument");
-    nb::class_<PythonOperatorDagBuilder>(module, "OperatorDagBuilder")
-        .def("add_elementwise_add", &PythonOperatorDagBuilder::addElementwiseAdd, nb::arg("invocation"),
-             nb::arg("output"), nb::arg("left"), nb::arg("right"), nb::keep_alive<1, 2>())
-        .def("execute", &PythonOperatorDagBuilder::execute, nb::arg("command_sink") = nullptr,
-             nb::arg("retained") = nb::none());
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("prepare_host_tensor", &PipelineInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
@@ -240,7 +244,6 @@ void bindNativeCompiler(nb::module_ &module) {
                           const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
         .def("encode", [](PipelineInvocationBuilder &builder,
                           const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
-        .def("operator_dag", &createPythonOperatorDagBuilder, nb::keep_alive<0, 1>())
         .def("submit", [](PipelineInvocationBuilder &builder) { return builder.submit(); });
     nb::class_<PythonPullback>(module, "Pullback")
         .def("__call__", &PythonPullback::apply, nb::arg("cotangent") = nb::none())
@@ -330,7 +333,14 @@ void bindNativeCompiler(nb::module_ &module) {
                                     nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
             },
             nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
+        .def(
+            "program_vjp",
+            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings) {
+                return pipeline.programVjp(inputs, bindings, nb::cast(&pipeline, nb::rv_policy::reference));
+            },
+            nb::arg("inputs"), nb::arg("bindings"))
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
+        .def_prop_ro("program_ad_signature", &LoadedPipeline::programAdSignature)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
         .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)
         .def_prop_ro("write_footprints", &LoadedPipeline::writeFootprints)

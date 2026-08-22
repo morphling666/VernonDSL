@@ -355,23 +355,13 @@ struct VernonValidatePass : public PassWrapper<VernonValidatePass, OperationPass
     void runOnOperation() override {
         bool invalid = false;
         ModuleOp module = getOperation();
-        auto compilerContractVersion = module->getAttrOfType<IntegerAttr>("vernon.compiler_contract_version");
-        auto pipelineVersion = module->getAttrOfType<IntegerAttr>("vernon.pipeline_version");
-        if (!compilerContractVersion || compilerContractVersion.getInt() != VERNON_COMPILER_CONTRACT_VERSION) {
-            module.emitError() << "requires vernon.compiler_contract_version = " << VERNON_COMPILER_CONTRACT_VERSION;
-            invalid = true;
-        }
-        if (!pipelineVersion || pipelineVersion.getInt() != VERNON_PIPELINE_VERSION) {
-            module.emitError() << "requires vernon.pipeline_version = " << VERNON_PIPELINE_VERSION;
-            invalid = true;
-        }
         std::map<ShaderStage, SmallVector<LocationEndpoint>> stageInputs;
         std::map<ShaderStage, SmallVector<LocationEndpoint>> stageOutputs;
         std::set<ShaderStage> entryStages;
 
         for (StructDeclOp declaration : module.getOps<StructDeclOp>()) {
             auto structure = StructType::get(module.getContext(), declaration.getSymName());
-            FailureOr<ValueAbiLayout> layout = getValueAbiLayout(structure, module);
+            FailureOr<ValueAbiLayout> layout = getValueStorageLayout(structure, module);
             if (failed(layout)) {
                 declaration.emitError("does not define a finite canonical Value ABI layout");
                 invalid = true;

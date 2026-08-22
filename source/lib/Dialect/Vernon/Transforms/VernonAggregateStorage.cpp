@@ -156,7 +156,7 @@ LogicalResult decomposeAggregateValueVernon(Type type, Value value, SmallVectorI
 }
 
 FailureOr<SmallVector<int64_t>> getHostAggregateFieldIndices(Type sourceType, TypeRange fields, ModuleOp module) {
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(sourceType, module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(sourceType, module);
     if (failed(layout) || layout->fieldOffsets.size() != fields.size())
         return failure();
     SmallVector<int64_t> indices;
@@ -169,7 +169,7 @@ FailureOr<SmallVector<int64_t>> getHostAggregateFieldIndices(Type sourceType, Ty
         if (fieldOffset != offset)
             ++physicalIndex;
         indices.push_back(physicalIndex++);
-        FailureOr<ValueAbiLayout> fieldLayout = getValueAbiLayout(field, module);
+        FailureOr<ValueAbiLayout> fieldLayout = getValueStorageLayout(field, module);
         if (failed(fieldLayout))
             return failure();
         offset = fieldOffset + fieldLayout->size;
@@ -360,7 +360,7 @@ struct AggregateViewPattern final : ConversionPattern {
             return failure();
         if (view.getElementType().isIntOrFloat())
             return failure();
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
         if (failed(layout) || layout->leaves.empty())
             return operation->emitError("cannot resolve aggregate TensorView storage layout");
         const unsigned storagePosition = load ? 0 : 1;

@@ -5,8 +5,10 @@ import atexit
 import hashlib
 import importlib
 import inspect
+import json
+import tempfile
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
@@ -14,9 +16,9 @@ from typing import Any, ClassVar, Protocol
 import numpy as np
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from ..bundle import canonical_json, make_target_options
+from ..bundle import canonical_json, make_target_options, parse_reflection_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
-from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
+from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
 from .execution_graph import (
@@ -45,8 +47,12 @@ class _CompiledKernel:
     function: ast.FunctionDef
     frontend: FrontendCompileResult
     builtin_names: tuple[str, ...]
-    writable_names: tuple[str, ...]
     program: Any
+    canonical_directory: tempfile.TemporaryDirectory[str]
+    canonical_program: bytes
+    canonical_artifact_system: bytes
+    canonical_stage_bindings: dict[str, str]
+    canonical_stage: Any
     dependency_hashes: tuple[tuple[Path, str], ...] = ()
     native: Any | None = None
     native_generation: int = -1
@@ -124,6 +130,8 @@ class Kernel:
     def _argument_signature(value: Any) -> tuple[Any, ...]:
         if isinstance(value, (TensorStorage, TensorView)):
             return ("tensor",)
+        if isinstance(value, _TextureResource):
+            return ("texture", tuple(value.shape))
         return ("value", type(value).__module__, type(value).__qualname__)
 
     def _dispatch_key(
@@ -157,16 +165,24 @@ class Kernel:
     def _load_native(compiled: _CompiledKernel, state: Any, entry: str) -> None:
         if compiled.native is not None and compiled.native_generation == state._runtime_generation:
             return
-        if state._architecture == state.cpu:
-            compiled.native = state._native_runtime.load_cpu_entry(compiled.program, entry)
-        else:
-            if len(compiled.program.artifacts) != 1:
-                raise RuntimeError("kernel compilation must produce exactly one artifact")
-            compiled.native = state._native_runtime.load(
-                compiled.program.artifacts[0][1],
-                compiled.program.reflection,
-                entry,
-            )
+        cpu_stages = (
+            [
+                (
+                    compiled.canonical_stage.metadata["symbol"],
+                    compiled.canonical_stage.entry,
+                    compiled.program,
+                )
+            ]
+            if state._architecture == state.cpu
+            else []
+        )
+        compiled.native = state._native_runtime.load_canonical_program(
+            compiled.canonical_program,
+            compiled.canonical_artifact_system,
+            compiled.canonical_directory.name,
+            compiled.canonical_stage_bindings,
+            cpu_stages,
+        )
         compiled.native_generation = state._runtime_generation
 
     @staticmethod
@@ -191,34 +207,6 @@ class Kernel:
                 for node in ast.walk(argument.annotation)
             )
         )
-
-    @staticmethod
-    def _writable_parameters(frontend: FrontendCompileResult) -> tuple[str, ...]:
-        entry = next(
-            (function for function in frontend.typed_functions if function.symbol == frontend.request.entry),
-            None,
-        )
-        if entry is None:
-            raise RuntimeError("compiled kernel has no typed entry function")
-        parameter_names = {parameter.name for parameter in entry.parameters}
-        writable = {
-            parameter.name
-            for parameter in entry.parameters
-            if (
-                parameter.type.kind == "tensor_view"
-                and parameter.access is not AccessMode.READ
-                or parameter.type.kind == "texture"
-                and parameter.type.arguments[3] in {"write", "read_write"}
-            )
-        }
-        writable.update(
-            effect.owner.name
-            for effect in entry.effects
-            if isinstance(effect, StorageEffect)
-            and effect.kind is StorageEffectKind.WRITE
-            and effect.owner.name in parameter_names
-        )
-        return tuple(sorted(writable))
 
     @classmethod
     def _tensor_view_access(cls, annotation: ast.expr | None) -> str | None:
@@ -531,16 +519,79 @@ class Kernel:
         if cached is None:
             if target is None:
                 raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
-            program = state._native.Compiler().compile_program_result(frontend.mlir, target, **options.native_options)
+            native_compiler = state._native.Compiler()
+            planned = native_compiler.plan_kernel_result(frontend.mlir)
+            if not planned.ok:
+                raise RuntimeError(planned.diagnostics)
+            plan_reflection = parse_reflection_json(planned.reflection)
+            requests = plan_reflection.get("kernel_compile_requests")
+            execution = plan_reflection.get("execution")
+            values = execution.get("values") if isinstance(execution, Mapping) else None
+            if not isinstance(requests, list) or len(requests) != 1 or not isinstance(requests[0], Mapping):
+                raise RuntimeError("direct kernel planning must produce exactly one compile request")
+            if not isinstance(values, list):
+                raise RuntimeError("direct kernel planning produced no executable values")
+            request = requests[0]
+            request_id = request.get("id")
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError("direct kernel planning produced an invalid compile request id")
+            from ..program_frontend.providers import DirectKernelDslProvider
+
+            implementation = DirectKernelDslProvider(frontend.mlir, self._entry).lower(
+                request,
+                {
+                    value["id"]: value
+                    for value in values
+                    if isinstance(value, Mapping) and isinstance(value.get("id"), int)
+                },
+            )
+            if implementation is None:
+                raise RuntimeError("direct kernel provider did not match the C++ compile request")
+            program = native_compiler.compile_program_result(implementation.mlir, target, **options.native_options)
             if not program.ok:
                 raise RuntimeError(program.diagnostics)
+            from .._shader_assets.cooking import _canonical_kernel_deployment, _direct_compiled_stage
+
+            canonical_directory = tempfile.TemporaryDirectory(prefix="vernon-kernel-")
+            user_names = [argument.arg for argument in function.args.args if argument.arg not in builtins]
+            concrete_shapes = {
+                name: tuple(value.shape)
+                for name, value in zip(user_names, arguments, strict=True)
+                if isinstance(value, (TensorStorage, TensorView, _TextureResource))
+            }
+            canonical_stage = _direct_compiled_stage(program, target=options, entry=implementation.entry)
+            finalized = native_compiler.finalize_program_result(
+                planned.reflection,
+                [
+                    (
+                        request_id,
+                        canonical_stage.id,
+                        canonical_stage.entry,
+                        canonical_json(dict(canonical_stage.reflection)),
+                    )
+                ],
+                [(request_id, name, list(shape)) for name, shape in sorted(concrete_shapes.items())],
+            )
+            if not finalized.ok:
+                raise RuntimeError(finalized.diagnostics)
+            canonical_program, artifact_system, stage_bindings, canonical_stage = _canonical_kernel_deployment(
+                canonical_stage,
+                parse_reflection_json(finalized.reflection),
+                target=options,
+                request_id=request_id,
+                output=Path(canonical_directory.name),
+            )
             cached = _CompiledKernel(
                 frontend.mlir,
                 function,
                 frontend,
                 builtins,
-                self._writable_parameters(frontend),
                 program,
+                canonical_directory,
+                json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
+                json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
+                dict(stage_bindings),
+                canonical_stage,
                 self._dependency_hashes(frontend),
             )
             self._cache[key] = cached
@@ -560,7 +611,6 @@ class Kernel:
         binding_cache: _NativeBindingCache,
         binding_tokens: tuple[int | None, ...] | None = None,
     ) -> None:
-        state = _session_state()
         static_tensor_names = {
             argument.arg
             for argument in compiled.function.args.args
@@ -576,10 +626,32 @@ class Kernel:
                 compiled.native,
                 parameter,
                 value,
-                host_value=state._architecture == state.cuda and user_name in static_tensor_names,
+                host_value=user_name in static_tensor_names,
                 annotation=annotations.get(user_name),
                 binding_token=binding_token,
             )
+
+    @staticmethod
+    def _direct_parameter_accesses(
+        compiled: _CompiledKernel,
+        user_parameters: list[str],
+        state: Any,
+    ) -> dict[str, str]:
+        if compiled.native is None:
+            raise RuntimeError("kernel native program is not loaded")
+        native_parameters = list(compiled.native.parameters)
+        if len(native_parameters) != len(user_parameters):
+            raise RuntimeError("finalized kernel endpoint ABI does not match its Python arguments")
+        return {
+            name: (
+                "read"
+                if parameter.access == state._native.ACCESS_READ
+                else "write"
+                if parameter.access == state._native.ACCESS_WRITE
+                else "read_write"
+            )
+            for name, parameter in zip(user_parameters, native_parameters, strict=True)
+        }
 
     def _invoke_direct(
         self,
@@ -598,11 +670,13 @@ class Kernel:
         user_parameters = [
             argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
         ]
+        parameter_accesses = self._direct_parameter_accesses(compiled, user_parameters, state)
         if grid is None:
             writable_shapes = {
                 value.shape
                 for name, value in zip(user_parameters, arguments, strict=True)
-                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView, _TextureResource))
+                if parameter_accesses[name] != "read"
+                and isinstance(value, (TensorStorage, TensorView, _TextureResource))
             }
             if not writable_shapes:
                 raise TypeError("grid is required when no writable Tensor domain can be inferred")
@@ -622,7 +696,7 @@ class Kernel:
         if binding_cache is None:
             binding_cache = _NativeBindingCache()
         dispatch_borrows = [
-            (name, value, "write" if name in compiled.writable_names else "read")
+            (name, value, parameter_accesses[name])
             for name, value in zip(user_parameters, arguments, strict=True)
             if isinstance(value, (TensorStorage, TensorView, _TextureResource))
         ]
@@ -632,6 +706,8 @@ class Kernel:
                 self._bind_direct_arguments(
                     compiled, builder, arguments, user_parameters, binding_cache, binding_tokens
                 )
+                # The loaded single-node pipeline exposes the canonical Program's
+                # groups_x/y/z control arguments through this direct-dispatch facade.
                 builder.grid(*grid)
                 if encoder is None:
                     submission = builder.submit()
@@ -646,7 +722,7 @@ class Kernel:
         for name, value in zip(user_parameters, arguments, strict=True):
             if (
                 state._architecture != state.cpu
-                and name in compiled.writable_names
+                and parameter_accesses[name] != "read"
                 and isinstance(value, (TensorStorage, TensorView, _TextureResource))
             ):
                 value._mark_device_dirty()
@@ -661,35 +737,11 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
-        self._submit_direct(arguments, grid, features)
+        from ..frontend.capture import capture_kernel_call
 
-    def _append_operator(
-        self,
-        operator_dag: Any | None,
-        *arguments: Any,
-        grid: tuple[int, int, int],
-        append: Callable[[Any, Any], None],
-        features: tuple[str, ...] = (),
-    ) -> Any:
-        state = _session_state()
-        compiled = self._compile(arguments, features)
-        if compiled.native is None or state._native_runtime is None:
-            raise RuntimeError("operator kernel is not loaded")
-        user_parameters = [
-            argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
-        ]
-        cache_key = (
-            features,
-            tuple(self._argument_signature(value) for value in arguments),
-        )
-        binding_cache = self._direct_binding_caches.setdefault(cache_key, _NativeBindingCache())
-        with binding_cache.invocation(compiled.native) as builder:
-            self._bind_direct_arguments(compiled, builder, arguments, user_parameters, binding_cache)
-            builder.grid(*grid)
-            if operator_dag is None:
-                operator_dag = builder.operator_dag()
-            append(operator_dag, builder)
-        return operator_dag
+        if capture_kernel_call(self, tuple(arguments), grid, features):
+            return
+        self._submit_direct(arguments, grid, features)
 
     def _submit_direct(
         self,

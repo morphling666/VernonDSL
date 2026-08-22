@@ -400,8 +400,15 @@ class _FunctionEmitter:
             ]
             if contract.builtin is not None:
                 attributes.append(f'vernon.builtin = "{contract.builtin}"')
-            else:
-                attributes.append('vernon.dtype = "f32"')
+            if value_type.kind == "scalar":
+                attributes.append(f'vernon.dtype = "{value_type.name}"')
+                attributes.append(self._abi_leaf_dtypes_attribute(value_type, "vernon.abi_leaf_dtypes"))
+            elif value_type.kind == "tensor":
+                element_type = value_type.arguments[0]
+                assert isinstance(element_type, DslType)
+                if element_type.kind == "scalar":
+                    attributes.append(f'vernon.dtype = "{element_type.name}"')
+                attributes.extend(self._abi_attributes(value_type))
             arguments.append(f"{value.name}: {value.type.mlir} {{{', '.join(attributes)}}}")
 
     def _line(self, text: str) -> None:

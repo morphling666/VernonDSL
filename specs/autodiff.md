@@ -21,6 +21,15 @@
 > differentiation remain deferred. GPU targets may still compile and run
 > ordinary non-AD compute and graphics pipelines.
 
+> **Breaking architecture target:** The profile and direct/cooked descriptions
+> below are historical facts about the currently implemented structured-kernel
+> VJP path, not future deployment alternatives. The coordinated release makes
+> every standalone compute executable a one-node Program and expresses VJP only
+> as Program forward/backward graphs linked by residual state. Kernel structured
+> VJP remains a compute-node implementation detail. After that release, Runtime
+> does not load an old profile manifest or normalize it into a Program. See
+> [`unified_program_vjp.md`](unified_program_vjp.md).
+
 This document defines Vernon's first public automatic-differentiation model.
 The design uses reverse-mode vector-Jacobian products (VJPs) and preserves the
 Value/Storage/Resource split. The implemented surface differentiates CPU
@@ -65,7 +74,7 @@ where `dY` has the same differentiable Value/Storage structure as `Y`, and
 `dX` has the structure selected by `wrt`.
 
 Aggregate Storage cotangents and gradients preserve this logical structure at
-the public API boundary. Compiler profiles may transport canonical ABI leaves
+the public API boundary. Compute-node ABIs may transport canonical leaves
 independently, but the host reconstructs them through one structural
 `TangentLayout` and one packed tangent owner per primal Storage owner.
 
@@ -100,8 +109,8 @@ Values derive gradient structure recursively from floating leaves.
 - An immutable Tensor gradient is an ordinary Tensor Value with the same
   logical shape.
 - A TensorView or mutable Storage gradient is newly owned Storage at the public
-  pullback boundary. In the compiler ABI it is a writable TensorView argument
-  of the backward profile, not a fixed-shape SSA result.
+  pullback boundary. In the compute-node ABI it is a writable TensorView
+  endpoint of the backward stage, not a fixed-shape SSA result.
 - Vector, Matrix, Tensor, Tuple, and Struct Storage elements derive one
   structural tangent schema recursively. Their public gradient is one packed
   tangent `TensorStorage`, not one owner per ABI leaf.
@@ -123,8 +132,8 @@ type, identity, ownership, or layout. The first API does not expose
 buffers are a later, independent Runtime feature.
 
 Dynamic Storage extents remain dynamic through differentiation. Backward
-profiles receive descriptor-backed shape-source TensorViews for primal Storage
-identities, descriptor-backed cotangent TensorViews, and writable gradient
+compute-node implementations receive descriptor-backed shape-source TensorViews
+for primal Storage identities, descriptor-backed cotangent TensorViews, and writable gradient
 TensorViews. Invocation-local adjoint buffers use those runtime extents;
 compiler analysis and reflection must not specialize `dyn` dimensions. This
 does not change the tape allocator ABI.
@@ -132,12 +141,12 @@ does not change the tape allocator ABI.
 External gradient destinations carry mandatory ownership metadata derived by
 autodiff analysis: `invocation_private`, `workgroup_shared`, `atomic_shared`,
 or `none`. Static and dynamic TensorViews use the same rule; shape size never
-selects ownership. Missing metadata fails profile loading, and unsupported
+selects ownership. Missing metadata fails Program resolution, and unsupported
 shared accumulation fails lowering instead of selecting shared staging or
 serial execution.
 
-Forward-with-tape and backward profiles each reflect the same internal
-dispatch contract used by ordinary compute. CPU AD validates both contracts
+Forward and backward compute stages each reflect the same internal dispatch
+contract used by ordinary compute. `ResolveProgram` validates both contracts
 against the requested primal grid before constructing an effect transaction,
 allocating tape, or staging gradients, and validates the backward contract
 again when a reusable pullback is applied.
@@ -175,8 +184,8 @@ Storage versions.
 ## 4. Source and asset declaration
 
 `pipeline_asset()` remains the only cookable declaration. For supported
-autodiff cooking, its `program=` operand is a CPU Kernel VJP
-`ProgramExpression`.
+autodiff cooking, its `program=` operand is a VJP `ProgramExpression`. A CPU
+Kernel operand normalizes to a one-node Program before VJP construction.
 
 ```python
 loss_asset = vd.pipeline_asset(
@@ -194,12 +203,10 @@ loss_asset = vd.pipeline_asset(
 not an execution call and not another asset type.
 
 An ordinary `program=(vertex, fragment)` or `program=kernel` declaration cooks
-only a primal profile. A VJP program expression cooks, under the same asset ID:
-
-- an ordinary primal profile;
-- a `forward_with_tape` profile;
-- a backward profile;
-- versioned tape, cotangent, gradient, `wrt`, and custom-rule reflection.
+one primal Program. A VJP program expression cooks one differentiated Program
+containing forward and backward graphs, residual state, and versioned
+cotangent/gradient signature metadata. The cooker does not emit a three-profile
+topology.
 
 The cooker CLI and descriptor reference remain unchanged:
 
@@ -211,14 +218,14 @@ There is no `ad_pipeline_asset()` and no `autodiff=True` Boolean.
 
 ## 5. Python execution
 
-After the Runtime resolves the cooked pipeline:
+After Runtime resolves the cooked Program:
 
 ```python
-pipeline = vd.load_cooked_vjp_asset(
-    "build/render/render.pipeline.json",
+program = vd.resolve_program(
+    "build/render/render.program.json",
     features=(),
 )
-image, pullback = pipeline.vjp(bindings, grid=(grid_x, grid_y, grid_z))
+image, pullback = program.vjp(bindings, grid=(grid_x, grid_y, grid_z))
 gradients = pullback(d_image)
 
 d_roughness = gradients["material.roughness"]
@@ -227,20 +234,19 @@ d_vertices = gradients["vertices.position"]
 
 The binding names and paths accepted by `wrt` are canonical reflected source
 paths. They are fixed at cook time and cannot be changed by a Runtime call.
-Compiler and Runtime profiles transport structured output cotangents and
+Program signature groups transport structured output cotangents and
 aggregate gradients through flattened, fully qualified leaf paths such as
 `output.color` and `material.roughness`. The public pullback API groups those
 leaves by the declared output or `wrt` path and packs aggregate Storage through
 its reflected `TangentLayout`; leaf paths are not separate public Storage
-owners. Every profile variant must expose identical groups and leaf paths.
+owners. Every Program variant must expose identical groups and leaf paths.
 
-The Runtime stores one canonical typed derivative-group table in
-gradient-then-cotangent order. Direct execution supplies it through POD metadata
-views; cooked execution derives it once from the validated transform and
-backward profile. Both paths validate the same canonical paths, unique group
-ownership and executable signature. Python always reads groups from
-the loaded native pipeline; it does not maintain a second direct or cooked
-grouping model.
+The serialized Program stores derivative authority only in Signature.
+`ResolveProgram` projects one canonical typed derivative-group table in
+gradient-then-cotangent order, validates canonical paths, unique group
+ownership, and the executable signature once, and stores the table in
+ResolvedProgram. Interactive and cooked APIs read groups from ResolvedProgram;
+neither has a second direct/cooked grouping or execution model.
 
 The public C Runtime exposes indexed reflection rather than a scalar-output
 special case:
@@ -266,8 +272,8 @@ does not calibrate later dispatches from maximum observed per-lane usage;
 runtime calibration was removed because it inflated subsequent reservations.
 
 The positive three-dimensional workgroup grid is supplied for each forward invocation;
-it is not part of the pipeline asset, manifest identity, ProgramGraph, profile
-identity, or cooked artifact identity. Each workgroup contains the reflected
+it is not part of Program semantic identity or cooked artifact identity. Each
+workgroup contains the reflected
 `workgroup_size`; invocation carriers use physical `(z, y, x)` order, with X
 fastest. A pullback retains its forward grid and
 always runs backward over that same logical invocation domain.
@@ -282,8 +288,8 @@ Runtime contract does not promise concurrent calls on one pullback.
 
 ### CPU range-phase execution
 
-CPU primal, `forward_with_tape`, and `backward` profiles all use the ordinary
-range-phase scheduler described by
+CPU primal, forward-with-tape, and backward compute implementations all use the
+ordinary range-phase scheduler described by
 [`runtime/design.md`](runtime/design.md#cpu-range-phase-execution). There is no
 AD scalar-entry adapter, worker-local lane identity, fixed-tape execution
 branch, or serial fallback.
@@ -314,7 +320,7 @@ CPU ABI wrapper.
 
 Backward execution creates fresh mutable lane/workgroup phase state for each
 pullback application. The original bounded forward uses the Tape-free primal
-profile and retains one immutable prepared input shadow; it does not construct
+implementation and retains one immutable prepared input shadow; it does not construct
 and discard per-workgroup Tape. Bounded replay restores that shadow, replays one
 complete workgroup with its original virtual IDs, applies backward into shared
 transactional gradient destinations, and releases that segment's Tape. Reverse
@@ -353,10 +359,12 @@ The transform spec participates in frontend semantic identity, compiler cache
 identity, symbols, reflection, cooked stage identity, and the pipeline
 manifest. It does not alter primal helper specialization keys.
 
-The compiler-internal `ProgramGraph` represents one specialized program's
-typed Value flow, structured control flow, Storage effects, alias regions,
-differentiability boundaries, saved Values, and reverse dependencies. It is
-not a deployment graph.
+The compiler's typed Program IR represents one specialized program's Value
+flow, structured kernel-local control semantics, Storage effects, alias
+regions, differentiability boundaries, saved Values, and reverse dependencies.
+Program VJP is the sole authority that constructs deployment forward,
+backward, and residual topology. Kernel structured VJP only supplies a selected
+compute-node implementation and its tape ABI.
 
 ## 7. Stateful Kernel differentiation
 
@@ -378,7 +386,7 @@ Backend capability does not change the frontend derivative graph.
 ## 8. Deferred graphics and custom VJP rules
 
 Compute GPU autodiff supports no-Tape and captured static/dynamic Storage
-pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured profiles use
+pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured implementations use
 complete-workgroup bounded replay with original virtual IDs, device-local Tape,
 fixed lane-status readback, transactional gradient publication, and no
 GPU-to-host Tape payload readback. RHI graph resources provide checkpoint
@@ -411,6 +419,10 @@ reflection, and manifests.
 
 ## 9. ExecutionGraph composition
 
+The following is the shipped pre-breaking composition behavior, retained here
+as implementation history. It is removed as a second AD topology by the
+coordinated Program release.
+
 Python `ExecutionGraph` builders may name differentiable resource or execution
 parameter inputs and Storage objective resources. A `VjpComputePass` binds one
 directly compiled or cooked structured CPU VJP to graph resources. Compilation
@@ -419,6 +431,11 @@ Automatic checkpoint planning currently requires directly compiled passes,
 because the frozen pipeline contract does not expose cooked tape-size and
 replay-cost metadata; cooked graph VJPs remain available without checkpoint
 planning.
+
+In the target architecture, Program forward/backward/residual graphs are the
+only top-level AD topology. Native ExecutionGraph consumes that topology for
+hazards, checkpointing, replay, and submission; it does not discover a second
+reverse graph from passes or compose profile pullbacks.
 
 `CompiledExecutionGraph.vjp()` calls the native graph VJP entry and returns a
 `GraphPullback` retaining that submission, the plan, resources, checkpoints,
@@ -442,10 +459,10 @@ remain required before CPU/WebAssembly graph VJP is complete.
 
 ## 10. C and C++ deployment API
 
-C++ can load a CPU manifest and select its cooked VJP profile:
+C++ resolves a differentiated Program and invokes its VJP:
 
 ```cpp
-auto program = bundle.resolvePipeline("pipeline/render");
+auto program = bundle.resolveProgram("pipeline/render");
 auto [image, pullback] = program.vjp(bindings, {gridX, gridY, gridZ});
 auto gradients = pullback({{"color", dImage}});
 ```
@@ -455,7 +472,7 @@ The application-facing C ABI uses an opaque pullback handle:
 ```c
 VernonPullback *pullback = NULL;
 VernonLaunchSize grid = {grid_x, grid_y, grid_z};
-vernonAdPipelineForward(program, grid, &inputs, &outputs, &pullback);
+vernonProgramVjpForward(program, grid, &inputs, &outputs, &pullback);
 vernonPullbackApply(pullback, &cotangents, &gradients);
 vernonPullbackDestroy(pullback);
 ```
@@ -466,15 +483,15 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 12 and pipeline contract 16 are the current CPU VJP boundary.
-Differentiated assets use the canonical pipeline manifest with one optional
-root `autodiff` object; pipeline-14 transform/profile fields are not aliases in
-the current schema. No
-older manifest is reinterpreted as containing current structured profiles.
-CPU VJP has one structured compiler/runtime path. Differentiated
-GPU and graphics assets are not supported.
+Compiler contract 12 and pipeline contract 16 remain the current shipped CPU
+VJP boundary until the coordinated release; their profile behavior above is
+historical implementation fact. The breaking Program release updates the
+contracts together and intentionally rejects all older profile manifests. It
+does not reinterpret, normalize, or retain them as a parallel loading path.
+The target CPU VJP has one Program/ResolveProgram/ExecuteProgram path.
+Differentiated graphics remains unsupported.
 
-CPU acceptance covers direct and cooked structured Storage VJP, recursive
+Current pre-breaking CPU acceptance covers direct and cooked structured Storage VJP, recursive
 aggregate tangents, multiple outputs, owner aliases, signed-stride descriptors,
 multi-invocation cotangent carriers, dynamic control flow, scratch overwrite,
 finite differences, and deterministic reusable pullbacks. Runtime acceptance

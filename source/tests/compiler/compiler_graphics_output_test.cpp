@@ -434,22 +434,28 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
           vernon.interface = "output", vernon.location = 0 : i64
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 1 : i64
+          vernon.interface = "output", vernon.location = 1 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 2 : i64
+          vernon.interface = "output", vernon.location = 2 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
-          vernon.interface = "output", vernon.location = 3 : i64
+          vernon.interface = "output", vernon.location = 3 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
-          vernon.interface = "output", vernon.location = 4 : i64
+          vernon.interface = "output", vernon.location = 4 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 5 : i64
+          vernon.interface = "output", vernon.location = 5 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
-          vernon.interface = "output", vernon.location = 6 : i64
+          vernon.interface = "output", vernon.location = 6 : i64,
+          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
         }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %lod = arith.constant 1.0 : f32
     %level = arith.constant 1 : i32
@@ -494,10 +500,12 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
   func.func @builtin_vertex(
       %vertexId: i32 {
-        vernon.interface = "input", vernon.builtin = "vertex_index"
+        vernon.interface = "input", vernon.builtin = "vertex_index",
+        vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
       },
       %instanceId: i32 {
-        vernon.interface = "input", vernon.builtin = "instance_index"
+        vernon.interface = "input", vernon.builtin = "instance_index",
+        vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
       },
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -568,7 +576,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       },
       %coordinate: tensor<3xi32> {
         vernon.interface = "uniform",
-        vernon.source_name = "coordinate"
+        vernon.source_name = "coordinate",
+        vernon.dtype = "i32",
+        vernon.abi_leaf_dtypes = ["i32"]
       },
       %value: tensor<4xf32> {
         vernon.interface = "uniform",

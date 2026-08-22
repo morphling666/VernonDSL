@@ -158,14 +158,6 @@ struct ScalarAutodiffValue final : GraphAutodiffValue {
     uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(this); }
     uint64_t allocationBytes() const override { return sizeof(value); }
 
-    std::shared_ptr<GraphAutodiffValue> add(const GraphAutodiffValue &other, std::string &error) const override {
-        const auto *scalar = dynamic_cast<const ScalarAutodiffValue *>(&other);
-        if (!scalar) {
-            error = "incompatible test autodiff value";
-            return {};
-        }
-        return std::make_shared<ScalarAutodiffValue>(value + scalar->value);
-    }
     bool materialize(detail::RhiCommandPlanSink *sink, std::string &error) override {
         (void)sink;
         (void)error;
@@ -1318,7 +1310,7 @@ TEST(ExecutionGraphAutodiff, SerializesConcurrentApplicationsWithoutSharingGradi
         EXPECT_DOUBLE_EQ(applications[index].get(), static_cast<double>((index + 1) * 10));
 }
 
-TEST(ExecutionGraphAutodiff, AccumulatesBranchedObjectivesByEndpointIdentity) {
+TEST(ExecutionGraphAutodiff, RejectsFanInThatWasNotLoweredFromProgramGraph) {
     ExecutionGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer leftObjective = importCheckpointBuffer(graph, 2, true);
@@ -1336,10 +1328,9 @@ TEST(ExecutionGraphAutodiff, AccumulatesBranchedObjectivesByEndpointIdentity) {
     auto submission = pullback->submit(
         {{"left", std::make_shared<ScalarAutodiffValue>(5.0)}, {"right", std::make_shared<ScalarAutodiffValue>(7.0)}},
         false);
-    ASSERT_TRUE(submission->wait(error)) << error;
-    const auto gradient = std::dynamic_pointer_cast<ScalarAutodiffValue>(submission->gradients().front().second);
-    ASSERT_TRUE(gradient);
-    EXPECT_DOUBLE_EQ(gradient->value, 31.0);
+    EXPECT_FALSE(submission->wait(error));
+    EXPECT_NE(error.find("Program Operation Graph"), std::string::npos);
+    EXPECT_TRUE(submission->gradients().empty());
 }
 
 TEST(ExecutionGraphAutodiff, DeduplicatesAliasedContributionsAndPublishesGradientsTransactionally) {
@@ -1600,6 +1591,25 @@ TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails
     auto retry = pullback->submit({{"objective", std::make_shared<ScalarAutodiffValue>(1.0)}}, false);
     EXPECT_FALSE(retry->wait(error));
     EXPECT_EQ(error, "graph pullback is no longer reusable after failed checkpoint replay");
+}
+
+TEST(ExecutionGraphAutodiff, PlansExplicitReverseCommandDagMetadata) {
+    ExecutionGraph graph;
+    graph.setExplicitReverseCommandDag({
+        {0, {}, 64, 0, 5},
+        {1, {0}, 0, 32, 3},
+    });
+    graph.planAutodiffCheckpoints(96);
+    std::string error;
+    auto compiled = graph.compile(error);
+    ASSERT_TRUE(compiled) << error;
+    const AutodiffDagCheckpointPlan *plan = compiled->autodiffCheckpointPlan();
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->backwardValueBytes, 96u);
+    EXPECT_EQ(plan->replayCost, 8u);
+
+    ExecutionGraph invalid;
+    EXPECT_THROW(invalid.setExplicitReverseCommandDag({{0, {0}, 0, 0, 0}}), std::invalid_argument);
 }
 
 TEST(ExecutionGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFailure) {

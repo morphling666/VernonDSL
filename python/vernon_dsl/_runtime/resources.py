@@ -106,12 +106,13 @@ class _NativeBindingCache:
                 self._prepared.clear()
             yield native_pipeline.invocation_builder()
 
-    def _bind(self, builder: Any, parameter: Any, token: tuple[Any, ...], prepare: Any) -> None:
+    def _bind(self, builder: Any, parameter: Any, token: tuple[Any, ...], prepare: Any) -> Any:
         cached = self._prepared.get(parameter.slot)
         if cached is None or cached[0] != token:
             cached = (token, prepare())
             self._prepared[parameter.slot] = cached
         builder.prepared_argument(cached[1])
+        return cached[1]
 
     def bind_argument(
         self,
@@ -123,7 +124,7 @@ class _NativeBindingCache:
         host_value: bool = False,
         annotation: Any | None = None,
         binding_token: int | None = None,
-    ) -> None:
+    ) -> Any:
         state = _session_state()
         if isinstance(value, (TensorStorage, TensorView)):
             if state._architecture == state.cpu or host_value:
@@ -135,13 +136,12 @@ class _NativeBindingCache:
                     tuple(array.shape),
                     tuple(array.strides),
                 )
-                self._bind(
+                return self._bind(
                     builder,
                     parameter,
                     token,
                     lambda: builder.prepare_host_tensor(parameter.name, array),
                 )
-                return
             if state._rhi_host is None:
                 raise RuntimeError("device Tensor arguments require a GPU RHI host")
             buffer = value._resident_buffer()
@@ -154,7 +154,7 @@ class _NativeBindingCache:
                 tuple(layout.byte_strides),
                 layout.byte_offset,
             )
-            self._bind(
+            return self._bind(
                 builder,
                 parameter,
                 token,
@@ -167,20 +167,18 @@ class _NativeBindingCache:
                     layout.byte_offset,
                 ),
             )
-            return
         if isinstance(value, _TextureResource):
             if state._architecture == state.cpu:
                 raise TypeError("CPU kernels do not support Texture arguments")
             if state._rhi_host is None:
                 raise RuntimeError("Texture arguments require a GPU RHI host")
             view = value._resident_view()
-            self._bind(
+            return self._bind(
                 builder,
                 parameter,
                 ("rhi-texture", id(view)),
                 lambda: builder.prepare_rhi_texture(parameter.name, view),
             )
-            return
 
         execution_token = ("execution-value", binding_token) if binding_token is not None else None
         cached = self._prepared.get(parameter.slot)
@@ -210,17 +208,31 @@ class _NativeBindingCache:
                 state._native.DATA_F64: np.dtype(np.float64),
             }
             leaves = tuple(parameter.element_leaves)
-            dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][1:] == (1, 0) else None
+            dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][2] == 0 else None
             if dtype is None:
                 raise TypeError(f"aggregate parameter {parameter.name!r} requires canonical TensorStorage")
-            host_array = np.asarray(value, dtype=dtype)
-            if tuple(host_array.shape) != tuple(parameter.shape):
+            source = np.asarray(value, dtype=dtype)
+            whole_value = not parameter.shape and leaves[0][1] > 1
+            if whole_value:
+                packed = np.ascontiguousarray(source)
+                if packed.size != leaves[0][1] or packed.nbytes != parameter.element_byte_size:
+                    raise ValueError(
+                        f"parameter {parameter.name!r} expects {leaves[0][1]} scalar values, got {packed.size}"
+                    )
+                host_array = np.empty(
+                    (),
+                    dtype=np.dtype([("_bytes", np.uint8, (parameter.element_byte_size,))]),
+                )
+                host_array["_bytes"] = packed.view(np.uint8).reshape(-1)
+            else:
+                host_array = source
+            if not whole_value and tuple(host_array.shape) != tuple(parameter.shape):
                 raise ValueError(
                     f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
                     f"got {tuple(host_array.shape)}"
                 )
         token = execution_token or ("host-value", host_array.dtype.str, tuple(host_array.shape), host_array.tobytes())
-        self._bind(
+        return self._bind(
             builder,
             parameter,
             token,

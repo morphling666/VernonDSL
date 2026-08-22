@@ -1145,11 +1145,9 @@ public:
             values.emplace(endpoint, std::move(contribution));
             return true;
         }
-        auto sum = found->second->add(*contribution, error);
-        if (!sum)
-            return false;
-        found->second = std::move(sum);
-        return true;
+        error = "execution graph VJP encountered cotangent fan-in that was not lowered from a Program "
+                "Operation Graph";
+        return false;
     }
 
     bool observeBackwardValues(const EndpointValues &accumulated, const EndpointValues *localValues,

@@ -90,8 +90,23 @@ CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions) {
     return {readString("triple"), readString("processor"), readString("features")};
 }
 
-std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
-                                                      const nb::dict &targetOptions) {
+namespace {
+
+struct OwnedCompileOptions {
+    VernonCompileOptions value{};
+    CpuTargetOptionStrings cpu;
+    std::string platform;
+
+    void refresh() {
+        if (value.target == VERNON_TARGET_CPU) {
+            value.as.cpu.triple = VernonStringView{cpu.triple.data(), cpu.triple.size()};
+            value.as.cpu.processor = VernonStringView{cpu.processor.data(), cpu.processor.size()};
+            value.as.cpu.features = VernonStringView{cpu.features.data(), cpu.features.size()};
+        }
+    }
+};
+
+OwnedCompileOptions parseCompileOptions(VernonTarget target, const nb::dict &targetOptions) {
     auto readString = [&](const char *name) {
         return targetOptions.contains(name) ? nb::cast<std::string>(targetOptions[name]) : std::string();
     };
@@ -102,34 +117,108 @@ std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const 
                 throw std::invalid_argument("unknown option '" + key + "' for selected target");
         }
     };
-    VernonCompileOptions options{};
-    options.struct_size = sizeof(options);
-    options.target = target;
-    CpuTargetOptionStrings cpu;
+    OwnedCompileOptions parsed;
+    parsed.value.struct_size = sizeof(parsed.value);
+    parsed.value.target = target;
     if (target == VERNON_TARGET_CPU) {
-        cpu = parseCpuTargetOptions(targetOptions);
-        options.as.cpu.triple = VernonStringView{cpu.triple.data(), cpu.triple.size()};
-        options.as.cpu.processor = VernonStringView{cpu.processor.data(), cpu.processor.size()};
-        options.as.cpu.features = VernonStringView{cpu.features.data(), cpu.features.size()};
+        parsed.cpu = parseCpuTargetOptions(targetOptions);
     } else if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES) {
         rejectUnknown({"version"});
-        options.as.opengl.version =
+        parsed.value.as.opengl.version =
             targetOptions.contains("version") ? nb::cast<uint32_t>(targetOptions["version"]) : 0;
     } else if (target == VERNON_TARGET_METAL) {
         rejectUnknown({"platform"});
-        const std::string platform = readString("platform");
-        options.as.metal.platform = platform.empty() || platform == "macos" ? VERNON_METAL_PLATFORM_MACOS
-                                    : platform == "ios"                     ? VERNON_METAL_PLATFORM_IOS
-                                                        : static_cast<VernonMetalPlatform>(UINT32_MAX);
+        parsed.platform = readString("platform");
+        parsed.value.as.metal.platform = parsed.platform.empty() || parsed.platform == "macos"
+                                             ? VERNON_METAL_PLATFORM_MACOS
+                                         : parsed.platform == "ios" ? VERNON_METAL_PLATFORM_IOS
+                                                                    : static_cast<VernonMetalPlatform>(UINT32_MAX);
     } else if (target == VERNON_TARGET_DIRECTX) {
         rejectUnknown({"shader_model"});
-        options.as.directx.shader_model =
+        parsed.value.as.directx.shader_model =
             targetOptions.contains("shader_model") ? nb::cast<uint32_t>(targetOptions["shader_model"]) : 0;
     } else {
         rejectUnknown({});
     }
+    parsed.refresh();
+    return parsed;
+}
+
+} // namespace
+
+std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
+                                                      const nb::dict &targetOptions) {
+    OwnedCompileOptions options = parseCompileOptions(target, targetOptions);
+    options.refresh();
     return std::make_unique<CompiledProgram>(
-        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options), target);
+        vernonCompilerCompileMlirWithOptions(compiler.context, mlir.data(), mlir.size(), &options.value), target);
+}
+
+std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std::string &program) {
+    return std::make_unique<CompiledProgram>(
+        vernonCompilerPlanProgram(compiler.context, program.data(), program.size()), VERNON_TARGET_CPU);
+}
+
+std::unique_ptr<CompiledProgram> planKernelResult(Compiler &compiler, const std::string &kernel) {
+    return std::make_unique<CompiledProgram>(vernonCompilerPlanKernel(compiler.context, kernel.data(), kernel.size()),
+                                             VERNON_TARGET_CPU);
+}
+
+std::unique_ptr<CompiledProgram>
+planGraphicsResult(Compiler &compiler, const std::vector<std::string> &stages, const std::string &topology,
+                   const std::vector<std::string> &features, const std::vector<std::string> &attachmentTypes,
+                   uint32_t colorCount, const std::vector<std::tuple<std::string, std::string>> &operands) {
+    std::vector<VernonGraphicsStageSource> stageSources;
+    stageSources.reserve(stages.size());
+    for (const std::string &stage : stages)
+        stageSources.push_back({sizeof(VernonGraphicsStageSource), stage.data(), stage.size()});
+    std::vector<VernonStringView> featureViews;
+    featureViews.reserve(features.size());
+    for (const std::string &feature : features)
+        featureViews.push_back({feature.data(), feature.size()});
+    std::vector<VernonStringView> attachmentViews;
+    attachmentViews.reserve(attachmentTypes.size());
+    for (const std::string &type : attachmentTypes)
+        attachmentViews.push_back({type.data(), type.size()});
+    std::vector<VernonGraphicsPlanOperand> operandViews;
+    operandViews.reserve(operands.size());
+    for (const auto &[name, type] : operands)
+        operandViews.push_back(
+            {sizeof(VernonGraphicsPlanOperand), {name.data(), name.size()}, {type.data(), type.size()}});
+    return std::make_unique<CompiledProgram>(
+        vernonCompilerPlanGraphics(compiler.context, stageSources.data(), stageSources.size(), topology.data(),
+                                   topology.size(), featureViews.data(), featureViews.size(), attachmentViews.data(),
+                                   attachmentViews.size(), colorCount, operandViews.data(), operandViews.size()),
+        VERNON_TARGET_CPU);
+}
+
+std::unique_ptr<CompiledProgram>
+finalizeProgramResult(Compiler &compiler, const std::string &plan,
+                      const std::vector<std::tuple<std::string, std::string, std::string, std::string>> &inputs,
+                      const std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>> &inputShapes) {
+    std::vector<VernonCompiledKernel> kernels;
+    kernels.reserve(inputs.size());
+    for (const auto &[requestId, stageId, entry, reflection] : inputs)
+        kernels.push_back({{requestId.data(), requestId.size()},
+                           {stageId.data(), stageId.size()},
+                           {entry.data(), entry.size()},
+                           {reflection.data(), reflection.size()}});
+    std::vector<VernonProgramShapeFact> shapeFacts;
+    shapeFacts.reserve(inputShapes.size());
+    for (const auto &[requestId, parameter, extents] : inputShapes)
+        shapeFacts.push_back({{requestId.data(), requestId.size()},
+                              {parameter.data(), parameter.size()},
+                              extents.data(),
+                              extents.size()});
+    return std::make_unique<CompiledProgram>(
+        vernonCompilerFinalizeProgramWithShapes(compiler.context, plan.data(), plan.size(), kernels.data(),
+                                                kernels.size(), shapeFacts.data(), shapeFacts.size()),
+        VERNON_TARGET_CPU);
+}
+
+std::unique_ptr<CompiledProgram> analyzeProgramResult(Compiler &compiler, const std::string &mlir) {
+    return std::make_unique<CompiledProgram>(vernonCompilerValidateMlir(compiler.context, mlir.data(), mlir.size()),
+                                             VERNON_TARGET_CPU);
 }
 
 std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,

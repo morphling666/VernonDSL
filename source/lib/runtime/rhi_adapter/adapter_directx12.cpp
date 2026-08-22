@@ -700,8 +700,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto *value = &values[bindings.valueIndices[index]];
         if (value->kind != slot.layout.kind)
             return fail(adapter, "D3D12 binding slot or kind is invalid");
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.inlineStorage.size())
                 return fail(adapter, "D3D12 inline or uniform-buffer binding size is invalid");
             bindings.resolvedValues[index] = 0;
@@ -752,9 +751,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const bool slotChanged =
             slot.flags != value.flags || !sameResource(slot.resourceReference, resource) ||
             (value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && slot.stride != value.payload.buffer.stride) ||
-            ((value.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-              value.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) &&
-             value.payload.inline_value.data &&
+            (packedUniformBytes(value.kind, slot.layout.interface_kind) && value.payload.inline_value.data &&
              std::memcmp(slot.inlineStorage.data(), value.payload.inline_value.data, value.payload.inline_value.size));
         const bool graphicsRootConstant = slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                                           slot.layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
@@ -768,8 +765,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto &value = values[bindings.valueIndices[index]];
         slot.flags = value.flags;
         slot.resourceReference = {};
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             std::memcpy(slot.inlineStorage.data(), value.payload.inline_value.data, value.payload.inline_value.size);
             slot.resource = slot.inlineResource.resource;
             slot.offset = 0;
@@ -840,19 +836,20 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
                 destroyBindingSetImpl(*bindings);
                 return fail(adapter, "D3D12 binding layout contains duplicate slots");
             }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                 slot.inlineStorage.resize(slot.layout.element_size);
                 const bool needsInlineResource = slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                                                 slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                                                  slot.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                 if (needsInlineResource) {
                     const size_t resourceSize =
                         slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
                             ? (static_cast<size_t>(slot.layout.element_size) + 255u) & ~size_t{255u}
                             : slot.layout.element_size;
-                    if (!bindings->device->createBuffer(
-                            slot.inlineResource, resourceSize, slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE,
-                            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, adapter.error)) {
+                    if (!bindings->device->createBuffer(slot.inlineResource, resourceSize,
+                                                        slot.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER,
+                                                        D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON,
+                                                        adapter.error)) {
                         destroyBindingSetImpl(*bindings);
                         return VERNON_STATUS_INTERNAL_ERROR;
                     }
@@ -1167,21 +1164,53 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                     resourceCpu.ptr += resourceIncrement;
                 }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-                auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
-                if (!buffer || !buffer->resource)
-                    return fail(adapter, "D3D12 draw contains an invalid storage buffer");
-                if (!transition(adapter, commandEncoder, commands, *buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-                    return fail(adapter, "D3D12 draw could not track storage buffer state",
-                                VERNON_STATUS_INTERNAL_ERROR);
-                if (!reuseDescriptors) {
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
-                    view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    view.Format = DXGI_FORMAT_R32_TYPELESS;
-                    view.Buffer.FirstElement = slot.offset / 4;
-                    view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
-                    view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                    device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, resourceCpu);
-                    resourceCpu.ptr += resourceIncrement;
+                if (slot.layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+                    if (!reuseDescriptors) {
+                        ID3D12Resource *upload = nullptr;
+                        size_t uploadOffset = 0;
+                        uint8_t *mapped = nullptr;
+                        if (!device.acquireStaging(true, slot.inlineStorage.size(), 256, upload, uploadOffset, mapped,
+                                                   adapter.error))
+                            return VERNON_STATUS_INTERNAL_ERROR;
+                        std::memcpy(mapped, slot.inlineStorage.data(), slot.inlineStorage.size());
+                        if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                        D3D12_RESOURCE_STATE_COPY_DEST))
+                            return fail(adapter, "D3D12 draw could not track inline resource state",
+                                        VERNON_STATUS_INTERNAL_ERROR);
+                        commands->CopyBufferRegion(slot.inlineResource.resource, 0, upload, uploadOffset,
+                                                   slot.inlineStorage.size());
+                        if (!transition(adapter, commandEncoder, commands, slot.inlineResource,
+                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                            return fail(adapter, "D3D12 draw could not track inline resource state",
+                                        VERNON_STATUS_INTERNAL_ERROR);
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                        view.Format = DXGI_FORMAT_R32_TYPELESS;
+                        view.Buffer.FirstElement = 0;
+                        view.Buffer.NumElements =
+                            static_cast<UINT>(std::max<uint64_t>(1, (slot.inlineStorage.size() + 3) / 4));
+                        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                        device.device->CreateUnorderedAccessView(slot.inlineResource.resource, nullptr, &view,
+                                                                 resourceCpu);
+                        resourceCpu.ptr += resourceIncrement;
+                    }
+                } else {
+                    auto *buffer = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource);
+                    if (!buffer || !buffer->resource)
+                        return fail(adapter, "D3D12 draw contains an invalid storage buffer");
+                    if (!transition(adapter, commandEncoder, commands, *buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+                        return fail(adapter, "D3D12 draw could not track storage buffer state",
+                                    VERNON_STATUS_INTERNAL_ERROR);
+                    if (!reuseDescriptors) {
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC view{};
+                        view.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+                        view.Format = DXGI_FORMAT_R32_TYPELESS;
+                        view.Buffer.FirstElement = slot.offset / 4;
+                        view.Buffer.NumElements = static_cast<UINT>(std::max<uint64_t>(1, (slot.size + 3) / 4));
+                        view.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+                        device.device->CreateUnorderedAccessView(buffer->resource, nullptr, &view, resourceCpu);
+                        resourceCpu.ptr += resourceIncrement;
+                    }
                 }
             } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
                 auto *image = static_cast<rhi::directx12::Image *>(slot.opaqueResource);

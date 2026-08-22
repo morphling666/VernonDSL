@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -1282,6 +1283,31 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(fill.compile_count, 1)
         fill(output, 20.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
+
+    def test_direct_kernel_uses_finalized_program_controls_and_access(self) -> None:
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+        compiled = fill._compile((output, 1.0), ())
+        program = json.loads(compiled.canonical_program)
+        node = program["graphs"][0]["nodes"][0]
+        self.assertEqual(
+            node["operation"]["workgroups"],
+            [
+                {"control": {"argument": 2}},
+                {"control": {"argument": 3}},
+                {"control": {"argument": 4}},
+            ],
+        )
+        self.assertEqual(program["storages"][0]["descriptor"]["byte_length"], output.to_numpy().nbytes)
+        artifact_system = json.loads(compiled.canonical_artifact_system)
+        artifact = next(iter(artifact_system["artifacts"].values()))
+        output_endpoint = next(
+            endpoint
+            for endpoint in artifact["reflection"]["endpoints"]
+            if endpoint.get("interface") == "argument" and endpoint.get("index") == 0
+        )
+        self.assertEqual(output_endpoint["layout"]["shape"], [-1, -1])
+        self.assertEqual(compiled.native.parameters[0].access, vd._native.ACCESS_WRITE)
+        self.assertFalse(hasattr(compiled, "writable_names"))
 
     def test_warm_dispatch_skips_frontend_lowering(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

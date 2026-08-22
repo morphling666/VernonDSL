@@ -203,10 +203,10 @@ permit removing queue waits or letting recorded work outlive its owners.
 
 ### Post-release platform and execution sequence
 
-The sequencing and scope for performance work, statically linked browser
-WebAssembly CPU objects, asynchronous GPU execution, and GPU autodiff are
-defined in the
-[`Platform and execution evolution plan`](platform_execution_plan.md).
+Browser WebAssembly CPU objects are sequenced in
+[`web_wasm.md`](web_wasm.md). GPU autodiff and Program VJP follow
+[`autodiff.md`](autodiff.md) and
+[`unified_program_vjp.md`](unified_program_vjp.md).
 
 ### Host language and native interop
 

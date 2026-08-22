@@ -28,9 +28,9 @@ partition。Kernel、ComputePass 和 RenderPass 是 lowering 结果，不是用�
 
 本规范不要求：
 
-- 第一版支持 graphics differentiation；
+- 把 graphics differentiation 纳入 active VJP；
 - 自动微分 opaque 外部 binary；
-- 把具体 `RenderTarget`、clear/load/store 或帧资源 Cook 进 Program Asset；
+- 把一次 invocation 的具体帧资源作为 Program-owned object Cook 进 asset；
 - 把 C++ ExecutionGraph 序列化为 Program Asset；
 - 在当前发布前修改既有 compiler contract 或 pipeline contract。
 
@@ -64,6 +64,32 @@ ExecutionGraph / Command DAG / RHI
 
 `Module` 不拥有具体帧资源，不负责 queue、barrier、clear/load/store 或 command submission。
 
+`Module.__init__()` 可以保存 typed/static 配置并注册子 Module。子 Module 通过属性赋值获得稳定 qualified
+name，配置进入 graph/cache identity。具体 `TensorStorage`、`TensorView` 和每帧资源不得注册为持久
+Module 属性；invocation-private 中间资源由 `forward()` 内的 `empty()`、`empty_like()`、`zeros()`
+或 `zeros_like()` 创建。
+
+普通顶层调用只执行 primal，不构建 reverse variant，也不分配或保留 tape：
+
+```python
+outputs = module(inputs)
+```
+
+需要微分时必须显式构造 VJP variant：
+
+```python
+outputs, pullback = vd.ad.vjp(
+    module,
+    wrt=("input",),
+    outputs=("result",),
+)(inputs)
+gradients = pullback(cotangents)
+```
+
+`pullback` 独占该次 invocation 的 reverse program、compiled checkpoint plan 和 tape；多个尚未调用的
+pullback 必须互不覆盖。子 Module 调用继续 capture 到同一个 Program Operation Graph，而不是嵌套创建
+独立 submission。
+
 ### 3.2 Program
 
 Cook 后的 Module 成为一个 Program。Program 可以内部包含零个、一个或多个 kernel，也可以包含
@@ -74,7 +100,6 @@ graphics pipeline invocation。
 ```text
 Program
 - public value/resource signature
-- structural graph input signature
 - aggregate effects
 - typed variant key
 - forward entry
@@ -129,17 +154,28 @@ predicate、迭代次数和退出轨迹。
 
 ### 4.2 Module 输入
 
-`forward()` 参数定义 Program 的公开输入。参数分为两类 contract：
+`forward()` 参数定义 Program 的公开输入。所有输入都通过统一的 Program Value binding 进入
+invocation；不存在额外的 `structural_inputs`、`configure()` 或 `graphics_config` 路径。输入包括：
 
-1. **Program bindings**
-   - Tensor/Value；
-   - Buffer、Texture、Sampler；
-   - uniform 和普通 scalar；
-   - submission 时可更新的参数。
-2. **Structural graph inputs**
-   - RenderTarget 或 attachment slot；
-   - 由外层 ExecutionGraph 实例化的执行结构；
-   - 不进入 shader/kernel argument binding。
+- Tensor/Value、TensorView、uniform、普通 scalar 和显式 RawBuffer；
+- Texture/ImageView、Sampler；
+- source/Program IR 的 `RenderTarget`、`Attachment` 和 `RenderState` typed builtin。
+
+这些 graphics builtin 是 source convenience 和 IR 语义，不是最终 public resource-aggregate ABI。
+Final manifest 必须把它们规范化到每个 graphics node 的 `attachments`、`state` 和 `draw` 字段，并把
+shader-visible Texture/ImageView/typed byte storage/Sampler 作为独立 Program Values 绑定。Shader resource
+不得嵌套在 ABI-stable struct 中，也不得依赖 host struct layout。
+
+ImageView 只是在 source/runtime 层携带 descriptor 的 Texture alias，不新增 Program dialect type。
+Final Program 中 root 与 view 都使用 `!vernon.texture`；view Origin 保存 parent version 与
+aspect/mip/layer descriptor。Sampled Texture 的 dialect format 必须是 `"unknown"`，具体 allocation
+format 与 extent 由 image StorageDescriptor 表达；只有 storage Texture 的
+`read`/`write`/`read_write` access
+携带具体 format。
+
+Graphics calls do not return replacement Texture objects. Deployment lowering
+assigns one Storage identity per resource and explicit internal value versions
+per use.
 
 Module 属性只应用于：
 
@@ -253,75 +289,78 @@ Module compiler 从 specialization 后实际保留的程序推导 variant signat
 
 ## 6. Graphics 与 RenderPass 边界
 
-### 6.1 Graphics 暂时 forward-only
+### 6.1 Graphics 在 active VJP 之外
 
-第一阶段 `GraphicsPipelineCallOp` 是 forward-only effectful operation。若 requested gradient path
+`GraphicsPipelineCallOp` 是 forward-only effectful operation。若 requested gradient path
 穿过 graphics result，compiler 必须给出明确 unsupported diagnostic；graphics 在 AD 计算之后仅用于
 显示或输出时不阻塞其他 differentiable subgraphs。
 
-### 6.2 Program 不拥有 pass declaration
+### 6.2 Graphics builtin 的规范化边界
 
-Cooked Program 可以描述 graphics invocation 和其 symbolic structural inputs，但不包含具体：
-
-- GraphImage/RenderTarget instance；
-- color/depth attachment resource；
-- load/store operation；
-- clear value；
-- render area；
-- pass dependency 和 enable state。
-
-这些由加载 Program 的 C++ ExecutionGraph 提供。
-
-### 6.3 AttachmentUse 是正确的 C++ contract
-
-现有 C++ `ColorAttachmentUse` 和 `DepthStencilAttachmentUse` 是规范 contract：
+Source 和 Program IR 可使用：
 
 ```text
-AttachmentUse
-= concrete GraphImage
-+ this-pass load/store/clear policy
-+ read-only policy
+Attachment
+= image view/use
++ load: load | clear | discard
++ clear value when load == clear
++ store: store | discard
++ optional resolve target
+
+RenderState
+= blend
++ depth/stencil
++ raster
++ color write mask
++ multisample
 ```
 
-资源与操作位于同一个 **use edge**，但这些操作不属于 `RenderTarget` 资源本身。`load=preserve`
-产生旧内容依赖；`clear/discard` 不读取旧内容；`store` 参与后续 preserve 合法性和 render-scope fusion。
+Clear 属于 `Attachment`，不属于 `RenderState`。`RenderTarget` 只是 source convenience：它可以在
+内部创建 Texture 并聚合 color/depth attachments，但 final manifest 不把 `RenderTarget` 或其他
+resource aggregate 暴露为 public ABI。它只保留规范化后的 graphics node：
 
-新的 declarative graphics API 应直接生成现有：
+Resolve destination 的 load 隐式为 discard；multisample source 与 resolve destination 的 store
+policy 相互独立。
 
-- `std::vector<ColorAttachmentUse>`；
-- optional `DepthStencilAttachmentUse`；
-- render area。
+```text
+graphics node
+- attachments
+- state
+- draw
+```
 
-Python `RenderTarget` 只作为生成 attachment uses 的 convenience，不建立第二套
-`RenderPassOperations` 语义。
+`draw` 包含 optional `index_buffer: TensorView`、默认值为 1 的 `instance_count`，以及 direct draw
+必须显式提供的 `vertex_count`；deployment 不从 vertex inputs 推导 draw count。不存在 `DrawArgs`。Primitive topology 是
+pipeline/artifact 的 static specialization，不是 runtime draw value。
 
-Depth attachment 是否存在、load/store/clear 和 read-only 属于 RenderPass。Depth test enable、
-write、compare，以及 blend/cull/fill 属于 graphics pipeline state。
+### 6.3 Attachment continuity 与 native render-pass fusion
+
+Attachment use 同时表达 view/resource identity 和本次使用的 load/store/clear/resolve 语义。
+ExecutionGraph 根据 parent image、aspect/mip/layer、attachment geometry、前后 use continuity、
+load/store/resolve compatibility 和中间 RAW/WAR/WAW hazard 决定是否形成同一个 native render
+pass。中间 discard、被 discard 后的 load，或 attachment-to-sampling hazard 必须切断 fusion。
+
+Fusion 不要求相邻 draw 的 `RenderState` 相等；blend、depth/stencil、raster、write mask 和
+multisample state 可在同一 native render pass 内按 draw 改变，只要 backend capability 允许且
+attachment continuity/hazard 条件成立。
 
 ### 6.4 不要求用户派生 Pass
 
 普通调用应允许：
 
 ```python
-invocations = module(...)
-
-graph.add_render(
-    "shadow",
-    invocations.shadow,
-    colors=shadow_colors,
-    depth=shadow_depth,
+invocation = module.bind(
+    scene=scene,
+    shadow_depth=shadow_depth,
+    color=color,
+    depth=depth,
 )
-
-graph.add_render(
-    "pbr",
-    invocations.pbr,
-    colors=pbr_colors,
-    depth=pbr_depth,
-)
+graph.invoke(invocation)
 ```
 
-内部可以使用 invocation-backed RenderPass adapter 复用现有 C++ contract。手写 `RenderPass` 仅保留为
-插入自定义 encoder command 的低层 escape hatch。
+所有 Program Values，包括 attachment views，使用同一个 bind 路径。内部可以使用
+invocation-backed RenderPass adapter 复用已发布的 C++ contract；手写 `RenderPass` 仅保留为插入
+自定义 encoder command 的低层 escape hatch，不构成 target public invocation ABI。
 
 ## 7. Operator-level AD
 
@@ -375,9 +414,17 @@ cotangent B ─┘
 - 映射到 CPU implementation 或 GPU compute kernel；
 - 与相邻 backward operations 一起 partition。
 
-`GraphAutodiffValue::add()` 不再承担 Operator 语义，不能在 materialization 阶段临时构造一个单独
-pipeline/command 作为永久架构。现有 `OperatorDag` 的物理 `TensorViewDescriptor + Add-only`
-实现只是过渡原型；新 graph 生效后应删除，而不是维护两套 operator contract。
+`AddOp` 由 Python/compiler 的 reverse graph transform 生成，和其他 Operation 一样经过统一
+implementation mapping。CPU、Metal、Vulkan、CUDA 等只是同一个 generated Add kernel 的不同 backend；
+不得在 graph semantic 或 lowering API 中增加 `allow_cpu`、`device_add` 等 backend 分支。
+
+`GraphAutodiffValue::add()`、materialization-time gradient expression 和 Add-only `OperatorDag`
+已删除。低层 `ExecutionGraph` 若收到未经过 Program transform 的 cotangent fan-in 会直接拒绝，
+避免重新引入隐式累积语义或维护两套 operator contract。
+
+C++ `ExecutionGraph` 只接收 Program lowering 后的 compute/render fragments，不暴露 `add()`、
+`lowerAdd()` 或其他按具体数学 Operation 命名的 graph-autodiff virtual method。它可以调度由 `AddOp`
+生成的普通 ComputePass，但不负责发现 cotangent fan-in 或构造 Add。
 
 ### 7.4 Custom kernel AD
 
@@ -444,11 +491,15 @@ Cooked Program Asset 包含：
 - define declarations 和版本化 variant metadata；
 - optimized Operation Graph 或其稳定序列化表示；
 - selected implementation/fusion plan；
-- backend artifacts；
+- content-addressed StageArtifacts：exact target、runtime requirements、
+  authenticated code Blob ranges 和 entry points；
 - internal execution fragment；
 - optional forward/pullback entries。
 
 不包含具体帧资源和外层 ExecutionGraph declaration。
+Program 不序列化第二份 node dependency list；ResolveProgram 从 Value SSA、
+ResourceAccess version chain 与 view overlap 推导完整 producer/RAW/WAR/WAW DAG。
+每个 Storage 的 root versions 必须形成 non-branching chain。
 
 C++ 目标接口：
 
@@ -458,19 +509,15 @@ auto invocation = program.bind(values);
 graph.invoke(invocation);
 ```
 
-Graphics invocation 由 C++ graph 绑定 attachment uses：
+Graphics invocation 与 compute 一样只绑定 Program Values：
 
 ```cpp
-graph.addRender(
-    "pbr",
-    invocation.graphics("pbr"),
-    colors,
-    depth,
-    renderArea);
+auto invocation = program.bind(values);
+graph.invoke(invocation);
 ```
 
-Program binding 与 attachment declaration 使用不同 API，但都作为 graph node 的输入进入 validation 和
-compile。
+Runtime 从 final manifest 的 graphics-node `attachments`、`state` 和 `draw` 字段实例化执行节点；
+不需要第二个 attachment declaration/configuration API。
 
 ## 10. 核心不变量
 
@@ -478,7 +525,11 @@ compile。
 - 普通控制流在 source 保持普通控制流。
 - Operation Graph 在 kernel partition 前保留足够的语义用于 AD、fusion 和 mapping。
 - 显式 kernel 是可分析的 call operation，但默认是 fusion boundary。
-- Graphics attachment operations 不属于 Program binding，也不属于 RenderTarget 的持久状态。
+- Graphics 使用统一 Program Value binding；不存在 structural/configure 双路径。
+- Attachment 拥有 view/use、load/clear/store/resolve；clear 不属于 RenderState。
+- RenderTarget 是 source convenience，不是 final manifest 的 public resource aggregate。
+- Topology 是 static specialization；Draw 不使用 `DrawArgs`。
+- Shader resources 独立绑定，不得嵌套在 ABI-stable struct 中。
 - Runtime 条件不改变 ABI；compile-time define variant 可以改变 active signature。
 - AD fan-in 以语义级 accumulation operation 表达。
 - 不存在 Operator-level Add 与 materialization-time Add 两套长期实现。
@@ -491,7 +542,7 @@ compile。
 
 - 增加用户可见 `Module` 和 `forward()` 调用；
 - capture 多个 pipeline invocations；
-- 增加 `ExecutionGraph.add_render(...)`，直接消费现有 attachment-use contract；
+- 用统一 `bind(values)` 规范化并调用 graphics Program；
 - 迁移 `examples/pbr.py`，删除用户定义的普通 `RenderPass` subclasses；
 - 保留低层 Pass API 作为 custom encoder escape hatch。
 
@@ -506,6 +557,8 @@ compile。
 
 - 用 SSA Value/Operation/Region/Block 取代 Add-only physical `OperatorDag`；
 - 引入 primitive、KernelCall、GraphicsPipelineCall 和 structured control operations；
+- 先完成 compute-only `Module` vertical slice、子 Module qualified naming 和 invocation-private transient；
+- 每次 resource write 产生 `ResourceVersion`，reverse AD 按版本化 value 累积 cotangent；
 - 完成 shape/type/effect/alias verification；
 - 建立 optimization 和 implementation mapping 接口。
 
@@ -513,9 +566,10 @@ compile。
 
 - 从 primitive VJP 构建 reverse Operation Graph；
 - 自动插入 accumulation AddOp；
+- Module backward 只执行已经生成的 reverse Operation Graph，不调用 C++ graph-level Add；
 - 接入 control-history/Tape、rematerialization 和 checkpoint planning；
 - 透明 custom kernel 接入 kernel-level AD；
-- 删除现有 materialization-time Add hack 和过渡 OperatorDag。
+- materialization-time Add hack 和过渡 OperatorDag 已从 runtime、Python binding 与 build target 删除。
 
 ### Phase 5：Kernel partition 与 Program lowering
 
@@ -528,7 +582,7 @@ compile。
 
 - 版本化 typed define map；
 - 序列化 Module Program metadata、variant signature 和 internal graph/fragment；
-- 增加 C++ typed variant selection、Program load/bind/invoke；
+- 增加 C++ typed variant selection、统一 Program load/bind/invoke；
 - 仅在正式 contract version 切换时删除旧 serialized representation。
 
 ## 12. 验收标准

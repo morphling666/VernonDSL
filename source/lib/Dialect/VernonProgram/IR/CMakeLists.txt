@@ -1,0 +1,12 @@
+add_mlir_dialect_library(
+    MLIRVernonProgramDialect
+    VernonProgramDialect.cpp
+    ADDITIONAL_HEADER_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../../../include/mlir/Dialect/VernonProgram
+    DEPENDS
+    MLIRVernonProgramDialectIncGen
+    MLIRVernonProgramOpsIncGen
+    LINK_LIBS
+    PUBLIC
+    MLIRIR
+    MLIRSupport)

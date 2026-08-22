@@ -1,7 +1,7 @@
 #include "native_execution_graph_autodiff.h"
 
 #include "execution_graph/execution_graph_internal.h"
-#include "native_operator.h"
+#include "native_command_retention.h"
 #include "native_pipeline_autodiff.h"
 
 #include <nanobind/stl/unique_ptr.h>
@@ -275,29 +275,15 @@ struct PythonCheckpointResource final : vernon::execution::GraphCheckpointResour
 };
 
 struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
-    struct AddExpression {
-        std::shared_ptr<PythonGraphAutodiffValue> left;
-        std::shared_ptr<PythonGraphAutodiffValue> right;
-    };
-
     PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState)
         : value(std::move(value)), allocationBytesValue(pythonValueAllocationBytes(this->value)),
-          valueBytesValue(allocationBytesValue), callbackState(std::move(callbackState)) {}
+          callbackState(std::move(callbackState)) {}
 
     PythonGraphAutodiffValue(nb::object value, std::shared_ptr<PythonGraphCallbackState> callbackState,
                              uint64_t allocationBytes)
-        : value(std::move(value)), allocationBytesValue(allocationBytes), valueBytesValue(allocationBytes),
-          callbackState(std::move(callbackState)) {}
+        : value(std::move(value)), allocationBytesValue(allocationBytes), callbackState(std::move(callbackState)) {}
 
-    PythonGraphAutodiffValue(std::shared_ptr<AddExpression> expression,
-                             std::shared_ptr<PythonGraphCallbackState> callbackState, uint64_t allocationBytes,
-                             uint64_t valueBytes)
-        : expression(std::move(expression)), allocationBytesValue(allocationBytes), valueBytesValue(valueBytes),
-          callbackState(std::move(callbackState)) {}
-
-    uintptr_t logicalIdentity() const override {
-        return expression ? reinterpret_cast<uintptr_t>(expression.get()) : reinterpret_cast<uintptr_t>(value.ptr());
-    }
+    uintptr_t logicalIdentity() const override { return reinterpret_cast<uintptr_t>(value.ptr()); }
     uint64_t allocationBytes() const override { return allocationBytesValue; }
 
     bool materialize(vernon::execution::detail::RhiCommandPlanSink *sink, std::string &error) override {
@@ -312,96 +298,14 @@ struct PythonGraphAutodiffValue final : vernon::execution::GraphAutodiffValue {
         return false;
     }
 
-    std::shared_ptr<PythonGraphAutodiffValue> clone() const {
-        return expression ? std::make_shared<PythonGraphAutodiffValue>(expression, callbackState, allocationBytesValue,
-                                                                       valueBytesValue)
-                          : std::make_shared<PythonGraphAutodiffValue>(value, callbackState, allocationBytesValue);
-    }
-
     nb::object materialize(vernon::execution::detail::RhiCommandPlanSink *sink = nullptr) const {
-        if (!expression) {
-            if (sink)
-                value = plannedDeviceValue(std::move(value), *sink);
-            return value;
-        }
-        nb::list nodes;
-        appendExpression(nodes, sink);
-        nb::object materialize =
-            nb::module_::import_("vernon_dsl._runtime.operators.gradient_expression").attr("materialize");
-        value = sink ? materialize(nodes, nb::cast(sink, nb::rv_policy::reference)) : materialize(nodes);
-        expression.reset();
-        allocationBytesValue = valueBytesValue;
+        if (sink)
+            value = plannedDeviceValue(std::move(value), *sink);
         return value;
     }
 
-    size_t appendExpression(nb::list &nodes, vernon::execution::detail::RhiCommandPlanSink *sink) const {
-        struct Frame {
-            const PythonGraphAutodiffValue *value;
-            bool expanded;
-        };
-        std::vector<Frame> frames{{this, false}};
-        std::vector<size_t> indices;
-        while (!frames.empty()) {
-            const Frame frame = frames.back();
-            frames.pop_back();
-            if (!frame.value->expression) {
-                if (sink)
-                    frame.value->value = plannedDeviceValue(std::move(frame.value->value), *sink);
-                nodes.append(nb::make_tuple("leaf", frame.value->value));
-                indices.push_back(nodes.size() - 1);
-                continue;
-            }
-            if (!frame.expanded) {
-                frames.push_back({frame.value, true});
-                frames.push_back({frame.value->expression->right.get(), false});
-                frames.push_back({frame.value->expression->left.get(), false});
-                continue;
-            }
-            const size_t right = indices.back();
-            indices.pop_back();
-            const size_t left = indices.back();
-            indices.pop_back();
-            nodes.append(nb::make_tuple("add", left, right));
-            indices.push_back(nodes.size() - 1);
-        }
-        return indices.back();
-    }
-
-    std::shared_ptr<vernon::execution::GraphAutodiffValue> add(const vernon::execution::GraphAutodiffValue &other,
-                                                               std::string &error) const override {
-        const auto *python = dynamic_cast<const PythonGraphAutodiffValue *>(&other);
-        if (!python) {
-            error = "graph cotangent contributions have incompatible native value types";
-            return {};
-        }
-        try {
-            if (callbackState)
-                callbackState->recordReverseCallback();
-            auto node = std::make_shared<AddExpression>();
-            node->left = clone();
-            node->right = python->clone();
-            const uint64_t resultBytes = std::max(valueBytesValue, python->valueBytesValue);
-            if (python->allocationBytesValue > std::numeric_limits<uint64_t>::max() - allocationBytesValue ||
-                resultBytes >
-                    std::numeric_limits<uint64_t>::max() - allocationBytesValue - python->allocationBytesValue) {
-                error = "graph cotangent accumulation size overflows";
-                return {};
-            }
-            return std::make_shared<PythonGraphAutodiffValue>(
-                std::move(node), callbackState, allocationBytesValue + python->allocationBytesValue + resultBytes,
-                resultBytes);
-        } catch (...) {
-            if (callbackState)
-                callbackState->captureException(std::current_exception());
-            error = "graph cotangent accumulation failed";
-            return {};
-        }
-    }
-
     mutable nb::object value;
-    mutable std::shared_ptr<AddExpression> expression;
-    mutable uint64_t allocationBytesValue;
-    uint64_t valueBytesValue;
+    uint64_t allocationBytesValue;
     std::shared_ptr<PythonGraphCallbackState> callbackState;
 };
 

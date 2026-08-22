@@ -64,6 +64,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/CompilerTargets.cmake")
 foreach(
     _vernon_compiler_target IN
     ITEMS MLIRVernonDialect
+          MLIRVernonProgramDialect
+          MLIRVernonProgramTransforms
           MLIRVernonTransforms
           VernonDSLCompiler
           vernon-compile-packaging
@@ -86,7 +88,8 @@ target_link_libraries(
               MLIRFuncDialect
               MLIRParser
               MLIRSCFDialect
-              MLIRVernonDialect)
+              MLIRVernonDialect
+              MLIRVernonProgramDialect)
 
 # The combined build registers tests after Runtime and Python targets exist. Register here only when the compiler is
 # configured as a standalone project.

@@ -28,3 +28,4 @@ class ShaderPipelineDescriptor:
     canonical_manifest: str
     modules: dict[str, ShaderModuleDescriptor]
     transform: Mapping[str, Any] | None = None
+    program_kind: str = "stages"

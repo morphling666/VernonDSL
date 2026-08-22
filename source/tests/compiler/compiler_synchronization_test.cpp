@@ -51,7 +51,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %output: !vernon.tensor_view<i32, [1], "write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 0 : i64,
+        vernon.dtype = "i32",
+        vernon.element_abi_leaf_dtypes = ["i32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -215,7 +217,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       },
       %global: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "global_invocation_id"
+        vernon.builtin = "global_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -300,7 +304,9 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %values: !vernon.tensor_view<i32, [64], "read_write", "device"> {
         vernon.interface = "resource",
         vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
+        vernon.binding = 0 : i64,
+        vernon.dtype = "i32",
+        vernon.element_abi_leaf_dtypes = ["i32"]
       })
       attributes {
         vernon.entry,
@@ -390,11 +396,15 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @builtin_probe(
       %local_id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "local_invocation_id"
+        vernon.builtin = "local_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %workgroup_id: tensor<3xi32> {
         vernon.interface = "input",
-        vernon.builtin = "workgroup_id"
+        vernon.builtin = "workgroup_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",

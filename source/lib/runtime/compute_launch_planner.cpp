@@ -102,9 +102,12 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                         return fail(error, "compute value Tensor is missing its typed interface plan");
                     if (use.interfacePlan->root->size > std::numeric_limits<size_t>::max())
                         return fail(error, "compute Tensor physical size exceeds the host size range");
+                    const std::vector<uint64_t> &logicalShape = use.shape.empty() ? parameter.shape : use.shape;
                     std::optional<TensorCopyPlan> layout =
-                        compileTensorCopyPlan(supplied.tensor.element_layout, *use.interfacePlan->root,
-                                              use.shape.empty() ? parameter.shape : use.shape);
+                        parameter.valueLayout
+                            ? compileWholeValueCopyPlan(supplied.tensor.element_layout, *use.interfacePlan->root)
+                            : compileElementStreamCopyPlan(supplied.tensor.element_layout, logicalShape,
+                                                           *use.interfacePlan->root);
                     if (!layout)
                         return fail(error, "compute Tensor interface plan does not match its canonical layout");
                     VernonTensorView packedTensor = supplied.tensor;
@@ -250,7 +253,8 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
             size_t requiredSpan = 0;
             if (!tensorRequiredSpan(tensor, requiredSpan))
                 return fail(error, "pipeline Tensor argument byte layout is invalid");
-            error = "pipeline Tensor argument requires " + std::to_string(requiredSpan) +
+            error = "pipeline Tensor argument '" + parameter.name + "' at byte offset " +
+                    std::to_string(tensor.byte_offset) + " requires " + std::to_string(requiredSpan) +
                     " bytes but its allocation has " + std::to_string(tensor.byte_size);
             return false;
         }

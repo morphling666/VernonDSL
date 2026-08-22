@@ -3,6 +3,9 @@
 
 #include "native_execution_graph.h"
 #include "native_pipeline_autodiff.h"
+#include "runtime/program_execution_backend.h"
+
+#include <nanobind/stl/map.h>
 
 struct Runtime {
     explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
@@ -145,9 +148,9 @@ struct Runtime {
             names.push_back(feature.c_str());
         VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
         if (!pipeline) {
+            const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
             vernonRuntimePipelineBundleDestroy(bundle);
-            throw std::runtime_error("cannot resolve pipeline bundle: " +
-                                     nativeStringView(vernonRuntimeGetLastError(handle)));
+            throw std::runtime_error("cannot resolve pipeline bundle: " + error);
         }
         return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
     }
@@ -167,11 +170,98 @@ struct Runtime {
             names.push_back(feature.c_str());
         VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
         if (!pipeline) {
+            const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
             vernonRuntimePipelineBundleDestroy(bundle);
-            throw std::runtime_error("cannot resolve pipeline bundle: " +
-                                     nativeStringView(vernonRuntimeGetLastError(handle)));
+            throw std::runtime_error("cannot resolve pipeline bundle: " + error);
         }
         return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
+    }
+
+    std::unique_ptr<LoadedPipeline> loadProgramPipelineAsset(const nb::bytes &data, const std::string &directory,
+                                                             const std::vector<std::string> &features,
+                                                             const nb::list &compiledStages) {
+        std::vector<SharedCompileResult> retained;
+        std::vector<std::pair<std::string, VernonCpuEntryPoint>> entries;
+        retained.reserve(compiledStages.size());
+        entries.reserve(compiledStages.size());
+        for (nb::handle item : compiledStages) {
+            nb::tuple stage = nb::cast<nb::tuple>(item);
+            if (stage.size() != 3)
+                throw std::invalid_argument("compiled Program stage metadata is invalid");
+            const std::string symbol = nb::cast<std::string>(stage[0]);
+            const std::string entryName = nb::cast<std::string>(stage[1]);
+            const CompiledProgram &program = nb::cast<const CompiledProgram &>(stage[2]);
+            program.requireSuccess();
+            VernonCpuEntryPoint entry =
+                vernonCompileResultGetCpuEntry(program.result.get(), entryName.data(), entryName.size());
+            if (!entry)
+                throw std::runtime_error("compiled Program CPU entry '" + entryName + "' was not found");
+            if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry) != VERNON_STATUS_OK) {
+                for (const auto &[registeredSymbol, registeredEntry] : entries)
+                    vernonRuntimeUnregisterCpuEntry(handle, {registeredSymbol.data(), registeredSymbol.size()},
+                                                    registeredEntry);
+                throw std::runtime_error("cannot register compiled Program CPU entry '" + symbol + "'");
+            }
+            retained.push_back(program.result);
+            entries.emplace_back(symbol, entry);
+        }
+        try {
+            std::unique_ptr<LoadedPipeline> pipeline = loadPipelineAsset(data, directory, features);
+            pipeline->retainedResults = std::move(retained);
+            pipeline->registeredCpuEntries = std::move(entries);
+            return pipeline;
+        } catch (...) {
+            for (const auto &[symbol, entry] : entries)
+                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
+            throw;
+        }
+    }
+
+    std::unique_ptr<LoadedPipeline> loadCanonicalProgram(const nb::bytes &programData,
+                                                         const nb::bytes &artifactSystemData,
+                                                         const std::string &directory,
+                                                         const std::map<std::string, std::string> &stageBindings,
+                                                         const nb::list &compiledStages) {
+        namespace program = vernon::runtime::program;
+        std::string error;
+        std::vector<SharedCompileResult> retained;
+        std::vector<std::pair<std::string, VernonCpuEntryPoint>> registered;
+        const auto unregister = [&]() {
+            for (const auto &[symbol, entry] : registered)
+                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
+        };
+        try {
+            retained.reserve(compiledStages.size());
+            registered.reserve(compiledStages.size());
+            for (nb::handle item : compiledStages) {
+                nb::tuple stage = nb::cast<nb::tuple>(item);
+                if (stage.size() != 3)
+                    throw std::invalid_argument("compiled canonical Program stage metadata is invalid");
+                const std::string symbol = nb::cast<std::string>(stage[0]);
+                const std::string entryName = nb::cast<std::string>(stage[1]);
+                const CompiledProgram &compiled = nb::cast<const CompiledProgram &>(stage[2]);
+                compiled.requireSuccess();
+                VernonCpuEntryPoint entry =
+                    vernonCompileResultGetCpuEntry(compiled.result.get(), entryName.data(), entryName.size());
+                if (!entry)
+                    throw std::runtime_error("compiled canonical Program CPU entry '" + entryName + "' was not found");
+                if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry) != VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot register canonical Program CPU entry '" + symbol + "'");
+                retained.push_back(compiled.result);
+                registered.emplace_back(symbol, entry);
+            }
+            VernonLoadedPipeline *loaded = program::loadBackendProgramPipeline(
+                *handle, programData.c_str(), programData.size(), artifactSystemData.c_str(), artifactSystemData.size(),
+                stageBindings, directory, error);
+            if (!loaded)
+                throw std::runtime_error(error);
+            auto pipeline = std::make_unique<LoadedPipeline>(this, handle, nullptr, loaded, std::move(retained));
+            pipeline->registeredCpuEntries = std::move(registered);
+            return pipeline;
+        } catch (...) {
+            unregister();
+            throw;
+        }
     }
 
     VernonRuntimeContext *handle{};

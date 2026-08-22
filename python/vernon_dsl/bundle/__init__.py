@@ -13,7 +13,7 @@ from .parameters import (
     reflected_parameters,
     validate_graphics_interfaces,
 )
-from .planner import build_bundle_plan, plan_variant
+from .planner import build_bundle_plan, build_program_bundle_plan, plan_variant
 from .reflection import (
     compiled_stage_from_program,
     parse_reflection_json,
@@ -62,6 +62,7 @@ __all__ = [
     "VulkanTargetOptions",
     "assign_parameter_slots",
     "build_bundle_plan",
+    "build_program_bundle_plan",
     "canonical_json",
     "classify_parameter_use",
     "compiled_stage_from_program",

@@ -43,9 +43,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
     if (!variant.compute.empty()) {
         const Stage &stage = bundle.stages.at(variant.compute);
         ReflectedEntry reflection;
-        const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-        if (parsed.is_discarded() || !parseReflection(parsed, stage.entry, reflection, bundle.context->backend,
-                                                      invocationDiagnostic(*bundle.context))) {
+        if (!resolveStageReflection(stage, bundle.context->backend, reflection,
+                                    invocationDiagnostic(*bundle.context))) {
             delete state;
             return false;
         }
@@ -239,18 +238,12 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     continue;
                 }
                 if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                    use.transport == "storage_buffer" && parameter.elementLayout.byteSize &&
-                    use.binding != UINT32_MAX) {
-                    candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                    candidate.layout.element_size = parameter.elementLayout.byteSize;
-                    candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                    candidate.layout.binding = use.binding;
-                    candidate.layout.set = use.descriptorSet;
-                    candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE;
-                } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                           use.interfacePlan->root && (!use.uniformName.empty() || use.transport == "uniform_buffer")) {
+                    use.interfacePlan->root &&
+                    (!use.uniformName.empty() || use.transport == "uniform_buffer" ||
+                     use.transport == "storage_buffer")) {
                     const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                     const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
+                    const uint64_t physicalSize = use.interfacePlan->root->size;
                     uint64_t valueCount = 1;
                     for (uint64_t dimension : shape) {
                         if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
@@ -259,7 +252,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                         }
                         valueCount *= dimension;
                     }
-                    const bool buffered = use.transport == "uniform_buffer";
+                    if (shape.empty() && physicalSize && physicalSize % sizeof(uint32_t) == 0)
+                        valueCount = physicalSize / sizeof(uint32_t);
+                    const bool buffered = use.transport == "uniform_buffer" || use.transport == "storage_buffer";
                     const bool scalarOrVector = shape.empty() || (shape.size() == 1 && shape[0] <= 4);
                     const bool floatingMatrix = use.dtype == "f32" && shape.size() == 2 && shape[0] >= 2 &&
                                                 shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
@@ -271,10 +266,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                         useRhiGraphics = false;
                         break;
                     }
-                    const size_t elementSize = dataTypeSize(*dtype);
-                    candidate.layout.kind =
-                        buffered ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                    const uint64_t physicalSize = use.interfacePlan->root->size;
+                    candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                            : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                                : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                     if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
                         representationError = "OpenGL uniform reflection is incomplete";
                         useRhiGraphics = false;
@@ -292,8 +286,11 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     const ValueLayout &canonical =
                         parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
                     std::optional<TensorCopyPlan> packing =
-                        compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
-                    if (!packing || packing->elementSize != elementSize) {
+                        parameter.valueLayout
+                            ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                            : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape,
+                                                           *use.interfacePlan->root);
+                    if (!packing || packing->elementSize != canonical.byteSize) {
                         representationError = "OpenGL interface plan does not match the canonical layout";
                         useRhiGraphics = false;
                         break;

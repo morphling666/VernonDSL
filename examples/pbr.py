@@ -238,37 +238,7 @@ def main() -> None:
     shadow_invocation: vd.PipelineInvocation | None = None
     plan: vd.CompiledExecutionGraph | None = None
 
-    class PbrPass(vd.RenderPass):
-        def declare(self) -> None:
-            if invocation is None:
-                raise RuntimeError("PBR pass invocation was not prepared")
-            invocation.declare(self)
-            self.attachments(target)
-
-        def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
-            if invocation is None:
-                raise RuntimeError("PBR pass invocation was not prepared")
-            invocation.encode(encoder, resources)
-
     graph = vd.ExecutionGraph()
-    if shadow_enabled:
-        assert shadow_target is not None
-        active_shadow_target = shadow_target
-
-        class ShadowPass(vd.RenderPass):
-            def declare(self) -> None:
-                if shadow_invocation is None:
-                    raise RuntimeError("shadow pass invocation was not prepared")
-                shadow_invocation.declare(self)
-                self.attachments(active_shadow_target)
-
-            def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
-                if shadow_invocation is None:
-                    raise RuntimeError("shadow pass invocation was not prepared")
-                shadow_invocation.encode(encoder, resources)
-
-        graph.add_pass(ShadowPass("shadow"))
-    graph.add_pass(PbrPass("pbr"))
     view_projection_parameter = graph.parameter("view_projection")
     camera_position_parameter = graph.parameter("camera_position")
 
@@ -331,6 +301,10 @@ def main() -> None:
             environment_sampler=environment_sampler,
         )
     invocation = render.invocation(**render_arguments)
+    if shadow_enabled:
+        assert shadow_target is not None and shadow_invocation is not None
+        graph.add_pass(vd.GraphicsInvocationPass("shadow", shadow_invocation, shadow_target))
+    graph.add_pass(vd.GraphicsInvocationPass("pbr", invocation, target))
     plan = graph.compile()
     bindings: vd.ExecutionBindings | None = None
     start_time = time.perf_counter()

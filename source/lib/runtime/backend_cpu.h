@@ -54,8 +54,10 @@ VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint
 bool loadCpuEntry(VernonCpuEntryPoint entry, const char *reflection, size_t reflectionSize, const char *entryName,
                   size_t entryNameSize, CpuKernelState &state, ReflectedEntry &metadata, std::string &error);
 
-bool loadCpuNativeArtifact(const CpuNativeArtifact &artifact, CpuKernelState &state, ReflectedEntry &metadata,
-                           std::string &error);
+bool loadCpuNativeArtifact(VernonRuntimeContext &context, const CpuNativeArtifact &artifact, CpuKernelState &state,
+                           ReflectedEntry &metadata, std::string &error);
+bool findRegisteredCpuEntry(VernonRuntimeContext &context, const std::string &symbol, VernonCpuEntryPoint &entry,
+                            std::string &error);
 
 } // namespace vernon::runtime
 

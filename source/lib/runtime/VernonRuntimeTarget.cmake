@@ -178,12 +178,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_checkpoint_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_submission.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/elementwise_operator.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_execution.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_lowering.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_model.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../operator/operator_validation.cpp)
+        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp)
     add_library(Vernon::ExecutionGraph ALIAS VernonExecutionGraph)
     set_target_properties(VernonExecutionGraph PROPERTIES EXPORT_NAME ExecutionGraph POSITION_INDEPENDENT_CODE ON)
     target_include_directories(
@@ -216,6 +211,10 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/vertex_attribute_capabilities.cpp)
@@ -291,6 +290,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_resources.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_signature.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_telemetry.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_program_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_direct_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp

@@ -156,6 +156,7 @@ struct PreparedBindingSet {
     struct Slot {
         uint32_t slot{};
         VernonRuntimeProviderBindingKind kind{VERNON_RUNTIME_PROVIDER_INLINE_VALUE};
+        VernonRuntimeProviderBindingInterface interfaceKind{VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM};
         uint32_t valueCount{};
         uint32_t columnCount{};
         uint32_t flags{};
@@ -345,7 +346,8 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                                        (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE ||
                                         source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
                                         source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) &&
-                                       source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE &&
+                                       (source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE ||
+                                        source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) &&
                                        source.binding != UINT32_MAX && source.element_size != 0;
             const bool uniformBuffer = source.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
                                        source.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
@@ -588,10 +590,10 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto *value = &values[bindings.valueIndices[index]];
         if (value->kind != slot.kind)
             return fail(adapter, "OpenGL binding slot or kind is invalid");
-        if (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.kind, slot.interfaceKind)) {
             if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.byteSize ||
                 (value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 ||
-                (slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
+                (slot.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                  (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0) ||
                 (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                  (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 && slot.columnCount <= 1))
@@ -630,9 +632,10 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         auto &slot = bindings.slots[index];
         const auto *value = &values[bindings.valueIndices[index]];
-        if (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.kind, slot.interfaceKind)) {
             std::memcpy(slot.storage.data(), value->payload.inline_value.data, value->payload.inline_value.size);
             if (slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                 slot.stageMask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                 if (!bindings.device->uploadBuffer(slot.inlineBuffer, 0, value->payload.inline_value.data,
                                                    value->payload.inline_value.size, adapter.error))
@@ -698,6 +701,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
                 !bindings->vertexSlotByBinding.emplace(entry.layout.binding, index).second)
                 return fail(adapter, "OpenGL binding layout contains duplicate vertex-buffer bindings");
             slot.kind = entry.layout.kind;
+            slot.interfaceKind = entry.layout.interface_kind;
             slot.valueCount =
                 entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER
                     ? 0
@@ -707,10 +711,10 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
             slot.stageMask = entry.layout.stage_mask;
             slot.numericType = entry.layout.numeric_type;
             slot.byteSize = entry.layout.element_size;
-            if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(entry.layout.kind, entry.layout.interface_kind)) {
                 slot.storage.resize(entry.layout.element_size);
                 if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+                    entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                     entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                     if (!bindings->device->createBuffer(slot.inlineBuffer, entry.layout.element_size, adapter.error))
                         return VERNON_STATUS_INTERNAL_ERROR;

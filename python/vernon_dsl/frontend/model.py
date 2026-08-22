@@ -288,6 +288,16 @@ class BranchMerge:
 
 
 @dataclass(frozen=True)
+class StorageActivitySummary:
+    readable_roots: frozenset[str]
+    writable_roots: frozenset[str]
+    output_dependencies: tuple[tuple[str, frozenset[str]], ...]
+
+    def dependencies_for(self, output: str) -> frozenset[str]:
+        return dict(self.output_dependencies).get(output, frozenset())
+
+
+@dataclass(frozen=True)
 class TypedStatement:
     source: ast.stmt
     termination: Termination
@@ -334,6 +344,7 @@ class TypedFunctionInstance:
     body: tuple[TypedStatement, ...] = ()
     parameters: tuple[TypedParameter, ...] = ()
     effects: tuple[TypedEffect, ...] = ()
+    storage_activity: StorageActivitySummary | None = None
 
     @property
     def specialization_key(self) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
@@ -357,6 +368,7 @@ SemanticValue = (
     | TypedEffect
     | LValue
     | BranchMerge
+    | StorageActivitySummary
     | TypedStatement
     | TypedFunctionInstance
     | Any

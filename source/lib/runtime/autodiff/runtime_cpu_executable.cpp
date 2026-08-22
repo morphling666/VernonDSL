@@ -237,9 +237,12 @@ bool loadStructuredCpuExecutable(VernonRuntimeContext &context, const Stage &pri
     auto forwardKernel = std::make_shared<CpuKernelState>();
     auto backwardKernel = std::make_shared<CpuKernelState>();
     ReflectedEntry reflection;
-    if (!loadCpuNativeArtifact(*primalStage.cpuArtifact, *primalKernel, reflection, invocationDiagnostic(context)) ||
-        !loadCpuNativeArtifact(*forwardStage.cpuArtifact, *forwardKernel, reflection, invocationDiagnostic(context)) ||
-        !loadCpuNativeArtifact(*backwardStage.cpuArtifact, *backwardKernel, reflection, invocationDiagnostic(context)))
+    if (!loadCpuNativeArtifact(context, *primalStage.cpuArtifact, *primalKernel, reflection,
+                               invocationDiagnostic(context)) ||
+        !loadCpuNativeArtifact(context, *forwardStage.cpuArtifact, *forwardKernel, reflection,
+                               invocationDiagnostic(context)) ||
+        !loadCpuNativeArtifact(context, *backwardStage.cpuArtifact, *backwardKernel, reflection,
+                               invocationDiagnostic(context)))
         return false;
     return finishStructuredCpuExecutable(context, primalStage, forwardStage, backwardStage, std::move(primalKernel),
                                          std::move(forwardKernel), std::move(backwardKernel), gradientPaths,

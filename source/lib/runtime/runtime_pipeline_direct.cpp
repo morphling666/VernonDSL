@@ -219,6 +219,37 @@ bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backe
     return buildDirectComputeVariant(reflection, stage.entry, variant, entry, backend, error);
 }
 
+bool isDirectPipelineTopology(const Variant &variant) {
+    if (variant.program.size() != 1 || variant.compute.empty() ||
+        variant.program.find("compute") == variant.program.end())
+        return false;
+    if (!variant.executable)
+        return true;
+    if (variant.executable->graphs.size() != 1)
+        return false;
+    const ProgramGraph &forward = variant.executable->graphs.front();
+    if (forward.direction != "forward" || forward.nodes.size() != 1)
+        return false;
+    const ProgramNode &node = forward.nodes.front();
+    return node.id == 0 && node.kind == "compute" && node.stage == "compute" && node.dependencies.empty();
+}
+
+bool initializeDirectPipelineTopology(const Variant &variant, VernonLoadedPipeline &pipeline, std::string &error) {
+    if (!isDirectPipelineTopology(variant)) {
+        error = "pipeline variant is not a direct single-compute topology";
+        return false;
+    }
+    auto topology = std::make_shared<VernonPipelineTopology>();
+    if (variant.executable)
+        topology->execution = *variant.executable;
+    else if (!normalizeLegacySingleComputeExecution(variant, topology->execution, error))
+        return false;
+    topology->residualValues = topology->execution.backwardCaptures();
+    topology->directDispatch = true;
+    pipeline.topology = std::move(topology);
+    return true;
+}
+
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
     return registerStaticCpuEntry(symbol, entryPoint);
 }
@@ -235,7 +266,8 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
     if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU,
-                                   invocationDiagnostic(context)))
+                                   invocationDiagnostic(context)) ||
+        !initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
         return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
@@ -266,10 +298,64 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
+    if (!initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
+        return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
     pipeline->readFootprints = reflection.readFootprints;
     pipeline->writeFootprints = reflection.writeFootprints;
+    VernonPipelineBundle bundle;
+    bundle.context = &context;
+    bundle.stages.emplace(stage.entry, std::move(stage));
+    if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
+        return nullptr;
+    ++context.livePipelines;
+    return pipeline.release();
+}
+
+VernonLoadedPipeline *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
+                                                      ReflectedEntry reflection, const void *artifact,
+                                                      size_t artifactSize, const std::string &entry,
+                                                      VernonCpuEntryPoint cpuEntry,
+                                                      const std::vector<NativeResourceSlot> &nativeSlots) {
+    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    pipeline->context = &context;
+    pipeline->variant = std::move(variant);
+    if (!initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
+        return nullptr;
+    pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
+    pipeline->dispatchContract = reflection.dispatchContract;
+    pipeline->readFootprints = reflection.readFootprints;
+    pipeline->writeFootprints = reflection.writeFootprints;
+    if (context.backend == VERNON_RUNTIME_CPU) {
+        CpuKernelState kernel;
+        kernel.entry = cpuEntry;
+        auto state = std::make_unique<CpuPipelineState>();
+        if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(reflection), *state))
+            return nullptr;
+        installRuntimeBackendState(*pipeline, state.release());
+        ++context.livePipelines;
+        return pipeline.release();
+    }
+    if (!artifact || !artifactSize)
+        return nullptr;
+    Stage stage;
+    stage.stage = "compute";
+    stage.entry = entry;
+    stage.reflected = std::move(reflection);
+    stage.nativeSlots = nativeSlots;
+    stage.dispatchContract = pipeline->dispatchContract;
+    stage.workgroup[0] = pipeline->workgroupSize.x;
+    stage.workgroup[1] = pipeline->workgroupSize.y;
+    stage.workgroup[2] = pipeline->workgroupSize.z;
+    stage.readFootprints = pipeline->readFootprints;
+    stage.writeFootprints = pipeline->writeFootprints;
+    if (context.backend == VERNON_RUNTIME_CUDA || context.backend == VERNON_RUNTIME_METAL ||
+        isOpenGLBackend(context.backend))
+        stage.source.assign(static_cast<const char *>(artifact), artifactSize);
+    else
+        stage.binary.assign(static_cast<const uint8_t *>(artifact),
+                            static_cast<const uint8_t *>(artifact) + artifactSize);
     VernonPipelineBundle bundle;
     bundle.context = &context;
     bundle.stages.emplace(stage.entry, std::move(stage));

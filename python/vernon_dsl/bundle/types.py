@@ -241,11 +241,14 @@ class VariantPlan:
     parameters: tuple[Mapping[str, Any], ...]
     internal_parameters: tuple[Mapping[str, Any], ...]
     outputs: tuple[Mapping[str, Any], ...]
+    execution: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if any(not feature for feature in self.key) or tuple(sorted(set(self.key))) != self.key:
             raise PipelineCompileError("pipeline variant key must contain unique non-empty features in sorted order")
         object.__setattr__(self, "program", frozen_mapping(self.program))
+        if self.execution is not None:
+            object.__setattr__(self, "execution", frozen_mapping(self.execution))
         for name in ("parameters", "internal_parameters", "outputs"):
             values = tuple(frozen_mapping(value) for value in getattr(self, name))
             object.__setattr__(self, name, values)
@@ -259,6 +262,8 @@ class VariantPlan:
         }
         if self.internal_parameters:
             result["internal_parameters"] = [dict(value) for value in self.internal_parameters]
+        if self.execution is not None:
+            result["execution"] = dict(self.execution)
         return result
 
 

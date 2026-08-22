@@ -32,9 +32,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
     auto state = std::make_unique<CudaPipelineState>();
     const Stage &stage = bundle.stages.at(variant.compute);
     ReflectedEntry reflection;
-    const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
-    if (parsed.is_discarded() ||
-        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_CUDA, invocationDiagnostic(*bundle.context)))
+    if (!resolveStageReflection(stage, VERNON_RUNTIME_CUDA, reflection, invocationDiagnostic(*bundle.context)))
         return false;
     uint32_t internalSlot = 0;
     for (const Parameter &parameter : variant.parameters)

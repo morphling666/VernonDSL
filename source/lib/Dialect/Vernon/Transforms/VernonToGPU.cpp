@@ -174,7 +174,7 @@ struct PhysicalLoadConversion final : OpConversionPattern<PhysicalLoadOp> {
         if (!llvm::hasSingleElement(adaptor.getIndex()))
             return rewriter.notifyMatchFailure(op, "expected one converted physical index");
         auto module = op->getParentOfType<ModuleOp>();
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(op.getResult().getType(), module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(op.getResult().getType(), module);
         if (failed(layout) || adaptor.getStorage().size() != layout->leaves.size())
             return rewriter.notifyMatchFailure(op, "TensorView storage expansion does not match its value ABI");
         FailureOr<Value> value =
@@ -195,7 +195,7 @@ struct PhysicalStoreConversion final : OpConversionPattern<PhysicalStoreOp> {
         if (!llvm::hasSingleElement(adaptor.getIndex()) || !llvm::hasSingleElement(adaptor.getValue()))
             return rewriter.notifyMatchFailure(op, "expected scalar converted store index and value");
         auto module = op->getParentOfType<ModuleOp>();
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(op.getValue().getType(), module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(op.getValue().getType(), module);
         if (failed(layout) || adaptor.getStorage().size() != layout->leaves.size())
             return rewriter.notifyMatchFailure(op, "TensorView storage expansion does not match its value ABI");
         if (failed(storeAggregateRecordToStorages(op.getValue().getType(), adaptor.getStorage(),
@@ -317,18 +317,19 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                             sourceArgumentRanges[index] = {kernelIndex, 1};
                             continue;
                         }
-                        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(tensor.getElementType(), module);
-                        if (failed(layout) || layout->leaves.empty()) {
+                        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(tensor.getElementType(), module);
+                        if (failed(layout) || layout->leaves.empty() || layout->size % sizeof(uint32_t) != 0 ||
+                            llvm::any_of(layout->leaves, [](const ValueAbiLeaf &leaf) {
+                                return leaf.scalarType.getIntOrFloatBitWidth() != 32 ||
+                                       leaf.byteOffset % sizeof(uint32_t) != 0;
+                            })) {
                             source.emitError() << "cannot lower aggregate Tensor-by-value argument #" << index;
                             return signalPassFailure();
                         }
-                        unsigned firstKernelIndex = kernelArgumentTypes.size();
-                        for (const ValueAbiLeaf &leaf : layout->leaves) {
-                            unsigned kernelIndex = kernelArgumentTypes.size();
-                            kernelArgumentTypes.push_back(convertStorageLeaf(leaf.scalarType, useSpirvStorage));
-                            resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
-                        }
-                        sourceArgumentRanges[index] = {firstKernelIndex, layout->leaves.size()};
+                        unsigned kernelIndex = kernelArgumentTypes.size();
+                        kernelArgumentTypes.push_back(convertStorageLeaf(moduleBuilder.getI32Type(), true));
+                        resourceBindings.emplace_back(kernelIndex, std::make_pair(0u, kernelIndex));
+                        sourceArgumentRanges[index] = {kernelIndex, 1};
                         aggregateTensorArguments[index] = tensor;
                         continue;
                     }
@@ -366,8 +367,8 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                         continue;
                     }
                     auto view = dyn_cast<TensorViewType>(type);
-                    FailureOr<ValueAbiLayout> layout =
-                        view ? getValueAbiLayout(view.getElementType(), module) : FailureOr<ValueAbiLayout>(failure());
+                    FailureOr<ValueAbiLayout> layout = view ? getValueStorageLayout(view.getElementType(), module)
+                                                            : FailureOr<ValueAbiLayout>(failure());
                     if (!view || failed(layout) || layout->leaves.empty()) {
                         source.emitError() << "cannot lower compute resource argument #" << index << " type " << type;
                         return signalPassFailure();
@@ -420,22 +421,35 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                 auto aggregateTensor = aggregateTensorArguments.find(sourceIndex);
                 if (aggregateTensor != aggregateTensorArguments.end()) {
                     FailureOr<ValueAbiLayout> layout =
-                        getValueAbiLayout(aggregateTensor->second.getElementType(), module);
-                    if (failed(layout))
+                        getValueStorageLayout(aggregateTensor->second.getElementType(), module);
+                    if (failed(layout) || layout->size % sizeof(uint32_t) != 0)
                         return signalPassFailure();
-                    SmallVector<Value> storages;
-                    storages.reserve(range.second);
-                    for (unsigned offset = 0; offset < range.second; ++offset)
-                        storages.push_back(entry->getArgument(range.first + offset));
+                    Value recordStride = arith::ConstantIndexOp::create(
+                        bodyBuilder, source.getLoc(), static_cast<int64_t>(layout->size / sizeof(uint32_t)));
                     int64_t elementCount = 1;
                     for (int64_t dimension : aggregateTensor->second.getShape())
                         elementCount *= dimension;
                     SmallVector<Value> elements;
                     for (int64_t index = 0; index < elementCount; ++index) {
                         Value recordIndex = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(), index);
-                        FailureOr<Value> element = loadAggregateRecordFromStorages(
-                            aggregateTensor->second.getElementType(), storages, recordIndex, *layout, module,
-                            bodyBuilder, source.getLoc(), AggregateStorageBackend::MemRef);
+                        Value recordBase =
+                            arith::MulIOp::create(bodyBuilder, source.getLoc(), recordIndex, recordStride);
+                        SmallVector<Value> scalars;
+                        for (const ValueAbiLeaf &leaf : layout->leaves)
+                            for (uint64_t scalar = 0; scalar < leaf.scalarCount; ++scalar) {
+                                const uint64_t word = leaf.byteOffset / sizeof(uint32_t) + scalar;
+                                Value wordOffset = arith::ConstantIndexOp::create(bodyBuilder, source.getLoc(),
+                                                                                  static_cast<int64_t>(word));
+                                Value wordIndex =
+                                    arith::AddIOp::create(bodyBuilder, source.getLoc(), recordBase, wordOffset);
+                                Value loaded = memref::LoadOp::create(bodyBuilder, source.getLoc(), first, wordIndex);
+                                if (leaf.scalarType.isF32())
+                                    loaded =
+                                        arith::BitcastOp::create(bodyBuilder, source.getLoc(), leaf.scalarType, loaded);
+                                scalars.push_back(loaded);
+                            }
+                        FailureOr<Value> element = buildAggregateValueFromScalars(
+                            aggregateTensor->second.getElementType(), scalars, module, bodyBuilder, source.getLoc());
                         if (failed(element))
                             return signalPassFailure();
                         elements.push_back(*element);
@@ -540,7 +554,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             TypeConverter storageConverter;
             storageConverter.addConversion([](Type type) { return type; });
             storageConverter.addConversion([&](TensorViewType view, SmallVectorImpl<Type> &converted) {
-                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+                FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
                 if (failed(layout) || layout->leaves.empty())
                     return failure();
                 for (const ValueAbiLeaf &leaf : layout->leaves)

@@ -91,7 +91,7 @@ TEST(TensorBridgeTest, RejectsBitIncompatibleTransportRepresentation) {
     vernon::runtime::TransportNode array{
         vernon::runtime::TransportNodeKind::Array, "", 0, 4, 4, {1}, {4}, {std::move(scalar)}};
     EXPECT_FALSE(
-        vernon::runtime::compileTensorCopyPlan(vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32), array, {1}));
+        vernon::runtime::compileElementStreamCopyPlan(vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32), {1}, array));
 }
 
 TEST(TensorBridgeTest, PacksNegativeStrideFromLogicalFirstElement) {

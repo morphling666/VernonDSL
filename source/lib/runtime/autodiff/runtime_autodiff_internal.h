@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -107,6 +108,8 @@ public:
 };
 
 size_t dtypeSize(VernonDataType dtype);
+bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
+                             std::string &error);
 bool validLaunchSize(VernonLaunchSize grid);
 bool invocationExtent(VernonLaunchSize grid, VernonLaunchSize workgroup, VernonLaunchSize &extent);
 bool carrierCount(VernonLaunchSize extent, size_t &count);
@@ -121,6 +124,8 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
 bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature);
+std::optional<size_t> programAdParameterIndex(const VernonLoadedPipeline *pipeline, VernonProgramAdBoundary boundary,
+                                              size_t boundaryIndex);
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
                          const Stage &backward, const std::vector<std::string> &gradientPaths,
@@ -141,6 +146,8 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
                          const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profile,
                              VernonLoadedPipeline &pipeline);
+bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
+                            const std::vector<AutodiffDerivativeGroup> &derivativeGroups);
 
 } // namespace vernon::runtime::ad
 

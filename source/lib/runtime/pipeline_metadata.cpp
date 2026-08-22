@@ -1,4 +1,5 @@
 #include "pipeline_metadata.h"
+#include "pipeline_bundle.h"
 #include "pipeline_manifest.h"
 
 #include "VernonVersions.h"
@@ -442,6 +443,20 @@ std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access) 
     if (access == "read_write")
         return VERNON_ACCESS_READ_WRITE;
     return std::nullopt;
+}
+
+bool resolveStageReflection(const Stage &stage, VernonRuntimeBackend backend, ReflectedEntry &output,
+                            std::string &error) {
+    if (stage.reflected) {
+        output = *stage.reflected;
+        return true;
+    }
+    const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
+    if (parsed.is_discarded()) {
+        error = "compute artifact reflection is invalid JSON";
+        return false;
+    }
+    return parseReflection(parsed, stage.entry, output, backend, error);
 }
 
 bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProviderBindingLayoutEntry &layout) {

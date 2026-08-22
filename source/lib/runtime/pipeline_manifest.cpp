@@ -102,7 +102,8 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
     return true;
 }
 
-constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
+constexpr std::string_view kVariantKeys[] = {"key",    "program", "execution", "parameters", "internal_parameters",
+                                             "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
     "slot",
     "name",
@@ -1006,7 +1007,9 @@ bool Variant::validate(std::string &error) const {
         const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
                                 parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
                                 parameter.shape == std::vector<uint64_t>{2};
-        if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution)) {
+        const bool programValue =
+            parameter.source == "program_value" && parameter.kind == "tensor" && parameter.systemValue.empty();
+        if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution && !programValue)) {
             error = "internal pipeline parameter invariant failed";
             return false;
         }
@@ -1079,6 +1082,8 @@ bool Variant::validate(std::string &error) const {
             error = "sampler references an unknown sampled image binding";
             return false;
         }
+    if (executable)
+        return executable->validate(program, error);
     const bool computeTopology = !compute.empty() && program.size() == 1;
     const bool graphicsTopology = compute.empty() && !vertex.empty() && !fragment.empty() && program.size() == 2;
     if (!computeTopology && !graphicsTopology) {
@@ -1373,14 +1378,15 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             return false;
         }
         if (parameter.kind == "tensor") {
-            if (row.contains("dtype") || row.contains("element_layout") == row.contains("value_layout")) {
-                error = "Tensor parameter must contain exactly one value_layout or element_layout";
+            if (row.contains("dtype") || (!row.contains("element_layout") && !row.contains("value_layout"))) {
+                error = "Tensor parameter must contain value_layout, element_layout, or both";
                 return false;
             }
             if (row.contains("element_layout")) {
                 if (!parseValueLayout(row["element_layout"], parameter.elementLayout, error))
                     return false;
-            } else {
+            }
+            if (row.contains("value_layout")) {
                 ValueLayout layout;
                 if (!parseValueLayout(row["value_layout"], layout, error))
                     return false;
@@ -1396,7 +1402,9 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
                                     parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
                                     parameter.shape == std::vector<uint64_t>{2};
-            if (!implicitSampler && !resolution) {
+            const bool programValue =
+                parameter.source == "program_value" && parameter.kind == "tensor" && parameter.systemValue.empty();
+            if (!implicitSampler && !resolution && !programValue) {
                 error = "internal pipeline parameter metadata is unsupported";
                 return false;
             }
@@ -1485,6 +1493,12 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         }
         variant.outputs.push_back(std::move(output));
     }
+    if (value.contains("execution")) {
+        ExecutableProgram executable;
+        if (!parseExecutableProgram(value["execution"], executable, error))
+            return false;
+        variant.executable = std::move(executable);
+    }
     for (const auto &[stage, artifact] : value["program"].items()) {
         if (!artifact.is_string() || artifact.get_ref<const std::string &>().empty()) {
             error = "pipeline program stage artifact id is invalid";
@@ -1497,16 +1511,54 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
             variant.vertex = artifact.get<std::string>();
         else if (stage == "fragment")
             variant.fragment = artifact.get<std::string>();
-        else {
-            error = "pipeline program contains an unknown shader stage";
-            return false;
-        }
     }
     if (variant.vertex.empty() != variant.fragment.empty()) {
         error = "graphics pipeline requires both vertex and fragment stages";
         return false;
     }
     return variant.validate(error);
+}
+
+bool normalizeLegacySingleComputeExecution(const Variant &variant, ExecutableProgram &execution, std::string &error) {
+    if (variant.executable || variant.program.size() != 1 || variant.compute.empty() ||
+        variant.program.find("compute") == variant.program.end()) {
+        error = "pipeline variant is not a legacy single-compute topology";
+        return false;
+    }
+
+    execution = {};
+    ProgramGraph forward;
+    forward.name = "forward";
+    forward.direction = "forward";
+    ProgramNode node;
+    node.id = 0;
+    node.name = "compute";
+    node.kind = "compute";
+    node.stage = "compute";
+
+    for (const Parameter &parameter : variant.parameters) {
+        ProgramValueSlot value;
+        value.id = static_cast<uint32_t>(execution.values.size());
+        value.name = parameter.name;
+        const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+        value.type = layout.logicalType.empty() ? parameter.kind : layout.logicalType;
+        value.dtype =
+            layout.leaves.empty() || layout.leaves.front().dtype.empty() ? "opaque" : layout.leaves.front().dtype;
+        value.shape = parameter.shape;
+        value.external = true;
+        value.output = parameter.access == "write" || parameter.access == "read_write";
+        execution.values.push_back(std::move(value));
+
+        const uint32_t valueId = static_cast<uint32_t>(execution.values.size() - 1);
+        forward.arguments.push_back(valueId);
+        execution.adSignature.inputs.push_back(ProgramAdSignatureBinding{valueId, parameter.name});
+        node.operands.push_back(valueId);
+        node.bindings.push_back(ProgramValueBinding{parameter.name, valueId});
+        node.resources.push_back(ProgramResourceUse{valueId, parameter.access});
+    }
+    forward.nodes.push_back(std::move(node));
+    execution.graphs.push_back(std::move(forward));
+    return execution.validate(variant.program, error);
 }
 
 bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error) {

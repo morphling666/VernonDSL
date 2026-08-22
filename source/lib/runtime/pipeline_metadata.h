@@ -71,8 +71,12 @@ struct ReflectedEntry {
     std::vector<TensorViewWriteFootprint> writeFootprints;
 };
 
+struct Stage;
+
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,
                      VernonRuntimeBackend backend, std::string &error);
+bool resolveStageReflection(const Stage &stage, VernonRuntimeBackend backend, ReflectedEntry &output,
+                            std::string &error);
 
 const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::string &transport);
 

@@ -341,6 +341,21 @@ void ExecutionGraph::planAutodiffCheckpoints(uint64_t memoryBudget) {
     dirty_ = true;
 }
 
+void ExecutionGraph::setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    for (uint32_t index = 0; index < nodes.size(); ++index) {
+        if (nodes[index].id != index)
+            throw std::invalid_argument("explicit reverse command node IDs must be dense and ordered");
+        for (uint32_t dependency : nodes[index].dependencies)
+            if (dependency >= index)
+                throw std::invalid_argument("explicit reverse command dependencies must precede their consumer");
+    }
+    explicitReverseNodes_ = std::move(nodes);
+    hasAutodiffSchedule_ = true;
+    dirty_ = true;
+}
+
 bool ExecutionGraph::validate(std::string &error) { return buildPlan(error); }
 
 void ExecutionGraph::setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
@@ -1027,11 +1042,48 @@ bool ExecutionGraph::buildPlan(std::string &error) {
                         initialStateBytes += range.byteSize;
             }
         }
+        uint64_t explicitTemporaryBytes = 0;
+        uint64_t explicitResidualBytes = 0;
+        uint64_t explicitReplayCost = 0;
+        for (const ExplicitReverseCommandNode &node : explicitReverseNodes_) {
+            explicitTemporaryBytes = std::max(explicitTemporaryBytes, node.temporaryBytes);
+            if (node.residualBytes > std::numeric_limits<uint64_t>::max() - explicitResidualBytes) {
+                error = "explicit reverse command residual storage overflows";
+                return false;
+            }
+            explicitResidualBytes += node.residualBytes;
+            if (node.replayCost > std::numeric_limits<uint64_t>::max() - explicitReplayCost) {
+                error = "explicit reverse command replay cost overflows";
+                return false;
+            }
+            explicitReplayCost += node.replayCost;
+        }
+        if (explicitResidualBytes > std::numeric_limits<uint64_t>::max() - backwardValueBytes ||
+            explicitTemporaryBytes >
+                std::numeric_limits<uint64_t>::max() - backwardValueBytes - explicitResidualBytes) {
+            error = "explicit reverse command temporary storage overflows";
+            return false;
+        }
+        backwardValueBytes += explicitResidualBytes + explicitTemporaryBytes;
         if (!detail::planDagAutodiffCheckpoints(autodiffNodes, autodiffMemoryBudget_, autodiffCheckpointPlan_, error,
                                                 initialStateBytes, initialStateCheckpointable, restorationBytes,
                                                 restorationCheckpointable, transactionBytes, transactionCheckpointable,
                                                 backwardValueBytes))
             return false;
+        if (explicitReplayCost > std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.replayCost) {
+            error = "combined reverse replay cost overflows";
+            return false;
+        }
+        if (explicitResidualBytes >
+                std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.logicalResidualBytes ||
+            explicitResidualBytes >
+                std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.retainedAllocationBytes) {
+            error = "combined reverse residual storage overflows";
+            return false;
+        }
+        autodiffCheckpointPlan_.replayCost += explicitReplayCost;
+        autodiffCheckpointPlan_.logicalResidualBytes += explicitResidualBytes;
+        autodiffCheckpointPlan_.retainedAllocationBytes += explicitResidualBytes;
     }
     const auto validEndpoint = [&](const DerivativeEndpointKey &endpoint) {
         return endpoint.kind == DerivativeEndpointKind::Resource ? endpoint.id < resources_.size()

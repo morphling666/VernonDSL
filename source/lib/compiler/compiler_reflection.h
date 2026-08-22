@@ -4,7 +4,10 @@
 #include "VernonCpuAbiWrapper.h"
 #include "compiler_frontend.h"
 
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/Support/JSON.h"
 
 #include <string>
 #include <vector>
@@ -12,6 +15,9 @@
 namespace vernon::compiler {
 
 mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::ModuleOp module);
+mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
+                                                                llvm::ArrayRef<llvm::StringRef> logicalDtypes = {});
+llvm::json::Object reflectCanonicalValueLayout(const mlir::vernon::ValueAbiLayout &layout, llvm::StringRef logicalType);
 std::vector<PhysicalEntryModel> buildPhysicalEntryModels(mlir::ModuleOp module,
                                                          const std::vector<PhysicalEntryProvenance> &provenance);
 

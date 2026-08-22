@@ -185,6 +185,17 @@ CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions);
 
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
                                                       const nb::dict &targetOptions);
+std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std::string &program);
+std::unique_ptr<CompiledProgram> planKernelResult(Compiler &compiler, const std::string &kernel);
+std::unique_ptr<CompiledProgram>
+planGraphicsResult(Compiler &compiler, const std::vector<std::string> &stages, const std::string &topology,
+                   const std::vector<std::string> &features, const std::vector<std::string> &attachmentTypes,
+                   uint32_t colorCount, const std::vector<std::tuple<std::string, std::string>> &operands);
+std::unique_ptr<CompiledProgram>
+finalizeProgramResult(Compiler &compiler, const std::string &plan,
+                      const std::vector<std::tuple<std::string, std::string, std::string, std::string>> &kernels,
+                      const std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>> &shapeFacts);
+std::unique_ptr<CompiledProgram> analyzeProgramResult(Compiler &compiler, const std::string &mlir);
 
 std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,
                                                                        const nb::dict &targetOptions);

@@ -62,6 +62,22 @@ def mrt_target(color: vd.Texture, object_id: vd.Texture) -> vd.RenderTarget:
 
 
 class RenderTargetTests(unittest.TestCase):
+    def test_render_target_use_is_immutable_and_complete(self) -> None:
+        target = vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(16, 16))).attach_depth()
+        use = vd.render(
+            target,
+            color=vd.clear((0.1, 0.2, 0.3, 1.0)),
+            depth=vd.preserve(),
+            render_area=(1, 2, 8, 9),
+        )
+
+        self.assertIs(use.target, target)
+        self.assertEqual(use.colors[0][0], 0)
+        self.assertEqual(use.colors[0][1].clear_value, (0.1, 0.2, 0.3, 1.0))
+        self.assertEqual(use.render_area, (1, 2, 8, 9))
+        with self.assertRaisesRegex(TypeError, "either color or colors"):
+            vd.render(target, color=vd.load(), colors={0: vd.load()})
+
     def test_attachment_validation(self) -> None:
         color = vd.Texture.zeros(shape=(16, 16))
         with self.assertRaisesRegex(ValueError, "two positive dimensions"):
@@ -979,12 +995,14 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         line_positions = vd.storage.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(
-            position=line_positions, target=render_target(target), topology=vd.lines
+        vd.pipeline(triangle_vertex, solid_fragment, topology=vd.lines)(
+            position=line_positions,
+            target=render_target(target),
         )
         point_positions = vd.storage.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(
-            position=point_positions, target=render_target(target), topology=vd.points
+        vd.pipeline(triangle_vertex, solid_fragment, topology=vd.points)(
+            position=point_positions,
+            target=render_target(target),
         )
 
 
@@ -1104,18 +1122,15 @@ class VulkanPipelineTests(unittest.TestCase):
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(16, 16))
-        with (
-            mock.patch(
-                "subprocess.run",
-                side_effect=AssertionError("subprocess prohibited"),
-            ),
-            mock.patch(
-                "vernon_dsl._runtime.pipeline.build_bundle_plan",
-                wraps=pipeline_module.build_bundle_plan,
-            ) as planner,
+        self.assertFalse(hasattr(pipeline_module, "build_bundle_plan"))
+        with mock.patch(
+            "subprocess.run",
+            side_effect=AssertionError("subprocess prohibited"),
         ):
             render(position=positions, target=render_target(target))
-        planner.assert_called_once()
+        self.assertIsNotNone(render._compiled)
+        assert render._compiled is not None
+        self.assertIsNotNone(render._compiled.canonical_program)
 
     def test_bundle_parameter_output_layout_and_reinit_cache(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
@@ -1137,17 +1152,9 @@ class VulkanPipelineTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "different reflected kind"):
             compiled.native.invocation_builder().rhi_texture(0, target._resident_view())
-        bundle = json.loads(compiled.bundle)
-        variant = bundle["variants"][0]
-        self.assertEqual(
-            [(row["name"], row["slot"], row["kind"]) for row in variant["parameters"]],
-            [("position", 0, "tensor")],
-        )
-        self.assertEqual(
-            [(row["name"], row["location"]) for row in variant["outputs"]],
-            [("output_0", 0)],
-        )
-        self.assertNotIn("type", variant["outputs"][0])
+        self.assertTrue(compiled.canonical_program)
+        program = json.loads(compiled.canonical_program)
+        self.assertEqual(program["graphs"][0]["nodes"][0]["operation"]["tag"], "graphics")
         self.assertEqual(render.compile_count, 1)
         vd.init(arch=vd.vulkan)
         render(position=positions, target=attachments)

@@ -296,13 +296,6 @@ if(SKBUILD)
         PATTERN "*.cpp"
         PATTERN "*.h")
     install(
-        DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../operator/"
-        DESTINATION vernon_dsl/runtime_src/lib/operator
-        COMPONENT VernonWheel
-        FILES_MATCHING
-        PATTERN "*.cpp"
-        PATTERN "*.h")
-    install(
         DIRECTORY "${_VERNON_RUNTIME_IMPL_DIR}/../rhi/"
         DESTINATION vernon_dsl/runtime_src/lib/rhi
         COMPONENT VernonWheel

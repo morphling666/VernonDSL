@@ -459,30 +459,19 @@ bool isRowMajorContiguous(const VernonTensorView &tensor) {
     return true;
 }
 
-std::optional<TensorCopyPlan> compileTensorCopyPlan(const VernonValueLayoutView &canonical,
-                                                    const TransportNode &transport, std::vector<uint64_t> shape) {
-    if (!valueLayoutValid(canonical) || transport.size > std::numeric_limits<size_t>::max() ||
-        transport.byteStrides.size() != shape.size())
+namespace {
+
+std::optional<TensorCopyPlan> compileValueCopyPlan(const VernonValueLayoutView &canonical,
+                                                   const TransportNode &physicalValue, size_t byteSize) {
+    if (!valueLayoutValid(canonical) || byteSize > std::numeric_limits<size_t>::max())
         return std::nullopt;
-    const TransportNode *element = &transport;
-    if (transport.kind == TransportNodeKind::Array) {
-        if (transport.children.size() != 1)
-            return std::nullopt;
-        element = &transport.children.front();
-    }
     std::vector<TransportScalar> physicalScalars;
-    if (!collectTransportScalars(*element, 0, physicalScalars))
+    if (!collectTransportScalars(physicalValue, 0, physicalScalars))
         return std::nullopt;
 
     TensorCopyPlan plan;
     plan.elementSize = canonical.byte_size;
-    plan.shape = std::move(shape);
-    plan.byteSize = static_cast<size_t>(transport.size);
-    for (uint64_t stride : transport.byteStrides) {
-        if (stride > std::numeric_limits<size_t>::max())
-            return std::nullopt;
-        plan.byteStrides.push_back(static_cast<size_t>(stride));
-    }
+    plan.byteSize = byteSize;
     size_t scalarIndex = 0;
     for (size_t leafIndex = 0; leafIndex < canonical.leaf_count; ++leafIndex) {
         const VernonValueLeafView &leaf = canonical.leaves[leafIndex];
@@ -515,7 +504,64 @@ std::optional<TensorCopyPlan> compileTensorCopyPlan(const VernonValueLayoutView 
     return plan;
 }
 
+} // namespace
+
+std::optional<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
+                                                        const TransportNode &physicalValue) {
+    if (physicalValue.size > std::numeric_limits<size_t>::max())
+        return std::nullopt;
+    return compileValueCopyPlan(canonicalValue, physicalValue, static_cast<size_t>(physicalValue.size));
+}
+
+std::optional<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
+                                                           std::vector<uint64_t> logicalShape,
+                                                           const TransportNode &physicalStream) {
+    if (physicalStream.kind != TransportNodeKind::Array || physicalStream.children.size() != 1 ||
+        physicalStream.byteStrides.size() != logicalShape.size() ||
+        physicalStream.size > std::numeric_limits<size_t>::max())
+        return std::nullopt;
+    std::optional<TensorCopyPlan> plan =
+        compileValueCopyPlan(elementLayout, physicalStream.children.front(), static_cast<size_t>(physicalStream.size));
+    if (!plan)
+        return std::nullopt;
+    plan->shape = std::move(logicalShape);
+    for (uint64_t stride : physicalStream.byteStrides) {
+        if (stride > std::numeric_limits<size_t>::max())
+            return std::nullopt;
+        plan->byteStrides.push_back(static_cast<size_t>(stride));
+    }
+    return plan;
+}
+
+std::optional<std::vector<uint8_t>> packWholeValue(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+    if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) || layout.operations.empty() ||
+        !layout.shape.empty() || !layout.byteStrides.empty() || layout.byteSize < layout.elementSize)
+        return std::nullopt;
+    std::optional<std::vector<uint8_t>> logical;
+    if (tensor.rank == 0 && tensor.element_layout.byte_size == layout.elementSize) {
+        const uint8_t *source = hostTensorData(tensor);
+        if (!source || !tensorFitsAllocation(tensor))
+            return std::nullopt;
+        logical = std::vector<uint8_t>(source, source + layout.elementSize);
+    } else {
+        logical = packTensorRowMajor(tensor);
+        if (!logical || logical->size() != layout.elementSize)
+            return std::nullopt;
+    }
+    std::vector<uint8_t> packed(layout.byteSize);
+    for (const CopyOperation &operation : layout.operations) {
+        if (operation.sourceOffset > logical->size() || operation.size > logical->size() - operation.sourceOffset ||
+            operation.destinationOffset > packed.size() || operation.size > packed.size() - operation.destinationOffset)
+            return std::nullopt;
+        std::memcpy(packed.data() + operation.destinationOffset, logical->data() + operation.sourceOffset,
+                    operation.size);
+    }
+    return packed;
+}
+
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+    if (layout.shape.empty() && layout.byteStrides.empty())
+        return packWholeValue(tensor, layout);
     if (tensor.storage != VERNON_TENSOR_HOST || !valueLayoutValid(tensor.element_layout) ||
         tensor.element_layout.byte_size != layout.elementSize || tensor.rank != layout.shape.size() ||
         layout.byteStrides.size() != layout.shape.size() || (tensor.rank && !tensor.shape) || layout.operations.empty())

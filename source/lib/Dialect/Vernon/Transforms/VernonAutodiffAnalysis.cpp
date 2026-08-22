@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonGlobalIdIndexProof.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/BitVector.h"
@@ -200,13 +201,15 @@ public:
 private:
     FailureOr<ValueAbiLayout> planLayout(Type type, ArrayRef<StringRef> dtypes) {
         auto view = dyn_cast<TensorViewType>(type);
-        if (!view)
-            return mlir::vernon::getValueAbiLayout(type, module, dtypes);
-        FailureOr<ValueAbiLayout> elementLayout =
-            mlir::vernon::getValueAbiLayout(view.getElementType(), module, dtypes);
-        if (failed(elementLayout))
+        Type layoutType = view ? Type(view.getElementType()) : type;
+        FailureOr<ValueAbiLayout> planned = dtypes.empty()
+                                                ? mlir::vernon::getValueStorageLayout(layoutType, module)
+                                                : mlir::vernon::getValueAbiLayout(layoutType, module, dtypes);
+        if (failed(planned))
             return failure();
-        ValueAbiLayout layout = std::move(*elementLayout);
+        if (!view)
+            return planned;
+        ValueAbiLayout layout = std::move(*planned);
         layout.elementStride = layout.size;
         layout.layoutHash += ":storage";
         for (int64_t extent : view.getShape())
@@ -1035,8 +1038,9 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
                                                      : static_cast<Type>(RankedTensorType::get(
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
                                                            *getAutodiffDerivativeType(leaf.scalarType)));
-            result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex), path, leaf.scalarType,
-                                                    derivativeType, leaf.dtype, leaf.shape});
+            result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
+                                                    components.front().str(), path, leaf.scalarType, derivativeType,
+                                                    leaf.dtype, leaf.shape});
             if (isa<TensorViewType>(argument.getType())) {
                 wrtStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
             } else {
@@ -1099,7 +1103,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
                 if (function.getNumResults() > 1 && root == "output")
                     path = appendAbiPath(("output." + std::to_string(resultIndex)), leaf.path);
                 result.activeResultLeaves.push_back(
-                    AutodiffLeaf{value, static_cast<unsigned>(leafIndex), std::move(path), leaf.scalarType,
+                    AutodiffLeaf{value, static_cast<unsigned>(leafIndex), root.str(), std::move(path), leaf.scalarType,
                                  leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
                                                     : static_cast<Type>(RankedTensorType::get(
                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
@@ -1184,8 +1188,8 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
                                                            *getAutodiffDerivativeType(leaf.scalarType)));
             result.activeResultLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
-                                                             std::move(leafPath), leaf.scalarType, derivativeType,
-                                                             leaf.dtype, leaf.shape});
+                                                             components.front().str(), std::move(leafPath),
+                                                             leaf.scalarType, derivativeType, leaf.dtype, leaf.shape});
             resultStorageLeaves.push_back(StorageLeafSelection{argument, static_cast<unsigned>(leafIndex)});
             ++matches;
         }
@@ -1537,14 +1541,6 @@ bool isDifferentiableAutodiffLeaf(Type scalarType, StringRef logicalDtype) {
     if (!(scalarType.isF16() || scalarType.isF32() || scalarType.isF64()))
         return false;
     return logicalDtype.empty() || logicalDtype == "f16" || logicalDtype == "f32" || logicalDtype == "f64";
-}
-
-FailureOr<Type> getAutodiffDerivativeType(Type scalarType) {
-    if (scalarType.isF64())
-        return scalarType;
-    if (scalarType.isF16() || scalarType.isF32())
-        return Float32Type::get(scalarType.getContext());
-    return failure();
 }
 
 AutodiffEffectKind classifyAutodiffEffect(Operation *operation) {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import struct
@@ -10,9 +11,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 from vernon_dsl._shader_assets.artifact_io import artifact_extension
+from vernon_dsl._shader_assets.cooking import _canonical_kernel_deployment
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from vernon_dsl.bundle import CpuTargetOptions, build_bundle_plan, make_target_options
+from vernon_dsl.bundle import (
+    CompiledArtifact,
+    CompiledStage,
+    CpuTargetOptions,
+    build_bundle_plan,
+    build_program_bundle_plan,
+    make_target_options,
+)
 from vernon_dsl.module_graph import load_project, resolve_project_entry
 from vernon_dsl.pipeline_assets import (
     PipelineCompileError,
@@ -49,6 +59,204 @@ def _native_available() -> bool:
 
 
 class ShaderAssetManifestTests(unittest.TestCase):
+    def test_direct_deployment_uses_cpp_program_and_contract_hash(self) -> None:
+        target = CpuTargetOptions()
+        stage = CompiledStage(
+            "interactive/kernel/direct",
+            "{}",
+            "direct",
+            "compute",
+            target,
+            {"required_features": []},
+            {"workgroup_size": [1, 1, 1]},
+            CompiledArtifact("relocatable_object", b"object", "direct.o"),
+            {
+                "symbol": "direct",
+                "target_triple": "arm64-apple-darwin",
+                "object_format": "macho",
+            },
+        )
+        canonical_program = {
+            "stages": {"forward:0": {"operation": "compute", "contract_hash": "cpp-contract-hash"}},
+            "graphs": [],
+        }
+        finalized = {
+            "canonical_program": canonical_program,
+            "stage_contracts": {
+                "forward:0": {
+                    "operation": "compute",
+                    "reflection": {"required_features": [], "endpoints": []},
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            program, artifacts, bindings, _ = _canonical_kernel_deployment(
+                stage,
+                finalized,
+                target=target,
+                request_id="forward:0",
+                output=Path(directory),
+            )
+        self.assertEqual(program, canonical_program)
+        self.assertEqual(artifacts["artifacts"][stage.id]["contract_hash"], "cpp-contract-hash")
+        self.assertEqual(bindings, {"forward:0": stage.id})
+
+    def test_program_bundle_composes_logical_stages_with_kernel_artifacts(self) -> None:
+        target = make_target_options("vulkan")
+        stage = CompiledStage(
+            "python/square",
+            "{}",
+            "square",
+            "compute",
+            target,
+            {},
+            {
+                "arguments": [
+                    {
+                        "index": 0,
+                        "kind": "tensor",
+                        "type": '!vernon.tensor_view<f32, [4], "read", "device">',
+                        "vernon.source_name": "source",
+                        "vernon.interface": "input",
+                        "vernon.set": 0,
+                        "vernon.binding": 0,
+                        "access": "read",
+                        "address_space": "device",
+                        "source_shape": [4],
+                        "element_layout": {
+                            "logical_type": "f32",
+                            "layout_hash": "f32-layout",
+                            "byte_size": 4,
+                            "alignment": 4,
+                            "leaves": [],
+                        },
+                    },
+                    {
+                        "index": 1,
+                        "kind": "tensor",
+                        "type": '!vernon.tensor_view<f32, [4], "write", "device">',
+                        "vernon.source_name": "output",
+                        "vernon.interface": "output",
+                        "vernon.set": 0,
+                        "vernon.binding": 1,
+                        "access": "write",
+                        "address_space": "device",
+                        "source_shape": [4],
+                        "element_layout": {
+                            "logical_type": "f32",
+                            "layout_hash": "f32-layout",
+                            "byte_size": 4,
+                            "alignment": 4,
+                            "leaves": [],
+                        },
+                    },
+                ]
+            },
+            CompiledArtifact("spirv", b"\x03\x02\x23\x07"),
+        )
+        execution = {
+            "values": [
+                {
+                    "id": 0,
+                    "name": "input.source",
+                    "type": "tensor<4xf32>",
+                    "dtype": "f32",
+                    "shape": [4],
+                    "external": True,
+                    "output": False,
+                    "value_layout": {
+                        "logical_type": "tensor<4xf32>",
+                        "layout_hash": "tensor-layout",
+                        "byte_size": 16,
+                        "alignment": 4,
+                        "leaves": [],
+                    },
+                },
+                {
+                    "id": 1,
+                    "name": "output.result",
+                    "type": "tensor<4xf32>",
+                    "dtype": "f32",
+                    "shape": [4],
+                    "external": False,
+                    "output": True,
+                    "value_layout": {
+                        "logical_type": "tensor<4xf32>",
+                        "layout_hash": "tensor-layout",
+                        "byte_size": 16,
+                        "alignment": 4,
+                        "leaves": [],
+                    },
+                },
+            ],
+            "graphs": [
+                {
+                    "name": "forward",
+                    "direction": "forward",
+                    "arguments": [0],
+                    "results": [1],
+                    "nodes": [
+                        {
+                            "id": 0,
+                            "name": "square",
+                            "kind": "compute",
+                            "stage": "Module.square",
+                            "operands": [0],
+                            "results": [1],
+                            "dependencies": [],
+                            "bindings": [
+                                {"parameter": "source", "value": 0},
+                                {"parameter": "output", "value": 1},
+                            ],
+                            "resources": [
+                                {"value": 0, "access": "read"},
+                                {"value": 1, "access": "write"},
+                            ],
+                            "grid": [4, 1, 1],
+                        }
+                    ],
+                }
+            ],
+            "signature": {
+                "inputs": [{"path": "source", "value": 0}],
+                "outputs": [{"path": "output", "value": 1}],
+                "cotangents": [],
+                "gradients": [],
+                "captures": [],
+            },
+        }
+
+        plan = build_program_bundle_plan(
+            "modules/square",
+            target,
+            (),
+            [((), execution, {"Module.square": stage})],
+            canonical_execution=True,
+            canonical_program={
+                "stages": {"Module.square": {"operation": "compute", "contract_hash": "0" * 64}},
+                "graphs": [
+                    {
+                        "nodes": [
+                            {
+                                "operation": {"tag": "compute", "workgroups": [4, 1, 1]},
+                            }
+                        ]
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(dict(plan.variants[0].program), {"Module.square": stage.id})
+        canonical = plan.variants[0].execution
+        assert canonical is not None
+        self.assertEqual(set(canonical["stages"]), {"Module.square"})
+        self.assertNotIn("dependencies", canonical["graphs"][0]["nodes"][0])
+        self.assertEqual(canonical["graphs"][0]["nodes"][0]["operation"]["workgroups"], [4, 1, 1])
+        self.assertEqual(
+            tuple((parameter["name"], parameter["slot"]) for parameter in plan.variants[0].parameters),
+            (("input.source", 0), ("output.result", 1)),
+        )
+
     def test_pipeline_asset_promotes_an_imported_entry_without_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -473,6 +681,10 @@ asset = vd.pipeline_asset(
             )
             bundle = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertNotIn("features", bundle)
+            execution = bundle["variants"][0]["execution"]
+            self.assertEqual(execution["values"], [])
+            self.assertEqual(execution["graphs"][0]["direction"], "forward")
+            self.assertEqual(execution["graphs"][0]["nodes"][0]["stage"], "compute")
             self.assertEqual(
                 bundle["target"],
                 {
@@ -785,6 +997,178 @@ asset = vd.pipeline_asset(
                         json.dumps(document, indent=2, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n",
                     )
 
+    def test_module_single_compute_cooks_canonical_program(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "module_compute.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def square(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    output[0] = source[0] * source[0]
+
+class Square(vd.Module):
+    def forward(
+        self,
+        source: vd.TensorView[vd.f32, (1,), vd.read],
+    ) -> vd.TensorStorage:
+        output = self.empty_like(source)
+        square(source, output)
+        return output
+
+asset = vd.pipeline_asset(id="module/square", program=Square())
+""",
+                encoding="utf-8",
+            )
+
+            manifest = cook_pipeline_asset(
+                pipeline_asset=f"{source}:asset",
+                output=root / "cooked",
+                target="cpu",
+            )
+            bundle = json.loads(manifest.read_text(encoding="utf-8"))
+            program = bundle["variants"][0]["execution"]
+            self.assertEqual(
+                set(program),
+                {
+                    "stages",
+                    "parameters",
+                    "storages",
+                    "values",
+                    "shape_symbols",
+                    "shape_constraints",
+                    "alias_preconditions",
+                    "graphs",
+                    "signature",
+                },
+            )
+            self.assertEqual(len(program["graphs"]), 1)
+            self.assertEqual(len(program["graphs"][0]["nodes"]), 1)
+            node = program["graphs"][0]["nodes"][0]
+            self.assertNotIn("dependencies", node)
+            self.assertEqual(node["operation"], {"tag": "compute", "workgroups": [1, 1, 1]})
+            self.assertEqual([value["origin"]["tag"] for value in program["values"]], ["argument", "node_result"])
+            self.assertEqual([storage["ownership"] for storage in program["storages"]], ["borrowed", "owned"])
+
+            from vernon_dsl._shader_assets.artifact_io import write_external_artifact
+            from vernon_dsl._shader_assets.cooking import (
+                _canonical_deployment,
+                _compile_module_bundle_plan,
+                _load_pipeline_asset_declaration,
+                _native_module,
+                _native_target,
+            )
+
+            native = _native_module()
+            pipeline = parse_python_pipeline_asset(source, "asset")
+            declaration = _load_pipeline_asset_declaration(source, "asset")
+            for target_name in ("cpu", "metal", "vulkan"):
+                with self.subTest(target=target_name):
+                    target = make_target_options(target_name)
+                    retained: list[tuple[CompiledStage, object]] = []
+                    plan = _compile_module_bundle_plan(
+                        declaration,
+                        pipeline,
+                        target,
+                        native,
+                        _native_target(native, target_name),
+                        retained,
+                    )
+                    runtime_root = root / f"runtime-{target_name}"
+                    runtime_root.mkdir()
+                    descriptors = {
+                        stage.id: write_external_artifact(
+                            runtime_root,
+                            stage.artifact.data,
+                            stage.artifact.format,
+                            stage.stage,
+                            stage.artifact.filename,
+                        )
+                        for stage in plan.stages
+                    }
+                    canonical_program, artifact_system, stage_bindings = _canonical_deployment(plan, descriptors)
+                    host = None
+                    if target_name == "cpu":
+                        runtime = native.Runtime(native.RuntimeBackend.CPU)
+                        compiled_stages = [
+                            (stage.metadata["symbol"], stage.entry, result) for stage, result in retained
+                        ]
+                    else:
+                        runtime_backend = getattr(native.RuntimeBackend, target_name.upper())
+                        if not native.runtime_available(runtime_backend):
+                            continue
+                        backend = getattr(native.RhiBackend, target_name.upper())
+                        host = native.RhiHost(backend)
+                        runtime = host.create_runtime()
+                        compiled_stages = []
+                    loaded = runtime.load_canonical_program(
+                        json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
+                        json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
+                        str(runtime_root),
+                        stage_bindings,
+                        compiled_stages,
+                    )
+                    source_array = np.array([3.0], dtype=np.float32)
+                    output_array = np.zeros(1, dtype=np.float32)
+                    builder = loaded.invocation_builder()
+                    if target_name == "cpu":
+                        for parameter, array in zip(loaded.parameters, (source_array, output_array), strict=True):
+                            builder.host_tensor(parameter.slot, array)
+                    else:
+                        assert host is not None
+                        source_buffer = host.create_buffer(source_array.nbytes)
+                        output_buffer = host.create_buffer(output_array.nbytes)
+                        source_buffer.upload(source_array.tobytes())
+                        output_buffer.upload(output_array.tobytes())
+                        for parameter, buffer in zip(loaded.parameters, (source_buffer, output_buffer), strict=True):
+                            builder.rhi_tensor(parameter.slot, buffer, parameter.access, [1], [4])
+                    builder.grid(1, 1, 1).submit().wait()
+                    if target_name != "cpu":
+                        output_array = np.frombuffer(output_buffer.download(), dtype=np.float32)
+                    np.testing.assert_array_equal(output_array, np.array([9.0], dtype=np.float32))
+                    if target_name == "cpu":
+                        artifact_id = next(iter(artifact_system["artifacts"]))
+                        bad_program = copy.deepcopy(canonical_program)
+                        bad_artifacts = copy.deepcopy(artifact_system)
+                        bad_reflection = bad_artifacts["artifacts"][artifact_id]["reflection"]
+                        bad_reflection["endpoints"][1]["abi"]["bindings"][0]["carrier"]["slot"] = 0
+                        contract = {"operation": "compute", "reflection": bad_reflection}
+                        contract_hash = hashlib.sha256(
+                            json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
+                        ).hexdigest()
+                        bad_artifacts["artifacts"][artifact_id]["contract_hash"] = contract_hash
+                        bad_program["stages"][next(iter(bad_program["stages"]))]["contract_hash"] = contract_hash
+                        with self.assertRaisesRegex(RuntimeError, "portable ABI slots|resource ABI slots"):
+                            runtime.load_canonical_program(
+                                json.dumps(bad_program, sort_keys=True, separators=(",", ":")).encode(),
+                                json.dumps(bad_artifacts, sort_keys=True, separators=(",", ":")).encode(),
+                                str(runtime_root),
+                                stage_bindings,
+                                compiled_stages,
+                            )
+
+                        artifact_path = runtime_root / descriptors[next(iter(descriptors))]["path"]
+                        original_bytes = artifact_path.read_bytes()
+                        artifact_path.write_bytes(b"broken")
+                        try:
+                            with self.assertRaisesRegex(RuntimeError, "PROGRAM_BLOB_AUTHENTICATION"):
+                                runtime.load_canonical_program(
+                                    json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
+                                    json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
+                                    str(runtime_root),
+                                    stage_bindings,
+                                    compiled_stages,
+                                )
+                        finally:
+                            artifact_path.write_bytes(original_bytes)
+
     def test_cpu_graphics_pipeline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -829,6 +1213,8 @@ asset = vd.pipeline_asset(
             bundle = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(bundle["target"]["kind"], "vulkan")
             self.assertEqual(bundle["autodiff"]["profiles"][0]["residual_storage"], "none")
+            self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["direction"], "forward")
+            self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["nodes"][0]["stage"], "compute")
 
     def test_gpu_captured_tape_vjp_cooks_static_and_dynamic_profiles(self) -> None:
         if not _native_available():
@@ -865,6 +1251,7 @@ asset = vd.pipeline_asset(
                     profile = bundle["autodiff"]["profiles"][0]
                     self.assertEqual(profile["residual_storage"], expected_storage)
                     self.assertGreater(profile["static_tape_bytes_hint"], 0)
+                    self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["direction"], "forward")
 
     def test_four_variants_share_unchanged_fragment(self) -> None:
         root = Path(__file__).parents[2]

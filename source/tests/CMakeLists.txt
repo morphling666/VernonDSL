@@ -249,8 +249,8 @@ if(TARGET VernonRuntime)
         runtime/execution_command_model_test.cpp
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
-        runtime/operator_model_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
+        runtime/program_manifest_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
         runtime/runtime_autodiff_test.cpp
@@ -978,8 +978,12 @@ if(TARGET VernonCompilerTestSupport AND TARGET MLIRVernonTransforms)
         compiler/vernon_autodiff_tape_planning_test.cpp
         compiler/vernon_structured_vjp_test.cpp)
     set_target_properties(VernonAutodiffAnalysisTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
-    target_link_libraries(VernonAutodiffAnalysisTests PRIVATE GTest::gtest_main VernonCompilerTestSupport
-                                                              MLIRVernonTransforms)
+    target_link_libraries(
+        VernonAutodiffAnalysisTests
+        PRIVATE GTest::gtest_main
+                VernonCompilerTestSupport
+                MLIRVernonTransforms
+                MLIRVernonProgramTransforms)
     vernon_discover_gtests(VernonAutodiffAnalysisTests)
 endif()
 
@@ -992,7 +996,8 @@ if(TARGET VernonDSLCompiler)
         compiler/compiler_graphics_output_test.cpp
         compiler/compiler_synchronization_test.cpp
         compiler/spirv_image_query_size_lod_materialization_test.cpp
-        compiler/vernon_compile_packaging_test.cpp)
+        compiler/vernon_compile_packaging_test.cpp
+        compiler/vernon_value_abi_test.cpp)
     set_target_properties(VernonCompilerTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
     target_include_directories(
         VernonCompilerTests

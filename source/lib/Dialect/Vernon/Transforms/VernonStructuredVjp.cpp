@@ -91,6 +91,31 @@ void copyProfileFunctionAttrs(func::FuncOp source, func::FuncOp target) {
     target->setAttr(kStageAttr, StringAttr::get(target.getContext(), "compute"));
 }
 
+SmallVector<StringRef> languageLeafDtypes(DictionaryAttr attrs, Type valueType = {}) {
+    SmallVector<StringRef> result;
+    if (!attrs)
+        return result;
+    const bool container = isa_and_nonnull<RankedTensorType, TensorViewType>(valueType);
+    if (container)
+        if (auto dtypes = attrs.getAs<ArrayAttr>("vernon.element_abi_leaf_dtypes")) {
+            for (Attribute attribute : dtypes)
+                if (auto dtype = dyn_cast<StringAttr>(attribute))
+                    result.push_back(dtype.getValue());
+            if (!result.empty())
+                return result;
+        }
+    if (auto dtypes = attrs.getAs<ArrayAttr>("vernon.abi_leaf_dtypes")) {
+        for (Attribute attribute : dtypes)
+            if (auto dtype = dyn_cast<StringAttr>(attribute))
+                result.push_back(dtype.getValue());
+        if (!result.empty())
+            return result;
+    }
+    if (auto dtype = attrs.getAs<StringAttr>("vernon.dtype"); dtype && !dtype.getValue().empty())
+        result.push_back(dtype.getValue());
+    return result;
+}
+
 DictionaryAttr makeInterfaceAttrs(MLIRContext *context, StringRef interfaceName, StringRef sourceName,
                                   ArrayRef<StringRef> dtypes, int64_t location, Type valueType = {},
                                   StringRef autodiffRole = {}, StringRef autodiffSource = {}) {
@@ -103,6 +128,8 @@ DictionaryAttr makeInterfaceAttrs(MLIRContext *context, StringRef interfaceName,
     attributes.set("vernon.abi_leaf_dtypes", ArrayAttr::get(context, dtypeAttrs));
     if (isa_and_nonnull<RankedTensorType, TensorViewType>(valueType))
         attributes.set("vernon.element_abi_leaf_dtypes", ArrayAttr::get(context, dtypeAttrs));
+    if (dtypes.size() == 1)
+        attributes.set("vernon.dtype", StringAttr::get(context, dtypes.front()));
     attributes.set("vernon.location", IntegerAttr::get(IntegerType::get(context, 64), location));
     if (!autodiffRole.empty())
         attributes.set("vernon.autodiff_role", StringAttr::get(context, autodiffRole));
@@ -383,7 +410,7 @@ Value readLeaf(OpBuilder &builder, Location location, Value region, Value record
 LogicalResult writeCanonicalTapeValue(OpBuilder &builder, Location location, ModuleOp module, Value region,
                                       Value record, Value value, Value sourceIdentity,
                                       ArrayRef<AutodiffTapeLeaf> tapeLeaves, ArrayRef<uint64_t> overrideOffsets = {}) {
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(value.getType(), module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(value.getType(), module);
     FailureOr<SmallVector<Value>> scalars =
         decomposeAggregateValueToScalars(value.getType(), value, module, builder, location);
     if (failed(layout) || failed(scalars))
@@ -420,7 +447,7 @@ FailureOr<Value> readCanonicalTapeValue(OpBuilder &builder, Location location, M
                                         Value recordIndex, Value source, ArrayRef<AutodiffTapeLeaf> tapeLeaves,
                                         uint64_t recordSize, uint64_t recordAlignment,
                                         ArrayRef<uint64_t> overrideOffsets = {}) {
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(source.getType(), module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(source.getType(), module);
     if (failed(layout))
         return failure();
     SmallVector<Value> scalars;
@@ -1944,9 +1971,10 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
         auto sourceName = primal.getArgAttrOfType<StringAttr>(argument.getArgNumber(), "vernon.source_name");
         if (!sourceName || sourceName.getValue().empty())
             return primal.emitError("required backward primal argument has no source name");
-        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", ("primal." + sourceName.getValue()).str(),
-                                                           {}, primalBase + index, argument.getType(),
-                                                           "retained_primal", sourceName.getValue()));
+        backwardArgumentAttrs.push_back(
+            makeInterfaceAttrs(context, "input", ("primal." + sourceName.getValue()).str(),
+                               languageLeafDtypes(primal.getArgAttrDict(argument.getArgNumber()), argument.getType()),
+                               primalBase + index, argument.getType(), "retained_primal", sourceName.getValue()));
     }
     const unsigned shapeBase = primalBase + primalArguments.size();
     unsigned shapeSourceIndex = 0;
@@ -1957,23 +1985,25 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
                                                               "vernon.source_name");
         if (!sourceName || sourceName.getValue().empty())
             return primal.emitError("Storage identity has no source name for its backward shape source");
-        backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", ("shape." + sourceName.getValue()).str(),
-                                                           {}, shapeBase + shapeSourceIndex, identity.binding.getType(),
-                                                           "retained_primal", sourceName.getValue()));
+        backwardArgumentAttrs.push_back(makeInterfaceAttrs(
+            context, "input", ("shape." + sourceName.getValue()).str(),
+            languageLeafDtypes(primal.getArgAttrDict(cast<BlockArgument>(identity.binding).getArgNumber()),
+                               identity.binding.getType()),
+            shapeBase + shapeSourceIndex, identity.binding.getType(), "retained_primal", sourceName.getValue()));
         ++shapeSourceIndex;
     }
     const unsigned cotangentBase = shapeBase + profileTypes.shapeSources.size();
     for (auto [index, leaf] : llvm::enumerate(analysis.getActiveResultLeaves()))
         backwardArgumentAttrs.push_back(makeInterfaceAttrs(context, "input", leaf.path,
                                                            {profileTypes.cotangentDtypes[index]}, cotangentBase + index,
-                                                           profileTypes.cotangents[index], "cotangent"));
+                                                           profileTypes.cotangents[index], "cotangent", leaf.rootPath));
     const unsigned gradientBase = cotangentBase + profileTypes.cotangents.size();
     unsigned storageGradientIndex = 0;
     for (auto [index, leaf] : llvm::enumerate(analysis.getWrtLeaves()))
         if (isa<TensorViewType>(leaf.value.getType())) {
             backwardArgumentAttrs.push_back(makeInterfaceAttrs(
                 context, "input", leaf.path, {profileTypes.gradientDtypes[index]}, gradientBase + storageGradientIndex,
-                profileTypes.storageGradients[storageGradientIndex], "gradient"));
+                profileTypes.storageGradients[storageGradientIndex], "gradient", leaf.rootPath));
             ++storageGradientIndex;
         }
     backward.setAllArgAttrs(backwardArgumentAttrs);

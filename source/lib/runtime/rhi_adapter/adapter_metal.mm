@@ -711,8 +711,7 @@ VernonStatus encodeArgumentBuffers(VernonRuntimeRhiAdapter &adapter, const std::
                     slot.layout.set != argumentBuffer.index)
                     continue;
                 const uint32_t member = slot.layout.binding;
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                     [argumentBuffer.encoder setBuffer:slot.inlineBuffer offset:0 atIndex:member];
                     continue;
                 }
@@ -761,8 +760,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto &value = values[valueIndices[index]];
         if (value.kind != slot.layout.kind)
             return fail(adapter, "Metal binding kind does not match the prepared layout");
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             if (!value.payload.inline_value.data || value.payload.inline_value.size != slot.layout.element_size)
                 return fail(adapter, "Metal inline binding has an invalid physical size");
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
@@ -788,8 +786,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
     for (size_t index = 0; index < updatedSlots.size(); ++index) {
         auto &slot = updatedSlots[index];
         const auto &value = values[valueIndices[index]];
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             slot.resource = {};
             slot.inlineStorage.assign(static_cast<const uint8_t *>(value.payload.inline_value.data),
                                       static_cast<const uint8_t *>(value.payload.inline_value.data) +
@@ -924,15 +921,13 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
             if ((slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) == 0)
                 continue;
             if (!isArgumentResource(slot.layout)) {
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind))
                     [encoder setBytes:slot.inlineStorage.data()
                                length:slot.inlineStorage.size()
                               atIndex:slot.layout.binding];
                 continue;
             }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                 [encoder useResource:slot.inlineBuffer usage:MTLResourceUsageRead];
                 continue;
             }
@@ -1178,8 +1173,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             const bool vertexStage = (slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_VERTEX) != 0;
             const bool fragmentStage = (slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) != 0;
             if (!isArgumentResource(slot.layout)) {
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                     if (vertexStage)
                         [encoder setVertexBytes:slot.inlineStorage.data()
                                          length:slot.inlineStorage.size()
@@ -1199,8 +1193,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                 [encoder setVertexBuffer:buffer offset:slot.resource.offset atIndex:index];
                 continue;
             }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                 [encoder useResource:slot.inlineBuffer
                                usage:MTLResourceUsageRead
                               stages:renderStages(slot.layout.stage_mask)];

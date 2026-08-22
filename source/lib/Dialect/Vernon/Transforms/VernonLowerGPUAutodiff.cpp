@@ -48,6 +48,14 @@ StringRef scalarDtype(Type type) {
     return {};
 }
 
+void setLanguageDtypes(NamedAttrList &attrs, MLIRContext *context, StringRef dtype, bool container) {
+    Attribute leaf = StringAttr::get(context, dtype);
+    attrs.set("vernon.dtype", StringAttr::get(context, dtype));
+    attrs.set("vernon.abi_leaf_dtypes", ArrayAttr::get(context, {leaf}));
+    if (container)
+        attrs.set("vernon.element_abi_leaf_dtypes", ArrayAttr::get(context, {leaf}));
+}
+
 Value createPhysicalLoad(OpBuilder &builder, Location location, Type type, Value storage, Value index) {
     OperationState state(location, PhysicalLoadOp::getOperationName());
     state.addOperands({storage, index});
@@ -291,7 +299,7 @@ private:
         attrs.set(kBindingAttrName, IntegerAttr::get(IntegerType::get(context, 64), binding));
         attrs.set("vernon.source_name", StringAttr::get(context, sourceName));
         attrs.set("vernon.autodiff_role", StringAttr::get(context, role));
-        attrs.set("vernon.element_abi_leaf_dtypes", ArrayAttr::get(context, {StringAttr::get(context, "i32")}));
+        setLanguageDtypes(attrs, context, "i32", /*container=*/true);
         return attrs.getDictionary(context);
     }
 
@@ -338,8 +346,7 @@ private:
             attributes.set("vernon.source_name", path);
             attributes.set("vernon.autodiff_source", path);
             attributes.set("vernon.autodiff_role", StringAttr::get(context, "gradient"));
-            attributes.set("vernon.element_abi_leaf_dtypes",
-                           ArrayAttr::get(context, {StringAttr::get(context, dtype)}));
+            setLanguageDtypes(attributes, context, dtype, /*container=*/true);
             resourceAttributes.push_back(attributes.getDictionary(context));
         }
         if (failed(function.insertArguments(indices, resourceTypes, resourceAttributes, locations)))
@@ -390,9 +397,11 @@ private:
         NamedAttrList physicalLocalAttrs;
         physicalLocalAttrs.set(kBuiltinAttrName, StringAttr::get(context, "local_invocation_id"));
         physicalLocalAttrs.set(kInterfaceAttrName, StringAttr::get(context, "input"));
+        setLanguageDtypes(physicalLocalAttrs, context, "u32", /*container=*/true);
         NamedAttrList physicalWorkgroupAttrs;
         physicalWorkgroupAttrs.set(kBuiltinAttrName, StringAttr::get(context, "workgroup_id"));
         physicalWorkgroupAttrs.set(kInterfaceAttrName, StringAttr::get(context, "input"));
+        setLanguageDtypes(physicalWorkgroupAttrs, context, "u32", /*container=*/true);
         SmallVector<DictionaryAttr> attrs = {resourceAttrs("__vernon_ad_tape", "tape", nextBinding),
                                              resourceAttrs("__vernon_ad_segment", "replay_segment", nextBinding + 1)};
         if (forward) {
@@ -550,7 +559,7 @@ private:
         attributes.set(kBindingAttrName, IntegerAttr::get(IntegerType::get(context, 64), nextBinding));
         attributes.set("vernon.source_name", StringAttr::get(context, "__vernon_ad_launch"));
         attributes.set("vernon.autodiff_role", StringAttr::get(context, "launch_metadata"));
-        attributes.set("vernon.element_abi_leaf_dtypes", ArrayAttr::get(context, {StringAttr::get(context, "i32")}));
+        setLanguageDtypes(attributes, context, "i32", /*container=*/true);
         if (failed(function.insertArgument(argumentIndex, launchType, attributes.getDictionary(context),
                                            function.getLoc())))
             return function.emitError("cannot append GPU no-Tape launch metadata");
@@ -558,6 +567,7 @@ private:
             NamedAttrList physicalAttributes;
             physicalAttributes.set(kBuiltinAttrName, StringAttr::get(context, "global_invocation_id"));
             physicalAttributes.set(kInterfaceAttrName, StringAttr::get(context, "input"));
+            setLanguageDtypes(physicalAttributes, context, "u32", /*container=*/true);
             Type physicalIdType = RankedTensorType::get({3}, IntegerType::get(context, 32));
             if (failed(function.insertArgument(function.getNumArguments(), physicalIdType,
                                                physicalAttributes.getDictionary(context), function.getLoc())))

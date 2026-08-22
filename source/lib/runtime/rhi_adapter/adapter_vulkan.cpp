@@ -869,8 +869,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto *value = &values[bindings.valueIndices[index]];
         if (value->kind != slot.entry.layout.kind)
             return fail(adapter, "Vulkan binding slot or kind is invalid");
-        if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind)) {
             if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.inlineStorage.size())
                 return fail(adapter, "Vulkan inline or uniform-buffer binding size is invalid");
         } else if ((value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
@@ -890,8 +889,7 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto *newResource = providerBindingResource(value);
         bool slotChanged =
             slot.value.slot != value.slot || slot.value.kind != value.kind || slot.value.flags != value.flags;
-        if (value.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            value.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind)) {
             slotChanged |= slot.value.payload.inline_value.size != value.payload.inline_value.size ||
                            (value.payload.inline_value.data &&
                             std::memcmp(slot.inlineStorage.data(), value.payload.inline_value.data,
@@ -911,14 +909,14 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         auto &slot = bindings.slots[index];
         slot.value = values[bindings.valueIndices[index]];
-        if (slot.value.payload.inline_value.data && (slot.value.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                                                     slot.value.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)) {
+        if (slot.value.payload.inline_value.data &&
+            packedUniformBytes(slot.value.kind, slot.entry.layout.interface_kind)) {
             std::memcpy(slot.inlineStorage.data(), slot.value.payload.inline_value.data,
                         slot.value.payload.inline_value.size);
             if (slot.entry.inlineOffset != UINT32_MAX)
                 std::memcpy(bindings.pushConstantStorage.data() + slot.entry.inlineOffset,
                             slot.value.payload.inline_value.data, slot.value.payload.inline_value.size);
-            slot.value.payload.inline_value.data = nullptr;
+            slot.value.payload = {};
         }
     }
     if (resourcesChanged) {
@@ -938,6 +936,8 @@ bool retainBindingResources(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProvi
     if (!bindings)
         return true;
     for (const auto &slot : bindings->slots) {
+        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind))
+            continue;
         const auto *resource = providerBindingResource(slot.value);
         if (resource && resource->resource.value && !retainCommandResource(adapter, encoder, *resource)) {
             fail(adapter, "Vulkan could not retain binding slot " + std::to_string(slot.entry.layout.slot));
@@ -1017,8 +1017,8 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
     const VkDeviceSize alignment = bindings.device->descriptorBufferOffsetAlignment;
     for (size_t index = 0; index < snapshot->slots.size(); ++index) {
         const auto &slot = snapshot->slots[index];
-        if (slot.entry.layout.kind != VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER &&
-            (slot.entry.layout.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE || slot.entry.inlineOffset != UINT32_MAX))
+        if (!packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind) ||
+            (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE && slot.entry.inlineOffset != UINT32_MAX))
             continue;
         inlineSize = (inlineSize + alignment - 1) & ~(alignment - 1);
         snapshot->inlineOffsets[index] = inlineSize;
@@ -1070,8 +1070,7 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
         if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
             slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
             slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-            const bool internallyOwned = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                                         slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+            const bool internallyOwned = packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind);
             rhi::vulkan::Buffer *buffer = internallyOwned ? &snapshot->inlineBuffer
                                                           : reinterpret_cast<rhi::vulkan::Buffer *>(resolveRhiResource(
                                                                 adapter, slot.value.payload.buffer.resource));
@@ -1173,8 +1172,7 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
         if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
             !bindings->samplerByBinding.emplace(entry.layout.binding, index).second)
             return fail(adapter, "Vulkan binding layout contains duplicate sampler bindings");
-        if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
+        if (packedUniformBytes(entry.layout.kind, entry.layout.interface_kind))
             slot.inlineStorage.resize(entry.layout.element_size);
         bindings->slots.push_back(std::move(slot));
     }

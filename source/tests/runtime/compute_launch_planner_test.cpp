@@ -182,7 +182,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 6 * sizeof(float);
     ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline Tensor argument requires 36 bytes but its allocation has 24");
+    EXPECT_EQ(error, "pipeline Tensor argument '' at byte offset 8 requires 36 bytes but its allocation has 24");
 }
 
 TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {

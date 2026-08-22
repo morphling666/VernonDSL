@@ -551,26 +551,52 @@ nlohmann::json scalarElementLayout(const std::string &dtype) {
 }
 
 nlohmann::json nativeUniformPlan(uint64_t size, uint64_t alignment, std::initializer_list<uint64_t> byteStrides,
-                                 const char *representation = "f32") {
+                                 const char *representation = "f32", std::vector<uint64_t> shape = {},
+                                 const char *layoutHash = "test-layout") {
+    const uint64_t scalarSize = std::min<uint64_t>(size, 4);
     nlohmann::json scalar = {{"kind", "scalar"},
                              {"representation", representation},
                              {"offset", 0},
-                             {"size", std::min<uint64_t>(size, 4)},
+                             {"size", scalarSize},
                              {"alignment", std::min<uint64_t>(alignment, 4)}};
     nlohmann::json root = scalar;
-    if (byteStrides.size()) {
-        root = {{"kind", "array"},
-                {"offset", 0},
-                {"size", size},
-                {"alignment", alignment},
-                {"shape", std::vector<uint64_t>(byteStrides.size(), 1)},
-                {"byte_strides", byteStrides},
-                {"children", nlohmann::json::array({std::move(scalar)})}};
+    if (!shape.empty() || byteStrides.size()) {
+        if (shape.empty())
+            shape.assign(byteStrides.size(), 1);
+        if (byteStrides.size())
+            root = {{"kind", "array"},
+                    {"offset", 0},
+                    {"size", size},
+                    {"alignment", alignment},
+                    {"shape", shape},
+                    {"byte_strides", byteStrides},
+                    {"children", nlohmann::json::array({std::move(scalar)})}};
     }
     return {{"kind", "native_uniform"},
             {"profile", "opengl_native_uniform"},
-            {"canonical_layout_hash", "test-layout"},
+            {"canonical_layout_hash", layoutHash},
             {"root", std::move(root)}};
+}
+
+nlohmann::json vectorValueLayout(const char *dtype, uint32_t components) {
+    const VernonDataType dataType = dtype == std::string("u32")   ? VERNON_DATA_U32
+                                    : dtype == std::string("i32") ? VERNON_DATA_I32
+                                                                  : VERNON_DATA_F32;
+    const VernonValueLayoutView scalar = vernonRuntimeGetScalarValueLayout(dataType);
+    const uint64_t byteSize = components * scalar.byte_size;
+    const std::string spelling =
+        components == 1 ? std::string(dtype) : std::string("tensor<") + std::to_string(components) + "x" + dtype + ">";
+    const std::string hash =
+        std::string(scalar.layout_hash.data, scalar.layout_hash.size) + "|vec" + std::to_string(components);
+    nlohmann::json leaf = {
+        {"path", nlohmann::json::array()}, {"dtype", dtype}, {"byte_offset", 0}, {"scalar_count", components}};
+    if (components > 1)
+        leaf["shape"] = nlohmann::json::array({components});
+    return {{"logical_type", spelling},
+            {"byte_size", byteSize},
+            {"alignment", scalar.alignment},
+            {"layout_hash", hash},
+            {"leaves", nlohmann::json::array({std::move(leaf)})}};
 }
 
 std::string pipelineBundle(const nlohmann::json &artifact) {
@@ -647,12 +673,15 @@ std::string integerUniformBundle(const char *dtype, uint32_t components) {
     const std::string shapeType =
         components == 1 ? dtype : std::string("tensor<") + std::to_string(components) + "x" + dtype + ">";
     const nlohmann::json shape = components == 1 ? nlohmann::json::array() : nlohmann::json::array({components});
+    const nlohmann::json valueLayout = vectorValueLayout(dtype, components);
+    const std::string layoutHash = valueLayout["layout_hash"].get<std::string>();
     root["variants"][0]["parameters"] = nlohmann::json::array(
         {{{"slot", 0},
           {"name", "budget"},
           {"kind", "tensor"},
           {"type", shapeType},
           {"element_layout", scalarElementLayout(dtype)},
+          {"value_layout", valueLayout},
           {"access", "read"},
           {"shape", shape},
           {"uses", nlohmann::json::array(
@@ -662,10 +691,12 @@ std::string integerUniformBundle(const char *dtype, uint32_t components) {
                          {"dtype", dtype},
                          {"shape", shape},
                          {"transport", "native_uniform"},
-                         {"interface_plan", nativeUniformPlan(components * sizeof(uint32_t), sizeof(uint32_t),
-                                                              components == 1 ? std::initializer_list<uint64_t>{}
-                                                                              : std::initializer_list<uint64_t>{4},
-                                                              dtype)}}})}}});
+                         {"interface_plan",
+                          nativeUniformPlan(
+                              components * sizeof(uint32_t), sizeof(uint32_t),
+                              components == 1 ? std::initializer_list<uint64_t>{} : std::initializer_list<uint64_t>{4},
+                              dtype, components == 1 ? std::vector<uint64_t>{} : std::vector<uint64_t>{components},
+                              layoutHash.c_str())}}})}}});
     root.erase("content_hash");
     const std::string canonical = root.dump(-1, ' ', false);
     root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());

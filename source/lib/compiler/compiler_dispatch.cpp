@@ -114,8 +114,18 @@ bool validateTargetCapabilities(PreparedModule &prepared, const TargetProfile &p
                 if (function.getArgAttrDict(index).get("vernon.builtin") ||
                     containsBackendLocalTapeHandle(function.getArgumentTypes()[index]))
                     continue;
+                mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+                llvm::SmallVector<llvm::StringRef> logicalDtypes;
+                if (auto dtypes = attrs.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
+                    for (mlir::Attribute dtype : dtypes)
+                        if (auto value = mlir::dyn_cast<mlir::StringAttr>(dtype))
+                            logicalDtypes.push_back(value.getValue());
+                if (logicalDtypes.empty())
+                    if (auto sugar = attrs.getAs<mlir::StringAttr>("vernon.dtype"); sugar && !sugar.getValue().empty())
+                        logicalDtypes.push_back(sugar.getValue());
                 mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
-                    function.getArgumentTypes()[index], module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
+                    function.getArgumentTypes()[index], module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter,
+                    logicalDtypes);
                 if (mlir::failed(plan)) {
                     diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
                     return false;

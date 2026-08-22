@@ -156,7 +156,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
                 return failure();
             elements.push_back(*converted);
         }
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
         if (failed(layout))
             return failure();
         SmallVector<uint32_t> offsets;
@@ -187,7 +187,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
         if (!module)
             return failure();
         FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields = resolveStructFields(structure, module);
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
         if (failed(fields) || failed(layout))
             return failure();
         SmallVector<Type> elements;
@@ -271,7 +271,7 @@ LogicalResult collectTransportScalarOffsets(const ByteTransportNode &node, uint6
 }
 
 FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
-    FailureOr<ValueAbiLayout> elementLayout = getValueAbiLayout(tensor.getElementType(), module);
+    FailureOr<ValueAbiLayout> elementLayout = getValueStorageLayout(tensor.getElementType(), module);
     FailureOr<ByteTransportPlan> physicalLayout =
         getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
     FailureOr<int64_t> count = getStaticShapeElementCount(tensor.getShape());

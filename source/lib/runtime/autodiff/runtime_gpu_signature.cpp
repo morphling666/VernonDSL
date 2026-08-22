@@ -9,69 +9,9 @@
 namespace vernon::runtime::ad::gpu {
 namespace {
 
-bool checkedMultiply(size_t left, size_t right, size_t &result) {
-    if (left && right > std::numeric_limits<size_t>::max() / left)
-        return false;
-    result = left * right;
-    return true;
-}
-
-std::optional<VernonDataType> leafDtype(const ValueLeaf &leaf) { return pipelineDataType(leaf.dtype); }
-
-std::string leafPath(const std::string &root, const ValueLeaf &leaf) {
-    std::string result = root;
-    for (const ValuePathComponent &component : leaf.path) {
-        result.push_back('.');
-        result += component.field ? *component.field : std::to_string(component.index);
-    }
-    return result;
-}
-
 bool appendParameterValues(const Parameter &parameter, std::vector<ValueAbi> &values, std::string &error) {
-    const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
-    if (!layout || layout->leaves.empty()) {
-        error = "GPU autodiff parameter has no canonical Value layout";
-        return false;
-    }
-    size_t elementCount = 1;
-    bool dynamicShape = false;
-    for (uint64_t extent : parameter.shape) {
-        if (!extent) {
-            dynamicShape = true;
-            continue;
-        }
-        if (!checkedMultiply(elementCount, static_cast<size_t>(extent), elementCount)) {
-            error = "GPU autodiff reflected Tensor shape overflows";
-            return false;
-        }
-    }
     const std::string &source = parameter.autodiffSource.empty() ? parameter.name : parameter.autodiffSource;
-    for (const ValueLeaf &leaf : layout->leaves) {
-        const std::optional<VernonDataType> dtype = leafDtype(leaf);
-        const size_t scalarSize = dtype ? dtypeSize(*dtype) : 0;
-        size_t byteSize = 0;
-        if (!scalarSize || !leaf.scalarCount ||
-            !checkedMultiply(static_cast<size_t>(leaf.scalarCount), scalarSize, byteSize) ||
-            (!dynamicShape && !checkedMultiply(byteSize, elementCount, byteSize))) {
-            error = "GPU autodiff parameter leaf byte size overflows";
-            return false;
-        }
-        std::vector<uint64_t> shape = parameter.shape;
-        shape.insert(shape.end(), leaf.shape.begin(), leaf.shape.end());
-        ValueAbi candidate{leafPath(source, leaf), *dtype, byteSize, std::max<size_t>(layout->alignment, 1),
-                           std::move(shape)};
-        const auto existing = std::find_if(values.begin(), values.end(),
-                                           [&](const ValueAbi &value) { return value.path == candidate.path; });
-        if (existing != values.end()) {
-            if (!sameValueAbi(*existing, candidate)) {
-                error = "GPU autodiff parameters define conflicting ABI values for '" + candidate.path + "'";
-                return false;
-            }
-            continue;
-        }
-        values.push_back(std::move(candidate));
-    }
-    return true;
+    return appendParameterValueAbi(parameter, source, values, error);
 }
 
 bool isAutodiffInternal(const Parameter &parameter) {
@@ -90,8 +30,10 @@ bool makeLogicalDerivativeAbi(ValueAbi &derivative, const std::vector<ValueAbi> 
     const size_t derivativeScalar = dtypeSize(derivative.dtype);
     size_t byteSize = 0;
     if (!sourceScalar || !derivativeScalar || source->byteSize % sourceScalar ||
-        !checkedMultiply(source->byteSize / sourceScalar, derivativeScalar, byteSize))
+        (source->byteSize / sourceScalar &&
+         derivativeScalar > std::numeric_limits<size_t>::max() / (source->byteSize / sourceScalar)))
         return false;
+    byteSize = (source->byteSize / sourceScalar) * derivativeScalar;
     derivative.logicalShape = source->logicalShape;
     derivative.byteSize = byteSize;
     return true;

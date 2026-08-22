@@ -68,6 +68,13 @@ inline bool isRhiImageViewReference(VernonRuntimeProviderResourceReference resou
     return (resource.identity & kRhiResourceKindMask) == kRhiImageViewResource;
 }
 
+inline bool packedUniformBytes(VernonRuntimeProviderBindingKind kind,
+                               VernonRuntimeProviderBindingInterface interfaceKind) {
+    return kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+           (kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+            interfaceKind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM);
+}
+
 template <typename Object> VernonRuntimeProviderObject toHandle(Object *object) {
     return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))};
 }

@@ -35,32 +35,60 @@ struct MetalResourceLocation {
     uint32_t count{};
 };
 
-bool resolveMetalResourceLocation(const nlohmann::json &reflection, const std::string &entry, const char *stage,
-                                  const char *kind, uint32_t set, uint32_t binding, MetalResourceLocation &output,
-                                  std::string &error, const std::string *name = nullptr) {
-    const auto slots = reflection.find("metal_resource_slots");
-    if (slots == reflection.end() || !slots->is_array()) {
+bool parseMetalResourceSlots(const nlohmann::json &reflection, std::vector<NativeResourceSlot> &slots,
+                             std::string &error) {
+    const auto jsonSlots = reflection.find("metal_resource_slots");
+    if (jsonSlots == reflection.end() || !jsonSlots->is_array()) {
         error = "Metal reflection has no argument-buffer resource sidecar";
         return false;
     }
-    bool found = false;
-    for (const auto &slot : *slots) {
-        if (!slot.is_object() || slot.value("entry_point", std::string()) != entry ||
-            slot.value("stage", std::string()) != stage || slot.value("kind", std::string()) != kind ||
-            (name && slot.value("name", std::string()) != *name) ||
-            (set != UINT32_MAX && slot.value("set", UINT32_MAX) != set) ||
-            (binding != UINT32_MAX && slot.value("binding", UINT32_MAX) != binding))
+    for (const auto &slot : *jsonSlots) {
+        if (!slot.is_object())
             continue;
         if (!slot.contains("argument_buffer_index") || !slot.contains("member_id") ||
             !slot.contains("direct_buffer_index")) {
             error = "Metal reflection uses the obsolete direct-resource slot contract";
             return false;
         }
+        NativeResourceSlot parsed;
+        parsed.entry = slot.value("entry_point", std::string());
+        parsed.stage = slot.value("stage", std::string());
+        parsed.kind = slot.value("kind", std::string());
+        parsed.name = slot.value("name", std::string());
+        parsed.set = slot.value("set", UINT32_MAX);
+        parsed.binding = slot.value("binding", UINT32_MAX);
+        parsed.argumentBufferIndex = slot.value("argument_buffer_index", UINT32_MAX);
+        parsed.memberId = slot.value("member_id", UINT32_MAX);
+        parsed.directBufferIndex = slot.value("direct_buffer_index", UINT32_MAX);
+        parsed.count = slot.value("count", 0u);
+        slots.push_back(std::move(parsed));
+    }
+    return true;
+}
+
+const std::vector<NativeResourceSlot> *metalSlotsForStage(const Stage &stage, const nlohmann::json *reflection,
+                                                          std::vector<NativeResourceSlot> &parsed, std::string &error) {
+    if (!stage.nativeSlots.empty() || stage.reflection.empty())
+        return &stage.nativeSlots;
+    if (!reflection || !parseMetalResourceSlots(*reflection, parsed, error))
+        return nullptr;
+    return &parsed;
+}
+
+bool resolveMetalResourceLocation(const std::vector<NativeResourceSlot> &slots, const std::string &entry,
+                                  const char *stage, const char *kind, uint32_t set, uint32_t binding,
+                                  MetalResourceLocation &output, std::string &error,
+                                  const std::string *name = nullptr) {
+    bool found = false;
+    for (const NativeResourceSlot &slot : slots) {
+        if (slot.entry != entry || slot.stage != stage || slot.kind != kind || (name && slot.name != *name) ||
+            (set != UINT32_MAX && slot.set != set) || (binding != UINT32_MAX && slot.binding != binding))
+            continue;
         MetalResourceLocation location;
-        location.argumentBufferIndex = slot.value("argument_buffer_index", UINT32_MAX);
-        location.memberId = slot.value("member_id", UINT32_MAX);
-        location.directBufferIndex = slot.value("direct_buffer_index", UINT32_MAX);
-        location.count = slot.value("count", 0u);
+        location.argumentBufferIndex = slot.argumentBufferIndex;
+        location.memberId = slot.memberId;
+        location.directBufferIndex = slot.directBufferIndex;
+        location.count = slot.count;
         const bool descriptor = set != UINT32_MAX;
         const bool validDescriptor = location.argumentBufferIndex < 8 && location.memberId != UINT32_MAX &&
                                      location.directBufferIndex == UINT32_MAX;
@@ -86,35 +114,22 @@ struct MetalArgumentBufferUsage {
     bool writableTexture{};
 };
 
-bool collectMetalArgumentBufferUsage(const nlohmann::json &reflection, const std::string &entry, const char *stage,
-                                     MetalArgumentBufferUsage &usage, std::string &error) {
-    const auto slots = reflection.find("metal_resource_slots");
-    if (slots == reflection.end() || !slots->is_array()) {
-        error = "Metal reflection has no argument-buffer resource sidecar";
-        return false;
-    }
-    for (const auto &slot : *slots) {
-        if (!slot.is_object() || slot.value("entry_point", std::string()) != entry ||
-            slot.value("stage", std::string()) != stage)
+bool collectMetalArgumentBufferUsage(const std::vector<NativeResourceSlot> &slots, const std::string &entry,
+                                     const char *stage, MetalArgumentBufferUsage &usage, std::string &error) {
+    for (const NativeResourceSlot &slot : slots) {
+        if (slot.entry != entry || slot.stage != stage)
             continue;
-        if (!slot.contains("argument_buffer_index") || !slot.contains("member_id") ||
-            !slot.contains("direct_buffer_index")) {
-            error = "Metal reflection uses the obsolete direct-resource slot contract";
-            return false;
-        }
-        const uint64_t count = slot.value("count", 0u);
-        if (!count) {
+        if (!slot.count) {
             error = "Metal reflection contains a zero-sized resource binding";
             return false;
         }
-        const std::string kind = slot.value("kind", std::string());
-        if (kind == "uniform_buffer" || kind == "storage_buffer")
-            usage.buffers += count;
-        else if (kind == "sampled_image" || kind == "storage_image") {
-            usage.textures += count;
-            usage.writableTexture |= kind == "storage_image";
-        } else if (kind == "sampler")
-            usage.samplers += count;
+        if (slot.kind == "uniform_buffer" || slot.kind == "storage_buffer")
+            usage.buffers += slot.count;
+        else if (slot.kind == "sampled_image" || slot.kind == "storage_image") {
+            usage.textures += slot.count;
+            usage.writableTexture |= slot.kind == "storage_image";
+        } else if (slot.kind == "sampler")
+            usage.samplers += slot.count;
     }
     return true;
 }
@@ -160,14 +175,23 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
         const Stage &fragment = bundle.stages.at(variant.fragment);
         const nlohmann::json vertexReflection = nlohmann::json::parse(vertex.reflection, nullptr, false);
         const nlohmann::json fragmentReflection = nlohmann::json::parse(fragment.reflection, nullptr, false);
-        if (vertexReflection.is_discarded() || fragmentReflection.is_discarded()) {
-            invocationDiagnostic(*bundle.context) = "Metal graphics reflection is invalid";
+        std::vector<NativeResourceSlot> vertexSlots;
+        std::vector<NativeResourceSlot> fragmentSlots;
+        const std::vector<NativeResourceSlot> *vertexNative =
+            metalSlotsForStage(vertex, vertexReflection.is_discarded() ? nullptr : &vertexReflection, vertexSlots,
+                               invocationDiagnostic(*bundle.context));
+        const std::vector<NativeResourceSlot> *fragmentNative =
+            metalSlotsForStage(fragment, fragmentReflection.is_discarded() ? nullptr : &fragmentReflection,
+                               fragmentSlots, invocationDiagnostic(*bundle.context));
+        if (!vertexNative || !fragmentNative) {
+            if (invocationDiagnostic(*bundle.context).empty())
+                invocationDiagnostic(*bundle.context) = "Metal graphics reflection is invalid";
             return false;
         }
         MetalArgumentBufferUsage argumentBufferUsage;
-        if (!collectMetalArgumentBufferUsage(vertexReflection, vertex.entry, "vertex", argumentBufferUsage,
+        if (!collectMetalArgumentBufferUsage(*vertexNative, vertex.entry, "vertex", argumentBufferUsage,
                                              invocationDiagnostic(*bundle.context)) ||
-            !collectMetalArgumentBufferUsage(fragmentReflection, fragment.entry, "fragment", argumentBufferUsage,
+            !collectMetalArgumentBufferUsage(*fragmentNative, fragment.entry, "fragment", argumentBufferUsage,
                                              invocationDiagnostic(*bundle.context)) ||
             !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
                                               metalState(*bundle.context).argumentBufferEncodingSupported,
@@ -196,10 +220,11 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             candidate.binding.descriptorSet = use.descriptorSet;
             candidate.binding.descriptorBinding = use.binding;
             const Stage &nativeStage = use.stage == "vertex" ? vertex : fragment;
-            const nlohmann::json &nativeReflection = use.stage == "vertex" ? vertexReflection : fragmentReflection;
+            const std::vector<NativeResourceSlot> &nativeSlots =
+                use.stage == "vertex" ? *vertexNative : *fragmentNative;
             auto resolveDescriptor = [&](const char *kind) {
                 MetalResourceLocation location;
-                if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), kind,
+                if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), kind,
                                                   use.descriptorSet, use.binding, location,
                                                   invocationDiagnostic(*bundle.context)))
                     return false;
@@ -226,7 +251,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     sampler.binding.descriptorSet = binding.descriptorSet;
                     sampler.binding.descriptorBinding = binding.binding;
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), "sampler",
+                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), "sampler",
                                                       binding.descriptorSet, binding.binding, location,
                                                       invocationDiagnostic(*bundle.context)))
                         return false;
@@ -240,17 +265,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 return true;
             }
             if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                use.transport == "storage_buffer" && parameter.elementLayout.byteSize && use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.set = use.descriptorSet;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_STORAGE;
-                if (!resolveDescriptor("storage_buffer"))
-                    return false;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
-                       use.interfacePlan->root) {
+                use.interfacePlan->root) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 uint64_t count = 1;
@@ -262,8 +277,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
                     !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
                     return false;
-                candidate.layout.kind = use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                          : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_count = static_cast<uint32_t>(count);
@@ -275,19 +291,25 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                                                     : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
                 const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
                 std::optional<TensorCopyPlan> packing =
-                    compileTensorCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root, shape);
-                if (!packing || packing->elementSize != dataTypeSize(*dtype))
+                    parameter.valueLayout
+                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
+                if (!packing || packing->elementSize != canonical.byteSize)
                     return false;
                 candidate.binding.packing = std::move(*packing);
                 candidate.binding.storage.resize(candidate.layout.element_size);
                 if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
                     if (!resolveDescriptor("uniform_buffer"))
                         return false;
+                } else if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                    if (!resolveDescriptor("storage_buffer"))
+                        return false;
                 } else {
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(),
+                    const std::string inlineName = !use.uniformName.empty() ? use.uniformName : parameter.name;
+                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(),
                                                       "inline_constant", UINT32_MAX, UINT32_MAX, location,
-                                                      invocationDiagnostic(*bundle.context), &parameter.name))
+                                                      invocationDiagnostic(*bundle.context), &inlineName))
                         return false;
                     candidate.layout.set = UINT32_MAX;
                     candidate.layout.binding = location.directBufferIndex;
@@ -401,13 +423,17 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
         return true;
     }
     const Stage &stage = bundle.stages.at(variant.compute);
-    const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
     ReflectedEntry reflection;
-    if (parsed.is_discarded() ||
-        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_METAL, invocationDiagnostic(*bundle.context)))
+    if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*bundle.context)))
+        return false;
+    const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
+    std::vector<NativeResourceSlot> parsedSlots;
+    const std::vector<NativeResourceSlot> *nativeSlots = metalSlotsForStage(
+        stage, parsed.is_discarded() ? nullptr : &parsed, parsedSlots, invocationDiagnostic(*bundle.context));
+    if (!nativeSlots)
         return false;
     MetalArgumentBufferUsage argumentBufferUsage;
-    if (!collectMetalArgumentBufferUsage(parsed, stage.entry, "compute", argumentBufferUsage,
+    if (!collectMetalArgumentBufferUsage(*nativeSlots, stage.entry, "compute", argumentBufferUsage,
                                          invocationDiagnostic(*bundle.context)) ||
         !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
                                           metalState(*bundle.context).argumentBufferEncodingSupported,
@@ -471,8 +497,8 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     parameter.kind == "image" ? (parameter.bindingRole == "sampled" ? "sampled_image" : "storage_image")
                                               : "storage_buffer";
                 if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
-                    !resolveMetalResourceLocation(parsed, stage.entry, "compute", resourceKind, candidate.layout.set,
-                                                  candidate.layout.binding, location,
+                    !resolveMetalResourceLocation(*nativeSlots, stage.entry, "compute", resourceKind,
+                                                  candidate.layout.set, candidate.layout.binding, location,
                                                   invocationDiagnostic(*bundle.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
@@ -494,7 +520,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     candidate.layout.element_size = 4;
                     candidate.source = {kind, use.index, dimension};
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
+                    if (!resolveMetalResourceLocation(*nativeSlots, stage.entry, "compute", "storage_buffer",
                                                       candidate.layout.set, binding, location,
                                                       invocationDiagnostic(*bundle.context)))
                         return false;

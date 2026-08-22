@@ -392,7 +392,7 @@ std::optional<CanonicalLeafLayout> getCanonicalLeafLayout(Operation *operation, 
     ModuleOp module = operation->getParentOfType<ModuleOp>();
     if (!module)
         return std::nullopt;
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
     if (failed(layout) || !layout->tree.root || layout->tree.root->kind != CanonicalAbiNodeKind::Scalar ||
         layout->leaves.size() != 1 || layout->leaves.front().scalarCount != 1 ||
         layout->size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||

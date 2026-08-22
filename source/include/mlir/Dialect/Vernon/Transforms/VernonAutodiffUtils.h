@@ -1,8 +1,16 @@
 #pragma once
 
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Types.h"
 #include "mlir/Support/LLVM.h"
 
 namespace mlir::vernon {
+
+FailureOr<Type> getAutodiffDerivativeType(Type scalarType);
+FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module);
+FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type derivativeType, ModuleOp module,
+                                                           ArrayRef<StringRef> logicalLeafDtypes = {});
 
 inline SmallVector<SmallVector<int64_t>> enumerateStaticCoordinates(ArrayRef<int64_t> shape) {
     SmallVector<SmallVector<int64_t>> coordinates(1);

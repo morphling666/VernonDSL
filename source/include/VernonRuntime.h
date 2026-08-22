@@ -90,6 +90,10 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntim
  */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterStaticCpuEntry(VernonStringView symbol,
                                                                      VernonCpuEntryPoint entry_point);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeRegisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,
+                                                               VernonCpuEntryPoint entry_point);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeUnregisterCpuEntry(VernonRuntimeContext *context, VernonStringView symbol,
+                                                                 VernonCpuEntryPoint entry_point);
 
 typedef enum VernonIndexType { VERNON_INDEX_U32 = 0 } VernonIndexType;
 
@@ -343,6 +347,24 @@ typedef struct VernonAdValueMetadataView {
     uint32_t reserved[4];
 } VernonAdValueMetadataView;
 
+typedef enum VernonProgramAdBoundary {
+    VERNON_PROGRAM_AD_INPUT = 0,
+    VERNON_PROGRAM_AD_OUTPUT = 1,
+    VERNON_PROGRAM_AD_COTANGENT = 2,
+    VERNON_PROGRAM_AD_GRADIENT = 3,
+    VERNON_PROGRAM_AD_CAPTURE = 4
+} VernonProgramAdBoundary;
+
+typedef struct VernonProgramAdValueView {
+    uint32_t struct_size;
+    VernonStringView path;
+    uint32_t value_id;
+    uint8_t external;
+    uint8_t output;
+    /* Reserved for future use; initialize all elements to zero. */
+    uint32_t reserved[4];
+} VernonProgramAdValueView;
+
 typedef enum VernonAdDerivativeRole {
     VERNON_AD_DERIVATIVE_GRADIENT = 0,
     VERNON_AD_DERIVATIVE_COTANGENT = 1
@@ -442,6 +464,12 @@ VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdGradientCount(const V
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdGradientByIndex(const VernonLoadedPipeline *pipeline,
                                                                                  size_t index,
                                                                                  VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI uint8_t vernonRuntimeLoadedPipelineHasProgramAutodiff(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetProgramAdValueCount(const VernonLoadedPipeline *pipeline,
+                                                                             VernonProgramAdBoundary boundary);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(
+    const VernonLoadedPipeline *pipeline, VernonProgramAdBoundary boundary, size_t index,
+    VernonProgramAdValueView *value);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(
     const VernonLoadedPipeline *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);

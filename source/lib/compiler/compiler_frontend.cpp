@@ -11,6 +11,10 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramExecutable.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramImplementation.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramVjp.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
@@ -99,6 +103,7 @@ public:
         mlir::registerAllToLLVMIRTranslations(registry);
         mlir::vernon::registerVernonCpuPipelineDialects(registry);
         registry.insert<mlir::vernon::VernonDialect>();
+        registry.insert<mlir::vernon::program::VernonProgramDialect>();
         context.appendDialectRegistry(registry);
     }
 
@@ -253,6 +258,47 @@ VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t 
         return VERNON_STATUS_VERIFICATION_ERROR;
 
     mlir::PassManager passManager(&frontend.context);
+    bool hasProgramGraph = false;
+    module->walk([&](mlir::func::FuncOp function) { hasProgramGraph |= function->hasAttr("vernon_program.graph"); });
+    std::optional<mlir::vernon::program::ProgramVjpOptions> programVjp;
+    if (auto wrt = (*module)->getAttrOfType<mlir::ArrayAttr>("vernon_program.vjp_wrt")) {
+        mlir::vernon::program::ProgramVjpOptions options;
+        mlir::func::FuncOp primal;
+        bool multiplePrimals = false;
+        module->walk([&](mlir::func::FuncOp function) {
+            if (auto graph = function->getAttrOfType<mlir::StringAttr>("vernon_program.graph");
+                graph && graph.getValue() == "primal") {
+                multiplePrimals |= static_cast<bool>(primal);
+                if (!primal)
+                    primal = function;
+            }
+        });
+        if (!primal || multiplePrimals) {
+            (*module).emitError("Program VJP request requires one primal graph");
+            return VERNON_STATUS_VERIFICATION_ERROR;
+        }
+        llvm::SmallVector<llvm::StringRef> publicPaths;
+        for (mlir::Attribute value : wrt) {
+            auto name = mlir::dyn_cast<mlir::StringAttr>(value);
+            if (!name) {
+                (*module).emitError("Program VJP wrt paths must be strings");
+                return VERNON_STATUS_VERIFICATION_ERROR;
+            }
+            publicPaths.push_back(name.getValue());
+        }
+        mlir::FailureOr<llvm::SmallVector<unsigned>> indices =
+            mlir::vernon::program::resolveProgramWrtBoundaryIndices(primal, publicPaths);
+        if (mlir::failed(indices))
+            return VERNON_STATUS_VERIFICATION_ERROR;
+        options.wrtBoundaryIndices = std::move(*indices);
+        programVjp = std::move(options);
+    }
+    if (hasProgramGraph) {
+        if (programVjp)
+            passManager.addPass(mlir::vernon::program::createVernonProgramVjpPass(std::move(*programVjp)));
+        passManager.addPass(mlir::vernon::program::createVernonProgramSelectImplementationsPass());
+        passManager.addPass(mlir::vernon::program::createVernonProgramBuildExecutablePass());
+    }
     passManager.addPass(mlir::vernon::createVernonValidatePass());
     if (mlir::failed(passManager.run(*module)))
         return VERNON_STATUS_VERIFICATION_ERROR;

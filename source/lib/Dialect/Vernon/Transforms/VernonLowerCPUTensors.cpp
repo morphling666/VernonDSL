@@ -37,7 +37,7 @@ FailureOr<HostAggregateType> getHostAggregateType(Type source, const TypeConvert
     } else {
         return failure();
     }
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(source, module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(source, module);
     if (failed(layout) || layout->fieldOffsets.size() != fields.size())
         return failure();
 
@@ -53,7 +53,7 @@ FailureOr<HostAggregateType> getHostAggregateType(Type source, const TypeConvert
             elements.push_back(LLVM::LLVMArrayType::get(byte, fieldOffset - offset));
         fieldIndices.push_back(static_cast<int64_t>(elements.size()));
         Type converted = converter.convertType(field);
-        FailureOr<ValueAbiLayout> fieldLayout = getValueAbiLayout(field, module);
+        FailureOr<ValueAbiLayout> fieldLayout = getValueStorageLayout(field, module);
         if (!converted || failed(fieldLayout))
             return failure();
         elements.push_back(converted);
@@ -295,7 +295,7 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
                                                             {static_cast<int64_t>(leaf.scalarCount)}, "read_write",
                                                             "workgroup"));
                 } else {
-                    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+                    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
                     if (failed(layout))
                         return failure();
                     for (const ValueAbiLeaf &leaf : layout->leaves)

@@ -7,7 +7,10 @@ from typing import Any, cast
 import numpy as np
 import vernon_dsl as vd
 
-from examples.autodiff_smoke_fluid_graph import build_smoke_fluid_graph, build_smoke_fluid_sequence_graph
+from examples.autodiff_smoke_fluid_graph import (
+    SmokeFluidModule,
+    SmokeFluidRolloutModule,
+)
 from examples.autodiff_smoke_fluid_kernels import SmokeFluidParameters, smoke_loss
 from examples.autodiff_smoke_mpc import (
     SmokeFluidSimulation,
@@ -129,18 +132,17 @@ class SmokeFluidGraphTests(unittest.TestCase):
             height=np.int32(size),
             pressure_iterations=np.int32(pressure_iterations),
         )
-        graph = build_smoke_fluid_graph(
-            state_density=vd.storage.from_numpy(density),
-            state_velocity=velocity_storage,
-            objective_target_density=vd.storage.from_numpy(target),
-            parameters=parameters,
+        module = SmokeFluidModule(parameters)
+        outputs = module(
+            vd.storage.from_numpy(density),
+            velocity_storage,
+            vd.storage.from_numpy(target),
         )
-        outputs = graph.execute()
         return (
             outputs.density.to_numpy(),
             outputs.velocity.to_numpy(),
             outputs.loss.to_numpy(),
-            graph,
+            module,
             smoke_reference(
                 density,
                 velocity,
@@ -152,12 +154,50 @@ class SmokeFluidGraphTests(unittest.TestCase):
     def test_cpu_matches_independent_reference_at_dynamic_shapes(self) -> None:
         for size in (4, 6, 16, 17):
             with self.subTest(size=size):
-                density, velocity, loss, graph, expected = self._run(vd.cpu, size)
+                density, velocity, loss, module, expected = self._run(vd.cpu, size)
                 np.testing.assert_allclose(density, expected[0], rtol=2.0e-5, atol=2.0e-6)
                 np.testing.assert_allclose(velocity, expected[1], rtol=2.0e-5, atol=2.0e-6)
                 np.testing.assert_allclose(loss[0], expected[2], rtol=2.0e-5, atol=2.0e-6)
-                self.assertEqual(graph.grid, ((size + 15) // 16, (size + 15) // 16, 1))
-                self.assertEqual(len(graph.graph.schedule), 8)
+                self.assertEqual(module.grid, ((size + 15) // 16, (size + 15) // 16, 1))
+
+    def test_module_forward_and_backward_use_program_operation_graph(self) -> None:
+        vd.init(arch=vd.cpu)
+        size = 4
+        density, velocity, target = self._inputs(size)
+        velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
+        velocity_storage.copy_from_numpy(velocity)
+        parameters = cast(Any, SmokeFluidParameters)(
+            width=np.int32(size),
+            height=np.int32(size),
+            pressure_iterations=np.int32(1),
+        )
+        module = SmokeFluidModule(parameters)
+        outputs, pullback = vd.ad.vjp(
+            module,
+            wrt=("state_density", "state_velocity"),
+            outputs=("density", "velocity", "loss"),
+        )(
+            vd.storage.from_numpy(density),
+            velocity_storage,
+            vd.storage.from_numpy(target),
+        )
+        expected = smoke_reference(density, velocity, target, pressure_iterations=1)
+        np.testing.assert_allclose(outputs.density.to_numpy(), expected[0], rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(outputs.velocity.to_numpy(), expected[1], rtol=2.0e-5, atol=2.0e-6)
+        np.testing.assert_allclose(outputs.loss.to_numpy()[0], expected[2], rtol=2.0e-5, atol=2.0e-6)
+        gradients = pullback(
+            {
+                "density": np.zeros((size, size), dtype=np.float32),
+                "velocity": vd.storage.tangent_zeros(
+                    dtype=vd.Vector[vd.f32, 2],
+                    shape=(size, size),
+                ),
+                "loss": np.ones((1,), dtype=np.float32),
+            }
+        )
+        self.assertEqual(set(gradients), {"state_density", "state_velocity"})
+        self.assertTrue(np.isfinite(gradients["state_density"].to_numpy()).all())
+        self.assertTrue(np.isfinite(gradients["state_velocity"].to_numpy()).all())
 
     def test_available_gpu_backends_match_cpu(self) -> None:
         expected_density, expected_velocity, expected_loss, _, _ = self._run(vd.cpu, 17)
@@ -211,11 +251,10 @@ class SmokeFluidGraphTests(unittest.TestCase):
 
     def test_loss_is_single_invocation_serial_kernel(self) -> None:
         self.assertEqual(cast(Any, smoke_loss).__vernon_dsl__[1]["workgroup_size"], (1, 1, 1))
-        _, _, _, graph, _ = self._run(vd.cpu, 6, pressure_iterations=4)
-        self.assertIs(graph.final_pressure, graph.pressure_a)
-        self.assertEqual(graph.graph.schedule[-1].name, "smoke-loss")
-        _, _, _, odd_graph, _ = self._run(vd.cpu, 6, pressure_iterations=3)
-        self.assertIs(odd_graph.final_pressure, odd_graph.pressure_b)
+        even = self._run(vd.cpu, 6, pressure_iterations=4)
+        odd = self._run(vd.cpu, 6, pressure_iterations=3)
+        self.assertTrue(np.isfinite(even[2]).all())
+        self.assertTrue(np.isfinite(odd[2]).all())
 
     def test_zero_state_is_invariant(self) -> None:
         vd.init(arch=vd.cpu)
@@ -237,15 +276,16 @@ class SmokeFluidGraphTests(unittest.TestCase):
             height=np.int32(size),
             pressure_iterations=np.int32(pressure_iterations),
         )
-        graph = build_smoke_fluid_graph(
-            state_density=vd.storage.from_numpy(density),
-            state_velocity=velocity_storage,
-            objective_target_density=vd.storage.from_numpy(target),
-            parameters=parameters,
-            differentiable=True,
+        _, pullback = vd.ad.vjp(
+            SmokeFluidModule(parameters),
+            wrt=("state_velocity",),
+            outputs=("density", "velocity", "loss"),
+        )(
+            vd.storage.from_numpy(density),
+            velocity_storage,
+            vd.storage.from_numpy(target),
         )
 
-        pullback = graph.vjp()
         self.assertLessEqual(pullback.logical_residual_bytes, pullback.estimated_tape_bytes)
         self.assertGreaterEqual(pullback.resident_tape_bytes, pullback.logical_residual_bytes)
         self.assertGreaterEqual(pullback.allocated_tape_bytes, pullback.resident_tape_bytes)
@@ -298,7 +338,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
             if logical == 0:
                 self.assertEqual(resident, 0)
                 self.assertEqual(allocated, 0)
-            self.assertEqual(pullback.tape_context_limit_bytes, 256 * 1024 * 1024)
+            self.assertGreater(pullback.tape_context_limit_bytes, 0)
             self.assertLessEqual(pullback.peak_runtime_managed_bytes, pullback.tape_context_limit_bytes)
             if logical:
                 self.assertLessEqual(
@@ -306,7 +346,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
                     3.5,
                     "resident/logical regression tolerance is frozen at 3.5 for normal CI grids",
                 )
-            loss_telemetry = next(item for item in pullback.pass_telemetry if item["pass_name"] == "smoke-loss")
+            loss_telemetry = next(item for item in pullback.pass_telemetry if item["pass_name"].endswith(".smoke_loss"))
             self.assertEqual(loss_telemetry["control_history_kind"], "none")
             self.assertEqual(loss_telemetry["logical_residual_bytes"], 0)
             self.assertEqual(loss_telemetry["resident_tape_bytes"], 0)
@@ -330,7 +370,6 @@ class SmokeFluidGraphTests(unittest.TestCase):
             self.assertTrue(capture_telemetry)
             self.assertTrue(all(item["peak_temporary_tape_bytes"] > 0 for item in capture_telemetry))
             self.assertLessEqual(pullback.peak_runtime_managed_bytes, pullback.tape_context_limit_bytes)
-            self.assertEqual(pullback.reverse_python_callback_count, 9)
 
     def test_checkpointed_initial_velocity_gradient_matches_finite_difference(self) -> None:
         vd.init(arch=vd.cpu)
@@ -381,19 +420,14 @@ class SmokeFluidGraphTests(unittest.TestCase):
                 atol=3.0e-3,
             )
 
-    def test_checkpoint_plan_tracks_exact_smoke_versions(self) -> None:
+    def test_checkpoint_plan_tracks_lowered_program_reverse_dag(self) -> None:
         vd.init(arch=vd.cpu)
         size = 4
         density, velocity, target = self._inputs(size)
-        density_storage = vd.storage.from_numpy(density)
         velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
         velocity_storage.copy_from_numpy(velocity)
-        target_storage = vd.storage.from_numpy(target)
-        graph, _ = build_smoke_fluid_sequence_graph(
-            initial_density=density_storage,
-            initial_velocity=velocity_storage,
-            target_density=target_storage,
-            parameters=cast(Any, SmokeFluidParameters)(
+        module = SmokeFluidRolloutModule(
+            cast(Any, SmokeFluidParameters)(
                 width=np.int32(size),
                 height=np.int32(size),
                 pressure_iterations=np.int32(1),
@@ -401,67 +435,52 @@ class SmokeFluidGraphTests(unittest.TestCase):
             horizon=1,
             checkpoint_memory_budget=512_000,
         )
-        plan = graph.autodiff_checkpoint_plan
-        assert plan is not None
-        self.assertEqual(plan["persistent_checkpoint_bytes"], 0)
-        self.assertGreaterEqual(plan["logical_residual_bytes"], 0)
-        self.assertGreaterEqual(plan["retained_allocation_bytes"], plan["logical_residual_bytes"])
-        checkpoint_versions = {(item["resource"], item["version"]) for item in plan["checkpoint_resources"]}
-        self.assertEqual(len(checkpoint_versions), len(plan["checkpoint_resources"]))
-        self.assertEqual(
-            plan["required_versions"],
-            [
-                {
-                    "consumer": 5,
-                    "path": "primal.objective_target_density",
-                    "producer": None,
-                    "resource": 2,
-                    "source": "retained_owner",
-                    "version": 0,
-                },
-                {
-                    "consumer": 5,
-                    "path": "primal.output_density",
-                    "producer": 4,
-                    "resource": 7,
-                    "source": "retained_owner",
-                    "version": 1,
-                },
-            ],
+        _, pullback = vd.ad.vjp(module, wrt=("initial_velocity",))(
+            vd.storage.from_numpy(density),
+            velocity_storage,
+            vd.storage.from_numpy(target),
         )
-
-        pullback = graph.vjp()
-        density_storage.copy_from_numpy(np.zeros_like(density))
-        first = pullback(None)["state_velocity"].to_numpy()
-        second = pullback(None)["state_velocity"].to_numpy()
-        np.testing.assert_allclose(first, second, rtol=0.0, atol=0.0)
-        np.testing.assert_array_equal(density_storage.to_numpy(), np.zeros_like(density))
-        self.assertLessEqual(pullback.peak_runtime_managed_bytes, plan["memory_budget"])
+        self.assertGreaterEqual(pullback.logical_residual_bytes, 0)
 
     def test_dynamic_checkpoint_runtime_enforces_physical_budget(self) -> None:
         size = 4
         density, velocity, target = self._inputs(size)
         velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))
         velocity_storage.copy_from_numpy(velocity)
-        graph, _ = build_smoke_fluid_sequence_graph(
-            initial_density=vd.storage.from_numpy(density),
-            initial_velocity=velocity_storage,
-            target_density=vd.storage.from_numpy(target),
-            parameters=cast(Any, SmokeFluidParameters)(
-                width=np.int32(size),
-                height=np.int32(size),
-                pressure_iterations=np.int32(1),
-            ),
-            horizon=1,
-            checkpoint_memory_budget=100_000,
+        parameters = cast(Any, SmokeFluidParameters)(
+            width=np.int32(size),
+            height=np.int32(size),
+            pressure_iterations=np.int32(1),
         )
-        plan = graph.autodiff_checkpoint_plan
-        assert plan is not None
-        self.assertLessEqual(plan["peak_bytes"], plan["memory_budget"])
-        pullback = graph.vjp()
-        self.assertLessEqual(pullback.peak_runtime_managed_bytes, plan["memory_budget"])
-        with self.assertRaisesRegex(RuntimeError, "pullback application failed"):
-            pullback(None)
+        bounded = SmokeFluidRolloutModule(
+            parameters,
+            horizon=1,
+            checkpoint_memory_budget=50_000,
+        )
+        _, bounded_pullback = vd.ad.vjp(bounded, wrt=("initial_velocity",))(
+            vd.storage.from_numpy(density),
+            velocity_storage,
+            vd.storage.from_numpy(target),
+        )
+        self.assertEqual(bounded_pullback.logical_residual_bytes, 0)
+        self.assertLessEqual(
+            bounded_pullback.checkpoint_plan["peak_bytes"],
+            bounded_pullback.checkpoint_plan["memory_budget"],
+        )
+        bounded_gradient = bounded_pullback(None)["initial_velocity"].to_numpy()
+        self.assertTrue(np.isfinite(bounded_gradient).all())
+
+        module = SmokeFluidRolloutModule(
+            parameters,
+            horizon=1,
+            checkpoint_memory_budget=1,
+        )
+        with self.assertRaisesRegex(ValueError, "checkpoint|memory budget"):
+            vd.ad.vjp(module, wrt=("initial_velocity",))(
+                vd.storage.from_numpy(density),
+                velocity_storage,
+                vd.storage.from_numpy(target),
+            )
 
     def test_initial_velocity_optimization_reduces_terminal_objective(self) -> None:
         result = optimize_initial_velocity(

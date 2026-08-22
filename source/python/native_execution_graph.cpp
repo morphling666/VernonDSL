@@ -3,6 +3,8 @@
 #include "VernonExecutionGraph.h"
 #include "execution_graph/execution_graph_internal.h"
 #include "native_execution_graph_autodiff.h"
+#include "native_pipeline.h"
+#include "native_pipeline_autodiff.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 
 #include <nanobind/stl/array.h>
@@ -85,12 +87,27 @@ struct PythonExecutionBindingValue final : vernon::execution::ExecutionBindingVa
     nb::object value;
 };
 
+struct PythonPipelineArgumentBindingValue final : vernon::execution::ExecutionBindingValue {
+    explicit PythonPipelineArgumentBindingValue(nb::object value)
+        : owner(std::move(value)), argument(nb::cast<PreparedPipelineArgument *>(owner)) {
+        if (!argument)
+            throw std::invalid_argument("pipeline argument binding requires a prepared native argument");
+    }
+
+    nb::object owner;
+    PreparedPipelineArgument *argument{};
+};
+
 struct PythonExecutionBindingsBuilder {
     explicit PythonExecutionBindingsBuilder(vernon::execution::ExecutionBindingsBuilder value)
         : builder(std::move(value)) {}
 
     void set(const PythonExecutionParameter &parameter, nb::object value) {
         builder.set(parameter.parameter, std::make_shared<PythonExecutionBindingValue>(std::move(value)));
+    }
+
+    void setPipelineArgument(const PythonExecutionParameter &parameter, nb::object value) {
+        builder.set(parameter.parameter, std::make_shared<PythonPipelineArgumentBindingValue>(std::move(value)));
     }
 
     vernon::execution::ExecutionBindingsBuilder builder;
@@ -331,6 +348,44 @@ struct PythonComputePass final : vernon::execution::ComputePass, vernon::executi
     bool hasCheckpointPlanningMetadata_{};
 };
 
+struct NativePipelineComputePass final : vernon::execution::ComputePass {
+    NativePipelineComputePass(std::shared_ptr<PythonGraphCallbackState> callbackState, std::string name,
+                              LoadedPipeline *pipeline, std::vector<vernon::execution::ExecutionParameter> parameters,
+                              std::array<uint32_t, 3> grid)
+        : ComputePass(std::move(name)), callbackState(std::move(callbackState)), pipeline(pipeline),
+          parameters(std::move(parameters)), grid(grid) {
+        if (!this->pipeline || !grid[0] || !grid[1] || !grid[2])
+            throw std::invalid_argument("native pipeline pass requires a pipeline and positive grid");
+    }
+
+    void declare() override {}
+
+    VernonRhiStatus execute(vernon::execution::ComputeEncoder &encoder,
+                            const vernon::execution::ExecutionResources &resources) override {
+        try {
+            PipelineInvocationBuilder builder(pipeline->owner, pipeline->runtime, pipeline->pipeline);
+            for (const vernon::execution::ExecutionParameter &parameter : parameters) {
+                auto value =
+                    std::dynamic_pointer_cast<const PythonPipelineArgumentBindingValue>(resources.binding(parameter));
+                if (!value || !value->argument)
+                    throw std::runtime_error("native pipeline pass received an incompatible argument binding");
+                builder.preparedArgument(*value->argument);
+            }
+            builder.grid(grid[0], grid[1], grid[2]);
+            builder.encode(encoder);
+            return VERNON_RHI_STATUS_OK;
+        } catch (...) {
+            callbackState->captureException(std::current_exception());
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+    }
+
+    std::shared_ptr<PythonGraphCallbackState> callbackState;
+    LoadedPipeline *pipeline{};
+    std::vector<vernon::execution::ExecutionParameter> parameters;
+    std::array<uint32_t, 3> grid{};
+};
+
 struct PythonCompiledBarrier {
     uint32_t sourceStageMask{};
     uint32_t destinationStageMask{};
@@ -385,6 +440,20 @@ struct PythonCompiledExecutionGraph {
             const auto &parameter = nb::cast<const PythonExecutionParameter &>(entry[0]);
             bindings.push_back(
                 {parameter.parameter, std::make_shared<PythonExecutionBindingValue>(nb::borrow<nb::object>(entry[1]))});
+        }
+        return std::make_unique<PythonExecutionBindingsBuilder>(plan->createBindings(bindings));
+    }
+
+    std::unique_ptr<PythonExecutionBindingsBuilder> createPipelineBindings(const nb::list &initial) {
+        std::vector<vernon::execution::ExecutionBinding> bindings;
+        bindings.reserve(nb::len(initial));
+        for (nb::handle item : initial) {
+            nb::tuple entry = nb::cast<nb::tuple>(item);
+            if (nb::len(entry) != 2)
+                throw std::invalid_argument("execution binding entries must contain a parameter and value");
+            const auto &parameter = nb::cast<const PythonExecutionParameter &>(entry[0]);
+            bindings.push_back({parameter.parameter, std::make_shared<PythonPipelineArgumentBindingValue>(
+                                                         nb::borrow<nb::object>(entry[1]))});
         }
         return std::make_unique<PythonExecutionBindingsBuilder>(plan->createBindings(bindings));
     }
@@ -558,6 +627,21 @@ struct PythonExecutionGraph {
         return &graph.emplacePass<PythonComputePass>(callbackState, name, owner.ptr());
     }
 
+    NativePipelineComputePass *addNativeComputePass(const std::string &name, const nb::object &pipelineOwner,
+                                                    const nb::list &parameterValues,
+                                                    const std::array<uint32_t, 3> &grid) {
+        LoadedPipeline *pipeline = nb::cast<LoadedPipeline *>(pipelineOwner);
+        if (!pipeline)
+            throw std::invalid_argument("native compute pass requires a loaded pipeline");
+        std::vector<vernon::execution::ExecutionParameter> parameters;
+        parameters.reserve(nb::len(parameterValues));
+        for (nb::handle value : parameterValues)
+            parameters.push_back(nb::cast<PythonExecutionParameter &>(value).parameter);
+        owners->push_back(pipelineOwner);
+        return &graph.emplacePass<NativePipelineComputePass>(callbackState, name, pipeline, std::move(parameters),
+                                                             grid);
+    }
+
     PythonGraphResource importBuffer(RhiBuffer &buffer, bool exported) {
         if (buffer.host != host)
             throw std::invalid_argument("buffer belongs to another execution graph device");
@@ -611,6 +695,15 @@ struct PythonExecutionGraph {
     }
 
     void planAutodiffCheckpoints(uint64_t memoryBudget) { graph.planAutodiffCheckpoints(memoryBudget); }
+
+    void setExplicitReverseCommandDag(
+        const std::vector<std::tuple<uint32_t, std::vector<uint32_t>, uint64_t, uint64_t, uint64_t>> &nodes) {
+        std::vector<vernon::execution::ExplicitReverseCommandNode> lowered;
+        lowered.reserve(nodes.size());
+        for (const auto &[id, dependencies, residualBytes, temporaryBytes, replayCost] : nodes)
+            lowered.push_back({id, dependencies, residualBytes, temporaryBytes, replayCost});
+        graph.setExplicitReverseCommandDag(std::move(lowered));
+    }
 
     std::unique_ptr<PythonCompiledExecutionGraph> compile() {
         std::string error;
@@ -831,6 +924,8 @@ void bindNativeExecutionGraph(nb::module_ &module) {
             },
             nb::arg("resource"), nb::arg("access"), nb::arg("state"), nb::arg("stage_mask"))
         .def("set_autodiff", &PythonComputePass::setAutodiff);
+    [[maybe_unused]] auto nativePipelineComputePass =
+        nb::class_<NativePipelineComputePass, vernon::execution::ExecutionPass>(module, "_NativePipelineComputePass");
     nb::class_<PythonCompiledBarrier>(module, "_CompiledBarrier")
         .def_ro("source_stage_mask", &PythonCompiledBarrier::sourceStageMask)
         .def_ro("destination_stage_mask", &PythonCompiledBarrier::destinationStageMask)
@@ -851,13 +946,15 @@ void bindNativeExecutionGraph(nb::module_ &module) {
     nb::class_<PythonExecutionParameter>(module, "_ExecutionParameter")
         .def_prop_ro("id", [](const PythonExecutionParameter &value) { return value.parameter.id; });
     nb::class_<PythonExecutionBindingsBuilder>(module, "_ExecutionBindings")
-        .def("set", &PythonExecutionBindingsBuilder::set);
+        .def("set", &PythonExecutionBindingsBuilder::set)
+        .def("set_pipeline_argument", &PythonExecutionBindingsBuilder::setPipelineArgument);
     nb::class_<PythonExecutionBindingsView>(module, "_ExecutionBindingsView")
         .def("get", &PythonExecutionBindingsView::get)
         .def("token", &PythonExecutionBindingsView::token);
     nb::class_<PythonExecutionGraph>(module, "_ExecutionGraph")
         .def("add_render_pass", &PythonExecutionGraph::addRenderPass, nb::rv_policy::reference)
         .def("add_compute_pass", &PythonExecutionGraph::addComputePass, nb::rv_policy::reference)
+        .def("add_native_compute_pass", &PythonExecutionGraph::addNativeComputePass, nb::rv_policy::reference)
         .def("import_buffer", &PythonExecutionGraph::importBuffer, nb::arg("buffer"), nb::arg("exported") = false)
         .def("import_host_buffer", &PythonExecutionGraph::importHostBuffer, nb::arg("identity"),
              nb::arg("checkpoint_bytes") = nb::none(), nb::arg("exported") = false)
@@ -865,10 +962,12 @@ void bindNativeExecutionGraph(nb::module_ &module) {
         .def("parameter", &PythonExecutionGraph::parameter)
         .def("set_autodiff_endpoints", &PythonExecutionGraph::setAutodiffEndpoints)
         .def("plan_autodiff_checkpoints", &PythonExecutionGraph::planAutodiffCheckpoints)
+        .def("set_explicit_reverse_command_dag", &PythonExecutionGraph::setExplicitReverseCommandDag)
         .def("compile", &PythonExecutionGraph::compile)
         .def("validate", &PythonExecutionGraph::validate);
     nb::class_<PythonCompiledExecutionGraph>(module, "_CompiledExecutionGraph")
         .def("create_bindings", &PythonCompiledExecutionGraph::createBindings)
+        .def("create_pipeline_bindings", &PythonCompiledExecutionGraph::createPipelineBindings)
         .def("submit", &PythonCompiledExecutionGraph::submit, nb::arg("bindings") = nb::none())
         .def("vjp", &PythonCompiledExecutionGraph::vjp, nb::arg("bindings") = nb::none())
         .def_prop_ro(

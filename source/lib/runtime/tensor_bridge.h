@@ -54,8 +54,11 @@ struct TensorCopyPlan {
     std::vector<CopyOperation> operations;
 };
 
-std::optional<TensorCopyPlan> compileTensorCopyPlan(const VernonValueLayoutView &canonical,
-                                                    const TransportNode &transport, std::vector<uint64_t> shape);
+std::optional<TensorCopyPlan> compileWholeValueCopyPlan(const VernonValueLayoutView &canonicalValue,
+                                                        const TransportNode &physicalValue);
+std::optional<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayoutView &elementLayout,
+                                                           std::vector<uint64_t> logicalShape,
+                                                           const TransportNode &physicalStream);
 
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &plan);
 

@@ -169,16 +169,28 @@ struct UnsupportedBackendInterfaceAbi {
 using BackendInterfaceAbiPlan = std::variant<ByteTransportPlan, NativeUniformPlan, KernelParameterPlan,
                                              ResourceBindingPlan, UnsupportedBackendInterfaceAbi>;
 
+/// Language ABI layout. 32-bit integer leaves require explicit logical dtypes
+/// (`i32` or `u32`). MLIR signless `i32` is never an ABI oracle.
 FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes = {});
+
+/// Physical size/offset layout. Integer leaves use signless storage class `i32`
+/// and must not be compared to host or Program language ABI hashes.
+FailureOr<ValueAbiLayout> getValueStorageLayout(Type type, ModuleOp module);
+
+LogicalResult rebaseValueAbiLayout(ValueAbiLayout &layout, const ValueAbiLayout &sourcePaths,
+                                   StringRef logicalIdentity);
 
 /// Validate a logical Value with the same canonical planner used by reflection
 /// and every physical ABI lowering.  This is intentionally available to IR
 /// verifiers so malformed textual IR cannot bypass frontend validation.
 LogicalResult verifyValueAbiType(Type type, ModuleOp module);
 
+/// Host-facing physical ABI. Integer values require explicit language leaves.
 FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile,
                                                               ArrayRef<StringRef> logicalLeafDtypes = {});
 
+/// Target lowering size/offset plan. Integer leaves use signless storage class
+/// `i32` and must not be compared to host or Program language ABI hashes.
 FailureOr<ByteTransportPlan> getByteTransportPlan(Type type, ModuleOp module, PhysicalAbiProfile profile);
 
 constexpr uint64_t kPortableWorkgroupStorageLimit = 16 * 1024;

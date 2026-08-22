@@ -75,15 +75,20 @@ namespace {
 
 mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> logicalDtypes(mlir::DictionaryAttr attributes) {
     llvm::SmallVector<llvm::StringRef> result;
-    auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes");
-    if (!dtypes)
+    if (!attributes)
         return result;
-    for (mlir::Attribute attribute : dtypes) {
-        auto dtype = mlir::dyn_cast<mlir::StringAttr>(attribute);
-        if (!dtype)
-            return mlir::failure();
-        result.push_back(dtype.getValue());
+    if (auto dtypes = attributes.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes")) {
+        for (mlir::Attribute attribute : dtypes) {
+            auto dtype = mlir::dyn_cast<mlir::StringAttr>(attribute);
+            if (!dtype)
+                return mlir::failure();
+            result.push_back(dtype.getValue());
+        }
+        if (!result.empty())
+            return result;
     }
+    if (auto sugar = attributes.getAs<mlir::StringAttr>("vernon.dtype"); sugar && !sugar.getValue().empty())
+        result.push_back(sugar.getValue());
     return result;
 }
 
@@ -160,7 +165,7 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
                 auto view = mlir::cast<mlir::vernon::TensorViewType>(type);
                 packing.tensorRank = static_cast<uint32_t>(view.getShape().size());
                 mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
-                    mlir::vernon::getValueAbiLayout(view.getElementType(), module);
+                    mlir::vernon::getValueStorageLayout(view.getElementType(), module);
                 if (mlir::failed(layout)) {
                     diagnostics =
                         "invalid aggregate TensorView layout in CPU entry '" + function.getSymName().str() + "'";

@@ -44,6 +44,32 @@ def _scalar_layout(dtype: str) -> dict[str, object]:
     }
 
 
+def _vector_layout(dtype: str, shape: list[int]) -> dict[str, object]:
+    sizes = {"bool": 1, "i32": 4, "u32": 4, "f16": 2, "f32": 4, "f64": 8}
+    scalar = sizes[dtype]
+    count = 1
+    for extent in shape:
+        count *= extent
+    physical = "i32" if dtype == "u32" else dtype
+    spelling = f"tensor<{'x'.join(str(extent) for extent in shape)}x{dtype}>"
+    canonical = f"tensor({spelling},{scalar * count},{scalar})|dtypes={dtype}"
+    return {
+        "logical_type": spelling,
+        "byte_size": scalar * count,
+        "alignment": scalar,
+        "layout_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+        "leaves": [
+            {
+                "path": [],
+                "dtype": dtype,
+                "byte_offset": 0,
+                "scalar_count": count,
+                "shape": list(shape),
+            }
+        ],
+    }
+
+
 def _interface_plan(
     profile: str,
     size: int,
@@ -448,14 +474,14 @@ class PipelineCompileTests(unittest.TestCase):
                         },
                         {
                             "index": 2,
-                            "kind": "scalar",
+                            "kind": "tensor",
                             "type": "tensor<2xf32>",
+                            "shape": [2],
                             "element_layout": _scalar_layout("f32"),
+                            "value_layout": _vector_layout("f32", [2]),
                             "vernon.source_name": "__resolution",
-                            "vernon.interface": "uniform",
+                            "vernon.interface": "system_value",
                             "vernon.implicit": "resolution",
-                            "value_transport": "push_constant",
-                            "physical_layouts": _physical_layouts(8, 8, [4]),
                         },
                     ],
                 },

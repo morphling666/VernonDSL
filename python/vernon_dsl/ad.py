@@ -134,15 +134,28 @@ def rule_set(*, id: str, **rules: Callable[..., Any]) -> RuleSet:
 
 
 def vjp(
-    program: Callable[..., Any] | tuple[Callable[..., Any], ...],
+    program: Any,
     *,
     wrt: tuple[str, ...] | list[str],
     outputs: tuple[str, ...] | list[str] | None = None,
     rules: RuleSet | None = None,
     planning_policy: str = "min_memory",
-) -> ProgramExpression:
+) -> Any:
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
+    from .module import Module
+
+    if isinstance(program, Module):
+        if rules is not None:
+            raise ValueError("Module VJP does not accept graphics custom rules")
+        from .program import ModuleVjpExpression
+
+        return ModuleVjpExpression(
+            program,
+            wrt=_canonical_paths(wrt, label="wrt"),
+            outputs=(_canonical_paths(outputs, label="outputs") if outputs is not None else None),
+            planning_policy=planning_policy,
+        )
     if isinstance(program, ProgramExpression):
         raise TypeError("higher-order program transforms are not supported")
     if isinstance(program, tuple):

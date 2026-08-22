@@ -16,6 +16,7 @@ from ..shader_contracts import (
     texture_sampling_contract,
 )
 from .abi import workgroup_physical_bytes
+from .activity import analyze_storage_activity
 from .model import (
     AccessMode,
     AtomicEffect,
@@ -353,6 +354,7 @@ class _Inference:
             active.pop()
             effects = self._function_effects(body)
             result = replace(function, body=body, effects=effects)
+            result = replace(result, storage_activity=analyze_storage_activity(result))
             resolved[symbol] = result
             return result
 

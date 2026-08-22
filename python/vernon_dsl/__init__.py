@@ -48,7 +48,9 @@ from .intrinsics import (
     workgroup_barrier,
     workgroup_storage,
 )
-from .pipeline_assets import PipelineAssetDeclaration, load_cooked_vjp_asset, pipeline_asset
+from .module import Module
+from .pipeline_assets import PipelineAssetDeclaration, load_cooked_vjp_asset, load_pipeline, pipeline_asset
+from .render import AttachmentOperation, RenderTargetUse, clear, load, preserve, render
 from .runtime import (
     ColorAttachmentUse,
     CompiledBarrier,
@@ -64,6 +66,7 @@ from .runtime import (
     ExecutionSubmission,
     GraphBackwardSubmission,
     GraphicsEncoder,
+    GraphicsInvocationPass,
     GraphPullback,
     GraphResource,
     Kernel,
@@ -136,6 +139,7 @@ from .types import (
 
 __all__ = [
     "Annotated",
+    "AttachmentOperation",
     "ad",
     "abs",
     "acos",
@@ -163,14 +167,17 @@ __all__ = [
     "GraphPullback",
     "GraphResource",
     "GraphicsEncoder",
+    "GraphicsInvocationPass",
     "Kernel",
     "LoadOperation",
     "Matrix",
+    "Module",
     "Pipeline",
     "PipelineInvocation",
     "PipelineAssetDeclaration",
     "PrimitiveTopology",
     "RenderTarget",
+    "RenderTargetUse",
     "RenderPass",
     "Sampler",
     "SamplerState",
@@ -192,6 +199,7 @@ __all__ = [
     "bool",
     "builtin",
     "clamp",
+    "clear",
     "compile_file",
     "compile_source",
     "cos",
@@ -218,6 +226,8 @@ __all__ = [
     "init",
     "lines",
     "load_cooked_vjp_asset",
+    "load",
+    "load_pipeline",
     "log",
     "kernel",
     "matmul",
@@ -228,6 +238,7 @@ __all__ = [
     "opengl",
     "opengles",
     "pow",
+    "preserve",
     "pipeline",
     "pipeline_asset",
     "points",
@@ -242,6 +253,7 @@ __all__ = [
     "rgba8_srgb",
     "rgba8_unorm",
     "resource",
+    "render",
     "read",
     "read_write",
     "resolution",

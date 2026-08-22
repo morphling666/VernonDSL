@@ -1050,7 +1050,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
             const ValueAbiLayout *knownLayout = analysis.getValueAbi(index);
             FailureOr<ValueAbiLayout> canonical =
                 knownLayout ? FailureOr<ValueAbiLayout>(*knownLayout)
-                            : getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
+                            : getValueStorageLayout(index.getType(), function->getParentOfType<ModuleOp>());
             if (succeeded(canonical)) {
                 AdResidualSourceKind selectedSource =
                     appendSourceSelections(index, *canonical, owningRegion(index), recipe);
@@ -1071,7 +1071,7 @@ FailureOr<VernonAutodiffTapePlan> planAutodiffTape(func::FuncOp function, const 
                 return appendResidualIntervals(index, *layout, lifetimeEnd, false, 0, diagnostic);
             }
             FailureOr<ValueAbiLayout> canonical =
-                getValueAbiLayout(index.getType(), function->getParentOfType<ModuleOp>());
+                getValueStorageLayout(index.getType(), function->getParentOfType<ModuleOp>());
             if (failed(canonical) || failed(builder.add(index, *canonical)))
                 return failure();
             appendSourceSelections(index, *canonical, owningRegion(index), recipe);
