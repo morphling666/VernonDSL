@@ -130,6 +130,29 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(implementation.entry, "_program_add_f32_rank1")
         self.assertIn('vernon.source_name = "output"', implementation.mlir)
 
+    def test_fusion_dsl_provider_lowers_rank_two_builtin_add_with_view_shape(self) -> None:
+        values = {
+            0: {"id": 0, "dtype": "f32", "shape": [2, 3]},
+            1: {"id": 1, "dtype": "f32", "shape": [2, 3]},
+            2: {"id": 2, "dtype": "f32", "shape": [2, 3]},
+        }
+        request = {
+            "implementation_hint": "vernon.builtin.add",
+            "bindings": [
+                {"parameter": "left", "value": 0},
+                {"parameter": "right", "value": 1},
+                {"parameter": "output", "value": 2},
+            ],
+        }
+
+        implementation = BuiltinDslProvider().lower(request, values)
+
+        self.assertIsNotNone(implementation)
+        assert implementation is not None
+        self.assertEqual(implementation.entry, "_program_add_f32_rank2")
+        self.assertIn('"vernon.get_shape"', implementation.mlir)
+        self.assertIn("tensor<2xi32>", implementation.mlir)
+
     @classmethod
     def setUpClass(cls) -> None:
         try:

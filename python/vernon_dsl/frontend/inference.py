@@ -74,6 +74,17 @@ def _element(value_type: InferenceType) -> InferenceType:
     return element_type(value_type)
 
 
+def _shape_rank(value_type: InferenceType) -> int | None:
+    if not isinstance(value_type, ConcreteType):
+        return None
+    if value_type.kind == "tensor":
+        return len(value_type.arguments) - 1
+    if value_type.kind == "tensor_view":
+        shape = value_type.arguments[1]
+        return len(shape) if isinstance(shape, tuple) else None
+    return None
+
+
 def _common(left: InferenceType, right: InferenceType, *, division: bool = False) -> InferenceType | None:
     return common_type(left, right, division=division)
 
@@ -1191,6 +1202,13 @@ class _Inference:
                 return element
         if isinstance(node, ast.Attribute):
             value_type = self._expression(node.value, environment)
+            if node.attr == "shape":
+                rank = _shape_rank(value_type)
+                if rank is None:
+                    raise self.error(node, "shape requires a Tensor or TensorView")
+                if rank < 1:
+                    raise self.error(node, "shape requires rank >= 1")
+                return ConcreteType("tensor", "Tensor", (_scalar("u32"), rank))
             if (
                 isinstance(value_type, ConcreteType)
                 and value_type.kind == "tensor"
@@ -1222,6 +1240,7 @@ class _Inference:
                 ast.Sub: "sub",
                 ast.Mult: "mul",
                 ast.Div: "div",
+                ast.FloorDiv: "floordiv",
                 ast.Mod: "mod",
                 ast.Pow: "pow",
             }.get(type(node.op))

@@ -6,6 +6,7 @@ import unittest
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Annotated
 from unittest import mock
 
 import numpy as np
@@ -73,7 +74,10 @@ class TensorStorageRuntimeTests(unittest.TestCase):
 
         self.assertEqual(_logical_collection_shape(first, tuple_type), ())
         self.assertEqual(_logical_collection_shape((first, second), tuple_type), (2,))
-        self.assertEqual(_logical_collection_shape(((first, second), (second, first)), tuple_type), (2, 2))
+        self.assertEqual(
+            _logical_collection_shape(((first, second), (second, first)), tuple_type),
+            (2, 2),
+        )
         with self.assertRaisesRegex(ValueError, "rectangular"):
             _logical_collection_shape(((first,), (first, second)), tuple_type)
 
@@ -653,7 +657,9 @@ class TensorViewFrontendTests(unittest.TestCase):
         self.assertNotIn("storage", parameters[0])
         self.assertEqual(parameters[1]["access"], "read")
 
-    def test_tensor_view_accepts_rank_zero_static_dynamic_and_mixed_shapes(self) -> None:
+    def test_tensor_view_accepts_rank_zero_static_dynamic_and_mixed_shapes(
+        self,
+    ) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
             "@kernel\n"
@@ -705,6 +711,39 @@ class TensorViewFrontendTests(unittest.TestCase):
         )
         self.assertIn('"vernon.load"', output)
 
+    def test_shape_lowers_to_get_shape_for_tensor_and_tensor_view(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def extents(\n"
+            "    output: TensorView[f32, (dyn, dyn), write],\n"
+            "    tile: Tensor[f32, (2, 5)],\n"
+            "    vec: Vector[f32, 3],\n"
+            "    mat: Matrix[f32, 2, 4],\n"
+            ") -> None:\n"
+            "    output[output.shape[0], tile.shape[1]] = f32(vec.shape[0]) + f32(mat.shape[1])\n",
+            "tensor_and_view_shape.py",
+        )
+        self.assertEqual(output.count('"vernon.get_shape"'), 4)
+        self.assertIn(
+            '!vernon.tensor_view<f32, [-1, -1], "write", "device">) -> tensor<2xi32>',
+            output,
+        )
+        self.assertIn("tensor<2x5xf32>) -> tensor<2xi32>", output)
+        self.assertIn("tensor<3xf32>) -> tensor<1xi32>", output)
+        self.assertIn("tensor<2x4xf32>) -> tensor<2xi32>", output)
+        self.assertNotIn("cannot load through a write-only TensorView", output)
+
+    def test_rank_zero_view_shape_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CompileError, "shape requires rank >= 1"):
+            compile_source(
+                "from vernon_dsl import *\n"
+                "@kernel\n"
+                "def bad(value: TensorView[f32, (), read_write]) -> None:\n"
+                "    extent = value.shape\n",
+                "rank_zero_shape.py",
+            )
+
     def test_tensor_view_layout_is_not_frontend_specialization_data(self) -> None:
         source = (
             "from vernon_dsl import *\n"
@@ -739,6 +778,55 @@ class TensorViewFrontendTests(unittest.TestCase):
                 "from vernon_dsl import *\n@kernel\ndef bad(value: RawBuffer) -> None:\n    pass\n",
                 "runtime_only_raw_buffer.py",
             )
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def fill_with_extents(
+    output: vd.TensorView[vd.f32, (vd.dyn, vd.dyn), vd.write],
+    tile: vd.Tensor[vd.f32, (2, 5)],
+    vec: vd.Vector[vd.f32, 3],
+    mat: vd.Matrix[vd.f32, 2, 4],
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    output[gid[1], gid[0]] = (
+        vd.f32(output.shape[0]) * 1000.0
+        + vd.f32(tile.shape[1]) * 100.0
+        + vd.f32(vec.shape[0]) * 10.0
+        + vd.f32(mat.shape[1])
+    )
+
+
+class TensorViewShapeRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_available(architecture: object) -> bool:
+        try:
+            vd.init(arch=architecture)  # type: ignore[arg-type]
+        except RuntimeError:
+            vd.init(arch=vd.cpu)
+            return False
+        return True
+
+    def _available_compute_backends(self) -> list[object]:
+        backends: list[object] = [vd.cpu]
+        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
+            if self._runtime_available(architecture):
+                backends.append(architecture)
+        return backends
+
+    def test_tensor_and_tensor_view_shape_read_static_and_descriptor_extents(
+        self,
+    ) -> None:
+        expected = np.full((3, 4), 3534.0, dtype=np.float32)
+        tile = np.zeros((2, 5), dtype=np.float32)
+        vec = np.zeros(3, dtype=np.float32)
+        mat = np.zeros((2, 4), dtype=np.float32)
+        for backend in self._available_compute_backends():
+            with self.subTest(backend=getattr(backend, "name", backend)):
+                vd.init(arch=backend)  # type: ignore[arg-type]
+                output = vd.storage.zeros(dtype=vd.f32, shape=(3, 4))
+                fill_with_extents(output, tile, vec, mat, grid=(4, 3, 1))
+                np.testing.assert_array_equal(output.to_numpy(), expected)
+        vd.init(arch=vd.cpu)
 
 
 if __name__ == "__main__":

@@ -204,6 +204,28 @@ LogicalResult IntrinsicOp::verify() {
     return success();
 }
 
+LogicalResult GetShapeOp::verify() {
+    Type sourceType = getSource().getType();
+    int64_t rank = -1;
+    if (auto tensor = dyn_cast<RankedTensorType>(sourceType))
+        rank = tensor.getRank();
+    else if (auto tensor = dyn_cast<TensorType>(sourceType))
+        rank = static_cast<int64_t>(tensor.getShape().size());
+    else if (auto view = dyn_cast<TensorViewType>(sourceType))
+        rank = static_cast<int64_t>(view.getShape().size());
+    else
+        return emitOpError("source must be a ranked tensor, !vernon.tensor, or TensorView");
+
+    if (rank < 1)
+        return emitOpError("get_shape requires rank >= 1");
+
+    auto result = dyn_cast<RankedTensorType>(getResult().getType());
+    if (!result || result.getRank() != 1 || result.isDynamicDim(0) || result.getDimSize(0) != rank ||
+        !result.getElementType().isSignlessInteger(32))
+        return emitOpError() << "result must be tensor<" << rank << "xi32>";
+    return success();
+}
+
 LogicalResult WorkgroupAllocOp::verify() {
     TensorViewType type = getResult().getType();
     if (type.getAddressSpace() != "workgroup")

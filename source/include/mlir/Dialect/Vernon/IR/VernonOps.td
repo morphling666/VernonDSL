@@ -69,6 +69,13 @@ def Vernon_IntrinsicOp : Vernon_Op<"intrinsic"> {
   let hasVerifier = 1;
 }
 
+def Vernon_GetShapeOp : Vernon_Op<"get_shape", [Pure]> {
+  let summary = "Read the ranked extents of a Tensor Value or TensorView";
+  let arguments = (ins AnyTypeOf<[AnyRankedTensor, Vernon_TensorType, Vernon_TensorViewType]>:$source);
+  let results = (outs AnyRankedTensor:$result);
+  let hasVerifier = 1;
+}
+
 def Vernon_WorkgroupAllocOp : Vernon_Op<"workgroup_alloc"> {
   let summary = "Allocate a statically shaped workgroup TensorView";
   let results = (outs Vernon_TensorViewType:$result);

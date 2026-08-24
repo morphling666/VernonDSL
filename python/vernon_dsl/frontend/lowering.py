@@ -33,6 +33,7 @@ from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower
 from .resource_lowering import lower_texture_sample, lower_texture_size
 from .storage_lowering import (
     lower_buffer_index,
+    lower_shape_attribute,
     lower_storage_store,
     lower_tensor_view_indices,
 )
@@ -516,6 +517,7 @@ class _FunctionEmitter:
                     ast.Sub: "sub",
                     ast.Mult: "mul",
                     ast.Div: "div",
+                    ast.FloorDiv: "floordiv",
                     ast.Mod: "mod",
                     ast.Pow: "pow",
                 }.get(type(node.op)),
@@ -1025,6 +1027,8 @@ class _FunctionEmitter:
 
     def _attribute(self, node: ast.Attribute) -> Value:
         value = self._expression(node.value)
+        if node.attr == "shape":
+            return lower_shape_attribute(self, node, value)
         if value.type.kind == "struct":
             fields = self.context.structs[value.type.name]
             field_names = [name for name, _ in fields]

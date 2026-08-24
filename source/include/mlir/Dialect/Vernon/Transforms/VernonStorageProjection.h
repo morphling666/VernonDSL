@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -93,6 +94,91 @@ inline LogicalResult appendTensorViewDescriptorArguments(Operation *root) {
     return success();
 }
 
+inline FailureOr<unsigned> tensorViewDescriptorBase(Value storage) {
+    auto view = dyn_cast<TensorViewType>(storage.getType());
+    if (!view || view.getAddressSpace() != "device")
+        return failure();
+    auto argument = dyn_cast<BlockArgument>(storage);
+    auto function =
+        argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp()) : FunctionOpInterface{};
+    if (!function)
+        return failure();
+    unsigned descriptorBase = 0;
+    while (descriptorBase < function.getNumArguments() &&
+           !function.getArgAttr(descriptorBase, kTensorDescriptorComponentAttrName))
+        ++descriptorBase;
+    if (descriptorBase == function.getNumArguments() || argument.getArgNumber() >= descriptorBase)
+        return failure();
+    for (unsigned index = 0; index < argument.getArgNumber(); ++index)
+        if (auto preceding = dyn_cast<TensorViewType>(function.getArgumentTypes()[index]);
+            preceding && preceding.getAddressSpace() == "device")
+            descriptorBase += 1 + 2 * preceding.getShape().size();
+    if (descriptorBase + 1 + 2 * view.getShape().size() > function.getNumArguments())
+        return failure();
+    return descriptorBase;
+}
+
+inline FailureOr<Value> tensorViewExtent(Value storage, unsigned axis, Location location, OpBuilder &builder) {
+    auto view = dyn_cast<TensorViewType>(storage.getType());
+    if (!view || axis >= view.getShape().size())
+        return failure();
+    if (view.getAddressSpace() == "device") {
+        auto argument = dyn_cast<BlockArgument>(storage);
+        auto function = argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp())
+                                 : FunctionOpInterface{};
+        FailureOr<unsigned> descriptorBase = tensorViewDescriptorBase(storage);
+        if (!function || failed(descriptorBase))
+            return failure();
+        return function.getArgument(*descriptorBase + 1 + axis);
+    }
+    int64_t extent = view.getShape()[axis];
+    if (extent <= 0)
+        return failure();
+    return arith::ConstantIndexOp::create(builder, location, extent).getResult();
+}
+
+inline LogicalResult materializeGetShape(GetShapeOp getShape, OpBuilder &builder) {
+    Location location = getShape.getLoc();
+    Type sourceType = getShape.getSource().getType();
+    SmallVector<Value> extents;
+    auto emitI32 = [&](int64_t extent) -> LogicalResult {
+        if (extent <= 0 || extent > std::numeric_limits<int32_t>::max())
+            return failure();
+        extents.push_back(arith::ConstantIntOp::create(builder, location, static_cast<int32_t>(extent), 32));
+        return success();
+    };
+    auto castIndexToI32 = [&](Value extent) {
+        extents.push_back(arith::IndexCastOp::create(builder, location, builder.getI32Type(), extent));
+    };
+    if (auto view = dyn_cast<TensorViewType>(sourceType)) {
+        for (unsigned axis = 0; axis < view.getShape().size(); ++axis) {
+            FailureOr<Value> extent = tensorViewExtent(getShape.getSource(), axis, location, builder);
+            if (failed(extent))
+                return failure();
+            castIndexToI32(*extent);
+        }
+    } else if (auto tensor = dyn_cast<RankedTensorType>(sourceType)) {
+        for (int64_t axis = 0; axis < tensor.getRank(); ++axis) {
+            if (tensor.isDynamicDim(axis)) {
+                Value dim = tensor::DimOp::create(builder, location, getShape.getSource(), axis);
+                castIndexToI32(dim);
+            } else if (failed(emitI32(tensor.getDimSize(axis)))) {
+                return failure();
+            }
+        }
+    } else if (auto tensor = dyn_cast<TensorType>(sourceType)) {
+        for (int64_t extent : tensor.getShape())
+            if (failed(emitI32(extent)))
+                return failure();
+    } else {
+        return failure();
+    }
+    Value packed = tensor::FromElementsOp::create(builder, location, getShape.getType(), extents);
+    getShape.getResult().replaceAllUsesWith(packed);
+    getShape.erase();
+    return success();
+}
+
 /// Convert a logical ranked TensorView index to its canonical physical record
 /// index. Device views consume per-dispatch descriptor operands. Non-device
 /// views are statically shaped and use canonical row-major projection.
@@ -102,23 +188,12 @@ inline FailureOr<Value> projectTensorViewIndex(Operation *operation, TensorViewT
         return failure();
     Value storage = isa<StoreOp>(operation) ? operation->getOperand(1) : operation->getOperand(0);
     if (view.getAddressSpace() == "device") {
-        auto argument = dyn_cast<BlockArgument>(storage);
-        auto function = argument ? dyn_cast_or_null<FunctionOpInterface>(argument.getOwner()->getParentOp())
-                                 : FunctionOpInterface{};
-        if (!function)
+        FailureOr<unsigned> descriptorBaseOrError = tensorViewDescriptorBase(storage);
+        if (failed(descriptorBaseOrError))
             return failure();
-        unsigned descriptorBase = 0;
-        while (descriptorBase < function.getNumArguments() &&
-               !function.getArgAttr(descriptorBase, kTensorDescriptorComponentAttrName))
-            ++descriptorBase;
-        if (descriptorBase == function.getNumArguments() || argument.getArgNumber() >= descriptorBase)
-            return failure();
-        for (unsigned index = 0; index < argument.getArgNumber(); ++index)
-            if (auto preceding = dyn_cast<TensorViewType>(function.getArgumentTypes()[index]);
-                preceding && preceding.getAddressSpace() == "device")
-                descriptorBase += 1 + 2 * preceding.getShape().size();
-        if (descriptorBase + 1 + 2 * view.getShape().size() > function.getNumArguments())
-            return failure();
+        auto argument = cast<BlockArgument>(storage);
+        auto function = cast<FunctionOpInterface>(argument.getOwner()->getParentOp());
+        unsigned descriptorBase = *descriptorBaseOrError;
         Value offset = function.getArgument(descriptorBase);
         SmallVector<Value> strides;
         strides.reserve(view.getShape().size());
@@ -165,10 +240,16 @@ inline LogicalResult materializeTensorViewProjections(Operation *root) {
         return failure();
     SmallVector<Operation *> operations;
     root->walk([&](Operation *operation) {
-        if (isa<LoadOp, StoreOp, AtomicOp>(operation))
+        if (isa<LoadOp, StoreOp, AtomicOp, GetShapeOp>(operation))
             operations.push_back(operation);
     });
     for (Operation *operation : operations) {
+        if (auto getShape = dyn_cast<GetShapeOp>(operation)) {
+            OpBuilder builder(operation);
+            if (failed(materializeGetShape(getShape, builder)))
+                return operation->emitError("cannot resolve Tensor or TensorView shape");
+            continue;
+        }
         Value storage = isa<StoreOp>(operation) ? operation->getOperand(1) : operation->getOperand(0);
         auto view = dyn_cast<TensorViewType>(storage.getType());
         if (!view)
