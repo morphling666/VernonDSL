@@ -49,7 +49,12 @@ from .intrinsics import (
     workgroup_storage,
 )
 from .module import Module
-from .pipeline_assets import PipelineAssetDeclaration, load_cooked_vjp_asset, load_pipeline, pipeline_asset
+from .pipeline_assets import (
+    PipelineAssetDeclaration,
+    load_cooked_vjp_asset,
+    load_pipeline,
+    pipeline_asset,
+)
 from .render import AttachmentOperation, RenderTargetUse, clear, load, preserve, render
 from .runtime import (
     ColorAttachmentUse,
@@ -111,6 +116,7 @@ from .runtime import (
     triangles,
     vulkan,
 )
+from .storage import empty, empty_like, from_values, zeros, zeros_like
 from .types import (
     Feature,
     Matrix,
@@ -208,6 +214,8 @@ __all__ = [
     "cuda",
     "directx",
     "dot",
+    "empty",
+    "empty_like",
     "dyn",
     "exp",
     "f16",
@@ -218,6 +226,7 @@ __all__ = [
     "metal",
     "fragment",
     "fragment_coord",
+    "from_values",
     "front_facing",
     "func",
     "i32",
@@ -280,4 +289,6 @@ __all__ = [
     "write",
     "workgroup_storage",
     "workgroup_barrier",
+    "zeros",
+    "zeros_like",
 ]

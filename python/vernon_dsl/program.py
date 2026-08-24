@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._runtime.resources import TensorStorage, TensorView
-from .frontend.capture import capture_scope
 from .operation_graph import KernelParameter, OperationGraph
 
 
@@ -51,12 +50,12 @@ class CapturedKernelCall:
 
 
 class ProgramCapture:
-    def __init__(self, root: Any, inputs: Mapping[str, Any], *, consume_kernels: bool):
+    def __init__(self, root: Any, inputs: Mapping[str, Any]):
         self.root = root
         self.inputs = dict(inputs)
-        self.consume_kernels = consume_kernels
         self.calls: list[CapturedKernelCall] = []
         self.allocations: dict[int, tuple[TensorStorage, str]] = {}
+        self.allocation_constants: dict[int, Any] = {}
         self._scopes = [type(root).__name__]
         self._name_counts: dict[str, int] = {}
 
@@ -72,7 +71,7 @@ class ProgramCapture:
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
         features: tuple[str, ...],
-    ) -> bool:
+    ) -> None:
         dispatch_grid = grid or (1, 1, 1)
         if len(dispatch_grid) != 3 or any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dispatch_grid
@@ -83,7 +82,6 @@ class ProgramCapture:
         self._name_counts[base] = ordinal + 1
         name = base if ordinal == 0 else f"{base}.{ordinal}"
         self.calls.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features)))
-        return self.consume_kernels
 
     def capture_allocation(self, value: Any, initializer: str) -> None:
         if not isinstance(value, TensorStorage):
@@ -266,14 +264,10 @@ def _capture_module(
     module: Any,
     arguments: tuple[Any, ...],
     keywords: Mapping[str, Any],
-    *,
-    consume_kernels: bool,
 ) -> tuple[ProgramCapture, Any]:
-    inputs = dict(inspect.signature(module.forward).bind(*arguments, **keywords).arguments)
-    capture = ProgramCapture(module, inputs, consume_kernels=consume_kernels)
-    with capture_scope(capture):
-        outputs = module.forward(*arguments, **keywords)
-    return capture, outputs
+    from .frontend.module_ast import interpret_module_forward
+
+    return interpret_module_forward(module, arguments, keywords)
 
 
 def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
@@ -433,7 +427,6 @@ def _parse_module_program(
         module,
         arguments,
         supplied_keywords,
-        consume_kernels=True,
     )
     template = ProgramTemplate.compile(capture)
     invocation = template.bind(capture, outputs)
@@ -447,7 +440,7 @@ def _parse_module_program(
 
 def _plan_module_program(module: Any) -> Any:
     arguments, keywords = _inferred_module_arguments(module)
-    capture, outputs = _capture_module(module, arguments, keywords, consume_kernels=True)
+    capture, outputs = _capture_module(module, arguments, keywords)
     template = ProgramTemplate.plan(capture)
     invocation = template.bind(capture, outputs)
     allocation_initializers = {
@@ -463,8 +456,11 @@ class _AllocationSpec:
     dtype: Any
     shape: tuple[int, ...]
     initializer: str
+    values: Any = None
 
     def create(self) -> TensorStorage:
+        if self.initializer == "from_values":
+            return TensorStorage.from_values(self.values, dtype=self.dtype)
         factory = TensorStorage.zeros if self.initializer == "zeros" else TensorStorage.empty
         return factory(dtype=self.dtype, shape=self.shape)
 
@@ -693,7 +689,7 @@ def _primal_specialization(
             else:
                 raise TypeError(
                     "Module.forward() captured an unregistered TensorStorage; "
-                    "use Module.empty(), Module.zeros(), or an invocation parameter"
+                    "use vd.empty(), vd.zeros(), vd.from_values(), or an invocation parameter"
                 )
             if isinstance(value, TensorView):
                 return _ValueRecipe(
@@ -732,7 +728,13 @@ def _primal_specialization(
         raise TypeError("Module output contains a value that cannot be reconstructed from Program IR")
 
     allocations = tuple(
-        _AllocationSpec(_tensor_dtype(value), tuple(value.shape), initializer) for value, initializer in allocation_rows
+        _AllocationSpec(
+            _tensor_dtype(value),
+            tuple(value.shape),
+            initializer,
+            capture.allocation_constants.get(id(value)),
+        )
+        for value, initializer in allocation_rows
     )
     allocation_initializers = {invocation.graph.owner_id(value): initializer for value, initializer in allocation_rows}
     calls = tuple(
@@ -761,7 +763,7 @@ def execute_module_primal(module: Any, arguments: tuple[Any, ...], keywords: Map
     key = module._program_specialization_key(arguments, keywords, variant="primal")
     specialization = module._program_cache.get(key)
     if not isinstance(specialization, _PrimalSpecialization):
-        capture, outputs = _capture_module(module, arguments, keywords, consume_kernels=True)
+        capture, outputs = _capture_module(module, arguments, keywords)
         template = ProgramTemplate.compile(capture)
         invocation = template.bind(capture, outputs)
         specialization = _primal_specialization(module, capture, outputs, invocation)
@@ -775,7 +777,7 @@ def execute_module_vjp(
     keywords: Mapping[str, Any],
 ) -> tuple[Any, Any]:
     module = expression.module
-    capture, outputs = _capture_module(module, arguments, keywords, consume_kernels=True)
+    capture, outputs = _capture_module(module, arguments, keywords)
     key = module._program_specialization_key(
         arguments,
         keywords,

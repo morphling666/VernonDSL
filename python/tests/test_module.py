@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from dataclasses import dataclass
 from unittest import mock
 
 import numpy as np
@@ -49,12 +50,18 @@ class PowerBranch(vd.Module):
         self.grid = grid
 
     def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
-        output = self.empty_like(source)
+        output = vd.empty_like(source)
         if self.power == 2:
             module_square(source, output, grid=self.grid)
         else:
             module_cube(source, output, grid=self.grid)
         return output
+
+
+@dataclass
+class FanInOutput:
+    square: vd.TensorStorage
+    cube: vd.TensorStorage
 
 
 class FanIn(vd.Module):
@@ -64,11 +71,8 @@ class FanIn(vd.Module):
         self.square = PowerBranch(power=2, grid=grid)
         self.cube = PowerBranch(power=3, grid=grid)
 
-    def forward(self, source: vd.TensorStorage) -> dict[str, vd.TensorStorage]:
-        return {
-            "square": self.square(source),
-            "cube": self.cube(source),
-        }
+    def forward(self, source: vd.TensorStorage) -> FanInOutput:
+        return FanInOutput(self.square(source), self.cube(source))
 
 
 class AnnotatedSquare(vd.Module):
@@ -79,7 +83,7 @@ class AnnotatedSquare(vd.Module):
         self,
         source: vd.TensorView[vd.f32, (1,), vd.read],
     ) -> vd.TensorStorage:
-        output = self.empty_like(source)
+        output = vd.empty_like(source)
         module_square(source, output)
         return output
 
@@ -89,7 +93,7 @@ class AggregateCopy(vd.Module):
         self,
         source: vd.TensorView[ModulePair, (1,), vd.read],
     ) -> vd.TensorStorage:
-        output = self.empty_like(source)
+        output = vd.empty_like(source)
         module_copy_pair(source, output)
         return output
 
@@ -130,7 +134,9 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(implementation.entry, "_program_add_f32_rank1")
         self.assertIn('vernon.source_name = "output"', implementation.mlir)
 
-    def test_fusion_dsl_provider_lowers_rank_two_builtin_add_with_view_shape(self) -> None:
+    def test_fusion_dsl_provider_lowers_rank_two_builtin_add_with_view_shape(
+        self,
+    ) -> None:
         values = {
             0: {"id": 0, "dtype": "f32", "shape": [2, 3]},
             1: {"id": 1, "dtype": "f32", "shape": [2, 3]},
@@ -176,8 +182,8 @@ class ModuleTests(unittest.TestCase):
             outputs=("square", "cube"),
         )(source)
 
-        np.testing.assert_array_equal(outputs["square"].to_numpy(), np.array([4.0], dtype=np.float32))
-        np.testing.assert_array_equal(outputs["cube"].to_numpy(), np.array([8.0], dtype=np.float32))
+        np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
+        np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
         specialization = next(iter(module._program_cache.values()))
         signature = specialization.pipeline.program_ad_signature
         self.assertEqual([value["path"] for value in signature["inputs"]], ["source"])
@@ -239,8 +245,8 @@ class ModuleTests(unittest.TestCase):
             side_effect=AssertionError("plain Module call compiled VJP"),
         ):
             outputs = module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
-        np.testing.assert_array_equal(outputs["square"].to_numpy(), np.array([4.0], dtype=np.float32))
-        np.testing.assert_array_equal(outputs["cube"].to_numpy(), np.array([8.0], dtype=np.float32))
+        np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
+        np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
         module(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)))
         self.assertEqual(len(module._program_cache), 1)
 
@@ -272,8 +278,8 @@ class ModuleTests(unittest.TestCase):
                 side_effect=AssertionError("native cache hit called Python Kernel.__call__"),
             ):
                 outputs = module(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)))
-            np.testing.assert_array_equal(outputs["square"].to_numpy(), np.array([9.0], dtype=np.float32))
-            np.testing.assert_array_equal(outputs["cube"].to_numpy(), np.array([27.0], dtype=np.float32))
+            np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([9.0], dtype=np.float32))
+            np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([27.0], dtype=np.float32))
         finally:
             vd.init(arch=vd.cpu)
 
@@ -318,17 +324,34 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual(parsed.structs[0][0], "ModulePair")
         self.assertEqual(parsed.forward.arguments[0].type.logical.arguments[0].name, "ModulePair")
         self.assertIn('"vernon.struct"()', parsed.mlir)
-        self.assertIn('!vernon.tensor_view<!vernon.struct<"ModulePair">, [1], "read_write", "device">', parsed.mlir)
+        self.assertIn(
+            '!vernon.tensor_view<!vernon.struct<"ModulePair">, [1], "read_write", "device">',
+            parsed.mlir,
+        )
 
     def test_module_frontend_rejects_ambiguous_unused_parameter(self) -> None:
         from vernon_dsl.program import _parse_module_program
 
         class Ambiguous(vd.Module):
             def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
-                return self.zeros(dtype=vd.f32, shape=(1,))
+                return vd.zeros(dtype=vd.f32, shape=(1,))
 
         with self.assertRaisesRegex(TypeError, "cannot infer Module parameter 'source'"):
             _parse_module_program(Ambiguous())
+
+    def test_forward_rejects_host_from_numpy(self) -> None:
+        from vernon_dsl.frontend.module_ast import interpret_module_forward
+
+        class HostAlloc(vd.Module):
+            def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
+                return vd.storage.from_numpy(np.array([1.0], dtype=np.float32))
+
+        with self.assertRaisesRegex(TypeError, "host session"):
+            interpret_module_forward(
+                HostAlloc(),
+                (vd.storage.zeros(dtype=vd.f32, shape=(1,)),),
+                {},
+            )
 
     def test_typed_storage_activity_drives_program_dependencies(self) -> None:
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))

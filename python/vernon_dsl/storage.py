@@ -6,7 +6,15 @@ from typing import Any
 
 import numpy as np
 
-from ._runtime.resources import TensorStorage
+from ._runtime.resources import TensorStorage, TensorView
+
+
+def empty_like(value: TensorStorage | TensorView) -> TensorStorage:
+    return TensorStorage.empty_like(value)
+
+
+def zeros_like(value: TensorStorage | TensorView) -> TensorStorage:
+    return TensorStorage.zeros_like(value)
 
 
 def zeros(*, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
@@ -29,4 +37,4 @@ def tangent_zeros(*, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
     return TensorStorage.tangent_zeros(dtype=dtype, shape=shape)
 
 
-__all__ = ["empty", "from_numpy", "from_values", "tangent_zeros", "zeros"]
+__all__ = ["empty", "empty_like", "from_numpy", "from_values", "tangent_zeros", "zeros", "zeros_like"]

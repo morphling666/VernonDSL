@@ -1019,7 +1019,7 @@ class Square(vd.Module):
         self,
         source: vd.TensorView[vd.f32, (1,), vd.read],
     ) -> vd.TensorStorage:
-        output = self.empty_like(source)
+        output = vd.empty_like(source)
         square(source, output)
         return output
 

@@ -47,9 +47,9 @@ class PressureSolveModule(vd.Module):
         advected_velocity: vd.TensorStorage,
         scalar_template: vd.TensorStorage,
     ) -> vd.TensorStorage:
-        divergence = self.zeros_like(scalar_template)
-        pressure_a = self.zeros_like(scalar_template)
-        pressure_b = self.zeros_like(scalar_template)
+        divergence = vd.zeros_like(scalar_template)
+        pressure_a = vd.zeros_like(scalar_template)
+        pressure_b = vd.zeros_like(scalar_template)
         initialize_pressure(
             advected_velocity,
             divergence,
@@ -102,7 +102,7 @@ class SmokeFluidModule(vd.Module):
         state_velocity: vd.TensorStorage,
         target_density: vd.TensorStorage,
     ) -> SmokeFluidOutputs:
-        advected_velocity = self.empty_like(state_velocity)
+        advected_velocity = vd.empty_like(state_velocity)
         advect_velocity(
             state_velocity,
             advected_velocity,
@@ -111,7 +111,7 @@ class SmokeFluidModule(vd.Module):
             grid=self.grid,
         )
         pressure = self.pressure(advected_velocity, state_density)
-        output_velocity = self.empty_like(state_velocity)
+        output_velocity = vd.empty_like(state_velocity)
         project_velocity(
             advected_velocity,
             pressure,
@@ -120,7 +120,7 @@ class SmokeFluidModule(vd.Module):
             self.height_value,
             grid=self.grid,
         )
-        output_density = self.empty_like(state_density)
+        output_density = vd.empty_like(state_density)
         transport_density(
             state_density,
             output_velocity,
@@ -129,7 +129,7 @@ class SmokeFluidModule(vd.Module):
             self.height_value,
             grid=self.grid,
         )
-        output_loss = self.zeros(dtype=vd.f32, shape=(1,))
+        output_loss = vd.zeros(dtype=vd.f32, shape=(1,))
         smoke_loss(
             output_density,
             target_density,

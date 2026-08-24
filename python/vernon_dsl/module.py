@@ -29,15 +29,8 @@ def _tensor_dtype(value: TensorStorage) -> Any:
     return getattr(types, name)
 
 
-def _record_allocation(value: TensorStorage, initializer: str) -> TensorStorage:
-    from .frontend.capture import capture_allocation
-
-    capture_allocation(value, initializer)
-    return value
-
-
 class Module:
-    """Composable host program whose forward method captures semantic operations."""
+    """Composable host program whose forward method is parsed into a Program."""
 
     _module_initialized: bool
     _modules: dict[str, Module]
@@ -71,49 +64,13 @@ class Module:
     def forward(self, *arguments: Any, **keywords: Any) -> Any:
         raise NotImplementedError
 
-    def empty_like(self, value: TensorStorage | TensorView) -> TensorStorage:
-        if not isinstance(value, (TensorStorage, TensorView)):
-            raise TypeError("Module.empty_like() requires TensorStorage or TensorView")
-        owner = value.owner if isinstance(value, TensorView) else value
-        if not isinstance(owner, TensorStorage):
-            raise TypeError("Module transients require TensorStorage-backed values")
-        return _record_allocation(
-            TensorStorage.empty(dtype=_tensor_dtype(owner), shape=tuple(value.shape)),
-            "empty",
-        )
-
-    def empty(self, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
-        return _record_allocation(TensorStorage.empty(dtype=dtype, shape=shape), "empty")
-
-    def zeros_like(self, value: TensorStorage | TensorView) -> TensorStorage:
-        if not isinstance(value, (TensorStorage, TensorView)):
-            raise TypeError("Module.zeros_like() requires TensorStorage or TensorView")
-        owner = value.owner if isinstance(value, TensorView) else value
-        if not isinstance(owner, TensorStorage):
-            raise TypeError("Module transients require TensorStorage-backed values")
-        return _record_allocation(
-            TensorStorage.zeros(dtype=_tensor_dtype(owner), shape=tuple(value.shape)),
-            "zeros",
-        )
-
-    def zeros(self, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
-        return _record_allocation(TensorStorage.zeros(dtype=dtype, shape=shape), "zeros")
+    def backward(self, *arguments: Any, **keywords: Any) -> Any:
+        raise NotImplementedError
 
     def __call__(self, *arguments: Any, **keywords: Any) -> Any:
         self._require_initialized()
-        from .frontend.capture import current_capture
         from .program import execute_module_primal
 
-        active = current_capture()
-        if active is not None:
-            child_name = next(
-                (name for name, child in active.root.named_modules() if child is self), type(self).__name__
-            )
-            active.enter_module(child_name)
-            try:
-                return self.forward(*arguments, **keywords)
-            finally:
-                active.leave_module()
         return execute_module_primal(self, arguments, keywords)
 
     def named_modules(self, prefix: str = "") -> tuple[tuple[str, Module], ...]:

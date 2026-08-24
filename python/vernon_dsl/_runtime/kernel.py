@@ -737,10 +737,6 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
-        from ..frontend.capture import capture_kernel_call
-
-        if capture_kernel_call(self, tuple(arguments), grid, features):
-            return
         self._submit_direct(arguments, grid, features)
 
     def _submit_direct(

@@ -190,9 +190,7 @@ class _NativeBindingCache:
         struct_type = (
             annotation
             if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
-            else value_type
-            if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct"
-            else None
+            else (value_type if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct" else None)
         )
         if struct_type is not None:
             layout = host_abi_layout(struct_type)
@@ -231,7 +229,12 @@ class _NativeBindingCache:
                     f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
                     f"got {tuple(host_array.shape)}"
                 )
-        token = execution_token or ("host-value", host_array.dtype.str, tuple(host_array.shape), host_array.tobytes())
+        token = execution_token or (
+            "host-value",
+            host_array.dtype.str,
+            tuple(host_array.shape),
+            host_array.tobytes(),
+        )
         return self._bind(
             builder,
             parameter,
@@ -516,6 +519,15 @@ class TensorStorage:
         return _storage_array_dtype(layout), layout
 
     @classmethod
+    def zeros_like(cls, value: TensorStorage | TensorView) -> TensorStorage:
+        if not isinstance(value, (TensorStorage, TensorView)):
+            raise TypeError("zeros_like() requires TensorStorage or TensorView")
+        owner = value.owner if isinstance(value, TensorView) else value
+        if not isinstance(owner, TensorStorage):
+            raise TypeError("Transients require TensorStorage-backed values")
+        return cls.zeros(dtype=owner.dtype, shape=tuple(value.shape))
+
+    @classmethod
     def zeros(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
         numpy_dtype, layout = cls._storage_dtype(dtype)
         return cls(
@@ -523,6 +535,15 @@ class TensorStorage:
             element_type=dtype if layout is not None else None,
             element_layout=layout,
         )
+
+    @classmethod
+    def empty_like(cls, value: TensorStorage | TensorView) -> TensorStorage:
+        if not isinstance(value, (TensorStorage, TensorView)):
+            raise TypeError("empty_like() requires TensorStorage or TensorView")
+        owner = value.owner if isinstance(value, TensorView) else value
+        if not isinstance(owner, TensorStorage):
+            raise TypeError("Transients require TensorStorage-backed values")
+        return cls.empty(dtype=owner.dtype, shape=tuple(value.shape))
 
     @classmethod
     def empty(cls, *, dtype: Any, shape: tuple[int, ...]) -> TensorStorage:
@@ -737,7 +758,13 @@ class TensorStorage:
     @staticmethod
     def _gradient_add_views(
         output: TensorStorage, left: TensorStorage, right: TensorStorage
-    ) -> list[tuple[TensorStorage | TensorView, TensorStorage | TensorView, TensorStorage | TensorView]]:
+    ) -> list[
+        tuple[
+            TensorStorage | TensorView,
+            TensorStorage | TensorView,
+            TensorStorage | TensorView,
+        ]
+    ]:
         layout = TensorStorage._gradient_layout(left, right)
         if layout is None:
             return [(output, left, right)]
@@ -837,7 +864,9 @@ class TensorStorage:
                 raise TypeError("partial update indices must be integers")
             normalized_indices = raw_indices.astype(np.int64, copy=False)
             normalized_indices = np.where(
-                normalized_indices < 0, normalized_indices + self.shape[0], normalized_indices
+                normalized_indices < 0,
+                normalized_indices + self.shape[0],
+                normalized_indices,
             )
             if np.any(normalized_indices < 0) or np.any(normalized_indices >= self.shape[0]):
                 raise IndexError("partial update index is outside TensorStorage")
@@ -883,7 +912,11 @@ class TensorStorage:
         if raw_indices.dtype.kind not in {"i", "u"}:
             raise TypeError("partial value update indices must be integers")
         normalized_indices = raw_indices.astype(np.int64, copy=False)
-        normalized_indices = np.where(normalized_indices < 0, normalized_indices + self.shape[0], normalized_indices)
+        normalized_indices = np.where(
+            normalized_indices < 0,
+            normalized_indices + self.shape[0],
+            normalized_indices,
+        )
         if np.any(normalized_indices < 0) or np.any(normalized_indices >= self.shape[0]):
             raise IndexError("partial value update index is outside TensorStorage")
         logical_values = (values,) if scalar_index else tuple(values)
@@ -986,7 +1019,9 @@ class TensorStorage:
             self._upload_dirty_ranges()
         return self._native_buffer
 
-    def _begin_planned_upload(self) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
+    def _begin_planned_upload(
+        self,
+    ) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
         state = _session_state()
         if state._native_runtime is None or state._rhi_host is None:
             raise RuntimeError("planned TensorStorage residency requires a GPU RHI host")
@@ -1475,7 +1510,9 @@ class TensorView:
     def _resident_buffer(self) -> Any:
         return self._owner._resident_buffer()
 
-    def _begin_planned_upload(self) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
+    def _begin_planned_upload(
+        self,
+    ) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
         return self._owner._begin_planned_upload()
 
     def _planned_buffer(self) -> Any:
@@ -1626,7 +1663,15 @@ _TEXTURE_FORMATS = (
     r11g11b10_float,
 )
 _TEXTURE_FORMAT_SET = frozenset(_TEXTURE_FORMATS)
-_TEXTURE_USAGES = frozenset({"sampled", "storage", "transfer_source", "transfer_destination", "color_attachment"})
+_TEXTURE_USAGES = frozenset(
+    {
+        "sampled",
+        "storage",
+        "transfer_source",
+        "transfer_destination",
+        "color_attachment",
+    }
+)
 
 
 class Texture(_TextureResource):
@@ -1801,7 +1846,13 @@ class Texture(_TextureResource):
         mip_levels: int = 1,
         usage: tuple[str, ...] | None = None,
     ) -> Texture:
-        return cls(array, format=format, dimension=dimension, mip_levels=mip_levels, usage=usage)
+        return cls(
+            array,
+            format=format,
+            dimension=dimension,
+            mip_levels=mip_levels,
+            usage=usage,
+        )
 
     @classmethod
     def cube(
@@ -2095,7 +2146,10 @@ class TextureView(_TextureResource):
         dimension = owner.dimension if dimension is None else dimension
         if format not in _TEXTURE_FORMAT_SET or dimension not in {"2d", "3d", "cube"}:
             raise ValueError("TextureView format or dimension is unsupported")
-        if format != owner.format and {format, owner.format} != {rgba8_unorm, rgba8_srgb}:
+        if format != owner.format and {format, owner.format} != {
+            rgba8_unorm,
+            rgba8_srgb,
+        }:
             raise ValueError("TextureView format is incompatible with its owner")
         if dimension != owner.dimension and not (owner.dimension == "cube" and dimension == "2d"):
             raise ValueError("TextureView dimension is incompatible with its owner")
@@ -2246,7 +2300,13 @@ class _DepthTexture(_TextureResource):
     def usage(self) -> frozenset[str]:
         return frozenset({"sampled"})
 
-    def upload(self, array: np.ndarray, *, mip_level: int = 0, origin: tuple[int, ...] | None = None) -> None:
+    def upload(
+        self,
+        array: np.ndarray,
+        *,
+        mip_level: int = 0,
+        origin: tuple[int, ...] | None = None,
+    ) -> None:
         del array, mip_level, origin
         raise RuntimeError("depth attachments cannot be uploaded from the host")
 
