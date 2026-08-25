@@ -6,6 +6,7 @@
 #include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
 #include <algorithm>
@@ -21,12 +22,23 @@ bool isProgramGraph(Operation *operation) {
     return function && function->hasAttr("vernon_program.graph");
 }
 
+FailureOr<ArrayRef<int64_t>> staticProgramShape(Type type) {
+    if (auto tensor = dyn_cast<RankedTensorType>(type); tensor && tensor.hasStaticShape())
+        return tensor.getShape();
+    if (auto tensor = dyn_cast<TensorType>(type))
+        return tensor.getShape();
+    if (auto view = dyn_cast<TensorViewType>(type);
+        view && llvm::all_of(view.getShape(), [](int64_t extent) { return extent >= 0; }))
+        return view.getShape();
+    return failure();
+}
+
 FailureOr<int64_t> staticElementCount(Type type) {
-    auto tensor = dyn_cast<RankedTensorType>(type);
-    if (!tensor || !tensor.hasStaticShape())
+    FailureOr<ArrayRef<int64_t>> shape = staticProgramShape(type);
+    if (failed(shape))
         return failure();
     int64_t count = 1;
-    for (int64_t extent : tensor.getShape()) {
+    for (int64_t extent : *shape) {
         if (extent < 0 || (extent != 0 && count > std::numeric_limits<int64_t>::max() / extent))
             return failure();
         count *= extent;
@@ -37,17 +49,17 @@ FailureOr<int64_t> staticElementCount(Type type) {
 FailureOr<SmallVector<int64_t, 3>> implementationGrid(StringRef implementation, Type resultType) {
     if (isa<TupleType>(resultType) && (implementation == "add" || implementation == "zeros"))
         return SmallVector<int64_t, 3>{1, 1, 1};
-    auto tensor = dyn_cast<RankedTensorType>(resultType);
-    if (!tensor || !tensor.hasStaticShape())
+    FailureOr<ArrayRef<int64_t>> shape = staticProgramShape(resultType);
+    if (failed(shape))
         return failure();
-    if (implementation == "add" && tensor.getRank() <= 3) {
+    if (implementation == "add" && shape->size() <= 3) {
         SmallVector<int64_t, 3> grid{1, 1, 1};
-        if (tensor.getRank() > 0)
-            grid[0] = std::max<int64_t>(tensor.getShape().back(), 1);
-        if (tensor.getRank() > 1)
-            grid[1] = std::max<int64_t>(tensor.getShape()[tensor.getRank() - 2], 1);
-        if (tensor.getRank() > 2)
-            grid[2] = std::max<int64_t>(tensor.getShape()[tensor.getRank() - 3], 1);
+        if (!shape->empty())
+            grid[0] = std::max<int64_t>(shape->back(), 1);
+        if (shape->size() > 1)
+            grid[1] = std::max<int64_t>((*shape)[shape->size() - 2], 1);
+        if (shape->size() > 2)
+            grid[2] = std::max<int64_t>((*shape)[shape->size() - 3], 1);
         return grid;
     }
     FailureOr<int64_t> count = staticElementCount(resultType);

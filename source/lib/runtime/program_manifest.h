@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -20,8 +21,15 @@ struct ProgramValueSlot {
     std::string dtype;
     std::vector<uint64_t> shape;
     std::shared_ptr<ValueLayout> valueLayout;
+    std::optional<uint32_t> storage;
     bool external{};
     bool output{};
+};
+
+struct ProgramStorageSlot {
+    uint32_t id{UINT32_MAX};
+    uint64_t byteLength{};
+    uint32_t initialValue{UINT32_MAX};
 };
 
 struct ProgramResourceUse {
@@ -71,6 +79,7 @@ struct ProgramAdSignature {
 
 struct ExecutableProgram {
     std::vector<ProgramValueSlot> values;
+    std::vector<ProgramStorageSlot> storages;
     std::vector<ProgramGraph> graphs;
     ProgramAdSignature adSignature;
 

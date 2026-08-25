@@ -259,7 +259,7 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     if (!exactObject(value,
                      {"stages", "parameters", "storages", "values", "shape_symbols", "shape_constraints",
                       "alias_preconditions", "graphs", "signature"},
-                     {}, diagnostic, ""))
+                     {"residual_contract"}, diagnostic, ""))
         return false;
     if (!value["stages"].is_object() || !value["parameters"].is_array() || !value["storages"].is_array() ||
         !value["values"].is_array() || !value["shape_symbols"].is_array() || !value["shape_symbols"].empty() ||
@@ -440,12 +440,28 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             return fail(diagnostic, "PROGRAM_UNKNOWN_FIELD", "parse", path, "invalid Graph");
         graph.name = row["name"].get<std::string>();
         graph.direction = row["direction"].get<std::string>();
-        if (graph.name != graph.direction || graph.direction != "forward")
+        if (graph.name != graph.direction || (graph.direction != "forward" && graph.direction != "backward"))
             return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/direction",
-                        "phase-one compute requires exactly one forward graph");
-        if (!row["captures"].empty())
-            return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", path + "/captures",
-                        "forward captures must be empty");
+                        "graph name must equal direction and be forward or backward");
+        if ((graphIndex == 0 && graph.direction != "forward") || (graphIndex == 1 && graph.direction != "backward") ||
+            graphIndex >= 2)
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/direction",
+                        "graphs must be exactly one forward graph followed by an optional backward graph");
+        if (graph.direction == "forward") {
+            if (!row["captures"].empty())
+                return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", path + "/captures",
+                            "forward captures must be empty");
+        } else {
+            for (size_t captureIndex = 0; captureIndex < row["captures"].size(); ++captureIndex) {
+                const auto &captureValue = row["captures"][captureIndex];
+                const std::string capturePath = path + "/captures/" + std::to_string(captureIndex);
+                uint32_t capture = 0;
+                if (!exactObject(captureValue, {"value"}, {}, diagnostic, capturePath) ||
+                    !uint32Value(captureValue["value"], capture))
+                    return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", capturePath, "invalid capture");
+                graph.captures.push_back(capture);
+            }
+        }
         for (size_t inputIndex = 0; inputIndex < row["inputs"].size(); ++inputIndex) {
             const auto &inputValue = row["inputs"][inputIndex];
             const std::string inputPath = path + "/inputs/" + std::to_string(inputIndex);
@@ -662,13 +678,13 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             const auto &row = rows[index];
             const std::string path = basePath + "/" + std::to_string(index);
             SignatureBinding binding;
-            if (!exactObject(row, {"path", "value"},
-                             output       ? std::initializer_list<std::string_view>{"disposition"}
-                             : derivative ? std::initializer_list<std::string_view>{"primal"}
-                                          : std::initializer_list<std::string_view>{},
-                             diagnostic, path) ||
-                !row["path"].is_string() || row["path"].get_ref<const std::string &>().empty() ||
-                !uint32Value(row["value"], binding.value))
+            const std::initializer_list<std::string_view> optional =
+                output && derivative ? std::initializer_list<std::string_view>{"disposition", "primal"}
+                : output             ? std::initializer_list<std::string_view>{"disposition"}
+                : derivative         ? std::initializer_list<std::string_view>{"primal"}
+                                     : std::initializer_list<std::string_view>{};
+            if (!exactObject(row, {"path", "value"}, optional, diagnostic, path) || !row["path"].is_string() ||
+                row["path"].get_ref<const std::string &>().empty() || !uint32Value(row["value"], binding.value))
                 return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "parse", path, "invalid Signature binding");
             binding.path = row["path"].get<std::string>();
             if (row.contains("disposition"))
@@ -686,8 +702,42 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     if (!parseSignature("inputs", program.signature.inputs, false, false) ||
         !parseSignature("outputs", program.signature.outputs, true, false) ||
         !parseSignature("cotangents", program.signature.cotangents, false, true) ||
-        !parseSignature("gradients", program.signature.gradients, false, true))
+        !parseSignature("gradients", program.signature.gradients, true, true))
         return false;
+    const bool hasBackward = program.graphs.size() == 2;
+    if (hasBackward != value.contains("residual_contract"))
+        return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", "/residual_contract",
+                    "residual_contract is required exactly when a backward graph exists");
+    if (!hasBackward)
+        return true;
+    const auto &residual = value["residual_contract"];
+    if (!exactObject(residual, {"captures", "shape_symbols"}, {}, diagnostic, "/residual_contract") ||
+        !residual["captures"].is_array() || !residual["shape_symbols"].is_array() || !residual["shape_symbols"].empty())
+        return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", "/residual_contract",
+                    "invalid residual_contract");
+    ResidualContract contract;
+    const Graph &backward = program.graphs.back();
+    if (residual["captures"].size() != backward.captures.size())
+        return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", "/residual_contract/captures",
+                    "residual captures must equal the backward graph capture array");
+    for (size_t index = 0; index < residual["captures"].size(); ++index) {
+        const auto &row = residual["captures"][index];
+        const std::string path = "/residual_contract/captures/" + std::to_string(index);
+        ResidualCapture capture;
+        if (!exactObject(row, {"value", "replay"}, {}, diagnostic, path) || !uint32Value(row["value"], capture.value) ||
+            capture.value != backward.captures[index] || !row["replay"].is_object())
+            return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", path, "invalid residual capture");
+        const auto &replay = row["replay"];
+        if (!exactObject(replay, {"legal", "required_values", "cost"}, {}, diagnostic, path + "/replay") ||
+            !replay["legal"].is_boolean() || !replay["required_values"].is_array() ||
+            (!replay["legal"].get<bool>() && !replay["required_values"].empty()))
+            return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", path + "/replay", "invalid capture replay");
+        uint64_t cost = 0;
+        if (!uint64Value(replay["cost"], cost))
+            return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", path + "/replay/cost", "invalid replay cost");
+        contract.captures.push_back(capture);
+    }
+    program.residualContract = std::move(contract);
     return true;
 }
 
@@ -1358,9 +1408,10 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
              ResolvedProgram &resolved, Diagnostic &diagnostic) {
     resolved = {};
     diagnostic = {};
-    if (program.graphs.size() != 1 || !findGraph(program, "forward"))
+    if (program.graphs.empty() || program.graphs.front().direction != "forward" ||
+        (program.graphs.size() == 2 && program.graphs.back().direction != "backward") || program.graphs.size() > 2)
         return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "resolve", "/graphs",
-                    "phase-one compute requires one forward graph");
+                    "phase-one compute requires one forward graph and at most one backward graph");
     if (stageBindings.size() != program.stages.size())
         return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stage_bindings",
                     "stage_bindings must cover every Program stage exactly once");
@@ -1409,247 +1460,295 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                         "Parameter and ParameterOrigin disagree");
     }
 
-    const Graph &graph = program.graphs.front();
-    std::set<uint32_t> entryValues;
-    uint32_t nextUserSlot = 0;
-    for (size_t index = 0; index < graph.inputs.size(); ++index) {
-        const GraphInput &input = graph.inputs[index];
-        if (input.value >= program.values.size() || !entryValues.insert(input.value).second)
-            return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "resolve", "/graphs/0/inputs/" + std::to_string(index),
-                        "invalid or duplicate graph input");
-        const Value &value = program.values[input.value];
-        const bool valid =
-            (input.kind == GraphInputKind::UserInput && input.slot == nextUserSlot++ &&
-             value.origin.kind == OriginKind::Argument && value.origin.graph == "forward" &&
-             value.origin.slot == input.slot) ||
-            (input.kind == GraphInputKind::Parameter && input.parameter < program.parameters.size() &&
-             program.parameters[input.parameter].value == input.value && value.origin.kind == OriginKind::Parameter) ||
-            (input.kind == GraphInputKind::Allocation && input.storage < program.storages.size() &&
-             program.storages[input.storage].initialValue == input.value &&
-             value.origin.kind == OriginKind::Allocation);
-        if (!valid)
-            return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "resolve", "/graphs/0/inputs/" + std::to_string(index),
-                        "GraphInput and Value origin disagree");
-    }
-
-    std::vector<std::optional<uint32_t>> producers(program.values.size());
-    std::vector<std::set<uint32_t>> readers(program.values.size());
-    std::vector<std::optional<uint32_t>> successors(program.values.size());
-    ResolvedGraph resolvedGraph;
-    resolvedGraph.predecessors.resize(graph.nodes.size());
     std::set<std::string> usedStages;
-    for (size_t nodeIndex = 0; nodeIndex < graph.nodes.size(); ++nodeIndex) {
-        const Node &node = graph.nodes[nodeIndex];
-        const std::string nodePath = "/graphs/0/nodes/" + std::to_string(nodeIndex);
-        const auto stage = program.stages.find(node.stage);
-        if (node.id != nodeIndex || stage == program.stages.end() || stage->second.operation != node.operation)
-            return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", nodePath + "/stage",
-                        "Node references an unknown or incompatible stage");
-        usedStages.insert(node.stage);
-        const StageArtifact &stageArtifact = resolved.stages.at(node.stage).stage;
-        std::vector<const ReflectedEndpoint *> bindableEndpoints;
-        for (const ReflectedEndpoint &endpoint : stageArtifact.endpoints)
-            if (endpoint.tag != "system" && endpoint.interfaceKind != "system_value")
-                bindableEndpoints.push_back(&endpoint);
-        if (node.bindings.size() != bindableEndpoints.size())
-            return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
-                        "Program bindings do not cover reflected endpoints exactly");
-        std::set<uint32_t> expectedOperands;
-        std::set<uint32_t> expectedResults;
-        for (size_t accessIndex = 0; accessIndex < node.accesses.size(); ++accessIndex) {
-            const ResourceAccess &access = node.accesses[accessIndex];
-            if (access.storage >= program.storages.size())
-                return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve",
-                            nodePath + "/accesses/" + std::to_string(accessIndex) + "/storage",
-                            "ResourceAccess names an unknown Storage");
-            const auto checkRoot = [&](uint32_t value) {
-                return value < program.values.size() && program.values[value].storage &&
-                       *program.values[value].storage == access.storage;
-            };
-            if (access.kind == AccessKind::Read) {
-                if (!checkRoot(access.value))
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "read root does not belong to its Storage");
-                expectedOperands.insert(access.value);
-                readers[access.value].insert(node.id);
-            } else if (access.kind == AccessKind::Initialize) {
-                if (!checkRoot(access.after) ||
-                    program.storages[access.storage].mutability == StorageMutability::ReadOnly)
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "initialize result is incompatible with its Storage");
-                expectedResults.insert(access.after);
-                const uint32_t initial = program.storages[access.storage].initialValue;
-                const OriginKind initialOrigin = program.values[initial].origin.kind;
-                if ((initialOrigin == OriginKind::Allocation && access.after == initial) ||
-                    (initialOrigin == OriginKind::NodeResult && access.after != initial) ||
-                    (initialOrigin != OriginKind::Allocation && initialOrigin != OriginKind::NodeResult) ||
-                    (initialOrigin == OriginKind::Allocation && successors[initial])) {
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "initialize does not produce the unique first readable Storage version");
+    for (size_t graphIndex = 0; graphIndex < program.graphs.size(); ++graphIndex) {
+        const Graph &graph = program.graphs[graphIndex];
+        const std::string graphPath = "/graphs/" + std::to_string(graphIndex);
+        std::set<uint32_t> entryValues;
+        uint32_t nextUserSlot = 0;
+        for (size_t index = 0; index < graph.inputs.size(); ++index) {
+            const GraphInput &input = graph.inputs[index];
+            if (input.value >= program.values.size() || !entryValues.insert(input.value).second)
+                return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "resolve",
+                            graphPath + "/inputs/" + std::to_string(index), "invalid or duplicate graph input");
+            const Value &value = program.values[input.value];
+            const bool valid =
+                (input.kind == GraphInputKind::UserInput && input.slot == nextUserSlot++ &&
+                 value.origin.kind == OriginKind::Argument && value.origin.graph == graph.direction &&
+                 value.origin.slot == input.slot) ||
+                (input.kind == GraphInputKind::Parameter && input.parameter < program.parameters.size() &&
+                 program.parameters[input.parameter].value == input.value &&
+                 value.origin.kind == OriginKind::Parameter) ||
+                (input.kind == GraphInputKind::Allocation && input.storage < program.storages.size() &&
+                 program.storages[input.storage].initialValue == input.value &&
+                 value.origin.kind == OriginKind::Allocation && value.origin.graph == graph.direction);
+            if (!valid)
+                return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "resolve",
+                            graphPath + "/inputs/" + std::to_string(index), "GraphInput and Value origin disagree");
+        }
+        for (size_t captureIndex = 0; captureIndex < graph.captures.size(); ++captureIndex) {
+            const uint32_t capture = graph.captures[captureIndex];
+            if (capture >= program.values.size() || !entryValues.insert(capture).second)
+                return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "resolve",
+                            graphPath + "/captures/" + std::to_string(captureIndex),
+                            "invalid or duplicate graph capture");
+        }
+
+        std::vector<std::optional<uint32_t>> producers(program.values.size());
+        std::vector<std::set<uint32_t>> readers(program.values.size());
+        std::vector<std::optional<uint32_t>> successors(program.values.size());
+        ResolvedGraph resolvedGraph;
+        resolvedGraph.predecessors.resize(graph.nodes.size());
+        for (size_t nodeIndex = 0; nodeIndex < graph.nodes.size(); ++nodeIndex) {
+            const Node &node = graph.nodes[nodeIndex];
+            const std::string nodePath = graphPath + "/nodes/" + std::to_string(nodeIndex);
+            const auto stage = program.stages.find(node.stage);
+            if (node.id != nodeIndex || stage == program.stages.end() || stage->second.operation != node.operation)
+                return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", nodePath + "/stage",
+                            "Node references an unknown or incompatible stage");
+            usedStages.insert(node.stage);
+            const StageArtifact &stageArtifact = resolved.stages.at(node.stage).stage;
+            std::vector<const ReflectedEndpoint *> bindableEndpoints;
+            for (const ReflectedEndpoint &endpoint : stageArtifact.endpoints)
+                if (endpoint.tag != "system" && endpoint.interfaceKind != "system_value")
+                    bindableEndpoints.push_back(&endpoint);
+            if (node.bindings.size() != bindableEndpoints.size())
+                return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
+                            "Program bindings do not cover reflected endpoints exactly");
+            std::set<uint32_t> expectedOperands;
+            std::set<uint32_t> expectedResults;
+            for (size_t accessIndex = 0; accessIndex < node.accesses.size(); ++accessIndex) {
+                const ResourceAccess &access = node.accesses[accessIndex];
+                if (access.storage >= program.storages.size())
+                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve",
+                                nodePath + "/accesses/" + std::to_string(accessIndex) + "/storage",
+                                "ResourceAccess names an unknown Storage");
+                const auto checkRoot = [&](uint32_t value) {
+                    return value < program.values.size() && program.values[value].storage &&
+                           *program.values[value].storage == access.storage;
+                };
+                if (access.kind == AccessKind::Read) {
+                    if (!checkRoot(access.value))
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "read root does not belong to its Storage");
+                    expectedOperands.insert(access.value);
+                    readers[access.value].insert(node.id);
+                } else if (access.kind == AccessKind::Initialize) {
+                    if (!checkRoot(access.after) ||
+                        program.storages[access.storage].mutability == StorageMutability::ReadOnly)
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "initialize result is incompatible with its Storage");
+                    expectedResults.insert(access.after);
+                    const uint32_t initial = program.storages[access.storage].initialValue;
+                    const OriginKind initialOrigin = program.values[initial].origin.kind;
+                    if ((initialOrigin == OriginKind::Allocation && access.after == initial) ||
+                        (initialOrigin == OriginKind::NodeResult && access.after != initial) ||
+                        (initialOrigin != OriginKind::Allocation && initialOrigin != OriginKind::NodeResult) ||
+                        (initialOrigin == OriginKind::Allocation && successors[initial])) {
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "initialize does not produce the unique first readable Storage version");
+                    }
+                    if (initialOrigin == OriginKind::Allocation) {
+                        successors[initial] = node.id;
+                        expectedOperands.insert(initial);
+                    }
+                } else {
+                    if (!checkRoot(access.before) || !checkRoot(access.after) ||
+                        program.storages[access.storage].mutability == StorageMutability::ReadOnly)
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "write versions are incompatible with their Storage");
+                    if (access.before == access.after || successors[access.before])
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "Storage version has multiple or self successors");
+                    successors[access.before] = node.id;
+                    if (access.access == "read_write")
+                        readers[access.before].insert(node.id);
+                    else if (access.access != "write")
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
+                                    "write access mode must be write or read_write");
+                    expectedOperands.insert(access.before);
+                    expectedResults.insert(access.after);
                 }
-                if (initialOrigin == OriginKind::Allocation) {
-                    successors[initial] = node.id;
-                    expectedOperands.insert(initial);
+                if (access.view)
+                    expectedOperands.insert(*access.view);
+            }
+            for (size_t bindingIndex = 0; bindingIndex < node.bindings.size(); ++bindingIndex) {
+                const EndpointBinding &binding = node.bindings[bindingIndex];
+                const ReflectedEndpoint &endpoint = *bindableEndpoints[bindingIndex];
+                if (binding.module != endpoint.module || binding.interfaceKind != endpoint.interfaceKind ||
+                    binding.index != endpoint.index || (binding.tag == BindingTag::Value) != (endpoint.tag == "value"))
+                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
+                                nodePath + "/bindings/" + std::to_string(bindingIndex),
+                                "EndpointBinding identity does not match artifact reflection");
+                if (binding.tag == BindingTag::Value) {
+                    if (binding.value >= program.values.size())
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
+                                    nodePath + "/bindings/" + std::to_string(bindingIndex),
+                                    "value binding ABI does not match reflection");
+                    const Value &value = program.values[binding.value];
+                    if (value.type != endpoint.type || !value.layout || value.layout->layoutHash != endpoint.layoutHash)
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
+                                    nodePath + "/bindings/" + std::to_string(bindingIndex),
+                                    "value binding ABI does not match reflection");
+                    if (binding.interfaceKind == "argument")
+                        expectedOperands.insert(binding.value);
+                    else if (binding.interfaceKind == "result")
+                        expectedResults.insert(binding.value);
+                    else
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
+                                    "binding interface must be argument or result");
+                } else {
+                    if (binding.access >= node.accesses.size())
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
+                                    "resource binding names an unknown access");
+                    const ResourceAccess &access = node.accesses[binding.access];
+                    const uint32_t physicalValue = access.kind == AccessKind::Read         ? access.value
+                                                   : access.kind == AccessKind::Initialize ? access.after
+                                                                                           : access.before;
+                    const std::string requiredAccess = access.kind == AccessKind::Read         ? "read"
+                                                       : access.kind == AccessKind::Initialize ? "write"
+                                                                                               : access.access;
+                    if (physicalValue >= program.values.size() || program.values[physicalValue].type != endpoint.type ||
+                        (endpoint.role != "storage" && endpoint.role != "image" && endpoint.role != "sampled" &&
+                         endpoint.role != "sampler" && endpoint.role != "vertex") ||
+                        (endpoint.transport != "resource_handle" && endpoint.transport != "device_address") ||
+                        endpoint.access != requiredAccess)
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
+                                    nodePath + "/bindings/" + std::to_string(bindingIndex),
+                                    "resource binding ABI or access does not match reflection");
+                }
+            }
+            if (node.operation == "compute") {
+                for (const ControlComponent &control : node.compute.workgroups) {
+                    if (control.kind == ControlKind::Parameter) {
+                        if (control.reference >= program.parameters.size())
+                            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
+                                        "dispatch parameter is unavailable");
+                        expectedOperands.insert(program.parameters[control.reference].value);
+                    } else if (control.kind == ControlKind::Argument) {
+                        const auto argument =
+                            std::find_if(program.values.begin(), program.values.end(), [&](const Value &value) {
+                                return value.origin.kind == OriginKind::Argument &&
+                                       value.origin.graph == graph.direction && value.origin.slot == control.reference;
+                            });
+                        if (argument == program.values.end())
+                            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
+                                        "dispatch argument is unavailable");
+                        expectedOperands.insert(argument->id);
+                    }
                 }
             } else {
-                if (!checkRoot(access.before) || !checkRoot(access.after) ||
-                    program.storages[access.storage].mutability == StorageMutability::ReadOnly)
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "write versions are incompatible with their Storage");
-                if (access.before == access.after || successors[access.before])
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "Storage version has multiple or self successors");
-                successors[access.before] = node.id;
-                if (access.access == "read_write")
-                    readers[access.before].insert(node.id);
-                else if (access.access != "write")
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/accesses",
-                                "write access mode must be write or read_write");
-                expectedOperands.insert(access.before);
-                expectedResults.insert(access.after);
+                for (uint32_t attachment : node.graphics.attachmentAccesses)
+                    if (attachment >= node.accesses.size() || node.accesses[attachment].kind != AccessKind::Attachment)
+                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operation/attachments",
+                                    "graphics attachment does not select an attachment access");
             }
-            if (access.view)
-                expectedOperands.insert(*access.view);
-        }
-        for (size_t bindingIndex = 0; bindingIndex < node.bindings.size(); ++bindingIndex) {
-            const EndpointBinding &binding = node.bindings[bindingIndex];
-            const ReflectedEndpoint &endpoint = *bindableEndpoints[bindingIndex];
-            if (binding.module != endpoint.module || binding.interfaceKind != endpoint.interfaceKind ||
-                binding.index != endpoint.index || (binding.tag == BindingTag::Value) != (endpoint.tag == "value"))
-                return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                            nodePath + "/bindings/" + std::to_string(bindingIndex),
-                            "EndpointBinding identity does not match artifact reflection");
-            if (binding.tag == BindingTag::Value) {
-                if (binding.value >= program.values.size())
-                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                                nodePath + "/bindings/" + std::to_string(bindingIndex),
-                                "value binding ABI does not match reflection");
-                const Value &value = program.values[binding.value];
-                if (value.type != endpoint.type || !value.layout || value.layout->layoutHash != endpoint.layoutHash)
-                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                                nodePath + "/bindings/" + std::to_string(bindingIndex),
-                                "value binding ABI does not match reflection");
-                if (binding.interfaceKind == "argument")
-                    expectedOperands.insert(binding.value);
-                else if (binding.interfaceKind == "result")
-                    expectedResults.insert(binding.value);
-                else
-                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
-                                "binding interface must be argument or result");
-            } else {
-                if (binding.access >= node.accesses.size())
-                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
-                                "resource binding names an unknown access");
-                const ResourceAccess &access = node.accesses[binding.access];
-                const uint32_t physicalValue = access.kind == AccessKind::Read         ? access.value
-                                               : access.kind == AccessKind::Initialize ? access.after
-                                                                                       : access.before;
-                const std::string requiredAccess = access.kind == AccessKind::Read         ? "read"
-                                                   : access.kind == AccessKind::Initialize ? "write"
-                                                                                           : access.access;
-                if (physicalValue >= program.values.size() || program.values[physicalValue].type != endpoint.type ||
-                    (endpoint.role != "storage" && endpoint.role != "image" && endpoint.role != "sampled" &&
-                     endpoint.role != "sampler" && endpoint.role != "vertex") ||
-                    (endpoint.transport != "resource_handle" && endpoint.transport != "device_address") ||
-                    endpoint.access != requiredAccess)
-                    return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                                nodePath + "/bindings/" + std::to_string(bindingIndex),
-                                "resource binding ABI or access does not match reflection");
+            if (std::vector<uint32_t>(expectedOperands.begin(), expectedOperands.end()) != node.operands ||
+                std::vector<uint32_t>(expectedResults.begin(), expectedResults.end()) != node.results)
+                return fail(diagnostic, "PROGRAM_OPERAND_CLOSURE", "resolve", nodePath,
+                            "Node operands or results do not equal their exact binding/access/control closure");
+            std::set<uint32_t> predecessors;
+            for (uint32_t operand : node.operands) {
+                if (operand >= program.values.size())
+                    return fail(diagnostic, "PROGRAM_OPERAND_CLOSURE", "resolve", nodePath + "/operands",
+                                "Node operand is unknown");
+                if (producers[operand])
+                    predecessors.insert(*producers[operand]);
+                else if (!entryValues.count(operand))
+                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operands",
+                                "Node operand is unavailable");
             }
-        }
-        if (node.operation == "compute") {
-            for (const ControlComponent &control : node.compute.workgroups) {
-                if (control.kind == ControlKind::Parameter) {
-                    if (control.reference >= program.parameters.size())
-                        return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
-                                    "dispatch parameter is unavailable");
-                    expectedOperands.insert(program.parameters[control.reference].value);
-                } else if (control.kind == ControlKind::Argument) {
-                    const auto argument =
-                        std::find_if(program.values.begin(), program.values.end(), [&](const Value &value) {
-                            return value.origin.kind == OriginKind::Argument && value.origin.graph == "forward" &&
-                                   value.origin.slot == control.reference;
-                        });
-                    if (argument == program.values.end())
-                        return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
-                                    "dispatch argument is unavailable");
-                    expectedOperands.insert(argument->id);
-                }
+            for (uint32_t result : node.results) {
+                if (result >= program.values.size() || producers[result] ||
+                    program.values[result].origin.kind != OriginKind::NodeResult ||
+                    program.values[result].origin.graph != graph.direction ||
+                    program.values[result].origin.node != node.id)
+                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/results",
+                                "Node result producer metadata disagrees");
+                producers[result] = node.id;
             }
-        } else {
-            for (uint32_t attachment : node.graphics.attachmentAccesses)
-                if (attachment >= node.accesses.size() || node.accesses[attachment].kind != AccessKind::Attachment)
-                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operation/attachments",
-                                "graphics attachment does not select an attachment access");
+            resolvedGraph.predecessors[node.id] = {predecessors.begin(), predecessors.end()};
         }
-        if (std::vector<uint32_t>(expectedOperands.begin(), expectedOperands.end()) != node.operands ||
-            std::vector<uint32_t>(expectedResults.begin(), expectedResults.end()) != node.results)
-            return fail(diagnostic, "PROGRAM_OPERAND_CLOSURE", "resolve", nodePath,
-                        "Node operands or results do not equal their exact binding/access/control closure");
-        std::set<uint32_t> predecessors;
-        for (uint32_t operand : node.operands) {
-            if (operand >= program.values.size())
-                return fail(diagnostic, "PROGRAM_OPERAND_CLOSURE", "resolve", nodePath + "/operands",
-                            "Node operand is unknown");
-            if (producers[operand])
-                predecessors.insert(*producers[operand]);
-            else if (!entryValues.count(operand))
-                return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operands",
-                            "Node operand is unavailable");
-        }
-        for (uint32_t result : node.results) {
-            if (result >= program.values.size() || producers[result] ||
-                program.values[result].origin.kind != OriginKind::NodeResult ||
-                program.values[result].origin.graph != "forward" || program.values[result].origin.node != node.id)
-                return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/results",
-                            "Node result producer metadata disagrees");
-            producers[result] = node.id;
-        }
-        resolvedGraph.predecessors[node.id] = {predecessors.begin(), predecessors.end()};
-    }
-    for (size_t value = 0; value < successors.size(); ++value) {
-        if (!successors[value])
-            continue;
-        const uint32_t successor = *successors[value];
-        for (uint32_t reader : readers[value]) {
-            if (reader == successor)
+        for (size_t value = 0; value < successors.size(); ++value) {
+            if (!successors[value])
                 continue;
-            if (reader > successor)
-                return fail(diagnostic, "PROGRAM_DEPENDENCY_ORDER", "resolve",
-                            "/graphs/0/nodes/" + std::to_string(successor),
-                            "Storage successor precedes a reader of its predecessor version");
-            std::vector<uint32_t> &predecessors = resolvedGraph.predecessors[successor];
-            if (std::find(predecessors.begin(), predecessors.end(), reader) == predecessors.end()) {
-                predecessors.push_back(reader);
-                std::sort(predecessors.begin(), predecessors.end());
+            const uint32_t successor = *successors[value];
+            for (uint32_t reader : readers[value]) {
+                if (reader == successor)
+                    continue;
+                if (reader > successor)
+                    return fail(diagnostic, "PROGRAM_DEPENDENCY_ORDER", "resolve",
+                                graphPath + "/nodes/" + std::to_string(successor),
+                                "Storage successor precedes a reader of its predecessor version");
+                std::vector<uint32_t> &predecessors = resolvedGraph.predecessors[successor];
+                if (std::find(predecessors.begin(), predecessors.end(), reader) == predecessors.end()) {
+                    predecessors.push_back(reader);
+                    std::sort(predecessors.begin(), predecessors.end());
+                }
             }
         }
+        for (size_t index = 0; index < graph.outputs.size(); ++index)
+            if (graph.outputs[index].value >= producers.size() || !producers[graph.outputs[index].value])
+                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
+                            graphPath + "/outputs/" + std::to_string(index), "output has no producer");
+        resolved.graphs.push_back(std::move(resolvedGraph));
     }
     if (usedStages.size() != program.stages.size())
         return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stages",
                     "every StageContract must be referenced");
 
-    if (program.signature.inputs.size() != nextUserSlot || program.signature.outputs.size() != graph.outputs.size() ||
-        !program.signature.cotangents.empty() || !program.signature.gradients.empty())
-        return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature",
-                    "Signature does not match forward graph boundaries");
-    for (size_t index = 0; index < program.signature.inputs.size(); ++index) {
-        const auto input = std::find_if(graph.inputs.begin(), graph.inputs.end(), [&](const GraphInput &candidate) {
-            return candidate.kind == GraphInputKind::UserInput && candidate.slot == index;
-        });
-        if (input == graph.inputs.end() || program.signature.inputs[index].value != input->value)
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
-                        "/signature/inputs/" + std::to_string(index), "input boundary mismatch");
+    const Graph *forward = findGraph(program, "forward");
+    const Graph *backward = findGraph(program, "backward");
+    if (!forward)
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "resolve", "/graphs",
+                    "phase-one compute requires one forward graph");
+    const auto userInputCount = [](const Graph &graph) {
+        uint32_t count = 0;
+        for (const GraphInput &input : graph.inputs)
+            if (input.kind == GraphInputKind::UserInput)
+                ++count;
+        return count;
+    };
+    const auto matchUserInputs = [&](const Graph &graph, const std::vector<SignatureBinding> &bindings,
+                                     const std::string &field) {
+        if (bindings.size() != userInputCount(graph))
+            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature/" + field,
+                        "Signature does not match graph user inputs");
+        for (size_t index = 0; index < bindings.size(); ++index) {
+            const auto input = std::find_if(graph.inputs.begin(), graph.inputs.end(), [&](const GraphInput &candidate) {
+                return candidate.kind == GraphInputKind::UserInput && candidate.slot == index;
+            });
+            if (input == graph.inputs.end() || bindings[index].value != input->value)
+                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
+                            "/signature/" + field + "/" + std::to_string(index), "input boundary mismatch");
+        }
+        return true;
+    };
+    const auto matchOutputs = [&](const Graph &graph, const std::vector<SignatureBinding> &bindings,
+                                  const std::string &field) {
+        if (bindings.size() != graph.outputs.size())
+            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature/" + field,
+                        "Signature does not match graph outputs");
+        for (size_t index = 0; index < graph.outputs.size(); ++index)
+            if (bindings[index].value != graph.outputs[index].value ||
+                bindings[index].disposition != graph.outputs[index].disposition)
+                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
+                            "/signature/" + field + "/" + std::to_string(index), "output boundary mismatch");
+        return true;
+    };
+    if (!matchUserInputs(*forward, program.signature.inputs, "inputs") ||
+        !matchOutputs(*forward, program.signature.outputs, "outputs"))
+        return false;
+    if (!backward) {
+        if (!program.signature.cotangents.empty() || !program.signature.gradients.empty())
+            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature",
+                        "Signature does not match forward graph boundaries");
+    } else if (!matchUserInputs(*backward, program.signature.cotangents, "cotangents") ||
+               !matchOutputs(*backward, program.signature.gradients, "gradients")) {
+        return false;
     }
-    for (size_t index = 0; index < graph.outputs.size(); ++index)
-        if (program.signature.outputs[index].value != graph.outputs[index].value ||
-            program.signature.outputs[index].disposition != graph.outputs[index].disposition ||
-            graph.outputs[index].value >= producers.size() || !producers[graph.outputs[index].value])
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
-                        "/signature/outputs/" + std::to_string(index), "output boundary mismatch");
 
     resolved.program = std::move(program);
-    resolved.graphs.push_back(std::move(resolvedGraph));
     return true;
 }
 

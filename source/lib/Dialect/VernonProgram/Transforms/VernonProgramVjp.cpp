@@ -29,9 +29,35 @@ FailureOr<Type> derivativeType(Type type, Operation *scope) {
     return getAutodiffDerivativeType(type, module);
 }
 
+FailureOr<Type> cotangentType(Type type, Operation *scope) {
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return failure();
+    return getAutodiffDerivativeType(type, module, "read");
+}
+
+FailureOr<Type> gradientDestType(Type type, Operation *scope) {
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return failure();
+    return getAutodiffDerivativeType(type, module, "write");
+}
+
+Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef name, ValueRange operands,
+                             Type resultType, ArrayRef<NamedAttribute> attributes = {}) {
+    OperationState state(location, IntrinsicOp::getOperationName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttribute("name", builder.getStringAttr(name));
+    state.addAttributes(attributes);
+    return builder.create(state)->getResult(0);
+}
+
 Value createZero(OpBuilder &builder, Location location, Type type) {
     if (auto scalar = dyn_cast<FloatType>(type))
         return arith::ConstantOp::create(builder, location, builder.getFloatAttr(scalar, 0.0));
+    if (isa<TensorViewType, TensorType>(type))
+        return createProgramIntrinsic(builder, location, "zeros", {}, type);
     auto tensor = dyn_cast<RankedTensorType>(type);
     auto element = tensor ? dyn_cast<FloatType>(tensor.getElementType()) : FloatType{};
     if (!tensor || !element || !tensor.hasStaticShape()) {
@@ -54,6 +80,8 @@ Value createZero(OpBuilder &builder, Location location, Type type) {
 Value addValues(OpBuilder &builder, Location location, Value left, Value right) {
     if (left.getType() != right.getType())
         return {};
+    if (isa<TensorViewType, TensorType>(left.getType()))
+        return createProgramIntrinsic(builder, location, "add", {left, right}, left.getType());
     auto tuple = dyn_cast<TupleType>(left.getType());
     if (!tuple)
         return arith::AddFOp::create(builder, location, left, right);
@@ -97,7 +125,9 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     SmallVector<Attribute> resultNames;
     SmallVector<Value> contributions(operation.getNumOperands());
     for (unsigned index : context.activeOperandIndices) {
-        FailureOr<Type> type = derivativeType(operation.getOperand(index).getType(), operation);
+        if (isWriteOnlyProgramOperand(operation, index))
+            continue;
+        FailureOr<Type> type = gradientDestType(operation.getOperand(index).getType(), operation);
         if (failed(type))
             continue;
         resultTypes.push_back(*type);
@@ -150,20 +180,13 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
             state.addAttribute(name, attribute);
     Operation *vjp = context.builder.create(state);
     unsigned result = 0;
-    for (unsigned index : context.activeOperandIndices)
+    for (unsigned index : context.activeOperandIndices) {
+        if (isWriteOnlyProgramOperand(operation, index))
+            continue;
         if (succeeded(derivativeType(operation.getOperand(index).getType(), operation)))
             contributions[index] = vjp->getResult(result++);
+    }
     return contributions;
-}
-
-Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef name, ValueRange operands,
-                             RankedTensorType resultType, ArrayRef<NamedAttribute> attributes = {}) {
-    OperationState state(location, IntrinsicOp::getOperationName());
-    state.addOperands(operands);
-    state.addTypes(resultType);
-    state.addAttribute("name", builder.getStringAttr(name));
-    state.addAttributes(attributes);
-    return builder.create(state)->getResult(0);
 }
 
 FailureOr<SmallVector<int64_t>> broadcastBatchShape(ArrayRef<int64_t> left, ArrayRef<int64_t> right) {
@@ -321,7 +344,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     for (Value retained : retainedValues)
         backwardArguments.push_back(retained.getType());
     for (Type result : primal.getResultTypes()) {
-        FailureOr<Type> derivative = derivativeType(result, primal);
+        FailureOr<Type> derivative = cotangentType(result, primal);
         if (failed(derivative)) {
             forward.erase();
             return primal.emitError("Program VJP result is not differentiable");
@@ -330,7 +353,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     }
     SmallVector<Type> backwardResults;
     for (unsigned index : wrtIndices)
-        backwardResults.push_back(*derivativeType(primal.getArgument(index).getType(), primal));
+        backwardResults.push_back(*gradientDestType(primal.getArgument(index).getType(), primal));
     auto backward = func::FuncOp::create(moduleBuilder, primal.getLoc(), options.backwardSymbol,
                                          FunctionType::get(primal.getContext(), backwardArguments, backwardResults));
     backward->setAttr("vernon_program.graph", moduleBuilder.getStringAttr("backward"));
@@ -377,6 +400,10 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         SmallVector<unsigned> activeOperands;
         for (auto [index, operand] : llvm::enumerate(operation->getOperands())) {
             primalOperands.push_back(primals.lookup(operand));
+            // Local VJP wrt is the callee's read inputs, not every involved
+            // buffer. Write-only dests are kernel outputs / cotangents.
+            if (isWriteOnlyProgramOperand(operation, index))
+                continue;
             if (succeeded(derivativeType(operand.getType(), operation)))
                 activeOperands.push_back(index);
         }
@@ -384,7 +411,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             primalResults.push_back(primals.lookup(result));
             Value cotangent = adjoints.lookup(result);
             if (!cotangent) {
-                FailureOr<Type> type = derivativeType(result.getType(), operation);
+                FailureOr<Type> type = cotangentType(result.getType(), operation);
                 if (failed(type) || !(cotangent = createZero(builder, operation->getLoc(), *type)))
                     return operation->emitError("Program VJP cannot create a zero result cotangent");
             }
@@ -397,6 +424,12 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             contributions = buildComputeVjp(compute, context);
         } else if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "matmul") {
             contributions = buildProgramMatmulVjp(intrinsic, context);
+        } else if (isa<arith::ConstantOp>(operation) ||
+                   (isa<IntrinsicOp>(operation) &&
+                    isProgramAllocIntrinsicName(cast<IntrinsicOp>(operation).getName()))) {
+            // Allocations and constants introduce a new owner or a literal. They
+            // do not depend on operand values, so result cotangents stop here.
+            continue;
         } else {
             const DifferentiationRule *rule = registry.lookup(operation);
             if (!rule)

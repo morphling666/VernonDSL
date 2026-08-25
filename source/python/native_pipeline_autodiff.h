@@ -120,6 +120,7 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
 
 nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterMetadata &parameter,
                               const VernonPipelineValueLeafView &leaf);
+nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
 struct PythonPullback {
     PythonPullback(VernonRuntimeContext *runtime, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
@@ -474,22 +475,13 @@ struct LoadedPipeline {
     nb::tuple programVjp(const nb::dict &inputs, const nb::dict &programBindings, nb::object pipelineOwner) {
         if (!vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline))
             throw std::runtime_error("pipeline has no Program autodiff signature");
-        const auto metadata = [&](VernonProgramAdBoundary boundary, size_t index) {
-            VernonProgramAdValueView value{};
-            value.struct_size = sizeof(value);
-            if (vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(pipeline, boundary, index, &value) !=
-                VERNON_STATUS_OK)
-                throw std::runtime_error("cannot read Program autodiff signature");
-            PythonAdMetadata result;
-            result.path = nativeStringView(value.path);
-            result.binding = result.path;
-            return result;
-        };
         const auto leafMetadata = [&](const char *kind, size_t index) {
             VernonAdValueMetadataView value{};
             value.struct_size = sizeof(value);
             VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
-            if (std::string_view(kind) == "output")
+            if (std::string_view(kind) == "input")
+                status = vernonRuntimeLoadedPipelineGetAdInputByIndex(pipeline, index, &value);
+            else if (std::string_view(kind) == "output")
                 status = vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, index, &value);
             else if (std::string_view(kind) == "cotangent")
                 status = vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, index, &value);
@@ -527,31 +519,14 @@ struct LoadedPipeline {
         const size_t inputCount = vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_INPUT);
         if (inputs.size() != inputCount)
             throw std::invalid_argument("Program autodiff inputs do not match its signature");
-        const std::vector<PipelineParameterMetadata> pipelineParameters = parameters();
         std::deque<PythonAdValue> inputValues;
         std::vector<VernonAdValue> inputViews;
-        for (size_t index = 0; index < inputCount; ++index) {
-            const PythonAdMetadata declared = metadata(VERNON_PROGRAM_AD_INPUT, index);
-            nb::str path(declared.path.c_str());
-            if (!inputs.contains(path))
-                throw std::invalid_argument("missing Program autodiff input '" + declared.path + "'");
-            const std::optional<size_t> parameterIndex =
-                vernon::runtime::ad::programAdParameterIndex(pipeline, VERNON_PROGRAM_AD_INPUT, index);
-            if (!parameterIndex || *parameterIndex >= pipelineParameters.size())
-                throw std::invalid_argument("Program input has no canonical pipeline parameter");
-            const PipelineParameterMetadata &parameter = pipelineParameters[*parameterIndex];
-            nb::dict aliases(inputs);
-            aliases[nb::str(parameter.name.c_str())] = nb::borrow<nb::object>(inputs[path]);
-            for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
-                VernonPipelineValueLeafView leafView{};
-                PythonAdMetadata reflected = adInputLeafMetadata(pipeline, parameter, leafIndex, &leafView);
-                if (reflected.path.compare(0, parameter.name.size(), parameter.name) != 0)
-                    throw std::runtime_error("Program input leaf path does not match its owning parameter");
-                reflected.path = declared.path + reflected.path.substr(parameter.name.size());
-                nb::object leaf = resolveAdInputLeaf(aliases, parameter, leafView);
-                inputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, leaf);
-                inputViews.push_back(inputValues.back().value);
-            }
+        const size_t inputLeafCount = vernonRuntimeLoadedPipelineGetAdInputCount(pipeline);
+        for (size_t index = 0; index < inputLeafCount; ++index) {
+            const PythonAdMetadata reflected = leafMetadata("input", index);
+            nb::object leaf = resolveProgramInputLeaf(inputs, reflected.path);
+            inputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, leaf);
+            inputViews.push_back(inputValues.back().value);
         }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
 

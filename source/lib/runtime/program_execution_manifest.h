@@ -342,6 +342,14 @@ struct Signature {
     std::vector<SignatureBinding> gradients;
 };
 
+struct ResidualCapture {
+    uint32_t value{};
+};
+
+struct ResidualContract {
+    std::vector<ResidualCapture> captures;
+};
+
 struct Program {
     std::map<std::string, StageContract> stages;
     std::vector<Parameter> parameters;
@@ -349,6 +357,7 @@ struct Program {
     std::vector<Value> values;
     std::vector<Graph> graphs;
     Signature signature;
+    std::optional<ResidualContract> residualContract;
 };
 
 struct ResolvedGraph {

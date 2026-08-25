@@ -78,21 +78,24 @@ Value scale(OpBuilder &builder, Location location, Value tensorValue, Value scal
     return arith::MulFOp::create(builder, location, tensorValue, splat(builder, location, scalar, type));
 }
 
+bool hasDynamicRankedTensorShape(Type type) {
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    return tensor && !tensor.hasStaticShape();
+}
+
 LogicalResult verifyFloatingIntrinsic(Operation *operation) {
     if (!isa<IntrinsicOp>(operation) || operation->getNumResults() != 1)
         return operation->emitOpError("autodiff intrinsic rule requires one result");
+    // Static-shape rejection must win over "not a differentiable value": dynamic
+    // ranked tensors fail getAutodiffDerivativeValueType, but the rule diagnostic
+    // is that autodiff needs static Tensor shapes.
+    if (llvm::any_of(operation->getOperandTypes(), hasDynamicRankedTensorShape) ||
+        hasDynamicRankedTensorShape(operation->getResult(0).getType()))
+        return operation->emitOpError("autodiff intrinsic rule requires static Tensor shapes");
     if (failed(getAutodiffDerivativeValueType(operation->getResult(0).getType())) ||
         llvm::any_of(operation->getOperandTypes(),
                      [](Type type) { return failed(getAutodiffDerivativeValueType(type)); }))
         return operation->emitOpError("autodiff intrinsic rule requires floating-point scalar or ranked Tensor values");
-    if (llvm::any_of(operation->getOperandTypes(),
-                     [](Type type) {
-                         auto tensor = dyn_cast<RankedTensorType>(type);
-                         return tensor && !tensor.hasStaticShape();
-                     }) ||
-        (isa<RankedTensorType>(operation->getResult(0).getType()) &&
-         !cast<RankedTensorType>(operation->getResult(0).getType()).hasStaticShape()))
-        return operation->emitOpError("autodiff intrinsic rule requires static Tensor shapes");
     return success();
 }
 

@@ -158,19 +158,13 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         llvm::SmallVector<llvm::StringRef> layoutDtypes(logicalDtypes.begin(), logicalDtypes.end());
         if (layoutDtypes.empty() && logicalDtype && !logicalDtype->empty())
             layoutDtypes.push_back(*logicalDtype);
-        mlir::FailureOr<llvm::json::Object> valueLayout = mlir::failure();
-        if (derivativeOf) {
-            mlir::FailureOr<mlir::vernon::ValueAbiLayout> derivative =
-                mlir::vernon::getAutodiffDerivativeValueLayout(derivativeOf, type, module, layoutDtypes);
-            if (mlir::succeeded(derivative)) {
-                std::string primalSpelling;
-                llvm::raw_string_ostream primalStream(primalSpelling);
-                derivativeOf.print(primalStream);
-                valueLayout = reflectCanonicalValueLayout(*derivative, "tangent<" + primalSpelling + ">");
-            }
-        } else {
-            valueLayout = reflectCanonicalValueLayout(module, layoutType, layoutDtypes);
+        if (derivativeOf &&
+            failed(mlir::vernon::getAutodiffDerivativeValueLayout(derivativeOf, type, module, layoutDtypes))) {
+            module.emitError("cannot reflect executable Program derivative Value ABI");
+            invalid = true;
+            return;
         }
+        mlir::FailureOr<llvm::json::Object> valueLayout = reflectCanonicalValueLayout(module, layoutType, layoutDtypes);
         if (mlir::failed(valueLayout)) {
             module.emitError("cannot reflect executable Program Value ABI");
             invalid = true;

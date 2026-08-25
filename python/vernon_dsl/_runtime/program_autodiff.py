@@ -8,8 +8,8 @@ from typing import Any, Mapping
 import numpy as np
 
 from .._shader_assets.artifact_io import write_external_artifact
-from .._shader_assets.cooking import _compile_program_bundle_plan, _native_target
-from ..bundle import CpuTargetOptions, materialize_bundle, serialize_bundle
+from .._shader_assets.cooking import _canonical_deployment, _compile_program_bundle_plan, _native_target
+from ..bundle import CpuTargetOptions, canonical_json
 from ..storage import TensorStorage
 from . import session as state
 from .autodiff import _pipeline_derivative_groups
@@ -160,6 +160,7 @@ def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpeci
         native=native,
         native_target=_native_target(native, target.target),
         retained_programs=retained_programs,
+        canonical_execution=True,
     )
     directory = tempfile.TemporaryDirectory(prefix="vernon-program-ad-")
     root = Path(directory.name)
@@ -173,10 +174,12 @@ def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpeci
         )
         for stage in plan.stages
     }
-    pipeline = state._native_runtime.load_program_pipeline_asset(
-        serialize_bundle(materialize_bundle(plan, descriptors)),
+    canonical_program, artifact_system, stage_bindings = _canonical_deployment(plan, descriptors)
+    pipeline = state._native_runtime.load_canonical_program(
+        canonical_json(dict(canonical_program)).encode(),
+        canonical_json(dict(artifact_system)).encode(),
         directory.name,
-        [],
+        stage_bindings,
         [(stage.metadata["symbol"], stage.entry, result) for stage, result in retained_programs],
     )
     return ProgramAutodiffSpecialization(template, pipeline, directory)

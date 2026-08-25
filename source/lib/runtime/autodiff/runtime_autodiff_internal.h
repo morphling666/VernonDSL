@@ -124,8 +124,6 @@ bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi,
 bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature);
-std::optional<size_t> programAdParameterIndex(const VernonLoadedPipeline *pipeline, VernonProgramAdBoundary boundary,
-                                              size_t boundaryIndex);
 
 bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
                          const Stage &backward, const std::vector<std::string> &gradientPaths,

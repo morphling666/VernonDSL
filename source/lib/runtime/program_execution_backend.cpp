@@ -2,8 +2,10 @@
 
 #include "backend_cpu.h"
 #include "content_hash.h"
+#include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
 #include "program_manifest.h"
+#include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime_dispatch.h"
 #include "runtime_state.h"
 #include "target_binding_plan.h"
@@ -15,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <set>
 
 namespace vernon::runtime::program {
 namespace {
@@ -192,6 +195,15 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
 bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram &execution, Diagnostic &diagnostic) {
     execution = {};
     execution.values.resize(program.program.values.size());
+    std::set<uint32_t> userInputs;
+    std::set<uint32_t> userOutputs;
+    for (const Graph &graph : program.program.graphs) {
+        for (const GraphInput &input : graph.inputs)
+            if (input.kind == GraphInputKind::UserInput)
+                userInputs.insert(input.value);
+        for (const GraphOutput &output : graph.outputs)
+            userOutputs.insert(output.value);
+    }
     for (const Value &value : program.program.values) {
         if (value.id >= execution.values.size())
             return reject(diagnostic, "PROGRAM_VALUE", "/values", "Program value id exceeds the value arena");
@@ -200,7 +212,15 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
         slot.name = value.name;
         slot.type = value.type;
         slot.shape = value.shape;
+        slot.storage = value.storage;
+        slot.external = userInputs.count(value.id) != 0;
+        slot.output = userOutputs.count(value.id) != 0;
         if (value.layout) {
+            if (value.layout->byteSize > std::numeric_limits<uint32_t>::max() ||
+                value.layout->alignment > std::numeric_limits<uint32_t>::max())
+                return reject(diagnostic, "PROGRAM_LAYOUT_HASH",
+                              "/values/" + std::to_string(value.id) + "/value_layout",
+                              "ValueLayout exceeds the runtime ABI");
             auto layout = std::make_shared<vernon::runtime::ValueLayout>();
             layout->layoutHash = value.layout->layoutHash;
             layout->byteSize = static_cast<uint32_t>(value.layout->byteSize);
@@ -218,34 +238,84 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
                         path.index = *component.index;
                     converted.path.push_back(std::move(path));
                 }
+                if (const std::optional<VernonDataType> dtype = pipelineDataType(converted.dtype))
+                    layout->abiLeaves.push_back(
+                        {static_cast<uint32_t>(*dtype), converted.scalarCount, converted.byteOffset});
                 layout->leaves.push_back(std::move(converted));
             }
+            rebuildValueLayoutPathViews(*layout);
             slot.valueLayout = std::move(layout);
+            if (value.layout->leaves.size() == 1)
+                slot.dtype = value.layout->leaves.front().dtype;
         }
         execution.values[value.id] = std::move(slot);
     }
-    for (const Graph &graph : program.program.graphs) {
+    execution.storages.resize(program.program.storages.size());
+    for (const Storage &storage : program.program.storages) {
+        if (storage.id >= execution.storages.size())
+            return reject(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "/storages",
+                          "Program storage id exceeds the storage arena");
+        ProgramStorageSlot slot;
+        slot.id = storage.id;
+        slot.initialValue = storage.initialValue;
+        if (storage.descriptorKind == StorageDescriptorKind::Buffer)
+            slot.byteLength = storage.buffer.byteLength;
+        execution.storages[storage.id] = slot;
+    }
+    const auto convertBindings = [](const std::vector<SignatureBinding> &bindings) {
+        std::vector<ProgramAdSignatureBinding> converted;
+        converted.reserve(bindings.size());
+        for (const SignatureBinding &binding : bindings)
+            converted.push_back({binding.value, binding.path});
+        return converted;
+    };
+    execution.adSignature.inputs = convertBindings(program.program.signature.inputs);
+    execution.adSignature.outputs = convertBindings(program.program.signature.outputs);
+    execution.adSignature.cotangents = convertBindings(program.program.signature.cotangents);
+    execution.adSignature.gradients = convertBindings(program.program.signature.gradients);
+    execution.adSignature.declared = true;
+    for (size_t graphIndex = 0; graphIndex < program.program.graphs.size(); ++graphIndex) {
+        const Graph &graph = program.program.graphs[graphIndex];
         ProgramGraph converted;
         converted.name = graph.name;
         converted.direction = graph.direction;
         for (const GraphInput &input : graph.inputs)
-            converted.arguments.push_back(input.value);
+            if (input.kind == GraphInputKind::UserInput)
+                converted.arguments.push_back(input.value);
         for (const GraphOutput &output : graph.outputs)
             converted.results.push_back(output.value);
+        const ResolvedGraph *resolvedGraph = graphIndex < program.graphs.size() ? &program.graphs[graphIndex] : nullptr;
         for (const Node &node : graph.nodes) {
             ProgramNode convertedNode;
             convertedNode.id = node.id;
-            convertedNode.name = node.name;
             convertedNode.kind = node.operation == "graphics" ? "render" : "compute";
             convertedNode.stage = node.stage;
+            convertedNode.name = node.name.empty() ? graph.direction + "." + std::to_string(node.id) : node.name;
             convertedNode.operands = node.operands;
             convertedNode.results = node.results;
+            if (resolvedGraph && node.id < resolvedGraph->predecessors.size())
+                convertedNode.dependencies = resolvedGraph->predecessors[node.id];
             for (const EndpointBinding &binding : node.bindings)
                 convertedNode.bindings.push_back({binding.module + ":" + std::to_string(binding.index), binding.value});
+            for (const ResourceAccess &access : node.accesses) {
+                ProgramResourceUse use;
+                if (access.kind == AccessKind::Read) {
+                    use.value = access.value;
+                    use.access = "read";
+                } else if (access.kind == AccessKind::Initialize) {
+                    use.value = access.after;
+                    use.access = "write";
+                } else {
+                    use.value = access.before;
+                    use.access = access.access.empty() ? "write" : access.access;
+                }
+                convertedNode.resources.push_back(std::move(use));
+            }
             converted.nodes.push_back(std::move(convertedNode));
         }
         execution.graphs.push_back(std::move(converted));
     }
+    execution.adSignature.captures = execution.backwardCaptures();
     return true;
 }
 
@@ -292,6 +362,14 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
         topology->stages.push_back(VernonResolvedProgramStage{std::move(child), std::move(bindings)});
     }
     pipeline->topology = std::move(topology);
+    const bool nativeProgramAutodiff =
+        std::any_of(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
+                    [](const ProgramGraph &graph) { return graph.direction == "backward"; });
+    if (nativeProgramAutodiff && !vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
+        return reject(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "/signature",
+                      invocationDiagnostic(context).empty() ? "Program autodiff topology is invalid"
+                                                            : invocationDiagnostic(context)),
+               nullptr;
     ++context.livePipelines;
     return pipeline.release();
 }

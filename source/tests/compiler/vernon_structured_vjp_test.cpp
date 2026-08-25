@@ -4,6 +4,7 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonGPUProfileABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
@@ -17,6 +18,8 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+
+#include "llvm/ADT/STLExtras.h"
 
 #include <gtest/gtest.h>
 
@@ -91,6 +94,129 @@ module {
     EXPECT_EQ(backward.getBody().front().getOperations().size(), 3u);
 }
 
+TEST_F(VernonStructuredVjpTest, ProgramVjpStopsAtStorageAllocIntrinsics) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %source: !vernon.tensor_view<f32, [1], "read_write", "device">
+          {vernon.source_name = "source", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]})
+      -> (!vernon.tensor_view<f32, [1], "read_write", "device">
+              {vernon.source_name = "square", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+          !vernon.tensor_view<f32, [1], "read_write", "device">
+              {vernon.source_name = "cube", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]})
+      attributes {vernon_program.graph = "primal"} {
+    %square_buffer = "vernon.intrinsic"(%source) {name = "empty_like"}
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
+          !vernon.tensor_view<f32, [1], "read_write", "device">
+    %square = "vernon_program.compute"(%source, %square_buffer) {
+      callee = "square", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [1], "read_write", "device">,
+         !vernon.tensor_view<f32, [1], "read_write", "device">) ->
+        !vernon.tensor_view<f32, [1], "read_write", "device">
+    %cube_buffer = "vernon.intrinsic"(%source) {name = "empty_like"}
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
+          !vernon.tensor_view<f32, [1], "read_write", "device">
+    %cube = "vernon_program.compute"(%source, %cube_buffer) {
+      callee = "cube", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [1], "read_write", "device">,
+         !vernon.tensor_view<f32, [1], "read_write", "device">) ->
+        !vernon.tensor_view<f32, [1], "read_write", "device">
+    func.return %square, %cube : !vernon.tensor_view<f32, [1], "read_write", "device">,
+                                 !vernon.tensor_view<f32, [1], "read_write", "device">
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    ASSERT_TRUE(primal);
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    auto backward = module->lookupSymbol<func::FuncOp>("backward");
+    ASSERT_TRUE(backward);
+    unsigned allocs = 0;
+    unsigned adds = 0;
+    backward.walk([&](Operation *operation) {
+        if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "empty_like")
+            ++allocs;
+        if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "add")
+            ++adds;
+    });
+    EXPECT_EQ(allocs, 0u);
+    EXPECT_GE(adds, 1u);
+    SmallVector<program::ComputeOp> nestedVjps;
+    backward.walk([&](program::ComputeOp operation) {
+        if (operation.getCallee().ends_with(".vjp"))
+            nestedVjps.push_back(operation);
+    });
+    ASSERT_EQ(nestedVjps.size(), 2u);
+    for (program::ComputeOp operation : nestedVjps) {
+        ASSERT_EQ(operation.getResultNames().size(), 1u);
+        EXPECT_EQ(cast<StringAttr>(operation.getResultNames()[0]).getValue(), "source");
+        auto sources = operation->getAttrOfType<ArrayAttr>("vernon_program.result_autodiff_sources");
+        ASSERT_TRUE(sources);
+        ASSERT_EQ(sources.size(), 1u);
+        EXPECT_EQ(cast<StringAttr>(sources[0]).getValue(), "source");
+        auto roles = operation->getAttrOfType<ArrayAttr>("vernon_program.operand_autodiff_roles");
+        ASSERT_TRUE(roles);
+        EXPECT_TRUE(llvm::any_of(roles, [](Attribute attribute) {
+            auto role = dyn_cast<StringAttr>(attribute);
+            return role && role.getValue() == "cotangent";
+        }));
+        auto gradient = dyn_cast<TensorViewType>(operation.getResultTypes().front());
+        ASSERT_TRUE(gradient);
+        EXPECT_EQ(gradient.getAccess(), "write");
+    }
+    unsigned cotangents = 0;
+    for (auto [index, argument] : llvm::enumerate(backward.getArguments())) {
+        auto role = backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_role");
+        if (!role || role.getValue() != "cotangent")
+            continue;
+        ++cotangents;
+        auto view = dyn_cast<TensorViewType>(argument.getType());
+        ASSERT_TRUE(view);
+        EXPECT_EQ(view.getAccess(), "read");
+    }
+    EXPECT_EQ(cotangents, 2u);
+    auto publicGradient = dyn_cast<TensorViewType>(backward.getResultTypes().front());
+    ASSERT_TRUE(publicGradient);
+    EXPECT_EQ(publicGradient.getAccess(), "write");
+    EXPECT_TRUE(succeeded(verify(*module)));
+    PassManager executable(&context);
+    executable.addPass(program::createVernonProgramSelectImplementationsPass());
+    executable.addPass(program::createVernonProgramBuildExecutablePass());
+    EXPECT_TRUE(succeeded(executable.run(*module)));
+}
+
+TEST_F(VernonStructuredVjpTest, AutodiffDerivativeValueLayoutUsesPhysicalPayloadAbi) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>("module {}", ParserConfig(&context));
+    ASSERT_TRUE(module);
+    Type f32 = Float32Type::get(&context);
+    Type f16 = Float16Type::get(&context);
+    auto primal = TensorViewType::get(&context, f32, ArrayRef<int64_t>{1}, "read_write", "device");
+    Type cotangent = wrapAutodiffDerivativeTensorView(primal, f32, "read");
+    FailureOr<ValueAbiLayout> physical = getValueAbiLayout(f32, *module);
+    FailureOr<ValueAbiLayout> derivative = getAutodiffDerivativeValueLayout(primal, cotangent, *module);
+    ASSERT_TRUE(succeeded(physical));
+    ASSERT_TRUE(succeeded(derivative));
+    EXPECT_EQ(physical->layoutHash, derivative->layoutHash);
+
+    auto primalF16 = TensorViewType::get(&context, f16, ArrayRef<int64_t>{1}, "read_write", "device");
+    Type cotangentF16 = wrapAutodiffDerivativeTensorView(primalF16, f32, "read");
+    FailureOr<ValueAbiLayout> promoted = getAutodiffDerivativeValueLayout(primalF16, cotangentF16, *module);
+    ASSERT_TRUE(succeeded(promoted));
+    EXPECT_EQ(physical->layoutHash, promoted->layoutHash);
+    FailureOr<ValueAbiLayout> physicalF16 = getValueAbiLayout(f16, *module);
+    ASSERT_TRUE(succeeded(physicalF16));
+    EXPECT_NE(physicalF16->layoutHash, promoted->layoutHash);
+}
+
 TEST_F(VernonStructuredVjpTest, ProgramVjpMaterializesFanInAccumulation) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
         R"mlir(
@@ -157,19 +283,19 @@ module {
     ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
-    auto derivative = dyn_cast<TupleType>(backward.getResultTypes().front());
+    // Shaped Values keep the tensor constructor; the struct payload maps to ABI
+    // leaves. Do not flatten the [2] tensor of Pair into four scalar results.
+    auto derivative = dyn_cast<TensorType>(backward.getResultTypes().front());
     ASSERT_TRUE(derivative);
-    ASSERT_EQ(derivative.size(), 4u);
-    for (Type leaf : derivative.getTypes())
+    EXPECT_EQ(llvm::ArrayRef<int64_t>(derivative.getShape()), llvm::ArrayRef<int64_t>({2}));
+    auto payload = dyn_cast<TupleType>(derivative.getElementType());
+    ASSERT_TRUE(payload);
+    ASSERT_EQ(payload.size(), 2u);
+    for (Type leaf : payload.getTypes())
         EXPECT_EQ(leaf, Float32Type::get(&context));
     unsigned adds = 0;
-    unsigned tupleCreates = 0;
-    backward.walk([&](Operation *operation) {
-        adds += isa<arith::AddFOp>(operation);
-        tupleCreates += isa<TupleCreateOp>(operation);
-    });
-    EXPECT_EQ(adds, 4u);
-    EXPECT_GE(tupleCreates, 1u);
+    backward.walk([&](IntrinsicOp operation) { adds += operation.getName() == "add"; });
+    EXPECT_EQ(adds, 1u);
     EXPECT_TRUE(succeeded(verify(*module)));
     PassManager executable(&context);
     executable.addPass(program::createVernonProgramSelectImplementationsPass());

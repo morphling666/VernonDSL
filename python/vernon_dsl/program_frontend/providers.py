@@ -74,15 +74,36 @@ class CapturedVjpDslProvider:
         if not isinstance(raw_bindings, list) or not isinstance(raw_results, list):
             raise ImplementationUnavailable("Program VJP request has no canonical ABI bindings")
         result_ids = {value for value in raw_results if isinstance(value, int)}
-        bindings = [
-            (binding.get("parameter"), binding.get("value"))
-            for binding in raw_bindings
-            if isinstance(binding, Mapping)
-            and isinstance(binding.get("parameter"), str)
-            and isinstance(binding.get("value"), int)
-        ]
-        wrt = tuple(name for name, value in bindings if value in result_ids)
-        outputs = tuple(name.removeprefix("cotangent.") for name, _ in bindings if name.startswith("cotangent."))
+        wrt: list[str] = []
+        outputs: list[str] = []
+        seen_wrt: set[str] = set()
+        seen_outputs: set[str] = set()
+        for binding in raw_bindings:
+            if not isinstance(binding, Mapping):
+                continue
+            role = binding.get("autodiff_role")
+            source = binding.get("autodiff_source")
+            parameter = binding.get("parameter")
+            value = binding.get("value")
+            if role == "cotangent":
+                path = (
+                    source
+                    if isinstance(source, str)
+                    else (parameter.removeprefix("cotangent.") if isinstance(parameter, str) else None)
+                )
+                if path and path not in seen_outputs:
+                    seen_outputs.add(path)
+                    outputs.append(path)
+            elif value in result_ids and (role == "gradient" or role is None):
+                path = source if isinstance(source, str) else (parameter if isinstance(parameter, str) else None)
+                if path and path not in seen_wrt:
+                    seen_wrt.add(path)
+                    wrt.append(path)
+        overlap = sorted(set(wrt) & set(outputs))
+        if overlap:
+            raise ImplementationUnavailable(
+                "Program VJP kernel request has wrt paths that collide with outputs: " + ", ".join(overlap)
+            )
         if not wrt or not outputs:
             raise ImplementationUnavailable("Program VJP request has no gradient or cotangent bindings")
         identity = hashlib.sha256(

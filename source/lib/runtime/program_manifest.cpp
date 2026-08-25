@@ -251,11 +251,11 @@ bool ExecutableProgram::validate(const std::map<std::string, std::string> &stage
             for (size_t index = 0; index < primalValue.valueLayout->leaves.size(); ++index) {
                 const ValueLeaf &primalLeaf = primalValue.valueLayout->leaves[index];
                 const ValueLeaf &derivativeLeaf = derivativeValue.valueLayout->leaves[index];
-                std::vector<uint64_t> derivativeShape(primalValue.shape);
-                derivativeShape.insert(derivativeShape.end(), primalLeaf.shape.begin(), primalLeaf.shape.end());
-                if (derivativeLeaf.shape != derivativeShape ||
-                    (primalLeaf.dtype != derivativeLeaf.dtype &&
-                     !(primalLeaf.dtype == "f16" && derivativeLeaf.dtype == "f32"))) {
+                const bool dtypeOk = primalLeaf.dtype == derivativeLeaf.dtype ||
+                                     (primalLeaf.dtype == "f16" && derivativeLeaf.dtype == "f32");
+                std::vector<uint64_t> tangentShape(primalValue.shape);
+                tangentShape.insert(tangentShape.end(), primalLeaf.shape.begin(), primalLeaf.shape.end());
+                if (!dtypeOk || (derivativeLeaf.shape != primalLeaf.shape && derivativeLeaf.shape != tangentShape)) {
                     error = "executable program AD aggregate derivative ABI does not match primal boundary";
                     return false;
                 }

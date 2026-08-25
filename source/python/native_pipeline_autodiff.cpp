@@ -1,5 +1,8 @@
 #include "native_pipeline_autodiff.h"
 
+#include <algorithm>
+#include <cctype>
+
 PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, VernonDataType dtype,
                                                     const std::vector<uint64_t> &expectedShape, const nb::object &array,
                                                     bool writable) {
@@ -345,6 +348,70 @@ nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterM
         } else {
             throw std::runtime_error("autodiff input leaf has an invalid path");
         }
+    }
+    return value;
+}
+
+nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath) {
+    std::string root;
+    nb::list keys(inputs.attr("keys")());
+    for (size_t index = 0; index < keys.size(); ++index) {
+        const std::string key = nb::cast<std::string>(nb::str(keys[index]));
+        if (leafPath == key || (leafPath.size() > key.size() && leafPath.compare(0, key.size(), key) == 0 &&
+                                leafPath[key.size()] == '.')) {
+            if (key.size() > root.size())
+                root = key;
+        }
+    }
+    if (root.empty())
+        throw std::invalid_argument("missing Program autodiff input '" + leafPath + "'");
+    nb::object value = nb::borrow<nb::object>(inputs[nb::str(root.c_str())]);
+    if (nb::hasattr(value, "_native_host_array")) {
+        nb::object array = value.attr("_native_host_array")();
+        nb::object fields = array.attr("dtype").attr("fields");
+        if (!fields.is_none()) {
+            nb::str wrapped("__value");
+            if (nb::cast<bool>(fields.attr("__contains__")(wrapped)))
+                array = array.attr("__getitem__")(wrapped);
+        }
+        value = std::move(array);
+        if (leafPath == root)
+            return value;
+    }
+    if (leafPath == root)
+        return value;
+    const size_t tensorRank = nb::cast<std::vector<uint64_t>>(value.attr("shape")).size();
+    size_t begin = root.size() + 1;
+    while (begin <= leafPath.size()) {
+        const size_t end = std::min(leafPath.find('.', begin), leafPath.size());
+        const std::string component = leafPath.substr(begin, end - begin);
+        const bool index =
+            !component.empty() && std::all_of(component.begin(), component.end(),
+                                              [](unsigned char character) { return std::isdigit(character) != 0; });
+        if (index) {
+            nb::object fields = nb::hasattr(value, "dtype") ? value.attr("dtype").attr("fields") : nb::none();
+            nb::str key(component.c_str());
+            if (!fields.is_none() && nb::cast<bool>(fields.attr("__contains__")(key)))
+                value = value.attr("__getitem__")(key);
+            else
+                value = nb::module_::import_("numpy").attr("take")(value, std::stoul(component),
+                                                                   nb::arg("axis") = tensorRank);
+        } else if (nb::isinstance<nb::dict>(value)) {
+            nb::dict mapping = nb::cast<nb::dict>(value);
+            nb::str key(component.c_str());
+            if (!mapping.contains(key))
+                throw std::invalid_argument("autodiff Struct binding is missing field '" + component + "'");
+            value = nb::borrow<nb::object>(mapping[key]);
+        } else if (nb::hasattr(value, component.c_str())) {
+            value = value.attr(component.c_str());
+        } else if (nb::hasattr(value, "__getitem__")) {
+            value = value.attr("__getitem__")(component);
+        } else {
+            throw std::invalid_argument("autodiff Struct binding has no field '" + component + "'");
+        }
+        if (end == leafPath.size())
+            break;
+        begin = end + 1;
     }
     return value;
 }

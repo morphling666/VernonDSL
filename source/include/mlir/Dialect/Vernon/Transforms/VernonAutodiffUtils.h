@@ -13,10 +13,16 @@ FailureOr<Type> getAutodiffDerivativeScalarType(Type scalarType);
 // tensor, vector) keep their constructor and map the element. Products and
 // scalars map differentiable ABI leaves. `module` resolves named structs.
 FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module = {});
-// TensorView envelope around a payload derivative. Shape stays; `access` is the resource ABI.
+// TensorView envelope around a payload derivative. Shape stays; `access` is the
+// resource ABI (`read` for cotangents, `write` for gradient dests).
 Type wrapAutodiffDerivativeTensorView(TensorViewType view, Type payload, StringRef access);
-// Any SSA type: TensorView resource or Value.
+// Any SSA type: TensorView resource or Value. The 2-argument overload keeps the
+// primal TensorView access; the 3-argument form sets the AD resource ABI.
 FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module);
+FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module, StringRef tensorViewAccess);
+// Physical Value ABI of a derivative payload. Validates that `derivativeType` is
+// a legal tangent of `primalType`. `layout_hash` uses the same pipeline Value ABI
+// as ordinary values; AD pairing is origin/signature, not a `tangent<>` identity.
 FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type derivativeType, ModuleOp module,
                                                            ArrayRef<StringRef> logicalLeafDtypes = {});
 

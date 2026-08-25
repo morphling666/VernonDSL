@@ -439,23 +439,6 @@ VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *c
     return context ? context->rhiDevice : VernonRhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
-std::optional<size_t> vernon::runtime::ad::programAdParameterIndex(const VernonLoadedPipeline *pipeline,
-                                                                   VernonProgramAdBoundary boundary,
-                                                                   size_t boundaryIndex) {
-    const ExecutableProgram *execution = programExecution(pipeline);
-    if (!execution || boundary != VERNON_PROGRAM_AD_INPUT || boundaryIndex >= execution->adSignature.inputs.size())
-        return std::nullopt;
-    const uint32_t value = execution->adSignature.inputs[boundaryIndex].value;
-    if (value >= execution->values.size())
-        return std::nullopt;
-    const std::string &name = execution->values[value].name;
-    const auto parameter = std::find_if(pipeline->variant.parameters.begin(), pipeline->variant.parameters.end(),
-                                        [&](const Parameter &candidate) { return candidate.name == name; });
-    return parameter == pipeline->variant.parameters.end()
-               ? std::nullopt
-               : std::optional<size_t>(static_cast<size_t>(parameter - pipeline->variant.parameters.begin()));
-}
-
 extern "C" {
 
 uint8_t vernonRuntimeLoadedPipelineHasProgramAutodiff(const VernonLoadedPipeline *pipeline) {
@@ -529,6 +512,21 @@ VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoa
              static_cast<uint8_t>(slot.external),
              static_cast<uint8_t>(slot.output),
              {}};
+    return VERNON_STATUS_OK;
+}
+
+size_t vernonRuntimeLoadedPipelineGetAdInputCount(const VernonLoadedPipeline *pipeline) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto *executable = autodiffExecutable(pipeline);
+    return executable ? executable->signature().inputs.size() : 0;
+}
+
+VernonStatus vernonRuntimeLoadedPipelineGetAdInputByIndex(const VernonLoadedPipeline *pipeline, size_t index,
+                                                          VernonAdValueMetadataView *metadata) {
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto *executable = autodiffExecutable(pipeline);
+    if (!executable || !copyMetadata(executable->signature().inputs, index, metadata))
+        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff input query");
     return VERNON_STATUS_OK;
 }
 

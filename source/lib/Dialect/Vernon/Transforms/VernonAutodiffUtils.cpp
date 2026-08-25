@@ -4,7 +4,6 @@
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <limits>
 
@@ -78,11 +77,17 @@ FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module) 
 }
 
 FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module) {
+    if (auto view = dyn_cast<TensorViewType>(type))
+        return getAutodiffDerivativeType(type, module, view.getAccess());
+    return getAutodiffDerivativeValueType(type, module);
+}
+
+FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module, StringRef tensorViewAccess) {
     if (auto view = dyn_cast<TensorViewType>(type)) {
         FailureOr<Type> payload = getAutodiffDerivativeValueType(view.getElementType(), module);
         if (failed(payload))
             return failure();
-        return wrapAutodiffDerivativeTensorView(view, *payload, view.getAccess());
+        return wrapAutodiffDerivativeTensorView(view, *payload, tensorViewAccess);
     }
     return getAutodiffDerivativeValueType(type, module);
 }
@@ -101,6 +106,12 @@ FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type
                 return failure();
             outerShape.push_back(static_cast<uint64_t>(extent));
         }
+    } else if (auto view = dyn_cast<TensorViewType>(primalType)) {
+        auto derivativeView = dyn_cast<TensorViewType>(derivativeType);
+        if (!derivativeView || view.getShape() != derivativeView.getShape())
+            return failure();
+        primalLayoutType = view.getElementType();
+        derivativeLayoutType = derivativeView.getElementType();
     } else if (auto tensor = dyn_cast<RankedTensorType>(primalType)) {
         auto derivativeTensor = dyn_cast<RankedTensorType>(derivativeType);
         if (!tensor.hasStaticShape() || !derivativeTensor || tensor.getShape() != derivativeTensor.getShape())
@@ -119,13 +130,8 @@ FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type
         llvm::append_range(expectedShape, primalLeaf.shape);
         if (expectedShape != derivativeLeaf.shape)
             return failure();
+        derivativeLeaf.path = primalLeaf.path;
     }
-    std::string primalSpelling;
-    llvm::raw_string_ostream stream(primalSpelling);
-    primalType.print(stream);
-    const std::string identity = "tangent<" + primalSpelling + ">";
-    if (failed(rebaseValueAbiLayout(*derivative, *primal, identity)))
-        return failure();
     return std::move(*derivative);
 }
 
