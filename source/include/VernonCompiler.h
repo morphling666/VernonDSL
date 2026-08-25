@@ -100,6 +100,8 @@ typedef struct VernonCompiledKernel {
     VernonStringView reflection;
 } VernonCompiledKernel;
 
+/* Graphics image/attachment extents only. Compute TensorView dyn extents are
+ * resolved at bind from the borrowed buffer; do not pass them as shape facts. */
 typedef struct VernonProgramShapeFact {
     VernonStringView request_id;
     VernonStringView parameter;

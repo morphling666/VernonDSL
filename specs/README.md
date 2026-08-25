@@ -51,6 +51,9 @@ Supporting future designs:
   build, linking, and browser deployment path.
 - [`autodiff.md`](autodiff.md) is the current autodiff contract; Program VJP
   follow-up is [`unified_program_vjp.md`](unified_program_vjp.md).
+- [`program_vjp_debug_priority.md`](program_vjp_debug_priority.md) is the
+  active debug ladder (which AD tests to green first) while finishing that
+  convergence; refresh its failure list as layers pass.
 
 ## Version policy
 
@@ -80,7 +83,12 @@ source executable
 ```
 
 A standalone compute or graphics executable, including a single shader, is a
-one-node Program; a Module differs only in node count. The cooker selects the
+one-node Program; a Module differs only in node count. Compute kernel stages
+are locked in [`unified_module_pipeline.md`](unified_module_pipeline.md)
+section 1.1: lower without tensors, specialize without launch extents, bind
+runtime shape in C++. Do not bake `vd.dyn` into the native artifact.
+
+The cooker selects the
 target and emits exactly one Program plus content-addressed stage artifacts.
 The Program remains platform-neutral: its `stages` are portable contracts,
 while each cooked variant maps them to target code through

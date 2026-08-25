@@ -444,18 +444,12 @@ def _parameter_types_from_values(
     return types
 
 
-def _rewrite_capture_inputs(capture: ProgramCapture, outputs: Any, inputs: Mapping[str, Any]) -> Any:
+def _materialize_invocation_outputs(capture: ProgramCapture, outputs: Any, inputs: Mapping[str, Any]) -> Any:
     mapping = {id(placeholder): inputs[name] for name, placeholder in capture.inputs.items()}
-    capture.inputs = dict(inputs)
-    capture.ops = [
-        dataclasses.replace(
-            op,
-            arguments=tuple(mapping.get(id(argument), argument) for argument in op.arguments),
-        )
-        if isinstance(op, CapturedKernelCall)
-        else op
-        for op in capture.ops
-    ]
+    for alloc in capture.allocs:
+        mapping[id(alloc.result)] = _AllocationSpec(
+            alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values
+        ).create()
     return _rewrite_value(outputs, mapping)
 
 
@@ -651,9 +645,7 @@ class _PrimalSpecialization:
         return self.outputs.resolve(inputs, allocations)
 
 
-def _specialize_native_primal(
-    calls: tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...],
-) -> _NativePrimalPlan | None:
+def _specialize_native_primal(calls: tuple[CapturedKernelCall, ...]) -> _NativePrimalPlan | None:
     from ._runtime import session
 
     if session._architecture == session.cpu:
@@ -667,8 +659,13 @@ def _specialize_native_primal(
     user_parameter_rows: list[tuple[str, ...]] = []
     caches: list[Any] = []
     previous = None
-    for operation_index, (kernel, _, grid, features) in enumerate(calls):
-        compiled = kernel.specialize(features)
+    for operation_index, call in enumerate(calls):
+        kernel = call.kernel
+        lowered = kernel._lower(call.features)
+        compiled = kernel.specialize(
+            call.features,
+            lowered=lowered,
+        )
         if compiled.native is None:
             raise RuntimeError(f"kernel {kernel.__name__!r} did not produce a native pipeline")
         user_parameters = tuple(
@@ -681,7 +678,7 @@ def _specialize_native_primal(
             f"{operation_index}.{kernel.__name__}",
             compiled.native,
             parameters,
-            grid,
+            call.grid,
         )
         if previous is not None:
             execution_pass.depends_on(previous)
@@ -769,7 +766,7 @@ def _primal_specialization(
         allocations,
         calls,
         tree(outputs),
-        _specialize_native_primal(calls),
+        _specialize_native_primal(capture.calls),
     )
 
 
@@ -791,9 +788,8 @@ def execute_module_vjp(
     keywords: Mapping[str, Any],
 ) -> tuple[Any, Any]:
     module = expression.module
-    inputs = _bind_forward_arguments(module, arguments, keywords)
+    live_inputs = _bind_forward_arguments(module, arguments, keywords)
     capture, outputs = _capture_module(module, _parameter_types_from_values(module, arguments, keywords))
-    outputs = _rewrite_capture_inputs(capture, outputs, inputs)
     key = module._program_specialization_key(
         arguments,
         keywords,
@@ -826,7 +822,13 @@ def execute_module_vjp(
     if not isinstance(specialization, ProgramAutodiffSpecialization):
         specialization = compile_program_autodiff(parsed_program, template)
         module._program_cache[key] = specialization
-    return specialization.invoke(invocation)
+    return specialization.invoke(
+        dataclasses.replace(
+            invocation,
+            inputs=dict(live_inputs),
+            outputs=_materialize_invocation_outputs(capture, outputs, live_inputs),
+        )
+    )
 
 
 __all__ = [

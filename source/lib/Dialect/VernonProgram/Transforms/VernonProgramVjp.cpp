@@ -26,7 +26,7 @@ FailureOr<Type> derivativeType(Type type, Operation *scope) {
     ModuleOp module = scope->getParentOfType<ModuleOp>();
     if (!module)
         return failure();
-    return getAutodiffDerivativeValueType(type, module);
+    return getAutodiffDerivativeType(type, module);
 }
 
 Value createZero(OpBuilder &builder, Location location, Type type) {

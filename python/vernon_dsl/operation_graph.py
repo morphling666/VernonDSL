@@ -7,8 +7,6 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
-from ._runtime.resources import TensorStorage, TensorView
-
 
 class OperationKind(Enum):
     ALLOC = "alloc"
@@ -73,13 +71,7 @@ class KernelCallOp:
 
 
 def _resource_owner(value: Any) -> Any | None:
-    if isinstance(value, GraphBuffer):
-        return value
-    if isinstance(value, TensorStorage):
-        return value
-    if isinstance(value, TensorView) and isinstance(value.owner, TensorStorage):
-        return value.owner
-    return None
+    return value if isinstance(value, GraphBuffer) else None
 
 
 def _resource_type(value: Any) -> ResourceType:
@@ -223,15 +215,21 @@ class OperationGraph:
     def _current_version(self, value: Any) -> int:
         owner_id = self._owner(value)
         existing = self._current.get(owner_id)
-        if existing is not None:
-            return existing
-        return self._define_version(value, producer=None)
+        if existing is None:
+            raise ValueError("resource version is not defined in this Program graph")
+        return existing
 
     def _advance(self, value: Any, producer: int) -> int:
         previous = self._values[self._current_version(value)]
         value_id = len(self._values)
         self._values.append(
-            ResourceVersion(value_id, previous.owner, previous.version + 1, _resource_type(value), producer)
+            ResourceVersion(
+                value_id,
+                previous.owner,
+                previous.version + 1,
+                _resource_type(value),
+                producer,
+            )
         )
         self._current[previous.owner] = value_id
         return value_id

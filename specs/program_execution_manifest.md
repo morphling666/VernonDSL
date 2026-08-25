@@ -116,9 +116,10 @@ sort rule above or by its defining section preserves declared semantic order.
 
 ### 3.3 Shapes and expressions
 
-A `ShapeDim` is a positive integer or `{"symbol": S}`. An empty shape denotes
-rank zero. Zero, negative, `null`, anonymous dynamic markers, and bare strings
-are invalid.
+A `ShapeDim` is a positive integer, `-1` for TensorView `vd.dyn`, or
+`{"symbol": S}` when a ShapeSymbol is explicitly declared. An empty shape
+denotes rank zero. `null` and bare strings are invalid. Ordinary TensorView
+`vd.dyn` uses `-1` on Value `.shape` and does not allocate a ShapeSymbol.
 
 A `ShapeExpr` is exactly one of:
 
@@ -550,7 +551,7 @@ Storage is the sole descriptor authority:
   "mutability": "read_only",
   "descriptor": {
     "tag": "buffer",
-    "byte_length": {"control": {"argument": 3}},
+    "byte_length": 1024,
     "alignment": 16,
     "memory": "device",
     "usage": ["storage"]
@@ -584,11 +585,7 @@ The descriptor is exactly one of:
 {
   "tag": "image",
   "dimension": "2d",
-  "extent": [
-    {"control": {"argument": 0}},
-    {"control": {"argument": 1}},
-    1
-  ],
+  "extent": [64, 32, 1],
   "format": "rgba16_float",
   "sample_count": 1,
   "mip_levels": 1,
@@ -607,13 +604,20 @@ The descriptor is exactly one of:
 }
 ```
 
-Buffer `byte_length` is a positive integer, ShapeExpr, or control component.
+Buffer `byte_length` is a non-negative integer. A positive value is a static
+provider constraint or owned allocation size. `0` is legal only on borrowed
+Storage: TensorView `vd.dyn` already records the dynamic rank/extent on the
+Value `.shape` as `-1`, and bind takes the concrete byte length from the
+provider buffer. Do not encode buffer size as a ShapeExpr, ShapeSymbol, or
+control component, and do not bake a Python launch shape into the descriptor.
 `alignment` is a positive power of two. `memory` and `usage` use enums defined
 in Appendix B.
 
 Image `dimension` is REQUIRED and is `1d`, `2d`, `3d`, or `cube`. `extent`
-has exactly three positive components. Canonical shapes are `1d = [W,1,1]`,
-`2d = [W,H,1]`, `cube = [W,H,1]` with `W = H`, and `3d = [W,H,D]`.
+has exactly three non-negative components. `0` on an axis is legal only on
+borrowed Storage and means that axis is TensorView dyn (same as Value `.shape`
+`-1`). Canonical static shapes are `1d = [W,1,1]`, `2d = [W,H,1]`,
+`cube = [W,H,1]` with `W = H`, and `3d = [W,H,D]`.
 Format, sample count, mip levels, array layers, aspects, and usage are exact
 creation or provider requirements. Opaque contract identity is exact; opaque
 storage has no byte range, image subresource, or ValueLayout.
@@ -807,6 +811,10 @@ Constant Program Values referenced through ControlValueRef. Such values are
 never raw JSON floating-point fields in an operation.
 
 ## 9. Shape symbols and alias preconditions
+
+TensorView `vd.dyn` is a type-level `-1` on Value `.shape`. It does not create
+a ShapeSymbol. Phase-one compute keeps `shape_symbols`, `shape_constraints`,
+and `alias_preconditions` empty.
 
 A ShapeSymbol is:
 

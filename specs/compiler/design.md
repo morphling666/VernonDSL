@@ -17,6 +17,16 @@ the compiler-contract and pipeline versions instead of private cache epochs.
 Changing `PIPELINE_VERSION` requires rebuilding every Runtime, Provider, and RHI
 component; third-party precompiled Provider/RHI plugins are not supported.
 
+## Compute kernel compile vs bind
+
+Kernel native artifacts stay layout-polymorphic. Compiler analysis, kernel
+`specialize`, and compute `finalize` must not consume invoke-time extents.
+Borrowed dyn Storage keeps TensorView `vd.dyn` as `-1` on Value shape and
+`byte_length` `0` on the buffer descriptor; bind uses the provider buffer.
+Do not restore a Python `specialize(shapes=...)` path for compute. Graphics
+`shape_facts` remain the way to materialize image/attachment extents at
+pipeline finalize.
+
 ## Tensor-first type system
 
 The Python language has one compound numeric type,

@@ -1034,10 +1034,10 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
             const std::string path = appendAbiPath(components.front(), leaf.path);
             if (!canonicalPaths.insert(path).second)
                 return emitFunctionError(Twine("duplicate canonical wrt leaf '") + path + "'");
-            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
                                                      : static_cast<Type>(RankedTensorType::get(
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
-                                                           *getAutodiffDerivativeType(leaf.scalarType)));
+                                                           *getAutodiffDerivativeScalarType(leaf.scalarType)));
             result.wrtLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
                                                     components.front().str(), path, leaf.scalarType, derivativeType,
                                                     leaf.dtype, leaf.shape});
@@ -1104,10 +1104,10 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
                     path = appendAbiPath(("output." + std::to_string(resultIndex)), leaf.path);
                 result.activeResultLeaves.push_back(
                     AutodiffLeaf{value, static_cast<unsigned>(leafIndex), root.str(), std::move(path), leaf.scalarType,
-                                 leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+                                 leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
                                                     : static_cast<Type>(RankedTensorType::get(
                                                           SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
-                                                          *getAutodiffDerivativeType(leaf.scalarType))),
+                                                          *getAutodiffDerivativeScalarType(leaf.scalarType))),
                                  leaf.dtype, leaf.shape});
             }
         }
@@ -1183,10 +1183,10 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
             std::string leafPath = appendAbiPath(components.front(), leaf.path);
             if (!canonicalPaths.insert(leafPath).second)
                 return emitFunctionError(Twine("duplicate canonical Storage output leaf '") + leafPath + "'");
-            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeType(leaf.scalarType)
+            Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
                                                      : static_cast<Type>(RankedTensorType::get(
                                                            SmallVector<int64_t>(leaf.shape.begin(), leaf.shape.end()),
-                                                           *getAutodiffDerivativeType(leaf.scalarType)));
+                                                           *getAutodiffDerivativeScalarType(leaf.scalarType)));
             result.activeResultLeaves.push_back(AutodiffLeaf{argument, static_cast<unsigned>(leafIndex),
                                                              components.front().str(), std::move(leafPath),
                                                              leaf.scalarType, derivativeType, leaf.dtype, leaf.shape});

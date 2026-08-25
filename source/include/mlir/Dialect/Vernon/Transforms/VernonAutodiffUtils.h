@@ -7,8 +7,16 @@
 
 namespace mlir::vernon {
 
-FailureOr<Type> getAutodiffDerivativeType(Type scalarType);
-FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module);
+// Scalar dtype policy: f16/f32 → f32, f64 → f64.
+FailureOr<Type> getAutodiffDerivativeScalarType(Type scalarType);
+// Value payload derivative (not TensorView). Shaped Values (Tensor, ranked
+// tensor, vector) keep their constructor and map the element. Products and
+// scalars map differentiable ABI leaves. `module` resolves named structs.
+FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module = {});
+// TensorView envelope around a payload derivative. Shape stays; `access` is the resource ABI.
+Type wrapAutodiffDerivativeTensorView(TensorViewType view, Type payload, StringRef access);
+// Any SSA type: TensorView resource or Value.
+FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module);
 FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type derivativeType, ModuleOp module,
                                                            ArrayRef<StringRef> logicalLeafDtypes = {});
 

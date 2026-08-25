@@ -1,14 +1,16 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
 
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <limits>
 
 namespace mlir::vernon {
 
-FailureOr<Type> getAutodiffDerivativeType(Type scalarType) {
+FailureOr<Type> getAutodiffDerivativeScalarType(Type scalarType) {
     if (scalarType.isF64())
         return scalarType;
     if (scalarType.isF16() || scalarType.isF32())
@@ -16,19 +18,42 @@ FailureOr<Type> getAutodiffDerivativeType(Type scalarType) {
     return failure();
 }
 
+Type wrapAutodiffDerivativeTensorView(TensorViewType view, Type payload, StringRef access) {
+    return TensorViewType::get(view.getContext(), payload, view.getShape(), access, view.getAddressSpace());
+}
+
 FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module) {
-    if (auto tensor = dyn_cast<RankedTensorType>(valueType)) {
-        FailureOr<Type> element = getAutodiffDerivativeType(tensor.getElementType());
-        if (failed(element) || !tensor.hasStaticShape())
+    if (isa<TensorViewType>(valueType))
+        return failure();
+    // Shaped Values keep their constructor; autodiff maps the ABI-stable element.
+    if (auto tensor = dyn_cast<TensorType>(valueType)) {
+        FailureOr<Type> element = getAutodiffDerivativeValueType(tensor.getElementType(), module);
+        if (failed(element))
             return failure();
-        return RankedTensorType::get(tensor.getShape(), *element);
+        return TensorType::get(valueType.getContext(), *element, tensor.getShape());
+    }
+    if (auto tensor = dyn_cast<RankedTensorType>(valueType)) {
+        if (!tensor.hasStaticShape())
+            return failure();
+        FailureOr<Type> element = getAutodiffDerivativeValueType(tensor.getElementType(), module);
+        if (failed(element))
+            return failure();
+        return RankedTensorType::get(tensor.getShape(), *element, tensor.getEncoding());
+    }
+    if (auto vector = dyn_cast<VectorType>(valueType)) {
+        if (vector.isScalable())
+            return failure();
+        FailureOr<Type> element = getAutodiffDerivativeValueType(vector.getElementType(), module);
+        if (failed(element))
+            return failure();
+        return VectorType::get(vector.getShape(), *element, vector.getScalableDims());
     }
     FailureOr<ValueAbiLayout> layout = getValueStorageLayout(valueType, module);
     if (failed(layout))
         return failure();
     SmallVector<Type> leaves;
     for (const ValueAbiLeaf &leaf : layout->leaves) {
-        FailureOr<Type> scalar = getAutodiffDerivativeType(leaf.scalarType);
+        FailureOr<Type> scalar = getAutodiffDerivativeScalarType(leaf.scalarType);
         if (failed(scalar))
             continue;
         SmallVector<uint64_t> logicalShape(leaf.shape);
@@ -50,6 +75,16 @@ FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module) 
     if (leaves.size() == 1)
         return leaves.front();
     return TupleType::get(valueType.getContext(), leaves);
+}
+
+FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module) {
+    if (auto view = dyn_cast<TensorViewType>(type)) {
+        FailureOr<Type> payload = getAutodiffDerivativeValueType(view.getElementType(), module);
+        if (failed(payload))
+            return failure();
+        return wrapAutodiffDerivativeTensorView(view, *payload, view.getAccess());
+    }
+    return getAutodiffDerivativeValueType(type, module);
 }
 
 FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type derivativeType, ModuleOp module,

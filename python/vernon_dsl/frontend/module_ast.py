@@ -11,9 +11,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from .._runtime.resources import TensorStorage, _logical_collection_shape
 from ..module import Module
 from ..operation_graph import GraphBuffer
+from ..storage import TensorStorage, _logical_collection_shape
 from ..storage import empty as storage_empty
 from ..storage import empty_like as storage_empty_like
 from ..storage import from_numpy as storage_from_numpy
@@ -223,6 +223,16 @@ class _ForwardInterpreter:
             return
         if isinstance(statement, ast.Pass):
             return
+        if isinstance(statement, ast.Assert):
+            test = _require_comptime(self._expr(statement.test, owner, locals_, globals_), what="assert")
+            if test:
+                return
+            message = ""
+            if statement.msg is not None:
+                message = str(
+                    _require_comptime(self._expr(statement.msg, owner, locals_, globals_), what="assert message")
+                )
+            raise AssertionError(message)
         if isinstance(statement, ast.Raise):
             exception = (
                 self._expr(statement.exc, owner, locals_, globals_) if statement.exc is not None else RuntimeError()

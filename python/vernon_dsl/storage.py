@@ -7,6 +7,11 @@ from typing import Any
 import numpy as np
 
 from ._runtime.resources import TensorStorage, TensorView
+from ._runtime.resources import _logical_collection_shape as _resource_collection_shape
+
+
+def _logical_collection_shape(values: Any, element_type: Any) -> tuple[int, ...]:
+    return _resource_collection_shape(values, element_type)
 
 
 def empty_like(value: TensorStorage | TensorView) -> TensorStorage:

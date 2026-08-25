@@ -1285,8 +1285,7 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(fill.compile_count, 1)
 
     def test_direct_kernel_uses_finalized_program_controls_and_access(self) -> None:
-        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        compiled = fill.specialize(shapes={"output": tuple(output.shape)})
+        compiled = fill.specialize()
         program = json.loads(compiled.canonical_program)
         node = program["graphs"][0]["nodes"][0]
         self.assertEqual(
@@ -1297,7 +1296,9 @@ class KernelTests(unittest.TestCase):
                 {"control": {"argument": 4}},
             ],
         )
-        self.assertEqual(program["storages"][0]["descriptor"]["byte_length"], output.to_numpy().nbytes)
+        self.assertEqual(program["storages"][0]["descriptor"]["byte_length"], 0)
+        self.assertEqual(program["values"][0]["shape"], [-1, -1])
+        self.assertEqual(program["shape_symbols"], [])
         artifact_system = json.loads(compiled.canonical_artifact_system)
         artifact = next(iter(artifact_system["artifacts"].values()))
         output_endpoint = next(
@@ -1308,6 +1309,17 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(output_endpoint["layout"]["shape"], [-1, -1])
         self.assertEqual(compiled.native.parameters[0].access, vd._native.ACCESS_WRITE)
         self.assertFalse(hasattr(compiled, "writable_names"))
+
+    def test_dynamic_kernel_reuses_one_artifact_across_shapes(self) -> None:
+        small = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+        large = vd.storage.zeros(dtype=vd.f32, shape=(4, 5))
+        self.assertIsNone(fill(small, 10.0, grid=(3, 2, 1)))
+        self.assertIsNone(fill(large, 2.0, grid=(5, 4, 1)))
+        self.assertEqual(fill.compile_count, 1)
+        np.testing.assert_array_equal(
+            small.to_numpy(),
+            np.array([[0, 1, 2], [10, 11, 12]], dtype=np.float32),
+        )
 
     def test_warm_dispatch_reuses_specialized_artifact(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

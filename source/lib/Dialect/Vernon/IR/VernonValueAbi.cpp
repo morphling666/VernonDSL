@@ -21,6 +21,8 @@ bool containsLogicalAutodiffHandle(Type type) {
 }
 
 FailureOr<ResolvedStructFields> resolveNamedStructFields(StructType structure, ModuleOp module) {
+    if (!module)
+        return failure();
     StructDeclOp declaration;
     for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {
         if (candidate.getSymName() == structure.getName()) {

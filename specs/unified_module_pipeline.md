@@ -28,6 +28,38 @@ frontend logic, but it must not execute lowered operations, reverse fragments, o
 
 The compiler contract, pipeline contract, bundle schema, and manifest version remain unchanged until a separate release.
 
+## 1.1 Compute kernel stages (locked)
+
+A compute kernel has three stages. Do not collapse them or add a Python
+workaround that moves invoke-time extents into compile.
+
+```text
+source + annotations + features  →  _lower()      →  MLIR
+MLIR + target                    →  specialize()  →  native artifact
+native + TensorStorage/View      →  C++ bind      →  dispatch
+```
+
+Rules:
+
+- `_lower` / Program compile never receive tensors or launch extents. `vd.dyn`
+  stays `vd.dyn`.
+- `specialize` / `finalize` produce one native artifact per (source, features,
+  target). Static annotation extents may appear in the Program. TensorView
+  `vd.dyn` stays `-1` on Value `.shape`, the same marker as shader endpoints.
+  Borrowed Storage with a dyn view records `byte_length` / image `extent` `0`:
+  size comes from the bound provider, not a formula. CPU and GPU share this
+  artifact. Different launch sizes must not recompile.
+- C++ bind/invoke is the only place that reads runtime shape, strides, offset,
+  and byte length from the bound buffer. Direct C++ `load → bind → invoke`
+  must work without a Python shape dictionary.
+- `finalize` `shape_facts` are graphics image/attachment extents only. Passing
+  `GraphBuffer.shape` or `TensorStorage.shape` into compute `specialize` is
+  forbidden.
+
+Module GPU primal may build an `ExecutionGraph` at specialization time, but
+that graph still loads the dyn native pipeline. Extents are bound when the
+user tensors are submitted, not when the graph is compiled.
+
 ## 2. Public API
 
 ### 2.1 Module

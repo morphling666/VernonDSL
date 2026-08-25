@@ -312,6 +312,11 @@ bool checkedByteLength(const llvm::json::Object &layout, const llvm::json::Array
     return length <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
 }
 
+bool dynamicExtent(const llvm::json::Value &extentValue) {
+    const std::optional<int64_t> extent = extentValue.getAsInteger();
+    return !extent || *extent <= 0;
+}
+
 llvm::json::Object valueCarrier(llvm::StringRef tag, int64_t slot, const llvm::json::Object &layout) {
     return llvm::json::Object{{"tag", tag.str()},
                               {"slot", slot},
@@ -664,20 +669,37 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
         llvm::json::Object descriptor;
         if (isTextureType(type)) {
             const std::vector<std::string> fields = quotedTypeFields(type);
-            if (fields.size() < 2 || shape->empty() || shape->size() > 3) {
-                error = "canonical compute texture has no valid dimension, format, or concrete extent";
+            if (fields.size() < 2 || shape->size() > 3) {
+                error = "canonical compute texture has no valid dimension, format, or rank";
                 return false;
             }
+            size_t spatialRank = shape->size();
+            if (spatialRank == 0) {
+                if (fields[0] == "1d")
+                    spatialRank = 1;
+                else if (fields[0] == "3d")
+                    spatialRank = 3;
+                else
+                    spatialRank = 2;
+            }
+            const bool borrowed = argumentSlots.count(root);
             llvm::json::Array extent;
             for (size_t axis = 0; axis < 3; ++axis) {
-                const size_t sourceAxis = shape->size() > axis ? shape->size() - axis - 1 : shape->size();
-                const std::optional<int64_t> component =
-                    sourceAxis < shape->size() ? (*shape)[sourceAxis].getAsInteger() : std::optional<int64_t>(1);
-                if (!component || *component <= 0) {
-                    error = "canonical compute texture extent must be concrete and positive";
+                const size_t sourceAxis = spatialRank > axis ? spatialRank - axis - 1 : spatialRank;
+                if (sourceAxis >= spatialRank) {
+                    extent.emplace_back(int64_t{1});
+                    continue;
+                }
+                const bool hasExtent = sourceAxis < shape->size();
+                const llvm::json::Value *planned = hasExtent ? &(*shape)[sourceAxis] : nullptr;
+                if (planned && !dynamicExtent(*planned)) {
+                    extent.emplace_back(*planned->getAsInteger());
+                } else if (borrowed) {
+                    extent.emplace_back(int64_t{0});
+                } else {
+                    error = "owned compute texture requires a concrete extent";
                     return false;
                 }
-                extent.emplace_back(*component);
             }
             descriptor = llvm::json::Object{{"tag", "image"},
                                             {"dimension", fields[0]},
@@ -695,12 +717,23 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
         } else {
             uint64_t byteLength = 0;
             const std::optional<int64_t> alignment = layout ? layout->getInteger("alignment") : std::nullopt;
-            if (!layout || !alignment || *alignment <= 0 || !checkedByteLength(*layout, *shape, byteLength)) {
+            const std::optional<int64_t> byteSize = layout ? layout->getInteger("byte_size") : std::nullopt;
+            const bool borrowed = argumentSlots.count(root);
+            if (!layout || !alignment || *alignment <= 0 || !byteSize || *byteSize <= 0) {
                 error = "canonical compute buffer has no valid static layout";
                 return false;
             }
+            llvm::json::Value byteLengthValue = nullptr;
+            if (checkedByteLength(*layout, *shape, byteLength)) {
+                byteLengthValue = static_cast<int64_t>(byteLength);
+            } else if (borrowed) {
+                byteLengthValue = int64_t{0};
+            } else {
+                error = "owned compute Storage requires a static buffer layout";
+                return false;
+            }
             descriptor = llvm::json::Object{{"tag", "buffer"},
-                                            {"byte_length", static_cast<int64_t>(byteLength)},
+                                            {"byte_length", std::move(byteLengthValue)},
                                             {"alignment", *alignment},
                                             {"memory", "device"},
                                             {"usage", llvm::json::Array{"storage"}}};

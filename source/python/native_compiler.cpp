@@ -88,6 +88,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("plan_kernel_result", &planKernelResult, nb::arg("kernel"))
         .def("plan_graphics_result", &planGraphicsResult, nb::arg("stages"), nb::arg("topology"), nb::arg("features"),
              nb::arg("attachment_types"), nb::arg("color_count"), nb::arg("operands"))
+        // shape_facts fill graphics image/attachment extents only. Compute TensorView dyn
+        // extents are not compile inputs; C++ bind reads them from the bound buffer.
         .def("finalize_program_result", &finalizeProgramResult, nb::arg("plan"), nb::arg("kernels"),
              nb::arg("shape_facts") = std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>>{})
         .def("compile_program_result", &compileProgramResult, nb::arg("mlir"), nb::arg("target"),

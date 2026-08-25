@@ -89,14 +89,22 @@ bool parseIdArray(const nlohmann::json &value, std::vector<uint32_t> &result, Di
 }
 
 bool parseShape(const nlohmann::json &value, std::vector<uint64_t> &result, Diagnostic &diagnostic,
-                const std::string &path, bool allowEmpty = true) {
+                const std::string &path, bool allowEmpty = true, bool allowDynamic = false) {
     if (!value.is_array() || (!allowEmpty && value.empty()))
         return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path, "expected a shape array");
     for (size_t index = 0; index < value.size(); ++index) {
+        if (allowDynamic && value[index].is_number_integer()) {
+            const auto signedExtent = value[index].get<int64_t>();
+            if (signedExtent == 0 || signedExtent == -1) {
+                result.push_back(0);
+                continue;
+            }
+        }
         uint64_t extent = 0;
         if (!uint64Value(value[index], extent) || !extent)
             return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/" + std::to_string(index),
-                        "phase-one compute requires positive static extents");
+                        allowDynamic ? "TensorView extent must be a positive static size or dyn"
+                                     : "phase-one compute requires positive static extents");
         result.push_back(extent);
     }
     return true;
@@ -259,7 +267,7 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         !value["alias_preconditions"].is_array() || !value["alias_preconditions"].empty() ||
         !value["graphs"].is_array()) {
         return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", "",
-                    "phase-one compute requires static shapes and no alias constraints");
+                    "phase-one compute requires static shape_symbols and no alias constraints");
     }
 
     for (const auto &[stageId, row] : value["stages"].items()) {
@@ -321,12 +329,13 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         if (descriptorTag == "buffer") {
             if (!exactObject(descriptor, {"tag", "byte_length", "alignment", "memory", "usage"}, {}, diagnostic,
                              path + "/descriptor") ||
-                !uint64Value(descriptor["byte_length"], storage.buffer.byteLength) || !storage.buffer.byteLength ||
+                !uint64Value(descriptor["byte_length"], storage.buffer.byteLength) ||
+                (!storage.buffer.byteLength && storage.ownership != StorageOwnership::Borrowed) ||
                 !uint64Value(descriptor["alignment"], storage.buffer.alignment) || !storage.buffer.alignment ||
                 (storage.buffer.alignment & (storage.buffer.alignment - 1)) || !descriptor["memory"].is_string() ||
                 !descriptor["usage"].is_array())
                 return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
-                            "invalid static buffer descriptor");
+                            "invalid buffer descriptor");
             storage.buffer.memory = descriptor["memory"].get<std::string>();
             for (const auto &usage : descriptor["usage"]) {
                 if (!usage.is_string())
@@ -359,9 +368,9 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             storage.image.format = descriptor["format"].get<std::string>();
             for (const auto &extent : descriptor["extent"]) {
                 uint64_t component = 0;
-                if (!uint64Value(extent, component) || !component)
+                if (!uint64Value(extent, component) || (!component && storage.ownership != StorageOwnership::Borrowed))
                     return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor/extent",
-                                "image extent must contain positive integers");
+                                "image extent must be a positive static size, or 0 on borrowed Storage");
                 storage.image.extent.push_back(component);
             }
             for (const auto &[key, target] :
@@ -404,7 +413,7 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             return false;
         parsed.name = row.value("name", "");
         parsed.type = row["type"].get<std::string>();
-        if (row.contains("shape") && !parseShape(row["shape"], parsed.shape, diagnostic, path + "/shape"))
+        if (row.contains("shape") && !parseShape(row["shape"], parsed.shape, diagnostic, path + "/shape", true, true))
             return false;
         if (row.contains("storage")) {
             uint32_t storage = 0;
@@ -1677,6 +1686,10 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
                             "/storages/" + std::to_string(storage.id) + "/descriptor",
                             "generic byte-buffer execution does not support image or opaque Storage");
             if (storage.ownership == StorageOwnership::Owned) {
+                if (!storage.buffer.byteLength)
+                    return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "instance_bind",
+                                "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                                "owned Storage requires a static byte_length");
                 owned[storage.id].resize(static_cast<size_t>(storage.buffer.byteLength));
                 storageBuffers[storage.id] = {owned[storage.id].data(), owned[storage.id].size()};
                 continue;
@@ -1691,7 +1704,7 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
                             "/storages/" + std::to_string(storage.id) + "/initial_value",
                             "borrowed Storage has no public input provider");
             const InvocationBuffer supplied = invocation.arguments[input->second];
-            if (!supplied.data || supplied.byteLength < storage.buffer.byteLength)
+            if (!supplied.data || (storage.buffer.byteLength && supplied.byteLength < storage.buffer.byteLength))
                 return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
                             "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
                             "borrowed buffer provider is too small");

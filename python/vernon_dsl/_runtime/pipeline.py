@@ -340,6 +340,7 @@ class Pipeline:
                 }
             ).encode()
         ).hexdigest()
+        # Graphics image/attachment extents only. Compute TensorView dyn is bound later.
         shape_facts = [
             (
                 request_id,

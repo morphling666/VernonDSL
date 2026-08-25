@@ -202,10 +202,8 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
     }
     for (const AutodiffLeaf &leaf : analysis.getActiveResultLeaves()) {
         auto source = dyn_cast<TensorViewType>(leaf.value.getType());
-        types.cotangents.push_back(
-            source ? static_cast<Type>(TensorViewType::get(context, leaf.derivativeType, source.getShape(), "read",
-                                                           source.getAddressSpace()))
-                   : leaf.derivativeType);
+        types.cotangents.push_back(source ? wrapAutodiffDerivativeTensorView(source, leaf.derivativeType, "read")
+                                          : leaf.derivativeType);
         types.cotangentDtypes.push_back(scalarDtype(leaf.primalType));
         if (leaf.primalType.isF16())
             types.cotangentDtypes.back() = "f32";
@@ -226,8 +224,9 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
                 elementType = aggregate.getElementType();
                 llvm::append_range(shape, aggregate.getShape());
             }
-            types.storageGradients.push_back(TensorViewType::get(
-                context, elementType, shape, invocationPrivate ? "read_write" : "write", source.getAddressSpace()));
+            types.storageGradients.push_back(TensorViewType::get(source.getContext(), elementType, shape,
+                                                                 invocationPrivate ? "read_write" : "write",
+                                                                 source.getAddressSpace()));
         } else {
             types.valueGradients.push_back(leaf.derivativeType);
             types.valueGradientDtypes.push_back(dtype);
@@ -888,7 +887,7 @@ public:
                     continue;
                 if (identity.internalAdjointOwnership == AutodiffInternalAdjointOwnership::None)
                     continue;
-                FailureOr<Type> scalar = getAutodiffDerivativeType(leaf.scalarType);
+                FailureOr<Type> scalar = getAutodiffDerivativeScalarType(leaf.scalarType);
                 if (failed(scalar))
                     return primal.emitError("active Storage identity has no derivative scalar type");
                 SmallVector<int64_t> shape(view.getShape());
@@ -968,7 +967,7 @@ private:
         if (!layout || leafIndex >= layout->leaves.size())
             return failure();
         const ValueAbiLeaf &leaf = layout->leaves[leafIndex];
-        FailureOr<Type> element = getAutodiffDerivativeType(leaf.scalarType);
+        FailureOr<Type> element = getAutodiffDerivativeScalarType(leaf.scalarType);
         if (failed(element))
             return failure();
         if (leaf.shape.empty())

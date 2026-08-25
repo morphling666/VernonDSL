@@ -543,11 +543,8 @@ module {
                                               {stageId.data(), stageId.size()},
                                               {entry.data(), entry.size()},
                                               compiledReflection};
-    const uint64_t concreteShape[]{16};
-    const VernonProgramShapeFact shapeFact{
-        {requestId.data(), requestId.size()}, {"values", strlen("values")}, concreteShape, 1};
-    VernonCompileResult *finalized = vernonCompilerFinalizeProgramWithShapes(compiler, reflected.data, reflected.size,
-                                                                             &compiledKernel, 1, &shapeFact, 1);
+    VernonCompileResult *finalized =
+        vernonCompilerFinalizeProgram(compiler, reflected.data, reflected.size, &compiledKernel, 1);
     ASSERT_NE(finalized, nullptr);
     ASSERT_EQ(vernonCompileResultGetStatus(finalized), VERNON_STATUS_OK) << std::string(
         vernonCompileResultGetDiagnostics(finalized).data, vernonCompileResultGetDiagnostics(finalized).size);
@@ -557,7 +554,9 @@ module {
     const nlohmann::json &canonical = finalizedJson.at("canonical_program");
     ASSERT_EQ(canonical.at("storages").size(), 1u);
     EXPECT_EQ(canonical.at("storages").at(0).at("initial_value"), 0);
-    EXPECT_EQ(canonical.at("storages").at(0).at("descriptor").at("byte_length"), 64);
+    EXPECT_EQ(canonical.at("storages").at(0).at("descriptor").at("byte_length"), 0);
+    EXPECT_TRUE(canonical.at("shape_symbols").empty());
+    EXPECT_EQ(canonical.at("values").at(0).at("shape"), nlohmann::json::array({-1}));
     EXPECT_EQ(canonical.at("storages").at(0).at("mutability"), "mutable");
     EXPECT_EQ(canonical.at("values").at(0).at("storage"), 0);
     EXPECT_EQ(canonical.at("values").at(4).at("storage"), 0);

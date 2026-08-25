@@ -182,6 +182,15 @@ signed element strides, and offset are dispatch descriptor values, and every
 logical index is projected to the owner's physical element index before
 backend lowering.
 
+Do not feed `TensorStorage`, `TensorView`, or `GraphBuffer` extents into
+kernel `_lower`, `specialize`, or compute `finalize` `shape_facts`. Annotation
+static extents may be recorded in the Program. `vd.dyn` stays `-1` on the
+Value shape; borrowed Storage does not invent a compile-time byte length.
+C++ bind/invoke reads shape, strides, offset, and byte length from the bound
+buffer. Python must not paper over GPU `finalize` by baking a launch shape
+into the native artifact. Graphics `shape_facts` exist only for
+image/attachment extents.
+
 Language-level typed shape, strides, and offset use units of the recursively
 resolved leaf element. Compiler reflection and `PIPELINE_VERSION` manifests
 record static shape constraints and descriptor binding positions, never

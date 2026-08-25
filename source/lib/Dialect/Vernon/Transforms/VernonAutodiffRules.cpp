@@ -22,18 +22,6 @@ std::string getRuleKey(Operation *operation) {
     return operation->getName().getStringRef().str();
 }
 
-FailureOr<Type> getDerivativeValueType(Type type) {
-    if (auto scalar = dyn_cast<FloatType>(type))
-        return getAutodiffDerivativeType(scalar);
-    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        FailureOr<Type> element = getAutodiffDerivativeType(tensor.getElementType());
-        if (failed(element))
-            return failure();
-        return RankedTensorType::get(tensor.getShape(), *element, tensor.getEncoding());
-    }
-    return failure();
-}
-
 Value castPrimal(OpBuilder &builder, Location location, Value value, Type targetType) {
     if (!value)
         return {};
@@ -93,8 +81,9 @@ Value scale(OpBuilder &builder, Location location, Value tensorValue, Value scal
 LogicalResult verifyFloatingIntrinsic(Operation *operation) {
     if (!isa<IntrinsicOp>(operation) || operation->getNumResults() != 1)
         return operation->emitOpError("autodiff intrinsic rule requires one result");
-    if (failed(getDerivativeValueType(operation->getResult(0).getType())) ||
-        llvm::any_of(operation->getOperandTypes(), [](Type type) { return failed(getDerivativeValueType(type)); }))
+    if (failed(getAutodiffDerivativeValueType(operation->getResult(0).getType())) ||
+        llvm::any_of(operation->getOperandTypes(),
+                     [](Type type) { return failed(getAutodiffDerivativeValueType(type)); }))
         return operation->emitOpError("autodiff intrinsic rule requires floating-point scalar or ranked Tensor values");
     if (llvm::any_of(operation->getOperandTypes(),
                      [](Type type) {
@@ -155,8 +144,8 @@ SmallVector<int64_t> broadcastCoordinate(ArrayRef<int64_t> coordinate, ArrayRef<
 LogicalResult buildMatmulVjp(Operation *operation, const AutodiffVjpBuildContext &context,
                              SmallVectorImpl<Value> &results) {
     Value seed = context.resultCotangents[0];
-    FailureOr<Type> leftDerivativeType = getDerivativeValueType(operation->getOperand(0).getType());
-    FailureOr<Type> rightDerivativeType = getDerivativeValueType(operation->getOperand(1).getType());
+    FailureOr<Type> leftDerivativeType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
+    FailureOr<Type> rightDerivativeType = getAutodiffDerivativeValueType(operation->getOperand(1).getType());
     if (failed(leftDerivativeType) || failed(rightDerivativeType))
         return operation->emitOpError("matmul VJP requires floating-point ranked Tensor operands");
     auto leftType = dyn_cast<RankedTensorType>(*leftDerivativeType);
@@ -194,7 +183,7 @@ LogicalResult buildMatmulVjp(Operation *operation, const AutodiffVjpBuildContext
         expectedResultShape.push_back(columns);
     if (failed(checkedElementCount(expectedResultShape)))
         return operation->emitOpError("matmul VJP result shape is too large");
-    FailureOr<Type> resultDerivativeType = getDerivativeValueType(operation->getResult(0).getType());
+    FailureOr<Type> resultDerivativeType = getAutodiffDerivativeValueType(operation->getResult(0).getType());
     if (failed(resultDerivativeType))
         return operation->emitOpError("matmul VJP requires a differentiable result");
     Type expectedResultType =
@@ -292,7 +281,7 @@ LogicalResult verifyElementwiseOperation(Operation *operation, unsigned operandC
     if (operation->getNumOperands() != operandCount || operation->getNumResults() != resultCount)
         return operation->emitOpError() << "autodiff rule expects " << operandCount << " operand(s) and " << resultCount
                                         << " result(s)";
-    if (resultCount != 1 || failed(getDerivativeValueType(operation->getResult(0).getType())))
+    if (resultCount != 1 || failed(getAutodiffDerivativeValueType(operation->getResult(0).getType())))
         return operation->emitOpError("autodiff rule requires one floating-point scalar or ranked Tensor result");
     Type resultType = operation->getResult(0).getType();
     if (auto tensor = dyn_cast<RankedTensorType>(resultType); tensor && !tensor.hasStaticShape())
@@ -306,8 +295,6 @@ bool isStructuralAutodiffOperation(Operation *operation) {
     return isa<scf::IfOp, scf::ForOp, scf::WhileOp, StructGetOp, TupleGetOp, StructCreateOp, TupleCreateOp, LoadOp,
                StoreOp, ReduceSumOp, ScatterAddOp, AtomicOp>(operation);
 }
-
-bool isDifferentiableValueType(Type type) { return succeeded(getDerivativeValueType(type)); }
 
 } // namespace
 
@@ -368,7 +355,7 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
     if (context.primalOperands.size() != operation->getNumOperands() || context.primalResults.size() != resultCount ||
         context.resultCotangents.size() != resultCount)
         return operation->emitOpError("autodiff VJP provider does not match the rule signature");
-    FailureOr<Type> derivativeType = getDerivativeValueType(operation->getResult(0).getType());
+    FailureOr<Type> derivativeType = getAutodiffDerivativeValueType(operation->getResult(0).getType());
     if (failed(derivativeType) || context.resultCotangents.front().getType() != *derivativeType)
         return operation->emitOpError("autodiff VJP cotangent has an incompatible derivative type");
     for (const AutodiffPrimalRequirement &requirement : vjpPrimalRequirements) {
@@ -387,7 +374,7 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildVjp(Operation *operation
     for (unsigned operandIndex = 0; operandIndex < contributions.size(); ++operandIndex) {
         Value contribution = contributions[operandIndex];
         Value operand = operation->getOperand(operandIndex);
-        FailureOr<Type> expectedType = getDerivativeValueType(operand.getType());
+        FailureOr<Type> expectedType = getAutodiffDerivativeValueType(operand.getType());
         if (failed(expectedType)) {
             if (contribution)
                 return operation->emitOpError(
@@ -412,7 +399,7 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildJvp(Operation *operation
         context.tangentOperands.size() != operation->getNumOperands())
         return operation->emitOpError("autodiff JVP provider does not match the rule signature");
     for (auto [tangent, operand] : llvm::zip_equal(context.tangentOperands, operation->getOperands())) {
-        FailureOr<Type> expectedType = getDerivativeValueType(operand.getType());
+        FailureOr<Type> expectedType = getAutodiffDerivativeValueType(operand.getType());
         if (failed(expectedType) || tangent.getType() != *expectedType)
             return operation->emitOpError("autodiff JVP operand tangent has an incompatible type");
     }
@@ -422,7 +409,7 @@ FailureOr<SmallVector<Value>> DifferentiationRule::buildJvp(Operation *operation
     if (tangents.size() != resultCount)
         return operation->emitOpError("autodiff JVP builder returned the wrong number of result tangents");
     for (auto [tangent, result] : llvm::zip_equal(tangents, operation->getResults())) {
-        FailureOr<Type> expectedType = getDerivativeValueType(result.getType());
+        FailureOr<Type> expectedType = getAutodiffDerivativeValueType(result.getType());
         if (failed(expectedType) || !tangent || tangent.getType() != *expectedType)
             return operation->emitOpError("autodiff JVP builder returned an incompatible tangent type");
     }
@@ -531,8 +518,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
                 return operation->emitOpError("autodiff extension rule requires arith.extf");
             Type source = extension.getIn().getType();
             Type result = extension.getOut().getType();
-            FailureOr<Type> sourceDerivative = getDerivativeValueType(source);
-            FailureOr<Type> resultDerivative = getDerivativeValueType(result);
+            FailureOr<Type> sourceDerivative = getAutodiffDerivativeValueType(source);
+            FailureOr<Type> resultDerivative = getAutodiffDerivativeValueType(result);
             if (failed(sourceDerivative) || failed(resultDerivative) || *sourceDerivative != *resultDerivative ||
                 !getElementTypeOrSelf(source).isF16() || !getElementTypeOrSelf(result).isF32())
                 return operation->emitOpError("autodiff extension rule supports only f16-to-f32 promotion");
@@ -697,8 +684,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             Value seed = context.resultCotangents[0];
-            FailureOr<Type> leftType = getDerivativeValueType(operation->getOperand(0).getType());
-            FailureOr<Type> rightType = getDerivativeValueType(operation->getOperand(1).getType());
+            FailureOr<Type> leftType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
+            FailureOr<Type> rightType = getAutodiffDerivativeValueType(operation->getOperand(1).getType());
             if (failed(leftType) || failed(rightType) || !isa<RankedTensorType>(*leftType) ||
                 !isa<RankedTensorType>(*rightType))
                 return operation->emitOpError("dot VJP requires floating-point ranked Tensor operands");
@@ -721,8 +708,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             Value seed = context.resultCotangents[0];
-            FailureOr<Type> leftType = getDerivativeValueType(operation->getOperand(0).getType());
-            FailureOr<Type> rightType = getDerivativeValueType(operation->getOperand(1).getType());
+            FailureOr<Type> leftType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
+            FailureOr<Type> rightType = getAutodiffDerivativeValueType(operation->getOperand(1).getType());
             if (failed(leftType) || failed(rightType) || !isa<RankedTensorType>(*leftType) ||
                 cast<RankedTensorType>(*leftType).getRank() != 1 ||
                 cast<RankedTensorType>(*leftType).getDimSize(0) != 3 || *leftType != *rightType ||
@@ -743,7 +730,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         intrinsicRuleKey("construct"), std::nullopt, 1, {}, buildConstructVjp, {},
         [](Operation *operation) -> LogicalResult {
             auto resultType = dyn_cast<RankedTensorType>(operation->getResult(0).getType());
-            if (!resultType || !resultType.hasStaticShape() || failed(getDerivativeValueType(resultType)))
+            if (!resultType || !resultType.hasStaticShape() || failed(getAutodiffDerivativeValueType(resultType)))
                 return operation->emitOpError("construct VJP requires a static floating-point Tensor result");
             FailureOr<size_t> elementCount = checkedElementCount(resultType.getShape());
             if (failed(elementCount) || *elementCount != operation->getNumOperands() ||
@@ -758,7 +745,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             auto swizzle = cast<SwizzleOp>(operation);
-            auto inputType = cast<RankedTensorType>(*getDerivativeValueType(swizzle.getInput().getType()));
+            auto inputType = cast<RankedTensorType>(*getAutodiffDerivativeValueType(swizzle.getInput().getType()));
             StringRef mask = swizzle.getMask();
             Value seed = context.resultCotangents[0];
             Value zero = constant(context.builder, context.location, inputType.getElementType(), 0.0);
@@ -787,7 +774,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
             auto swizzle = dyn_cast<SwizzleOp>(operation);
             if (!swizzle)
                 return failure();
-            FailureOr<Type> derivative = getDerivativeValueType(swizzle.getInput().getType());
+            FailureOr<Type> derivative = getAutodiffDerivativeValueType(swizzle.getInput().getType());
             auto input = succeeded(derivative) ? dyn_cast<RankedTensorType>(*derivative) : RankedTensorType{};
             if (!input || !input.hasStaticShape() || input.getRank() != 1 || input.getDimSize(0) > 4)
                 return operation->emitOpError("swizzle VJP requires a static floating rank-one input");
@@ -798,7 +785,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             Value seed = context.resultCotangents[0];
-            FailureOr<Type> inputType = getDerivativeValueType(operation->getOperand(0).getType());
+            FailureOr<Type> inputType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
             if (failed(inputType) || !isa<RankedTensorType>(*inputType))
                 return operation->emitOpError("normalize VJP requires a floating-point ranked Tensor operand");
             if (cast<RankedTensorType>(*inputType).getRank() != 1 ||
@@ -828,8 +815,8 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         [](Operation *operation, const AutodiffVjpBuildContext &context,
            SmallVectorImpl<Value> &results) -> LogicalResult {
             Value seed = context.resultCotangents[0];
-            FailureOr<Type> directionType = getDerivativeValueType(operation->getOperand(0).getType());
-            FailureOr<Type> normalType = getDerivativeValueType(operation->getOperand(1).getType());
+            FailureOr<Type> directionType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
+            FailureOr<Type> normalType = getAutodiffDerivativeValueType(operation->getOperand(1).getType());
             if (failed(directionType) || failed(normalType) || !isa<RankedTensorType>(*directionType) ||
                 cast<RankedTensorType>(*directionType).getRank() != 1 || *directionType != *normalType ||
                 operation->getResult(0).getType() != operation->getOperand(0).getType())
@@ -859,7 +846,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
         {}, verifyFloatingIntrinsic));
     auto buildBroadcastVjp = [](Operation *operation, const AutodiffVjpBuildContext &context,
                                 SmallVectorImpl<Value> &results) -> LogicalResult {
-        FailureOr<Type> inputType = getDerivativeValueType(operation->getOperand(0).getType());
+        FailureOr<Type> inputType = getAutodiffDerivativeValueType(operation->getOperand(0).getType());
         if (failed(inputType))
             return operation->emitOpError("broadcast VJP requires a differentiable input");
         results.push_back(createIntrinsic(context.builder, context.location, "reduce_sum_to_shape",
@@ -883,7 +870,7 @@ VernonAutodiffRuleRegistry createDefaultAutodiffRuleRegistry() {
            SmallVectorImpl<Value> &results) -> LogicalResult {
             auto extract = cast<tensor::ExtractOp>(operation);
             auto sourceType = dyn_cast<RankedTensorType>(extract.getTensor().getType());
-            FailureOr<Type> derivative = getDerivativeValueType(extract.getTensor().getType());
+            FailureOr<Type> derivative = getAutodiffDerivativeValueType(extract.getTensor().getType());
             if (!sourceType || !sourceType.hasStaticShape() || failed(derivative))
                 return operation->emitOpError("tensor.extract VJP requires a static floating-point Tensor");
             auto derivativeType = cast<RankedTensorType>(*derivative);
@@ -929,7 +916,7 @@ LogicalResult verifyAutodiffRuleCoverage(const VernonAutodiffAnalysisResult &ana
             continue;
         if (operation->getNumResults() > 1)
             return operation->emitOpError("active autodiff operation must have exactly one result");
-        if (!isDifferentiableValueType(operation->getResult(0).getType()))
+        if (failed(getAutodiffDerivativeValueType(operation->getResult(0).getType())))
             continue;
         const DifferentiationRule *rule = registry.lookup(operation);
         if (!rule)

@@ -404,18 +404,6 @@ class Kernel:
                 shapes[parameter.name] = tuple(int(extent) for extent in shape)
         return shapes
 
-    def _resource_shapes(
-        self,
-        lowered: _LoweredKernel,
-        arguments: tuple[Any, ...],
-    ) -> dict[str, tuple[int, ...]]:
-        names = [argument.arg for argument in lowered.source.args.args if argument.arg not in lowered.builtins]
-        return {
-            name: tuple(value.shape)
-            for name, value in zip(names, arguments, strict=True)
-            if isinstance(value, (TensorStorage, TensorView, _TextureResource))
-        }
-
     def _bind_launch(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> None:
         user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
         self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
@@ -509,10 +497,14 @@ class Kernel:
         self,
         features: tuple[str, ...] = (),
         *,
-        shapes: Mapping[str, tuple[int, ...]] | None = None,
         lowered: _LoweredKernel | None = None,
     ) -> _CompiledKernel:
-        """Lowered MLIR + session target → native artifact. Runtime tensors are not inputs."""
+        """Lowered MLIR + session target → native artifact.
+
+        Runtime tensors, GraphBuffer extents, and other invoke-time shapes are
+        not inputs. Static annotation extents may be recorded; `vd.dyn` stays
+        dynamic until C++ bind.
+        """
 
         state, target, options = self._session_target()
         lowered = lowered or self._lower(features)
@@ -568,8 +560,6 @@ class Kernel:
 
         canonical_directory = tempfile.TemporaryDirectory(prefix="vernon-kernel-")
         concrete_shapes = dict(self._annotation_shapes(frontend))
-        if shapes:
-            concrete_shapes.update(shapes)
         canonical_stage = _direct_compiled_stage(program, target=options, entry=implementation.entry)
         finalized = native_compiler.finalize_program_result(
             planned.reflection,
@@ -676,7 +666,7 @@ class Kernel:
         state = _session_state()
         lowered = self._lower(features)
         self._bind_launch(lowered, arguments)
-        compiled = self.specialize(features, shapes=self._resource_shapes(lowered, arguments), lowered=lowered)
+        compiled = self.specialize(features, lowered=lowered)
         user_parameters = [
             argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
         ]
@@ -784,7 +774,7 @@ class Kernel:
         state = _session_state()
         lowered = self._lower(features)
         self._bind_launch(lowered, arguments)
-        compiled = self.specialize(features, shapes=self._resource_shapes(lowered, arguments), lowered=lowered)
+        compiled = self.specialize(features, lowered=lowered)
         for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
             if not isinstance(value, (TensorStorage, TensorView, _TextureResource)):
                 continue

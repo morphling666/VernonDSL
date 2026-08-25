@@ -467,14 +467,16 @@ Backend 将统一 barrier/state 映射为：
 ```text
 Python decorated entry
   -> FrontendCompileRequest
-  -> Vernon MLIR
-  -> native Compiler
-  -> artifact + reflection
-  -> inline artifact descriptor
-  -> in-memory pipeline bundle
+  -> Vernon MLIR                         # _lower: no tensors, dyn stays dyn
+  -> specialize / finalize               # native artifact; no launch extents
   -> Runtime load/resolve
+  -> C++ bind (shape/strides from buffer)
   -> direct invocation or ExecutionGraph
 ```
+
+`vd.dyn` is not a compile-time size. Do not pass runtime tensor or GraphBuffer
+shapes into kernel `specialize` to satisfy GPU `finalize`. Graphics pipelines
+may still pass image/attachment extents as `shape_facts`.
 
 Artifact data 内联在 bundle 中：SPIR-V/DXIL 使用 base64，文本 artifact 使用
 UTF-8。交互路径仍使用正式 `PIPELINE_VERSION` schema，不存在另一套私有 runtime
