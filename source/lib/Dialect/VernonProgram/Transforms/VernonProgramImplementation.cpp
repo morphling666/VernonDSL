@@ -50,8 +50,11 @@ FailureOr<SmallVector<int64_t, 3>> implementationGrid(StringRef implementation, 
     if (isa<TupleType>(resultType) && (implementation == "add" || implementation == "zeros"))
         return SmallVector<int64_t, 3>{1, 1, 1};
     FailureOr<ArrayRef<int64_t>> shape = staticProgramShape(resultType);
-    if (failed(shape))
+    if (failed(shape)) {
+        if (isa<TensorViewType>(resultType) && implementation == "add")
+            return SmallVector<int64_t, 3>{1, 1, 1};
         return failure();
+    }
     if (implementation == "add" && shape->size() <= 3) {
         SmallVector<int64_t, 3> grid{1, 1, 1};
         if (!shape->empty())

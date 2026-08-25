@@ -6,10 +6,11 @@ import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
-import vernon_dsl as vd
-
-from .._runtime.operation_implementations import ImplementationUnavailable, program_add_invocation
-from .._runtime.resources import TensorStorage
+from .._runtime.operation_implementations import (
+    ImplementationUnavailable,
+    elementwise_kernel,
+    python_element_annotation,
+)
 from .model import ProgramImplementation
 
 
@@ -73,7 +74,6 @@ class CapturedVjpDslProvider:
         raw_results = request.get("results")
         if not isinstance(raw_bindings, list) or not isinstance(raw_results, list):
             raise ImplementationUnavailable("Program VJP request has no canonical ABI bindings")
-        result_ids = {value for value in raw_results if isinstance(value, int)}
         wrt: list[str] = []
         outputs: list[str] = []
         seen_wrt: set[str] = set()
@@ -84,7 +84,6 @@ class CapturedVjpDslProvider:
             role = binding.get("autodiff_role")
             source = binding.get("autodiff_source")
             parameter = binding.get("parameter")
-            value = binding.get("value")
             if role == "cotangent":
                 path = (
                     source
@@ -94,7 +93,7 @@ class CapturedVjpDslProvider:
                 if path and path not in seen_outputs:
                     seen_outputs.add(path)
                     outputs.append(path)
-            elif value in result_ids and (role == "gradient" or role is None):
+            elif role == "gradient":
                 path = source if isinstance(source, str) else (parameter if isinstance(parameter, str) else None)
                 if path and path not in seen_wrt:
                     seen_wrt.add(path)
@@ -133,7 +132,7 @@ class BuiltinDslProvider:
     """Provider for built-in Program semantic operations."""
 
     def __init__(self, lowerers: Sequence[BuiltinLowerer] = ()):
-        self._lowerers = (*lowerers, _lower_builtin_add)
+        self._lowerers = (*lowerers, _lower_builtin_add, _lower_builtin_copy)
 
     def lower(
         self,
@@ -175,15 +174,19 @@ def _request_value(
     return value
 
 
-def _lower_builtin_add(
+def _lower_builtin_elementwise(
     request: Mapping[str, Any],
     values: Mapping[int, Mapping[str, Any]],
+    *,
+    callee: str,
+    operation: str,
+    parameters: tuple[str, ...],
 ) -> ProgramImplementation | None:
-    if request.get("implementation_hint") != "vernon.builtin.add":
+    if request.get("implementation_hint") != callee:
         return None
     raw_bindings = request.get("bindings")
     if not isinstance(raw_bindings, list):
-        raise ImplementationUnavailable("built-in Add request has no ABI bindings")
+        raise ImplementationUnavailable(f"built-in {operation} request has no ABI bindings")
     bindings = {
         binding["parameter"]: binding["value"]
         for binding in raw_bindings
@@ -191,20 +194,44 @@ def _lower_builtin_add(
         and isinstance(binding.get("parameter"), str)
         and isinstance(binding.get("value"), int)
     }
-    reflected = {name: _request_value(bindings, values, name) for name in ("output", "left", "right")}
-    shapes = {tuple(value.get("shape", ())) for value in reflected.values()}
-    dtypes = {value.get("dtype") for value in reflected.values()}
-    if len(shapes) != 1 or dtypes != {"f32"}:
-        raise ImplementationUnavailable("built-in Add requires equal-shape f32 tensors")
+    reflected = [_request_value(bindings, values, name) for name in parameters]
+    shapes = {tuple(value.get("shape", ())) for value in reflected}
+    annotations = {python_element_annotation(value) for value in reflected}
+    if len(shapes) != 1 or len(annotations) != 1 or None in annotations:
+        raise ImplementationUnavailable(f"built-in {operation} requires equal-shape tensors of one element type")
     shape = next(iter(shapes))
-    if not all(isinstance(extent, int) and extent >= 0 for extent in shape):
-        raise ImplementationUnavailable("built-in Add currently requires a static shape")
-    output = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("write")
-    left = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("read")
-    right = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("read")
-    kernel, _arguments, _grid = program_add_invocation(output, left, right)
-    frontend = kernel._lower().frontend
-    return ProgramImplementation("vernon.builtin.add", kernel._entry, "compute", frontend.mlir)
+    element = next(iter(annotations))
+    assert element is not None
+    if not all(isinstance(extent, int) for extent in shape):
+        raise ImplementationUnavailable(f"built-in {operation} requires a ranked TensorView")
+    kernel = elementwise_kernel(operation, element, len(shape))
+    return ProgramImplementation(callee, kernel._entry, "compute", kernel._lower().frontend.mlir)
+
+
+def _lower_builtin_add(
+    request: Mapping[str, Any],
+    values: Mapping[int, Mapping[str, Any]],
+) -> ProgramImplementation | None:
+    return _lower_builtin_elementwise(
+        request,
+        values,
+        callee="vernon.builtin.add",
+        operation="add",
+        parameters=("output", "left", "right"),
+    )
+
+
+def _lower_builtin_copy(
+    request: Mapping[str, Any],
+    values: Mapping[int, Mapping[str, Any]],
+) -> ProgramImplementation | None:
+    return _lower_builtin_elementwise(
+        request,
+        values,
+        callee="vernon.builtin.copy",
+        operation="copy",
+        parameters=("output", "source"),
+    )
 
 
 __all__ = [

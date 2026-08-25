@@ -7,6 +7,9 @@
 
 #include <nanobind/stl/map.h>
 
+#include <mutex>
+#include <unordered_map>
+
 struct Runtime {
     explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
         : handle(handle), rhiHost(std::move(rhiHost)) {}
@@ -18,6 +21,61 @@ struct Runtime {
             throw std::runtime_error("requested runtime backend is unavailable");
     }
     ~Runtime() { vernonRuntimeDestroy(handle); }
+
+    std::shared_ptr<InternedCpuJit> internCpuJit(const std::string &symbol, SharedCompileResult result,
+                                                 VernonCpuEntryPoint entry) {
+        std::lock_guard<std::mutex> lock(internedCpuMutex);
+        std::weak_ptr<InternedCpuJit> &slot = internedCpuEntries[symbol];
+        if (std::shared_ptr<InternedCpuJit> existing = slot.lock())
+            return existing;
+        auto interned = std::make_shared<InternedCpuJit>();
+        interned->result = std::move(result);
+        interned->entry = entry;
+        slot = interned;
+        return interned;
+    }
+
+    void registerInternedCpuStages(const nb::list &compiledStages, const char *invalidMetadata,
+                                   const char *missingEntryPrefix, const char *registerFailurePrefix,
+                                   std::vector<SharedCompileResult> &retained,
+                                   std::vector<std::pair<std::string, VernonCpuEntryPoint>> &registered,
+                                   std::vector<std::shared_ptr<InternedCpuJit>> &interned) {
+        const auto rollback = [&]() {
+            for (const auto &[symbol, entry] : registered)
+                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
+            registered.clear();
+            retained.clear();
+            interned.clear();
+        };
+        retained.reserve(compiledStages.size());
+        registered.reserve(compiledStages.size());
+        interned.reserve(compiledStages.size());
+        try {
+            for (nb::handle item : compiledStages) {
+                nb::tuple stage = nb::cast<nb::tuple>(item);
+                if (stage.size() != 3)
+                    throw std::invalid_argument(invalidMetadata);
+                const std::string symbol = nb::cast<std::string>(stage[0]);
+                const std::string entryName = nb::cast<std::string>(stage[1]);
+                const CompiledProgram &program = nb::cast<const CompiledProgram &>(stage[2]);
+                program.requireSuccess();
+                VernonCpuEntryPoint entry =
+                    vernonCompileResultGetCpuEntry(program.result.get(), entryName.data(), entryName.size());
+                if (!entry)
+                    throw std::runtime_error(std::string(missingEntryPrefix) + "'" + entryName + "' was not found");
+                std::shared_ptr<InternedCpuJit> internedJit = internCpuJit(symbol, program.result, entry);
+                if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, internedJit->entry) !=
+                    VERNON_STATUS_OK)
+                    throw std::runtime_error(std::string(registerFailurePrefix) + "'" + symbol + "'");
+                retained.push_back(internedJit->result);
+                registered.emplace_back(symbol, internedJit->entry);
+                interned.push_back(std::move(internedJit));
+            }
+        } catch (...) {
+            rollback();
+            throw;
+        }
+    }
 
     nb::object createExecutionGraph() { return createNativeExecutionGraph(rhiHost); }
 
@@ -182,31 +240,13 @@ struct Runtime {
                                                              const nb::list &compiledStages) {
         std::vector<SharedCompileResult> retained;
         std::vector<std::pair<std::string, VernonCpuEntryPoint>> entries;
-        retained.reserve(compiledStages.size());
-        entries.reserve(compiledStages.size());
-        for (nb::handle item : compiledStages) {
-            nb::tuple stage = nb::cast<nb::tuple>(item);
-            if (stage.size() != 3)
-                throw std::invalid_argument("compiled Program stage metadata is invalid");
-            const std::string symbol = nb::cast<std::string>(stage[0]);
-            const std::string entryName = nb::cast<std::string>(stage[1]);
-            const CompiledProgram &program = nb::cast<const CompiledProgram &>(stage[2]);
-            program.requireSuccess();
-            VernonCpuEntryPoint entry =
-                vernonCompileResultGetCpuEntry(program.result.get(), entryName.data(), entryName.size());
-            if (!entry)
-                throw std::runtime_error("compiled Program CPU entry '" + entryName + "' was not found");
-            if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry) != VERNON_STATUS_OK) {
-                for (const auto &[registeredSymbol, registeredEntry] : entries)
-                    vernonRuntimeUnregisterCpuEntry(handle, {registeredSymbol.data(), registeredSymbol.size()},
-                                                    registeredEntry);
-                throw std::runtime_error("cannot register compiled Program CPU entry '" + symbol + "'");
-            }
-            retained.push_back(program.result);
-            entries.emplace_back(symbol, entry);
-        }
+        std::vector<std::shared_ptr<InternedCpuJit>> interned;
+        registerInternedCpuStages(compiledStages, "compiled Program stage metadata is invalid",
+                                  "compiled Program CPU entry ", "cannot register compiled Program CPU entry ",
+                                  retained, entries, interned);
         try {
             std::unique_ptr<LoadedPipeline> pipeline = loadPipelineAsset(data, directory, features);
+            pipeline->internedCpuJits = std::move(interned);
             pipeline->retainedResults = std::move(retained);
             pipeline->registeredCpuEntries = std::move(entries);
             return pipeline;
@@ -226,36 +266,22 @@ struct Runtime {
         std::string error;
         std::vector<SharedCompileResult> retained;
         std::vector<std::pair<std::string, VernonCpuEntryPoint>> registered;
+        std::vector<std::shared_ptr<InternedCpuJit>> interned;
         const auto unregister = [&]() {
             for (const auto &[symbol, entry] : registered)
                 vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
         };
         try {
-            retained.reserve(compiledStages.size());
-            registered.reserve(compiledStages.size());
-            for (nb::handle item : compiledStages) {
-                nb::tuple stage = nb::cast<nb::tuple>(item);
-                if (stage.size() != 3)
-                    throw std::invalid_argument("compiled canonical Program stage metadata is invalid");
-                const std::string symbol = nb::cast<std::string>(stage[0]);
-                const std::string entryName = nb::cast<std::string>(stage[1]);
-                const CompiledProgram &compiled = nb::cast<const CompiledProgram &>(stage[2]);
-                compiled.requireSuccess();
-                VernonCpuEntryPoint entry =
-                    vernonCompileResultGetCpuEntry(compiled.result.get(), entryName.data(), entryName.size());
-                if (!entry)
-                    throw std::runtime_error("compiled canonical Program CPU entry '" + entryName + "' was not found");
-                if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry) != VERNON_STATUS_OK)
-                    throw std::runtime_error("cannot register canonical Program CPU entry '" + symbol + "'");
-                retained.push_back(compiled.result);
-                registered.emplace_back(symbol, entry);
-            }
+            registerInternedCpuStages(compiledStages, "compiled canonical Program stage metadata is invalid",
+                                      "compiled canonical Program CPU entry ",
+                                      "cannot register canonical Program CPU entry ", retained, registered, interned);
             VernonLoadedPipeline *loaded = program::loadBackendProgramPipeline(
                 *handle, programData.c_str(), programData.size(), artifactSystemData.c_str(), artifactSystemData.size(),
                 stageBindings, directory, error);
             if (!loaded)
                 throw std::runtime_error(error);
             auto pipeline = std::make_unique<LoadedPipeline>(this, handle, nullptr, loaded, std::move(retained));
+            pipeline->internedCpuJits = std::move(interned);
             pipeline->registeredCpuEntries = std::move(registered);
             return pipeline;
         } catch (...) {
@@ -266,6 +292,8 @@ struct Runtime {
 
     VernonRuntimeContext *handle{};
     std::shared_ptr<RhiHostState> rhiHost;
+    std::mutex internedCpuMutex;
+    std::unordered_map<std::string, std::weak_ptr<InternedCpuJit>> internedCpuEntries;
 };
 
 RhiHostState *runtimeRhiHost(const Runtime *runtime);

@@ -16,6 +16,7 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace mlir;
 
@@ -53,10 +54,35 @@ Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef na
     return builder.create(state)->getResult(0);
 }
 
-Value createZero(OpBuilder &builder, Location location, Type type) {
+SmallVector<int64_t, 3> linearizedLaunchGrid(Type type) {
+    auto view = dyn_cast<TensorViewType>(type);
+    if (!view)
+        return {1, 1, 1};
+    ArrayRef<int64_t> shape = view.getShape();
+    if (!llvm::all_of(shape, [](int64_t extent) { return extent >= 0; }))
+        return {1, 1, 1};
+    int64_t count = 1;
+    for (int64_t extent : shape) {
+        const int64_t factor = std::max<int64_t>(extent, 1);
+        if (count > std::numeric_limits<int64_t>::max() / factor)
+            return {1, 1, 1};
+        count *= factor;
+    }
+    return {count, 1, 1};
+}
+
+bool hasDynamicExtent(Type type) {
+    auto view = dyn_cast<TensorViewType>(type);
+    return view && llvm::any_of(view.getShape(), [](int64_t extent) { return extent < 0; });
+}
+
+Value createZero(OpBuilder &builder, Location location, Type type, Value like = {}) {
     if (auto scalar = dyn_cast<FloatType>(type))
         return arith::ConstantOp::create(builder, location, builder.getFloatAttr(scalar, 0.0));
-    if (isa<TensorViewType, TensorType>(type))
+    if (isa<TensorViewType>(type))
+        return like && hasDynamicExtent(type) ? createProgramIntrinsic(builder, location, "zeros_like", like, type)
+                                              : createProgramIntrinsic(builder, location, "zeros", {}, type);
+    if (isa<TensorType>(type))
         return createProgramIntrinsic(builder, location, "zeros", {}, type);
     auto tensor = dyn_cast<RankedTensorType>(type);
     auto element = tensor ? dyn_cast<FloatType>(tensor.getElementType()) : FloatType{};
@@ -77,10 +103,52 @@ Value createZero(OpBuilder &builder, Location location, Type type) {
                                      DenseElementsAttr::get(tensor, builder.getFloatAttr(element, 0.0)));
 }
 
+Value createDestinationPassingCompute(OpBuilder &builder, Location location, StringRef callee, ValueRange operands,
+                                      ArrayRef<StringRef> operandNames, ArrayRef<StringRef> operandAccesses,
+                                      Type resultType, int64_t destOperand) {
+    OperationState state(location, ComputeOp::getOperationName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttribute("callee", builder.getStringAttr(callee));
+    state.addAttribute("grid", builder.getDenseI64ArrayAttr(linearizedLaunchGrid(resultType)));
+    state.addAttribute("features", builder.getArrayAttr({}));
+    state.addAttribute("operand_names",
+                       builder.getArrayAttr(llvm::map_to_vector(
+                           operandNames, [&](StringRef name) -> Attribute { return builder.getStringAttr(name); })));
+    state.addAttribute("result_names", builder.getArrayAttr({builder.getStringAttr("output")}));
+    state.addAttribute(kOperandAccessesAttrName,
+                       builder.getArrayAttr(llvm::map_to_vector(operandAccesses, [&](StringRef access) -> Attribute {
+                           return builder.getStringAttr(access);
+                       })));
+    state.addAttribute("vernon_program.result_resource_sources",
+                       builder.getDenseI64ArrayAttr(SmallVector<int64_t, 1>{destOperand}));
+    return builder.create(state)->getResult(0);
+}
+
+Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {}) {
+    if (source.getType() == destType)
+        return source;
+    if (!isa<TensorViewType>(source.getType()) || !isa<TensorViewType>(destType))
+        return {};
+    Value dest = createZero(builder, location, destType, like ? like : source);
+    if (!dest)
+        return {};
+    return createDestinationPassingCompute(builder, location, "vernon.builtin.copy", {source, dest},
+                                           {"source", "output"}, {"read", "write"}, destType, 1);
+}
+
 Value addValues(OpBuilder &builder, Location location, Value left, Value right) {
     if (left.getType() != right.getType())
         return {};
-    if (isa<TensorViewType, TensorType>(left.getType()))
+    if (isa<TensorViewType>(left.getType())) {
+        Value dest = createZero(builder, location, left.getType(), left);
+        if (!dest)
+            return {};
+        return createDestinationPassingCompute(builder, location, "vernon.builtin.add", {left, right, dest},
+                                               {"left", "right", "output"}, {"read", "read", "write"}, left.getType(),
+                                               2);
+    }
+    if (isa<TensorType>(left.getType()))
         return createProgramIntrinsic(builder, location, "add", {left, right}, left.getType());
     auto tuple = dyn_cast<TupleType>(left.getType());
     if (!tuple)
@@ -118,67 +186,87 @@ StringRef resultSourceName(func::FuncOp function, unsigned result) {
 }
 
 FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const AutodiffVjpBuildContext &context) {
+    OpBuilder &builder = context.builder;
     SmallVector<Value> operands(context.primalOperands);
     llvm::append_range(operands, context.primalResults);
     llvm::append_range(operands, context.resultCotangents);
+    SmallVector<Attribute> operandNames;
+    SmallVector<Attribute> operandRoles;
+    SmallVector<Attribute> operandSources;
+    SmallVector<Attribute> operandAccesses;
+    for (auto [index, name] : llvm::enumerate(operation.getOperandNames())) {
+        operandNames.push_back(builder.getStringAttr(("primal." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("retained_primal"));
+        operandSources.push_back(name);
+        StringRef access = getProgramOperandAccess(operation, static_cast<unsigned>(index));
+        operandAccesses.push_back(builder.getStringAttr(access.empty() ? "read" : access));
+    }
+    for (Attribute name : operation.getResultNames()) {
+        operandNames.push_back(builder.getStringAttr(("result." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("retained_primal"));
+        operandSources.push_back(name);
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+    for (Attribute name : operation.getResultNames()) {
+        operandNames.push_back(builder.getStringAttr(("cotangent." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("cotangent"));
+        operandSources.push_back(name);
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+
     SmallVector<Type> resultTypes;
     SmallVector<Attribute> resultNames;
+    SmallVector<Attribute> resultRoles;
+    SmallVector<int64_t> resultResourceSources;
     SmallVector<Value> contributions(operation.getNumOperands());
     for (unsigned index : context.activeOperandIndices) {
         if (isWriteOnlyProgramOperand(operation, index))
             continue;
-        FailureOr<Type> type = gradientDestType(operation.getOperand(index).getType(), operation);
+        FailureOr<Type> type = derivativeType(operation.getOperand(index).getType(), operation);
         if (failed(type))
             continue;
+        Attribute name = index < operation.getOperandNames().size() ? operation.getOperandNames()[index]
+                                                                    : builder.getStringAttr(std::to_string(index));
+        if (isa<TensorViewType>(*type)) {
+            Value dest = createZero(builder, context.location, *type, context.getPrimalOperand(index));
+            if (!dest)
+                return operation.emitOpError("Program VJP cannot allocate a nested gradient dest");
+            resultResourceSources.push_back(static_cast<int64_t>(operands.size()));
+            operands.push_back(dest);
+            operandNames.push_back(name);
+            operandRoles.push_back(builder.getStringAttr("gradient"));
+            operandSources.push_back(name);
+            operandAccesses.push_back(builder.getStringAttr("write"));
+        } else {
+            resultResourceSources.push_back(-1);
+        }
         resultTypes.push_back(*type);
-        if (index < operation.getOperandNames().size())
-            resultNames.push_back(operation.getOperandNames()[index]);
-        else
-            resultNames.push_back(context.builder.getStringAttr(std::to_string(index)));
+        resultNames.push_back(name);
+        resultRoles.push_back(builder.getStringAttr("gradient"));
     }
     if (resultTypes.empty())
         return contributions;
 
-    SmallVector<Attribute> operandNames;
-    SmallVector<Attribute> operandRoles;
-    SmallVector<Attribute> operandSources;
-    for (Attribute name : operation.getOperandNames())
-        operandNames.push_back(context.builder.getStringAttr(("primal." + cast<StringAttr>(name).getValue()).str()));
-    for (Attribute name : operation.getOperandNames()) {
-        operandRoles.push_back(context.builder.getStringAttr("retained_primal"));
-        operandSources.push_back(name);
-    }
-    for (Attribute name : operation.getResultNames())
-        operandNames.push_back(context.builder.getStringAttr(("result." + cast<StringAttr>(name).getValue()).str()));
-    for (Attribute name : operation.getResultNames()) {
-        operandRoles.push_back(context.builder.getStringAttr("retained_primal"));
-        operandSources.push_back(name);
-    }
-    for (Attribute name : operation.getResultNames())
-        operandNames.push_back(context.builder.getStringAttr(("cotangent." + cast<StringAttr>(name).getValue()).str()));
-    for (Attribute name : operation.getResultNames()) {
-        operandRoles.push_back(context.builder.getStringAttr("cotangent"));
-        operandSources.push_back(name);
-    }
-
     OperationState state(context.location, ComputeOp::getOperationName());
     state.addOperands(operands);
     state.addTypes(resultTypes);
-    state.addAttribute("callee", context.builder.getStringAttr((Twine(operation.getCallee()) + ".vjp").str()));
+    state.addAttribute("callee", builder.getStringAttr((Twine(operation.getCallee()) + ".vjp").str()));
     state.addAttribute("grid", operation.getGridAttr());
     state.addAttribute("features", operation.getFeaturesAttr());
-    state.addAttribute("operand_names", context.builder.getArrayAttr(operandNames));
-    state.addAttribute("vernon_program.operand_autodiff_roles", context.builder.getArrayAttr(operandRoles));
-    state.addAttribute("vernon_program.operand_autodiff_sources", context.builder.getArrayAttr(operandSources));
-    state.addAttribute("result_names", context.builder.getArrayAttr(resultNames));
-    state.addAttribute("vernon_program.result_autodiff_roles",
-                       context.builder.getArrayAttr(
-                           SmallVector<Attribute>(resultNames.size(), context.builder.getStringAttr("gradient"))));
-    state.addAttribute("vernon_program.result_autodiff_sources", context.builder.getArrayAttr(resultNames));
+    state.addAttribute("operand_names", builder.getArrayAttr(operandNames));
+    state.addAttribute(kOperandAccessesAttrName, builder.getArrayAttr(operandAccesses));
+    state.addAttribute("vernon_program.operand_autodiff_roles", builder.getArrayAttr(operandRoles));
+    state.addAttribute("vernon_program.operand_autodiff_sources", builder.getArrayAttr(operandSources));
+    state.addAttribute("result_names", builder.getArrayAttr(resultNames));
+    state.addAttribute("vernon_program.result_autodiff_roles", builder.getArrayAttr(resultRoles));
+    state.addAttribute("vernon_program.result_autodiff_sources", builder.getArrayAttr(resultNames));
+    if (llvm::any_of(resultResourceSources, [](int64_t source) { return source >= 0; }))
+        state.addAttribute("vernon_program.result_resource_sources",
+                           builder.getDenseI64ArrayAttr(resultResourceSources));
     for (StringRef name : {"constant_names", "constant_values"})
         if (Attribute attribute = operation->getAttr(name))
             state.addAttribute(name, attribute);
-    Operation *vjp = context.builder.create(state);
+    Operation *vjp = builder.create(state);
     unsigned result = 0;
     for (unsigned index : context.activeOperandIndices) {
         if (isWriteOnlyProgramOperand(operation, index))
@@ -387,8 +475,16 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
 
     DenseMap<Value, Value> adjoints;
     const unsigned cotangentBase = retainedValues.size();
-    for (auto [index, result] : llvm::enumerate(returnOp.getOperands()))
-        adjoints[result] = entry->getArgument(cotangentBase + index);
+    for (auto [index, result] : llvm::enumerate(returnOp.getOperands())) {
+        Value publicCotangent = entry->getArgument(cotangentBase + index);
+        FailureOr<Type> interior = derivativeType(result.getType(), primal);
+        if (failed(interior))
+            return primal.emitError("Program VJP result is not differentiable");
+        Value seed = copyValue(builder, primal.getLoc(), publicCotangent, *interior, primals.lookup(result));
+        if (!seed)
+            return primal.emitError("Program VJP cannot copy a public cotangent into an interior adjoint");
+        adjoints[result] = seed;
+    }
     VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
     for (Operation *operation : llvm::reverse(primalOperations)) {
         bool active = llvm::any_of(operation->getResults(), [&](Value result) { return adjoints.contains(result); });
@@ -411,8 +507,9 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             primalResults.push_back(primals.lookup(result));
             Value cotangent = adjoints.lookup(result);
             if (!cotangent) {
-                FailureOr<Type> type = cotangentType(result.getType(), operation);
-                if (failed(type) || !(cotangent = createZero(builder, operation->getLoc(), *type)))
+                FailureOr<Type> type = derivativeType(result.getType(), operation);
+                if (failed(type) ||
+                    !(cotangent = createZero(builder, operation->getLoc(), *type, primals.lookup(result))))
                     return operation->emitError("Program VJP cannot create a zero result cotangent");
             }
             resultCotangents.push_back(cotangent);
@@ -454,10 +551,13 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     for (unsigned index : wrtIndices) {
         Value primalArgument = primal.getArgument(index);
         Value gradient = adjoints.lookup(primalArgument);
+        Type publicType = backwardResults[gradients.size()];
         if (!gradient)
-            gradient = createZero(builder, primal.getLoc(), backwardResults[gradients.size()]);
+            gradient = createZero(builder, primal.getLoc(), publicType, primals.lookup(primalArgument));
+        else if (gradient.getType() != publicType)
+            gradient = copyValue(builder, primal.getLoc(), gradient, publicType, primals.lookup(primalArgument));
         if (!gradient)
-            return primal.emitError("Program VJP cannot create a zero input gradient");
+            return primal.emitError("Program VJP cannot create a public input gradient");
         gradients.push_back(gradient);
     }
     func::ReturnOp::create(builder, primal.getLoc(), gradients);

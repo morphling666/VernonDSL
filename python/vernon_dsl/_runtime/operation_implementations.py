@@ -6,6 +6,7 @@ import importlib.util
 import math
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,17 @@ _SCALAR_BY_DTYPE = {
     np.dtype(np.float64): "f64",
 }
 
-_generated_add: dict[tuple[str, int], Any] = {}
+_SCALAR_ANNOTATIONS = {
+    "f16": "vd.f16",
+    "f32": "vd.f32",
+    "f64": "vd.f64",
+    "i32": "vd.i32",
+    "u32": "vd.u32",
+    "bool": "vd.bool",
+    "i1": "vd.bool",
+}
+
+_generated_kernels: dict[tuple[str, str, int], Any] = {}
 _generated_directories: list[tempfile.TemporaryDirectory[str]] = []
 
 
@@ -43,12 +54,50 @@ def _view_shape_annotation(rank: int) -> str:
     return "(" + ", ".join(["vd.dyn"] * rank) + ")"
 
 
-def _linear_index_body(rank: int) -> list[str]:
-    if rank == 1:
-        return [
-            "    linear = gid[0]",
-            "    output[linear] = left[linear] + right[linear]",
-        ]
+def _mlir_tensor_view_element(spelling: str) -> str | None:
+    marker = "tensor_view<"
+    start = spelling.find(marker)
+    if start < 0:
+        return None
+    body = spelling[start + len(marker) :]
+    depth = 0
+    for index, character in enumerate(body):
+        if character == "<":
+            depth += 1
+        elif character == ">":
+            depth -= 1
+        elif character == "," and depth == 0:
+            return body[:index].strip()
+    return None
+
+
+def python_element_annotation(value: Mapping[str, Any]) -> str | None:
+    element = _mlir_tensor_view_element(str(value.get("type") or ""))
+    if element in _SCALAR_ANNOTATIONS:
+        return _SCALAR_ANNOTATIONS[element]
+    if element and element.startswith("tensor<") and element.endswith(">"):
+        parts = element[len("tensor<") : -1].split("x")
+        if len(parts) >= 2 and parts[-1] in _SCALAR_ANNOTATIONS and all(part.isdigit() for part in parts[:-1]):
+            extents = tuple(int(part) for part in parts[:-1])
+            scalar = _SCALAR_ANNOTATIONS[parts[-1]]
+            if len(extents) == 1:
+                return f"vd.Vector[{scalar}, {extents[0]}]"
+            return f"vd.Tensor[{scalar}, ({', '.join(str(extent) for extent in extents)},)]"
+    dtype = value.get("dtype")
+    if isinstance(dtype, str) and dtype in _SCALAR_ANNOTATIONS:
+        return _SCALAR_ANNOTATIONS[dtype]
+    return None
+
+
+def _linear_index_target(rank: int) -> str:
+    if rank <= 1:
+        return "linear" if rank == 1 else "()"
+    return ", ".join(f"index{axis}" for axis in range(rank))
+
+
+def _linear_index_prelude(rank: int) -> list[str]:
+    if rank <= 1:
+        return ["    linear = gid[0]"] if rank == 1 else []
     names = [f"index{axis}" for axis in range(rank)]
     lines = [
         "    linear = gid[0]",
@@ -58,24 +107,38 @@ def _linear_index_body(rank: int) -> list[str]:
         lines.append(f"    {names[axis]} = linear % shape[{axis}]")
         lines.append(f"    linear = linear // shape[{axis}]")
     lines.append(f"    {names[0]} = linear")
-    index = ", ".join(names)
-    lines.append(f"    output[{index}] = left[{index}] + right[{index}]")
     return lines
 
 
-def _add_kernel_source(dtype: str, rank: int) -> tuple[str, str]:
-    entry = f"_program_add_{dtype}_rank{rank}"
-    view = f"vd.TensorView[vd.{dtype}, {_view_shape_annotation(rank)}"
-    parameters = [
-        f"    output: {view}, vd.write],",
-        f"    left: {view}, vd.read],",
-        f"    right: {view}, vd.read],",
-    ]
+def _elementwise_kernel_source(operation: str, element: str, rank: int) -> tuple[str, str]:
+    if element.startswith("vd.") and "[" not in element:
+        token = element[3:]
+    else:
+        token = element.replace("[", "_").replace("]", "_").replace(", ", "x").replace(".", "_")
+    entry = f"_program_{operation}_{token}_rank{rank}"
+    view = f"vd.TensorView[{element}, {_view_shape_annotation(rank)}"
+    if operation == "add":
+        parameters = [
+            f"    output: {view}, vd.write],",
+            f"    left: {view}, vd.read],",
+            f"    right: {view}, vd.read],",
+        ]
+        index = _linear_index_target(rank)
+        assignment = f"output[{index}] = left[{index}] + right[{index}]"
+    elif operation == "copy":
+        parameters = [
+            f"    output: {view}, vd.write],",
+            f"    source: {view}, vd.read],",
+        ]
+        index = _linear_index_target(rank)
+        assignment = f"output[{index}] = source[{index}]"
+    else:
+        raise ImplementationUnavailable(f"unsupported Program elementwise operation {operation!r}")
     if rank == 0:
-        body = ["    output[()] = left[()] + right[()]"]
+        body = [f"    {assignment}"]
     else:
         parameters.append('    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],')
-        body = _linear_index_body(rank)
+        body = [*_linear_index_prelude(rank), f"    {assignment}"]
     source = "\n".join(
         [
             "from typing import Annotated",
@@ -93,24 +156,24 @@ def _add_kernel_source(dtype: str, rank: int) -> tuple[str, str]:
     return entry, source
 
 
-def _kernel_for(dtype: str, rank: int) -> Any:
-    cached = _generated_add.get((dtype, rank))
+def elementwise_kernel(operation: str, element: str, rank: int) -> Any:
+    cached = _generated_kernels.get((operation, element, rank))
     if cached is not None:
         return cached
-    entry, source = _add_kernel_source(dtype, rank)
-    directory = tempfile.TemporaryDirectory(prefix="vernon-add-")
+    entry, source = _elementwise_kernel_source(operation, element, rank)
+    directory = tempfile.TemporaryDirectory(prefix=f"vernon-{operation}-")
     path = Path(directory.name) / f"{entry}.py"
     path.write_text(source, encoding="utf-8")
-    module_name = f"vernon_dsl._runtime._generated_add_{dtype}_rank{rank}"
+    module_name = f"vernon_dsl._runtime._generated_{operation}_{abs(hash((element, rank)))}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load generated add kernel {entry}")
+        raise RuntimeError(f"failed to load generated {operation} kernel {entry}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     kernel = getattr(module, entry)
     _generated_directories.append(directory)
-    _generated_add[(dtype, rank)] = kernel
+    _generated_kernels[(operation, element, rank)] = kernel
     return kernel
 
 
@@ -139,10 +202,15 @@ def program_add_invocation(
     if numel > 2**31 - 1:
         raise ImplementationUnavailable("Program Add linearized grid exceeds the portable workgroup count")
     return (
-        _kernel_for(dtype, len(shape)),
+        elementwise_kernel("add", f"vd.{dtype}", len(shape)),
         (_view(output, "write"), _view(left, "read"), _view(right, "read")),
         (numel, 1, 1),
     )
 
 
-__all__ = ["ImplementationUnavailable", "program_add_invocation"]
+__all__ = [
+    "ImplementationUnavailable",
+    "elementwise_kernel",
+    "program_add_invocation",
+    "python_element_annotation",
+]

@@ -145,7 +145,8 @@ module {
     backward.walk([&](Operation *operation) {
         if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "empty_like")
             ++allocs;
-        if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "add")
+        if (auto compute = dyn_cast<program::ComputeOp>(operation);
+            compute && compute.getCallee() == "vernon.builtin.add")
             ++adds;
     });
     EXPECT_EQ(allocs, 0u);
@@ -171,7 +172,17 @@ module {
         }));
         auto gradient = dyn_cast<TensorViewType>(operation.getResultTypes().front());
         ASSERT_TRUE(gradient);
-        EXPECT_EQ(gradient.getAccess(), "write");
+        EXPECT_EQ(gradient.getAccess(), "read_write");
+        auto resourceSources = operation->getAttrOfType<DenseI64ArrayAttr>("vernon_program.result_resource_sources");
+        ASSERT_TRUE(resourceSources);
+        ASSERT_EQ(resourceSources.size(), 1u);
+        ASSERT_GE(resourceSources[0], 0);
+        ASSERT_LT(static_cast<size_t>(resourceSources[0]), operation.getNumOperands());
+        const unsigned destIndex = static_cast<unsigned>(resourceSources[0]);
+        EXPECT_EQ(program::getProgramOperandAccess(operation, destIndex), "write");
+        auto dest = dyn_cast<TensorViewType>(operation.getOperand(destIndex).getType());
+        ASSERT_TRUE(dest);
+        EXPECT_EQ(dest.getAccess(), "read_write");
     }
     unsigned cotangents = 0;
     for (auto [index, argument] : llvm::enumerate(backward.getArguments())) {

@@ -193,8 +193,11 @@ typedef struct VernonValuePathComponentView {
 typedef struct VernonPipelineValueLeafView {
     uint32_t struct_size;
     VernonValueLeafView value;
+    /* Struct field path of this payload leaf. Empty for a scalar Tensor cell. */
     const VernonValuePathComponentView *path;
     size_t path_count;
+    /* Leaf-internal packed extents. Empty for a scalar cell. Outer Tensor rank
+     * lives on VernonPipelineParameterView.rank / static_shape, not here. */
     const uint64_t *static_shape;
     uint32_t static_rank;
 } VernonPipelineValueLeafView;
@@ -270,8 +273,12 @@ typedef struct VernonPipelineParameterView {
     uint32_t slot;
     VernonStringView name;
     VernonPipelineArgumentKind kind;
+    /* Packed host-binding ABI of the whole argument (call-frame / copy plan).
+     * Named element_layout for historical reasons; for a shaped Tensor this
+     * is the packed value, not one cell. Cells/fields: GetParameterValueLeaf. */
     VernonValueLayoutView element_layout;
     VernonValueAccess access;
+    /* Outer Tensor extents. Empty for a scalar or struct parameter. */
     uint32_t rank;
     const uint64_t *static_shape;
 } VernonPipelineParameterView;
@@ -415,9 +422,27 @@ VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetParameterCount(const Ve
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(const VernonLoadedPipeline *pipeline,
                                                                                 size_t index,
                                                                                 VernonPipelineParameterView *parameter);
+/*
+ * Parameter identity and host binding: name, access, outer Tensor shape
+ * (rank / static_shape), and packed host_value ABI in element_layout.
+ *
+ * This is not the cell/field leaf table. A Tensor[f32,(2,)] reports
+ * rank=1, static_shape=[2], and element_layout of the whole packed value
+ * (scalar_count=2). Walk payload cells/fields with GetParameterValueLeaf.
+ */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline *pipeline,
                                                                           VernonStringView name,
                                                                           VernonPipelineParameterView *parameter);
+/*
+ * Logical payload leaf of one tensor parameter: one cell of a shaped Tensor,
+ * or one field of a struct. Query this for AD packing / reflection dtype
+ * and leaf-internal shape.
+ *
+ * Tensor[f32,(2,)] has one leaf: f32, scalar_count=1, static_rank=0. Outer
+ * extent [2] is FindParameter().static_shape, not this leaf. Packed
+ * host_value ABI (the whole tensor as one layout) is FindParameter().
+ * element_layout, not this API.
+ */
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoadedPipeline *pipeline,
                                                                                   VernonStringView parameter_name,
                                                                                   size_t leaf_index,

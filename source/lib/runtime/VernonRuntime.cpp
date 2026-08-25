@@ -152,6 +152,15 @@ std::string pipelineTargetKind(const nlohmann::json &root) {
     return kind;
 }
 
+const ValueLayout &parameterLogicalLeafLayout(const Parameter &parameter) {
+    /* Shaped Tensors keep outer extents on the parameter; leaves are cells. */
+    if (!parameter.shape.empty() && !parameter.elementLayout.leaves.empty())
+        return parameter.elementLayout;
+    if (parameter.valueLayout)
+        return *parameter.valueLayout;
+    return parameter.elementLayout;
+}
+
 } // namespace
 
 extern "C" {
@@ -967,7 +976,7 @@ VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoaded
                      [&](const Parameter &candidate) { return stringViewEquals(parameterName, candidate.name); });
     if (parameter == pipeline->variant.parameters.end() || parameter->kind != "tensor")
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const ValueLayout &layout = parameter->valueLayout ? *parameter->valueLayout : parameter->elementLayout;
+    const ValueLayout &layout = parameterLogicalLeafLayout(*parameter);
     if (leafIndex >= layout.leaves.size())
         return VERNON_STATUS_INVALID_ARGUMENT;
     const ValueLeaf &source = layout.leaves[leafIndex];

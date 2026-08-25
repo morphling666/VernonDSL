@@ -159,6 +159,48 @@ class ModuleTests(unittest.TestCase):
         self.assertIn('"vernon.get_shape"', implementation.mlir)
         self.assertIn("tensor<2xi32>", implementation.mlir)
 
+    def test_fusion_dsl_provider_lowers_dynamic_rank_builtin_add(self) -> None:
+        values = {
+            0: {"id": 0, "dtype": "f32", "shape": [-1, -1]},
+            1: {"id": 1, "dtype": "f32", "shape": [-1, -1]},
+            2: {"id": 2, "dtype": "f32", "shape": [-1, -1]},
+        }
+        request = {
+            "implementation_hint": "vernon.builtin.add",
+            "bindings": [
+                {"parameter": "left", "value": 0},
+                {"parameter": "right", "value": 1},
+                {"parameter": "output", "value": 2},
+            ],
+        }
+
+        implementation = BuiltinDslProvider().lower(request, values)
+
+        self.assertIsNotNone(implementation)
+        assert implementation is not None
+        self.assertEqual(implementation.entry, "_program_add_f32_rank2")
+        self.assertIn("[-1, -1]", implementation.mlir)
+
+    def test_fusion_dsl_provider_lowers_builtin_copy_request(self) -> None:
+        values = {
+            0: {"id": 0, "dtype": "f32", "shape": [4]},
+            1: {"id": 1, "dtype": "f32", "shape": [4]},
+        }
+        request = {
+            "implementation_hint": "vernon.builtin.copy",
+            "bindings": [
+                {"parameter": "source", "value": 0},
+                {"parameter": "output", "value": 1},
+            ],
+        }
+
+        implementation = BuiltinDslProvider().lower(request, values)
+
+        self.assertIsNotNone(implementation)
+        assert implementation is not None
+        self.assertEqual(implementation.callee, "vernon.builtin.copy")
+        self.assertEqual(implementation.entry, "_program_copy_f32_rank1")
+
     @classmethod
     def setUpClass(cls) -> None:
         try:
@@ -225,6 +267,25 @@ class ModuleTests(unittest.TestCase):
 
     def test_semantic_add_uses_builtin_program_stage(self) -> None:
         module = FanIn()
+        _, pullback = vd.ad.vjp(
+            module,
+            wrt=("source",),
+            outputs=("square", "cube"),
+        )(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
+        gradients = pullback(
+            {
+                "square": np.array([1.0], dtype=np.float32),
+                "cube": np.array([2.0], dtype=np.float32),
+            }
+        )
+        np.testing.assert_array_equal(gradients["source"].to_numpy(), np.array([28.0], dtype=np.float32))
+
+    def test_vjp_after_primal_kernel_load_reuses_interned_cpu_entries(self) -> None:
+        module = FanIn()
+        primal = module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
+        np.testing.assert_array_equal(primal.square.to_numpy(), np.array([4.0], dtype=np.float32))
+        np.testing.assert_array_equal(primal.cube.to_numpy(), np.array([8.0], dtype=np.float32))
+
         _, pullback = vd.ad.vjp(
             module,
             wrt=("source",),

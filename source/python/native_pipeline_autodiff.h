@@ -898,7 +898,8 @@ struct LoadedPipeline {
     VernonRuntimeContext *runtime{};
     VernonPipelineBundle *bundle{};
     VernonLoadedPipeline *pipeline{};
-    // ORC entry pointers are valid only while their compile result owns the JIT.
+    // ORC entry pointers are valid only while an interned compile result owns the JIT.
+    std::vector<std::shared_ptr<InternedCpuJit>> internedCpuJits;
     std::vector<SharedCompileResult> retainedResults;
     std::vector<std::pair<std::string, VernonCpuEntryPoint>> registeredCpuEntries;
 };

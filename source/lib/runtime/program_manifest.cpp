@@ -282,6 +282,14 @@ bool ExecutableProgram::validate(const std::map<std::string, std::string> &stage
 }
 
 std::vector<uint32_t> ExecutableProgram::backwardCaptures() const {
+    std::set<uint32_t> forwardValues;
+    for (const ProgramGraph &graph : graphs) {
+        if (graph.direction != "forward")
+            continue;
+        forwardValues.insert(graph.arguments.begin(), graph.arguments.end());
+        for (const ProgramNode &node : graph.nodes)
+            forwardValues.insert(node.results.begin(), node.results.end());
+    }
     std::vector<uint32_t> captures;
     for (const ProgramGraph &graph : graphs) {
         if (graph.direction != "backward")
@@ -290,7 +298,7 @@ std::vector<uint32_t> ExecutableProgram::backwardCaptures() const {
         std::set<uint32_t> captured;
         for (const ProgramNode &node : graph.nodes) {
             for (uint32_t operand : node.operands)
-                if (!available.count(operand) && captured.insert(operand).second)
+                if (!available.count(operand) && forwardValues.count(operand) && captured.insert(operand).second)
                     captures.push_back(operand);
             available.insert(node.results.begin(), node.results.end());
         }

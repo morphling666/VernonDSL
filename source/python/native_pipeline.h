@@ -135,6 +135,14 @@ struct PipelineInvocationBuilder;
 
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
+// One hashed CPU symbol maps to one JIT address, matching linked .o artifacts.
+// Later cooks of the same kernel keep this CompileResult alive instead of
+// registering a second ORC copy.
+struct InternedCpuJit {
+    SharedCompileResult result;
+    VernonCpuEntryPoint entry{};
+};
+
 struct CompiledProgram {
     CompiledProgram(VernonCompileResult *result, VernonTarget target)
         : result(result, &vernonCompileResultDestroy), target(target) {
