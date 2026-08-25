@@ -1072,7 +1072,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 copy_tensor_view(second_output, transposed_reversed)
                 np.testing.assert_array_equal(second_output.to_numpy(), owner.to_numpy().T[::-1])
                 self.assertEqual(copy_tensor_view.compile_count, 1)
-                self.assertEqual(len(type(copy_tensor_view)._dispatch_cache), 1)
+                self.assertEqual(len(type(copy_tensor_view)._cache), 1)
 
     def test_gpu_written_storage_survives_runtime_reinitialization(self) -> None:
         for backend in self._available_compute_backends():
@@ -1107,7 +1107,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             copy_tensor_view(output, invalid_access)
 
         self.assertEqual(copy_tensor_view.compile_count, 1)
-        self.assertEqual(len(type(copy_tensor_view)._dispatch_cache), 1)
+        self.assertEqual(len(type(copy_tensor_view)._cache), 1)
 
     def test_aggregate_tensor_view_dispatch(self) -> None:
         values = tuple(
@@ -1286,7 +1286,7 @@ class KernelTests(unittest.TestCase):
 
     def test_direct_kernel_uses_finalized_program_controls_and_access(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        compiled = fill._compile((output, 1.0), ())
+        compiled = fill.specialize(shapes={"output": tuple(output.shape)})
         program = json.loads(compiled.canonical_program)
         node = program["graphs"][0]["nodes"][0]
         self.assertEqual(
@@ -1309,12 +1309,11 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(compiled.native.parameters[0].access, vd._native.ACCESS_WRITE)
         self.assertFalse(hasattr(compiled, "writable_names"))
 
-    def test_warm_dispatch_skips_frontend_lowering(self) -> None:
+    def test_warm_dispatch_reuses_specialized_artifact(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        with mock.patch.object(fill, "_lower", wraps=fill._lower) as lower:
-            fill(output, 10.0, grid=(3, 2, 1))
-            fill(output, 20.0, grid=(3, 2, 1))
-        lower.assert_called_once()
+        fill(output, 10.0, grid=(3, 2, 1))
+        fill(output, 20.0, grid=(3, 2, 1))
+        self.assertEqual(fill.compile_count, 1)
 
     def test_cpu_kernel_uses_in_process_owning_compiler(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

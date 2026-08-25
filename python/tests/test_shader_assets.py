@@ -1054,7 +1054,10 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
             node = program["graphs"][0]["nodes"][0]
             self.assertNotIn("dependencies", node)
             self.assertEqual(node["operation"], {"tag": "compute", "workgroups": [1, 1, 1]})
-            self.assertEqual([value["origin"]["tag"] for value in program["values"]], ["argument", "node_result"])
+            self.assertEqual(
+                [value["origin"]["tag"] for value in program["values"]],
+                ["argument", "allocation", "node_result"],
+            )
             self.assertEqual([storage["ownership"] for storage in program["storages"]], ["borrowed", "owned"])
 
             from vernon_dsl._shader_assets.artifact_io import write_external_artifact

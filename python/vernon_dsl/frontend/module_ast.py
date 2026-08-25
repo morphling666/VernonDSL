@@ -8,10 +8,12 @@ import inspect
 import operator
 import textwrap
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
-from .._runtime.resources import TensorStorage, TensorView
-from ..module import Module, _tensor_dtype
+from .._runtime.resources import TensorStorage, _logical_collection_shape
+from ..module import Module
+from ..operation_graph import GraphBuffer
 from ..storage import empty as storage_empty
 from ..storage import empty_like as storage_empty_like
 from ..storage import from_numpy as storage_from_numpy
@@ -55,7 +57,6 @@ _UNARY = {
     ast.Invert: operator.invert,
 }
 
-_MODULE_ALLOCS = frozenset({"empty", "empty_like", "zeros", "zeros_like"})
 _PROGRAM_ALLOCS = {
     id(storage_empty): "empty",
     id(storage_empty_like): "empty_like",
@@ -77,24 +78,38 @@ class _ForwardReturn(Exception):
         self.value = value
 
 
+@dataclass(frozen=True)
+class ModuleParameterType:
+    dtype: Any
+    shape: tuple[int, ...]
+    access: str = "read_write"
+    as_view: bool = False
+
+
 def interpret_module_forward(
     module: Module,
-    arguments: tuple[Any, ...],
-    keywords: Mapping[str, Any],
+    parameter_types: Mapping[str, ModuleParameterType],
 ) -> tuple[Any, Any]:
     from ..program import ProgramCapture
 
-    bound = inspect.signature(module.forward).bind(*arguments, **keywords)
-    bound.apply_defaults()
-    inputs = dict(bound.arguments)
+    inputs = {
+        name: GraphBuffer(parameter_type.dtype, parameter_type.shape, parameter_type.access, parameter_type.as_view)
+        for name, parameter_type in parameter_types.items()
+    }
     capture = ProgramCapture(module, inputs)
     interpreter = _ForwardInterpreter(capture, module)
-    outputs = interpreter.interpret(module, inputs)
+    outputs = interpreter.interpret(module, dict(inputs))
     return capture, outputs
 
 
 def _is_graph(value: Any) -> bool:
-    return isinstance(value, (TensorStorage, TensorView))
+    return isinstance(value, GraphBuffer)
+
+
+def _require_graph(value: Any, *, what: str) -> GraphBuffer:
+    if not isinstance(value, GraphBuffer):
+        raise TypeError(f"{what} requires a Program buffer")
+    return value
 
 
 def _contains_graph(value: Any) -> bool:
@@ -134,7 +149,7 @@ def _parse_forward(module: Module) -> ast.FunctionDef:
 
 def _is_kernel(value: Any) -> bool:
     kind = getattr(value, "__vernon_dsl__", (None,))[0]
-    return kind == "compute" and hasattr(value, "_compile") and hasattr(value, "_function")
+    return kind == "compute" and hasattr(value, "_lower") and hasattr(value, "_function")
 
 
 class _ForwardInterpreter:
@@ -351,8 +366,6 @@ class _ForwardInterpreter:
             for keyword in expression.keywords
             if keyword.arg is not None
         }
-        if attr_name in _MODULE_ALLOCS:
-            return self._allocate(attr_name, args, keywords)
         if id(callee) in _HOST_STORAGE:
             raise TypeError(
                 "vd.storage.from_numpy() and vd.storage.tangent_zeros() are host session operations and cannot "
@@ -377,7 +390,12 @@ class _ForwardInterpreter:
                 raise TypeError(f"{callee.__name__} got unexpected Module.forward() keywords {sorted(keywords)}")
             grid_value = None if grid is None else _require_comptime(grid, what="grid")
             feature_value = _require_comptime(features, what="features")
-            self.capture.capture_kernel(callee, tuple(args), grid_value, tuple(feature_value))
+            self.capture.capture_kernel(
+                callee,
+                tuple(args),
+                grid_value,
+                tuple(feature_value),
+            )
             return None
         if dataclasses.is_dataclass(callee) and isinstance(callee, type):
             return callee(*args, **keywords)
@@ -390,28 +408,14 @@ class _ForwardInterpreter:
             raise TypeError(f"Module.forward() tried to call non-callable {callee!r}")
         return callee(*args, **keywords)
 
-    def _allocate(self, kind: str, args: list[Any], keywords: dict[str, Any]) -> TensorStorage:
+    def _allocate(self, kind: str, args: list[Any], keywords: dict[str, Any]) -> GraphBuffer:
         if kind in {"empty_like", "zeros_like"}:
             if keywords:
                 raise TypeError(f"vd.{kind}() does not take keywords")
             if len(args) != 1:
                 raise TypeError(f"vd.{kind}() takes one Storage argument")
-            value = args[0]
-            if not isinstance(value, (TensorStorage, TensorView)):
-                raise TypeError(f"vd.{kind}() requires TensorStorage or TensorView")
-            owner = value.owner if isinstance(value, TensorView) else value
-            if not isinstance(owner, TensorStorage):
-                raise TypeError("Program transients require TensorStorage-backed values")
-            dtype = _tensor_dtype(owner)
-            shape = tuple(value.shape)
-            storage = (
-                TensorStorage.zeros(dtype=dtype, shape=shape)
-                if kind == "zeros_like"
-                else TensorStorage.empty(dtype=dtype, shape=shape)
-            )
-            initializer = "zeros" if kind == "zeros_like" else "empty"
-            self.capture.capture_allocation(storage, initializer)
-            return storage
+            source = _require_graph(args[0], what=f"vd.{kind}()")
+            return self.capture.capture_allocation(kind, source.dtype, source.shape, like=source)
         if kind in {"empty", "zeros"}:
             if args:
                 raise TypeError(f"vd.{kind}() takes only dtype= and shape=")
@@ -419,13 +423,7 @@ class _ForwardInterpreter:
             shape = _require_comptime(keywords.pop("shape", None), what="shape")
             if keywords or dtype is None or shape is None:
                 raise TypeError(f"vd.{kind}() requires dtype= and shape=")
-            storage = (
-                TensorStorage.zeros(dtype=dtype, shape=tuple(shape))
-                if kind == "zeros"
-                else TensorStorage.empty(dtype=dtype, shape=tuple(shape))
-            )
-            self.capture.capture_allocation(storage, kind)
-            return storage
+            return self.capture.capture_allocation(kind, dtype, tuple(shape))
         if kind == "from_values":
             if len(args) != 1:
                 raise TypeError("vd.from_values() takes values and dtype=")
@@ -433,11 +431,9 @@ class _ForwardInterpreter:
             dtype = _require_comptime(keywords.pop("dtype", None), what="dtype")
             if keywords or dtype is None:
                 raise TypeError("vd.from_values() requires dtype=")
-            storage = TensorStorage.from_values(values, dtype=dtype)
-            self.capture.capture_allocation(storage, "from_values")
-            self.capture.allocation_constants[id(storage)] = values
-            return storage
+            shape = tuple(_logical_collection_shape(values, dtype))
+            return self.capture.capture_allocation("from_values", dtype, shape, values=values)
         raise RuntimeError(f"unknown Program allocation {kind!r}")
 
 
-__all__ = ["interpret_module_forward"]
+__all__ = ["ModuleParameterType", "interpret_module_forward"]

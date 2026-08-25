@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from ._runtime.resources import TensorStorage, TensorView
-from .operation_graph import KernelParameter, OperationGraph
+from .operation_graph import GraphBuffer, KernelParameter, OperationGraph
 
 
 def flatten_program_outputs(value: Any, prefix: str = "") -> dict[str, Any]:
-    if isinstance(value, (TensorStorage, TensorView)):
+    if isinstance(value, (GraphBuffer, TensorStorage, TensorView)):
         return {prefix or "output": value}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         result: dict[str, Any] = {}
@@ -37,7 +37,17 @@ def flatten_program_outputs(value: Any, prefix: str = "") -> dict[str, Any]:
             path = f"{prefix}.{index}" if prefix else str(index)
             result.update(flatten_program_outputs(member, path))
         return result
-    raise TypeError("Module.forward() outputs must contain only tensors, mappings, tuples, lists, or dataclasses")
+    raise TypeError(
+        "Module.forward() outputs must contain only Program buffers, mappings, tuples, lists, or dataclasses"
+    )
+
+
+@dataclass(frozen=True)
+class CapturedAlloc:
+    kind: str
+    result: GraphBuffer
+    like: GraphBuffer | None = None
+    values: Any = None
 
 
 @dataclass(frozen=True)
@@ -53,11 +63,17 @@ class ProgramCapture:
     def __init__(self, root: Any, inputs: Mapping[str, Any]):
         self.root = root
         self.inputs = dict(inputs)
-        self.calls: list[CapturedKernelCall] = []
-        self.allocations: dict[int, tuple[TensorStorage, str]] = {}
-        self.allocation_constants: dict[int, Any] = {}
+        self.ops: list[CapturedAlloc | CapturedKernelCall] = []
         self._scopes = [type(root).__name__]
         self._name_counts: dict[str, int] = {}
+
+    @property
+    def calls(self) -> tuple[CapturedKernelCall, ...]:
+        return tuple(op for op in self.ops if isinstance(op, CapturedKernelCall))
+
+    @property
+    def allocs(self) -> tuple[CapturedAlloc, ...]:
+        return tuple(op for op in self.ops if isinstance(op, CapturedAlloc))
 
     def enter_module(self, name: str) -> None:
         self._scopes.append(name)
@@ -81,12 +97,20 @@ class ProgramCapture:
         ordinal = self._name_counts.get(base, 0)
         self._name_counts[base] = ordinal + 1
         name = base if ordinal == 0 else f"{base}.{ordinal}"
-        self.calls.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features)))
+        self.ops.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features)))
 
-    def capture_allocation(self, value: Any, initializer: str) -> None:
-        if not isinstance(value, TensorStorage):
-            raise TypeError("Program allocations must produce TensorStorage")
-        self.allocations[id(value)] = (value, initializer)
+    def capture_allocation(
+        self,
+        kind: str,
+        dtype: Any,
+        shape: tuple[int, ...],
+        *,
+        like: GraphBuffer | None = None,
+        values: Any = None,
+    ) -> GraphBuffer:
+        result = GraphBuffer(dtype, tuple(shape), "read_write")
+        self.ops.append(CapturedAlloc(kind, result, like, values))
+        return result
 
 
 @dataclass(frozen=True)
@@ -109,20 +133,16 @@ class ProgramTemplate:
     def compile(cls, capture: ProgramCapture) -> ProgramTemplate:
         calls: list[KernelCallTemplate] = []
         for captured in capture.calls:
-            compiled = captured.kernel._compile(captured.arguments, captured.features)
+            lowered = captured.kernel._lower(captured.features)
+            frontend = lowered.frontend
+            builtin_names = lowered.builtins
             parameter_names = tuple(
-                name
-                for name in inspect.signature(captured.kernel._function).parameters
-                if name not in compiled.builtin_names
+                name for name in inspect.signature(captured.kernel._function).parameters if name not in builtin_names
             )
             if len(parameter_names) != len(captured.arguments):
                 raise TypeError(f"{captured.kernel.__name__} expects {len(parameter_names)} launch arguments")
             entry = next(
-                (
-                    function
-                    for function in compiled.frontend.typed_functions
-                    if function.source.name == captured.kernel._entry
-                ),
+                (function for function in frontend.typed_functions if function.source.name == captured.kernel._entry),
                 None,
             )
             if entry is None or entry.storage_activity is None:
@@ -152,46 +172,6 @@ class ProgramTemplate:
             )
         return cls(tuple(calls))
 
-    @classmethod
-    def plan(cls, capture: ProgramCapture) -> ProgramTemplate:
-        """Build Program operation metadata without producing target executables."""
-
-        calls: list[KernelCallTemplate] = []
-        for captured in capture.calls:
-            frontend, _, builtin_names, _ = captured.kernel._lower(captured.arguments, captured.features)
-            parameter_names = tuple(
-                name for name in inspect.signature(captured.kernel._function).parameters if name not in builtin_names
-            )
-            if len(parameter_names) != len(captured.arguments):
-                raise TypeError(f"{captured.kernel.__name__} expects {len(parameter_names)} launch arguments")
-            entry = next(
-                (function for function in frontend.typed_functions if function.source.name == captured.kernel._entry),
-                None,
-            )
-            if entry is None or entry.storage_activity is None:
-                raise RuntimeError(f"compiled kernel {captured.kernel.__name__!r} has no typed storage activity")
-            parameters = tuple(
-                KernelParameter(
-                    parameter.name,
-                    parameter.access.value,
-                    parameter.type.kind == "tensor_view" and parameter.name in entry.storage_activity.readable_roots,
-                    bool(entry.storage_activity.dependencies_for(parameter.name)),
-                )
-                for parameter in entry.parameters
-                if parameter.name in parameter_names
-            )
-            calls.append(
-                KernelCallTemplate(
-                    captured.name,
-                    captured.kernel,
-                    parameter_names,
-                    parameters,
-                    captured.grid,
-                    captured.features,
-                )
-            )
-        return cls(tuple(calls))
-
     def bind(self, capture: ProgramCapture, outputs: Any) -> ProgramInvocation:
         if len(capture.calls) != len(self.calls):
             raise RuntimeError("Module control flow changed for an existing Program specialization")
@@ -200,7 +180,18 @@ class ProgramTemplate:
         for name, value in capture.inputs.items():
             graph.import_input(name, value)
         operation_bindings: dict[int, tuple[Any, ...]] = {}
-        for template, captured in zip(self.calls, capture.calls, strict=True):
+        kernel_index = 0
+        for captured in capture.ops:
+            if isinstance(captured, CapturedAlloc):
+                graph.append_alloc(
+                    buffer=captured.result,
+                    name=captured.kind,
+                    like=captured.like,
+                    values=captured.values,
+                )
+                continue
+            template = self.calls[kernel_index]
+            kernel_index += 1
             if (
                 template.kernel is not captured.kernel
                 or template.grid != captured.grid
@@ -260,14 +251,20 @@ class ModuleVjpExpression:
         return execute_module_vjp(self, arguments, keywords)
 
 
-def _capture_module(
-    module: Any,
-    arguments: tuple[Any, ...],
-    keywords: Mapping[str, Any],
-) -> tuple[ProgramCapture, Any]:
+def _capture_module(module: Any, parameter_types: Mapping[str, Any]) -> tuple[ProgramCapture, Any]:
     from .frontend.module_ast import interpret_module_forward
 
-    return interpret_module_forward(module, arguments, keywords)
+    return interpret_module_forward(module, parameter_types)
+
+
+def _bind_forward_arguments(module: Any, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> dict[str, Any]:
+    bound = inspect.signature(module.forward).bind(*arguments, **keywords)
+    bound.apply_defaults()
+    return dict(bound.arguments)
+
+
+def _access_name(access: Any) -> str:
+    return str(getattr(access, "name", access))
 
 
 def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
@@ -371,16 +368,16 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
     return infer(module)
 
 
-def _inferred_module_arguments(module: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
+def _module_parameter_types(module: Any) -> dict[str, Any]:
+    from .frontend.module_ast import ModuleParameterType
     from .types import TypeExpr, dyn
 
     try:
         annotations = inspect.get_annotations(module.forward, eval_str=True)
     except (NameError, TypeError) as error:
         raise TypeError(f"cannot resolve {type(module).__name__}.forward annotations: {error}") from None
-    positional: list[Any] = []
-    keywords: dict[str, Any] = {}
     reflected = _reflect_module_parameter_types(module)
+    types: dict[str, Any] = {}
     for parameter in inspect.signature(module.forward).parameters.values():
         if parameter.default is not inspect.Parameter.empty:
             continue
@@ -401,18 +398,82 @@ def _inferred_module_arguments(module: Any) -> tuple[tuple[Any, ...], dict[str, 
             raise TypeError(
                 f"cannot infer dynamic shape for Module parameter {parameter.name!r} without an export argument"
             )
-        access_name = getattr(access, "name", access)
-        storage = TensorStorage.zeros(dtype=dtype, shape=tuple(shape))
-        value = (
-            storage.view(access=str(access_name))
-            if isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
-            else storage
+        as_view = isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
+        types[parameter.name] = ModuleParameterType(
+            dtype,
+            tuple(shape),
+            _access_name(access) if as_view else "read_write",
+            as_view,
         )
-        if parameter.kind is inspect.Parameter.POSITIONAL_ONLY:
-            positional.append(value)
-        else:
-            keywords[parameter.name] = value
-    return tuple(positional), keywords
+    return types
+
+
+def _parameter_types_from_values(
+    module: Any,
+    arguments: tuple[Any, ...],
+    keywords: Mapping[str, Any],
+) -> dict[str, Any]:
+    from .frontend.module_ast import ModuleParameterType
+    from .module import _tensor_dtype
+    from .types import TypeExpr
+
+    try:
+        annotations = inspect.get_annotations(module.forward, eval_str=True)
+    except (NameError, TypeError):
+        annotations = {}
+    types: dict[str, Any] = {}
+    for name, value in _bind_forward_arguments(module, arguments, keywords).items():
+        annotation = annotations.get(name)
+        as_view = isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
+        if isinstance(value, TensorView):
+            owner = value.owner
+            if not isinstance(owner, TensorStorage):
+                raise TypeError("Module.forward() TensorView parameters must borrow TensorStorage")
+            dtype = value.element_type if value.element_type is not None else _tensor_dtype(owner)
+            types[name] = ModuleParameterType(dtype, tuple(value.shape), str(value.access), True)
+            continue
+        if isinstance(value, TensorStorage):
+            access = "read_write"
+            if as_view and isinstance(annotation, TypeExpr) and len(annotation.arguments) == 3:
+                access = _access_name(annotation.arguments[2])
+            types[name] = ModuleParameterType(_tensor_dtype(value), tuple(value.shape), access, as_view)
+            continue
+        raise TypeError(
+            f"Module.forward() argument {name!r} must be TensorStorage or TensorView, got {type(value).__name__}"
+        )
+    return types
+
+
+def _rewrite_capture_inputs(capture: ProgramCapture, outputs: Any, inputs: Mapping[str, Any]) -> Any:
+    mapping = {id(placeholder): inputs[name] for name, placeholder in capture.inputs.items()}
+    capture.inputs = dict(inputs)
+    capture.ops = [
+        dataclasses.replace(
+            op,
+            arguments=tuple(mapping.get(id(argument), argument) for argument in op.arguments),
+        )
+        if isinstance(op, CapturedKernelCall)
+        else op
+        for op in capture.ops
+    ]
+    return _rewrite_value(outputs, mapping)
+
+
+def _rewrite_value(value: Any, mapping: Mapping[int, Any]) -> Any:
+    rewritten = mapping.get(id(value))
+    if rewritten is not None:
+        return rewritten
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return type(value)(
+            **{field.name: _rewrite_value(getattr(value, field.name), mapping) for field in dataclasses.fields(value)}
+        )
+    if isinstance(value, Mapping):
+        return {name: _rewrite_value(member, mapping) for name, member in value.items()}
+    if isinstance(value, tuple):
+        return tuple(_rewrite_value(member, mapping) for member in value)
+    if isinstance(value, list):
+        return [_rewrite_value(member, mapping) for member in value]
+    return value
 
 
 def _parse_module_program(
@@ -421,34 +482,17 @@ def _parse_module_program(
     keywords: Mapping[str, Any] | None = None,
 ) -> Any:
     supplied_keywords = {} if keywords is None else dict(keywords)
-    if not arguments and not supplied_keywords:
-        arguments, supplied_keywords = _inferred_module_arguments(module)
-    capture, outputs = _capture_module(
-        module,
-        arguments,
-        supplied_keywords,
+    parameter_types = (
+        _parameter_types_from_values(module, arguments, supplied_keywords)
+        if arguments or supplied_keywords
+        else _module_parameter_types(module)
     )
+    capture, outputs = _capture_module(module, parameter_types)
     template = ProgramTemplate.compile(capture)
     invocation = template.bind(capture, outputs)
-    allocation_initializers = {
-        invocation.graph.owner_id(value): initializer for value, initializer in capture.allocations.values()
-    }
     from .program_frontend import parse_program
 
-    return parse_program(invocation, allocation_initializers=allocation_initializers)
-
-
-def _plan_module_program(module: Any) -> Any:
-    arguments, keywords = _inferred_module_arguments(module)
-    capture, outputs = _capture_module(module, arguments, keywords)
-    template = ProgramTemplate.plan(capture)
-    invocation = template.bind(capture, outputs)
-    allocation_initializers = {
-        invocation.graph.owner_id(value): initializer for value, initializer in capture.allocations.values()
-    }
-    from .program_frontend import parse_program
-
-    return parse_program(invocation, allocation_initializers=allocation_initializers)
+    return parse_program(invocation)
 
 
 @dataclass(frozen=True)
@@ -461,8 +505,9 @@ class _AllocationSpec:
     def create(self) -> TensorStorage:
         if self.initializer == "from_values":
             return TensorStorage.from_values(self.values, dtype=self.dtype)
-        factory = TensorStorage.zeros if self.initializer == "zeros" else TensorStorage.empty
-        return factory(dtype=self.dtype, shape=self.shape)
+        if self.initializer in {"zeros", "zeros_like"}:
+            return TensorStorage.zeros(dtype=self.dtype, shape=self.shape)
+        return TensorStorage.empty(dtype=self.dtype, shape=self.shape)
 
 
 @dataclass(frozen=True)
@@ -476,24 +521,17 @@ class _ValueRecipe:
     dtype: Any = None
     element_type: Any = None
     constant: Any = None
+    as_view: bool = False
 
     def resolve(self, inputs: Mapping[str, Any], allocations: tuple[TensorStorage, ...]) -> Any:
         if self.source == "constant":
             return self.constant
         owner = inputs[self.key] if self.source == "input" else allocations[int(self.key)]
-        if self.shape is None:
-            return owner
         if isinstance(owner, TensorView):
             owner = owner.owner
-        return TensorView(
-            owner,
-            self.shape,
-            self.strides or (),
-            self.offset,
-            self.access,
-            dtype=self.dtype,
-            element_type=self.element_type,
-        )
+        if self.as_view:
+            return owner.view(access=self.access)
+        return owner
 
 
 @dataclass(frozen=True)
@@ -613,7 +651,9 @@ class _PrimalSpecialization:
         return self.outputs.resolve(inputs, allocations)
 
 
-def _lower_native_primal(capture: ProgramCapture) -> _NativePrimalPlan | None:
+def _specialize_native_primal(
+    calls: tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...],
+) -> _NativePrimalPlan | None:
     from ._runtime import session
 
     if session._architecture == session.cpu:
@@ -627,21 +667,21 @@ def _lower_native_primal(capture: ProgramCapture) -> _NativePrimalPlan | None:
     user_parameter_rows: list[tuple[str, ...]] = []
     caches: list[Any] = []
     previous = None
-    for operation_index, call in enumerate(capture.calls):
-        compiled = call.kernel._compile(call.arguments, call.features)
+    for operation_index, (kernel, _, grid, features) in enumerate(calls):
+        compiled = kernel.specialize(features)
         if compiled.native is None:
-            raise RuntimeError(f"KernelCallOp {call.name!r} did not produce a native pipeline")
+            raise RuntimeError(f"kernel {kernel.__name__!r} did not produce a native pipeline")
         user_parameters = tuple(
-            name for name in inspect.signature(call.kernel._function).parameters if name not in compiled.builtin_names
+            name for name in inspect.signature(kernel._function).parameters if name not in compiled.builtin_names
         )
         parameters = tuple(
             graph.parameter(f"{operation_index}.{parameter.name}") for parameter in compiled.native.parameters
         )
         execution_pass = _NativePipelineComputePass(
-            call.name,
+            f"{operation_index}.{kernel.__name__}",
             compiled.native,
             parameters,
-            call.grid,
+            grid,
         )
         if previous is not None:
             execution_pass.depends_on(previous)
@@ -651,7 +691,7 @@ def _lower_native_primal(capture: ProgramCapture) -> _NativePrimalPlan | None:
         compiled_rows.append(compiled)
         user_parameter_rows.append(user_parameters)
         caches.append(_NativeBindingCache())
-    if not capture.calls:
+    if not calls:
         return None
     return _NativePrimalPlan(
         graph.compile(),
@@ -668,48 +708,28 @@ def _primal_specialization(
     outputs: Any,
     invocation: ProgramInvocation,
 ) -> _PrimalSpecialization:
-    from .module import _tensor_dtype
-
-    input_owners: dict[int, str] = {}
-    for name, value in capture.inputs.items():
-        owner = value.owner if isinstance(value, TensorView) else value
-        if isinstance(owner, TensorStorage):
-            input_owners[id(owner)] = name
-    allocation_rows = tuple(capture.allocations.values())
-    allocation_indices = {id(value): index for index, (value, _) in enumerate(allocation_rows)}
+    input_ids = {id(value): name for name, value in capture.inputs.items()}
+    alloc_ids = {id(alloc.result): index for index, alloc in enumerate(capture.allocs)}
 
     def recipe(value: Any) -> _ValueRecipe:
-        owner = value.owner if isinstance(value, TensorView) else value
-        if isinstance(owner, TensorStorage):
-            identity = id(owner)
-            if identity in input_owners:
-                source, key = "input", input_owners[identity]
-            elif identity in allocation_indices:
-                source, key = "allocation", allocation_indices[identity]
+        if isinstance(value, GraphBuffer):
+            if id(value) in input_ids:
+                source, key = "input", input_ids[id(value)]
+            elif id(value) in alloc_ids:
+                source, key = "allocation", alloc_ids[id(value)]
             else:
                 raise TypeError(
-                    "Module.forward() captured an unregistered TensorStorage; "
+                    "Module.forward() captured an unregistered Program buffer; "
                     "use vd.empty(), vd.zeros(), vd.from_values(), or an invocation parameter"
                 )
-            if isinstance(value, TensorView):
-                return _ValueRecipe(
-                    source,
-                    key,
-                    tuple(value.shape),
-                    tuple(value.layout.element_strides),
-                    int(value.layout.element_offset),
-                    value.access,
-                    value.dtype,
-                    value.element_type,
-                )
-            return _ValueRecipe(source, key)
+            return _ValueRecipe(source, key, access=value.access, as_view=value.as_view)
         for name, supplied in capture.inputs.items():
             if value is supplied:
                 return _ValueRecipe("input", name)
         return _ValueRecipe("constant", constant=value)
 
     def tree(value: Any) -> _TreeRecipe:
-        if isinstance(value, (TensorStorage, TensorView)):
+        if isinstance(value, (GraphBuffer, TensorStorage, TensorView)):
             return _TreeRecipe("leaf", recipe(value))
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return _TreeRecipe(
@@ -728,15 +748,9 @@ def _primal_specialization(
         raise TypeError("Module output contains a value that cannot be reconstructed from Program IR")
 
     allocations = tuple(
-        _AllocationSpec(
-            _tensor_dtype(value),
-            tuple(value.shape),
-            initializer,
-            capture.allocation_constants.get(id(value)),
-        )
-        for value, initializer in allocation_rows
+        _AllocationSpec(alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values)
+        for alloc in capture.allocs
     )
-    allocation_initializers = {invocation.graph.owner_id(value): initializer for value, initializer in allocation_rows}
     calls = tuple(
         (
             call.kernel,
@@ -749,13 +763,13 @@ def _primal_specialization(
     from .program_frontend import parse_program
 
     return _PrimalSpecialization(
-        parse_program(invocation, allocation_initializers=allocation_initializers),
+        parse_program(invocation),
         invocation.template,
         inspect.signature(module.forward),
         allocations,
         calls,
         tree(outputs),
-        _lower_native_primal(capture),
+        _specialize_native_primal(calls),
     )
 
 
@@ -763,7 +777,7 @@ def execute_module_primal(module: Any, arguments: tuple[Any, ...], keywords: Map
     key = module._program_specialization_key(arguments, keywords, variant="primal")
     specialization = module._program_cache.get(key)
     if not isinstance(specialization, _PrimalSpecialization):
-        capture, outputs = _capture_module(module, arguments, keywords)
+        capture, outputs = _capture_module(module, _parameter_types_from_values(module, arguments, keywords))
         template = ProgramTemplate.compile(capture)
         invocation = template.bind(capture, outputs)
         specialization = _primal_specialization(module, capture, outputs, invocation)
@@ -777,7 +791,9 @@ def execute_module_vjp(
     keywords: Mapping[str, Any],
 ) -> tuple[Any, Any]:
     module = expression.module
-    capture, outputs = _capture_module(module, arguments, keywords)
+    inputs = _bind_forward_arguments(module, arguments, keywords)
+    capture, outputs = _capture_module(module, _parameter_types_from_values(module, arguments, keywords))
+    outputs = _rewrite_capture_inputs(capture, outputs, inputs)
     key = module._program_specialization_key(
         arguments,
         keywords,
@@ -801,14 +817,10 @@ def execute_module_vjp(
     selected_outputs = expression.outputs or tuple(invocation.graph.outputs)
     if set(selected_outputs) != set(invocation.graph.outputs):
         raise ValueError("Program autodiff currently requires all Module outputs")
-    allocation_initializers = {
-        invocation.graph.owner_id(value): initializer for value, initializer in capture.allocations.values()
-    }
     from .program_frontend import parse_program
 
     parsed_program = parse_program(
         invocation,
-        allocation_initializers=allocation_initializers,
         vjp_wrt=expression.wrt,
     )
     if not isinstance(specialization, ProgramAutodiffSpecialization):

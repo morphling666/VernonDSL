@@ -643,11 +643,11 @@ def _compile_module_bundle_plan(
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
 ) -> BundlePlan:
     from ..module import Module
-    from ..program import _plan_module_program
+    from ..program import _parse_module_program
 
     if not isinstance(declaration.program, Module):
         raise PipelineCompileError("pipeline asset declared a host Program that is not a Vernon Module")
-    parsed = _plan_module_program(declaration.program)
+    parsed = _parse_module_program(declaration.program)
     compiler = native.Compiler()
     variant_plans = [
         _compile_program_bundle_plan(

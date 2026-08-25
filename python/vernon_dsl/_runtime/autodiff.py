@@ -369,7 +369,8 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
         del direct.compiled[key]
         compiled = None
     if compiled is None:
-        frontend, function, builtins, _ = kernel._lower(arguments)
+        lowered = kernel._lower()
+        frontend, function, builtins = lowered.frontend, lowered.function, lowered.builtins
         structured = build_structured_vjp(
             runtime_state._native,
             frontend,

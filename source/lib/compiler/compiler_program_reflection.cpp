@@ -241,6 +241,8 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
 
         llvm::json::Array nodes;
         for (mlir::Operation &operation : function.getBody().front().without_terminator()) {
+            if (mlir::vernon::program::isStorageAllocIntrinsic(&operation))
+                continue;
             auto nodeId = operation.getAttrOfType<mlir::IntegerAttr>("vernon_program.node_id");
             auto stage = operation.getAttrOfType<mlir::StringAttr>("vernon_program.stage");
             auto operandIds = operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.operand_value_ids");

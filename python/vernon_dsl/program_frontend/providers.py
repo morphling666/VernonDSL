@@ -181,8 +181,8 @@ def _lower_builtin_add(
     output = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("write")
     left = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("read")
     right = TensorStorage.empty(dtype=vd.f32, shape=shape)._full_view("read")
-    kernel, arguments, _grid = program_add_invocation(output, left, right)
-    frontend, _, _, _ = kernel._lower(arguments)
+    kernel, _arguments, _grid = program_add_invocation(output, left, right)
+    frontend = kernel._lower().frontend
     return ProgramImplementation("vernon.builtin.add", kernel._entry, "compute", frontend.mlir)
 
 

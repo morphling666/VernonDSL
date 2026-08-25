@@ -764,10 +764,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             origin = llvm::json::Object{{"tag", "node_result"},
                                         {"graph", graph->getString("name").value_or("forward").str()},
                                         {"node", producer->second}};
-        else {
-            error = "canonical compute value has no logical origin";
-            return false;
-        }
+        else
+            origin = llvm::json::Object{{"tag", "allocation"},
+                                        {"graph", graph->getString("name").value_or("forward").str()}};
         const bool resource = resourceVersions.count(static_cast<int64_t>(expectedId));
         const bool opaqueResource = resource && (isTextureType(*type) || isSamplerType(*type));
         if (!opaqueResource && !layout) {
@@ -1625,6 +1624,20 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     for (size_t slot = 0; slot < argumentIds->size(); ++slot)
         graphInputs.emplace_back(llvm::json::Object{
             {"tag", "user_input"}, {"value", (*argumentIds)[slot]}, {"slot", static_cast<int64_t>(slot)}});
+    for (const llvm::json::Value &rowValue : values) {
+        const llvm::json::Object *row = rowValue.getAsObject();
+        const llvm::json::Object *origin = row ? row->getObject("origin") : nullptr;
+        if (!origin || origin->getString("tag") != "allocation")
+            continue;
+        const int64_t valueId = row->getInteger("id").value_or(-1);
+        auto storage = storageByValue.find(valueId);
+        if (storage == storageByValue.end()) {
+            error = "allocation origin has no Storage";
+            return false;
+        }
+        graphInputs.emplace_back(
+            llvm::json::Object{{"tag", "allocation"}, {"value", valueId}, {"storage", storage->second}});
+    }
     llvm::json::Array graphOutputs;
     for (const llvm::json::Value &value : *resultIds)
         graphOutputs.emplace_back(

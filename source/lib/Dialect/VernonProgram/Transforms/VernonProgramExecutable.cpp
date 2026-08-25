@@ -84,6 +84,13 @@ struct VernonProgramBuildExecutablePass final : PassWrapper<VernonProgramBuildEx
             }
             uint32_t nextNode = 0;
             for (Operation &operation : function.getBody().front().without_terminator()) {
+                if (isStorageAllocIntrinsic(&operation)) {
+                    for (Value result : operation.getResults()) {
+                        const uint32_t valueId = function == forward ? forwardIds.lookup(result) : nextValue++;
+                        values[result] = valueId;
+                    }
+                    continue;
+                }
                 if (!isa<ComputeOp, GraphicsOp>(operation)) {
                     operation.emitError(
                         "executable Program graph contains an operation without a selected implementation");

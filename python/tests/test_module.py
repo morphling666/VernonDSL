@@ -306,8 +306,15 @@ class ModuleTests(unittest.TestCase):
                 "FanIn.cube.module_cube",
             ),
         )
+        self.assertEqual(
+            tuple(operation.name for operation in parsed.forward.operations if operation.kind == "vernon.intrinsic"),
+            ("empty_like", "empty_like"),
+        )
+        self.assertEqual(parsed.forward.operations[0].operands[0][0], "source")
         self.assertIsNone(parsed.backward)
         self.assertIn("func.func @forward", parsed.mlir)
+        self.assertIn('name = "empty_like"', parsed.mlir)
+        self.assertIn('operand_names = ["source", "output"]', parsed.mlir)
         self.assertEqual(
             tuple((implementation.callee, implementation.entry) for implementation in parsed.implementations),
             (
@@ -340,7 +347,7 @@ class ModuleTests(unittest.TestCase):
             _parse_module_program(Ambiguous())
 
     def test_forward_rejects_host_from_numpy(self) -> None:
-        from vernon_dsl.frontend.module_ast import interpret_module_forward
+        from vernon_dsl.frontend.module_ast import ModuleParameterType, interpret_module_forward
 
         class HostAlloc(vd.Module):
             def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
@@ -349,16 +356,13 @@ class ModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "host session"):
             interpret_module_forward(
                 HostAlloc(),
-                (vd.storage.zeros(dtype=vd.f32, shape=(1,)),),
-                {},
+                {"source": ModuleParameterType(vd.f32, (1,))},
             )
 
     def test_typed_storage_activity_drives_program_dependencies(self) -> None:
-        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
-        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        compiled = module_square._compile((source, output), ())
+        lowered = module_square._lower()
         entry = next(
-            function for function in compiled.frontend.typed_functions if function.source.name == module_square._entry
+            function for function in lowered.frontend.typed_functions if function.source.name == module_square._entry
         )
         assert entry.storage_activity is not None
         self.assertEqual(entry.storage_activity.readable_roots, frozenset({"source"}))

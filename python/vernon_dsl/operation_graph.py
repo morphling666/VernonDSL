@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
@@ -12,14 +11,24 @@ from ._runtime.resources import TensorStorage, TensorView
 
 
 class OperationKind(Enum):
+    ALLOC = "alloc"
     KERNEL_CALL = "kernel_call"
+
+
+@dataclass
+class GraphBuffer:
+    """SSA symbol for a Program Storage full view. Not a runtime allocation."""
+
+    dtype: Any
+    shape: tuple[int, ...]
+    access: str
+    as_view: bool = False
 
 
 @dataclass(frozen=True)
 class ResourceType:
     shape: tuple[int, ...]
     dtype: str
-    byte_size: int
 
 
 @dataclass(frozen=True)
@@ -40,6 +49,16 @@ class KernelParameter:
 
 
 @dataclass(frozen=True)
+class AllocOp:
+    id: int
+    kind: OperationKind
+    name: str
+    like: int | None
+    values: Any
+    result: int
+
+
+@dataclass(frozen=True)
 class KernelCallOp:
     id: int
     kind: OperationKind
@@ -53,7 +72,9 @@ class KernelCallOp:
     features: tuple[str, ...]
 
 
-def _resource_owner(value: Any) -> TensorStorage | None:
+def _resource_owner(value: Any) -> Any | None:
+    if isinstance(value, GraphBuffer):
+        return value
     if isinstance(value, TensorStorage):
         return value
     if isinstance(value, TensorView) and isinstance(value.owner, TensorStorage):
@@ -61,23 +82,19 @@ def _resource_owner(value: Any) -> TensorStorage | None:
     return None
 
 
-def _resource_type(value: TensorStorage | TensorView) -> ResourceType:
-    return ResourceType(
-        tuple(value.shape),
-        str(value.dtype),
-        int(value.dtype.itemsize) * math.prod(value.shape),
-    )
+def _resource_type(value: Any) -> ResourceType:
+    return ResourceType(tuple(value.shape), str(getattr(value, "dtype", value)))
 
 
 class OperationGraph:
-    """Primal Module graph with conservative owner-level resource versioning."""
+    """Primal Module graph with owner-level resource versioning."""
 
     def __init__(self):
         self._values: list[ResourceVersion] = []
-        self._operations: list[KernelCallOp] = []
+        self._nodes: list[AllocOp | KernelCallOp] = []
         self._current: dict[int, int] = {}
         self._owner_ids: dict[int, int] = {}
-        self._owner_objects: dict[int, TensorStorage] = {}
+        self._owner_objects: dict[int, Any] = {}
         self._inputs: dict[str, int] = {}
         self._outputs: dict[str, int] = {}
 
@@ -86,8 +103,12 @@ class OperationGraph:
         return tuple(self._values)
 
     @property
+    def nodes(self) -> tuple[AllocOp | KernelCallOp, ...]:
+        return tuple(self._nodes)
+
+    @property
     def operations(self) -> tuple[KernelCallOp, ...]:
-        return tuple(self._operations)
+        return tuple(node for node in self._nodes if isinstance(node, KernelCallOp))
 
     @property
     def inputs(self) -> Mapping[str, int]:
@@ -101,11 +122,26 @@ class OperationGraph:
         owner = _resource_owner(value)
         if owner is None:
             return
-        version = self._current_version(value)
+        version = self._define_version(value, producer=None)
         existing = self._inputs.get(name)
         if existing is not None and existing != version:
             raise ValueError(f"Module input {name!r} was imported with inconsistent resource versions")
         self._inputs[name] = version
+
+    def append_alloc(
+        self,
+        *,
+        buffer: GraphBuffer,
+        name: str,
+        like: GraphBuffer | None = None,
+        values: Any = None,
+    ) -> AllocOp:
+        operation_id = len(self._nodes)
+        like_id = None if like is None else self._current_version(like)
+        result = self._define_version(buffer, producer=operation_id)
+        operation = AllocOp(operation_id, OperationKind.ALLOC, name, like_id, values, result)
+        self._nodes.append(operation)
+        return operation
 
     def append_kernel(
         self,
@@ -118,7 +154,7 @@ class OperationGraph:
         grid: tuple[int, int, int],
         features: tuple[str, ...],
     ) -> KernelCallOp:
-        operation_id = len(self._operations)
+        operation_id = len(self._nodes)
         inputs: dict[str, int] = {}
         outputs: dict[str, int] = {}
         for parameter in parameters:
@@ -127,8 +163,7 @@ class OperationGraph:
             if owner is None:
                 continue
             before = self._current_version(value)
-            if parameter.access in {"read", "read_write"}:
-                inputs[parameter.name] = before
+            inputs[parameter.name] = before
             if parameter.access in {"write", "read_write"}:
                 outputs[parameter.name] = self._advance(value, operation_id)
         operation = KernelCallOp(
@@ -143,7 +178,7 @@ class OperationGraph:
             grid,
             features,
         )
-        self._operations.append(operation)
+        self._nodes.append(operation)
         return operation
 
     def set_outputs(self, outputs: Mapping[str, Any]) -> None:
@@ -152,19 +187,17 @@ class OperationGraph:
             if _resource_owner(value) is not None:
                 resolved[path] = self._current_version(value)
         if not resolved:
-            raise ValueError("Module.forward() must return at least one TensorStorage or TensorView")
+            raise ValueError("Module.forward() must return at least one Program buffer")
         self._outputs = resolved
         self._validate()
 
-    def owner_id(self, value: TensorStorage | TensorView) -> int:
-        """Return the stable owner ID assigned during this graph capture."""
-
+    def owner_id(self, value: Any) -> int:
         owner = _resource_owner(value)
         if owner is None or id(owner) not in self._owner_ids:
             raise ValueError("resource is not present in this Program graph")
         return self._owner_ids[id(owner)]
 
-    def _current_version(self, value: TensorStorage | TensorView) -> int:
+    def _owner(self, value: Any) -> int:
         owner = _resource_owner(value)
         assert owner is not None
         identity = id(owner)
@@ -175,17 +208,26 @@ class OperationGraph:
             self._owner_objects[identity] = owner
         elif self._owner_objects[identity] is not owner:
             raise RuntimeError("Python resource identity collision during Program capture")
+        return owner_id
+
+    def _define_version(self, value: Any, *, producer: int | None) -> int:
+        owner_id = self._owner(value)
         existing = self._current.get(owner_id)
         if existing is not None:
             return existing
         value_id = len(self._values)
-        self._values.append(ResourceVersion(value_id, owner_id, 0, _resource_type(value), None))
+        self._values.append(ResourceVersion(value_id, owner_id, 0, _resource_type(value), producer))
         self._current[owner_id] = value_id
         return value_id
 
-    def _advance(self, value: TensorStorage | TensorView, producer: int) -> int:
-        owner = _resource_owner(value)
-        assert owner is not None
+    def _current_version(self, value: Any) -> int:
+        owner_id = self._owner(value)
+        existing = self._current.get(owner_id)
+        if existing is not None:
+            return existing
+        return self._define_version(value, producer=None)
+
+    def _advance(self, value: Any, producer: int) -> int:
         previous = self._values[self._current_version(value)]
         value_id = len(self._values)
         self._values.append(
@@ -195,16 +237,23 @@ class OperationGraph:
         return value_id
 
     def _validate(self) -> None:
-        produced: set[int] = {value.id for value in self._values if value.producer is None}
-        for operation in self._operations:
-            if any(value not in produced for value in operation.inputs.values()):
-                raise ValueError(f"KernelCallOp {operation.name!r} consumes an unavailable resource version")
-            produced.update(operation.outputs.values())
+        produced: set[int] = set(self._inputs.values())
+        for node in self._nodes:
+            if isinstance(node, AllocOp):
+                if node.like is not None and node.like not in produced:
+                    raise ValueError(f"AllocOp {node.name!r} copies an unavailable resource version")
+                produced.add(node.result)
+                continue
+            if any(value not in produced for value in node.inputs.values()):
+                raise ValueError(f"KernelCallOp {node.name!r} consumes an unavailable resource version")
+            produced.update(node.outputs.values())
         if any(value not in produced for value in self._outputs.values()):
             raise ValueError("Module output refers to an unavailable resource version")
 
 
 __all__ = [
+    "AllocOp",
+    "GraphBuffer",
     "KernelCallOp",
     "KernelParameter",
     "OperationGraph",

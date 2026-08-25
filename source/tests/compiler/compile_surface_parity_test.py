@@ -396,7 +396,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)
         frontend_tensor = vd.storage.from_numpy(source)
-        frontend, _, _, _ = scale._lower((frontend_tensor, 2.5))
+        frontend = scale._lower().frontend
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
         reflection = json.loads(program.reflection)

@@ -174,6 +174,8 @@ struct VernonProgramSelectImplementationsPass final
                         values.insert(name);
                     return values;
                 }();
+                if (isStorageAllocIntrinsic(operation))
+                    return;
                 if (supported.contains(intrinsic.getName()))
                     semanticOperations.push_back(operation);
                 return;
@@ -220,7 +222,8 @@ struct VernonProgramSelectImplementationsPass final
             if (!function->hasAttr("vernon_program.graph"))
                 return;
             function.walk([&](Operation *operation) {
-                if (operation == function || isa<ComputeOp, GraphicsOp, func::ReturnOp>(operation))
+                if (operation == function || isa<ComputeOp, GraphicsOp, func::ReturnOp>(operation) ||
+                    isStorageAllocIntrinsic(operation))
                     return;
                 operation->emitError("has no selected Program implementation");
                 unsupported = true;

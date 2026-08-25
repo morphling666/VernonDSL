@@ -41,6 +41,16 @@ def _session_state() -> Any:
     return importlib.import_module("vernon_dsl._runtime.session")
 
 
+@dataclass(frozen=True)
+class _LoweredKernel:
+    """Source + annotations compiled to MLIR. No target, no runtime tensors."""
+
+    frontend: FrontendCompileResult
+    function: ast.FunctionDef
+    source: ast.FunctionDef
+    builtins: tuple[str, ...]
+
+
 @dataclass
 class _CompiledKernel:
     mlir: str
@@ -63,8 +73,9 @@ class _DependencyTracked(Protocol):
 
 
 class Kernel:
+    """Device kernel: lower source to MLIR, specialize MLIR to a native artifact, bind tensors at launch."""
+
     _cache: ClassVar[dict[str, _CompiledKernel]] = {}
-    _dispatch_cache: ClassVar[dict[tuple[Any, ...], _CompiledKernel]] = {}
     _instances: ClassVar[weakref.WeakSet[Kernel]] = weakref.WeakSet()
 
     def __init__(self, function: Any, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)):
@@ -86,7 +97,6 @@ class Kernel:
     @classmethod
     def clear_cache(cls) -> None:
         cls._cache.clear()
-        cls._dispatch_cache.clear()
         from .autodiff import clear_vjp_cache
 
         clear_vjp_cache()
@@ -162,7 +172,7 @@ class Kernel:
         )
 
     @staticmethod
-    def _load_native(compiled: _CompiledKernel, state: Any, entry: str) -> None:
+    def _load_native(compiled: _CompiledKernel, state: Any) -> None:
         if compiled.native is not None and compiled.native_generation == state._runtime_generation:
             return
         cpu_stages = (
@@ -378,16 +388,60 @@ class Kernel:
                     f"kernel TensorView argument {name!r} access {value.access!r} does not satisfy {declared_access!r}"
                 )
 
-    def _lower(
+    def _annotation_shapes(self, frontend: FrontendCompileResult) -> dict[str, tuple[int, ...]]:
+        entry = next(
+            (function for function in frontend.typed_functions if function.source.name == self._entry),
+            None,
+        )
+        if entry is None:
+            return {}
+        shapes: dict[str, tuple[int, ...]] = {}
+        for parameter in entry.parameters:
+            if parameter.type.kind != "tensor_view":
+                continue
+            shape = parameter.type.arguments[1]
+            if isinstance(shape, tuple) and all(isinstance(extent, int) for extent in shape):
+                shapes[parameter.name] = tuple(int(extent) for extent in shape)
+        return shapes
+
+    def _resource_shapes(
         self,
+        lowered: _LoweredKernel,
         arguments: tuple[Any, ...],
-        features: tuple[str, ...] = (),
-    ) -> tuple[
-        FrontendCompileResult,
-        ast.FunctionDef,
-        tuple[str, ...],
-        dict[str, TensorStorage | TensorView],
-    ]:
+    ) -> dict[str, tuple[int, ...]]:
+        names = [argument.arg for argument in lowered.source.args.args if argument.arg not in lowered.builtins]
+        return {
+            name: tuple(value.shape)
+            for name, value in zip(names, arguments, strict=True)
+            if isinstance(value, (TensorStorage, TensorView, _TextureResource))
+        }
+
+    def _bind_launch(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> None:
+        user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
+        self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
+
+    def _session_target(self) -> tuple[Any, Any, Any]:
+        state = _session_state()
+        if state._native is None or state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
+        target = {
+            state.cpu: state._native.Target.CPU,
+            state.cuda: state._native.Target.CUDA,
+            state.vulkan: state._native.Target.VULKAN,
+            state.directx: state._native.Target.DIRECTX,
+            state.metal: state._native.Target.METAL,
+            state.opengl: state._native.Target.OPENGL,
+            state.opengles: state._native.Target.OPENGL_ES,
+        }.get(state._architecture)
+        options = make_target_options(
+            state._architecture.name,
+            {"version": state._interactive_glsl_version()}
+            if state._architecture in {state.opengl, state.opengles}
+            else {},
+        )
+        return state, target, options
+
+    def _lower(self, features: tuple[str, ...] = ()) -> _LoweredKernel:
         source = self._file.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(self._file))
         function = next(
@@ -397,12 +451,6 @@ class Kernel:
         if function is None:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
-        user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
-        tensors = {
-            name: value
-            for name, value in zip(user_parameters, normalized_arguments, strict=True)
-            if isinstance(value, (TensorStorage, TensorView))
-        }
         loaded_names = {
             node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
         }
@@ -420,12 +468,11 @@ class Kernel:
             self._workgroup_size,
         )
         frontend = Compiler().compile_request(request)
-        self._validate_tensor_view_arguments(frontend, user_parameters, normalized_arguments)
         specialized_tree = ast.parse(frontend.specialized_source, filename=str(self._file))
         specialized_function = next(
             node for node in specialized_tree.body if isinstance(node, ast.FunctionDef) and node.name == self._entry
         )
-        return frontend, specialized_function, builtins, tensors
+        return _LoweredKernel(frontend, specialized_function, function, builtins)
 
     def compile_artifact(self, *arguments: Any, target: str) -> tuple[bytes, str]:
         state = _session_state()
@@ -442,13 +489,15 @@ class Kernel:
         }
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
-        frontend, _, _, _ = self._lower(arguments)
+        lowered = self._lower()
+        if arguments:
+            self._bind_launch(lowered, arguments)
         options = make_target_options(
             target,
             {"version": 430} if target == "opengl" else {"version": 310} if target == "opengles" else {},
         )
         program = state._native.Compiler().compile_program_result(
-            frontend.mlir, targets[target], **options.native_options
+            lowered.frontend.mlir, targets[target], **options.native_options
         )
         if not program.ok:
             raise RuntimeError(program.diagnostics)
@@ -456,55 +505,18 @@ class Kernel:
             raise RuntimeError("kernel compilation must produce exactly one artifact")
         return bytes(program.artifacts[0][1]), str(program.reflection)
 
-    def _compile(self, arguments: tuple[Any, ...], features: tuple[str, ...] = ()) -> _CompiledKernel:
-        state = _session_state()
-        if state._native is None or state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
-        target = (
-            {
-                state.cpu: state._native.Target.CPU,
-                state.cuda: state._native.Target.CUDA,
-                state.vulkan: state._native.Target.VULKAN,
-                state.directx: state._native.Target.DIRECTX,
-                state.metal: state._native.Target.METAL,
-                state.opengl: state._native.Target.OPENGL,
-                state.opengles: state._native.Target.OPENGL_ES,
-            }.get(state._architecture)
-            if state._native is not None
-            else None
-        )
-        options = make_target_options(
-            state._architecture.name,
-            {"version": state._interactive_glsl_version()}
-            if state._architecture in {state.opengl, state.opengles}
-            else {},
-        )
-        dispatch_key = self._dispatch_key(arguments, features, options.target, tuple(sorted(options.options.items())))
-        cached = self._dispatch_cache.get(dispatch_key)
-        if cached is not None and self._dependencies_current(cached):
-            entry = next(
-                (function for function in cached.frontend.typed_functions if function.source.name == self._entry),
-                None,
-            )
-            if entry is None:
-                raise RuntimeError("compiled kernel has no typed entry function")
-            typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
-            user_parameters = [
-                parameter.name for parameter in entry.parameters if parameter.name not in cached.builtin_names
-            ]
-            if len(arguments) != len(user_parameters):
-                raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
-            normalized_arguments = tuple(
-                value._full_view(typed_parameters[name].type.arguments[2])
-                if isinstance(value, TensorStorage) and typed_parameters[name].type.kind == "tensor_view"
-                else value
-                for name, value in zip(user_parameters, arguments, strict=True)
-            )
-            self._validate_tensor_view_arguments(cached.frontend, user_parameters, normalized_arguments)
-            self._load_native(cached, state, self._entry)
-            return cached
+    def specialize(
+        self,
+        features: tuple[str, ...] = (),
+        *,
+        shapes: Mapping[str, tuple[int, ...]] | None = None,
+        lowered: _LoweredKernel | None = None,
+    ) -> _CompiledKernel:
+        """Lowered MLIR + session target → native artifact. Runtime tensors are not inputs."""
 
-        frontend, function, builtins, _ = self._lower(arguments, features)
+        state, target, options = self._session_target()
+        lowered = lowered or self._lower(features)
+        frontend = lowered.frontend
         key = hashlib.sha256(
             canonical_json(
                 {
@@ -516,90 +528,86 @@ class Kernel:
             ).encode()
         ).hexdigest()
         cached = self._cache.get(key)
-        if cached is None:
-            if target is None:
-                raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
-            native_compiler = state._native.Compiler()
-            planned = native_compiler.plan_kernel_result(frontend.mlir)
-            if not planned.ok:
-                raise RuntimeError(planned.diagnostics)
-            plan_reflection = parse_reflection_json(planned.reflection)
-            requests = plan_reflection.get("kernel_compile_requests")
-            execution = plan_reflection.get("execution")
-            values = execution.get("values") if isinstance(execution, Mapping) else None
-            if not isinstance(requests, list) or len(requests) != 1 or not isinstance(requests[0], Mapping):
-                raise RuntimeError("direct kernel planning must produce exactly one compile request")
-            if not isinstance(values, list):
-                raise RuntimeError("direct kernel planning produced no executable values")
-            request = requests[0]
-            request_id = request.get("id")
-            if not isinstance(request_id, str) or not request_id:
-                raise RuntimeError("direct kernel planning produced an invalid compile request id")
-            from ..program_frontend.providers import DirectKernelDslProvider
+        if cached is not None:
+            if not cached.dependency_hashes:
+                cached.dependency_hashes = self._dependency_hashes(frontend)
+            if self._dependencies_current(cached):
+                self._load_native(cached, state)
+                return cached
+            del self._cache[key]
+        if target is None:
+            raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
+        native_compiler = state._native.Compiler()
+        planned = native_compiler.plan_kernel_result(frontend.mlir)
+        if not planned.ok:
+            raise RuntimeError(planned.diagnostics)
+        plan_reflection = parse_reflection_json(planned.reflection)
+        requests = plan_reflection.get("kernel_compile_requests")
+        execution = plan_reflection.get("execution")
+        values = execution.get("values") if isinstance(execution, Mapping) else None
+        if not isinstance(requests, list) or len(requests) != 1 or not isinstance(requests[0], Mapping):
+            raise RuntimeError("direct kernel planning must produce exactly one compile request")
+        if not isinstance(values, list):
+            raise RuntimeError("direct kernel planning produced no executable values")
+        request = requests[0]
+        request_id = request.get("id")
+        if not isinstance(request_id, str) or not request_id:
+            raise RuntimeError("direct kernel planning produced an invalid compile request id")
+        from ..program_frontend.providers import DirectKernelDslProvider
 
-            implementation = DirectKernelDslProvider(frontend.mlir, self._entry).lower(
-                request,
-                {
-                    value["id"]: value
-                    for value in values
-                    if isinstance(value, Mapping) and isinstance(value.get("id"), int)
-                },
-            )
-            if implementation is None:
-                raise RuntimeError("direct kernel provider did not match the C++ compile request")
-            program = native_compiler.compile_program_result(implementation.mlir, target, **options.native_options)
-            if not program.ok:
-                raise RuntimeError(program.diagnostics)
-            from .._shader_assets.cooking import _canonical_kernel_deployment, _direct_compiled_stage
+        implementation = DirectKernelDslProvider(frontend.mlir, self._entry).lower(
+            request,
+            {value["id"]: value for value in values if isinstance(value, Mapping) and isinstance(value.get("id"), int)},
+        )
+        if implementation is None:
+            raise RuntimeError("direct kernel provider did not match the C++ compile request")
+        program = native_compiler.compile_program_result(implementation.mlir, target, **options.native_options)
+        if not program.ok:
+            raise RuntimeError(program.diagnostics)
+        from .._shader_assets.cooking import _canonical_kernel_deployment, _direct_compiled_stage
 
-            canonical_directory = tempfile.TemporaryDirectory(prefix="vernon-kernel-")
-            user_names = [argument.arg for argument in function.args.args if argument.arg not in builtins]
-            concrete_shapes = {
-                name: tuple(value.shape)
-                for name, value in zip(user_names, arguments, strict=True)
-                if isinstance(value, (TensorStorage, TensorView, _TextureResource))
-            }
-            canonical_stage = _direct_compiled_stage(program, target=options, entry=implementation.entry)
-            finalized = native_compiler.finalize_program_result(
-                planned.reflection,
-                [
-                    (
-                        request_id,
-                        canonical_stage.id,
-                        canonical_stage.entry,
-                        canonical_json(dict(canonical_stage.reflection)),
-                    )
-                ],
-                [(request_id, name, list(shape)) for name, shape in sorted(concrete_shapes.items())],
-            )
-            if not finalized.ok:
-                raise RuntimeError(finalized.diagnostics)
-            canonical_program, artifact_system, stage_bindings, canonical_stage = _canonical_kernel_deployment(
-                canonical_stage,
-                parse_reflection_json(finalized.reflection),
-                target=options,
-                request_id=request_id,
-                output=Path(canonical_directory.name),
-            )
-            cached = _CompiledKernel(
-                frontend.mlir,
-                function,
-                frontend,
-                builtins,
-                program,
-                canonical_directory,
-                json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
-                json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
-                dict(stage_bindings),
-                canonical_stage,
-                self._dependency_hashes(frontend),
-            )
-            self._cache[key] = cached
-            self.compile_count += 1
-        elif not cached.dependency_hashes:
-            cached.dependency_hashes = self._dependency_hashes(frontend)
-        self._dispatch_cache[dispatch_key] = cached
-        self._load_native(cached, state, self._entry)
+        canonical_directory = tempfile.TemporaryDirectory(prefix="vernon-kernel-")
+        concrete_shapes = dict(self._annotation_shapes(frontend))
+        if shapes:
+            concrete_shapes.update(shapes)
+        canonical_stage = _direct_compiled_stage(program, target=options, entry=implementation.entry)
+        finalized = native_compiler.finalize_program_result(
+            planned.reflection,
+            [
+                (
+                    request_id,
+                    canonical_stage.id,
+                    canonical_stage.entry,
+                    canonical_json(dict(canonical_stage.reflection)),
+                )
+            ],
+            [(request_id, name, list(shape)) for name, shape in sorted(concrete_shapes.items())],
+        )
+        if not finalized.ok:
+            raise RuntimeError(finalized.diagnostics)
+        canonical_program, artifact_system, stage_bindings, canonical_stage = _canonical_kernel_deployment(
+            canonical_stage,
+            parse_reflection_json(finalized.reflection),
+            target=options,
+            request_id=request_id,
+            output=Path(canonical_directory.name),
+        )
+        cached = _CompiledKernel(
+            frontend.mlir,
+            lowered.function,
+            frontend,
+            lowered.builtins,
+            program,
+            canonical_directory,
+            json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
+            json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
+            dict(stage_bindings),
+            canonical_stage,
+            self._dependency_hashes(frontend),
+        )
+        self._cache[key] = cached
+        self.compile_count += 1
+        self._load_native(cached, state)
         return cached
 
     def _bind_direct_arguments(
@@ -666,7 +674,9 @@ class Kernel:
         if return_submission and encoder is not None:
             raise ValueError("direct submission cannot encode into an existing command encoder")
         state = _session_state()
-        compiled = self._compile(arguments, features)
+        lowered = self._lower(features)
+        self._bind_launch(lowered, arguments)
+        compiled = self.specialize(features, shapes=self._resource_shapes(lowered, arguments), lowered=lowered)
         user_parameters = [
             argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
         ]
@@ -772,7 +782,9 @@ class Kernel:
         execution_pass: ComputePass,
     ) -> None:
         state = _session_state()
-        compiled = self._compile(arguments, features)
+        lowered = self._lower(features)
+        self._bind_launch(lowered, arguments)
+        compiled = self.specialize(features, shapes=self._resource_shapes(lowered, arguments), lowered=lowered)
         for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
             if not isinstance(value, (TensorStorage, TensorView, _TextureResource)):
                 continue

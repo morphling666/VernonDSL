@@ -70,17 +70,17 @@ def _constant_attribute(value: Any) -> str:
 
 def _forward_graph(
     invocation: Any,
-    allocation_initializers: Mapping[int, str],
     resource_types: Mapping[int, ProgramType],
     direction: str,
 ) -> ProgramGraph:
+    from ..operation_graph import AllocOp, KernelCallOp
+
     graph = invocation.graph
     values: dict[str, GraphValue] = {
         f"%v{value.id}": GraphValue(f"%v{value.id}", resource_types[value.id], "resource", value.id)
         for value in graph.values
     }
     arguments: list[GraphValue] = []
-    input_resource_ids = set(graph.inputs.values())
     for name, value_id in graph.inputs.items():
         ssa = f"%v{value_id}"
         if all(argument.name != ssa for argument in arguments):
@@ -101,42 +101,34 @@ def _forward_graph(
         scalar_inputs[id(value)] = ssa
 
     operations: list[GraphOperation] = []
-    next_synthetic_id = -1
-    consumed_values = {value_id for operation in graph.operations for value_id in operation.inputs.values()} | set(
-        graph.outputs.values()
-    )
-    for value in graph.values:
-        if (
-            value.producer is not None
-            or value.id in input_resource_ids
-            or value.version != 0
-            or value.id not in consumed_values
-        ):
-            continue
-        initializer = allocation_initializers.get(value.owner, "empty")
-        operations.append(
-            GraphOperation(
-                next_synthetic_id,
-                "vernon.intrinsic",
-                f"{initializer}.{value.owner}",
-                (),
-                (("result", f"%v{value.id}"),),
-                (("name", _quoted(initializer)),),
+    for node in graph.nodes:
+        if isinstance(node, AllocOp):
+            operands = (("source", f"%v{node.like}"),) if node.like is not None else ()
+            attributes: list[tuple[str, str]] = [("name", _quoted(node.name))]
+            if node.values is not None:
+                attributes.append(("payload", _quoted(json.dumps(node.values))))
+            operations.append(
+                GraphOperation(
+                    node.id,
+                    "vernon.intrinsic",
+                    node.name,
+                    operands,
+                    (("result", f"%v{node.result}"),),
+                    tuple(attributes),
+                )
             )
-        )
-        next_synthetic_id -= 1
-
-    for operation in graph.operations:
+            continue
+        if not isinstance(node, KernelCallOp):
+            continue
         operands: list[tuple[str, str]] = []
         constant_names: list[str] = []
         constant_values: list[str] = []
-        for parameter in operation.parameters:
-            if parameter.name in operation.inputs:
-                operands.append((parameter.name, f"%v{operation.inputs[parameter.name]}"))
+        access_by_name = {parameter.name: parameter.access for parameter in node.parameters}
+        for parameter in node.parameters:
+            if parameter.name in node.inputs:
+                operands.append((parameter.name, f"%v{node.inputs[parameter.name]}"))
                 continue
-            if parameter.name in operation.outputs:
-                continue
-            slot = operation.binding_slots[parameter.name]
+            slot = node.binding_slots[parameter.name]
             supplied = invocation.slots[slot]
             ssa = scalar_inputs.get(id(supplied))
             if ssa is None:
@@ -144,24 +136,38 @@ def _forward_graph(
                 constant_values.append(_constant_attribute(supplied))
             else:
                 operands.append((parameter.name, ssa))
-        results = tuple((name, f"%v{value}") for name, value in operation.outputs.items())
-        parsed = GraphOperation(
-            operation.id,
-            "vernon_program.compute",
-            operation.name,
-            tuple(operands),
-            results,
-            (
-                ("callee", _quoted(operation.name)),
-                ("grid", "array<i64: " + ", ".join(str(value) for value in operation.grid) + ">"),
-                ("features", _string_array(operation.features)),
-                ("operand_names", _string_array(tuple(name for name, _ in operands))),
-                ("result_names", _string_array(tuple(name for name, _ in results))),
-                ("constant_names", _string_array(tuple(constant_names))),
-                ("constant_values", "[" + ", ".join(constant_values) + "]"),
-            ),
+        results = tuple((name, f"%v{value}") for name, value in node.outputs.items())
+        operand_names = tuple(name for name, _ in operands)
+        result_names = tuple(name for name, _ in results)
+        resource_sources = []
+        for result_name in result_names:
+            resource_sources.append(str(operand_names.index(result_name)) if result_name in operand_names else "-1")
+        operations.append(
+            GraphOperation(
+                node.id,
+                "vernon_program.compute",
+                node.name,
+                tuple(operands),
+                results,
+                (
+                    ("callee", _quoted(node.name)),
+                    ("grid", "array<i64: " + ", ".join(str(value) for value in node.grid) + ">"),
+                    ("features", _string_array(node.features)),
+                    ("operand_names", _string_array(operand_names)),
+                    ("result_names", _string_array(result_names)),
+                    (
+                        "vernon_program.operand_accesses",
+                        _string_array(tuple(access_by_name.get(name, "read") for name in operand_names)),
+                    ),
+                    (
+                        "vernon_program.result_resource_sources",
+                        "array<i64: " + ", ".join(resource_sources) + ">",
+                    ),
+                    ("constant_names", _string_array(tuple(constant_names))),
+                    ("constant_values", "[" + ", ".join(constant_values) + "]"),
+                ),
+            )
         )
-        operations.append(parsed)
 
     results = [
         GraphValue(f"%v{value_id}", values[f"%v{value_id}"].type, f"output.{path}", value_id)
@@ -180,7 +186,6 @@ def _forward_graph(
 def parse_program(
     invocation: Any,
     *,
-    allocation_initializers: Mapping[int, str] | None = None,
     vjp_wrt: tuple[str, ...] = (),
 ) -> ParsedProgram:
     """Parse one captured Module specialization into a primal Program."""
@@ -189,8 +194,7 @@ def parse_program(
     resource_types: dict[int, ProgramType] = {}
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]] = {}
     for operation in invocation.graph.operations:
-        bindings = tuple(invocation.operation_bindings[operation.id])
-        frontend, _, _, _ = operation.kernel._lower(bindings, operation.features)
+        frontend = operation.kernel._lower(operation.features).frontend
         implementation = ProgramImplementation(operation.name, operation.kernel._entry, "compute", frontend.mlir)
         previous = implementations.get(operation.name)
         if previous is not None and previous.mlir != implementation.mlir:
@@ -243,7 +247,6 @@ def parse_program(
 
     forward = _forward_graph(
         invocation,
-        allocation_initializers or {},
         resource_types,
         "primal" if vjp_wrt else "forward",
     )
