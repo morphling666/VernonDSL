@@ -717,7 +717,7 @@ bool resolvePipelineTopology(VernonPipelineBundle &bundle, const Variant &varian
         return false;
     auto topology = std::make_shared<VernonPipelineTopology>();
     topology->execution = *variant.executable;
-    topology->residualValues = topology->execution.backwardCaptures();
+    topology->residualValues = topology->execution.residualCaptures();
 
     for (const ProgramGraph &graph : variant.executable->graphs) {
         for (const ProgramNode &node : graph.nodes) {
@@ -1093,8 +1093,15 @@ public:
             invocationDiagnostic(*pipeline_.context) = std::move(error);
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         }
-        return invokeBackendComputePipeline(pipeline_, plan) == VERNON_STATUS_OK ? VERNON_RHI_STATUS_OK
-                                                                                 : VERNON_RHI_STATUS_INTERNAL_ERROR;
+        const VernonStatus status = invokeBackendComputePipeline(pipeline_, plan);
+        if (status != VERNON_STATUS_OK) {
+            std::string &detail = invocationDiagnostic(*pipeline_.context);
+            if (detail.empty())
+                detail = "pipeline compute failed";
+            detail = node_.name + ": " + detail;
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        return VERNON_RHI_STATUS_OK;
     }
 
 private:
@@ -1149,7 +1156,13 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
     vernon::execution::ExecutionGraph executionGraph;
     std::vector<vernon::execution::GraphBuffer> resources;
     resources.reserve(valueArguments.size());
+    std::vector<char> used(execution.values.size());
+    vernon::runtime::markProgramGraphValues(graph, used);
     for (size_t index = 0; index < valueArguments.size(); ++index) {
+        if (index >= used.size() || !used[index]) {
+            resources.push_back({});
+            continue;
+        }
         const VernonPipelineArgument &argument = valueArguments[index];
         if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data)

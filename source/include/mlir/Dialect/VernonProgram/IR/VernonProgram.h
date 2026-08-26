@@ -16,6 +16,7 @@
 #include "llvm/ADT/StringRef.h"
 
 #include <optional>
+#include <string>
 
 #include "mlir/Dialect/VernonProgram/IR/VernonProgramDialect.h.inc"
 
@@ -37,10 +38,13 @@ inline llvm::StringRef getProgramOperandAccess(Operation *operation, unsigned in
 }
 
 /// Write-only DPS destinations are Storage objectives (kernel `outputs`), not
-/// local VJP `wrt`. Nested kernel bind keeps the callee's parameter names.
+/// local VJP `wrt`. Nested VJP dest operands are `gradient.<source>` so they
+/// do not share a name with a retained primal gather view.
 inline bool isWriteOnlyProgramOperand(Operation *operation, unsigned index) {
     return getProgramOperandAccess(operation, index) == "write";
 }
+
+inline std::string nestedVjpGradientDestName(llvm::StringRef source) { return ("gradient." + source).str(); }
 
 inline bool isProgramAllocIntrinsicName(llvm::StringRef name) {
     return name == "empty" || name == "empty_like" || name == "zeros" || name == "zeros_like" || name == "from_values";

@@ -57,7 +57,7 @@ const char *kBindings = R"([
     "autodiff_source": "pressure_a"
   },
   {
-    "parameter": "advected_velocity",
+    "parameter": "gradient.advected_velocity",
     "value": 3,
     "autodiff_role": "gradient",
     "autodiff_source": "advected_velocity"
@@ -136,7 +136,7 @@ TEST(CompilerProgramFinalization, RejectsUnmappedKernelGradient) {
 TEST(CompilerProgramFinalization, RejectsKernelCotangentProgramDidNotBind) {
     llvm::json::Value execution = executionWithBindings(R"([
   {
-    "parameter": "advected_velocity",
+    "parameter": "gradient.advected_velocity",
     "value": 3,
     "autodiff_role": "gradient",
     "autodiff_source": "advected_velocity"
@@ -144,7 +144,7 @@ TEST(CompilerProgramFinalization, RejectsKernelCotangentProgramDidNotBind) {
 ])");
     llvm::json::Value request = requestWithBindings(R"([
   {
-    "parameter": "advected_velocity",
+    "parameter": "gradient.advected_velocity",
     "value": 3,
     "autodiff_role": "gradient",
     "autodiff_source": "advected_velocity"
@@ -155,4 +155,57 @@ TEST(CompilerProgramFinalization, RejectsKernelCotangentProgramDidNotBind) {
     EXPECT_FALSE(vernon::compiler::normalizeProgramImplementationAbi(*execution.getAsObject(), *request.getAsObject(),
                                                                      *compiled.getAsObject(), error));
     EXPECT_EQ(error, "compiled kernel ABI requires unmapped Program value 'cotangent.divergence'");
+}
+
+TEST(CompilerProgramFinalization, BindsGradientDestByRoleNotPrimalName) {
+    const char *bindings = R"([
+  {
+    "parameter": "primal.projected_velocity",
+    "value": 1,
+    "autodiff_role": "retained_primal",
+    "autodiff_source": "projected_velocity"
+  },
+  {
+    "parameter": "gradient.projected_velocity",
+    "value": 2,
+    "autodiff_role": "gradient",
+    "autodiff_source": "projected_velocity"
+  }
+])";
+    llvm::json::Value execution = executionWithBindings(bindings);
+    llvm::json::Value request = requestWithBindings(bindings);
+    llvm::json::Value compiled = parse(R"({
+  "arguments": [
+    {
+      "vernon.source_name": "projected_velocity"
+    },
+    {
+      "vernon.source_name": "primal.projected_velocity",
+      "vernon.autodiff_role": "retained_primal",
+      "vernon.autodiff_source": "projected_velocity"
+    },
+    {
+      "vernon.source_name": "projected_velocity.x",
+      "vernon.autodiff_role": "gradient",
+      "vernon.autodiff_source": "projected_velocity"
+    }
+  ]
+})");
+    std::string error;
+    ASSERT_TRUE(vernon::compiler::normalizeProgramImplementationAbi(*execution.getAsObject(), *request.getAsObject(),
+                                                                    *compiled.getAsObject(), error))
+        << error;
+    const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
+    EXPECT_TRUE(hasParameter(requestBindings, "primal.projected_velocity"));
+    EXPECT_TRUE(hasParameter(requestBindings, "projected_velocity.x"));
+    EXPECT_FALSE(hasParameter(requestBindings, "projected_velocity"));
+    EXPECT_FALSE(hasParameter(requestBindings, "gradient.projected_velocity"));
+    const llvm::json::Array *nodeBindings = (*execution.getAsObject()->getArray("graphs"))[0]
+                                                .getAsObject()
+                                                ->getArray("nodes")
+                                                ->front()
+                                                .getAsObject()
+                                                ->getArray("bindings");
+    EXPECT_TRUE(hasParameter(nodeBindings, "projected_velocity.x"));
+    EXPECT_FALSE(hasParameter(nodeBindings, "projected_velocity"));
 }

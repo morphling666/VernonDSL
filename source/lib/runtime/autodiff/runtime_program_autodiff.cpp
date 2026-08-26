@@ -143,7 +143,7 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
             return error = "Program autodiff initial state size overflows", false;
         initialStateBytes += *bytes;
     }
-    for (uint32_t value : execution.backwardCaptures()) {
+    for (uint32_t value : execution.residualCaptures()) {
         if (!producers[value])
             continue;
         const ProgramValueSlot &slot = execution.values[value];
@@ -162,7 +162,7 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
         return false;
     const uint32_t retainBegin =
         result.checkpoint.replaySegments.empty() ? 0 : result.checkpoint.replaySegments.back().beginStep;
-    for (uint32_t value : execution.backwardCaptures()) {
+    for (uint32_t value : execution.residualCaptures()) {
         if (!producers[value] || *producers[value] >= retainBegin)
             result.retainedValues.push_back(value);
         else
@@ -244,11 +244,20 @@ bool programValueMatches(const VernonAdValue &value, const ValueAbi &abi) {
 
 bool applyBoundShape(HostProgramValue &host, StorageBacking *backing, const VernonAdValue &value,
                      const ProgramValueSlot &slot, const ValueLayout &layout, std::string &error) {
-    if (value.rank != slot.shape.size()) {
+    if (value.rank < slot.shape.size() || (value.rank && !value.shape)) {
         error = "Program autodiff bound value rank does not match its Program type";
         return false;
     }
-    host.runtimeShape.assign(value.shape, value.shape + value.rank);
+    // Host numpy may include trailing leaf axes (Vector/Matrix cells). Runtime extents
+    // are the TensorView prefix; extra axes are payload layout, not like-source shape.
+    host.runtimeShape.assign(value.shape, value.shape + slot.shape.size());
+    for (size_t dimension = 0; dimension < slot.shape.size(); ++dimension) {
+        // Reflection 0 is vd.dyn. A bound extent of 0 is an empty instantiation, not "unbound".
+        if (slot.shape[dimension] && host.runtimeShape[dimension] != slot.shape[dimension]) {
+            error = "Program autodiff bound value shape does not match its Program type";
+            return false;
+        }
+    }
     if (backing) {
         if (value.size > backing->bytes)
             backing->bytes = value.size;
@@ -303,14 +312,64 @@ struct ProgramLeafBinding {
     size_t elementCount{};
 };
 
+bool applyProgramBoundLeaves(const VernonAdValueSet &leaves, const std::vector<ValueAbi> &signature,
+                             const std::vector<ProgramLeafBinding> &bindings, const ExecutableProgram &execution,
+                             const std::vector<const ValueLayout *> &layouts, std::vector<HostProgramValue> &storage,
+                             std::map<uint32_t, StorageBacking> &backings, std::string &error) {
+    if (bindings.size() != signature.size() || leaves.value_count != signature.size())
+        return error = "Program autodiff leaf set does not match its canonical boundary", false;
+    for (size_t index = 0; index < bindings.size(); ++index) {
+        const ProgramLeafBinding &binding = bindings[index];
+        const VernonAdValue *value = findValue(leaves, signature[index].path);
+        if (!value || binding.value >= storage.size() || !programValueMatches(*value, signature[index])) {
+            error = "Program autodiff leaf does not match graph reflection";
+            return false;
+        }
+        const ProgramValueSlot &slot = execution.values[binding.value];
+        StorageBacking *backing = slot.storage ? &backings[*slot.storage] : nullptr;
+        if (!applyBoundShape(storage[binding.value], backing, *value, slot, *layouts[binding.value], error))
+            return false;
+        if (backing && backing->owner < storage.size() && storage[backing->owner].runtimeShape.empty())
+            storage[backing->owner].runtimeShape = storage[binding.value].runtimeShape;
+    }
+    return true;
+}
+
 bool materializeValues(const ExecutableProgram &execution, const Variant &variant,
                        std::vector<HostProgramValue> &storage, std::vector<VernonPipelineArgument> &arguments,
-                       const VernonAdValueSet *boundLeaves, const std::vector<ValueAbi> *boundSignature,
-                       const std::vector<ProgramLeafBinding> *boundBindings,
+                       const std::vector<char> &requiredValues, const VernonAdValueSet *boundLeaves,
+                       const std::vector<ValueAbi> *boundSignature,
+                       const std::vector<ProgramLeafBinding> *boundBindings, const VernonAdValueSet *resultLeaves,
+                       const std::vector<ValueAbi> *resultSignature,
+                       const std::vector<ProgramLeafBinding> *resultBindings,
                        const std::vector<std::vector<uint8_t>> *captures,
                        const std::vector<std::vector<uint64_t>> *captureShapes, std::string &error) {
     storage.assign(execution.values.size(), {});
     arguments.resize(execution.values.size());
+    std::vector<char> live = requiredValues;
+    live.resize(execution.values.size());
+    const auto mark = [&](uint32_t value) {
+        if (value < live.size())
+            live[value] = 1;
+    };
+    const auto markBindings = [&](const std::vector<ProgramLeafBinding> *bindings) {
+        if (!bindings)
+            return;
+        for (const ProgramLeafBinding &binding : *bindings)
+            mark(binding.value);
+    };
+    markBindings(boundBindings);
+    markBindings(resultBindings);
+    if (captures)
+        for (size_t value = 0; value < captures->size() && value < live.size(); ++value)
+            if (!(*captures)[value].empty())
+                mark(static_cast<uint32_t>(value));
+    std::vector<char> liveStorage(execution.storages.size());
+    for (const ProgramValueSlot &slot : execution.values) {
+        if (!live[slot.id] || !slot.storage || *slot.storage >= liveStorage.size())
+            continue;
+        liveStorage[*slot.storage] = 1;
+    }
     std::map<uint32_t, StorageBacking> backings;
     for (const ProgramStorageSlot &slot : execution.storages) {
         StorageBacking backing;
@@ -342,33 +401,26 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
             backing.sized = true;
         }
     }
-    if (boundLeaves && boundSignature && boundBindings) {
-        if (boundBindings->size() != boundSignature->size() || boundLeaves->value_count != boundSignature->size()) {
-            error = "Program autodiff leaf set does not match its canonical boundary";
-            return false;
-        }
-        for (size_t index = 0; index < boundBindings->size(); ++index) {
-            const ProgramLeafBinding &binding = (*boundBindings)[index];
-            const VernonAdValue *value = findValue(*boundLeaves, (*boundSignature)[index].path);
-            if (!value || binding.value >= storage.size() || !programValueMatches(*value, (*boundSignature)[index])) {
-                error = "Program autodiff leaf does not match graph reflection";
-                return false;
-            }
-            const ProgramValueSlot &slot = execution.values[binding.value];
-            StorageBacking *backing = slot.storage ? &backings[*slot.storage] : nullptr;
-            if (!applyBoundShape(storage[binding.value], backing, *value, slot, *layouts[binding.value], error))
-                return false;
-        }
-    }
+    if (boundLeaves && boundSignature && boundBindings &&
+        !applyProgramBoundLeaves(*boundLeaves, *boundSignature, *boundBindings, execution, layouts, storage, backings,
+                                 error))
+        return false;
+    if (resultLeaves && resultSignature && resultBindings &&
+        !applyProgramBoundLeaves(*resultLeaves, *resultSignature, *resultBindings, execution, layouts, storage,
+                                 backings, error))
+        return false;
     if (captures && captureShapes) {
         if (captures->size() != execution.values.size() || captureShapes->size() != execution.values.size()) {
             error = "Program autodiff capture state is incomplete";
             return false;
         }
-        for (uint32_t value : execution.backwardCaptures()) {
-            if (value >= storage.size() || (*captures)[value].empty())
+        for (size_t value = 0; value < captures->size(); ++value) {
+            if (value >= storage.size())
                 continue;
-            storage[value].runtimeShape = (*captureShapes)[value];
+            if (!(*captureShapes)[value].empty())
+                storage[value].runtimeShape = (*captureShapes)[value];
+            if ((*captures)[value].empty())
+                continue;
             const ProgramValueSlot &slot = execution.values[value];
             if (!slot.storage)
                 continue;
@@ -379,29 +431,30 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
         }
     }
     for (const ProgramStorageSlot &slot : execution.storages) {
+        if (slot.id >= liveStorage.size() || !liveStorage[slot.id])
+            continue;
         StorageBacking &backing = backings[slot.id];
         if (backing.sized)
             continue;
         if (slot.byteLengthExtents.empty()) {
-            error = "Program autodiff storage has no materializable backing";
+            const std::string ownerName =
+                slot.initialValue < execution.values.size() ? execution.values[slot.initialValue].name : std::string();
+            error = "Program autodiff storage '" + ownerName + "' has no bound buffer";
             return false;
         }
         size_t bytes = 0;
         std::vector<uint64_t> shape;
-        if (!evaluateOwnedExtents(slot, storage, layouts, bytes, shape, error)) {
-            if (captures)
-                return false;
-            error.clear();
-            backing.bytes = 1;
-            backing.sized = true;
-            continue;
-        }
+        if (!evaluateOwnedExtents(slot, storage, layouts, bytes, shape, error))
+            return false;
         backing.bytes = bytes;
         backing.sized = true;
         if (backing.owner < storage.size())
             storage[backing.owner].runtimeShape = shape;
     }
-    for (auto &[storageId, backing] : backings) {
+    for (const ProgramStorageSlot &slot : execution.storages) {
+        if (slot.id >= liveStorage.size() || !liveStorage[slot.id])
+            continue;
+        StorageBacking &backing = backings[slot.id];
         if (backing.owner >= storage.size() || !backing.bytes) {
             error = "Program autodiff storage has no materializable backing";
             return false;
@@ -409,6 +462,8 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
         storage[backing.owner].owned.resize(backing.bytes);
     }
     for (const ProgramValueSlot &slot : execution.values) {
+        if (!live[slot.id])
+            continue;
         HostProgramValue &value = storage[slot.id];
         void *hostData = nullptr;
         size_t byteSize = 0;
@@ -428,9 +483,8 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
             hostData = value.owned.data();
             byteSize = *bytes;
         } else {
-            value.owned.resize(1);
-            hostData = value.owned.data();
-            byteSize = 1;
+            error = "Program autodiff value has no storage";
+            return false;
         }
         if (!fillHostTensor(value, slot, *layouts[slot.id], byteSize, hostData, error))
             return false;
@@ -497,9 +551,26 @@ public:
         std::vector<HostProgramValue> storage;
         std::vector<VernonPipelineArgument> values;
         std::string error;
-        if (!materializeValues(topology_->execution, variant_, storage, values, cotangents,
+        std::vector<char> required(topology_->execution.values.size());
+        markProgramGraphValues(*backward, required);
+        if (plan_.replayEnd) {
+            const ProgramGraph *forward = findGraph(topology_->execution, "forward");
+            if (!forward)
+                return fail(*context_, "Program pullback replay has no forward graph");
+            ProgramGraph replay = *forward;
+            replay.nodes.resize(plan_.replayEnd);
+            markProgramGraphValues(replay, required);
+        }
+        for (uint32_t value : topology_->execution.residualCaptures())
+            if (value < required.size())
+                required[value] = 1;
+        for (uint32_t value : plan_.retainedValues)
+            if (value < required.size())
+                required[value] = 1;
+        if (!materializeValues(topology_->execution, variant_, storage, values, required, cotangents,
                                cotangents ? &signature_.cotangents : nullptr,
-                               cotangents ? &cotangentBindings_ : nullptr, &residuals_, &residualShapes_, error))
+                               cotangents ? &cotangentBindings_ : nullptr, &gradients, &signature_.gradients,
+                               &gradientBindings_, &residuals_, &residualShapes_, error))
             return fail(*context_, error);
         if (cotangents &&
             !transferLeaves(*cotangents, signature_.cotangents, cotangentBindings_, storage, false, error))
@@ -644,8 +715,14 @@ public:
         std::vector<HostProgramValue> storage;
         std::vector<VernonPipelineArgument> values;
         std::string error;
-        if (!materializeValues(topology->execution, variant_, storage, values, &inputs, &signature_.inputs,
-                               &inputBindings_, nullptr, nullptr, error) ||
+        std::vector<char> required(topology->execution.values.size());
+        markProgramGraphValues(*forward, required);
+        for (uint32_t value : topology->execution.residualCaptures())
+            if (value < required.size())
+                required[value] = 1;
+        if (!materializeValues(topology->execution, variant_, storage, values, required, &inputs, &signature_.inputs,
+                               &inputBindings_, outputs, &signature_.outputs, &outputBindings_, nullptr, nullptr,
+                               error) ||
             !transferLeaves(inputs, signature_.inputs, inputBindings_, storage, false, error))
             return fail(*context_, error);
         VernonLoadedPipeline proxy;
@@ -663,11 +740,13 @@ public:
             return fail(*context_, error);
         std::vector<std::vector<uint8_t>> residuals(topology->execution.values.size());
         std::vector<std::vector<uint64_t>> residualShapes(topology->execution.values.size());
-        for (uint32_t value : topology->execution.backwardCaptures())
+        for (uint32_t value : topology->execution.residualCaptures())
             residualShapes[value] = storage[value].runtimeShape;
         for (uint32_t value : plan.retainedValues) {
             const HostProgramValue &slot = storage[value];
             const auto *data = static_cast<const uint8_t *>(slot.argument.tensor.host_data);
+            if (!data || !slot.argument.tensor.byte_size)
+                return fail(*context_, "Program autodiff residual state is incomplete");
             residuals[value].assign(data, data + slot.argument.tensor.byte_size);
             residualShapes[value] = slot.runtimeShape;
         }

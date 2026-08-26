@@ -187,6 +187,8 @@ module {
         ASSERT_LT(static_cast<size_t>(resourceSources[0]), operation.getNumOperands());
         const unsigned destIndex = static_cast<unsigned>(resourceSources[0]);
         EXPECT_EQ(program::getProgramOperandAccess(operation, destIndex), "write");
+        ASSERT_LT(destIndex, operation.getOperandNames().size());
+        EXPECT_EQ(cast<StringAttr>(operation.getOperandNames()[destIndex]).getValue(), "gradient.source");
         auto dest = dyn_cast<TensorViewType>(operation.getOperand(destIndex).getType());
         ASSERT_TRUE(dest);
         EXPECT_EQ(dest.getAccess(), "read_write");
@@ -232,6 +234,60 @@ module {
     executable.addPass(program::createVernonProgramSelectImplementationsPass());
     executable.addPass(program::createVernonProgramBuildExecutablePass());
     EXPECT_TRUE(succeeded(executable.run(*module)));
+}
+
+TEST_F(VernonStructuredVjpTest, ProgramVjpBindsOnlyActiveResultCotangents) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @primal(
+      %source: !vernon.tensor_view<f32, [1], "read_write", "device">
+          {vernon.source_name = "source", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]},
+      %unused_dest: !vernon.tensor_view<f32, [1], "read_write", "device">
+          {vernon.source_name = "unused", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]})
+      -> (!vernon.tensor_view<f32, [1], "read_write", "device">
+              {vernon.source_name = "kept", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]})
+      attributes {vernon_program.graph = "primal"} {
+    %kept_dest = "vernon.intrinsic"(%source) {name = "empty_like",
+        vernon.abi_leaf_dtypes = ["f32"], vernon.dtype = "f32",
+        vernon_program.result_abi_leaf_dtypes = [["f32"]]}
+        : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
+          !vernon.tensor_view<f32, [1], "read_write", "device">
+    %kept, %unused = "vernon_program.compute"(%source, %kept_dest, %unused_dest) {
+      callee = "pair", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "kept", "unused"],
+      result_names = ["kept", "unused"],
+      vernon_program.operand_accesses = ["read", "write", "write"],
+      vernon_program.result_resource_sources = array<i64: 1, 2>,
+      vernon_program.result_abi_leaf_dtypes = [["f32"], ["f32"]]
+    } : (!vernon.tensor_view<f32, [1], "read_write", "device">,
+         !vernon.tensor_view<f32, [1], "read_write", "device">,
+         !vernon.tensor_view<f32, [1], "read_write", "device">) ->
+        (!vernon.tensor_view<f32, [1], "read_write", "device">,
+         !vernon.tensor_view<f32, [1], "read_write", "device">)
+    func.return %kept : !vernon.tensor_view<f32, [1], "read_write", "device">
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    ASSERT_TRUE(primal);
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    auto backward = module->lookupSymbol<func::FuncOp>("backward");
+    ASSERT_TRUE(backward);
+    program::ComputeOp nested;
+    backward.walk([&](program::ComputeOp operation) {
+        if (operation.getCallee() == "pair.vjp")
+            nested = operation;
+    });
+    ASSERT_TRUE(nested);
+    SmallVector<StringRef> names;
+    for (Attribute name : nested.getOperandNames())
+        names.push_back(cast<StringAttr>(name).getValue());
+    EXPECT_TRUE(llvm::is_contained(names, "cotangent.kept"));
+    EXPECT_FALSE(llvm::is_contained(names, "cotangent.unused"));
+    EXPECT_TRUE(succeeded(verify(*module)));
 }
 
 TEST_F(VernonStructuredVjpTest, AutodiffDerivativeValueLayoutUsesPhysicalPayloadAbi) {

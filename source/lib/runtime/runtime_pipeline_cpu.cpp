@@ -4,6 +4,7 @@
 #include "compute_launch_planner.h"
 
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace vernon::runtime {
@@ -63,7 +64,18 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
                 value.payload.inline_value.data = tensor->tensorViewData;
                 value.payload.inline_value.size = tensor->tensorViewSize;
             } else {
-                return fail(*pipeline.context, "CPU inline binding requires host data");
+                std::string detail = "CPU inline binding requires host data (argument " +
+                                     std::to_string(layout.argument_index) +
+                                     ", element_size=" + std::to_string(layout.element_size);
+                if (tensor)
+                    detail += ", tensorViewSize=" + std::to_string(tensor->tensorViewSize) +
+                              ", hasView=" + std::string(tensor->tensorViewData ? "yes" : "no");
+                else if (scalar)
+                    detail += ", scalarSize=" + std::to_string(scalar->size);
+                else
+                    detail += ", missing payload";
+                detail += ")";
+                return fail(*pipeline.context, std::move(detail));
             }
         }
     }

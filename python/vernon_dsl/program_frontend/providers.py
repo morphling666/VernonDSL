@@ -94,7 +94,11 @@ class CapturedVjpDslProvider:
                     seen_outputs.add(path)
                     outputs.append(path)
             elif role == "gradient":
-                path = source if isinstance(source, str) else (parameter if isinstance(parameter, str) else None)
+                path = (
+                    source
+                    if isinstance(source, str)
+                    else (parameter.removeprefix("gradient.") if isinstance(parameter, str) else None)
+                )
                 if path and path not in seen_wrt:
                     seen_wrt.add(path)
                     wrt.append(path)

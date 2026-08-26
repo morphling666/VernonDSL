@@ -378,15 +378,13 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 return reflected;
             };
             for (auto [index, name] : llvm::enumerate(operandNames))
-                bindings.emplace_back(
-                    llvm::json::Object{{"parameter", mlir::cast<mlir::StringAttr>(name).getValue().str()},
-                                       {"value", operandIds[index + operandOffset]}});
+                bindings.emplace_back(binding(name, operandIds[index + operandOffset], operandAutodiffRoles,
+                                              operandAutodiffSources, index));
             for (auto [index, name] : llvm::enumerate(resultNames))
                 if (!resultResourceSources || index >= static_cast<size_t>(resultResourceSources.size()) ||
                     resultResourceSources[index] < 0)
                     bindings.emplace_back(
-                        llvm::json::Object{{"parameter", mlir::cast<mlir::StringAttr>(name).getValue().str()},
-                                           {"value", resultIds[index]}});
+                        binding(name, resultIds[index], resultAutodiffRoles, resultAutodiffSources, index));
             node["bindings"] = std::move(bindings);
             node["resources"] = std::move(resources);
             llvm::json::Array grid;

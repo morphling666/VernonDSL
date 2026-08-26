@@ -296,11 +296,17 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
     execution.adSignature.cotangents = convertBindings(program.program.signature.cotangents);
     execution.adSignature.gradients = convertBindings(program.program.signature.gradients);
     execution.adSignature.declared = true;
+    if (program.program.residualContract) {
+        execution.adSignature.captures.reserve(program.program.residualContract->captures.size());
+        for (const ResidualCapture &capture : program.program.residualContract->captures)
+            execution.adSignature.captures.push_back(capture.value);
+    }
     for (size_t graphIndex = 0; graphIndex < program.program.graphs.size(); ++graphIndex) {
         const Graph &graph = program.program.graphs[graphIndex];
         ProgramGraph converted;
         converted.name = graph.name;
         converted.direction = graph.direction;
+        converted.captures = graph.captures;
         for (const GraphInput &input : graph.inputs)
             if (input.kind == GraphInputKind::UserInput)
                 converted.arguments.push_back(input.value);
@@ -337,7 +343,6 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
         }
         execution.graphs.push_back(std::move(converted));
     }
-    execution.adSignature.captures = execution.backwardCaptures();
     return true;
 }
 
@@ -367,7 +372,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
     auto topology = std::make_shared<VernonPipelineTopology>();
     if (!convertExecutableProgram(program, topology->execution, diagnostic))
         return nullptr;
-    topology->residualValues = topology->execution.backwardCaptures();
+    topology->residualValues = topology->execution.residualCaptures();
     for (const ResolvedExecutableNode &node : executable.nodes) {
         if (topology->stageIndices.find(node.node->stage) != topology->stageIndices.end())
             continue;

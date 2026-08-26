@@ -244,7 +244,7 @@ bool initializeDirectPipelineTopology(const Variant &variant, VernonLoadedPipeli
         topology->execution = *variant.executable;
     else if (!normalizeLegacySingleComputeExecution(variant, topology->execution, error))
         return false;
-    topology->residualValues = topology->execution.backwardCaptures();
+    topology->residualValues = topology->execution.residualCaptures();
     topology->directDispatch = true;
     pipeline.topology = std::move(topology);
     return true;

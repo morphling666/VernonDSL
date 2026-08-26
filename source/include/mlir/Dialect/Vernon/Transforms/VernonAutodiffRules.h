@@ -55,6 +55,7 @@ struct AutodiffVjpBuildContext {
     ValueRange primalResults;
     ValueRange resultCotangents;
     ArrayRef<unsigned> activeOperandIndices;
+    ArrayRef<unsigned> activeResultIndices{};
 
     Value getPrimalOperand(unsigned index) const {
         return index < primalOperands.size() ? primalOperands[index] : Value{};
@@ -64,6 +65,9 @@ struct AutodiffVjpBuildContext {
     }
     bool isOperandActive(unsigned index) const {
         return activeOperandIndices.empty() || llvm::is_contained(activeOperandIndices, index);
+    }
+    bool isResultActive(unsigned index) const {
+        return activeResultIndices.empty() || llvm::is_contained(activeResultIndices, index);
     }
 };
 

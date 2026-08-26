@@ -38,6 +38,6 @@ module {
 // CHECK-SAME: -> !vernon.tensor_view<f32, [1], "write", "device">
 // CHECK: "vernon_program.compute"
 // CHECK-SAME: callee = "square.vjp"
-// CHECK-SAME: operand_names = ["primal.source", "primal.output", "result.output", "cotangent.output"]
+// CHECK-SAME: operand_names = ["primal.source", "primal.output", "result.output", "cotangent.output", "gradient.source"]
 // CHECK-SAME: result_names = ["source"]}>
 // CHECK-NOT: name = "empty_like"

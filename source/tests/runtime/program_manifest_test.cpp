@@ -106,6 +106,12 @@ TEST(ProgramManifest, DerivesBackwardCapturesFromSharedForwardValues) {
         program.validate({{"Module.square", "compute.spv"}, {"Module.square_backward", "compute_backward.spv"}}, error))
         << error;
     EXPECT_EQ(program.backwardCaptures(), std::vector<uint32_t>({0, 1}));
+    program.adSignature.declared = true;
+    program.adSignature.captures = {0, 1};
+    EXPECT_EQ(program.residualCaptures(), std::vector<uint32_t>({0, 1}));
+    program.adSignature.captures = {0};
+    EXPECT_EQ(program.residualCaptures(), std::vector<uint32_t>({0}));
+    EXPECT_EQ(program.backwardCaptures(), std::vector<uint32_t>({0, 1}));
 
     program.graphs[1].nodes[0].operands[0] = 3;
     EXPECT_FALSE(program.validate(

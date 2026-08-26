@@ -306,6 +306,35 @@ std::vector<uint32_t> ExecutableProgram::backwardCaptures() const {
     return captures;
 }
 
+std::vector<uint32_t> ExecutableProgram::residualCaptures() const {
+    if (adSignature.declared)
+        return adSignature.captures;
+    return backwardCaptures();
+}
+
+void markProgramGraphValues(const ProgramGraph &graph, std::vector<char> &live) {
+    const auto mark = [&](uint32_t value) {
+        if (value < live.size())
+            live[value] = 1;
+    };
+    for (uint32_t value : graph.arguments)
+        mark(value);
+    for (uint32_t value : graph.captures)
+        mark(value);
+    for (uint32_t value : graph.results)
+        mark(value);
+    for (const ProgramNode &node : graph.nodes) {
+        for (uint32_t value : node.operands)
+            mark(value);
+        for (uint32_t value : node.results)
+            mark(value);
+        for (const ProgramValueBinding &binding : node.bindings)
+            mark(binding.value);
+        for (const ProgramResourceUse &resource : node.resources)
+            mark(resource.value);
+    }
+}
+
 bool parseExecutableProgram(const nlohmann::json &value, ExecutableProgram &program, std::string &error) {
     if (!value.is_object() || !hasOnlyKeys(value, {"values", "graphs", "signature"}) || !value.contains("values") ||
         !value["values"].is_array() || !value.contains("graphs") || !value["graphs"].is_array()) {

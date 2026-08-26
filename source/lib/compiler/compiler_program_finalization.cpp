@@ -94,6 +94,18 @@ void rebuildDependencies(llvm::json::Object &execution, llvm::StringRef graphNam
 
 const llvm::json::Object *valueById(const llvm::json::Array &values, int64_t id);
 
+bool valueHasDynamicExtents(const llvm::json::Object &value) {
+    const llvm::json::Array *shape = value.getArray("shape");
+    if (!shape)
+        return false;
+    for (const llvm::json::Value &extentValue : *shape) {
+        const std::optional<int64_t> extent = extentValue.getAsInteger();
+        if (!extent || *extent <= 0)
+            return true;
+    }
+    return false;
+}
+
 void considerCapture(int64_t value, const std::set<int64_t> &available, const std::set<int64_t> &forwardValues,
                      std::set<int64_t> &captures) {
     if (!available.count(value) && forwardValues.count(value))
@@ -162,7 +174,8 @@ void collectBackwardCaptures(const llvm::json::Object &execution, std::set<int64
                     for (const llvm::json::Value &operand : *operands)
                         if (std::optional<int64_t> value = operand.getAsInteger()) {
                             considerCapture(*value, available, forwardValues, captures);
-                            if (values)
+                            const llvm::json::Object *row = values ? valueById(*values, *value) : nullptr;
+                            if (row && valueHasDynamicExtents(*row))
                                 collectLikeCaptures(*values, *value, available, forwardValues, captures);
                         }
                 if (const llvm::json::Array *results = node->getArray("results"))
@@ -175,7 +188,7 @@ void collectBackwardCaptures(const llvm::json::Object &execution, std::set<int64
     for (const llvm::json::Value &rowValue : *values) {
         const llvm::json::Object *row = rowValue.getAsObject();
         const std::optional<int64_t> id = row ? row->getInteger("id") : std::nullopt;
-        if (!id || !row->getInteger("like") || forwardValues.count(*id))
+        if (!id || !row->getInteger("like") || forwardValues.count(*id) || !valueHasDynamicExtents(*row))
             continue;
         collectLikeCaptures(*values, *id, available, forwardValues, captures);
     }
@@ -186,10 +199,6 @@ void rebuildCaptures(llvm::json::Object &execution) {
     if (!signature)
         return;
     std::set<int64_t> captures;
-    if (const llvm::json::Array *rows = signature->getArray("captures"))
-        for (const llvm::json::Value &row : *rows)
-            if (std::optional<int64_t> value = row.getAsInteger())
-                captures.insert(*value);
     collectBackwardCaptures(execution, captures);
     llvm::json::Array reflected;
     for (int64_t capture : captures)
@@ -229,6 +238,26 @@ llvm::json::Array copyArray(const llvm::json::Array &array) {
     return result;
 }
 
+bool canonicalValueIds(const llvm::json::Array &ids, llvm::json::Array &canonical, std::string &error) {
+    std::set<int64_t> unique;
+    for (const llvm::json::Value &value : ids) {
+        const std::optional<int64_t> id = value.getAsInteger();
+        if (!id) {
+            error = "canonical compute node has invalid operand or result ids";
+            return false;
+        }
+        if (!unique.insert(*id).second) {
+            error = "canonical compute node has duplicate operand or result ids";
+            return false;
+        }
+    }
+    canonical.clear();
+    canonical.reserve(unique.size());
+    for (int64_t id : unique)
+        canonical.emplace_back(id);
+    return true;
+}
+
 llvm::json::Object copyObject(const llvm::json::Object &object) {
     llvm::json::Object result;
     for (const auto &[key, value] : object)
@@ -266,6 +295,17 @@ std::string sha256(const llvm::json::Value &value) {
 }
 
 bool validAccess(llvm::StringRef access) { return access == "read" || access == "write" || access == "read_write"; }
+
+// Program operand_accesses is the required edge. Kernel TensorView access is the
+// provided capability. A write dest may RMW (read_write) under accumulation
+// ownership; that is not a Program-level access upgrade.
+bool resourceAccessSatisfies(llvm::StringRef physical, llvm::StringRef logical) {
+    if (logical == "read")
+        return physical == "read" || physical == "read_write";
+    if (logical == "write")
+        return physical == "write" || physical == "read_write";
+    return logical == "read_write" && physical == "read_write";
+}
 
 bool kernelHiddenBuiltin(llvm::StringRef builtin) {
     return builtin == "ad_tape_allocator" || builtin == "ad_tape_root_region" || builtin == "global_invocation_id" ||
@@ -413,14 +453,19 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
             error = "Program implementation request has an invalid binding";
             return false;
         }
-        const auto exact = std::find_if(interface.begin(), interface.end(),
-                                        [&](const InterfaceValue &value) { return value.name == *parameter; });
+        const std::optional<llvm::StringRef> role = binding->getString("autodiff_role");
+        const auto exact = std::find_if(interface.begin(), interface.end(), [&](const InterfaceValue &value) {
+            if (value.name != *parameter)
+                return false;
+            if (!role || role->empty())
+                return true;
+            return value.role == *role;
+        });
         if (exact != interface.end()) {
             matched.insert(exact->name);
             ++bindingIndex;
             continue;
         }
-        const std::optional<llvm::StringRef> role = binding->getString("autodiff_role");
         const std::optional<llvm::StringRef> source = binding->getString("autodiff_source");
         if (!role || !source) {
             const std::optional<int64_t> valueId = binding->getInteger("value");
@@ -470,9 +515,9 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
             }
             bindingIndex += names.size();
         } else if (*role == "retained_primal" || *role == "cotangent") {
-            // Nested VJP requests every primal result cotangent as an upper bound.
-            // Structured VJP keeps only active Storage outputs for the selected wrt.
-            // Extra cotangents are unused, the same class as extra retained primals.
+            // Kernel structured VJP may drop an output that Program still seeded
+            // because that seed does not depend on this node's wrt. Extra retained
+            // primals are the same class. Inactive results are not zero-seeded.
             omitted.insert(parameter->str());
             requestBindings->erase(requestBindings->begin() + bindingIndex);
         } else {
@@ -813,10 +858,6 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
         }
     }
     std::set<int64_t> capturedValues;
-    if (const llvm::json::Array *rows = rawSignature->getArray("captures"))
-        for (const llvm::json::Value &row : *rows)
-            if (std::optional<int64_t> value = row.getAsInteger())
-                capturedValues.insert(*value);
     collectBackwardCaptures(execution, capturedValues);
     std::map<int64_t, ValueProducer> producerByValue;
     std::map<int64_t, std::string> allocationGraph;
@@ -909,6 +950,14 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     }
     for (const auto &[id, graphName] : allocationGraph) {
         if (graphDirections[graphName] != "backward")
+            continue;
+        const llvm::json::Object *allocated = valueById(*rawValues, id);
+        const llvm::json::Array *shape = allocated ? allocated->getArray("shape") : nullptr;
+        bool needsRuntimeExtents = false;
+        if (shape)
+            for (const llvm::json::Value &extent : *shape)
+                needsRuntimeExtents |= dynamicExtent(extent);
+        if (!needsRuntimeExtents)
             continue;
         std::string walkError;
         const int64_t like = walkLikeSource(*rawValues, id, graphName, true, argumentSlots, capturedValues,
@@ -1091,11 +1140,11 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                  producer != producerByValue.end())
             origin = llvm::json::Object{
                 {"tag", "node_result"}, {"graph", producer->second.graph}, {"node", producer->second.node}};
+        else if (auto found = allocationGraph.find(static_cast<int64_t>(expectedId)); found != allocationGraph.end())
+            origin = llvm::json::Object{{"tag", "allocation"}, {"graph", found->second}};
         else {
-            auto found = allocationGraph.find(static_cast<int64_t>(expectedId));
-            origin = llvm::json::Object{
-                {"tag", "allocation"},
-                {"graph", found != allocationGraph.end() ? found->second : selectedGraphs.front().name}};
+            error = "canonical compute value has no origin";
+            return false;
         }
         const bool resource = resourceVersions.count(static_cast<int64_t>(expectedId));
         const bool opaqueResource = resource && (isTextureType(*type) || isSamplerType(*type));
@@ -1599,10 +1648,15 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                                                 {"vertex_count", vertexCount},
                                                 {"instance_count", int64_t{1}}}},
                 };
+                llvm::json::Array operands;
+                llvm::json::Array results;
+                if (!canonicalValueIds(*nodeOperands, operands, error) ||
+                    !canonicalValueIds(*nodeResults, results, error))
+                    return false;
                 canonicalNodes.emplace_back(llvm::json::Object{{"id", node->getInteger("id").value_or(0)},
                                                                {"stage", requestId.str()},
-                                                               {"operands", copyArray(*nodeOperands)},
-                                                               {"results", copyArray(*nodeResults)},
+                                                               {"operands", std::move(operands)},
+                                                               {"results", std::move(results)},
                                                                {"bindings", std::move(endpointBindings)},
                                                                {"accesses", std::move(accesses)},
                                                                {"operation", std::move(operation)}});
@@ -1772,7 +1826,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 }
                 const std::optional<std::string> physicalAccess = reflectedAccess(row);
                 if ((!physicalAccess && interfaceKind != "result") ||
-                    (physicalAccess && *physicalAccess != resourceIt->second.access)) {
+                    (physicalAccess && !resourceAccessSatisfies(*physicalAccess, resourceIt->second.access))) {
                     error =
                         "compiled compute resource access disagrees with logical access for '" + source->str() + "'";
                     return false;
@@ -1955,11 +2009,15 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 targetImplementations[requestId] =
                     llvm::json::Object{{"endpoints", std::move(implementationEndpoints)}};
             stages[requestId] = llvm::json::Object{{"operation", "compute"}, {"contract_hash", contractHash}};
+            llvm::json::Array operands;
+            llvm::json::Array results;
+            if (!canonicalValueIds(*nodeOperands, operands, error) || !canonicalValueIds(*nodeResults, results, error))
+                return false;
             canonicalNodes.emplace_back(llvm::json::Object{
                 {"id", node->getInteger("id").value_or(0)},
                 {"stage", requestId.str()},
-                {"operands", copyArray(*nodeOperands)},
-                {"results", copyArray(*nodeResults)},
+                {"operands", std::move(operands)},
+                {"results", std::move(results)},
                 {"bindings", std::move(endpointBindings)},
                 {"accesses", std::move(accesses)},
                 {"operation", llvm::json::Object{{"tag", "compute"}, {"workgroups", copyArray(*workgroups)}}}});
@@ -1980,7 +2038,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             const int64_t valueId = row->getInteger("id").value_or(-1);
             auto storage = storageByValue.find(valueId);
             if (storage == storageByValue.end()) {
-                error = "allocation origin has no Storage";
+                error = ("allocation origin has no Storage for value " + llvm::Twine(valueId) + " '" +
+                         row->getString("name").value_or("") + "' type '" + row->getString("type").value_or("") + "'")
+                            .str();
                 return false;
             }
             graphInputs.emplace_back(

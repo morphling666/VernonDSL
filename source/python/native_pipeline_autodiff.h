@@ -53,23 +53,22 @@ struct PythonAdValue {
     PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source,
                   uint32_t access = VERNON_ACCESS_READ)
         : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(source)), array(this->source),
-          shape(std::move(shape)), writable(access != VERNON_ACCESS_READ) {
-        originalView = validatePythonAdOriginalView(this->path, dtype, this->shape, this->source, writable);
+          writable(access != VERNON_ACCESS_READ) {
+        originalView = validatePythonAdOriginalView(this->path, dtype, shape, this->source, writable);
+        this->shape = originalView.shape;
         if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous"))) {
             nb::object numpy = nb::module_::import_("numpy");
-            array =
-                access == VERNON_ACCESS_WRITE
-                    ? numpy.attr("empty")(this->shape, nb::arg("dtype") = numpy.attr("dtype")(numpyDtypeName(dtype)))
-                    : numpy.attr("ascontiguousarray")(array);
+            array = access == VERNON_ACCESS_WRITE ? numpy.attr("empty_like")(this->source)
+                                                  : numpy.attr("ascontiguousarray")(array);
         }
-        size_t scalarCount = 1;
+        const size_t itemSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
+        size_t bytes = itemSize;
         for (uint64_t extent : this->shape) {
-            if (scalarCount && extent > std::numeric_limits<size_t>::max() / scalarCount)
-                throw std::invalid_argument("Python autodiff Value shape overflows");
-            scalarCount *= static_cast<size_t>(extent);
+            if (extent && bytes > std::numeric_limits<size_t>::max() / static_cast<size_t>(extent))
+                throw std::invalid_argument("Python autodiff Value byte size overflows");
+            bytes *= static_cast<size_t>(extent);
         }
-        const size_t scalarSize = autodiffDtypeSize(dtype);
-        if (!scalarSize || (scalarCount && scalarSize > std::numeric_limits<size_t>::max() / scalarCount))
+        if (!itemSize)
             throw std::invalid_argument("Python autodiff Value byte size overflows");
         if (this->shape.size() > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("Python autodiff Value rank overflows");
@@ -77,7 +76,7 @@ struct PythonAdValue {
         value.path = {this->path.data(), this->path.size()};
         value.dtype = dtype;
         value.data = reinterpret_cast<void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
-        value.size = scalarCount * scalarSize;
+        value.size = bytes;
         value.rank = static_cast<uint32_t>(this->shape.size());
         value.shape = this->shape.empty() ? nullptr : this->shape.data();
     }
@@ -113,6 +112,37 @@ inline size_t pythonAdMetadataBytes(const PythonAdMetadata &metadata) {
         bytes *= static_cast<size_t>(extent);
     }
     return bytes;
+}
+
+inline nb::object pythonAdGradientBuffer(const PythonAdMetadata &gradient, const nb::object &binding) {
+    nb::object numpy = nb::module_::import_("numpy");
+    nb::object expectedDtype = numpy.attr("dtype")(numpyDtypeName(gradient.dtype));
+    if (!binding.is_none() && nb::hasattr(binding, "_native_host_array")) {
+        nb::object host = binding.attr("_native_host_array")();
+        const std::vector<uint64_t> hostShape = nb::cast<std::vector<uint64_t>>(host.attr("shape"));
+        if (hostShape.size() == gradient.shape.size() &&
+            nb::cast<bool>(host.attr("dtype").attr("__eq__")(expectedDtype))) {
+            bool compatible = true;
+            for (size_t dimension = 0; dimension < hostShape.size(); ++dimension) {
+                if (gradient.shape[dimension] && gradient.shape[dimension] != hostShape[dimension]) {
+                    compatible = false;
+                    break;
+                }
+            }
+            if (compatible)
+                return numpy.attr("zeros_like")(host);
+        }
+    }
+    return numpy.attr("zeros")(gradient.shape, numpy.attr(numpyDtypeName(gradient.dtype)));
+}
+
+inline void instantiatePythonAdMetadata(PythonAdMetadata &leaf, const std::deque<PythonAdValue> &bound) {
+    for (const PythonAdValue &value : bound) {
+        if (value.path == leaf.path) {
+            leaf.shape = value.shape;
+            return;
+        }
+    }
 }
 
 PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
@@ -266,8 +296,7 @@ private:
                 return false;
             nb::object owner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
             auto existing = gradientsByOwner.find(owner.ptr());
-            nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
-                gradient.shape, nb::module_::import_("numpy").attr(numpyDtypeName(gradient.dtype)));
+            nb::object zeros = pythonAdGradientBuffer(gradient, binding);
             nb::object materialized =
                 existing == gradientsByOwner.end()
                     ? binding.attr("_materialize_gradient")(zeros, gradient.path)
@@ -337,8 +366,10 @@ private:
         std::vector<VernonAdValue> gradientViews;
         nb::dict result;
         for (const PythonAdMetadata &gradient : gradients) {
-            nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
-                gradient.shape, nb::module_::import_("numpy").attr(numpyDtypeName(gradient.dtype)));
+            nb::str bindingPath(gradient.binding.c_str());
+            nb::object binding =
+                bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
+            nb::object zeros = pythonAdGradientBuffer(gradient, binding);
             gradientValues.emplace_back(gradient.path, gradient.dtype, gradient.shape, zeros);
             gradientViews.push_back(gradientValues.back().value);
         }
@@ -536,10 +567,8 @@ struct LoadedPipeline {
         nb::dict outputs;
         for (size_t index = 0; index < outputCount; ++index) {
             const PythonAdMetadata reflected = leafMetadata("output", index);
-            nb::object zeros = nb::module_::import_("numpy").attr("zeros")(
-                reflected.shape,
-                nb::arg("dtype") = nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(reflected.dtype)));
-            outputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, zeros, VERNON_ACCESS_WRITE);
+            nb::object leaf = resolveProgramInputLeaf(programBindings, reflected.path);
+            outputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, leaf, VERNON_ACCESS_WRITE);
             outputViews.push_back(outputValues.back().value);
             outputs[nb::str(reflected.path.c_str())] = outputValues.back().array;
         }
@@ -559,6 +588,7 @@ struct LoadedPipeline {
         for (size_t index = 0; index < cotangentCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("cotangent", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path);
+            instantiatePythonAdMetadata(leaf, outputValues);
             cotangents.push_back(std::move(leaf));
         }
         std::vector<PythonAdMetadata> gradients;
@@ -566,6 +596,7 @@ struct LoadedPipeline {
         for (size_t index = 0; index < gradientCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("gradient", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path);
+            instantiatePythonAdMetadata(leaf, inputValues);
             gradients.push_back(std::move(leaf));
         }
         return nb::make_tuple(outputs,

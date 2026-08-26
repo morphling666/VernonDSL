@@ -7,13 +7,27 @@ PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, Ver
                                                     const std::vector<uint64_t> &expectedShape, const nb::object &array,
                                                     bool writable) {
     std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
-    if (shape != expectedShape)
+    if (shape.size() != expectedShape.size())
         throw std::invalid_argument("Python autodiff Value '" + path + "' shape " + formatShape(shape) +
                                     " does not match reflection " + formatShape(expectedShape));
-    const size_t itemSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
-    if (itemSize != autodiffDtypeSize(dtype) ||
-        !nb::cast<bool>(
-            array.attr("dtype").attr("__eq__")(nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(dtype)))))
+    for (size_t dimension = 0; dimension < shape.size(); ++dimension) {
+        // Reflection 0 is vd.dyn. The bound buffer's extent, including empty 0, instantiates it.
+        if (!expectedShape[dimension])
+            continue;
+        if (shape[dimension] != expectedShape[dimension])
+            throw std::invalid_argument("Python autodiff Value '" + path + "' shape " + formatShape(shape) +
+                                        " does not match reflection " + formatShape(expectedShape));
+    }
+    nb::object numpy = nb::module_::import_("numpy");
+    nb::object expectedDtype = numpy.attr("dtype")(numpyDtypeName(dtype));
+    nb::object actualDtype = array.attr("dtype");
+    const size_t scalarSize = autodiffDtypeSize(dtype);
+    const size_t itemSize = nb::cast<size_t>(actualDtype.attr("itemsize"));
+    const bool exactDtype = nb::cast<bool>(actualDtype.attr("__eq__")(expectedDtype));
+    nb::object baseDtype = actualDtype.attr("base");
+    const bool packedCellDtype = !exactDtype && scalarSize && itemSize > scalarSize && itemSize % scalarSize == 0 &&
+                                 !baseDtype.is_none() && nb::cast<bool>(baseDtype.attr("__eq__")(expectedDtype));
+    if ((exactDtype && itemSize != scalarSize) || (!exactDtype && !packedCellDtype))
         throw std::invalid_argument("Python autodiff Value '" + path + "' dtype does not match reflection");
     std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
     if (strides.size() != shape.size())
@@ -28,7 +42,6 @@ PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, Ver
             break;
         allocation = std::move(base);
     }
-    nb::object numpy = nb::module_::import_("numpy");
     nb::object allocationArray = numpy.attr("asarray")(allocation);
     nb::tuple allocationBounds = nb::cast<nb::tuple>(numpy.attr("byte_bounds")(allocationArray));
     const uintptr_t allocationBegin = nb::cast<uintptr_t>(allocationBounds[0]);

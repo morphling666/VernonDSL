@@ -69,6 +69,7 @@ struct ProgramGraph {
     std::string name;
     std::string direction;
     std::vector<uint32_t> arguments;
+    std::vector<uint32_t> captures;
     std::vector<uint32_t> results;
     std::vector<ProgramNode> nodes;
 };
@@ -95,7 +96,10 @@ struct ExecutableProgram {
 
     bool validate(const std::map<std::string, std::string> &stages, std::string &error) const;
     std::vector<uint32_t> backwardCaptures() const;
+    std::vector<uint32_t> residualCaptures() const;
 };
+
+void markProgramGraphValues(const ProgramGraph &graph, std::vector<char> &live);
 
 bool parseExecutableProgram(const nlohmann::json &value, ExecutableProgram &program, std::string &error);
 

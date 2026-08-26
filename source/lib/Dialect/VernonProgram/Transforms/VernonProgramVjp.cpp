@@ -201,6 +201,15 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     SmallVector<Value> operands(context.primalOperands);
     llvm::append_range(operands, context.primalResults);
     llvm::append_range(operands, context.resultCotangents);
+    SmallVector<unsigned> cotangentResults;
+    if (context.activeResultIndices.empty()) {
+        for (unsigned index = 0; index < operation.getNumResults(); ++index)
+            cotangentResults.push_back(index);
+    } else {
+        llvm::append_range(cotangentResults, context.activeResultIndices);
+    }
+    if (context.resultCotangents.size() != cotangentResults.size())
+        return operation.emitOpError("Program VJP cotangent count does not match active results");
     SmallVector<Attribute> operandNames;
     SmallVector<Attribute> operandRoles;
     SmallVector<Attribute> operandSources;
@@ -218,7 +227,10 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
         operandSources.push_back(name);
         operandAccesses.push_back(builder.getStringAttr("read"));
     }
-    for (Attribute name : operation.getResultNames()) {
+    for (unsigned index : cotangentResults) {
+        if (index >= operation.getResultNames().size())
+            return operation.emitOpError("Program VJP cotangent does not name an active result");
+        Attribute name = operation.getResultNames()[index];
         operandNames.push_back(builder.getStringAttr(("cotangent." + cast<StringAttr>(name).getValue()).str()));
         operandRoles.push_back(builder.getStringAttr("cotangent"));
         operandSources.push_back(name);
@@ -246,7 +258,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
                 return operation.emitOpError("Program VJP cannot allocate a nested gradient dest");
             resultResourceSources.push_back(static_cast<int64_t>(operands.size()));
             operands.push_back(dest);
-            operandNames.push_back(name);
+            operandNames.push_back(builder.getStringAttr(nestedVjpGradientDestName(cast<StringAttr>(name).getValue())));
             operandRoles.push_back(builder.getStringAttr("gradient"));
             operandSources.push_back(name);
             operandAccesses.push_back(builder.getStringAttr("write"));
@@ -521,6 +533,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         SmallVector<Value> primalResults;
         SmallVector<Value> resultCotangents;
         SmallVector<unsigned> activeOperands;
+        SmallVector<unsigned> activeResults;
         for (auto [index, operand] : llvm::enumerate(operation->getOperands())) {
             primalOperands.push_back(primals.lookup(operand));
             // Local VJP wrt is the callee's read inputs, not every involved
@@ -530,19 +543,20 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             if (succeeded(derivativeType(operand.getType(), operation)))
                 activeOperands.push_back(index);
         }
-        for (Value result : operation->getResults()) {
+        for (auto [index, result] : llvm::enumerate(operation->getResults())) {
             primalResults.push_back(primals.lookup(result));
-            Value cotangent = adjoints.lookup(result);
-            if (!cotangent) {
-                FailureOr<Type> type = derivativeType(result.getType(), operation);
-                if (failed(type) ||
-                    !(cotangent = createZero(builder, operation->getLoc(), *type, primals.lookup(result))))
-                    return operation->emitError("Program VJP cannot create a zero result cotangent");
+            // Nested VJP cotangents are the results that actually have an
+            // incoming adjoint. Zero-seeding inactive outputs is an upper
+            // bound that later ABI omit cannot delete from the value arena.
+            if (Value cotangent = adjoints.lookup(result)) {
+                resultCotangents.push_back(cotangent);
+                activeResults.push_back(static_cast<unsigned>(index));
             }
-            resultCotangents.push_back(cotangent);
         }
-        AutodiffVjpBuildContext context{builder,       operation->getLoc(), primalOperands,
-                                        primalResults, resultCotangents,    activeOperands};
+        if (resultCotangents.empty())
+            return operation->emitError("Program VJP active operation has no result cotangents");
+        AutodiffVjpBuildContext context{builder,          operation->getLoc(), primalOperands, primalResults,
+                                        resultCotangents, activeOperands,      activeResults};
         FailureOr<SmallVector<Value>> contributions = failure();
         if (auto compute = dyn_cast<ComputeOp>(operation)) {
             contributions = buildComputeVjp(compute, context);
