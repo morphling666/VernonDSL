@@ -58,6 +58,16 @@ def _scalar_type(value: Any) -> ProgramType:
     raise TypeError(f"Program scalar value has unsupported type {type(value).__name__}")
 
 
+def _host_constant_value(value: Any) -> int | float | bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        return float(value)
+    raise TypeError(f"Program constant has unsupported type {type(value).__name__}")
+
+
 def _constant_attribute(value: Any) -> str:
     if isinstance(value, (bool, np.bool_)):
         return "true" if bool(value) else "false"
@@ -66,6 +76,35 @@ def _constant_attribute(value: Any) -> str:
     if isinstance(value, (float, np.floating)):
         return f"{float(value):.17g} : f64"
     raise TypeError(f"Program constant has unsupported type {type(value).__name__}")
+
+
+def _scalar_input_ids(invocation: Any) -> set[int]:
+    ids: set[int] = set()
+    for name, value in invocation.inputs.items():
+        if name in invocation.graph.inputs:
+            continue
+        try:
+            _scalar_type(value)
+        except TypeError:
+            continue
+        ids.add(id(value))
+    return ids
+
+
+def _operation_host_constants(
+    node: Any,
+    invocation: Any,
+    scalar_input_ids: set[int],
+) -> tuple[tuple[str, int | float | bool], ...]:
+    constants: list[tuple[str, int | float | bool]] = []
+    for parameter in node.parameters:
+        if parameter.name in node.inputs:
+            continue
+        supplied = invocation.slots[node.binding_slots[parameter.name]]
+        if id(supplied) in scalar_input_ids:
+            continue
+        constants.append((parameter.name, _host_constant_value(supplied)))
+    return tuple(constants)
 
 
 def _forward_graph(
@@ -193,11 +232,21 @@ def parse_program(
     implementations: dict[str, ProgramImplementation] = {}
     resource_types: dict[int, ProgramType] = {}
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]] = {}
+    scalar_input_ids = _scalar_input_ids(invocation)
     for operation in invocation.graph.operations:
         frontend = operation.kernel._lower(operation.features).frontend
-        implementation = ProgramImplementation(operation.name, operation.kernel._entry, "compute", frontend.mlir)
+        host_constants = _operation_host_constants(operation, invocation, scalar_input_ids)
+        implementation = ProgramImplementation(
+            operation.name,
+            operation.kernel._entry,
+            "compute",
+            frontend.mlir,
+            host_constants,
+        )
         previous = implementations.get(operation.name)
-        if previous is not None and previous.mlir != implementation.mlir:
+        if previous is not None and (
+            previous.mlir != implementation.mlir or previous.host_constants != implementation.host_constants
+        ):
             raise ValueError(
                 f"Program callee {operation.name!r} resolves to multiple specialized implementations; "
                 "callee names must identify one implementation per Program specialization"

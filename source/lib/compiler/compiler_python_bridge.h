@@ -72,6 +72,22 @@ VERNON_DSL_CAPI void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStruct
 VERNON_DSL_CAPI VernonPythonStructuredVjpView
 vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result);
 
+typedef struct VernonPythonSpecializedKernel VernonPythonSpecializedKernel;
+
+typedef struct VernonPythonSpecializedKernelView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView module;
+} VernonPythonSpecializedKernelView;
+
+VERNON_DSL_CAPI VernonPythonSpecializedKernel *
+vernonCompilerSpecializeKernelHostConstants(VernonStringView module, VernonStringView entry,
+                                            const VernonStringView *names, const int32_t *kinds,
+                                            const int64_t *integers, const double *floats, size_t count);
+VERNON_DSL_CAPI void vernonCompilerDestroySpecializedKernel(VernonPythonSpecializedKernel *result);
+VERNON_DSL_CAPI VernonPythonSpecializedKernelView
+vernonCompilerGetSpecializedKernelView(const VernonPythonSpecializedKernel *result);
+
 #ifdef __cplusplus
 }
 #endif

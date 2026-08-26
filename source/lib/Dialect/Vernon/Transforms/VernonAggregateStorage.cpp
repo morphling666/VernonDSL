@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonAttrs.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/STLExtras.h"
 
@@ -346,6 +347,47 @@ Value aggregateLeafIndex(Value recordIndex, const ValueAbiLayout &layout, const 
     return result;
 }
 
+FailureOr<SmallVector<Value>> atomicAddScalarsToStorages(ValueRange scalars, ValueRange storages, Value recordIndex,
+                                                         const ValueAbiLayout &layout, bool compact, OpBuilder &builder,
+                                                         Location location, AggregateStorageBackend backend,
+                                                         Attribute implementation) {
+    SmallVector<Value> oldScalars;
+    unsigned cursor = 0;
+    for (auto [leaf, storage] : llvm::zip_equal(layout.leaves, storages)) {
+        for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
+            if (cursor >= scalars.size())
+                return failure();
+            if (!leaf.scalarType.isF16() && !leaf.scalarType.isF32() && !leaf.scalarType.isF64())
+                return failure();
+            Value scalar = scalars[cursor++];
+            if (scalar.getType() != leaf.scalarType)
+                return failure();
+            Value index = aggregateLeafIndex(recordIndex, layout, leaf, scalarIndex, compact, builder, location);
+            Value old;
+            if (backend == AggregateStorageBackend::MemRef || isa<MemRefType>(storage.getType())) {
+                auto rmw =
+                    memref::AtomicRMWOp::create(builder, location, arith::AtomicRMWKind::addf, scalar, storage, index);
+                if (implementation)
+                    rmw->setAttr(kAtomicImplementationAttrName, implementation);
+                old = rmw.getResult();
+            } else {
+                OperationState state(location, PhysicalAtomicOp::getOperationName());
+                state.addOperands({storage, index, scalar});
+                state.addAttribute("atomic_kind", builder.getStringAttr("add"));
+                state.addAttribute("ordering", builder.getStringAttr("relaxed"));
+                if (implementation)
+                    state.addAttribute(kAtomicImplementationAttrName, implementation);
+                state.addTypes(scalar.getType());
+                old = builder.create(state)->getResult(0);
+            }
+            oldScalars.push_back(old);
+        }
+    }
+    if (cursor != scalars.size())
+        return failure();
+    return oldScalars;
+}
+
 struct AggregateViewPattern final : ConversionPattern {
     AggregateViewPattern(TypeConverter &converter, MLIRContext *context, ModuleOp module, StringRef operationName)
         : ConversionPattern(converter, operationName, 2, context), module(module) {}
@@ -354,7 +396,13 @@ struct AggregateViewPattern final : ConversionPattern {
                                   ConversionPatternRewriter &rewriter) const override {
         auto load = dyn_cast<PhysicalLoadOp>(operation);
         auto store = dyn_cast<PhysicalStoreOp>(operation);
-        Value sourceStorage = load ? load.getStorage() : store.getStorage();
+        auto atomic = dyn_cast<PhysicalAtomicOp>(operation);
+        Value sourceStorage = load     ? load.getStorage()
+                              : store  ? store.getStorage()
+                              : atomic ? atomic.getStorage()
+                                       : Value{};
+        if (!sourceStorage)
+            return failure();
         auto view = dyn_cast<TensorViewType>(sourceStorage.getType());
         if (!view)
             return failure();
@@ -363,6 +411,33 @@ struct AggregateViewPattern final : ConversionPattern {
         FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
         if (failed(layout) || layout->leaves.empty())
             return operation->emitError("cannot resolve aggregate TensorView storage layout");
+        Location loc = operation->getLoc();
+        const AggregateStorageBackend backend = view.getAddressSpace() == "workgroup"
+                                                    ? AggregateStorageBackend::WorkgroupTensorView
+                                                    : AggregateStorageBackend::MemRef;
+        if (atomic) {
+            if (atomic.getAtomicKind() != "add")
+                return atomic.emitError("aggregate TensorView atomic currently supports add");
+            if (operands.size() != 3 || operands[0].size() != layout->leaves.size() || operands[1].size() != 1 ||
+                operands[2].size() != 1)
+                return atomic.emitError("aggregate TensorView conversion received an invalid operand mapping");
+            SmallVector<Value> leaves;
+            if (failed(decomposeAggregateValueLlvm(view.getElementType(), operands[2].front(), leaves,
+                                                   *getTypeConverter(), module, rewriter, loc)))
+                return atomic.emitError("cannot decompose aggregate TensorView value");
+            FailureOr<SmallVector<Value>> oldScalars = atomicAddScalarsToStorages(
+                leaves, operands[0], operands[1].front(), *layout, view.getAddressSpace() == "workgroup", rewriter, loc,
+                backend, atomic->getAttr(kAtomicImplementationAttrName));
+            if (failed(oldScalars))
+                return atomic.emitError("cannot atomic-add aggregate TensorView value");
+            unsigned cursor = 0;
+            FailureOr<Value> oldValue = buildAggregateValueLlvm(view.getElementType(), *oldScalars, cursor,
+                                                                *getTypeConverter(), module, rewriter, loc);
+            if (failed(oldValue) || cursor != oldScalars->size())
+                return atomic.emitError("cannot reconstruct aggregate TensorView atomic result");
+            rewriter.replaceOp(operation, *oldValue);
+            return success();
+        }
         const unsigned storagePosition = load ? 0 : 1;
         const unsigned indicesPosition = storagePosition + 1;
         if (operands.size() != indicesPosition + 1 || operands[storagePosition].size() != layout->leaves.size())
@@ -371,11 +446,7 @@ struct AggregateViewPattern final : ConversionPattern {
         if (operands[indicesPosition].size() != 1)
             return operation->emitError("aggregate TensorView physical index conversion is invalid");
         Value recordIndex = operands[indicesPosition].front();
-        Location loc = operation->getLoc();
         if (load) {
-            const AggregateStorageBackend backend = view.getAddressSpace() == "workgroup"
-                                                        ? AggregateStorageBackend::WorkgroupTensorView
-                                                        : AggregateStorageBackend::MemRef;
             SmallVector<Value> leaves;
             for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
                 for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex)
@@ -400,9 +471,6 @@ struct AggregateViewPattern final : ConversionPattern {
                                                module, rewriter, loc))) {
             return operation->emitError("cannot decompose aggregate TensorView value");
         }
-        const AggregateStorageBackend backend = view.getAddressSpace() == "workgroup"
-                                                    ? AggregateStorageBackend::WorkgroupTensorView
-                                                    : AggregateStorageBackend::MemRef;
         unsigned cursor = 0;
         for (auto [leaf, storage] : llvm::zip_equal(layout->leaves, storageOperands))
             for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
@@ -504,10 +572,30 @@ LogicalResult storeAggregateRecordToStorages(Type elementType, ValueRange storag
     return success(cursor == leaves.size());
 }
 
+FailureOr<Value> atomicAddAggregateRecordToStorages(Type elementType, ValueRange storages, Value recordIndex,
+                                                    Value value, const ValueAbiLayout &layout, ModuleOp module,
+                                                    OpBuilder &builder, Location location,
+                                                    AggregateStorageBackend backend, Attribute implementation) {
+    SmallVector<Value> leaves;
+    if (failed(decomposeAggregateValueVernon(elementType, value, leaves, module, builder, location)))
+        return failure();
+    FailureOr<SmallVector<Value>> oldScalars = atomicAddScalarsToStorages(
+        leaves, storages, recordIndex, layout, backend == AggregateStorageBackend::WorkgroupTensorView, builder,
+        location, backend, implementation);
+    if (failed(oldScalars))
+        return failure();
+    unsigned cursor = 0;
+    FailureOr<Value> result = buildAggregateValueVernon(elementType, *oldScalars, cursor, module, builder, location);
+    if (failed(result) || cursor != oldScalars->size())
+        return failure();
+    return result;
+}
+
 void populateCpuAggregateTensorViewPatterns(TypeConverter &converter, RewritePatternSet &patterns, ModuleOp module) {
     MLIRContext *context = patterns.getContext();
     patterns.add<AggregateViewPattern>(converter, context, module, PhysicalLoadOp::getOperationName());
     patterns.add<AggregateViewPattern>(converter, context, module, PhysicalStoreOp::getOperationName());
+    patterns.add<AggregateViewPattern>(converter, context, module, PhysicalAtomicOp::getOperationName());
     patterns.add<AggregateWorkgroupAllocPattern>(converter, context, module);
 }
 
@@ -551,6 +639,18 @@ LogicalResult lowerGpuAggregateWorkgroupStorage(gpu::GPUFuncOp kernel, ModuleOp 
                         storageRewriter, store.getLoc(), AggregateStorageBackend::WorkgroupTensorView)))
                     return store.emitError("cannot decompose aggregate workgroup value");
                 storageRewriter.eraseOp(store);
+                continue;
+            }
+            if (auto atomic = dyn_cast<PhysicalAtomicOp>(user)) {
+                if (atomic.getAtomicKind() != "add")
+                    return atomic.emitError("aggregate workgroup atomic currently supports add");
+                FailureOr<Value> old = atomicAddAggregateRecordToStorages(
+                    view.getElementType(), storages, atomic.getIndex(), atomic.getValue(), plan->layout, module,
+                    storageRewriter, atomic.getLoc(), AggregateStorageBackend::WorkgroupTensorView,
+                    atomic->getAttr(kAtomicImplementationAttrName));
+                if (failed(old))
+                    return atomic.emitError("cannot atomic-add aggregate workgroup value");
+                storageRewriter.replaceOp(atomic, *old);
                 continue;
             }
             return user->emitError("aggregate workgroup storage has an unsupported use");

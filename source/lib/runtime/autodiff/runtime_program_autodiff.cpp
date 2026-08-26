@@ -101,6 +101,7 @@ void rebuildVariantLayouts(Variant &variant) {
 struct HostProgramValue {
     std::vector<uint8_t> owned;
     std::vector<int64_t> strides;
+    std::vector<uint64_t> runtimeShape;
     VernonPipelineArgument argument{};
 };
 
@@ -110,7 +111,8 @@ struct ProgramResidualPlan {
     uint32_t replayEnd{};
 };
 
-bool planProgramResiduals(const ExecutableProgram &execution, const Variant &variant, uint64_t memoryBudget,
+bool planProgramResiduals(const ExecutableProgram &execution, const Variant &variant,
+                          const std::vector<HostProgramValue> &materialized, uint64_t memoryBudget,
                           ProgramResidualPlan &result, std::string &error) {
     const ProgramGraph *forward = findGraph(execution, "forward");
     if (!forward)
@@ -127,10 +129,16 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
             producers[value] = node.id;
     }
     uint64_t initialStateBytes = 0;
+    const auto materializedBytes = [&](uint32_t value, const ProgramValueSlot &slot,
+                                       const Parameter *parameter) -> std::optional<size_t> {
+        if (value < materialized.size() && materialized[value].argument.tensor.byte_size)
+            return materialized[value].argument.tensor.byte_size;
+        return valueByteSize(slot, parameter);
+    };
     for (uint32_t value : forward->arguments) {
         const ProgramValueSlot &slot = execution.values[value];
         const Parameter *parameter = findParameter(variant, slot.name);
-        const std::optional<size_t> bytes = valueByteSize(slot, parameter);
+        const std::optional<size_t> bytes = materializedBytes(value, slot, parameter);
         if (!bytes || *bytes > std::numeric_limits<uint64_t>::max() - initialStateBytes)
             return error = "Program autodiff initial state size overflows", false;
         initialStateBytes += *bytes;
@@ -140,7 +148,7 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
             continue;
         const ProgramValueSlot &slot = execution.values[value];
         const Parameter *parameter = findParameter(variant, slot.name);
-        const std::optional<size_t> bytes = valueByteSize(slot, parameter);
+        const std::optional<size_t> bytes = materializedBytes(value, slot, parameter);
         execution::detail::AutodiffDagNode &node = nodes[*producers[value]];
         if (!bytes || *bytes > std::numeric_limits<uint64_t>::max() - node.residualBytes)
             return error = "Program autodiff residual size overflows", false;
@@ -179,19 +187,21 @@ const ValueLayout *stableValueLayout(const ProgramValueSlot &slot, const Paramet
 
 bool fillHostTensor(HostProgramValue &value, const ProgramValueSlot &slot, const ValueLayout &layout, size_t byteSize,
                     void *hostData, std::string &error) {
-    value.strides.resize(slot.shape.size());
+    const std::vector<uint64_t> &shape = value.runtimeShape.empty() ? slot.shape : value.runtimeShape;
+    value.strides.resize(shape.size());
     size_t stride = layout.byteSize;
-    for (size_t index = slot.shape.size(); index-- > 0;) {
+    for (size_t index = shape.size(); index-- > 0;) {
         if (stride > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
             error = "Program autodiff tensor stride overflows";
             return false;
         }
         value.strides[index] = static_cast<int64_t>(stride);
-        if (slot.shape[index] > std::numeric_limits<size_t>::max() / stride) {
+        const uint64_t extent = shape[index] ? shape[index] : 1;
+        if (extent > std::numeric_limits<size_t>::max() / stride) {
             error = "Program autodiff tensor footprint overflows";
             return false;
         }
-        stride *= static_cast<size_t>(slot.shape[index]);
+        stride *= static_cast<size_t>(extent);
     }
     value.argument.kind = VERNON_PIPELINE_TENSOR;
     value.argument.tensor.struct_size = sizeof(VernonTensorView);
@@ -199,8 +209,8 @@ bool fillHostTensor(HostProgramValue &value, const ProgramValueSlot &slot, const
     value.argument.tensor.host_data = hostData;
     value.argument.tensor.element_layout = layoutView(layout);
     value.argument.tensor.access = VERNON_ACCESS_READ_WRITE;
-    value.argument.tensor.rank = static_cast<uint32_t>(slot.shape.size());
-    value.argument.tensor.shape = slot.shape.empty() ? nullptr : slot.shape.data();
+    value.argument.tensor.rank = static_cast<uint32_t>(shape.size());
+    value.argument.tensor.shape = shape.empty() ? nullptr : shape.data();
     value.argument.tensor.byte_strides = value.strides.empty() ? nullptr : value.strides.data();
     value.argument.tensor.byte_size = byteSize;
     return true;
@@ -209,40 +219,187 @@ bool fillHostTensor(HostProgramValue &value, const ProgramValueSlot &slot, const
 struct StorageBacking {
     uint32_t owner{UINT32_MAX};
     size_t bytes{};
+    bool sized{};
+};
+
+bool dynamicShape(const std::vector<uint64_t> &shape) {
+    return std::any_of(shape.begin(), shape.end(), [](uint64_t extent) { return extent == 0; });
+}
+
+bool programValueMatches(const VernonAdValue &value, const ValueAbi &abi) {
+    if (value.dtype != abi.dtype || !value.data || value.rank != abi.logicalShape.size() ||
+        (value.rank && !value.shape))
+        return false;
+    bool dynamic = false;
+    for (size_t index = 0; index < abi.logicalShape.size(); ++index) {
+        if (!abi.logicalShape[index]) {
+            dynamic = true;
+            continue;
+        }
+        if (value.shape[index] != abi.logicalShape[index])
+            return false;
+    }
+    return dynamic ? value.size > 0 : value.size == abi.byteSize;
+}
+
+bool applyBoundShape(HostProgramValue &host, StorageBacking *backing, const VernonAdValue &value,
+                     const ProgramValueSlot &slot, const ValueLayout &layout, std::string &error) {
+    if (value.rank != slot.shape.size()) {
+        error = "Program autodiff bound value rank does not match its Program type";
+        return false;
+    }
+    host.runtimeShape.assign(value.shape, value.shape + value.rank);
+    if (backing) {
+        if (value.size > backing->bytes)
+            backing->bytes = value.size;
+        backing->sized = true;
+    }
+    (void)layout;
+    return true;
+}
+
+bool evaluateOwnedExtents(const ProgramStorageSlot &storage, const std::vector<HostProgramValue> &hosts,
+                          const std::vector<const ValueLayout *> &layouts, size_t &bytes, std::vector<uint64_t> &shape,
+                          std::string &error) {
+    bytes = 0;
+    shape.clear();
+    const uint32_t owner = storage.initialValue;
+    if (owner >= layouts.size() || !layouts[owner] || !layouts[owner]->byteSize) {
+        error = "owned dyn Storage has no element layout";
+        return false;
+    }
+    uint64_t product = 1;
+    shape.reserve(storage.byteLengthExtents.size());
+    for (const ProgramBufferExtent &extent : storage.byteLengthExtents) {
+        uint64_t length = extent.staticValue;
+        if (!extent.isStatic) {
+            if (extent.value >= hosts.size() || hosts[extent.value].runtimeShape.size() <= extent.axis ||
+                !hosts[extent.value].runtimeShape[extent.axis]) {
+                error = "owned dyn like-source dimension is unavailable at invocation bind";
+                return false;
+            }
+            length = hosts[extent.value].runtimeShape[extent.axis];
+        }
+        if (!length || product > std::numeric_limits<uint64_t>::max() / length) {
+            error = "owned dyn Storage extent overflows";
+            return false;
+        }
+        product *= length;
+        shape.push_back(length);
+    }
+    if (layouts[owner]->byteSize > std::numeric_limits<uint64_t>::max() / product) {
+        error = "owned dyn Storage byte length overflows";
+        return false;
+    }
+    bytes = static_cast<size_t>(layouts[owner]->byteSize * product);
+    return bytes != 0;
+}
+
+struct ProgramLeafBinding {
+    uint32_t value{UINT32_MAX};
+    size_t byteOffset{};
+    size_t elementStride{};
+    size_t leafElementBytes{};
+    size_t elementCount{};
 };
 
 bool materializeValues(const ExecutableProgram &execution, const Variant &variant,
                        std::vector<HostProgramValue> &storage, std::vector<VernonPipelineArgument> &arguments,
-                       std::string &error) {
-    storage.resize(execution.values.size());
+                       const VernonAdValueSet *boundLeaves, const std::vector<ValueAbi> *boundSignature,
+                       const std::vector<ProgramLeafBinding> *boundBindings,
+                       const std::vector<std::vector<uint8_t>> *captures,
+                       const std::vector<std::vector<uint64_t>> *captureShapes, std::string &error) {
+    storage.assign(execution.values.size(), {});
     arguments.resize(execution.values.size());
     std::map<uint32_t, StorageBacking> backings;
     for (const ProgramStorageSlot &slot : execution.storages) {
         StorageBacking backing;
         backing.owner = slot.initialValue;
         backing.bytes = static_cast<size_t>(slot.byteLength);
+        backing.sized = slot.byteLength > 0;
         backings.emplace(slot.id, backing);
     }
     std::vector<const ValueLayout *> layouts(execution.values.size());
-    std::vector<size_t> valueBytes(execution.values.size());
     for (const ProgramValueSlot &slot : execution.values) {
         const Parameter *parameter = findParameter(variant, slot.name);
-        const std::optional<size_t> bytes = valueByteSize(slot, parameter);
         const ValueLayout *layout = stableValueLayout(slot, parameter);
+        const bool dyn = dynamicShape(slot.shape);
         if ((!parameter && !slot.valueLayout) || (parameter && parameter->kind != "tensor" && !slot.valueLayout) ||
-            !bytes || !layout || !layout->byteSize) {
+            !layout || !layout->byteSize || (!dyn && !valueByteSize(slot, parameter))) {
             error = "Program autodiff value has no materializable tensor parameter";
             return false;
         }
         layouts[slot.id] = layout;
-        valueBytes[slot.id] = *bytes;
         if (!slot.storage)
             continue;
         StorageBacking &backing = backings[*slot.storage];
         if (backing.owner == UINT32_MAX || backing.owner >= execution.values.size())
             backing.owner = slot.id;
-        if (*bytes > backing.bytes)
-            backing.bytes = *bytes;
+        if (!dyn) {
+            const std::optional<size_t> bytes = valueByteSize(slot, parameter);
+            if (bytes && *bytes > backing.bytes)
+                backing.bytes = *bytes;
+            backing.sized = true;
+        }
+    }
+    if (boundLeaves && boundSignature && boundBindings) {
+        if (boundBindings->size() != boundSignature->size() || boundLeaves->value_count != boundSignature->size()) {
+            error = "Program autodiff leaf set does not match its canonical boundary";
+            return false;
+        }
+        for (size_t index = 0; index < boundBindings->size(); ++index) {
+            const ProgramLeafBinding &binding = (*boundBindings)[index];
+            const VernonAdValue *value = findValue(*boundLeaves, (*boundSignature)[index].path);
+            if (!value || binding.value >= storage.size() || !programValueMatches(*value, (*boundSignature)[index])) {
+                error = "Program autodiff leaf does not match graph reflection";
+                return false;
+            }
+            const ProgramValueSlot &slot = execution.values[binding.value];
+            StorageBacking *backing = slot.storage ? &backings[*slot.storage] : nullptr;
+            if (!applyBoundShape(storage[binding.value], backing, *value, slot, *layouts[binding.value], error))
+                return false;
+        }
+    }
+    if (captures && captureShapes) {
+        if (captures->size() != execution.values.size() || captureShapes->size() != execution.values.size()) {
+            error = "Program autodiff capture state is incomplete";
+            return false;
+        }
+        for (uint32_t value : execution.backwardCaptures()) {
+            if (value >= storage.size() || (*captures)[value].empty())
+                continue;
+            storage[value].runtimeShape = (*captureShapes)[value];
+            const ProgramValueSlot &slot = execution.values[value];
+            if (!slot.storage)
+                continue;
+            StorageBacking &backing = backings[*slot.storage];
+            if ((*captures)[value].size() > backing.bytes)
+                backing.bytes = (*captures)[value].size();
+            backing.sized = true;
+        }
+    }
+    for (const ProgramStorageSlot &slot : execution.storages) {
+        StorageBacking &backing = backings[slot.id];
+        if (backing.sized)
+            continue;
+        if (slot.byteLengthExtents.empty()) {
+            error = "Program autodiff storage has no materializable backing";
+            return false;
+        }
+        size_t bytes = 0;
+        std::vector<uint64_t> shape;
+        if (!evaluateOwnedExtents(slot, storage, layouts, bytes, shape, error)) {
+            if (captures)
+                return false;
+            error.clear();
+            backing.bytes = 1;
+            backing.sized = true;
+            continue;
+        }
+        backing.bytes = bytes;
+        backing.sized = true;
+        if (backing.owner < storage.size())
+            storage[backing.owner].runtimeShape = shape;
     }
     for (auto &[storageId, backing] : backings) {
         if (backing.owner >= storage.size() || !backing.bytes) {
@@ -254,14 +411,26 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
     for (const ProgramValueSlot &slot : execution.values) {
         HostProgramValue &value = storage[slot.id];
         void *hostData = nullptr;
-        size_t byteSize = valueBytes[slot.id];
+        size_t byteSize = 0;
         if (slot.storage) {
             const StorageBacking &backing = backings[*slot.storage];
             hostData = storage[backing.owner].owned.data();
             byteSize = backing.bytes;
-        } else {
-            value.owned.resize(valueBytes[slot.id]);
+            if (value.runtimeShape.empty())
+                value.runtimeShape = storage[backing.owner].runtimeShape;
+        } else if (!dynamicShape(slot.shape)) {
+            const std::optional<size_t> bytes = valueByteSize(slot, findParameter(variant, slot.name));
+            if (!bytes) {
+                error = "Program autodiff value has no materializable tensor parameter";
+                return false;
+            }
+            value.owned.resize(*bytes);
             hostData = value.owned.data();
+            byteSize = *bytes;
+        } else {
+            value.owned.resize(1);
+            hostData = value.owned.data();
+            byteSize = 1;
         }
         if (!fillHostTensor(value, slot, *layouts[slot.id], byteSize, hostData, error))
             return false;
@@ -269,14 +438,6 @@ bool materializeValues(const ExecutableProgram &execution, const Variant &varian
     }
     return true;
 }
-
-struct ProgramLeafBinding {
-    uint32_t value{UINT32_MAX};
-    size_t byteOffset{};
-    size_t elementStride{};
-    size_t leafElementBytes{};
-    size_t elementCount{};
-};
 
 bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi> &signature,
                     const std::vector<ProgramLeafBinding> &bindings, std::vector<HostProgramValue> &storage,
@@ -287,11 +448,18 @@ bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi
         const ValueAbi &abi = signature[index];
         const VernonAdValue *value = findValue(supplied, abi.path);
         const ProgramLeafBinding &binding = bindings[index];
-        if (!value || !valueMatches(*value, abi) || binding.value >= storage.size())
+        if (!value || !programValueMatches(*value, abi) || binding.value >= storage.size())
             return error = "Program autodiff leaf does not match graph reflection", false;
         auto *packed = static_cast<uint8_t *>(const_cast<void *>(storage[binding.value].argument.tensor.host_data));
         auto *leaf = static_cast<uint8_t *>(const_cast<void *>(value->data));
-        for (size_t element = 0; element < binding.elementCount; ++element) {
+        size_t elementCount = binding.elementCount;
+        if (!elementCount) {
+            const size_t bytes = publish ? storage[binding.value].argument.tensor.byte_size : value->size;
+            if (!binding.elementStride || bytes % binding.elementStride)
+                return error = "Program autodiff leaf does not match its dynamic footprint", false;
+            elementCount = bytes / binding.elementStride;
+        }
+        for (size_t element = 0; element < elementCount; ++element) {
             uint8_t *packedElement = packed + element * binding.elementStride + binding.byteOffset;
             uint8_t *leafElement = leaf + element * binding.leafElementBytes;
             if (publish)
@@ -313,10 +481,11 @@ public:
     ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<VernonPipelineTopology> topology, Variant variant,
                     Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
                     std::vector<ProgramLeafBinding> gradientBindings, ProgramResidualPlan plan,
-                    std::vector<std::vector<uint8_t>> residuals)
+                    std::vector<std::vector<uint8_t>> residuals, std::vector<std::vector<uint64_t>> residualShapes)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
           signature_(std::move(signature)), cotangentBindings_(std::move(cotangentBindings)),
-          gradientBindings_(std::move(gradientBindings)), plan_(std::move(plan)), residuals_(std::move(residuals)) {
+          gradientBindings_(std::move(gradientBindings)), plan_(std::move(plan)), residuals_(std::move(residuals)),
+          residualShapes_(std::move(residualShapes)) {
         rebuildVariantLayouts(variant_);
     }
 
@@ -328,7 +497,9 @@ public:
         std::vector<HostProgramValue> storage;
         std::vector<VernonPipelineArgument> values;
         std::string error;
-        if (!materializeValues(topology_->execution, variant_, storage, values, error))
+        if (!materializeValues(topology_->execution, variant_, storage, values, cotangents,
+                               cotangents ? &signature_.cotangents : nullptr,
+                               cotangents ? &cotangentBindings_ : nullptr, &residuals_, &residualShapes_, error))
             return fail(*context_, error);
         if (cotangents &&
             !transferLeaves(*cotangents, signature_.cotangents, cotangentBindings_, storage, false, error))
@@ -389,6 +560,7 @@ private:
     std::vector<ProgramLeafBinding> gradientBindings_;
     ProgramResidualPlan plan_;
     std::vector<std::vector<uint8_t>> residuals_;
+    std::vector<std::vector<uint64_t>> residualShapes_;
     PullbackControlPlaneUsage usage_;
 };
 
@@ -472,7 +644,8 @@ public:
         std::vector<HostProgramValue> storage;
         std::vector<VernonPipelineArgument> values;
         std::string error;
-        if (!materializeValues(topology->execution, variant_, storage, values, error) ||
+        if (!materializeValues(topology->execution, variant_, storage, values, &inputs, &signature_.inputs,
+                               &inputBindings_, nullptr, nullptr, error) ||
             !transferLeaves(inputs, signature_.inputs, inputBindings_, storage, false, error))
             return fail(*context_, error);
         VernonLoadedPipeline proxy;
@@ -485,17 +658,22 @@ public:
         if (!transferLeaves(*outputs, signature_.outputs, outputBindings_, storage, true, error))
             return fail(*context_, error);
         ProgramResidualPlan plan;
-        if (!planProgramResiduals(topology->execution, variant_, context_->autodiffMemoryPolicy->invocationLimit(),
-                                  plan, error))
+        if (!planProgramResiduals(topology->execution, variant_, storage,
+                                  context_->autodiffMemoryPolicy->invocationLimit(), plan, error))
             return fail(*context_, error);
         std::vector<std::vector<uint8_t>> residuals(topology->execution.values.size());
+        std::vector<std::vector<uint64_t>> residualShapes(topology->execution.values.size());
+        for (uint32_t value : topology->execution.backwardCaptures())
+            residualShapes[value] = storage[value].runtimeShape;
         for (uint32_t value : plan.retainedValues) {
             const HostProgramValue &slot = storage[value];
             const auto *data = static_cast<const uint8_t *>(slot.argument.tensor.host_data);
             residuals[value].assign(data, data + slot.argument.tensor.byte_size);
+            residualShapes[value] = slot.runtimeShape;
         }
         pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, cotangentBindings_,
-                                                     gradientBindings_, std::move(plan), std::move(residuals));
+                                                     gradientBindings_, std::move(plan), std::move(residuals),
+                                                     std::move(residualShapes));
         return VERNON_STATUS_OK;
     }
 
@@ -543,7 +721,7 @@ bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
         const ValueLayout *parameterLayout =
             parameter ? (parameter->valueLayout ? &*parameter->valueLayout : &parameter->elementLayout) : nullptr;
         const ValueLayout *valueLayout = value.valueLayout ? value.valueLayout.get() : parameterLayout;
-        if (!valueLayout || !valueByteSize(value, parameter) ||
+        if (!valueLayout || (!dynamicShape(value.shape) && !valueByteSize(value, parameter)) ||
             (value.valueLayout && !value.valueLayout->layoutHash.empty() && parameterLayout &&
              value.valueLayout->layoutHash != parameterLayout->layoutHash &&
              !physicallyEquivalent(*value.valueLayout, *parameterLayout))) {

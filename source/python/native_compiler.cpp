@@ -81,6 +81,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
     module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
                nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));
+    module.def("_specialize_kernel_constants", &specializeKernelHostConstants, nb::arg("module"), nb::arg("entry"),
+               nb::arg("names"), nb::arg("values"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
         .def("analyze_program_result", &analyzeProgramResult, nb::arg("mlir"))

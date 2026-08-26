@@ -8,6 +8,7 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonGPUProfileABI.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonSpecializeKernelConstants.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
 #include "mlir/Dialect/VernonProgram/Transforms/VernonProgramExecutable.h"
@@ -106,25 +107,31 @@ module {
           !vernon.tensor_view<f32, [1], "read_write", "device">
               {vernon.source_name = "cube", vernon.dtype = "f32", vernon.abi_leaf_dtypes = ["f32"]})
       attributes {vernon_program.graph = "primal"} {
-    %square_buffer = "vernon.intrinsic"(%source) {name = "empty_like"}
+    %square_buffer = "vernon.intrinsic"(%source) {name = "empty_like",
+        vernon.abi_leaf_dtypes = ["f32"], vernon.dtype = "f32",
+        vernon_program.result_abi_leaf_dtypes = [["f32"]]}
         : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %square = "vernon_program.compute"(%source, %square_buffer) {
       callee = "square", grid = array<i64: 1, 1, 1>, features = [],
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
-      vernon_program.result_resource_sources = array<i64: 1>
+      vernon_program.result_resource_sources = array<i64: 1>,
+      vernon_program.result_abi_leaf_dtypes = [["f32"]]
     } : (!vernon.tensor_view<f32, [1], "read_write", "device">,
          !vernon.tensor_view<f32, [1], "read_write", "device">) ->
         !vernon.tensor_view<f32, [1], "read_write", "device">
-    %cube_buffer = "vernon.intrinsic"(%source) {name = "empty_like"}
+    %cube_buffer = "vernon.intrinsic"(%source) {name = "empty_like",
+        vernon.abi_leaf_dtypes = ["f32"], vernon.dtype = "f32",
+        vernon_program.result_abi_leaf_dtypes = [["f32"]]}
         : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %cube = "vernon_program.compute"(%source, %cube_buffer) {
       callee = "cube", grid = array<i64: 1, 1, 1>, features = [],
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
-      vernon_program.result_resource_sources = array<i64: 1>
+      vernon_program.result_resource_sources = array<i64: 1>,
+      vernon_program.result_abi_leaf_dtypes = [["f32"]]
     } : (!vernon.tensor_view<f32, [1], "read_write", "device">,
          !vernon.tensor_view<f32, [1], "read_write", "device">) ->
         !vernon.tensor_view<f32, [1], "read_write", "device">
@@ -198,6 +205,28 @@ module {
     auto publicGradient = dyn_cast<TensorViewType>(backward.getResultTypes().front());
     ASSERT_TRUE(publicGradient);
     EXPECT_EQ(publicGradient.getAccess(), "write");
+    unsigned stampedAllocs = 0;
+    backward.walk([&](IntrinsicOp intrinsic) {
+        if (!program::isProgramAllocIntrinsicName(intrinsic.getName()))
+            return;
+        auto dtypes = intrinsic->getAttrOfType<ArrayAttr>("vernon.abi_leaf_dtypes");
+        ASSERT_TRUE(dtypes);
+        ASSERT_FALSE(dtypes.empty());
+        EXPECT_EQ(cast<StringAttr>(dtypes[0]).getValue(), "f32");
+        ++stampedAllocs;
+    });
+    EXPECT_GE(stampedAllocs, 1u);
+    unsigned cotangentDtypes = 0;
+    for (auto [index, argument] : llvm::enumerate(backward.getArguments())) {
+        auto role = backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_role");
+        if (!role || role.getValue() != "cotangent")
+            continue;
+        auto dtype = backward.getArgAttrOfType<StringAttr>(index, "vernon.dtype");
+        ASSERT_TRUE(dtype);
+        EXPECT_EQ(dtype.getValue(), "f32");
+        ++cotangentDtypes;
+    }
+    EXPECT_EQ(cotangentDtypes, 2u);
     EXPECT_TRUE(succeeded(verify(*module)));
     PassManager executable(&context);
     executable.addPass(program::createVernonProgramSelectImplementationsPass());
@@ -803,7 +832,7 @@ module {
     EXPECT_GE(takeAndClears, 2u);
 }
 
-TEST_F(VernonStructuredVjpTest, ScalarizesSharedTensorViewGradientLeaves) {
+TEST_F(VernonStructuredVjpTest, PreservesVectorTensorViewGradientDestConstructor) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
         R"mlir(
 module {
@@ -835,19 +864,27 @@ module {
     ASSERT_TRUE(succeeded(result));
     EXPECT_TRUE(succeeded(verify(*module)));
 
-    unsigned scalarScatterAdds = 0;
+    unsigned vectorScatterAdds = 0;
     result->backward.walk([&](ScatterAddOp scatter) {
-        EXPECT_TRUE(scatter.getValue().getType().isF32());
-        EXPECT_EQ(scatter.getIndices().size(), 2u);
-        ++scalarScatterAdds;
+        auto payload = dyn_cast<RankedTensorType>(scatter.getValue().getType());
+        EXPECT_TRUE(payload);
+        if (payload) {
+            EXPECT_TRUE(payload.getElementType().isF32());
+            EXPECT_EQ(payload.getShape(), ArrayRef<int64_t>({2}));
+        }
+        EXPECT_EQ(scatter.getIndices().size(), 1u);
+        ++vectorScatterAdds;
     });
-    EXPECT_EQ(scalarScatterAdds, 2u);
+    EXPECT_EQ(vectorScatterAdds, 1u);
 
     const unsigned gradientArgument = result->backward.getNumArguments() - 1;
     auto gradient = dyn_cast<TensorViewType>(result->backward.getArgument(gradientArgument).getType());
     ASSERT_TRUE(gradient);
-    EXPECT_TRUE(gradient.getElementType().isF32());
-    EXPECT_EQ(gradient.getShape(), ArrayRef<int64_t>({1, 2}));
+    auto payload = dyn_cast<RankedTensorType>(gradient.getElementType());
+    ASSERT_TRUE(payload);
+    EXPECT_TRUE(payload.getElementType().isF32());
+    EXPECT_EQ(payload.getShape(), ArrayRef<int64_t>({2}));
+    EXPECT_EQ(gradient.getShape(), ArrayRef<int64_t>({1}));
     auto ownership = result->backward.getArgAttrOfType<StringAttr>(gradientArgument, kAccumulationOwnershipAttrName);
     ASSERT_TRUE(ownership);
     EXPECT_EQ(ownership.getValue(), "atomic_shared");
@@ -1583,6 +1620,60 @@ TEST_F(VernonStructuredVjpTest, AccumulationPolicyRejectsDeterministicAndUnsuppo
 
     EXPECT_TRUE(rejected(true, AtomicAddImplementation::Native));
     EXPECT_TRUE(rejected(false, AtomicAddImplementation::Unsupported));
+}
+
+TEST_F(VernonStructuredVjpTest, SpecializeKernelHostConstantsInlinesScalarArguments) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @kernel(
+      %x: i32 {vernon.source_name = "x"},
+      %width: i32 {vernon.source_name = "width"},
+      %height: i32 {vernon.source_name = "height"}) -> i32 {
+    %sum = arith.addi %width, %height : i32
+    %out = arith.addi %x, %sum : i32
+    func.return %out : i32
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto kernel = module->lookupSymbol<func::FuncOp>("kernel");
+    ASSERT_TRUE(kernel);
+    KernelHostConstant width{"width", KernelHostConstant::Kind::Integer, 4};
+    KernelHostConstant height{"height", KernelHostConstant::Kind::Integer, 3};
+    ASSERT_TRUE(succeeded(specializeKernelHostConstants(kernel, {width, height})));
+    ASSERT_EQ(kernel.getNumArguments(), 1u);
+    EXPECT_EQ(kernel.getArgAttrOfType<StringAttr>(0, "vernon.source_name").getValue(), "x");
+    unsigned constants = 0;
+    kernel.walk([&](arith::ConstantOp op) {
+        auto value = dyn_cast<IntegerAttr>(op.getValue());
+        if (!value)
+            return;
+        const int64_t integer = value.getInt();
+        if (integer == 4 || integer == 3)
+            ++constants;
+    });
+    EXPECT_EQ(constants, 2u);
+    EXPECT_TRUE(succeeded(verify(*module)));
+}
+
+TEST_F(VernonStructuredVjpTest, SpecializeKernelHostConstantsRejectsResourceArguments) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  func.func @kernel(
+      %field: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {vernon.source_name = "field"}) {
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto kernel = module->lookupSymbol<func::FuncOp>("kernel");
+    ASSERT_TRUE(kernel);
+    KernelHostConstant field{"field", KernelHostConstant::Kind::Integer, 1};
+    EXPECT_TRUE(failed(specializeKernelHostConstants(kernel, ArrayRef<KernelHostConstant>(field))));
 }
 
 } // namespace

@@ -4,6 +4,7 @@
 #include <nlohmann/json_fwd.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -26,10 +27,19 @@ struct ProgramValueSlot {
     bool output{};
 };
 
+struct ProgramBufferExtent {
+    bool isStatic{true};
+    uint64_t staticValue{};
+    uint32_t value{UINT32_MAX};
+    uint32_t axis{};
+};
+
 struct ProgramStorageSlot {
     uint32_t id{UINT32_MAX};
     uint64_t byteLength{};
     uint32_t initialValue{UINT32_MAX};
+    bool owned{};
+    std::vector<ProgramBufferExtent> byteLengthExtents;
 };
 
 struct ProgramResourceUse {

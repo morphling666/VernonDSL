@@ -237,6 +237,25 @@ bool alignFrame(uint64_t &offset, uint64_t alignment) {
     return true;
 }
 
+bool assignCpuPhysical(uint64_t &cpuFrameOffset, const CompiledEndpointAbi *compiled, uint64_t alignment, uint64_t size,
+                       PhysicalArgumentLayout &physical, InterfacePlan *plan, Diagnostic &diagnostic,
+                       const char *what) {
+    uint64_t offset = cpuFrameOffset;
+    if (compiled && compiled->interfacePlan)
+        offset = compiled->interfacePlan->frameOffset;
+    else if (!alignFrame(offset, alignment))
+        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                      std::string(what) + " frame offset overflows");
+    if (size && offset > std::numeric_limits<uint64_t>::max() - size)
+        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                      std::string(what) + " frame offset overflows");
+    physical = {static_cast<size_t>(offset), static_cast<size_t>(size), static_cast<size_t>(alignment)};
+    if (plan)
+        plan->frameOffset = offset;
+    cpuFrameOffset = std::max(cpuFrameOffset, offset + size);
+    return true;
+}
+
 } // namespace
 
 bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, const ResolvedStage &stage,
@@ -326,13 +345,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.elementLayout = *target.wholeValueLayout;
             InterfacePlan physical = computeValuePlan(leafTransport(leaf), endpoint.layoutHash, backend);
             if (backend == VERNON_RUNTIME_CPU) {
-                if (!alignFrame(cpuFrameOffset, valueSlot->alignment))
-                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                  "system value frame offset overflows");
-                physical.frameOffset = cpuFrameOffset;
-                target.physical = {static_cast<size_t>(cpuFrameOffset), static_cast<size_t>(valueSlot->byteSize),
-                                   static_cast<size_t>(valueSlot->alignment)};
-                cpuFrameOffset += valueSlot->byteSize;
+                if (!assignCpuPhysical(cpuFrameOffset, findCompiledAbi(stage.stage, endpoint), valueSlot->alignment,
+                                       valueSlot->byteSize, target.physical, &physical, diagnostic, "system value"))
+                    return false;
             } else {
                 target.physical = {0, static_cast<size_t>(valueSlot->byteSize),
                                    static_cast<size_t>(valueSlot->alignment)};
@@ -384,11 +399,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             maximumSlot = std::max(maximumSlot, resource->slot);
             hasSlots = true;
             if (backend == VERNON_RUNTIME_CPU) {
-                if (!alignFrame(cpuFrameOffset, alignof(uintptr_t)))
-                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                  "resource frame offset overflows");
-                target.physical = {static_cast<size_t>(cpuFrameOffset), sizeof(uintptr_t), alignof(uintptr_t)};
-                cpuFrameOffset += sizeof(uintptr_t);
+                if (!assignCpuPhysical(cpuFrameOffset, compiled, alignof(uintptr_t), sizeof(uintptr_t), target.physical,
+                                       nullptr, diagnostic, "resource"))
+                    return false;
             }
         } else {
             if (!value.layout)
@@ -442,14 +455,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                       "compute value endpoint is missing its physical transport tree");
                     if (backend == VERNON_RUNTIME_CPU) {
-                        if (!alignFrame(cpuFrameOffset, value.layout->alignment))
-                            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                          "value frame offset overflows");
-                        physical.frameOffset = cpuFrameOffset;
-                        target.physical = {static_cast<size_t>(cpuFrameOffset),
-                                           static_cast<size_t>(value.layout->byteSize),
-                                           static_cast<size_t>(value.layout->alignment)};
-                        cpuFrameOffset += value.layout->byteSize;
+                        if (!assignCpuPhysical(cpuFrameOffset, compiled, value.layout->alignment,
+                                               value.layout->byteSize, target.physical, &physical, diagnostic, "value"))
+                            return false;
                     } else {
                         target.physical = {0, static_cast<size_t>(physical.root->size),
                                            static_cast<size_t>(physical.root->alignment)};
@@ -546,29 +554,22 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     hasSlots = true;
                     target.tensorViewDescriptor = std::move(descriptor);
                     if (backend == VERNON_RUNTIME_CPU) {
-                        if (!alignFrame(cpuFrameOffset, alignof(uintptr_t)))
-                            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                          "TensorView descriptor frame offset overflows");
                         const uint64_t descriptorSize =
                             static_cast<uint64_t>(2 + 2 * endpoint.viewRank) * sizeof(uintptr_t);
-                        target.physical = {static_cast<size_t>(cpuFrameOffset), static_cast<size_t>(descriptorSize),
-                                           alignof(uintptr_t)};
-                        cpuFrameOffset += descriptorSize;
+                        if (!assignCpuPhysical(cpuFrameOffset, compiled, alignof(uintptr_t), descriptorSize,
+                                               target.physical, nullptr, diagnostic, "TensorView descriptor"))
+                            return false;
                     }
                 } else if (backend == VERNON_RUNTIME_CPU) {
-                    if (!alignFrame(cpuFrameOffset, value.layout->alignment))
-                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                      "TensorView value frame offset overflows");
                     InterfacePlan physical =
                         computeValuePlan(valueTransport(*value.layout), value.layout->layoutHash, backend);
-                    physical.frameOffset = cpuFrameOffset;
-                    target.physical = {static_cast<size_t>(cpuFrameOffset), static_cast<size_t>(value.layout->byteSize),
-                                       static_cast<size_t>(value.layout->alignment)};
+                    if (!assignCpuPhysical(cpuFrameOffset, compiled, value.layout->alignment, value.layout->byteSize,
+                                           target.physical, &physical, diagnostic, "TensorView value"))
+                        return false;
                     target.transport =
                         TargetPhysicalTransport{*target.wholeValueLayout,
                                                 std::move(physical),
                                                 {0, storageBindings.front()->slot, storageBindings.front()->slot}};
-                    cpuFrameOffset += value.layout->byteSize;
                 }
             }
         }

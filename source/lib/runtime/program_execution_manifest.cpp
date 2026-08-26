@@ -223,9 +223,39 @@ bool parseControl(const nlohmann::json &value, ControlComponent &control, Diagno
         control.kind = ControlKind::Argument;
     else if (reference.contains("parameter") && uint32Value(reference["parameter"], control.reference))
         control.kind = ControlKind::Parameter;
+    else if (reference.contains("capture") && uint32Value(reference["capture"], control.reference))
+        control.kind = ControlKind::Capture;
     else
         return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", path + "/control",
-                    "phase-one compute supports argument and parameter control");
+                    "control supports argument, parameter, and capture");
+    return true;
+}
+
+bool parseExtentComponent(const nlohmann::json &value, ControlComponent &component, Diagnostic &diagnostic,
+                          const std::string &path, bool allowZero) {
+    if (uint64Value(value, component.value)) {
+        if (!component.value && !allowZero)
+            return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path,
+                        "owned extent must be a positive static size or a control dimension");
+        component.kind = ControlKind::Static;
+        return true;
+    }
+    if (value.is_object() && value.contains("dimension")) {
+        if (!exactObject(value, {"dimension"}, {}, diagnostic, path) || !value["dimension"].is_object())
+            return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path, "invalid dimension control");
+        const auto &dimension = value["dimension"];
+        if (!exactObject(dimension, {"control", "axis"}, {}, diagnostic, path + "/dimension") ||
+            !dimension["control"].is_object() || !uint32Value(dimension["axis"], component.axis))
+            return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/dimension",
+                        "dimension control requires control and axis");
+        nlohmann::json wrapped = {{"control", dimension["control"]}};
+        if (!parseControl(wrapped, component, diagnostic, path + "/dimension"))
+            return false;
+        component.hasAxis = true;
+        return true;
+    }
+    if (!parseControl(value, component, diagnostic, path))
+        return false;
     return true;
 }
 
@@ -329,13 +359,34 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         if (descriptorTag == "buffer") {
             if (!exactObject(descriptor, {"tag", "byte_length", "alignment", "memory", "usage"}, {}, diagnostic,
                              path + "/descriptor") ||
-                !uint64Value(descriptor["byte_length"], storage.buffer.byteLength) ||
-                (!storage.buffer.byteLength && storage.ownership != StorageOwnership::Borrowed) ||
                 !uint64Value(descriptor["alignment"], storage.buffer.alignment) || !storage.buffer.alignment ||
                 (storage.buffer.alignment & (storage.buffer.alignment - 1)) || !descriptor["memory"].is_string() ||
                 !descriptor["usage"].is_array())
                 return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
                             "invalid buffer descriptor");
+            if (descriptor["byte_length"].is_array()) {
+                if (storage.ownership != StorageOwnership::Owned)
+                    return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor/byte_length",
+                                "control byte_length is legal only on owned Storage");
+                for (size_t axis = 0; axis < descriptor["byte_length"].size(); ++axis) {
+                    ControlComponent component;
+                    if (!parseExtentComponent(descriptor["byte_length"][axis], component, diagnostic,
+                                              path + "/descriptor/byte_length/" + std::to_string(axis), false))
+                        return false;
+                    if (component.kind != ControlKind::Static && !component.hasAxis)
+                        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse",
+                                    path + "/descriptor/byte_length/" + std::to_string(axis),
+                                    "owned buffer dyn extent must name a like-source dimension");
+                    storage.buffer.byteLengthExtents.push_back(component);
+                }
+                if (storage.buffer.byteLengthExtents.empty())
+                    return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor/byte_length",
+                                "owned dyn buffer byte_length has no extents");
+            } else if (!uint64Value(descriptor["byte_length"], storage.buffer.byteLength) ||
+                       (!storage.buffer.byteLength && storage.ownership != StorageOwnership::Borrowed)) {
+                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
+                            "invalid buffer descriptor");
+            }
             storage.buffer.memory = descriptor["memory"].get<std::string>();
             for (const auto &usage : descriptor["usage"]) {
                 if (!usage.is_string())
@@ -366,13 +417,31 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                             "invalid static image descriptor");
             storage.image.dimension = descriptor["dimension"].get<std::string>();
             storage.image.format = descriptor["format"].get<std::string>();
-            for (const auto &extent : descriptor["extent"]) {
-                uint64_t component = 0;
-                if (!uint64Value(extent, component) || (!component && storage.ownership != StorageOwnership::Borrowed))
-                    return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor/extent",
-                                "image extent must be a positive static size, or 0 on borrowed Storage");
-                storage.image.extent.push_back(component);
+            const bool borrowedImage = storage.ownership == StorageOwnership::Borrowed;
+            for (size_t axis = 0; axis < descriptor["extent"].size(); ++axis) {
+                ControlComponent component;
+                if (!parseExtentComponent(descriptor["extent"][axis], component, diagnostic,
+                                          path + "/descriptor/extent/" + std::to_string(axis), borrowedImage))
+                    return false;
+                if (component.kind == ControlKind::Static) {
+                    storage.image.extent.push_back(component.value);
+                } else {
+                    if (borrowedImage)
+                        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse",
+                                    path + "/descriptor/extent/" + std::to_string(axis),
+                                    "borrowed image extent uses 0 for dyn, not a control component");
+                    storage.image.extent.push_back(0);
+                    storage.image.extentControls.resize(3);
+                    storage.image.extentControls[axis] = component;
+                }
             }
+            if (!storage.image.extentControls.empty())
+                for (size_t axis = 0; axis < storage.image.extent.size(); ++axis)
+                    if (storage.image.extentControls.size() <= axis ||
+                        (storage.image.extent[axis] && storage.image.extentControls[axis].kind == ControlKind::Static &&
+                         !storage.image.extentControls[axis].value))
+                        storage.image.extentControls[axis] =
+                            ControlComponent{ControlKind::Static, storage.image.extent[axis], 0, false, 0};
             for (const auto &[key, target] :
                  {std::pair<const char *, std::vector<std::string> *>("aspects", &storage.image.aspects),
                   std::pair<const char *, std::vector<std::string> *>("usage", &storage.image.usage)}) {
@@ -1752,6 +1821,106 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
     return true;
 }
 
+bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
+                         uint32_t &valueId) {
+    if (control.kind == ControlKind::Capture) {
+        valueId = control.reference;
+        return valueId < program.values.size();
+    }
+    if (control.kind == ControlKind::Parameter) {
+        if (control.reference >= program.parameters.size())
+            return false;
+        valueId = program.parameters[control.reference].value;
+        return valueId < program.values.size();
+    }
+    if (control.kind != ControlKind::Argument)
+        return false;
+    for (const Value &value : program.values) {
+        if (value.origin.kind == OriginKind::Argument && value.origin.graph == graph &&
+            value.origin.slot == control.reference) {
+            valueId = value.id;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool evaluateOwnedBufferLength(const Program &program, const Storage &storage,
+                               const std::vector<InvocationBuffer> &storageBuffers, uint64_t &byteLength,
+                               Diagnostic &diagnostic) {
+    byteLength = storage.buffer.byteLength;
+    if (byteLength)
+        return true;
+    if (storage.buffer.byteLengthExtents.empty())
+        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
+                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                    "owned Storage requires a static byte_length or like-source extents");
+    if (storage.initialValue >= program.values.size() || !program.values[storage.initialValue].layout ||
+        !program.values[storage.initialValue].layout->byteSize)
+        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
+                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                    "owned dyn Storage has no element layout");
+    const std::string &graph = program.values[storage.initialValue].origin.graph;
+    uint32_t likeValue = UINT32_MAX;
+    uint64_t staticProduct = 1;
+    for (size_t axis = 0; axis < storage.buffer.byteLengthExtents.size(); ++axis) {
+        const ControlComponent &extent = storage.buffer.byteLengthExtents[axis];
+        if (extent.kind == ControlKind::Static) {
+            if (!extent.value || staticProduct > std::numeric_limits<uint64_t>::max() / extent.value)
+                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
+                            "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length/" +
+                                std::to_string(axis),
+                            "owned dyn extent overflows");
+            staticProduct *= extent.value;
+            continue;
+        }
+        uint32_t valueId = UINT32_MAX;
+        if (!resolveControlValue(program, extent, graph, valueId) ||
+            (extent.kind != ControlKind::Capture && program.values[valueId].origin.kind == OriginKind::NodeResult))
+            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
+                        "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length/" + std::to_string(axis),
+                        "owned dyn like-source is not entry-available");
+        if (likeValue == UINT32_MAX)
+            likeValue = valueId;
+        else if (likeValue != valueId)
+            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
+                        "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                        "owned dyn buffer extents must share one like-source");
+    }
+    if (likeValue == UINT32_MAX) {
+        byteLength = staticProduct * program.values[storage.initialValue].layout->byteSize;
+        return byteLength != 0;
+    }
+    if (!program.values[likeValue].storage || *program.values[likeValue].storage >= storageBuffers.size() ||
+        !storageBuffers[*program.values[likeValue].storage].data || !program.values[likeValue].layout ||
+        !program.values[likeValue].layout->byteSize)
+        return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
+                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                    "owned dyn like-source is not bound");
+    const uint64_t likeBytes = storageBuffers[*program.values[likeValue].storage].byteLength;
+    const uint64_t likeCell = program.values[likeValue].layout->byteSize;
+    uint64_t likeStatic = 1;
+    for (uint64_t extent : program.values[likeValue].shape)
+        if (extent) {
+            if (likeStatic > std::numeric_limits<uint64_t>::max() / extent)
+                return false;
+            likeStatic *= extent;
+        }
+    if (!likeCell || likeBytes % likeCell || (likeBytes / likeCell) % likeStatic)
+        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
+                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                    "owned dyn like-source byte length does not match its layout");
+    const uint64_t likeDyn = (likeBytes / likeCell) / likeStatic;
+    const uint64_t ownedCell = program.values[storage.initialValue].layout->byteSize;
+    if (!likeDyn || staticProduct > std::numeric_limits<uint64_t>::max() / likeDyn ||
+        ownedCell > std::numeric_limits<uint64_t>::max() / (staticProduct * likeDyn))
+        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
+                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                    "owned dyn allocation overflows");
+    byteLength = ownedCell * staticProduct * likeDyn;
+    return true;
+}
+
 bool execute(const ResolvedProgram &resolved, const Invocation &invocation, const StageExecutor &executor,
              ExecutionResult &result, Diagnostic &diagnostic) {
     result = {};
@@ -1784,15 +1953,8 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
                 return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
                             "/storages/" + std::to_string(storage.id) + "/descriptor",
                             "generic byte-buffer execution does not support image or opaque Storage");
-            if (storage.ownership == StorageOwnership::Owned) {
-                if (!storage.buffer.byteLength)
-                    return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "instance_bind",
-                                "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                                "owned Storage requires a static byte_length");
-                owned[storage.id].resize(static_cast<size_t>(storage.buffer.byteLength));
-                storageBuffers[storage.id] = {owned[storage.id].data(), owned[storage.id].size()};
+            if (storage.ownership == StorageOwnership::Owned)
                 continue;
-            }
             if (storage.mutability != StorageMutability::ReadOnly)
                 return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
                             "/storages/" + std::to_string(storage.id) + "/mutability",
@@ -1808,6 +1970,15 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
                             "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
                             "borrowed buffer provider is too small");
             storageBuffers[storage.id] = supplied;
+        }
+        for (const Storage &storage : program.storages) {
+            if (storage.ownership != StorageOwnership::Owned)
+                continue;
+            uint64_t byteLength = 0;
+            if (!evaluateOwnedBufferLength(program, storage, storageBuffers, byteLength, diagnostic))
+                return false;
+            owned[storage.id].resize(static_cast<size_t>(byteLength));
+            storageBuffers[storage.id] = {owned[storage.id].data(), owned[storage.id].size()};
         }
     } catch (const std::bad_alloc &) {
         return fail(diagnostic, "PROGRAM_RUNTIME_FAILURE", "invocation_entry", "/storages",

@@ -59,6 +59,21 @@ static int views_equal(VernonStringView left, VernonStringView right) {
     return left.size == right.size && (left.size == 0 || memcmp(left.data, right.data, left.size) == 0);
 }
 
+static bool json_contains_capture(const nlohmann::json &value) {
+    if (value.is_object()) {
+        if (value.contains("capture"))
+            return true;
+        for (auto it = value.begin(); it != value.end(); ++it)
+            if (json_contains_capture(it.value()))
+                return true;
+    } else if (value.is_array()) {
+        for (const auto &element : value)
+            if (json_contains_capture(element))
+                return true;
+    }
+    return false;
+}
+
 static std::string canonical_sha256(const nlohmann::json &value) {
     llvm::SHA256 hash;
     hash.update(value.dump());
@@ -607,6 +622,325 @@ module {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerCApi, FinalizesOwnedDynamicZerosLikeFromLikeSource) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.source"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like", vernon.dtype = "f32"}
+        : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    %result = "vernon_program.compute"(%source, %buffer) {
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [-1, -1], "read", "device">,
+         !vernon.tensor_view<f32, [-1, -1], "read_write", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    func.return %result : !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+  }
+}
+)mlir";
+    static const char implementation[] = R"mlir(
+module {
+  func.func @copy(
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "source",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %output: !vernon.tensor_view<f32, [-1, -1], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "output",
+        vernon.set = 0 : i64,
+        vernon.binding = 1 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
+    ASSERT_NE(planned, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(planned), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
+    const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
+    const nlohmann::json reflection =
+        nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
+    const nlohmann::json &values = reflection.at("execution").at("values");
+    bool foundLike = false;
+    for (const auto &value : values) {
+        if (value.contains("like")) {
+            foundLike = true;
+            EXPECT_EQ(value.at("like"), 0);
+            EXPECT_EQ(value.at("shape"), nlohmann::json::array({-1, -1}));
+        }
+    }
+    EXPECT_TRUE(foundLike);
+    ASSERT_EQ(reflection.at("kernel_compile_requests").size(), 1u);
+    const nlohmann::json &request = reflection.at("kernel_compile_requests").at(0);
+    EXPECT_FALSE(request.contains("kind") && request.at("kind") == "storage");
+
+    VernonCompileResult *compiled =
+        vernonCompilerCompileMlir(compiler, implementation, strlen(implementation), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
+    const VernonStringView compiledReflection = vernonCompileResultGetReflection(compiled);
+    const std::string requestId = request.at("id").get<std::string>();
+    const std::string stageId = "compiled/copy";
+    const std::string entry = "copy";
+    const VernonCompiledKernel kernel{{requestId.data(), requestId.size()},
+                                      {stageId.data(), stageId.size()},
+                                      {entry.data(), entry.size()},
+                                      compiledReflection};
+    VernonCompileResult *finalized =
+        vernonCompilerFinalizeProgram(compiler, plannedReflection.data, plannedReflection.size, &kernel, 1);
+    ASSERT_NE(finalized, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(finalized), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(finalized).data, vernonCompileResultGetDiagnostics(finalized).size);
+    const VernonStringView finalizedReflection = vernonCompileResultGetReflection(finalized);
+    const nlohmann::json finalizedJson =
+        nlohmann::json::parse(finalizedReflection.data, finalizedReflection.data + finalizedReflection.size);
+    const nlohmann::json &canonical = finalizedJson.at("canonical_program");
+    ASSERT_GE(canonical.at("storages").size(), 2u);
+    bool foundOwnedDyn = false;
+    for (const auto &storage : canonical.at("storages")) {
+        if (storage.at("ownership") != "owned")
+            continue;
+        foundOwnedDyn = true;
+        EXPECT_TRUE(storage.at("descriptor").at("byte_length").is_array());
+        EXPECT_EQ(storage.at("descriptor").at("byte_length"),
+                  nlohmann::json::array({{{"dimension", {{"control", {{"argument", 0}}}, {"axis", 0}}}},
+                                         {{"dimension", {{"control", {{"argument", 0}}}, {"axis", 1}}}}}));
+        EXPECT_NE(storage.at("descriptor").at("byte_length"), 0);
+        EXPECT_FALSE(json_contains_capture(storage.at("descriptor")));
+    }
+    EXPECT_TRUE(foundOwnedDyn);
+    bool foundDynValue = false;
+    for (const auto &value : canonical.at("values")) {
+        if (value.at("shape") == nlohmann::json::array({-1, -1}))
+            foundDynValue = true;
+        EXPECT_FALSE(value.contains("like"));
+    }
+    EXPECT_TRUE(foundDynValue);
+    EXPECT_TRUE(canonical.at("shape_symbols").empty());
+
+    vernonCompileResultDestroy(finalized);
+    vernonCompileResultDestroy(compiled);
+    vernonCompileResultDestroy(planned);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, PlansFromValuesWithoutLike) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %source: !vernon.tensor_view<f32, [4], "read", "device"> {vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.source"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %buffer = "vernon.intrinsic"(%source) {name = "from_values", vernon.dtype = "f32"}
+        : (!vernon.tensor_view<f32, [4], "read", "device">)
+        -> !vernon.tensor_view<f32, [4], "read_write", "device">
+    %result = "vernon_program.compute"(%source, %buffer) {
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [4], "read", "device">,
+         !vernon.tensor_view<f32, [4], "read_write", "device">)
+        -> !vernon.tensor_view<f32, [4], "read_write", "device">
+    func.return %result : !vernon.tensor_view<f32, [4], "read_write", "device">
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
+    ASSERT_NE(planned, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(planned), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
+    const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
+    const nlohmann::json reflection =
+        nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
+    for (const auto &value : reflection.at("execution").at("values"))
+        EXPECT_FALSE(value.contains("like"));
+
+    vernonCompileResultDestroy(planned);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, FinalizesBackwardZerosLikeFromCapturedNodeResult) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.source"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like", vernon.dtype = "f32"}
+        : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    %result = "vernon_program.compute"(%source, %buffer) {
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [-1, -1], "read", "device">,
+         !vernon.tensor_view<f32, [-1, -1], "read_write", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    func.return %result : !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+  }
+  func.func @backward(
+      %output: !vernon.tensor_view<f32, [-1, -1], "read", "device">
+          {vernon_program.capture_forward_value = 2 : i32},
+      %cotangent: !vernon.tensor_view<f32, [-1, -1], "read", "device">
+          {vernon.source_name = "output"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "source"})
+      attributes {
+        vernon_program.graph = "backward",
+        vernon_program.argument_names = ["cotangent.output"],
+        vernon_program.result_names = ["gradient.source"]
+      } {
+    %buffer = "vernon.intrinsic"(%output) {name = "zeros_like", vernon.dtype = "f32"}
+        : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    %gradient = "vernon_program.compute"(%cotangent, %buffer) {
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["source", "output"], result_names = ["output"],
+      vernon_program.operand_accesses = ["read", "write"],
+      vernon_program.result_resource_sources = array<i64: 1>
+    } : (!vernon.tensor_view<f32, [-1, -1], "read", "device">,
+         !vernon.tensor_view<f32, [-1, -1], "read_write", "device">)
+        -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+    func.return %gradient : !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
+  }
+}
+)mlir";
+    static const char implementation[] = R"mlir(
+module {
+  func.func @copy(
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "source",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %output: !vernon.tensor_view<f32, [-1, -1], "write", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "output",
+        vernon.set = 0 : i64,
+        vernon.binding = 1 : i64
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
+    ASSERT_NE(planned, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(planned), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
+    const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
+    const nlohmann::json reflection =
+        nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
+    ASSERT_EQ(reflection.at("kernel_compile_requests").size(), 2u);
+    VernonCompileResult *compiled =
+        vernonCompilerCompileMlir(compiler, implementation, strlen(implementation), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
+    const VernonStringView compiledReflection = vernonCompileResultGetReflection(compiled);
+    const std::string forwardId = reflection.at("kernel_compile_requests").at(0).at("id").get<std::string>();
+    const std::string backwardId = reflection.at("kernel_compile_requests").at(1).at("id").get<std::string>();
+    const std::string stageId = "compiled/copy";
+    const std::string entry = "copy";
+    const VernonCompiledKernel kernels[2] = {{
+                                                 {forwardId.data(), forwardId.size()},
+                                                 {stageId.data(), stageId.size()},
+                                                 {entry.data(), entry.size()},
+                                                 compiledReflection,
+                                             },
+                                             {
+                                                 {backwardId.data(), backwardId.size()},
+                                                 {stageId.data(), stageId.size()},
+                                                 {entry.data(), entry.size()},
+                                                 compiledReflection,
+                                             }};
+    VernonCompileResult *finalized =
+        vernonCompilerFinalizeProgram(compiler, plannedReflection.data, plannedReflection.size, kernels, 2);
+    ASSERT_NE(finalized, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(finalized), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(finalized).data, vernonCompileResultGetDiagnostics(finalized).size);
+    const VernonStringView finalizedReflection = vernonCompileResultGetReflection(finalized);
+    const nlohmann::json finalizedJson =
+        nlohmann::json::parse(finalizedReflection.data, finalizedReflection.data + finalizedReflection.size);
+    const nlohmann::json &canonical = finalizedJson.at("canonical_program");
+    bool foundForwardArgument = false;
+    bool foundBackwardCapture = false;
+    for (const auto &storage : canonical.at("storages")) {
+        if (storage.at("ownership") != "owned") {
+            EXPECT_FALSE(json_contains_capture(storage.at("descriptor")));
+            continue;
+        }
+        const nlohmann::json &byteLength = storage.at("descriptor").at("byte_length");
+        ASSERT_TRUE(byteLength.is_array());
+        const int64_t initial = storage.at("initial_value").get<int64_t>();
+        const std::string graph = canonical.at("values").at(initial).at("origin").at("graph").get<std::string>();
+        if (graph == "forward") {
+            foundForwardArgument = true;
+            EXPECT_EQ(byteLength,
+                      nlohmann::json::array({{{"dimension", {{"control", {{"argument", 0}}}, {"axis", 0}}}},
+                                             {{"dimension", {{"control", {{"argument", 0}}}, {"axis", 1}}}}}));
+            EXPECT_FALSE(json_contains_capture(byteLength));
+        } else {
+            foundBackwardCapture = true;
+            EXPECT_EQ(byteLength,
+                      nlohmann::json::array({{{"dimension", {{"control", {{"capture", 2}}}, {"axis", 0}}}},
+                                             {{"dimension", {{"control", {{"capture", 2}}}, {"axis", 1}}}}}));
+        }
+    }
+    EXPECT_TRUE(foundForwardArgument);
+    EXPECT_TRUE(foundBackwardCapture);
+    ASSERT_EQ(canonical.at("graphs").size(), 2u);
+    EXPECT_TRUE(canonical.at("graphs").at(0).at("captures").empty());
+    bool capturedNodeResult = false;
+    for (const auto &capture : canonical.at("graphs").at(1).at("captures"))
+        if (capture.at("value") == 2)
+            capturedNodeResult = true;
+    EXPECT_TRUE(capturedNodeResult);
+
+    vernonCompileResultDestroy(finalized);
+    vernonCompileResultDestroy(compiled);
+    vernonCompileResultDestroy(planned);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerCApi, PlansProgramVjpAndFanInFromPrimalProgram) {
     static const char program[] = R"mlir(
 module attributes {vernon_program.vjp_wrt = ["source"]} {
@@ -699,6 +1033,117 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     EXPECT_EQ(entry.at("physical_layouts").at("host_value").at("packed_results_size"), sizeof(float));
 
     vernonCompileResultDestroy(compiled);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, FinalizeProgramKeepsTapeAllocatorOnKernelAbi) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %values: !vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "values"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.values"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %result = "vernon_program.compute"(%values) {
+      callee = "Module.increment", grid = array<i64: 1, 1, 1>, features = [],
+      operand_names = ["values"], result_names = ["values"],
+      vernon_program.operand_accesses = ["read_write"],
+      vernon_program.result_resource_sources = array<i64: 0>
+    } : (!vernon.tensor_view<f32, [4], "read_write", "device">)
+        -> !vernon.tensor_view<f32, [4], "read_write", "device">
+    func.return %result : !vernon.tensor_view<f32, [4], "read_write", "device">
+  }
+}
+)mlir";
+    static const char implementation[] = R"mlir(
+module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
+  func.func @increment(
+      %values: !vernon.tensor_view<f32, [4], "read_write", "device"> {
+        vernon.interface = "resource",
+        vernon.source_name = "values",
+        vernon.set = 0 : i64,
+        vernon.binding = 0 : i64
+      },
+      %allocator: index {
+        vernon.interface = "input",
+        vernon.builtin = "ad_tape_allocator"
+      },
+      %id: tensor<3xi32> {
+        vernon.interface = "input",
+        vernon.builtin = "global_invocation_id",
+        vernon.dtype = "u32",
+        vernon.abi_leaf_dtypes = ["u32"]
+      }) attributes {
+        vernon.entry,
+        vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    return
+  }
+}
+)mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
+    ASSERT_NE(planned, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(planned), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
+    const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
+    const nlohmann::json plannedJson =
+        nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
+    ASSERT_EQ(plannedJson.at("kernel_compile_requests").size(), 1u);
+    const std::string requestId = plannedJson.at("kernel_compile_requests").at(0).at("id").get<std::string>();
+
+    VernonCompileResult *compiled =
+        vernonCompilerCompileMlir(compiler, implementation, strlen(implementation), VERNON_TARGET_CPU);
+    ASSERT_NE(compiled, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
+    const VernonStringView compiledReflection = vernonCompileResultGetReflection(compiled);
+    const nlohmann::json compiledJson =
+        nlohmann::json::parse(compiledReflection.data, compiledReflection.data + compiledReflection.size);
+    const nlohmann::json &compiledArgs = compiledJson.at("entries").at(0).at("arguments");
+    ASSERT_EQ(compiledArgs.size(), 3u);
+    EXPECT_EQ(compiledArgs.at(1).at("builtin"), "ad_tape_allocator");
+    EXPECT_FALSE(compiledArgs.at(1).contains("value_layout"));
+    EXPECT_EQ(compiledArgs.at(1).at("physical_layouts").at("host_value").at("root").at("size"), sizeof(void *));
+    EXPECT_EQ(compiledArgs.at(2).at("builtin"), "global_invocation_id");
+
+    const std::string stageId = "compiled/increment";
+    const std::string entry = "increment";
+    const VernonCompiledKernel kernel{{requestId.data(), requestId.size()},
+                                      {stageId.data(), stageId.size()},
+                                      {entry.data(), entry.size()},
+                                      compiledReflection};
+    VernonCompileResult *finalized =
+        vernonCompilerFinalizeProgram(compiler, plannedReflection.data, plannedReflection.size, &kernel, 1);
+    ASSERT_NE(finalized, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(finalized), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(finalized).data, vernonCompileResultGetDiagnostics(finalized).size);
+    const VernonStringView finalizedReflection = vernonCompileResultGetReflection(finalized);
+    const nlohmann::json finalizedJson =
+        nlohmann::json::parse(finalizedReflection.data, finalizedReflection.data + finalizedReflection.size);
+    const nlohmann::json &endpoints =
+        finalizedJson.at("stage_contracts").at(requestId).at("reflection").at("endpoints");
+    for (const auto &endpoint : endpoints) {
+        EXPECT_NE(endpoint.value("builtin", ""), "ad_tape_allocator");
+        EXPECT_NE(endpoint.value("builtin", ""), "global_invocation_id");
+        EXPECT_NE(endpoint.value("interface", ""), "system_value");
+    }
+    if (finalizedJson.contains("target_implementations") &&
+        finalizedJson.at("target_implementations").contains(requestId)) {
+        for (const auto &endpoint : finalizedJson.at("target_implementations").at(requestId).at("endpoints")) {
+            EXPECT_NE(endpoint.value("builtin", ""), "ad_tape_allocator");
+            EXPECT_NE(endpoint.value("builtin", ""), "global_invocation_id");
+        }
+    }
+
+    vernonCompileResultDestroy(finalized);
+    vernonCompileResultDestroy(compiled);
+    vernonCompileResultDestroy(planned);
     vernonCompilerDestroy(compiler);
 }
 

@@ -480,9 +480,26 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                                                suffixShape(expectedShape, actualShape);
             if (!opaqueResource && ((expectedDtype && actualDtype && *expectedDtype != *actualDtype) ||
                                     (!sameShape(expectedShape, actualShape) && !graphicsVertexElement))) {
+                auto shapeText = [](const llvm::json::Array *shape) {
+                    if (!shape)
+                        return std::string("[]");
+                    std::string text = "[";
+                    for (size_t index = 0; index < shape->size(); ++index) {
+                        if (index)
+                            text += ", ";
+                        if (std::optional<int64_t> extent = (*shape)[index].getAsInteger())
+                            text += std::to_string(*extent);
+                    }
+                    text += "]";
+                    return text;
+                };
                 result->status = VERNON_STATUS_VERIFICATION_ERROR;
-                result->diagnostics =
-                    "compiled kernel ABI type does not match Program value for request '" + requestId + "'";
+                result->diagnostics = "compiled kernel ABI type does not match Program value for request '" +
+                                      requestId + "' parameter '" + parameter->str() +
+                                      "' expected dtype=" + (expectedDtype ? expectedDtype->str() : "<none>") +
+                                      " shape=" + shapeText(expectedShape) +
+                                      " actual dtype=" + (actualDtype ? actualDtype->str() : "<none>") +
+                                      " shape=" + shapeText(actualShape);
                 return result.release();
             }
         }

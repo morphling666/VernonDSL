@@ -85,10 +85,24 @@ struct VernonProgramBuildExecutablePass final : PassWrapper<VernonProgramBuildEx
             uint32_t nextNode = 0;
             for (Operation &operation : function.getBody().front().without_terminator()) {
                 if (isStorageAllocIntrinsic(&operation)) {
+                    SmallVector<int64_t> operandIds;
+                    for (Value operand : operation.getOperands()) {
+                        auto found = values.find(operand);
+                        if (found == values.end()) {
+                            operation.emitError("storage alloc like-source has no stable value id");
+                            invalid = true;
+                            continue;
+                        }
+                        operandIds.push_back(found->second);
+                    }
+                    SmallVector<int64_t> resultIds;
                     for (Value result : operation.getResults()) {
                         const uint32_t valueId = function == forward ? forwardIds.lookup(result) : nextValue++;
                         values[result] = valueId;
+                        resultIds.push_back(valueId);
                     }
+                    operation.setAttr("vernon_program.operand_value_ids", builder.getDenseI64ArrayAttr(operandIds));
+                    operation.setAttr("vernon_program.result_value_ids", builder.getDenseI64ArrayAttr(resultIds));
                     continue;
                 }
                 if (!isa<ComputeOp, GraphicsOp>(operation)) {

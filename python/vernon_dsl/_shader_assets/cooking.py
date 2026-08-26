@@ -39,6 +39,7 @@ from ..program_frontend import (
     CapturedDslProvider,
     CapturedVjpDslProvider,
     ParsedProgram,
+    ProgramImplementation,
     ProviderChain,
 )
 from .artifact_io import write_external_artifact
@@ -157,6 +158,35 @@ def _compile_stage(
     return compiled
 
 
+def _specialize_program_implementations(
+    implementations: Sequence[ProgramImplementation],
+    native: Any,
+) -> tuple[ProgramImplementation, ...]:
+    specialized: list[ProgramImplementation] = []
+    for implementation in implementations:
+        if not implementation.host_constants:
+            specialized.append(implementation)
+            continue
+        names = [name for name, _ in implementation.host_constants]
+        values = [value for _, value in implementation.host_constants]
+        try:
+            mlir = native._specialize_kernel_constants(implementation.mlir, implementation.entry, names, values)
+        except ValueError as error:
+            raise PipelineCompileError(
+                f"cannot specialize Program callee {implementation.callee!r} host constants: {error}"
+            ) from None
+        specialized.append(
+            ProgramImplementation(
+                implementation.callee,
+                implementation.entry,
+                implementation.kind,
+                mlir,
+                implementation.host_constants,
+            )
+        )
+    return tuple(specialized)
+
+
 def _compile_program_bundle_plan(
     parsed: ParsedProgram,
     *,
@@ -181,7 +211,7 @@ def _compile_program_bundle_plan(
         raise PipelineCompileError("Program compiler reflection has no kernel compile requests")
 
     stages: dict[str, CompiledStage] = {}
-    compiled_implementations: dict[str, CompiledStage] = {}
+    compiled_implementations: dict[tuple[str, str], CompiledStage] = {}
     source = Path(parsed.provenance[0]) if parsed.provenance else Path()
     reflected_values = execution.get("values")
     if not isinstance(reflected_values, list):
@@ -191,10 +221,11 @@ def _compile_program_bundle_plan(
         for value in reflected_values
         if isinstance(value, Mapping) and isinstance(value.get("id"), int)
     }
+    implementations = _specialize_program_implementations(parsed.implementations, native)
     providers = ProviderChain(
         (
-            CapturedDslProvider(parsed.implementations),
-            CapturedVjpDslProvider(parsed.implementations, native),
+            CapturedDslProvider(implementations),
+            CapturedVjpDslProvider(implementations, native),
             BuiltinDslProvider(),
         )
     )
@@ -218,7 +249,10 @@ def _compile_program_bundle_plan(
             )
         if implementation.kind != ("compute" if kind == "compute" else "graphics"):
             raise PipelineCompileError(f"Program request {request_id!r} selected an incompatible implementation")
-        stage = compiled_implementations.get(hint)
+        # Builtin copy/add share one hint across ranks. Rank (and dtype) live on
+        # the generated entry; extents stay vd.dyn from the view descriptor.
+        compile_key = (hint, implementation.entry)
+        stage = compiled_implementations.get(compile_key)
         if stage is None:
             module_manifest = canonical_json(
                 {
@@ -229,7 +263,7 @@ def _compile_program_bundle_plan(
                 }
             )
             module = ShaderModuleDescriptor(
-                f"{pipeline_id}/{hint}",
+                f"{pipeline_id}/{hint}/{implementation.entry}",
                 source,
                 source,
                 module_manifest,
@@ -245,7 +279,7 @@ def _compile_program_bundle_plan(
                 implementation.mlir,
                 retained_programs,
             )
-            compiled_implementations[hint] = stage
+            compiled_implementations[compile_key] = stage
         stages[request_id] = stage
     finalized = compiler.finalize_program_result(
         planned.reflection,

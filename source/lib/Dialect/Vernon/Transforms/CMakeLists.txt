@@ -23,6 +23,7 @@ add_mlir_library(
     VernonLowerSynchronization.cpp
     VernonAggregateStorage.cpp
     VernonSharedValuePatterns.cpp
+    VernonSpecializeKernelConstants.cpp
     VernonSpirvMath.cpp
     VernonTensorShapeSemantics.cpp
     VernonValidation.cpp

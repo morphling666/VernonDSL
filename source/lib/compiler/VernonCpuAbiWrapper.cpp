@@ -15,6 +15,7 @@
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <utility>
 
@@ -24,6 +25,14 @@ namespace {
 constexpr uint32_t kLanePhaseComplete = 6;
 
 llvm::Error invalidAbi(const llvm::Twine &message) { return llvm::createStringError(message); }
+
+uint64_t hostProvidedArgumentsSize(const CpuAbiWrapperMetadata &metadata) {
+    uint64_t size = 0;
+    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments)
+        if (packing.builtin.empty())
+            size = std::max(size, packing.offset + packing.size);
+    return size;
+}
 
 llvm::Constant *integerConstant(llvm::Type *type, uint64_t value) {
     auto *integerType = llvm::dyn_cast<llvm::IntegerType>(type);
@@ -606,7 +615,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     validRange =
         builder.CreateAnd(validRange, builder.CreateOr(builder.CreateNot(hasLaneTables),
                                                        builder.CreateICmpUGE(laneTableCount, workgroupVolume)));
-    if (metadata.argumentsSize)
+    if (const uint64_t hostSize = hostProvidedArgumentsSize(metadata); hostSize)
         validRange = builder.CreateAnd(
             validRange,
             builder.CreateAnd(
@@ -614,7 +623,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                                                                           llvm::cast<llvm::PointerType>(pointerType))),
                                  builder.CreateICmpNE(laneArguments, llvm::ConstantPointerNull::get(
                                                                          llvm::cast<llvm::PointerType>(pointerType)))),
-                builder.CreateICmpUGE(rangeArgumentsSize, builder.getInt64(metadata.argumentsSize))));
+                builder.CreateICmpUGE(rangeArgumentsSize, builder.getInt64(hostSize))));
     if (metadata.resultsSize)
         validRange = builder.CreateAnd(
             validRange,
@@ -702,7 +711,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Value *selectedArguments = selectLanePointer(rangeArguments, laneArguments, "lane_arguments");
     llvm::Value *selectedResults = selectLanePointer(rangeResults, laneResults, "lane_results");
     llvm::Value *validLanePointers = llvm::ConstantInt::getTrue(context);
-    if (metadata.argumentsSize)
+    if (hostProvidedArgumentsSize(metadata))
         validLanePointers = builder.CreateAnd(
             validLanePointers,
             builder.CreateICmpNE(selectedArguments,
@@ -714,8 +723,15 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::BasicBlock *laneReady = llvm::BasicBlock::Create(context, "lane_ready", wrapper);
     builder.CreateCondBr(validLanePointers, laneReady, rangeInvalid);
     builder.SetInsertPoint(laneReady);
-    if (metadata.argumentsSize)
-        builder.CreateMemCpy(packed, llvm::Align(16), selectedArguments, llvm::Align(1), metadata.argumentsSize);
+    if (metadata.argumentsSize) {
+        builder.CreateMemSet(packed, builder.getInt8(0), metadata.argumentsSize, llvm::MaybeAlign(16));
+        if (hostProvidedArgumentsSize(metadata)) {
+            llvm::Value *copySize = builder.CreateSelect(
+                builder.CreateICmpULT(rangeArgumentsSize, builder.getInt64(metadata.argumentsSize)), rangeArgumentsSize,
+                builder.getInt64(metadata.argumentsSize));
+            builder.CreateMemCpy(packed, llvm::Align(16), selectedArguments, llvm::Align(1), copySize);
+        }
+    }
     builder.CreateStore(selectedResults, builder.CreateStructGEP(invocationType, laneInvocation, 2));
 
     for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {

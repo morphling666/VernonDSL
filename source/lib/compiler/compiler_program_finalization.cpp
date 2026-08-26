@@ -92,54 +92,105 @@ void rebuildDependencies(llvm::json::Object &execution, llvm::StringRef graphNam
     }
 }
 
-void rebuildCaptures(llvm::json::Object &execution) {
-    llvm::json::Object *signature = execution.getObject("signature");
-    llvm::json::Array *graphs = execution.getArray("graphs");
-    if (!signature || !graphs)
+const llvm::json::Object *valueById(const llvm::json::Array &values, int64_t id);
+
+void considerCapture(int64_t value, const std::set<int64_t> &available, const std::set<int64_t> &forwardValues,
+                     std::set<int64_t> &captures) {
+    if (!available.count(value) && forwardValues.count(value))
+        captures.insert(value);
+}
+
+void collectLikeCaptures(const llvm::json::Array &values, int64_t start, const std::set<int64_t> &available,
+                         const std::set<int64_t> &forwardValues, std::set<int64_t> &captures) {
+    std::set<int64_t> seen;
+    int64_t current = start;
+    while (seen.insert(current).second) {
+        considerCapture(current, available, forwardValues, captures);
+        const llvm::json::Object *value = valueById(values, current);
+        if (!value)
+            return;
+        if (const std::optional<int64_t> like = value->getInteger("like"))
+            current = *like;
+        else
+            return;
+    }
+}
+
+void collectBackwardCaptures(const llvm::json::Object &execution, std::set<int64_t> &captures) {
+    const llvm::json::Array *graphs = execution.getArray("graphs");
+    const llvm::json::Array *values = execution.getArray("values");
+    if (!graphs)
         return;
     std::set<int64_t> forwardValues;
-    llvm::json::Object *backward = nullptr;
-    for (llvm::json::Value &graphValue : *graphs) {
-        llvm::json::Object *graph = graphValue.getAsObject();
+    const llvm::json::Object *backward = nullptr;
+    for (const llvm::json::Value &graphValue : *graphs) {
+        const llvm::json::Object *graph = graphValue.getAsObject();
         if (!graph)
             continue;
         if (graph->getString("direction") == "forward") {
-            if (llvm::json::Array *arguments = graph->getArray("arguments"))
+            if (const llvm::json::Array *arguments = graph->getArray("arguments"))
                 for (const llvm::json::Value &argument : *arguments)
                     if (std::optional<int64_t> value = argument.getAsInteger())
                         forwardValues.insert(*value);
-            if (llvm::json::Array *nodes = graph->getArray("nodes"))
+            if (const llvm::json::Array *nodes = graph->getArray("nodes"))
                 for (const llvm::json::Value &nodeValue : *nodes)
-                    if (const llvm::json::Object *node = nodeValue.getAsObject())
+                    if (const llvm::json::Object *node = nodeValue.getAsObject()) {
+                        if (const llvm::json::Array *operands = node->getArray("operands"))
+                            for (const llvm::json::Value &operand : *operands)
+                                if (std::optional<int64_t> value = operand.getAsInteger())
+                                    forwardValues.insert(*value);
                         if (const llvm::json::Array *results = node->getArray("results"))
                             for (const llvm::json::Value &result : *results)
                                 if (std::optional<int64_t> value = result.getAsInteger())
                                     forwardValues.insert(*value);
+                    }
         } else if (graph->getString("direction") == "backward") {
             backward = graph;
         }
     }
+    if (!backward)
+        return;
     std::set<int64_t> available;
-    std::set<int64_t> captures;
-    if (backward) {
-        if (llvm::json::Array *arguments = backward->getArray("arguments"))
-            for (const llvm::json::Value &argument : *arguments)
-                if (std::optional<int64_t> value = argument.getAsInteger())
-                    available.insert(*value);
-        if (llvm::json::Array *nodes = backward->getArray("nodes"))
-            for (const llvm::json::Value &nodeValue : *nodes)
-                if (const llvm::json::Object *node = nodeValue.getAsObject()) {
-                    if (const llvm::json::Array *operands = node->getArray("operands"))
-                        for (const llvm::json::Value &operand : *operands)
-                            if (std::optional<int64_t> value = operand.getAsInteger();
-                                value && !available.count(*value) && forwardValues.count(*value))
-                                captures.insert(*value);
-                    if (const llvm::json::Array *results = node->getArray("results"))
-                        for (const llvm::json::Value &result : *results)
-                            if (std::optional<int64_t> value = result.getAsInteger())
-                                available.insert(*value);
-                }
+    if (const llvm::json::Array *arguments = backward->getArray("arguments"))
+        for (const llvm::json::Value &argument : *arguments)
+            if (std::optional<int64_t> value = argument.getAsInteger())
+                available.insert(*value);
+    if (const llvm::json::Array *nodes = backward->getArray("nodes"))
+        for (const llvm::json::Value &nodeValue : *nodes)
+            if (const llvm::json::Object *node = nodeValue.getAsObject()) {
+                if (const llvm::json::Array *operands = node->getArray("operands"))
+                    for (const llvm::json::Value &operand : *operands)
+                        if (std::optional<int64_t> value = operand.getAsInteger()) {
+                            considerCapture(*value, available, forwardValues, captures);
+                            if (values)
+                                collectLikeCaptures(*values, *value, available, forwardValues, captures);
+                        }
+                if (const llvm::json::Array *results = node->getArray("results"))
+                    for (const llvm::json::Value &result : *results)
+                        if (std::optional<int64_t> value = result.getAsInteger())
+                            available.insert(*value);
+            }
+    if (!values)
+        return;
+    for (const llvm::json::Value &rowValue : *values) {
+        const llvm::json::Object *row = rowValue.getAsObject();
+        const std::optional<int64_t> id = row ? row->getInteger("id") : std::nullopt;
+        if (!id || !row->getInteger("like") || forwardValues.count(*id))
+            continue;
+        collectLikeCaptures(*values, *id, available, forwardValues, captures);
     }
+}
+
+void rebuildCaptures(llvm::json::Object &execution) {
+    llvm::json::Object *signature = execution.getObject("signature");
+    if (!signature)
+        return;
+    std::set<int64_t> captures;
+    if (const llvm::json::Array *rows = signature->getArray("captures"))
+        for (const llvm::json::Value &row : *rows)
+            if (std::optional<int64_t> value = row.getAsInteger())
+                captures.insert(*value);
+    collectBackwardCaptures(execution, captures);
     llvm::json::Array reflected;
     for (int64_t capture : captures)
         reflected.emplace_back(capture);
@@ -215,6 +266,11 @@ std::string sha256(const llvm::json::Value &value) {
 }
 
 bool validAccess(llvm::StringRef access) { return access == "read" || access == "write" || access == "read_write"; }
+
+bool kernelHiddenBuiltin(llvm::StringRef builtin) {
+    return builtin == "ad_tape_allocator" || builtin == "ad_tape_root_region" || builtin == "global_invocation_id" ||
+           builtin == "local_invocation_id" || builtin == "workgroup_id";
+}
 
 const llvm::json::Object *valueById(const llvm::json::Array &values, int64_t id) {
     for (const llvm::json::Value &value : values)
@@ -413,7 +469,10 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
                                         llvm::json::Value(std::move(expanded)));
             }
             bindingIndex += names.size();
-        } else if (*role == "retained_primal") {
+        } else if (*role == "retained_primal" || *role == "cotangent") {
+            // Nested VJP requests every primal result cotangent as an upper bound.
+            // Structured VJP keeps only active Storage outputs for the selected wrt.
+            // Extra cotangents are unused, the same class as extra retained primals.
             omitted.insert(parameter->str());
             requestBindings->erase(requestBindings->begin() + bindingIndex);
         } else {
@@ -556,6 +615,120 @@ struct ValueProducer {
     int64_t node = -1;
 };
 
+int64_t storageRootOf(const std::map<int64_t, int64_t> &parent, int64_t value) {
+    int64_t root = value;
+    while (parent.count(root) && parent.at(root) != root)
+        root = parent.at(root);
+    return root;
+}
+
+bool thisGraphArgument(int64_t value, llvm::StringRef allocGraph,
+                       const std::map<int64_t, ArgumentSlot> &argumentSlots) {
+    const auto argument = argumentSlots.find(value);
+    return argument != argumentSlots.end() && argument->second.graph == allocGraph;
+}
+
+bool entryAvailable(int64_t value, llvm::StringRef allocGraph, bool captureLegal,
+                    const std::map<int64_t, ArgumentSlot> &argumentSlots, const std::set<int64_t> &captures) {
+    if (thisGraphArgument(value, allocGraph, argumentSlots))
+        return true;
+    return captureLegal && captures.count(value) != 0;
+}
+
+int64_t walkLikeSource(const llvm::json::Array &values, int64_t root, llvm::StringRef allocGraph, bool captureLegal,
+                       const std::map<int64_t, ArgumentSlot> &argumentSlots, const std::set<int64_t> &captures,
+                       const std::map<int64_t, ValueProducer> &producerByValue,
+                       const std::map<int64_t, int64_t> &parent, std::string &error) {
+    std::set<int64_t> seen;
+    int64_t current = root;
+    while (true) {
+        if (!seen.insert(current).second) {
+            error = "owned compute Storage like-source cycle";
+            return -1;
+        }
+        const llvm::json::Object *value = valueById(values, current);
+        if (!value) {
+            error = "owned compute Storage like-source is unknown";
+            return -1;
+        }
+        if (const std::optional<int64_t> like = value->getInteger("like")) {
+            current = *like;
+            continue;
+        }
+        if (entryAvailable(current, allocGraph, captureLegal, argumentSlots, captures))
+            return current;
+        if (!producerByValue.count(current)) {
+            error = "owned compute Storage like-source is not a ControlValueRef";
+            return -1;
+        }
+        const llvm::json::Object *allocated = valueById(values, storageRootOf(parent, current));
+        if (allocated)
+            if (const std::optional<int64_t> like = allocated->getInteger("like"); like && *like != current) {
+                current = *like;
+                continue;
+            }
+        error = "owned compute Storage like-source has NodeResultOrigin";
+        return -1;
+    }
+}
+
+std::optional<llvm::json::Object> controlValueRef(int64_t likeId, llvm::StringRef allocGraph, bool captureLegal,
+                                                  const std::map<int64_t, ArgumentSlot> &argumentSlots,
+                                                  const std::set<int64_t> &captures,
+                                                  const std::map<int64_t, ValueProducer> &producerByValue,
+                                                  std::string &error) {
+    if (thisGraphArgument(likeId, allocGraph, argumentSlots)) {
+        const auto argument = argumentSlots.find(likeId);
+        return llvm::json::Object{{"argument", argument->second.slot}};
+    }
+    if (captureLegal && captures.count(likeId))
+        return llvm::json::Object{{"capture", likeId}};
+    if (producerByValue.count(likeId)) {
+        error = "owned compute Storage like-source has NodeResultOrigin";
+        return std::nullopt;
+    }
+    error = "owned compute Storage like-source is not a ControlValueRef";
+    return std::nullopt;
+}
+
+llvm::json::Value dimensionExtent(const llvm::json::Object &reference, int64_t axis) {
+    return llvm::json::Object{{"dimension", llvm::json::Object{{"control", copyObject(reference)}, {"axis", axis}}}};
+}
+
+bool ownedDynamicExtents(const llvm::json::Array &rawValues, int64_t root, llvm::StringRef allocGraph,
+                         bool captureLegal, const llvm::json::Array &shape,
+                         const std::map<int64_t, ArgumentSlot> &argumentSlots, const std::set<int64_t> &captures,
+                         const std::map<int64_t, ValueProducer> &producerByValue,
+                         const std::map<int64_t, int64_t> &parent, llvm::json::Array &extents, std::string &error) {
+    const int64_t like = walkLikeSource(rawValues, root, allocGraph, captureLegal, argumentSlots, captures,
+                                        producerByValue, parent, error);
+    if (like < 0)
+        return false;
+    const std::optional<llvm::json::Object> reference =
+        controlValueRef(like, allocGraph, captureLegal, argumentSlots, captures, producerByValue, error);
+    if (!reference)
+        return false;
+    const llvm::json::Object *likeValue = valueById(rawValues, like);
+    const llvm::json::Array *likeShape = likeValue ? likeValue->getArray("shape") : nullptr;
+    if (!likeShape || likeShape->size() != shape.size()) {
+        error = "owned compute Storage like-source rank does not match the allocated value";
+        return false;
+    }
+    for (size_t axis = 0; axis < shape.size(); ++axis) {
+        const llvm::json::Value &extentValue = shape[axis];
+        if (!dynamicExtent(extentValue)) {
+            extents.emplace_back(*extentValue.getAsInteger());
+            continue;
+        }
+        if (!dynamicExtent((*likeShape)[axis])) {
+            error = "owned compute Storage dyn axis has a static like-source extent";
+            return false;
+        }
+        extents.emplace_back(dimensionExtent(*reference, static_cast<int64_t>(axis)));
+    }
+    return true;
+}
+
 bool selectCanonicalGraphs(const llvm::json::Array &rawGraphs, std::vector<CanonicalGraph> &graphs,
                            std::string &error) {
     const llvm::json::Object *forward = nullptr;
@@ -628,7 +801,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     }
 
     std::map<int64_t, ArgumentSlot> argumentSlots;
+    std::map<std::string, std::string> graphDirections;
     for (const CanonicalGraph &view : selectedGraphs) {
+        graphDirections[view.name] = view.direction;
         for (size_t slot = 0; slot < view.argumentIds->size(); ++slot) {
             std::optional<int64_t> id = (*view.argumentIds)[slot].getAsInteger();
             if (!id || !argumentSlots.emplace(*id, ArgumentSlot{view.name, static_cast<int64_t>(slot)}).second) {
@@ -637,6 +812,12 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             }
         }
     }
+    std::set<int64_t> capturedValues;
+    if (const llvm::json::Array *rows = rawSignature->getArray("captures"))
+        for (const llvm::json::Value &row : *rows)
+            if (std::optional<int64_t> value = row.getAsInteger())
+                capturedValues.insert(*value);
+    collectBackwardCaptures(execution, capturedValues);
     std::map<int64_t, ValueProducer> producerByValue;
     std::map<int64_t, std::string> allocationGraph;
     std::map<std::string, const llvm::json::Object *> nodeByStage;
@@ -644,12 +825,6 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     std::map<std::string, std::map<int64_t, LogicalResource>> resourcesByStage;
     std::set<int64_t> resourceVersions;
     std::map<int64_t, int64_t> parent;
-    const auto rootOf = [&](int64_t value) {
-        int64_t root = value;
-        while (parent.count(root) && parent[root] != root)
-            root = parent[root];
-        return root;
-    };
     for (const CanonicalComputeStage &compiled : compiledStages)
         if (compiled.requestId.empty() || !compiledByRequest.emplace(compiled.requestId, &compiled).second) {
             error = "canonical compute stages have invalid or duplicate logical request ids";
@@ -708,14 +883,38 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 resourceVersions.insert(*value);
                 if (logical.after) {
                     parent.emplace(*logical.after, *logical.after);
-                    const int64_t beforeRoot = rootOf(*value);
-                    const int64_t afterRoot = rootOf(*logical.after);
+                    const int64_t beforeRoot = storageRootOf(parent, *value);
+                    const int64_t afterRoot = storageRootOf(parent, *logical.after);
                     parent[afterRoot] = beforeRoot;
                     resourceVersions.insert(*logical.after);
                 }
                 resources.emplace(*value, std::move(logical));
             }
         }
+    }
+    bool assignedAllocGraph = true;
+    while (assignedAllocGraph) {
+        assignedAllocGraph = false;
+        for (const llvm::json::Value &rowValue : *rawValues) {
+            const llvm::json::Object *value = rowValue.getAsObject();
+            const std::optional<int64_t> id = value ? value->getInteger("id") : std::nullopt;
+            const std::optional<int64_t> like = value ? value->getInteger("like") : std::nullopt;
+            if (!id || !like)
+                continue;
+            const auto found = allocationGraph.find(*id);
+            if (found == allocationGraph.end() || argumentSlots.count(*like) || producerByValue.count(*like))
+                continue;
+            assignedAllocGraph |= allocationGraph.try_emplace(*like, found->second).second;
+        }
+    }
+    for (const auto &[id, graphName] : allocationGraph) {
+        if (graphDirections[graphName] != "backward")
+            continue;
+        std::string walkError;
+        const int64_t like = walkLikeSource(*rawValues, id, graphName, true, argumentSlots, capturedValues,
+                                            producerByValue, parent, walkError);
+        if (like >= 0 && !thisGraphArgument(like, graphName, argumentSlots))
+            capturedValues.insert(like);
     }
 
     llvm::json::Array storages;
@@ -724,13 +923,13 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     for (const auto &[unusedStage, resources] : resourcesByStage) {
         (void)unusedStage;
         for (const auto &[before, resource] : resources) {
-            const int64_t root = rootOf(before);
+            const int64_t root = storageRootOf(parent, before);
             mutableByRoot[root] |= resource.access != "read";
         }
     }
     for (const auto &[version, unusedParent] : parent) {
         (void)unusedParent;
-        const int64_t root = rootOf(version);
+        const int64_t root = storageRootOf(parent, version);
         if (storageByRoot.count(root))
             continue;
         const llvm::json::Object *value = valueById(*rawValues, root);
@@ -743,6 +942,12 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
         }
         const int64_t storage = static_cast<int64_t>(storages.size());
         storageByRoot[root] = storage;
+        const auto foundGraph = allocationGraph.find(root);
+        const llvm::StringRef allocGraph = foundGraph != allocationGraph.end()
+                                               ? llvm::StringRef(foundGraph->second)
+                                               : llvm::StringRef(selectedGraphs.front().name);
+        const auto direction = graphDirections.find(allocGraph.str());
+        const bool captureLegal = direction != graphDirections.end() && direction->second == "backward";
         llvm::json::Object descriptor;
         if (isTextureType(type)) {
             const std::vector<std::string> fields = quotedTypeFields(type);
@@ -761,6 +966,15 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             }
             const bool borrowed = argumentSlots.count(root);
             llvm::json::Array extent;
+            llvm::json::Array dynamicExtents;
+            bool hasDynamic = false;
+            for (size_t axis = 0; axis < spatialRank; ++axis)
+                if (axis < shape->size() && dynamicExtent((*shape)[axis]))
+                    hasDynamic = true;
+            if (hasDynamic && !borrowed &&
+                !ownedDynamicExtents(*rawValues, root, allocGraph, captureLegal, *shape, argumentSlots, capturedValues,
+                                     producerByValue, parent, dynamicExtents, error))
+                return false;
             for (size_t axis = 0; axis < 3; ++axis) {
                 const size_t sourceAxis = spatialRank > axis ? spatialRank - axis - 1 : spatialRank;
                 if (sourceAxis >= spatialRank) {
@@ -773,6 +987,8 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     extent.emplace_back(*planned->getAsInteger());
                 } else if (borrowed) {
                     extent.emplace_back(int64_t{0});
+                } else if (sourceAxis < dynamicExtents.size()) {
+                    extent.emplace_back(dynamicExtents[sourceAxis]);
                 } else {
                     error = "owned compute texture requires a concrete extent";
                     return false;
@@ -806,8 +1022,11 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             } else if (borrowed) {
                 byteLengthValue = int64_t{0};
             } else {
-                error = "owned compute Storage requires a static buffer layout";
-                return false;
+                llvm::json::Array extents;
+                if (!ownedDynamicExtents(*rawValues, root, allocGraph, captureLegal, *shape, argumentSlots,
+                                         capturedValues, producerByValue, parent, extents, error))
+                    return false;
+                byteLengthValue = std::move(extents);
             }
             descriptor = llvm::json::Object{{"tag", "buffer"},
                                             {"byte_length", std::move(byteLengthValue)},
@@ -829,7 +1048,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     std::map<int64_t, int64_t> storageByValue;
     for (const auto &[version, unusedParent] : parent) {
         (void)unusedParent;
-        const int64_t root = rootOf(version);
+        const int64_t root = storageRootOf(parent, version);
         const llvm::json::Object *initial = valueById(*rawValues, root);
         const llvm::json::Object *current = valueById(*rawValues, version);
         const llvm::json::Object *initialLayout = initial ? initial->getObject("value_layout") : nullptr;
@@ -1465,9 +1684,11 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     row.getString("vernon.builtin") ? row.getString("vernon.builtin") : row.getString("builtin");
                 const int64_t endpointIndex = row.getInteger("index").value_or(static_cast<int64_t>(fallbackIndex));
                 if (builtin) {
+                    if (kernelHiddenBuiltin(*builtin))
+                        return true;
                     const llvm::json::Object *layout = row.getObject("value_layout");
                     if (!layout) {
-                        error = "compiled compute system value has no canonical layout";
+                        error = "compiled compute system value has no canonical layout (" + builtin->str() + ")";
                         return false;
                     }
                     llvm::json::Array abi;
@@ -1770,12 +1991,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             graphOutputs.emplace_back(
                 llvm::json::Object{{"tag", "user_output"}, {"value", value}, {"disposition", "transfer"}});
         llvm::json::Array captures;
-        if (view.direction == "backward") {
-            if (const llvm::json::Array *rows = rawSignature->getArray("captures"))
-                for (const llvm::json::Value &row : *rows)
-                    if (std::optional<int64_t> value = row.getAsInteger())
-                        captures.emplace_back(llvm::json::Object{{"value", *value}});
-        }
+        if (view.direction == "backward")
+            for (int64_t value : capturedValues)
+                captures.emplace_back(llvm::json::Object{{"value", value}});
         canonicalGraphs.emplace_back(llvm::json::Object{{"name", view.name},
                                                         {"direction", view.direction},
                                                         {"inputs", std::move(graphInputs)},
@@ -1812,14 +2030,11 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
     };
     if (selectedGraphs.size() > 1) {
         llvm::json::Array residualCaptures;
-        if (const llvm::json::Array *rows = rawSignature->getArray("captures"))
-            for (const llvm::json::Value &row : *rows)
-                if (std::optional<int64_t> value = row.getAsInteger())
-                    residualCaptures.emplace_back(
-                        llvm::json::Object{{"value", *value},
-                                           {"replay", llvm::json::Object{{"legal", false},
-                                                                         {"required_values", llvm::json::Array()},
-                                                                         {"cost", int64_t{0}}}}});
+        for (int64_t value : capturedValues)
+            residualCaptures.emplace_back(llvm::json::Object{
+                {"value", value},
+                {"replay", llvm::json::Object{
+                               {"legal", false}, {"required_values", llvm::json::Array()}, {"cost", int64_t{0}}}}});
         program["residual_contract"] =
             llvm::json::Object{{"captures", std::move(residualCaptures)}, {"shape_symbols", llvm::json::Array()}};
     }

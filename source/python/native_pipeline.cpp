@@ -78,6 +78,56 @@ std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText,
     return transformedResult;
 }
 
+std::string specializeKernelHostConstants(const std::string &moduleText, const std::string &entry,
+                                          const std::vector<std::string> &names, const nb::list &values) {
+    if (names.size() != values.size())
+        throw std::invalid_argument("kernel host-constant names and values must have the same length");
+    std::vector<VernonStringView> nameViews;
+    nameViews.reserve(names.size());
+    for (const std::string &name : names)
+        nameViews.push_back({name.data(), name.size()});
+    std::vector<int32_t> kinds;
+    std::vector<int64_t> integers;
+    std::vector<double> floats;
+    kinds.reserve(values.size());
+    integers.reserve(values.size());
+    floats.reserve(values.size());
+    for (nb::handle value : values) {
+        if (nb::isinstance<nb::bool_>(value)) {
+            kinds.push_back(2);
+            integers.push_back(nb::cast<bool>(value) ? 1 : 0);
+            floats.push_back(0.0);
+            continue;
+        }
+        if (nb::isinstance<nb::int_>(value)) {
+            kinds.push_back(0);
+            integers.push_back(nb::cast<int64_t>(value));
+            floats.push_back(0.0);
+            continue;
+        }
+        if (nb::isinstance<nb::float_>(value)) {
+            kinds.push_back(1);
+            integers.push_back(0);
+            floats.push_back(nb::cast<double>(value));
+            continue;
+        }
+        throw std::invalid_argument("kernel host constant must be bool, int, or float");
+    }
+    auto view = [](const std::string &value) { return VernonStringView{value.data(), value.size()}; };
+    std::unique_ptr<VernonPythonSpecializedKernel, decltype(&vernonCompilerDestroySpecializedKernel)> result(
+        vernonCompilerSpecializeKernelHostConstants(view(moduleText), view(entry), nameViews.data(), kinds.data(),
+                                                    integers.data(), floats.data(), names.size()),
+        &vernonCompilerDestroySpecializedKernel);
+    if (!result)
+        throw std::bad_alloc();
+    const VernonPythonSpecializedKernelView specialized = vernonCompilerGetSpecializedKernelView(result.get());
+    if (specialized.status != VERNON_STATUS_OK) {
+        const std::string diagnostics = nativeStringView(specialized.diagnostics);
+        throw std::invalid_argument(diagnostics.empty() ? "kernel host-constant specialization failed" : diagnostics);
+    }
+    return nativeStringView(specialized.module);
+}
+
 CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions) {
     for (auto item : targetOptions) {
         const std::string key = nb::cast<std::string>(item.first);

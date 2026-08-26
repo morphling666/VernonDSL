@@ -5,11 +5,13 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonSpecializeKernelConstants.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <memory>
 #include <new>
@@ -75,6 +77,12 @@ struct VernonPythonStructuredVjp {
     std::vector<VernonPythonNamedMetricView> costComponentViews;
     std::string selectedPolicy;
     bool wholeDispatchRetentionPermitted{};
+};
+
+struct VernonPythonSpecializedKernel {
+    VernonStatus status{VERNON_STATUS_INTERNAL_ERROR};
+    std::string diagnostics;
+    std::string module;
 };
 
 extern "C" {
@@ -360,6 +368,101 @@ VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const Ver
             result->costComponentViews.size(),
             viewOf(result->selectedPolicy),
             result->wholeDispatchRetentionPermitted ? 1u : 0u};
+}
+
+VernonPythonSpecializedKernel *
+vernonCompilerSpecializeKernelHostConstants(VernonStringView module, VernonStringView entry,
+                                            const VernonStringView *names, const int32_t *kinds,
+                                            const int64_t *integers, const double *floats, size_t count) {
+    auto result = std::make_unique<VernonPythonSpecializedKernel>();
+    if ((!module.data && module.size != 0) || (!entry.data && entry.size != 0) ||
+        (count != 0 && (!names || !kinds || !integers || !floats))) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "kernel host-constant specialization requires a module, entry, and constant arrays";
+        return result.release();
+    }
+    FrontendPtr &frontend = planningFrontend();
+    if (!frontend) {
+        result->diagnostics = "cannot create compiler frontend for kernel host-constant specialization";
+        return result.release();
+    }
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    mlir::ScopedDiagnosticHandler diagnostics(&context, [&](mlir::Diagnostic &diagnostic) {
+        vernon::compiler::appendDiagnostic(result->diagnostics, diagnostic);
+        return mlir::success();
+    });
+    mlir::OwningOpRef<mlir::ModuleOp> parsed =
+        mlir::parseSourceString<mlir::ModuleOp>(llvm::StringRef(module.data, module.size), &context);
+    if (!parsed) {
+        result->status = VERNON_STATUS_PARSE_ERROR;
+        return result.release();
+    }
+    if (mlir::failed(mlir::verify(*parsed))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        return result.release();
+    }
+    const std::string entryName(entry.data, entry.size);
+    mlir::func::FuncOp function = parsed->lookupSymbol<mlir::func::FuncOp>(entryName);
+    if (!function) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "kernel host-constant specialization entry was not found";
+        return result.release();
+    }
+    std::vector<mlir::vernon::KernelHostConstant> constants;
+    constants.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        if (!names[index].data && names[index].size != 0) {
+            result->status = VERNON_STATUS_INVALID_ARGUMENT;
+            result->diagnostics = "kernel host constant name is invalid";
+            return result.release();
+        }
+        mlir::vernon::KernelHostConstant constant;
+        constant.name.assign(names[index].data, names[index].size);
+        switch (kinds[index]) {
+        case 0:
+            constant.kind = mlir::vernon::KernelHostConstant::Kind::Integer;
+            constant.integer = integers[index];
+            break;
+        case 1:
+            constant.kind = mlir::vernon::KernelHostConstant::Kind::Float;
+            constant.floating = floats[index];
+            break;
+        case 2:
+            constant.kind = mlir::vernon::KernelHostConstant::Kind::Boolean;
+            constant.boolean = integers[index] != 0;
+            break;
+        default:
+            result->status = VERNON_STATUS_INVALID_ARGUMENT;
+            result->diagnostics = "kernel host constant kind is invalid";
+            return result.release();
+        }
+        constants.push_back(std::move(constant));
+    }
+    if (mlir::failed(mlir::vernon::specializeKernelHostConstants(function, constants))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        if (result->diagnostics.empty())
+            result->diagnostics = "kernel host-constant specialization failed";
+        return result.release();
+    }
+    if (mlir::failed(mlir::verify(*parsed))) {
+        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+        if (result->diagnostics.empty())
+            result->diagnostics = "specialized kernel failed verification";
+        return result.release();
+    }
+    llvm::raw_string_ostream stream(result->module);
+    parsed->print(stream, mlir::OpPrintingFlags().enableDebugInfo(false));
+    stream << '\n';
+    result->status = VERNON_STATUS_OK;
+    return result.release();
+}
+
+void vernonCompilerDestroySpecializedKernel(VernonPythonSpecializedKernel *result) { delete result; }
+
+VernonPythonSpecializedKernelView vernonCompilerGetSpecializedKernelView(const VernonPythonSpecializedKernel *result) {
+    if (!result)
+        return {VERNON_STATUS_INVALID_ARGUMENT, {}, {}};
+    return {result->status, viewOf(result->diagnostics), viewOf(result->module)};
 }
 
 } // extern "C"

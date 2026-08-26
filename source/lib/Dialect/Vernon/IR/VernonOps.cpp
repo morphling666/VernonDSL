@@ -269,6 +269,26 @@ LogicalResult StoreOp::verify() {
                                                          : emitOpError("value type must match the element type");
 }
 
+static bool isFloatingAtomicAddPayload(Type type) {
+    if (type.isF16() || type.isF32() || type.isF64())
+        return true;
+    auto shaped = dyn_cast<ShapedType>(type);
+    return shaped && shaped.hasStaticShape() && isFloatingAtomicAddPayload(shaped.getElementType());
+}
+
+static LogicalResult verifyAtomicPayload(Operation *operation, TensorViewType view, Type valueType, Type resultType,
+                                         StringRef kind) {
+    Type elementType = view.getElementType();
+    if (valueType != elementType || resultType != elementType)
+        return operation->emitOpError("value and result types must match the TensorView element type");
+    if (kind == "add" && (elementType.isSignlessInteger(32) || isFloatingAtomicAddPayload(elementType)))
+        return success();
+    if (kind != "add" && elementType.isSignlessInteger(32))
+        return success();
+    return operation->emitOpError(
+        "requires matching i32 types, or f16/f32/f64 scalar or statically shaped tensor types for atomic add");
+}
+
 LogicalResult AtomicOp::verify() {
     auto view = dyn_cast<TensorViewType>(getStorage().getType());
     if (!view)
@@ -279,17 +299,12 @@ LogicalResult AtomicOp::verify() {
         return emitOpError("requires device or workgroup TensorView storage");
     if (getIndices().size() != view.getShape().size())
         return emitOpError("requires one index per TensorView dimension");
-    Type elementType = view.getElementType();
-    const bool supportedElement =
-        elementType.isSignlessInteger(32) || ((elementType.isF32() || elementType.isF64()) && getAtomicKind() == "add");
-    if (!supportedElement || getValue().getType() != elementType || getResult().getType() != elementType)
-        return emitOpError("requires matching i32 types or f32/f64 types for atomic add");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
-    return success();
+    return verifyAtomicPayload(getOperation(), view, getValue().getType(), getResult().getType(), getAtomicKind());
 }
 
 static LogicalResult verifyAccumulationContribution(Operation *operation, Value value, Value storage,
@@ -353,17 +368,12 @@ LogicalResult PhysicalAtomicOp::verify() {
         return emitOpError("requires writable TensorView storage");
     if (view.getAddressSpace() != "device" && view.getAddressSpace() != "workgroup")
         return emitOpError("requires device or workgroup TensorView storage");
-    Type elementType = view.getElementType();
-    const bool supportedElement =
-        elementType.isSignlessInteger(32) || ((elementType.isF32() || elementType.isF64()) && getAtomicKind() == "add");
-    if (!supportedElement || getValue().getType() != elementType || getResult().getType() != elementType)
-        return emitOpError("requires matching i32 types or f32/f64 types for atomic add");
     if (getAtomicKind() != "add" && getAtomicKind() != "min" && getAtomicKind() != "max" && getAtomicKind() != "umin" &&
         getAtomicKind() != "umax" && getAtomicKind() != "exchange")
         return emitOpError("operation must be add, min, max, umin, umax, or exchange");
     if (getOrdering() != "relaxed")
         return emitOpError("currently supports only relaxed memory ordering");
-    return success();
+    return verifyAtomicPayload(getOperation(), view, getValue().getType(), getResult().getType(), getAtomicKind());
 }
 
 LogicalResult BarrierOp::verify() {

@@ -51,8 +51,11 @@ FailureOr<AtomicAddImplementation> parseImplementation(StringRef value) {
 
 AtomicAddImplementation implementationFor(Type type, StringRef addressSpace,
                                           const AccumulationTargetCapabilities &capabilities) {
-    if (isa<ShapedType>(type))
-        return AtomicAddImplementation::Unsupported;
+    if (auto shaped = dyn_cast<ShapedType>(type)) {
+        if (!shaped.hasStaticShape())
+            return AtomicAddImplementation::Unsupported;
+        return implementationFor(shaped.getElementType(), addressSpace, capabilities);
+    }
     const AtomicScopeCapabilities &scope = addressSpace == "workgroup" ? capabilities.workgroup : capabilities.device;
     if (type.isF32())
         return scope.f32;
@@ -86,6 +89,18 @@ FailureOr<uint64_t> estimatedUniformContention(ReduceSumOp operation) {
         lanes *= static_cast<uint32_t>(size);
     }
     return lanes;
+}
+
+bool isFloatingAtomicAdd(StringRef kind, Type type) {
+    if (kind != "add")
+        return false;
+    Type payload = type;
+    if (auto shaped = dyn_cast<ShapedType>(payload)) {
+        if (!shaped.hasStaticShape())
+            return false;
+        payload = shaped.getElementType();
+    }
+    return isa<FloatType>(payload);
 }
 
 uint32_t reductionCrossover(AtomicAddImplementation implementation, const AccumulationCostModel &costModel) {
@@ -316,7 +331,7 @@ struct VernonLowerAccumulationPass final : PassWrapper<VernonLowerAccumulationPa
             } else {
                 return WalkResult::advance();
             }
-            if (kind != "add" || !isa<FloatType>(value.getType()))
+            if (!isFloatingAtomicAdd(kind, value.getType()))
                 return WalkResult::advance();
             auto view = dyn_cast<TensorViewType>(storage.getType());
             if (!view) {
@@ -412,7 +427,7 @@ struct VernonVerifyGeneratedAccumulationPass final
             } else {
                 return WalkResult::advance();
             }
-            if (kind != "add" || !isa<FloatType>(value.getType()))
+            if (!isFloatingAtomicAdd(kind, value.getType()))
                 return WalkResult::advance();
             auto view = dyn_cast<TensorViewType>(storage.getType());
             if (!view) {

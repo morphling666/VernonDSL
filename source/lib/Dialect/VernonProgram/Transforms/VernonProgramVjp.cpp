@@ -79,11 +79,20 @@ bool hasDynamicExtent(Type type) {
 Value createZero(OpBuilder &builder, Location location, Type type, Value like = {}) {
     if (auto scalar = dyn_cast<FloatType>(type))
         return arith::ConstantOp::create(builder, location, builder.getFloatAttr(scalar, 0.0));
-    if (isa<TensorViewType>(type))
-        return like && hasDynamicExtent(type) ? createProgramIntrinsic(builder, location, "zeros_like", like, type)
-                                              : createProgramIntrinsic(builder, location, "zeros", {}, type);
-    if (isa<TensorType>(type))
-        return createProgramIntrinsic(builder, location, "zeros", {}, type);
+    if (isa<TensorViewType>(type)) {
+        Value zero = like && hasDynamicExtent(type)
+                         ? createProgramIntrinsic(builder, location, "zeros_like", like, type)
+                         : createProgramIntrinsic(builder, location, "zeros", {}, type);
+        if (like)
+            applyProgramLanguageAbi(zero.getDefiningOp(), getProgramValueLanguageAbi(like));
+        return zero;
+    }
+    if (isa<TensorType>(type)) {
+        Value zero = createProgramIntrinsic(builder, location, "zeros", {}, type);
+        if (like)
+            applyProgramLanguageAbi(zero.getDefiningOp(), getProgramValueLanguageAbi(like));
+        return zero;
+    }
     auto tensor = dyn_cast<RankedTensorType>(type);
     auto element = tensor ? dyn_cast<FloatType>(tensor.getElementType()) : FloatType{};
     if (!tensor || !element || !tensor.hasStaticShape()) {
@@ -122,7 +131,9 @@ Value createDestinationPassingCompute(OpBuilder &builder, Location location, Str
                        })));
     state.addAttribute("vernon_program.result_resource_sources",
                        builder.getDenseI64ArrayAttr(SmallVector<int64_t, 1>{destOperand}));
-    return builder.create(state)->getResult(0);
+    Value result = builder.create(state)->getResult(0);
+    applyProgramLanguageAbi(result.getDefiningOp(), getProgramValueLanguageAbi(operands[destOperand]));
+    return result;
 }
 
 Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {}) {
@@ -217,6 +228,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     SmallVector<Type> resultTypes;
     SmallVector<Attribute> resultNames;
     SmallVector<Attribute> resultRoles;
+    SmallVector<Attribute> resultDtypeRows;
     SmallVector<int64_t> resultResourceSources;
     SmallVector<Value> contributions(operation.getNumOperands());
     for (unsigned index : context.activeOperandIndices) {
@@ -227,6 +239,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
             continue;
         Attribute name = index < operation.getOperandNames().size() ? operation.getOperandNames()[index]
                                                                     : builder.getStringAttr(std::to_string(index));
+        ProgramLanguageAbi abi;
         if (isa<TensorViewType>(*type)) {
             Value dest = createZero(builder, context.location, *type, context.getPrimalOperand(index));
             if (!dest)
@@ -237,12 +250,15 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
             operandRoles.push_back(builder.getStringAttr("gradient"));
             operandSources.push_back(name);
             operandAccesses.push_back(builder.getStringAttr("write"));
+            abi = getProgramValueLanguageAbi(dest);
         } else {
             resultResourceSources.push_back(-1);
+            abi = getProgramValueLanguageAbi(context.getPrimalOperand(index));
         }
         resultTypes.push_back(*type);
         resultNames.push_back(name);
         resultRoles.push_back(builder.getStringAttr("gradient"));
+        resultDtypeRows.push_back(programLanguageAbiLeafArray(builder.getContext(), abi));
     }
     if (resultTypes.empty())
         return contributions;
@@ -260,6 +276,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     state.addAttribute("result_names", builder.getArrayAttr(resultNames));
     state.addAttribute("vernon_program.result_autodiff_roles", builder.getArrayAttr(resultRoles));
     state.addAttribute("vernon_program.result_autodiff_sources", builder.getArrayAttr(resultNames));
+    state.addAttribute("vernon_program.result_abi_leaf_dtypes", builder.getArrayAttr(resultDtypeRows));
     if (llvm::any_of(resultResourceSources, [](int64_t source) { return source >= 0; }))
         state.addAttribute("vernon_program.result_resource_sources",
                            builder.getDenseI64ArrayAttr(resultResourceSources));
@@ -455,18 +472,28 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
 
     Block *entry = backward.addEntryBlock();
     OpBuilder builder = OpBuilder::atBlockEnd(entry);
-    for (unsigned index = 0; index < retainedValues.size(); ++index)
+    for (unsigned index = 0; index < retainedValues.size(); ++index) {
         backward.setArgAttr(index, kCaptureForwardValueAttr, builder.getI32IntegerAttr(index));
+        applyProgramLanguageAbi(backward, index, getProgramValueLanguageAbi(retainedValues[index]), false);
+    }
     for (unsigned index = 0; index < primal.getNumResults(); ++index) {
         const unsigned argument = retainedValues.size() + index;
         if (StringRef name = resultSourceName(primal, index); !name.empty())
             backward.setArgAttr(argument, "vernon.source_name", builder.getStringAttr(name));
         backward.setArgAttr(argument, "vernon.autodiff_role", builder.getStringAttr("cotangent"));
+        applyProgramLanguageAbi(
+            backward, argument,
+            programLanguageAbiFromAttrs(primal.getResultAttrDict(index), backward.getArgument(argument).getType()),
+            false);
     }
     for (auto [result, primalArgument] : llvm::enumerate(wrtIndices)) {
         if (StringRef name = sourceName(primal, primalArgument); !name.empty())
             backward.setResultAttr(result, "vernon.source_name", builder.getStringAttr(name));
         backward.setResultAttr(result, "vernon.autodiff_role", builder.getStringAttr("gradient"));
+        applyProgramLanguageAbi(
+            backward, static_cast<unsigned>(result),
+            programLanguageAbiFromAttrs(primal.getArgAttrDict(primalArgument), backward.getResultTypes()[result]),
+            true);
     }
     IRMapping primals;
     for (auto [source, target] :

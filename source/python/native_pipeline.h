@@ -127,6 +127,9 @@ std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText,
                                                   const std::vector<std::string> &outputPaths,
                                                   const std::string &forwardSymbol, const std::string &backwardSymbol);
 
+std::string specializeKernelHostConstants(const std::string &moduleText, const std::string &entry,
+                                          const std::vector<std::string> &names, const nb::list &values);
+
 struct Runtime;
 RhiHostState *runtimeRhiHost(const Runtime *runtime);
 struct CompiledProgram;

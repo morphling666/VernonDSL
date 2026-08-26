@@ -258,8 +258,30 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
         ProgramStorageSlot slot;
         slot.id = storage.id;
         slot.initialValue = storage.initialValue;
-        if (storage.descriptorKind == StorageDescriptorKind::Buffer)
+        slot.owned = storage.ownership == StorageOwnership::Owned;
+        if (storage.descriptorKind == StorageDescriptorKind::Buffer) {
             slot.byteLength = storage.buffer.byteLength;
+            const std::string graph = storage.initialValue < program.program.values.size()
+                                          ? program.program.values[storage.initialValue].origin.graph
+                                          : std::string();
+            for (const ControlComponent &extent : storage.buffer.byteLengthExtents) {
+                ProgramBufferExtent converted;
+                if (extent.kind == ControlKind::Static) {
+                    converted.isStatic = true;
+                    converted.staticValue = extent.value;
+                } else {
+                    converted.isStatic = false;
+                    converted.axis = extent.axis;
+                    if (!resolveControlValue(program.program, extent, graph, converted.value) ||
+                        (extent.kind != ControlKind::Capture &&
+                         program.program.values[converted.value].origin.kind == OriginKind::NodeResult))
+                        return reject(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE",
+                                      "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
+                                      "owned dyn like-source is not entry-available");
+                }
+                slot.byteLengthExtents.push_back(converted);
+            }
+        }
         execution.storages[storage.id] = slot;
     }
     const auto convertBindings = [](const std::vector<SignatureBinding> &bindings) {

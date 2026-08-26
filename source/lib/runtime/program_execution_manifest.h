@@ -12,6 +12,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace vernon::runtime::program {
@@ -150,11 +151,27 @@ enum class StorageMutability {
     Mutable,
 };
 
+enum class ControlKind {
+    Static,
+    Argument,
+    Parameter,
+    Capture,
+};
+
+struct ControlComponent {
+    ControlKind kind{ControlKind::Static};
+    uint64_t value{};
+    uint32_t reference{};
+    bool hasAxis{};
+    uint32_t axis{};
+};
+
 struct BufferDescriptor {
     uint64_t byteLength{};
     uint64_t alignment{};
     std::string memory;
     std::vector<std::string> usage;
+    std::vector<ControlComponent> byteLengthExtents;
 };
 
 enum class StorageDescriptorKind {
@@ -166,6 +183,7 @@ enum class StorageDescriptorKind {
 struct ImageDescriptor {
     std::string dimension;
     std::vector<uint64_t> extent;
+    std::vector<ControlComponent> extentControls;
     std::string format;
     uint32_t sampleCount{};
     uint32_t mipLevels{};
@@ -284,18 +302,6 @@ struct ResourceAccess {
     std::string access;
 };
 
-enum class ControlKind {
-    Static,
-    Argument,
-    Parameter,
-};
-
-struct ControlComponent {
-    ControlKind kind{ControlKind::Static};
-    uint64_t value{};
-    uint32_t reference{};
-};
-
 struct ComputeOperation {
     ControlComponent workgroups[3];
 };
@@ -409,6 +415,8 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
 bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic);
 bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<std::string, std::string> &stageBindings,
              ResolvedProgram &resolved, Diagnostic &diagnostic);
+bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
+                         uint32_t &valueId);
 bool execute(const ResolvedProgram &program, const Invocation &invocation, const StageExecutor &executor,
              ExecutionResult &result, Diagnostic &diagnostic);
 

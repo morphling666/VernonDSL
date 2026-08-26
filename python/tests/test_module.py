@@ -41,6 +41,15 @@ def module_copy_pair(
     output[0] = source[0]
 
 
+@vd.kernel(workgroup_size=(1, 1, 1))
+def module_scale(
+    source: vd.TensorView[vd.f32, (1,), vd.read],
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+    factor: vd.i32,
+) -> None:
+    output[0] = source[0] * vd.f32(factor)
+
+
 class PowerBranch(vd.Module):
     def __init__(self, *, power: int, grid: tuple[int, int, int]):
         super().__init__()
@@ -95,6 +104,17 @@ class AggregateCopy(vd.Module):
     ) -> vd.TensorStorage:
         output = vd.empty_like(source)
         module_copy_pair(source, output)
+        return output
+
+
+class ScaleByHostConstant(vd.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.factor = np.int32(3)
+
+    def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        module_scale(source, output, self.factor, grid=(1, 1, 1))
         return output
 
 
@@ -200,6 +220,45 @@ class ModuleTests(unittest.TestCase):
         assert implementation is not None
         self.assertEqual(implementation.callee, "vernon.builtin.copy")
         self.assertEqual(implementation.entry, "_program_copy_f32_rank1")
+
+    def test_fusion_dsl_provider_selects_copy_kernel_by_program_value_rank(self) -> None:
+        rank_one = BuiltinDslProvider().lower(
+            {
+                "implementation_hint": "vernon.builtin.copy",
+                "bindings": [
+                    {"parameter": "source", "value": 0},
+                    {"parameter": "output", "value": 1},
+                ],
+            },
+            {
+                0: {"id": 0, "dtype": "f32", "shape": [1]},
+                1: {"id": 1, "dtype": "f32", "shape": [1]},
+            },
+        )
+        rank_two = BuiltinDslProvider().lower(
+            {
+                "implementation_hint": "vernon.builtin.copy",
+                "bindings": [
+                    {"parameter": "source", "value": 0},
+                    {"parameter": "output", "value": 1},
+                ],
+            },
+            {
+                0: {"id": 0, "dtype": "f32", "shape": [-1, -1]},
+                1: {"id": 1, "dtype": "f32", "shape": [-1, -1]},
+            },
+        )
+
+        self.assertIsNotNone(rank_one)
+        self.assertIsNotNone(rank_two)
+        assert rank_one is not None and rank_two is not None
+        self.assertEqual(rank_one.callee, "vernon.builtin.copy")
+        self.assertEqual(rank_two.callee, "vernon.builtin.copy")
+        self.assertEqual(rank_one.entry, "_program_copy_f32_rank1")
+        self.assertEqual(rank_two.entry, "_program_copy_f32_rank2")
+        self.assertIn("[-1]", rank_one.mlir)
+        self.assertIn("[-1, -1]", rank_two.mlir)
+        self.assertNotIn("[-1, -1]", rank_one.mlir)
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -383,6 +442,16 @@ class ModuleTests(unittest.TestCase):
                 ("FanIn.square.module_square", "module_square"),
             ),
         )
+
+    def test_host_static_kernel_scalars_are_implementation_constants(self) -> None:
+        from vernon_dsl.program import _parse_module_program
+
+        parsed = _parse_module_program(ScaleByHostConstant())
+        self.assertEqual(
+            parsed.implementations[0].host_constants,
+            (("factor", 3),),
+        )
+        self.assertIn('constant_names = ["factor"]', parsed.mlir)
 
     def test_module_frontend_reuses_canonical_aggregate_logical_types(self) -> None:
         from vernon_dsl.program import _parse_module_program

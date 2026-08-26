@@ -212,22 +212,39 @@ struct PhysicalAtomicConversion final : OpConversionPattern<PhysicalAtomicOp> {
 
     LogicalResult matchAndRewrite(PhysicalAtomicOp op, OneToNOpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        if (!llvm::hasSingleElement(adaptor.getStorage()) || !llvm::hasSingleElement(adaptor.getIndex()) ||
-            !llvm::hasSingleElement(adaptor.getValue()))
-            return rewriter.notifyMatchFailure(op, "atomic TensorView storage must lower to one scalar memref");
-        arith::AtomicRMWKind kind =
-            op.getAtomicKind() == "add"
-                ? (isa<FloatType>(op.getValue().getType()) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi)
-            : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
-            : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
-            : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
-            : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
-                                           : arith::AtomicRMWKind::assign;
-        auto replacement = memref::AtomicRMWOp::create(rewriter, op.getLoc(), kind, adaptor.getValue().front(),
-                                                       adaptor.getStorage().front(), adaptor.getIndex().front());
-        if (Attribute implementation = op->getAttr(kAtomicImplementationAttrName))
-            replacement->setAttr(kAtomicImplementationAttrName, implementation);
-        rewriter.replaceOp(op, replacement.getResult());
+        if (!llvm::hasSingleElement(adaptor.getIndex()) || !llvm::hasSingleElement(adaptor.getValue()))
+            return rewriter.notifyMatchFailure(op, "expected one converted physical index and value");
+        Type valueType = op.getValue().getType();
+        if (valueType.isIntOrFloat()) {
+            if (!llvm::hasSingleElement(adaptor.getStorage()))
+                return rewriter.notifyMatchFailure(op, "scalar atomic TensorView storage must lower to one memref");
+            arith::AtomicRMWKind kind =
+                op.getAtomicKind() == "add"
+                    ? (isa<FloatType>(valueType) ? arith::AtomicRMWKind::addf : arith::AtomicRMWKind::addi)
+                : op.getAtomicKind() == "min"  ? arith::AtomicRMWKind::mins
+                : op.getAtomicKind() == "max"  ? arith::AtomicRMWKind::maxs
+                : op.getAtomicKind() == "umin" ? arith::AtomicRMWKind::minu
+                : op.getAtomicKind() == "umax" ? arith::AtomicRMWKind::maxu
+                                               : arith::AtomicRMWKind::assign;
+            auto replacement = memref::AtomicRMWOp::create(rewriter, op.getLoc(), kind, adaptor.getValue().front(),
+                                                           adaptor.getStorage().front(), adaptor.getIndex().front());
+            if (Attribute implementation = op->getAttr(kAtomicImplementationAttrName))
+                replacement->setAttr(kAtomicImplementationAttrName, implementation);
+            rewriter.replaceOp(op, replacement.getResult());
+            return success();
+        }
+        if (op.getAtomicKind() != "add")
+            return rewriter.notifyMatchFailure(op, "aggregate TensorView atomic currently supports add");
+        auto module = op->getParentOfType<ModuleOp>();
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(valueType, module);
+        if (failed(layout) || adaptor.getStorage().size() != layout->leaves.size())
+            return rewriter.notifyMatchFailure(op, "TensorView storage expansion does not match its value ABI");
+        FailureOr<Value> old = atomicAddAggregateRecordToStorages(
+            valueType, adaptor.getStorage(), adaptor.getIndex().front(), adaptor.getValue().front(), *layout, module,
+            rewriter, op.getLoc(), AggregateStorageBackend::MemRef, op->getAttr(kAtomicImplementationAttrName));
+        if (failed(old))
+            return failure();
+        rewriter.replaceOp(op, *old);
         return success();
     }
 };

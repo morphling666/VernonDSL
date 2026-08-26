@@ -17,23 +17,6 @@
 #include <vector>
 
 namespace vernon::compiler {
-namespace {
-
-std::string unambiguousStorageDtype(mlir::Type type) {
-    if (type.isF16())
-        return "f16";
-    if (type.isF32())
-        return "f32";
-    if (type.isF64())
-        return "f64";
-    if (type.isInteger(1))
-        return "bool";
-    if (type.isIndex())
-        return "index";
-    return "";
-}
-
-} // namespace
 
 mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::ModuleOp module) {
     auto valueCount = module->getAttrOfType<mlir::IntegerAttr>("vernon_program.value_count");
@@ -137,8 +120,6 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             dtype = logicalDtype->str();
         else if (logicalDtypes.size() == 1)
             dtype = logicalDtypes.front().str();
-        else
-            dtype = unambiguousStorageDtype(element);
         if (logicalDtype && !logicalDtype->empty() && logicalDtypes.size() == 1 &&
             logicalDtype->str() != logicalDtypes.front()) {
             module.emitError("vernon.dtype does not match vernon.abi_leaf_dtypes");
@@ -235,8 +216,34 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
 
         llvm::json::Array nodes;
         for (mlir::Operation &operation : function.getBody().front().without_terminator()) {
-            if (mlir::vernon::program::isStorageAllocIntrinsic(&operation))
+            if (mlir::vernon::program::isStorageAllocIntrinsic(&operation)) {
+                auto operandIds = operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.operand_value_ids");
+                auto resultIds = operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.result_value_ids");
+                if (!resultIds || resultIds.size() != operation.getNumResults()) {
+                    operation.emitError("storage alloc has incomplete executable Program value ids");
+                    invalid = true;
+                    continue;
+                }
+                for (auto [index, id] : llvm::enumerate(resultIds.asArrayRef())) {
+                    if (id < 0) {
+                        operation.emitError("storage alloc has an invalid result value id");
+                        invalid = true;
+                        continue;
+                    }
+                    auto abi = mlir::vernon::program::getProgramValueLanguageAbi(operation.getResult(index));
+                    reflectValue(static_cast<uint32_t>(id), "value." + std::to_string(id),
+                                 operation.getResult(index).getType(), false, false, false, abi.leaves, {}, abi.dtype);
+                    auto intrinsic = mlir::cast<mlir::vernon::IntrinsicOp>(&operation);
+                    if (mlir::vernon::program::isLikeAllocIntrinsicName(intrinsic.getName()) && id >= 0 &&
+                        static_cast<size_t>(id) < reflectedValues.size() && reflectedValues[static_cast<size_t>(id)] &&
+                        operandIds && !operandIds.empty()) {
+                        const int64_t like = operandIds[0];
+                        if (like >= 0)
+                            (*reflectedValues[static_cast<size_t>(id)])["like"] = like;
+                    }
+                }
                 continue;
+            }
             auto nodeId = operation.getAttrOfType<mlir::IntegerAttr>("vernon_program.node_id");
             auto stage = operation.getAttrOfType<mlir::StringAttr>("vernon_program.stage");
             auto operandIds = operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.operand_value_ids");
@@ -295,8 +302,9 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                                 resource["after"] = resultIds[resultIndex];
                     resources.emplace_back(std::move(resource));
                 }
+                auto abi = mlir::vernon::program::getProgramValueLanguageAbi(operation.getOperand(index));
                 reflectValue(static_cast<uint32_t>(id), "value." + std::to_string(id),
-                             operation.getOperand(index).getType(), false, false);
+                             operation.getOperand(index).getType(), false, false, false, abi.leaves, {}, abi.dtype);
             }
             if (gridControlArguments)
                 for (int64_t argumentIndex : gridControlArguments.asArrayRef()) {

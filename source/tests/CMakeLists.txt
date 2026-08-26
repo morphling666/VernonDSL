@@ -994,6 +994,7 @@ if(TARGET VernonDSLCompiler)
         compiler/compiler_c_api_test.cpp
         compiler/compiler_cpp_api_test.cpp
         compiler/compiler_graphics_output_test.cpp
+        compiler/compiler_program_finalization_test.cpp
         compiler/compiler_synchronization_test.cpp
         compiler/spirv_image_query_size_lod_materialization_test.cpp
         compiler/vernon_compile_packaging_test.cpp

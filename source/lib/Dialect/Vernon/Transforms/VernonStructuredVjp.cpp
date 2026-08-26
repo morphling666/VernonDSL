@@ -218,15 +218,8 @@ BackwardProfileTypes getBackwardProfileTypes(MLIRContext *context, const VernonA
             const bool invocationPrivate =
                 identity != analysis.getStorageIdentities().end() &&
                 identity->externalGradientOwnership == AutodiffExternalGradientOwnership::InvocationPrivate;
-            Type elementType = leaf.derivativeType;
-            SmallVector<int64_t> shape(source.getShape());
-            if (auto aggregate = dyn_cast<RankedTensorType>(elementType)) {
-                elementType = aggregate.getElementType();
-                llvm::append_range(shape, aggregate.getShape());
-            }
-            types.storageGradients.push_back(TensorViewType::get(source.getContext(), elementType, shape,
-                                                                 invocationPrivate ? "read_write" : "write",
-                                                                 source.getAddressSpace()));
+            types.storageGradients.push_back(wrapAutodiffDerivativeTensorView(
+                source, leaf.derivativeType, invocationPrivate ? "read_write" : "write"));
         } else {
             types.valueGradients.push_back(leaf.derivativeType);
             types.valueGradientDtypes.push_back(dtype);
@@ -1207,25 +1200,9 @@ private:
                                              builder.getStringAttr(kInvocationPrivateAccumulationOwnership)));
                 else if (ownership != AutodiffExternalGradientOwnership::AtomicShared)
                     return load.emitError("active external Storage gradient has no supported ownership proof");
-                if (auto aggregate = dyn_cast<RankedTensorType>(seed.getType())) {
-                    if (!aggregate.hasStaticShape())
-                        return load.emitError("external aggregate Storage gradient has a dynamic element shape");
-                    for (const SmallVector<int64_t> &coordinate : enumerateStaticCoordinates(aggregate.getShape())) {
-                        SmallVector<Value> componentIndices(indices);
-                        for (int64_t index : coordinate)
-                            componentIndices.push_back(createIndexConstant(builder, load.getLoc(), index));
-                        Value component = tensor::ExtractOp::create(
-                            builder, load.getLoc(), seed, ValueRange(componentIndices).drop_front(indices.size()));
-                        SmallVector<Value> operands = {component, external};
-                        llvm::append_range(operands, componentIndices);
-                        createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {},
-                                        attributes);
-                    }
-                } else {
-                    SmallVector<Value> operands = {seed, external};
-                    llvm::append_range(operands, indices);
-                    createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {}, attributes);
-                }
+                SmallVector<Value> operands = {seed, external};
+                llvm::append_range(operands, indices);
+                createOperation(builder, load.getLoc(), ScatterAddOp::getOperationName(), operands, {}, attributes);
                 continue;
             }
             SmallVector<Value> operands = {buffer, seed};
