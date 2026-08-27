@@ -27,6 +27,10 @@ struct ProgramValueSlot {
     bool output{};
 };
 
+inline bool isProgramAdTapeType(const std::string &type) {
+    return type == "!vernon.ad_tape" || type.rfind("!vernon.ad_tape<", 0) == 0;
+}
+
 struct ProgramBufferExtent {
     bool isStatic{true};
     uint64_t staticValue{};

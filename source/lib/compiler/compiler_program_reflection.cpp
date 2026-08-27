@@ -99,7 +99,7 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         } else if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(type)) {
             element = texture.getElementType();
             layoutType = {};
-        } else if (mlir::isa<mlir::vernon::SamplerType>(type)) {
+        } else if (mlir::isa<mlir::vernon::SamplerType>(type) || mlir::isa<mlir::vernon::AdTapeType>(type)) {
             layoutType = {};
         } else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type)) {
             element = tensor.getElementType();

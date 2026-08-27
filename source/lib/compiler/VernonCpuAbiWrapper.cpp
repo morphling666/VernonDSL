@@ -28,9 +28,12 @@ llvm::Error invalidAbi(const llvm::Twine &message) { return llvm::createStringEr
 
 uint64_t hostProvidedArgumentsSize(const CpuAbiWrapperMetadata &metadata) {
     uint64_t size = 0;
-    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments)
-        if (packing.builtin.empty())
-            size = std::max(size, packing.offset + packing.size);
+    for (const CpuAbiArgumentPacking &packing : metadata.sourceArguments) {
+        if (!packing.builtin.empty() && packing.builtin != "ad_tape_allocator" &&
+            packing.builtin != "ad_tape_root_region")
+            continue;
+        size = std::max(size, packing.offset + packing.size);
+    }
     return size;
 }
 

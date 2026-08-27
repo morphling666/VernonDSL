@@ -291,6 +291,7 @@ public:
                                                        size_t invocationCapacity,
                                                        std::shared_ptr<HostTapeMemoryPolicy> policy,
                                                        std::shared_ptr<HostTapeDispatchBudget> dispatchBudget);
+    static HostStaticTapeBatch *fromWriteDescriptor(VernonAdTapeAllocator *allocator);
     ~HostStaticTapeBatch();
 
     HostStaticTapeBatch(const HostStaticTapeBatch &) = delete;

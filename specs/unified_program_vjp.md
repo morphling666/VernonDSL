@@ -226,6 +226,15 @@ The MLIR Program VJP transform is the single reverse-construction authority.
 7. delegate custom compute-node derivatives to kernel structured VJP;
 8. reject unsupported graphics differentiation.
 
+Interior adjoint SSA is a handle (`derivativeType` of the primal value), not a
+kernel that returns Storage. Nested `compute.vjp` results alias dests the same
+way primal compute does (`result_resource_sources`). TensorView fan-in is
+destination-passing `add` (void kernel, write dest, rank + `vd.dyn` extents).
+Kernel cotangent `read` and gradient dest `write` live on `operand_accesses`
+and on the public backward signature, not on interior handle types. Do not
+relax `add` type equality and do not capability-upgrade caller cotangents.
+Details: [`program_vjp_adjoint_ssa.md`](program_vjp_adjoint_ssa.md).
+
 It must stop cloning the complete primal computation into the backward graph.
 Rematerialization is selected by the native checkpoint planner.
 

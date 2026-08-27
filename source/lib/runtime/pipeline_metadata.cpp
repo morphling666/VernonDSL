@@ -95,6 +95,30 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             ReflectedArgument argument;
             argument.sourceName = value.value("vernon.source_name", "");
             argument.kind = value["kind"].get<std::string>();
+            if (value.contains("index")) {
+                const auto &indexValue = value["index"];
+                if (!indexValue.is_number_integer()) {
+                    error = "argument reflection has an invalid index";
+                    return false;
+                }
+                if (indexValue.is_number_unsigned()) {
+                    const uint64_t parsed = indexValue.get<uint64_t>();
+                    if (parsed > std::numeric_limits<uint32_t>::max()) {
+                        error = "argument reflection has an invalid index";
+                        return false;
+                    }
+                    argument.index = static_cast<uint32_t>(parsed);
+                } else {
+                    const int64_t parsed = indexValue.get<int64_t>();
+                    if (parsed < 0) {
+                        error = "argument reflection has an invalid index";
+                        return false;
+                    }
+                    argument.index = static_cast<uint32_t>(parsed);
+                }
+            } else {
+                argument.index = static_cast<uint32_t>(output.arguments.size());
+            }
             if (argument.kind != "scalar" && argument.kind != "tensor_value" && argument.kind != "tensor" &&
                 argument.kind != "image" && argument.kind != "sampler" && argument.kind != "builtin") {
                 error = "entry contains argument reflection with an unsupported kind";

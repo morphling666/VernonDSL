@@ -5,6 +5,8 @@
 #include "native_command_retention.h"
 #include "native_runtime.h"
 
+#include <algorithm>
+
 void bindNativeCompiler(nb::module_ &module) {
     nb::class_<vernon::execution::detail::RhiCommandExecutionPlan>(module, "_CommandPlan").def(nb::init<>());
     nb::class_<vernon::execution::detail::RhiCommandPlanSink>(module, "_CommandPlanSink")
@@ -257,6 +259,10 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
         .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)
+        .def_prop_ro(
+            "estimated_tape_bytes",
+            [](const PythonPullback &value) { return std::max(value.logicalResidualBytes(), value.allocatedBytes()); })
+        .def_prop_ro("recomputation_factor", [](const PythonPullback &) { return 1.0; })
         .def_prop_ro("peak_temporary_bytes", &PythonPullback::peakTemporaryBytes)
         .def_prop_ro("submission_count", &PythonPullback::submissionCount)
         .def_prop_ro("wait_count", &PythonPullback::waitCount)

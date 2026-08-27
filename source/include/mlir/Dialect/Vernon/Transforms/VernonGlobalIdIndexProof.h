@@ -1,5 +1,8 @@
 #pragma once
 
+// Decision procedure for ordinary-write injectivity:
+// specs/compiler/invocation_index_ownership.md
+
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "llvm/ADT/SmallVector.h"
@@ -28,11 +31,23 @@ struct GlobalIdAffineIndex {
 
 using GlobalIdAffineIndexTuple = SmallVector<GlobalIdAffineIndex>;
 
+struct MixedRadixExtent {
+    Value shapeSource;
+    int64_t value{};
+
+    bool operator==(const MixedRadixExtent &other) const;
+};
+
 struct ConditionalIndexProof {
     GlobalIdAffineIndexTuple normalizedIndices;
     std::array<bool, 3> coveredAxes{};
     SmallVector<unsigned> unitGridAxes;
     IndexOwnershipDomain ownership{IndexOwnershipDomain::None};
+    std::optional<GlobalIdAffineIndex> mixedRadixLinear;
+    SmallVector<MixedRadixExtent> mixedRadixExtents;
+
+    bool operator==(const ConditionalIndexProof &other) const;
+    bool operator!=(const ConditionalIndexProof &other) const { return !(*this == other); }
 };
 
 std::optional<GlobalIdAffineIndex> normalizeGlobalIdAffineIndex(Value value);

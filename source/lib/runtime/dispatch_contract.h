@@ -1,6 +1,9 @@
 #ifndef VERNON_RUNTIME_DISPATCH_CONTRACT_H
 #define VERNON_RUNTIME_DISPATCH_CONTRACT_H
 
+// Residual launch constraints of the ordinary-write injectivity proof:
+// specs/compiler/invocation_index_ownership.md §2
+
 #include <nlohmann/json.hpp>
 
 #include <cstdint>

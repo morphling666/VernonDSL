@@ -32,12 +32,9 @@ module {
 // CHECK: "vernon.intrinsic"
 // CHECK-SAME: name = "empty_like"
 // CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "square"
+// CHECK-SAME: callee = "square.forward_with_tape"
 // CHECK-LABEL: func.func @backward
-// CHECK: !vernon.tensor_view<f32, [1], "read", "device">
-// CHECK-SAME: -> !vernon.tensor_view<f32, [1], "write", "device">
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "square.vjp"
-// CHECK-SAME: operand_names = ["primal.source", "primal.output", "result.output", "cotangent.output", "gradient.source"]
+// CHECK: callee = "square.vjp"
+// CHECK-SAME: operand_names = ["tape", "primal.source", "primal.output", "result.output", "cotangent.output", "gradient.source"]
 // CHECK-SAME: result_names = ["source"]}>
 // CHECK-NOT: name = "empty_like"

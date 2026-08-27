@@ -40,6 +40,7 @@ struct ReflectedArgument {
     std::string sourceName;
     std::string kind;
     std::string builtin;
+    uint32_t index{UINT32_MAX};
     PhysicalArgumentLayout physical;
     size_t tensorBytes{};
     size_t tensorElements{};

@@ -192,6 +192,8 @@ module {
         auto dest = dyn_cast<TensorViewType>(operation.getOperand(destIndex).getType());
         ASSERT_TRUE(dest);
         EXPECT_EQ(dest.getAccess(), "read_write");
+        EXPECT_EQ(cast<StringAttr>(operation.getOperandNames()[0]).getValue(), "tape");
+        EXPECT_TRUE(isa<AdTapeType>(operation.getOperand(0).getType()));
     }
     unsigned cotangents = 0;
     for (auto [index, argument] : llvm::enumerate(backward.getArguments())) {
@@ -287,6 +289,7 @@ module {
         names.push_back(cast<StringAttr>(name).getValue());
     EXPECT_TRUE(llvm::is_contained(names, "cotangent.kept"));
     EXPECT_FALSE(llvm::is_contained(names, "cotangent.unused"));
+    EXPECT_TRUE(llvm::is_contained(names, "tape"));
     EXPECT_TRUE(succeeded(verify(*module)));
 }
 

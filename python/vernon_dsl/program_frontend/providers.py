@@ -6,7 +6,7 @@ import hashlib
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
-from .._runtime.operation_implementations import (
+from .._runtime.operators import (
     ImplementationUnavailable,
     elementwise_kernel,
     python_element_annotation,
@@ -57,19 +57,20 @@ class CapturedVjpDslProvider:
     def __init__(self, implementations: Sequence[ProgramImplementation], native: Any):
         self._implementations = {implementation.callee: implementation for implementation in implementations}
         self._native = native
+        self._pairs: dict[str, tuple[ProgramImplementation, ProgramImplementation]] = {}
 
-    def lower(
+    def _pair_for_vjp(
         self,
+        hint: str,
         request: Mapping[str, Any],
-        values: Mapping[int, Mapping[str, Any]],
-    ) -> ProgramImplementation | None:
-        del values
-        hint = request.get("implementation_hint")
-        if not isinstance(hint, str) or not hint.endswith(".vjp"):
-            return None
-        primal = self._implementations.get(hint.removesuffix(".vjp"))
+    ) -> tuple[ProgramImplementation, ProgramImplementation]:
+        primal_name = hint.removesuffix(".vjp")
+        cached = self._pairs.get(primal_name)
+        if cached is not None:
+            return cached
+        primal = self._implementations.get(primal_name)
         if primal is None:
-            return None
+            raise ImplementationUnavailable(f"Program VJP request has no primal implementation for {primal_name!r}")
         raw_bindings = request.get("bindings")
         raw_results = request.get("results")
         if not isinstance(raw_bindings, list) or not isinstance(raw_results, list):
@@ -123,7 +124,38 @@ class CapturedVjpDslProvider:
             backward_symbol,
         )
         profiles = transformed.profiles(identity)
-        return ProgramImplementation(hint, backward_symbol, "compute", str(profiles["backward"]))
+        pair = (
+            ProgramImplementation(
+                f"{primal_name}.forward_with_tape",
+                forward_symbol,
+                "compute",
+                str(profiles["forward_with_tape"]),
+            ),
+            ProgramImplementation(hint, backward_symbol, "compute", str(profiles["backward"])),
+        )
+        self._pairs[primal_name] = pair
+        return pair
+
+    def lower(
+        self,
+        request: Mapping[str, Any],
+        values: Mapping[int, Mapping[str, Any]],
+    ) -> ProgramImplementation | None:
+        del values
+        hint = request.get("implementation_hint")
+        if not isinstance(hint, str):
+            return None
+        if hint.endswith(".forward_with_tape"):
+            primal_name = hint.removesuffix(".forward_with_tape")
+            pair = self._pairs.get(primal_name)
+            if pair is None:
+                raise ImplementationUnavailable("Program forward_with_tape request has no matching structured VJP pair")
+            return pair[0]
+        if not hint.endswith(".vjp"):
+            return None
+        if self._implementations.get(hint.removesuffix(".vjp")) is None:
+            return None
+        return self._pair_for_vjp(hint, request)[1]
 
 
 BuiltinLowerer = Callable[
@@ -178,6 +210,19 @@ def _request_value(
     return value
 
 
+def _abi_bindings(request: Mapping[str, Any], operation: str) -> dict[str, int]:
+    raw_bindings = request.get("bindings")
+    if not isinstance(raw_bindings, list):
+        raise ImplementationUnavailable(f"built-in {operation} request has no ABI bindings")
+    return {
+        binding["parameter"]: binding["value"]
+        for binding in raw_bindings
+        if isinstance(binding, Mapping)
+        and isinstance(binding.get("parameter"), str)
+        and isinstance(binding.get("value"), int)
+    }
+
+
 def _lower_builtin_elementwise(
     request: Mapping[str, Any],
     values: Mapping[int, Mapping[str, Any]],
@@ -188,16 +233,7 @@ def _lower_builtin_elementwise(
 ) -> ProgramImplementation | None:
     if request.get("implementation_hint") != callee:
         return None
-    raw_bindings = request.get("bindings")
-    if not isinstance(raw_bindings, list):
-        raise ImplementationUnavailable(f"built-in {operation} request has no ABI bindings")
-    bindings = {
-        binding["parameter"]: binding["value"]
-        for binding in raw_bindings
-        if isinstance(binding, Mapping)
-        and isinstance(binding.get("parameter"), str)
-        and isinstance(binding.get("value"), int)
-    }
+    bindings = _abi_bindings(request, operation)
     reflected = [_request_value(bindings, values, name) for name in parameters]
     shapes = {tuple(value.get("shape", ())) for value in reflected}
     annotations = {python_element_annotation(value) for value in reflected}

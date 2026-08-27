@@ -1,6 +1,7 @@
 #include "target_binding_plan.h"
 
 #include "pipeline_metadata.h"
+#include "runtime/autodiff/tape_allocator_abi.h"
 #include "tensor_bridge.h"
 
 #include <algorithm>
@@ -243,6 +244,8 @@ bool assignCpuPhysical(uint64_t &cpuFrameOffset, const CompiledEndpointAbi *comp
     uint64_t offset = cpuFrameOffset;
     if (compiled && compiled->interfacePlan)
         offset = compiled->interfacePlan->frameOffset;
+    else if (compiled && compiled->packedFrameOffset)
+        offset = *compiled->packedFrameOffset;
     else if (!alignFrame(offset, alignment))
         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                       std::string(what) + " frame offset overflows");
@@ -604,6 +607,33 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         plan.bindings.push_back(std::move(target));
     }
 
+    if (backend == VERNON_RUNTIME_CPU) {
+        for (const CompiledEndpointAbi &compiled : stage.stage.compiledAbi) {
+            if (compiled.builtin != VERNON_AD_TAPE_ALLOCATOR_BUILTIN &&
+                compiled.builtin != VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
+                continue;
+            if (std::any_of(plan.bindings.begin(), plan.bindings.end(),
+                            [&](const TargetBinding &bound) { return bound.builtin == compiled.builtin; }))
+                continue;
+            if (!compiled.interfacePlan)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/implementation/endpoints",
+                              "tape packed ABI is missing its compiled physical plan");
+            TargetBinding target;
+            target.source = SourceRepresentation::SystemValue;
+            target.carrier = TargetCarrier::InlineValue;
+            target.name = compiled.builtin;
+            target.kind = "tensor";
+            target.reflectedKind = "builtin";
+            target.builtin = compiled.builtin;
+            target.access = "read";
+            target.endpoint = {"compute", "system_value", compiled.index, UINT32_MAX, "read", UINT32_MAX};
+            if (!assignCpuPhysical(cpuFrameOffset, &compiled, alignof(uintptr_t), sizeof(uintptr_t), target.physical,
+                                   nullptr, diagnostic, "tape packed field"))
+                return false;
+            plan.bindings.push_back(std::move(target));
+        }
+    }
+
     for (const GraphicsFragmentOutput &output : stage.stage.fragmentOutputs)
         plan.outputs.push_back({output.location, output.type});
     if (backend == VERNON_RUNTIME_CPU)
@@ -646,6 +676,7 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
     for (const TargetBinding &binding : plan.bindings) {
         ReflectedArgument argument;
         argument.sourceName = binding.name;
+        argument.index = binding.endpoint.index;
         argument.kind = binding.reflectedKind.empty() ? binding.kind : binding.reflectedKind;
         if (argument.kind == "tensor_value")
             argument.kind = "scalar";

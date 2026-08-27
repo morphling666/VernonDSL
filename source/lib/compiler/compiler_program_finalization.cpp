@@ -308,8 +308,7 @@ bool resourceAccessSatisfies(llvm::StringRef physical, llvm::StringRef logical) 
 }
 
 bool kernelHiddenBuiltin(llvm::StringRef builtin) {
-    return builtin == "ad_tape_allocator" || builtin == "ad_tape_root_region" || builtin == "global_invocation_id" ||
-           builtin == "local_invocation_id" || builtin == "workgroup_id";
+    return builtin == "global_invocation_id" || builtin == "local_invocation_id" || builtin == "workgroup_id";
 }
 
 const llvm::json::Object *valueById(const llvm::json::Array &values, int64_t id) {
@@ -368,7 +367,30 @@ bool isTextureType(llvm::StringRef type) { return type.starts_with("!vernon.text
 
 bool isSamplerType(llvm::StringRef type) { return type.starts_with("!vernon.sampler"); }
 
+bool isAdTapeType(llvm::StringRef type) { return type == "!vernon.ad_tape" || type.starts_with("!vernon.ad_tape<"); }
+
 bool isTensorViewType(llvm::StringRef type) { return type.starts_with("!vernon.tensor_view<"); }
+
+bool kernelTapeBuiltin(llvm::StringRef builtin) {
+    return builtin == "ad_tape_allocator" || builtin == "ad_tape_root_region";
+}
+
+bool compiledKernelHasTapeAbi(const llvm::json::Object &compiledEntry) {
+    const auto scan = [](const llvm::json::Array *rows) {
+        if (!rows)
+            return false;
+        for (const llvm::json::Value &value : *rows) {
+            const llvm::json::Object *row = value.getAsObject();
+            const std::optional<llvm::StringRef> builtin =
+                row ? (row->getString("vernon.builtin") ? row->getString("vernon.builtin") : row->getString("builtin"))
+                    : std::nullopt;
+            if (builtin && kernelTapeBuiltin(*builtin))
+                return true;
+        }
+        return false;
+    };
+    return scan(compiledEntry.getArray("arguments")) || scan(compiledEntry.getArray("results"));
+}
 
 std::vector<std::string> quotedTypeFields(llvm::StringRef type) {
     std::vector<std::string> fields;
@@ -514,12 +536,18 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
                                         llvm::json::Value(std::move(expanded)));
             }
             bindingIndex += names.size();
-        } else if (*role == "retained_primal" || *role == "cotangent") {
+        } else if (*role == "retained_primal" || *role == "cotangent" ||
+                   (*role == "tape" && !compiledKernelHasTapeAbi(compiledEntry))) {
             // Kernel structured VJP may drop an output that Program still seeded
             // because that seed does not depend on this node's wrt. Extra retained
             // primals are the same class. Inactive results are not zero-seeded.
+            // Elementwise / validNoTape kernels have no tape builtins; unmatched
+            // Program tape bindings are not a second reverse-construction authority.
             omitted.insert(parameter->str());
             requestBindings->erase(requestBindings->begin() + bindingIndex);
+        } else if (*role == "tape") {
+            matched.insert(parameter->str());
+            ++bindingIndex;
         } else {
             error = "compiled kernel ABI does not provide Program " + role->str() + " '" + source->str() + "'";
             return false;
@@ -626,6 +654,9 @@ const llvm::json::Object *selectedTransportPlan(const llvm::json::Object &row) {
 
 llvm::json::Object compiledEndpointAbi(const llvm::json::Object &row, llvm::StringRef module, int64_t index) {
     llvm::json::Object compiled{{"module", module.str()}, {"index", index}};
+    if (const std::optional<llvm::StringRef> builtin =
+            row.getString("vernon.builtin") ? row.getString("vernon.builtin") : row.getString("builtin"))
+        compiled["builtin"] = builtin->str();
     if (std::optional<llvm::StringRef> transport = row.getString("value_transport"))
         compiled["value_transport"] = transport->str();
     if (std::optional<int64_t> set = row.getInteger("vernon.set"))
@@ -638,6 +669,10 @@ llvm::json::Object compiledEndpointAbi(const llvm::json::Object &row, llvm::Stri
         compiled["element_layout"] = copyObject(*element);
     if (const llvm::json::Object *plan = selectedTransportPlan(row))
         compiled["interface_plan"] = copyObject(*plan);
+    if (const llvm::json::Object *layouts = row.getObject("physical_layouts"))
+        if (const llvm::json::Object *host = layouts->getObject("host_value"))
+            if (std::optional<int64_t> offset = host->getInteger("frame_offset"); offset && *offset >= 0)
+                compiled["packed_frame_offset"] = *offset;
     return compiled;
 }
 
@@ -911,7 +946,8 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 }
                 const llvm::json::Object *logicalValue = valueById(*rawValues, *value);
                 const llvm::StringRef type = logicalValue ? logicalValue->getString("type").value_or("") : "";
-                const bool actualResource = isTensorViewType(type) || isTextureType(type) || isSamplerType(type);
+                const bool actualResource =
+                    isTensorViewType(type) || isTextureType(type) || isSamplerType(type) || isAdTapeType(type);
                 if (!actualResource)
                     continue;
                 LogicalResource logical{*value, resource->getInteger("after"), access->str(), -1};
@@ -1052,7 +1088,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                                             {"array_layers", int64_t{1}},
                                             {"aspects", llvm::json::Array{"color"}},
                                             {"usage", llvm::json::Array{"storage"}}};
-        } else if (isSamplerType(type)) {
+        } else if (isSamplerType(type) || isAdTapeType(type)) {
             descriptor = llvm::json::Object{
                 {"tag", "opaque"},
                 {"contract_hash", sha256(llvm::json::Value(llvm::json::Object{{"type", type.str()}}))}};
@@ -1088,7 +1124,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             {"name", value->getString("name").value_or("value").str()},
             {"initial_value", root},
             {"ownership", argumentSlots.count(root) ? "borrowed" : "owned"},
-            {"lifetime", "invocation"},
+            {"lifetime", isAdTapeType(type) ? "pullback" : "invocation"},
             {"mutability", mutableByRoot[root] ? "mutable" : "read_only"},
             {"descriptor", std::move(descriptor)},
         });
@@ -1106,7 +1142,8 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
         const llvm::json::Array *currentShape = current ? current->getArray("shape") : nullptr;
         const llvm::StringRef initialType = initial ? initial->getString("type").value_or("") : "";
         const llvm::StringRef currentType = current ? current->getString("type").value_or("") : "";
-        const bool opaqueResource = isTextureType(initialType) || isSamplerType(initialType);
+        const bool opaqueResource =
+            isTextureType(initialType) || isSamplerType(initialType) || isAdTapeType(initialType);
         if (initialType.empty() || initialType != currentType ||
             (!opaqueResource && (!initialLayout || !currentLayout ||
                                  initialLayout->getString("layout_hash") != currentLayout->getString("layout_hash"))) ||
@@ -1147,7 +1184,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             return false;
         }
         const bool resource = resourceVersions.count(static_cast<int64_t>(expectedId));
-        const bool opaqueResource = resource && (isTextureType(*type) || isSamplerType(*type));
+        const bool opaqueResource = resource && (isTextureType(*type) || isSamplerType(*type) || isAdTapeType(*type));
         if (!opaqueResource && !layout) {
             error = "canonical compute byte values must have layouts";
             return false;
@@ -1683,12 +1720,20 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 }
                 return true;
             };
+            std::map<std::string, int64_t> namedBound;
+            for (const auto &[name, value] : boundValues) {
+                const llvm::json::Object *logical = valueById(*rawValues, value);
+                const llvm::StringRef type = logical ? logical->getString("type").value_or("") : "";
+                if (name == "tape" || isAdTapeType(type))
+                    continue;
+                namedBound.emplace(name, value);
+            }
             if (!collect(compiledEntry.getArray("arguments")) || !collect(compiledEntry.getArray("results")) ||
-                interface.size() != boundValues.size()) {
+                interface.size() != namedBound.size()) {
                 error = "compiled compute ABI source names must be unique and exactly cover logical bindings";
                 return false;
             }
-            for (const auto &[name, value] : boundValues)
+            for (const auto &[name, value] : namedBound)
                 if (!interface.count(name) || !valueById(*rawValues, value)) {
                     error = "compiled compute ABI does not exactly cover logical endpoint '" + name + "'";
                     return false;
@@ -1738,6 +1783,10 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     row.getString("vernon.builtin") ? row.getString("vernon.builtin") : row.getString("builtin");
                 const int64_t endpointIndex = row.getInteger("index").value_or(static_cast<int64_t>(fallbackIndex));
                 if (builtin) {
+                    if (kernelTapeBuiltin(*builtin)) {
+                        implementationEndpoints.emplace_back(compiledEndpointAbi(row, "compute", endpointIndex));
+                        return true;
+                    }
                     if (kernelHiddenBuiltin(*builtin))
                         return true;
                     const llvm::json::Object *layout = row.getObject("value_layout");
@@ -1943,6 +1992,24 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 return true;
             };
 
+            const auto emitTapeAccess = [&](int64_t valueId, const LogicalResource &resource) {
+                if (accessByBefore.count(valueId))
+                    return;
+                accessByBefore[valueId] = static_cast<int64_t>(accesses.size());
+                if (resource.access == "read")
+                    accesses.emplace_back(
+                        llvm::json::Object{{"tag", "read"}, {"storage", resource.storage}, {"value", valueId}});
+                else if (!resource.after)
+                    accesses.emplace_back(
+                        llvm::json::Object{{"tag", "initialize"}, {"storage", resource.storage}, {"after", valueId}});
+                else
+                    accesses.emplace_back(llvm::json::Object{{"tag", "write"},
+                                                             {"storage", resource.storage},
+                                                             {"before", valueId},
+                                                             {"after", *resource.after},
+                                                             {"access", resource.access}});
+            };
+
             size_t endpointOrdinal = 0;
             if (const llvm::json::Array *rows = compiledEntry.getArray("arguments"))
                 for (const llvm::json::Value &rowValue : *rows) {
@@ -1956,6 +2023,12 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     if (!row || !appendEndpoint(*row, "result", endpointOrdinal++))
                         return false;
                 }
+            for (const auto &[valueId, resource] : resources) {
+                const llvm::json::Object *logical = valueById(*rawValues, valueId);
+                const llvm::StringRef type = logical ? logical->getString("type").value_or("") : "";
+                if (isAdTapeType(type))
+                    emitTapeAccess(valueId, resource);
+            }
 
             std::vector<int64_t> emittedSlots;
             for (const llvm::json::Value &endpointValue : endpoints)

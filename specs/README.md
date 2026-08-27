@@ -31,6 +31,9 @@ and milestone checklists.
    residual-source, cost-model, and bounded-replay checklist.
 8. [`compiler/design.md`](compiler/design.md) defines compiler boundaries,
    lowering invariants, reflection, target routing, and artifact cooking.
+   Ordinary device-store injectivity (affine unique-axis, mixed-radix,
+   workgroup leader, and dispatch residuals) is
+   [`compiler/invocation_index_ownership.md`](compiler/invocation_index_ownership.md).
 9. [`runtime/design.md`](runtime/design.md) defines deployment ABI, backend
    ownership, resource behavior, and execution semantics.
 10. [`runtime/image_resources.md`](runtime/image_resources.md) defines the
@@ -54,6 +57,9 @@ Supporting future designs:
 - [`program_vjp_debug_priority.md`](program_vjp_debug_priority.md) is the
   active debug ladder (which AD tests to green first) while finishing that
   convergence; refresh its failure list as layers pass.
+- [`program_vjp_adjoint_ssa.md`](program_vjp_adjoint_ssa.md) is the interior
+  adjoint rule for Program VJP: SSA handles, DPS TensorView add, kernel/public
+  `read`/`write` ABI, no kernel that returns Storage.
 
 ## Version policy
 

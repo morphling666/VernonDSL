@@ -129,6 +129,12 @@ module {
     EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], remainder}));
     EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], quotient}));
     EXPECT_FALSE(proveInvocationOwnedIndex({casts[0], casts[2], casts[3], casts[4]}));
+    auto mixedRadix = proveInvocationOwnedIndex({quotient, remainder});
+    ASSERT_TRUE(mixedRadix);
+    EXPECT_EQ(mixedRadix->unitGridAxes, (SmallVector<unsigned>{1, 2}));
+    ASSERT_TRUE(mixedRadix->mixedRadixLinear);
+    EXPECT_FALSE(proveInvocationOwnedIndex({remainder}));
+    EXPECT_FALSE(proveInvocationOwnedIndex({quotient}));
 }
 
 TEST_F(VernonAutodiffAnalysisTest, PrunesValuesOutsideWrtToResultPath) {

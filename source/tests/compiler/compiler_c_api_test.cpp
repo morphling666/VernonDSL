@@ -979,15 +979,23 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
     EXPECT_TRUE(std::any_of(requests.begin(), requests.end(), [](const nlohmann::json &request) {
         return request.at("implementation_hint") == "vernon.builtin.add";
     }));
-    EXPECT_EQ(reflection.at("execution").at("values").size(), 8u);
+    EXPECT_TRUE(std::any_of(requests.begin(), requests.end(), [](const nlohmann::json &request) {
+        const auto hint = request.at("implementation_hint").get<std::string>();
+        return hint.size() >= 18 && hint.compare(hint.size() - 18, 18, ".forward_with_tape") == 0;
+    }));
+    EXPECT_TRUE(std::any_of(requests.begin(), requests.end(), [](const nlohmann::json &request) {
+        const auto hint = request.at("implementation_hint").get<std::string>();
+        return hint.size() >= 4 && hint.compare(hint.size() - 4, 4, ".vjp") == 0;
+    }));
+    EXPECT_EQ(reflection.at("execution").at("values").size(), 10u);
     const nlohmann::json &signature = reflection.at("execution").at("signature");
     EXPECT_EQ(signature.at("inputs"), nlohmann::json::array({{{"value", 0}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("outputs"),
-              nlohmann::json::array({{{"value", 1}, {"path", "left"}}, {{"value", 2}, {"path", "right"}}}));
+              nlohmann::json::array({{{"value", 1}, {"path", "left"}}, {{"value", 3}, {"path", "right"}}}));
     EXPECT_EQ(signature.at("cotangents"),
-              nlohmann::json::array({{{"value", 3}, {"path", "left"}}, {{"value", 4}, {"path", "right"}}}));
-    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 7}, {"path", "source"}}}));
-    EXPECT_EQ(signature.at("captures"), nlohmann::json::array({0, 1, 2}));
+              nlohmann::json::array({{{"value", 5}, {"path", "left"}}, {{"value", 6}, {"path", "right"}}}));
+    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 9}, {"path", "source"}}}));
+    EXPECT_EQ(signature.at("captures"), nlohmann::json::array({0, 1, 2, 3, 4}));
 
     vernonCompileResultDestroy(planned);
     vernonCompilerDestroy(compiler);
@@ -1026,6 +1034,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const nlohmann::json &allocator = entry.at("arguments").at(0);
     EXPECT_EQ(allocator.at("kind"), "builtin");
     EXPECT_EQ(allocator.at("builtin"), "ad_tape_allocator");
+    EXPECT_EQ(allocator.at("physical_layouts").at("host_value").at("kind"), "cpu_call");
+    EXPECT_FALSE(
+        allocator.at("physical_layouts").at("host_value").at("canonical_layout_hash").get<std::string>().empty());
+    EXPECT_EQ(allocator.at("physical_layouts").at("host_value").at("root").at("kind"), "scalar");
     EXPECT_EQ(allocator.at("physical_layouts").at("host_value").at("root").at("size"), sizeof(void *));
     EXPECT_EQ(entry.at("physical_layouts").at("host_value").at("packed_arguments_size"), sizeof(void *));
     EXPECT_EQ(entry.at("results").size(), 1u);
@@ -1133,13 +1145,30 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         EXPECT_NE(endpoint.value("builtin", ""), "global_invocation_id");
         EXPECT_NE(endpoint.value("interface", ""), "system_value");
     }
-    if (finalizedJson.contains("target_implementations") &&
-        finalizedJson.at("target_implementations").contains(requestId)) {
-        for (const auto &endpoint : finalizedJson.at("target_implementations").at(requestId).at("endpoints")) {
-            EXPECT_NE(endpoint.value("builtin", ""), "ad_tape_allocator");
-            EXPECT_NE(endpoint.value("builtin", ""), "global_invocation_id");
+    ASSERT_TRUE(finalizedJson.contains("target_implementations"));
+    ASSERT_TRUE(finalizedJson.at("target_implementations").contains(requestId));
+    bool sawTapeAllocator = false;
+    bool sawPackedTensor = false;
+    for (const auto &endpoint : finalizedJson.at("target_implementations").at(requestId).at("endpoints")) {
+        EXPECT_NE(endpoint.value("builtin", ""), "global_invocation_id");
+        if (endpoint.contains("packed_frame_offset"))
+            EXPECT_TRUE(endpoint.at("packed_frame_offset").is_number_integer());
+        if (endpoint.value("builtin", "") == "ad_tape_allocator") {
+            sawTapeAllocator = true;
+            ASSERT_TRUE(endpoint.contains("interface_plan"));
+            EXPECT_EQ(endpoint.at("interface_plan").at("kind"), "cpu_call");
+            EXPECT_EQ(endpoint.at("interface_plan").at("profile"), "host_value");
+            EXPECT_TRUE(endpoint.at("interface_plan").contains("frame_offset"));
+            EXPECT_EQ(endpoint.at("interface_plan").at("root").at("size"), sizeof(void *));
+            continue;
+        }
+        if (endpoint.value("index", -1) == 0) {
+            sawPackedTensor = true;
+            ASSERT_TRUE(endpoint.contains("packed_frame_offset"));
         }
     }
+    EXPECT_TRUE(sawTapeAllocator);
+    EXPECT_TRUE(sawPackedTensor);
 
     vernonCompileResultDestroy(finalized);
     vernonCompileResultDestroy(compiled);

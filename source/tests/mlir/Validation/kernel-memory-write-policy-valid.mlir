@@ -2,6 +2,8 @@
 //
 // CHECK-LABEL: func.func @rank_one_global_x
 // CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 1, 2>}
+// CHECK-LABEL: func.func @rank_two_linearized_global_x
+// CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 1, 2>}
 // CHECK-LABEL: func.func @valid_write_policies
 // CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = true, unit_grid_axes = array<i32: 0, 1, 2>}
 // CHECK-LABEL: func.func @partial_leader_guarded_workgroup_store
@@ -24,6 +26,32 @@ module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_
     %value = arith.constant 1.0 : f32
     "vernon.store"(%value, %output, %gx)
         : (f32, !vernon.tensor_view<f32, [-1], "write", "device">, index) -> ()
+    return
+  }
+
+  func.func @rank_two_linearized_global_x(
+      %output: !vernon.tensor_view<f32, [-1, -1], "write", "device"> {
+        vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64
+      },
+      %gid: tensor<3xi32> {
+        vernon.interface = "input", vernon.builtin = "global_invocation_id"
+      }) attributes {
+        vernon.entry, vernon.stage = "compute",
+        vernon.workgroup_size = array<i32: 1, 1, 1>
+      } {
+    %zero = arith.constant 0 : index
+    %one = arith.constant 1 : index
+    %gx_i32 = tensor.extract %gid[%zero] : tensor<3xi32>
+    %shape = "vernon.get_shape"(%output)
+        : (!vernon.tensor_view<f32, [-1, -1], "write", "device">) -> tensor<2xi32>
+    %extent1 = tensor.extract %shape[%one] : tensor<2xi32>
+    %index1_i32 = arith.remui %gx_i32, %extent1 : i32
+    %index0_i32 = arith.divui %gx_i32, %extent1 : i32
+    %index0 = arith.index_castui %index0_i32 : i32 to index
+    %index1 = arith.index_castui %index1_i32 : i32 to index
+    %value = arith.constant 1.0 : f32
+    "vernon.store"(%value, %output, %index0, %index1)
+        : (f32, !vernon.tensor_view<f32, [-1, -1], "write", "device">, index, index) -> ()
     return
   }
 

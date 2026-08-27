@@ -312,7 +312,11 @@ synchronization. Unknown overlap is conservatively aliasing.
 
 Every compute entry carries a compiler-derived `vernon.dispatch_contract`.
 Its `unit_grid_axes` and `requires_unit_workgroup` constraints are residual
-conditions of the ordinary-write injectivity proof. All public direct, cooked,
+conditions of the ordinary-write injectivity proof. The lemmas (affine
+unique-axis, unsigned mixed-radix, workgroup leader, and the serialized
+single-invocation fallback) are
+[`compiler/invocation_index_ownership.md`](../compiler/invocation_index_ownership.md).
+All public direct, cooked,
 AOT, graph, and autodiff dispatch paths validate this contract before
 allocation, staging, mutation, or submission. A failed constraint is an error;
 the runtime never serializes the dispatch. Constant ordinary writes therefore

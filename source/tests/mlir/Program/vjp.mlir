@@ -30,7 +30,7 @@ module {
 // CHECK-NOT: vernon.entry
 // CHECK-NOT: vernon.stage
 // CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "normalize"
+// CHECK-SAME: callee = "normalize.forward_with_tape"
 // CHECK-SAME: vernon_program.dependencies = array<i64>
 // CHECK: "vernon_program.compute"
 // CHECK-SAME: callee = "vernon.builtin.matmul"
@@ -46,20 +46,8 @@ module {
 // CHECK-NOT: vernon.entry
 // CHECK-NOT: vernon.stage
 // CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "normalize"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.matmul"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.matmul"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.add"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.transpose"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.transpose"
-// CHECK: "vernon_program.compute"
-// CHECK-SAME: callee = "vernon.builtin.matmul"
 // CHECK: callee = "normalize.vjp"
+// CHECK-SAME: operand_names = ["tape",
 // Gradients from normalize.vjp and the skip matmul must fan in to %left.
 // CHECK: "vernon_program.compute"
 // CHECK-SAME: callee = "vernon.builtin.add"

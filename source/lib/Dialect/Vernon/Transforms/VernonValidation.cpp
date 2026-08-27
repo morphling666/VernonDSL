@@ -211,7 +211,7 @@ public:
     LogicalResult verify(func::FuncOp function) {
         function->removeAttr(kDispatchContractAttrName);
         SmallVector<BarrierOp> barriers;
-        SmallVector<DeviceMemoryEffect> effects;
+        SmallVector<DeviceMemoryEffect, 8> effects;
         DenseSet<unsigned> unitGridAxes;
         auto workgroup = function->getAttrOfType<DenseI32ArrayAttr>(kWorkgroupSizeAttrName);
         const bool unitWorkgroup = workgroup && workgroup.size() == 3 &&
@@ -257,10 +257,13 @@ public:
                 return;
             effect.owner = effect.storage;
             if (effect.kind == DeviceMemoryEffect::Kind::OrdinaryStore) {
+                // Ordinary-write injectivity:
+                // specs/compiler/invocation_index_ownership.md
                 effect.ownershipProof = proveInvocationOwnedIndex(effect.indices);
                 if (!effect.ownershipProof)
                     effect.ownershipProof = proveLeaderGuardedWorkgroupOwnedIndex(operation, effect.indices);
                 if (!effect.ownershipProof && unitWorkgroup && !usesScalarGlobalInvocationId(effect.indices)) {
+                    // Serialized launch |Inv|=1: specs/compiler/invocation_index_ownership.md §6
                     effect.singleInvocationConstrained = true;
                 }
                 if (!effect.ownershipProof && !effect.singleInvocationConstrained) {

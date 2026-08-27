@@ -1268,7 +1268,8 @@ bool HostStaticTapeBatch::compact(bool retainConstructionStorage) {
     if (constructionState_ != ConstructionState::Constructing)
         return false;
     if (lanes_.size() != laneCount_ || std::any_of(lanes_.begin(), lanes_.end(), [](const LaneState &lane) {
-            return lane.phase != LanePhase::Sealed && lane.phase != LanePhase::Promoted;
+            return lane.phase != LanePhase::Sealed && lane.phase != LanePhase::Promoted &&
+                   lane.phase != LanePhase::Empty;
         }))
         return false;
     compactedLogicalBytes_ = logicalBytes();
@@ -1419,9 +1420,11 @@ VernonAdTapeAllocator *HostStaticTapeBatch::descriptor(size_t lane) {
 
 VernonAdRegionHandle HostStaticTapeBatch::rootRegion(size_t lane) const {
     if (compacted_) {
-        if (lane >= compactedLaneKinds_.size())
+        if (lane >= laneCount_)
             return VERNON_AD_INVALID_REGION_HANDLE;
-        return compactedLaneKinds_[lane] ? dynamicBatch()->rootRegion(lane) : VernonAdRegionHandle{1};
+        if (lane < compactedLaneKinds_.size() && compactedLaneKinds_[lane])
+            return dynamicBatch()->rootRegion(lane);
+        return VernonAdRegionHandle{1};
     }
     if (lane >= lanes_.size())
         return VERNON_AD_INVALID_REGION_HANDLE;
@@ -1445,6 +1448,22 @@ size_t HostStaticTapeBatch::residentBytes() const {
     const HostDynamicTapeBatch *dynamic = dynamicBatch();
     const size_t dynamicBytes = dynamic ? dynamic->residentBytes() : 0;
     return policyCharge_ + dynamicBytes;
+}
+
+HostStaticTapeBatch *HostStaticTapeBatch::fromWriteDescriptor(VernonAdTapeAllocator *allocator) {
+    if (!allocator || allocator->struct_size != sizeof(VernonAdTapeAllocator) ||
+        allocator->abi_version != VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION)
+        return nullptr;
+    auto *self = static_cast<HostStaticTapeBatch *>(allocator->user_data);
+    if (!self || self->descriptors_.empty())
+        return nullptr;
+    const auto address = reinterpret_cast<uintptr_t>(allocator);
+    const auto begin = reinterpret_cast<uintptr_t>(self->descriptors_.data());
+    size_t descriptorBytes = 0;
+    if (!checkedMultiply(self->descriptors_.size(), sizeof(VernonAdTapeAllocator), descriptorBytes) ||
+        address < begin || address - begin >= descriptorBytes || (address - begin) % sizeof(VernonAdTapeAllocator) != 0)
+        return nullptr;
+    return self;
 }
 
 std::pair<HostStaticTapeBatch *, size_t> HostStaticTapeBatch::owner(VernonAdTapeAllocator *allocator) {
@@ -1564,7 +1583,7 @@ VernonAdTapeAllocatorStatus HostStaticTapeBatch::reserveRecord(VernonAdTapeAlloc
         self->lanes_[lane].phase != LanePhase::RegionOpen || !payloadAlignment ||
         (payloadAlignment & (payloadAlignment - 1)))
         return self->fail(lane, VERNON_AD_TAPE_ALLOCATOR_INVALID_STATE);
-    if (childCount)
+    if (childCount || payloadSize > self->payloadStride_)
         return self->promote(lane, payloadSize, payloadAlignment, childCount, record);
     size_t required = 0;
     if (!checkedAdd(kHostTapeRegionResidentBytes, kHostTapeRecordResidentBytes, required) ||

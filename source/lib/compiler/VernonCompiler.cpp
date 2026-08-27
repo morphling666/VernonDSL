@@ -440,8 +440,12 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             llvm::json::Object *binding = bindingValue.getAsObject();
             std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
             std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
-            auto parameterIt = parameter ? interface.find(parameter->str()) : interface.end();
             llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
+            const std::optional<llvm::StringRef> role = binding ? binding->getString("autodiff_role") : std::nullopt;
+            const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
+            if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
+                continue;
+            auto parameterIt = parameter ? interface.find(parameter->str()) : interface.end();
             if (!parameter || !valueId || parameterIt == interface.end() || !value) {
                 result->status = VERNON_STATUS_VERIFICATION_ERROR;
                 result->diagnostics =

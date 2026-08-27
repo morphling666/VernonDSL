@@ -176,8 +176,11 @@ class ModuleTests(unittest.TestCase):
         self.assertIsNotNone(implementation)
         assert implementation is not None
         self.assertEqual(implementation.entry, "_program_add_f32_rank2")
+        self.assertIn("global_invocation_id", implementation.mlir)
         self.assertIn('"vernon.get_shape"', implementation.mlir)
         self.assertIn("tensor<2xi32>", implementation.mlir)
+        self.assertIn('!vernon.tensor_view<f32, [-1, -1], "write", "device">', implementation.mlir)
+        self.assertNotIn("2x3", implementation.mlir)
 
     def test_fusion_dsl_provider_lowers_dynamic_rank_builtin_add(self) -> None:
         values = {

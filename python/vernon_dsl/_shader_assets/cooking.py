@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Mapping
 
-from .._runtime.operation_implementations import ImplementationUnavailable
+from .._runtime.operators import ImplementationUnavailable
 from .._versions import PIPELINE_VERSION
 from ..ad import ProgramTransformSpec
 from ..bundle import (
@@ -229,9 +229,17 @@ def _compile_program_bundle_plan(
             BuiltinDslProvider(),
         )
     )
+    vjp_requests: list[Mapping[str, Any]] = []
+    other_requests: list[Mapping[str, Any]] = []
     for request in requests:
         if not isinstance(request, Mapping):
             raise PipelineCompileError("Program planner returned an invalid kernel compile request")
+        hint = request.get("implementation_hint")
+        if isinstance(hint, str) and hint.endswith(".vjp"):
+            vjp_requests.append(request)
+        else:
+            other_requests.append(request)
+    for request in (*vjp_requests, *other_requests):
         request_id = request.get("id")
         hint = request.get("implementation_hint")
         kind = request.get("kind")
@@ -324,8 +332,13 @@ def _compile_program_bundle_plan(
     if set(contracts) != set(stages) or any(not isinstance(contract, Mapping) for contract in contracts.values()):
         raise PipelineCompileError("canonical stage contracts do not exactly cover logical compute requests")
     contracts_by_implementation: dict[str, dict[str, Mapping[str, Any]]] = {}
+    implementations_by_stage: dict[str, dict[str, Mapping[str, Any]]] = {}
+    implementations = finalized_reflection.get("target_implementations")
     for logical_stage, stage in stages.items():
         contracts_by_implementation.setdefault(stage.id, {})[logical_stage] = contracts[logical_stage]
+        implementation = implementations.get(logical_stage) if isinstance(implementations, Mapping) else None
+        if isinstance(implementation, Mapping):
+            implementations_by_stage.setdefault(stage.id, {})[logical_stage] = implementation
     canonical_stages = tuple(
         CompiledStage(
             stage.module,
@@ -336,7 +349,11 @@ def _compile_program_bundle_plan(
             stage.reflection,
             stage.interface,
             stage.artifact,
-            {**stage.metadata, "program_contracts": contracts_by_implementation[stage.id]},
+            {
+                **stage.metadata,
+                "program_contracts": contracts_by_implementation[stage.id],
+                "program_implementations": implementations_by_stage.get(stage.id, {}),
+            },
         )
         for stage in plan.stages
     )
@@ -472,6 +489,10 @@ def _canonical_deployment(
             ],
             "reflection": copy.deepcopy(dict(reflection)),
         }
+        implementations = stage.metadata.get("program_implementations")
+        implementation = implementations.get(logical_stage) if isinstance(implementations, Mapping) else None
+        if isinstance(implementation, Mapping):
+            artifacts[logical_stage]["implementation"] = copy.deepcopy(dict(implementation))
         stage_bindings[logical_stage] = logical_stage
     return (
         copy.deepcopy(dict(variant.execution)),

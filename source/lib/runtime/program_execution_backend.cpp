@@ -339,6 +339,20 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
                 }
                 convertedNode.resources.push_back(std::move(use));
             }
+            if (node.operation == "compute") {
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const ControlComponent &control = node.compute.workgroups[axis];
+                    const std::string path = "/graphs/" + std::to_string(graphIndex) + "/nodes/" +
+                                             std::to_string(node.id) + "/operation/workgroups/" + std::to_string(axis);
+                    if (control.kind != ControlKind::Static)
+                        return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", path,
+                                      "ExecutionGraph Program dispatch requires static workgroup counts");
+                    if (!control.value || control.value > std::numeric_limits<uint32_t>::max())
+                        return reject(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", path,
+                                      "workgroup count is outside uint32");
+                    convertedNode.grid[axis] = control.value;
+                }
+            }
             converted.nodes.push_back(std::move(convertedNode));
         }
         execution.graphs.push_back(std::move(converted));

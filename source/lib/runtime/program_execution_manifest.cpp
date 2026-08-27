@@ -1313,13 +1313,19 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                 const std::string endpointPath = implementationPath + "/endpoints/" + std::to_string(index);
                 CompiledEndpointAbi compiled;
                 if (!exactObject(rowValue, {"module", "index"},
-                                 {"value_transport", "set", "binding", "interface_plan", "element_layout",
-                                  "sampled_image_bindings"},
+                                 {"builtin", "value_transport", "set", "binding", "interface_plan",
+                                  "packed_frame_offset", "element_layout", "sampled_image_bindings"},
                                  diagnostic, endpointPath) ||
                     !rowValue["module"].is_string() || !uint32Value(rowValue["index"], compiled.index))
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath,
                                 "invalid compiled endpoint ABI");
                 compiled.module = rowValue["module"].get<std::string>();
+                if (rowValue.contains("builtin")) {
+                    if (!rowValue["builtin"].is_string())
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/builtin",
+                                    "invalid compiled builtin");
+                    compiled.builtin = rowValue["builtin"].get<std::string>();
+                }
                 if (rowValue.contains("value_transport")) {
                     if (!rowValue["value_transport"].is_string())
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
@@ -1339,6 +1345,13 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
                                     endpointPath + "/interface_plan", error);
                     compiled.interfacePlan = std::move(plan);
+                }
+                if (rowValue.contains("packed_frame_offset")) {
+                    uint64_t offset = 0;
+                    if (!uint64Value(rowValue["packed_frame_offset"], offset))
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                    endpointPath + "/packed_frame_offset", "invalid packed frame offset");
+                    compiled.packedFrameOffset = offset;
                 }
                 if (rowValue.contains("element_layout")) {
                     vernon::runtime::ValueLayout layout;

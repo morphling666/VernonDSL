@@ -8,7 +8,10 @@
 #include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
 #include "platform/platform_library.h"
+#include "runtime/autodiff/tape_allocator_abi.h"
 
+#include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,8 +34,17 @@ struct CpuContextState {
 struct CpuPipelineState {
     VernonRuntimeCorePipeline *pipeline{};
     VernonRuntimeCoreBindings *bindings{};
+    VernonCpuEntryPoint entry{};
     std::vector<VernonRuntimeProviderBindingLayoutEntry> layout;
     std::vector<VernonRuntimeProviderBindingValue> values;
+    std::vector<std::string> layoutBuiltins;
+    std::vector<size_t> packedOffsets;
+    std::vector<size_t> packedFieldSizes;
+    size_t packedSize{};
+    size_t tapeAllocatorOffset{std::numeric_limits<size_t>::max()};
+    size_t tapeRootOffset{std::numeric_limits<size_t>::max()};
+    VernonAdTapeAllocator *tapeAllocator{};
+    VernonAdRegionHandle tapeRoot{};
     uint32_t workgroup[3]{1, 1, 1};
 };
 
@@ -48,6 +60,7 @@ uint64_t cpuProviderResourceIdentity(const VernonRuntimeContext &context);
 VernonStringView cpuProviderLastError(const VernonRuntimeContext &context);
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
                                CpuPipelineState &state);
+void setCpuProgramTape(VernonLoadedPipeline &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root);
 
 VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entry);
 

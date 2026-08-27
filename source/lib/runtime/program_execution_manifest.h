@@ -91,10 +91,12 @@ struct GraphicsFragmentOutput {
 struct CompiledEndpointAbi {
     std::string module;
     uint32_t index{};
+    std::string builtin;
     std::string valueTransport;
     uint32_t descriptorSet{UINT32_MAX};
     uint32_t binding{UINT32_MAX};
     std::optional<vernon::runtime::InterfacePlan> interfacePlan;
+    std::optional<uint64_t> packedFrameOffset;
     std::optional<vernon::runtime::ValueLayout> elementLayout;
     std::vector<vernon::runtime::SampledImageBinding> sampledImageBindings;
 };

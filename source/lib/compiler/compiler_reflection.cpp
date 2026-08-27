@@ -905,12 +905,22 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (cpuOpaqueBuiltin) {
                 hostAlignment = alignof(uintptr_t);
                 argumentOffset = llvm::alignTo(argumentOffset, hostAlignment);
-                physicalLayouts["host_value"] = llvm::json::Object{
-                    {"profile", "host_value"},
-                    {"kind", "cpu_call"},
-                    {"frame_offset", static_cast<int64_t>(argumentOffset)},
-                    {"root", llvm::json::Object{{"size", static_cast<int64_t>(sizeof(uintptr_t))},
-                                                {"alignment", static_cast<int64_t>(hostAlignment)}}}};
+                mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> indexPlan =
+                    mlir::vernon::getBackendInterfaceAbiPlan(argumentType, module,
+                                                             mlir::vernon::PhysicalAbiProfile::HostValue);
+                const auto *bytes =
+                    mlir::succeeded(indexPlan) ? std::get_if<mlir::vernon::ByteTransportPlan>(&*indexPlan) : nullptr;
+                if (!bytes || !bytes->root) {
+                    function.emitError() << "cannot reflect CPU packed ABI for argument #" << index;
+                    invalid = true;
+                    return;
+                }
+                physicalLayouts["host_value"] =
+                    llvm::json::Object{{"kind", "cpu_call"},
+                                       {"profile", "host_value"},
+                                       {"canonical_layout_hash", bytes->canonicalLayoutHash},
+                                       {"frame_offset", static_cast<int64_t>(argumentOffset)},
+                                       {"root", reflectTransportNode(*bytes->root)}};
                 argumentOffset += sizeof(uintptr_t);
             } else if (mlir::succeeded(cpuValuePlan)) {
                 hostAlignment = cpuValuePlan->layout.alignment;

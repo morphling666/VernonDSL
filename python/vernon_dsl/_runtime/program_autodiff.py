@@ -82,12 +82,20 @@ class ProgramNativePullback:
         return int(self._native.logical_residual_bytes)
 
     @property
+    def estimated_tape_bytes(self) -> int:
+        return int(self._native.estimated_tape_bytes)
+
+    @property
     def resident_tape_bytes(self) -> int:
         return int(self._native.resident_bytes)
 
     @property
     def allocated_tape_bytes(self) -> int:
         return int(self._native.allocated_bytes)
+
+    @property
+    def recomputation_factor(self) -> float:
+        return float(self._native.recomputation_factor)
 
     @property
     def peak_temporary_bytes(self) -> int:

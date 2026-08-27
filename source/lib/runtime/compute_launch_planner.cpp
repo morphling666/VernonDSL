@@ -148,7 +148,9 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
             if (argumentIt == arguments.end())
                 continue;
             const VernonPipelineArgument &argument = *argumentIt->second;
-            if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+            if (argument.kind != VERNON_PIPELINE_TENSOR ||
+                (argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE &&
+                 argument.tensor.storage != VERNON_TENSOR_HOST) ||
                 (argument.tensor.rank && !argument.tensor.shape))
                 continue;
             const uint32_t rank = argument.tensor.rank;

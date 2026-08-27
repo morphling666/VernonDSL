@@ -6,6 +6,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -107,11 +108,10 @@ VernonStatus prepareCpuLayout(void *data, const VernonRuntimeProviderPipelineLay
     } catch (const std::bad_alloc &) {
         return fail(context.error, "cannot allocate CPU provider bindings", VERNON_STATUS_INTERNAL_ERROR);
     }
-    for (size_t index = 0; index < layout->entries.size(); ++index) {
-        const auto &entry = layout->entries[index];
+    for (const auto &entry : layout->entries) {
         if ((entry.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
              entry.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE) ||
-            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE || entry.argument_index != index)
+            entry.stage_mask != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
             return fail(context.error, "CPU provider layout is not a canonical compute ABI");
     }
     *output = toHandle(layout.release());
@@ -158,7 +158,9 @@ VernonStatus updateCpuBindingsImpl(CpuContextState &context, CpuPreparedBindings
     const ReflectedEntry &reflection = bindings.pipeline->shader->reflection;
     size_t reflectedIndex = 0;
     for (const ReflectedArgument &argument : reflection.arguments) {
-        if (argument.kind == "builtin")
+        const bool tapeBuiltin = argument.kind == "builtin" && (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
+                                                                argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN);
+        if (argument.kind == "builtin" && !tapeBuiltin)
             continue;
         if (reflectedIndex >= valueCount)
             return fail(context.error, "CPU provider reflection exceeds its binding layout");
@@ -319,21 +321,30 @@ VernonStringView cpuProviderLastError(const VernonRuntimeContext &context) {
 
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
                                CpuPipelineState &state) {
-    uint32_t argumentIndex = 0;
+    state.entry = kernel.entry;
+    if (reflection.packedArguments)
+        state.packedSize = reflection.packedArguments->size;
     for (const ReflectedArgument &argument : reflection.arguments) {
-        if (argument.kind == "builtin")
+        const bool tapeBuiltin = argument.kind == "builtin" && (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
+                                                                argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN);
+        if (argument.kind == "builtin" && !tapeBuiltin)
             continue;
+        if (!tapeBuiltin && argument.index == UINT32_MAX) {
+            invocationDiagnostic(context) = "CPU compute reflection is missing a kernel argument index";
+            return false;
+        }
+        const uint32_t layoutIndex = static_cast<uint32_t>(state.layout.size());
         VernonRuntimeProviderBindingLayoutEntry binding{};
-        binding.slot = argumentIndex;
+        binding.slot = layoutIndex;
         binding.set = argument.descriptorSet;
-        binding.binding = argument.binding == UINT32_MAX ? argumentIndex : argument.binding;
+        binding.binding = argument.binding == UINT32_MAX ? layoutIndex : argument.binding;
         binding.kind = argument.kind == "tensor" && !argument.tensorViewDescriptor
                            ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
         binding.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
         binding.access = 3;
         binding.array_count = 1;
-        binding.argument_index = argumentIndex;
+        binding.argument_index = tapeBuiltin ? UINT32_MAX : argument.index;
         binding.element_size =
             static_cast<uint32_t>(binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ? argument.tensorElementSize
                                                                                          : argument.physical.size);
@@ -342,7 +353,13 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
             return false;
         }
         state.layout.push_back(binding);
-        ++argumentIndex;
+        state.layoutBuiltins.push_back(tapeBuiltin ? argument.builtin : std::string());
+        state.packedOffsets.push_back(argument.physical.offset);
+        state.packedFieldSizes.push_back(argument.physical.size);
+        if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN)
+            state.tapeAllocatorOffset = argument.physical.offset;
+        if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
+            state.tapeRootOffset = argument.physical.offset;
     }
     state.values.resize(state.layout.size());
     std::copy_n(reflection.workgroup, 3, state.workgroup);
@@ -372,6 +389,12 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     invocationDiagnostic(context) = providerError.data ? std::string(providerError.data, providerError.size)
                                                        : "failed to prepare CPU provider pipeline";
     return false;
+}
+
+void setCpuProgramTape(VernonLoadedPipeline &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root) {
+    CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
+    state.tapeAllocator = allocator;
+    state.tapeRoot = root;
 }
 
 VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entry) {

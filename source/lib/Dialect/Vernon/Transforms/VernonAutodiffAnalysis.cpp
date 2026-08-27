@@ -66,17 +66,19 @@ bool needsInternalStorageAdjoint(const VernonAutodiffAnalysisResult &result, con
 
 LogicalResult verifyLaneOwnedDeviceAdjoint(const VernonAutodiffAnalysisResult &result,
                                            const AutodiffStorageIdentity &identity) {
-    std::optional<GlobalIdAffineIndexTuple> ownedTuple;
+    // Same injectivity proof as ordinary stores:
+    // specs/compiler/invocation_index_ownership.md
+    std::optional<ConditionalIndexProof> owned;
     for (const AutodiffStorageEffect &effect : result.getStorageEffects()) {
         if (effect.identity != identity.id || !hasActiveStorageEffect(result, effect))
             continue;
         ValueRange indices = storageIndices(effect.operation);
         std::optional<ConditionalIndexProof> proof = proveInvocationOwnedIndex(indices);
-        if (!proof || (ownedTuple && *ownedTuple != proof->normalizedIndices))
+        if (!proof || (owned && *owned != *proof))
             return failure();
-        ownedTuple = std::move(proof->normalizedIndices);
+        owned = std::move(proof);
     }
-    if (!ownedTuple)
+    if (!owned)
         return failure();
     return success();
 }

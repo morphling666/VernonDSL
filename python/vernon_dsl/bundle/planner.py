@@ -321,6 +321,14 @@ def build_program_bundle_plan(
             value = values_by_id.get(value_id)
             if value is None:
                 return
+            value_type = value.get("type")
+            if isinstance(value_type, str) and (
+                value_type == "!vernon.ad_tape"
+                or value_type.startswith("!vernon.ad_tape<")
+                or value_type.startswith("!vernon.texture<")
+                or value_type.startswith("!vernon.sampler")
+            ):
+                return
             layout = parameter.get("value_layout", parameter.get("element_layout"))
             if layout is None:
                 raise PipelineCompileError(f"Program value {name!r} has no canonical layout")
