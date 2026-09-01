@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import dataclass
 from typing import Annotated, Any, cast
 from unittest import mock
 
@@ -9,7 +10,10 @@ import vernon_dsl as vd
 from vernon_dsl._runtime.autodiff import _StructuredPullback
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 
-from python.tests.storage_vjp_direct_fixture import Particle, aggregate_storage_objective_vjp
+from python.tests.storage_vjp_direct_fixture import (
+    Particle,
+    aggregate_storage_objective_vjp,
+)
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
@@ -129,6 +133,11 @@ graph_checkpoint_product_vjp = vd.ad.vjp(graph_checkpoint_product, wrt=("source"
 graph_cube_vjp = vd.ad.vjp(graph_cube, wrt=("source",), outputs=("output",))
 graph_product_vjp = vd.ad.vjp(graph_product, wrt=("left", "right"), outputs=("output",))
 graph_scale_vjp = vd.ad.vjp(graph_scale, wrt=("factor",), outputs=("output",))
+
+
+@dataclass
+class Loss:
+    loss: vd.TensorStorage
 
 
 class RecordingComputePass(vd.ComputePass):
@@ -252,7 +261,10 @@ class CpuExecutionGraphTests(unittest.TestCase):
         self.assertEqual(pullback.resident_tape_bytes, 0)
         self.assertEqual(pullback.allocated_tape_bytes, 0)
         self.assertEqual(pullback.retained_allocation_bytes, retained_primal_bytes)
-        self.assertGreaterEqual(pullback.peak_runtime_managed_bytes, retained_primal_bytes + transaction_bytes)
+        self.assertGreaterEqual(
+            pullback.peak_runtime_managed_bytes,
+            retained_primal_bytes + transaction_bytes,
+        )
 
         graph = make_graph()
         graph.plan_autodiff_checkpoints(memory_budget=minimum_budget)
@@ -274,7 +286,9 @@ class CpuExecutionGraphTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot satisfy the memory budget"):
             graph.compile()
 
-    def test_compile_rejects_foreign_dependencies_and_freezes_compiled_passes(self) -> None:
+    def test_compile_rejects_foreign_dependencies_and_freezes_compiled_passes(
+        self,
+    ) -> None:
         first_graph = vd.ExecutionGraph()
         first_pass = first_graph.add_pass(RecordingComputePass("first", []))
         first_pass.side_effect = True
@@ -304,9 +318,14 @@ class CpuExecutionGraphTests(unittest.TestCase):
         plan.submit().wait()
 
         np.testing.assert_array_equal(output.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
-        self.assertEqual([execution_pass.name for execution_pass in plan.schedule], ["first", "second"])
+        self.assertEqual(
+            [execution_pass.name for execution_pass in plan.schedule],
+            ["first", "second"],
+        )
 
-    def test_parameterized_kernel_invocation_resolves_each_submission_snapshot(self) -> None:
+    def test_parameterized_kernel_invocation_resolves_each_submission_snapshot(
+        self,
+    ) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(4,))
         graph = vd.ExecutionGraph()
@@ -329,7 +348,9 @@ class CpuExecutionGraphTests(unittest.TestCase):
         plan.submit(bindings).wait()
         np.testing.assert_array_equal(output.to_numpy(), np.arange(4, dtype=np.float32) + 5.0)
 
-    def test_parameter_bindings_validate_ownership_and_preserve_unchanged_values(self) -> None:
+    def test_parameter_bindings_validate_ownership_and_preserve_unchanged_values(
+        self,
+    ) -> None:
         graph = vd.ExecutionGraph()
         dynamic = graph.parameter("dynamic")
         constant = graph.parameter("constant")
@@ -408,7 +429,10 @@ class CpuExecutionGraphTests(unittest.TestCase):
         execution_pass = vd.VjpComputePass(
             "square",
             graph_square_vjp,
-            {"source": graph.import_resource(source), "output": graph.import_resource(output)},
+            {
+                "source": graph.import_resource(source),
+                "output": graph.import_resource(output),
+            },
             grid=(1, 1, 1),
         )
         graph.add_pass(execution_pass)
@@ -423,7 +447,9 @@ class CpuExecutionGraphTests(unittest.TestCase):
         forward.assert_not_called()
         np.testing.assert_array_equal(output.to_numpy(), np.array([9.0], dtype=np.float32))
 
-    def test_graph_vjp_composes_multi_pass_chain_and_retains_destroyed_plan(self) -> None:
+    def test_graph_vjp_composes_multi_pass_chain_and_retains_destroyed_plan(
+        self,
+    ) -> None:
         source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         intermediate = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
@@ -556,7 +582,9 @@ class CpuExecutionGraphTests(unittest.TestCase):
                 }
             )
 
-    def test_graph_vjp_returns_multiple_input_gradients_and_backward_submission(self) -> None:
+    def test_graph_vjp_returns_multiple_input_gradients_and_backward_submission(
+        self,
+    ) -> None:
         left = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         right = vd.storage.from_numpy(np.array([5.0], dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
@@ -568,7 +596,11 @@ class CpuExecutionGraphTests(unittest.TestCase):
             vd.VjpComputePass(
                 "product",
                 graph_product_vjp,
-                {"left": left_resource, "right": right_resource, "output": output_resource},
+                {
+                    "left": left_resource,
+                    "right": right_resource,
+                    "output": output_resource,
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -601,7 +633,11 @@ class CpuExecutionGraphTests(unittest.TestCase):
             vd.VjpComputePass(
                 "square-through-product",
                 graph_product_vjp,
-                {"left": source_resource, "right": source_resource, "output": output_resource},
+                {
+                    "left": source_resource,
+                    "right": source_resource,
+                    "output": output_resource,
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -748,7 +784,9 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
         np.testing.assert_array_equal(output.to_numpy(), np.array([13.0], dtype=np.float32))
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32))
 
-    def test_gpu_graph_vjp_allows_unrelated_non_differentiable_compute_pass(self) -> None:
+    def test_gpu_graph_vjp_allows_unrelated_non_differentiable_compute_pass(
+        self,
+    ) -> None:
         unrelated_source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
         unrelated_output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
@@ -756,7 +794,8 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
         graph = vd.ExecutionGraph()
         graph.add_pass(
             InvocationComputePass(
-                "unrelated", cast(Any, graph_increment).invocation(unrelated_output, unrelated_source)
+                "unrelated",
+                cast(Any, graph_increment).invocation(unrelated_output, unrelated_source),
             )
         )
         source_resource = graph.differentiable_input("source", source)
@@ -764,7 +803,10 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
             vd.VjpComputePass(
                 "square",
                 graph_square_vjp,
-                {"source": source_resource, "output": graph.objective("output", output)},
+                {
+                    "source": source_resource,
+                    "output": graph.objective("output", output),
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -784,7 +826,10 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
             vd.VjpComputePass(
                 "square",
                 graph_square_vjp,
-                {"source": source_resource, "output": graph.objective("square", square)},
+                {
+                    "source": source_resource,
+                    "output": graph.objective("square", square),
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -829,6 +874,47 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
         np.testing.assert_array_equal(gradient["velocity"].to_numpy(), np.array([[4.0, -6.0]], dtype=np.float32))
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
 
+    def test_gpu_module_vjp_preserves_structured_storage_gradients(self) -> None:
+        vd.init(arch=vd.cpu)
+
+        class Module(vd.Module):
+            def __init__(self):
+                super().__init__()
+
+            def forward(self, particles: vd.TensorStorage) -> Loss:
+                loss = vd.zeros(dtype=vd.f32, shape=(1,))
+                graph_aggregate_storage_objective(particles, loss, grid=(1, 1, 1))
+                return Loss(loss)
+
+        particles = vd.storage.zeros(dtype=GraphParticle, shape=(1,))
+        values = particles.to_numpy()
+        values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float16)
+        values["mass"][0] = np.float32(4.0)
+        particles.copy_from_numpy(values)
+        for wrt in (
+            ("particles.velocity", "particles.mass"),
+            ("particles",),
+        ):
+            with self.subTest(wrt=wrt):
+                _, pullback = vd.ad.vjp(
+                    Module(),
+                    wrt=wrt,
+                    outputs=("loss",),
+                )(particles)
+                gradient = pullback(
+                    {
+                        "loss": np.array([1.0], dtype=np.float32),
+                    }
+                )
+                np.testing.assert_array_equal(
+                    gradient["particles"]["velocity"].to_numpy(),
+                    np.array([[4.0, -6.0]], dtype=np.float32),
+                )
+                np.testing.assert_array_equal(
+                    gradient["particles"]["mass"].to_numpy(),
+                    np.array([8.0], dtype=np.float32),
+                )
+
     def test_gpu_graph_vjp_rejects_unlowered_aggregate_fan_in(self) -> None:
         particles = vd.storage.zeros(dtype=GraphParticle, shape=(1,))
         values = particles.to_numpy()
@@ -843,7 +929,10 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
             vd.VjpComputePass(
                 "first",
                 graph_aggregate_storage_objective_vjp,
-                {"particles": particles_resource, "loss": graph.objective("first_loss", first_loss)},
+                {
+                    "particles": particles_resource,
+                    "loss": graph.objective("first_loss", first_loss),
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -851,7 +940,10 @@ class GpuExecutionGraphAutodiffTests(unittest.TestCase):
             vd.VjpComputePass(
                 "second",
                 graph_aggregate_storage_objective_vjp,
-                {"particles": particles_resource, "loss": graph.objective("second_loss", second_loss)},
+                {
+                    "particles": particles_resource,
+                    "loss": graph.objective("second_loss", second_loss),
+                },
                 grid=(1, 1, 1),
             )
         )
@@ -889,7 +981,10 @@ class ExecutionGraphTests(unittest.TestCase):
         plan = graph.compile()
         plan.submit().wait()
 
-        self.assertEqual([execution_pass.name for execution_pass in plan.schedule], ["producer", "consumer"])
+        self.assertEqual(
+            [execution_pass.name for execution_pass in plan.schedule],
+            ["producer", "consumer"],
+        )
         self.assertEqual(events, ["producer", "consumer"])
         self.assertEqual(len(plan.scopes[1].barriers), 1)
 
@@ -897,7 +992,10 @@ class ExecutionGraphTests(unittest.TestCase):
         graph = vd.ExecutionGraph()
         events: list[str] = []
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=(8, 8)).attach_color(0, cast(Any, color)).attach_depth()
+        target = vd.RenderTarget.from_attachments(
+            colors={0: cast(Any, color)},
+            depth=vd.Texture.device(shape=color.shape, format=vd.d32_float),
+        )
         depth = target.depth_texture
         writer = RecordingRenderPass("shadow", events, target)
         reader = RecordingComputePass("sample", events, read=depth)
@@ -907,7 +1005,10 @@ class ExecutionGraphTests(unittest.TestCase):
 
         plan = graph.compile()
 
-        self.assertEqual([execution_pass.name for execution_pass in plan.schedule], ["shadow", "sample"])
+        self.assertEqual(
+            [execution_pass.name for execution_pass in plan.schedule],
+            ["shadow", "sample"],
+        )
         self.assertEqual(len(plan.scopes[1].barriers), 1)
 
     def test_texture_views_track_disjoint_mips_without_false_barriers(self) -> None:
@@ -967,7 +1068,7 @@ class ExecutionGraphTests(unittest.TestCase):
         graph = vd.ExecutionGraph()
         events: list[str] = []
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
+        target = vd.RenderTarget.from_attachments(colors={0: cast(Any, color)})
         graph.add_pass(RecordingRenderPass("first", events, target))
         graph.add_pass(RecordingRenderPass("second", events, target))
         compute = RecordingComputePass("compute", events)
@@ -977,12 +1078,15 @@ class ExecutionGraphTests(unittest.TestCase):
         plan = graph.compile()
 
         self.assertEqual([scope.kind for scope in plan.scopes], ["render", "compute"])
-        self.assertEqual([execution_pass.name for execution_pass in plan.scopes[0].passes], ["first", "second"])
+        self.assertEqual(
+            [execution_pass.name for execution_pass in plan.scopes[0].passes],
+            ["first", "second"],
+        )
 
     def test_no_merge_splits_matching_render_targets(self) -> None:
         graph = vd.ExecutionGraph()
         color = vd.Texture.zeros(shape=(8, 8))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
+        target = vd.RenderTarget.from_attachments(colors={0: cast(Any, color)})
         first = RecordingRenderPass("first", [], target)
         second = RecordingRenderPass("second", [], target)
         second.no_merge = True
@@ -1014,7 +1118,7 @@ class ExecutionGraphTests(unittest.TestCase):
     def test_unified_pipeline_invocation_checks_encoder_kind(self) -> None:
         invocation = vd.PipelineInvocation("compute", lambda encoder, resources: None)
         color = vd.Texture.zeros(shape=(4, 4))
-        target = vd.RenderTarget(shape=color.shape).attach_color(0, cast(Any, color))
+        target = vd.RenderTarget.from_attachments(colors={0: cast(Any, color)})
         render_pass = RecordingRenderPass("render", [], target, invocation)
         graph = vd.ExecutionGraph()
         graph.add_pass(render_pass)

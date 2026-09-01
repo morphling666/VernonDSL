@@ -452,6 +452,71 @@ struct LogicalResource {
 
 } // namespace
 
+std::optional<size_t> resolveProgramValueLeafIndex(const llvm::json::Object &layout, llvm::StringRef source,
+                                                   llvm::StringRef parameter) {
+    const llvm::json::Array *leaves = layout.getArray("leaves");
+    if (!leaves || source.empty())
+        return std::nullopt;
+    for (auto [leafIndex, leafValue] : llvm::enumerate(*leaves)) {
+        const llvm::json::Object *leaf = leafValue.getAsObject();
+        const llvm::json::Array *path = leaf ? leaf->getArray("path") : nullptr;
+        if (!path || path->empty())
+            continue;
+        std::string canonical = source.str();
+        for (const llvm::json::Value &component : *path) {
+            canonical.push_back('.');
+            if (std::optional<llvm::StringRef> field = component.getAsString())
+                canonical += *field;
+            else if (std::optional<int64_t> index = component.getAsInteger())
+                canonical += std::to_string(*index);
+            else
+                return std::nullopt;
+        }
+        if (parameter == canonical)
+            return leafIndex;
+    }
+    return std::nullopt;
+}
+
+static void annotateProgramValueLeafProjections(const llvm::json::Object &execution, llvm::json::Array &bindings) {
+    const llvm::json::Array *values = execution.getArray("values");
+    if (!values)
+        return;
+    for (llvm::json::Value &bindingValue : bindings) {
+        llvm::json::Object *binding = bindingValue.getAsObject();
+        const std::optional<llvm::StringRef> role = binding ? binding->getString("autodiff_role") : std::nullopt;
+        const std::optional<llvm::StringRef> source = binding ? binding->getString("autodiff_source") : std::nullopt;
+        const std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
+        const std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
+        if (!binding || (role != "gradient" && role != "cotangent") || !source || !parameter || !valueId ||
+            *valueId < 0 || static_cast<size_t>(*valueId) >= values->size())
+            continue;
+        const llvm::json::Object *value = (*values)[*valueId].getAsObject();
+        const llvm::json::Object *layout = value ? value->getObject("value_layout") : nullptr;
+        if (!layout)
+            continue;
+        if (const std::optional<size_t> leaf = resolveProgramValueLeafIndex(*layout, *source, *parameter))
+            (*binding)["leaf"] = static_cast<int64_t>(*leaf);
+    }
+}
+
+static void copyProgramValueLeafProjections(const llvm::json::Array &source, llvm::json::Array &destination) {
+    for (llvm::json::Value &destinationValue : destination) {
+        llvm::json::Object *binding = destinationValue.getAsObject();
+        const std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
+        const std::optional<int64_t> value = binding ? binding->getInteger("value") : std::nullopt;
+        if (!binding || !parameter || !value)
+            continue;
+        const auto projected = llvm::find_if(source, [&](const llvm::json::Value &sourceValue) {
+            const llvm::json::Object *candidate = sourceValue.getAsObject();
+            return candidate && candidate->getString("parameter") == parameter &&
+                   candidate->getInteger("value") == value && candidate->getInteger("leaf");
+        });
+        if (projected != source.end())
+            (*binding)["leaf"] = *projected->getAsObject()->getInteger("leaf");
+    }
+}
+
 bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json::Object &request,
                                        const llvm::json::Object &compiledEntry, std::string &error) {
     llvm::json::Array *requestBindings = request.getArray("bindings");
@@ -553,6 +618,7 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
             return false;
         }
     }
+    annotateProgramValueLeafProjections(execution, *requestBindings);
     for (const InterfaceValue &value : interface)
         if (!value.role.empty() && !matched.count(value.name)) {
             error = "compiled kernel ABI requires unmapped Program value '" + value.name + "'";
@@ -598,6 +664,7 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
         if (value)
             boundValues.insert(*value);
     }
+    copyProgramValueLeafProjections(*requestBindings, *nodeBindings);
     if (llvm::json::Array *grid = node->getArray("grid"))
         for (const llvm::json::Value &componentValue : *grid)
             if (const llvm::json::Object *component = componentValue.getAsObject())
@@ -1836,7 +1903,29 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     !opaqueResourceEndpoint && logicalValue && wholeLayout && logicalLayout && logicalShape &&
                     wholeLayout->getString("layout_hash") == logicalLayout->getString("layout_hash") &&
                     compatibleAbiShape(logicalShape, physicalShape ? physicalShape : logicalShape);
-                if (!opaqueMatches && !byteValueMatches) {
+                bool projectedLeafMatches = false;
+                const llvm::json::Array *logicalLeaves = logicalLayout ? logicalLayout->getArray("leaves") : nullptr;
+                const llvm::json::Array *physicalLeaves = wholeLayout ? wholeLayout->getArray("leaves") : nullptr;
+                const llvm::json::Object *physicalLeaf =
+                    physicalLeaves && physicalLeaves->size() == 1 ? (*physicalLeaves)[0].getAsObject() : nullptr;
+                std::optional<size_t> projectedLeafIndex;
+                const std::optional<llvm::StringRef> autodiffSource = row.getString("vernon.autodiff_source");
+                if (!opaqueResourceEndpoint && source && autodiffSource && logicalLayout && logicalLeaves &&
+                    physicalLeaf && logicalShape &&
+                    compatibleAbiShape(logicalShape, physicalShape ? physicalShape : logicalShape)) {
+                    projectedLeafIndex = resolveProgramValueLeafIndex(*logicalLayout, *autodiffSource, *source);
+                    const llvm::json::Object *projectedLeaf =
+                        projectedLeafIndex && *projectedLeafIndex < logicalLeaves->size()
+                            ? (*logicalLeaves)[*projectedLeafIndex].getAsObject()
+                            : nullptr;
+                    projectedLeafMatches =
+                        projectedLeaf && projectedLeaf->getString("dtype") == physicalLeaf->getString("dtype") &&
+                        projectedLeaf->getInteger("scalar_count") == physicalLeaf->getInteger("scalar_count") &&
+                        compatibleAbiShape(projectedLeaf->getArray("shape"), physicalLeaf->getArray("shape"));
+                    if (!projectedLeafMatches)
+                        projectedLeafIndex.reset();
+                }
+                if (!opaqueMatches && !byteValueMatches && !projectedLeafMatches) {
                     error = "compiled compute endpoint layout/type/shape does not match logical value '" +
                             source->str() + "'";
                     return false;
@@ -1892,7 +1981,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                         if (const llvm::json::Object *leaf = (*leaves)[leafIndex].getAsObject())
                             if (std::optional<int64_t> slot = leaf->getInteger("binding"))
                                 abi.emplace_back(llvm::json::Object{
-                                    {"semantic", llvm::json::Object{{"storage_leaf", static_cast<int64_t>(leafIndex)}}},
+                                    {"semantic", llvm::json::Object{{"storage_leaf",
+                                                                     static_cast<int64_t>(
+                                                                         projectedLeafIndex.value_or(0) + leafIndex)}}},
                                     {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}}});
                 if (descriptor) {
                     const int64_t rank = descriptor->getInteger("rank").value_or(0);
@@ -1983,11 +2074,14 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                                                                  {"after", *resourceIt->second.after},
                                                                  {"access", resourceIt->second.access}});
                 }
-                endpointBindings.emplace_back(llvm::json::Object{{"module", "compute"},
-                                                                 {"interface", interfaceKind.str()},
-                                                                 {"index", endpointIndex},
-                                                                 {"tag", "resource"},
-                                                                 {"access", accessIndex}});
+                llvm::json::Object endpointBinding{{"module", "compute"},
+                                                   {"interface", interfaceKind.str()},
+                                                   {"index", endpointIndex},
+                                                   {"tag", "resource"},
+                                                   {"access", accessIndex}};
+                if (projectedLeafIndex)
+                    endpointBinding["leaf"] = static_cast<int64_t>(*projectedLeafIndex);
+                endpointBindings.emplace_back(std::move(endpointBinding));
                 implementationEndpoints.emplace_back(compiledEndpointAbi(row, "compute", endpointIndex));
                 return true;
             };

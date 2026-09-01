@@ -92,6 +92,39 @@ FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module, StringRef 
     return getAutodiffDerivativeValueType(type, module);
 }
 
+std::string appendValueAbiPath(StringRef root, ArrayRef<ValueAbiPathComponent> path) {
+    std::string result = root.str();
+    for (const ValueAbiPathComponent &component : path) {
+        if (!result.empty())
+            result.push_back('.');
+        if (component.field)
+            result.append(*component.field);
+        else
+            result.append(std::to_string(component.index));
+    }
+    return result;
+}
+
+FailureOr<SmallVector<StringRef>> getAutodiffDerivativeLogicalLeafDtypes(Type primalType, ModuleOp module,
+                                                                         ArrayRef<StringRef> logicalLeafDtypes) {
+    Type layoutType = primalType;
+    if (auto view = dyn_cast<TensorViewType>(layoutType))
+        layoutType = view.getElementType();
+    else if (auto tensor = dyn_cast<TensorType>(layoutType))
+        layoutType = tensor.getElementType();
+    else if (auto tensor = dyn_cast<RankedTensorType>(layoutType))
+        layoutType = tensor.getElementType();
+
+    FailureOr<ValueAbiLayout> primal = getValueStorageLayout(layoutType, module);
+    if (failed(primal) || (!logicalLeafDtypes.empty() && logicalLeafDtypes.size() != primal->leaves.size()))
+        return failure();
+    SmallVector<StringRef> projected;
+    for (auto [index, leaf] : llvm::enumerate(primal->leaves))
+        if (succeeded(getAutodiffDerivativeScalarType(leaf.scalarType)) && !logicalLeafDtypes.empty())
+            projected.push_back(logicalLeafDtypes[index]);
+    return projected;
+}
+
 FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type derivativeType, ModuleOp module,
                                                            ArrayRef<StringRef> logicalLeafDtypes) {
     SmallVector<uint64_t> outerShape;
@@ -121,16 +154,22 @@ FailureOr<ValueAbiLayout> getAutodiffDerivativeValueLayout(Type primalType, Type
     }
     FailureOr<ValueAbiLayout> primal = getValueStorageLayout(primalLayoutType, module);
     FailureOr<ValueAbiLayout> derivative = getValueAbiLayout(derivativeLayoutType, module, logicalLeafDtypes);
-    if (failed(primal) || failed(derivative) || primal->leaves.size() != derivative->leaves.size())
+    if (failed(primal) || failed(derivative))
         return failure();
-    for (auto [primalLeaf, derivativeLeaf] : llvm::zip_equal(primal->leaves, derivative->leaves)) {
+    SmallVector<const ValueAbiLeaf *> differentiablePrimalLeaves;
+    for (const ValueAbiLeaf &leaf : primal->leaves)
+        if (succeeded(getAutodiffDerivativeScalarType(leaf.scalarType)))
+            differentiablePrimalLeaves.push_back(&leaf);
+    if (differentiablePrimalLeaves.size() != derivative->leaves.size())
+        return failure();
+    for (auto [primalLeaf, derivativeLeaf] : llvm::zip_equal(differentiablePrimalLeaves, derivative->leaves)) {
         SmallVector<uint64_t> expectedShape;
         if (derivativeLeavesCarryOuterShape)
             expectedShape = outerShape;
-        llvm::append_range(expectedShape, primalLeaf.shape);
+        llvm::append_range(expectedShape, primalLeaf->shape);
         if (expectedShape != derivativeLeaf.shape)
             return failure();
-        derivativeLeaf.path = primalLeaf.path;
+        derivativeLeaf.path = primalLeaf->path;
     }
     return std::move(*derivative);
 }

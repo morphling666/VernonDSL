@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from ..resources import TensorStorage, TensorView
+from ..tensor import TensorStorage, TensorView
 from ._indexing import element_token, linear_index_prelude, linear_index_target, view_shape_annotation
 from ._kernel_cache import load_generated_kernel
 from ._types import ImplementationUnavailable, as_view, scalar_name

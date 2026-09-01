@@ -3,7 +3,6 @@ from __future__ import annotations
 import ast
 import atexit
 import hashlib
-import importlib
 import inspect
 import json
 import tempfile
@@ -13,14 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
-import numpy as np
-
+from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from ..bundle import canonical_json, make_target_options, parse_reflection_json
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
+from .binding import _DispatchBorrowLease, _NativeBindingCache
 from .execution_graph import (
     ComputeEncoder,
     ComputePass,
@@ -28,17 +27,9 @@ from .execution_graph import (
     ExecutionResources,
     PipelineInvocation,
 )
-from .resources import (
-    TensorStorage,
-    TensorView,
-    _DispatchBorrowLease,
-    _NativeBindingCache,
-    _TextureResource,
-)
-
-
-def _session_state() -> Any:
-    return importlib.import_module("vernon_dsl._runtime.session")
+from .resource_common import _session_state
+from .tensor import TensorStorage, TensorView
+from .texture import _TextureResource
 
 
 @dataclass(frozen=True)
@@ -269,14 +260,6 @@ class Kernel:
         if entry is None:
             raise RuntimeError("compiled kernel has no typed entry function")
         typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
-        scalar_dtypes = {
-            "bool": np.dtype(np.bool_),
-            "i32": np.dtype(np.int32),
-            "u32": np.dtype(np.uint32),
-            "f16": np.dtype(np.float16),
-            "f32": np.dtype(np.float32),
-            "f64": np.dtype(np.float64),
-        }
         access_compatibility = {
             "read": {"read", "read_write"},
             "write": {"write", "read_write"},
@@ -376,7 +359,7 @@ class Kernel:
                         f"kernel TensorView argument {name!r} dimension {dimension} is {actual}, expected {expected}"
                     )
             if element.kind == "scalar":
-                matches_element = value.dtype == scalar_dtypes[element.name]
+                matches_element = value.dtype == NUMPY_DTYPE_BY_SCALAR[element.name]
             else:
                 matches_element = runtime_signature(value.element_type) == dsl_signature(element)
             if not matches_element:

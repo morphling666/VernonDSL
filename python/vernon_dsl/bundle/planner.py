@@ -16,6 +16,7 @@ from .parameters import (
     internal_parameters,
     merge_internal_parameter_uses,
     merge_parameter_uses,
+    merge_program_value_uses,
     reflected_parameters,
     validate_graphics_interfaces,
 )
@@ -262,6 +263,7 @@ def build_program_bundle_plan(
             raise PipelineCompileError("Program implementation stages do not match its graph: " + "; ".join(detail))
         program: dict[str, str] = {}
         records: dict[str, dict[str, Any]] = {}
+        program_leaf_projections: dict[tuple[str, int], int] = {}
         for name, stage in stages.items():
             expected = referenced[name]
             if stage.stage != expected:
@@ -282,7 +284,7 @@ def build_program_bundle_plan(
             if not isinstance(raw_bindings, list):
                 raise PipelineCompileError(f"Program stage {name!r} has no value bindings")
             bindings = {
-                binding["parameter"]: binding["value"]
+                binding["parameter"]: binding
                 for binding in raw_bindings
                 if isinstance(binding, Mapping)
                 and isinstance(binding.get("parameter"), str)
@@ -292,11 +294,21 @@ def build_program_bundle_plan(
                 if not isinstance(row, dict):
                     continue
                 parameter = row.get("vernon.source_name")
-                value_id = bindings.get(parameter)
-                if value_id is None and row.get("vernon.autodiff_role") == "cotangent":
-                    value_id = bindings.get(f"cotangent.{parameter}")
+                binding = bindings.get(parameter)
+                if binding is None and row.get("vernon.autodiff_role") == "cotangent":
+                    binding = bindings.get(f"cotangent.{parameter}")
+                value_id = binding.get("value") if binding is not None else None
                 value = values_by_id.get(value_id)
                 if value is not None:
+                    endpoint = row.get("index")
+                    if isinstance(parameter, str) and isinstance(endpoint, int):
+                        leaf = binding.get("leaf") if binding is not None else None
+                        if leaf is not None:
+                            if not isinstance(leaf, int) or leaf < 0:
+                                raise PipelineCompileError(
+                                    f"Program stage {name!r} parameter {parameter!r} has an invalid leaf projection"
+                                )
+                            program_leaf_projections[(name, endpoint)] = leaf
                     row["vernon.source_name"] = value["name"]
             records[name] = {
                 "id": stage.id,
@@ -347,6 +359,22 @@ def build_program_bundle_plan(
             if "value_layout" in parameter:
                 parameter["element_layout"] = parameter.pop("value_layout")
 
+        def leaf_projections_for(
+            uses: Sequence[Mapping[str, Any]],
+            *,
+            program_leaf_projections: Mapping[tuple[str, int], int] = program_leaf_projections,
+        ) -> list[int | None]:
+            projections: list[int | None] = []
+            for use in uses:
+                stage = use.get("stage")
+                index = use.get("index")
+                projections.append(
+                    program_leaf_projections.get((stage, index))
+                    if isinstance(stage, str) and isinstance(index, int)
+                    else None
+                )
+            return projections
+
         external_rows: list[dict[str, Any]] = []
         internal_rows: list[dict[str, Any]] = []
         for slot, name in enumerate(
@@ -355,7 +383,13 @@ def build_program_bundle_plan(
                 key=lambda candidate: value_ids_by_name[candidate],
             )
         ):
-            parameter = merge_parameter_uses(name, reflected_external[name])
+            uses = reflected_external[name]
+            parameter = merge_program_value_uses(
+                name,
+                uses,
+                values_by_id.get(value_ids_by_name.get(name, -1)),
+                leaf_projections_for(uses),
+            )
             parameter["slot"] = slot
             preserve_released_tensor_layout(name, parameter)
             if canonical_execution:
@@ -365,7 +399,13 @@ def build_program_bundle_plan(
             (name for name in reflected_external if value_ids_by_name.get(name) not in boundary_ids),
             key=lambda candidate: value_ids_by_name[candidate],
         ):
-            parameter = merge_parameter_uses(name, reflected_external[name])
+            uses = reflected_external[name]
+            parameter = merge_program_value_uses(
+                name,
+                uses,
+                values_by_id.get(value_ids_by_name.get(name, -1)),
+                leaf_projections_for(uses),
+            )
             parameter["source"] = "program_value"
             preserve_released_tensor_layout(name, parameter)
             if canonical_execution:

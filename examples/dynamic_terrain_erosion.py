@@ -275,10 +275,16 @@ def main() -> None:
     stage_materials = vd.storage.from_numpy(stage[3])
 
     output = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output).attach_depth()
+    target = vd.RenderTarget.from_attachments(
+        colors={0: output},
+        depth=vd.Texture.device(shape=output.shape, format=vd.d32_float),
+    )
     shadow_size = args.size * 2
     shadow_color = vd.Texture.zeros(shape=(shadow_size, shadow_size))
-    shadow_target = vd.RenderTarget(shape=shadow_color.shape).attach_color(0, shadow_color).attach_depth()
+    shadow_target = vd.RenderTarget.from_attachments(
+        colors={0: shadow_color},
+        depth=vd.Texture.device(shape=shadow_color.shape, format=vd.d32_float),
+    )
     shadow_map = shadow_target.depth_texture
     shadow_sampler = vd.sampler(address="clamp_to_edge")
     environment_map = load_equirectangular_environment(

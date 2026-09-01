@@ -92,7 +92,7 @@ def main() -> None:
     draw_offset = vd.storage.from_numpy(np.zeros((2,), dtype=np.float32))
     color = vd.storage.from_numpy(np.array((0.1, 0.65, 1.0, 1.0), dtype=np.float32))
     output = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
+    target = vd.RenderTarget.from_attachments(colors={0: output})
     render = vd.pipeline(vertex_main, fragment_main)
 
     frame = 0

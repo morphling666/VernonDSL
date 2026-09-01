@@ -149,6 +149,8 @@ struct VernonPipelineTopology {
     std::vector<VernonResolvedProgramStage> stages;
     std::unordered_map<std::string, size_t> stageIndices;
     std::optional<VernonDifferentiatedPipeline> differentiated;
+    std::optional<uint64_t> programCheckpointMemoryBudget;
+    std::string programCheckpointPolicy;
 };
 
 inline VernonLoadedPipeline::VernonLoadedPipeline(VernonLoadedPipeline &&) noexcept = default;

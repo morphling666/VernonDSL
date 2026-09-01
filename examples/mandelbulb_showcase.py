@@ -40,7 +40,7 @@ def main() -> None:
     )
     positions = create_fullscreen_triangle()
     output = vd.Texture.zeros(shape=(options.size, options.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
+    target = vd.RenderTarget.from_attachments(colors={0: output})
     render_mandelbulb = vd.pipeline(fullscreen_vertex, mandelbulb_fragment)
     quality = {
         "smoke": (np.int32(48), np.int32(9), np.int32(12)),

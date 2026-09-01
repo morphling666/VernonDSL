@@ -1,23 +1,24 @@
 from __future__ import annotations
 
+import copy
 from typing import Any, Mapping, Sequence
 
+from .._mlir import ranked_tensor_parts
 from .types import PipelineCompileError
 
 
 def dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
     if not isinstance(type_name, str):
         return None, []
-    if not type_name.startswith("tensor<") or not type_name.endswith(">"):
+    tensor = ranked_tensor_parts(type_name)
+    if tensor is None:
         return type_name, []
-    parts = type_name[7:-1].split("x")
-    if not parts:
-        return None, []
+    shape, dtype = tensor
     try:
-        shape = [0 if dimension == "?" else int(dimension) for dimension in parts[:-1]]
+        extents = [0 if dimension == "?" else int(dimension) for dimension in shape]
     except ValueError:
         raise PipelineCompileError(f"invalid reflected tensor type {type_name!r}") from None
-    return parts[-1], shape
+    return dtype, extents
 
 
 def _backend_name(name: str) -> str:
@@ -218,6 +219,64 @@ def classify_parameter_use(use: Mapping[str, Any]) -> str:
     if kind in {"image", "sampler"}:
         return str(kind)
     return "tensor"
+
+
+def merge_program_value_uses(
+    name: str,
+    uses: Sequence[Mapping[str, Any]],
+    value: Mapping[str, Any] | None,
+    projections: Sequence[int | None],
+) -> dict[str, Any]:
+    if len(uses) != len(projections):
+        raise PipelineCompileError(f"Program value {name!r} has inconsistent endpoint bindings")
+    canonical = value.get("value_layout") if value is not None else None
+    owner_shape = value.get("shape") if value is not None else None
+    value_type = value.get("type") if value is not None else None
+    if not isinstance(canonical, Mapping) or not isinstance(owner_shape, list) or not isinstance(value_type, str):
+        return merge_parameter_uses(name, uses)
+    canonical_leaves = canonical.get("leaves")
+    if not isinstance(canonical_leaves, list):
+        raise PipelineCompileError(f"Program value {name!r} has no canonical ABI leaves")
+
+    if not any(projection is not None for projection in projections):
+        return merge_parameter_uses(name, uses)
+
+    physical_uses = [dict(use) for use in uses]
+    normalized_uses: list[dict[str, Any]] = []
+    for physical, projection in zip(physical_uses, projections, strict=True):
+        layout = physical.get("value_layout", physical.get("element_layout"))
+        if not isinstance(layout, Mapping):
+            raise PipelineCompileError(f"Program value {name!r} has a physical use without ABI leaves")
+        leaves = layout.get("leaves")
+        if not isinstance(leaves, list):
+            raise PipelineCompileError(f"Program value {name!r} has a physical use without ABI leaves")
+        full_value = (
+            len(leaves) == len(canonical_leaves)
+            and layout.get("layout_hash") == canonical.get("layout_hash")
+            and physical.get("shape", []) == owner_shape
+        )
+        projected_leaf_matches = False
+        if projection is not None and projection < len(canonical_leaves) and len(leaves) == 1:
+            projected_leaf = canonical_leaves[projection]
+            physical_leaf = leaves[0]
+            if isinstance(projected_leaf, Mapping) and isinstance(physical_leaf, Mapping):
+                projected_leaf_matches = (
+                    projected_leaf.get("dtype") == physical_leaf.get("dtype")
+                    and projected_leaf.get("scalar_count") == physical_leaf.get("scalar_count")
+                    and [*owner_shape, *projected_leaf.get("shape", [])]
+                    == [*physical.get("shape", []), *physical_leaf.get("shape", [])]
+                )
+        if not full_value and not projected_leaf_matches:
+            raise PipelineCompileError(f"Program value {name!r} has an incompatible aggregate leaf use")
+        normalized = dict(physical)
+        normalized["type"] = value_type
+        normalized["shape"] = list(owner_shape)
+        normalized.pop("element_layout", None)
+        normalized["value_layout"] = copy.deepcopy(canonical)
+        normalized_uses.append(normalized)
+    parameter = merge_parameter_uses(name, normalized_uses)
+    parameter["uses"] = physical_uses
+    return parameter
 
 
 def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

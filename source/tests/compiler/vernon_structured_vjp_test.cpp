@@ -316,6 +316,74 @@ TEST_F(VernonStructuredVjpTest, AutodiffDerivativeValueLayoutUsesPhysicalPayload
     EXPECT_NE(physicalF16->layoutHash, promoted->layoutHash);
 }
 
+TEST_F(VernonStructuredVjpTest, AggregateDerivativeProjectsDifferentiableLeafAbi) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  "vernon.struct"() {
+    sym_name = "Particle",
+    fields = ["velocity:tensor<2xf32>", "mass:f32", "tag:i32"],
+    abi_leaf_dtypes = ["f32", "f32", "i32"]
+  } : () -> ()
+  func.func @primal(
+      %particles: !vernon.tensor_view<!vernon.struct<"Particle">, [1], "read", "device">
+          {vernon.source_name = "particles",
+           vernon.abi_leaf_dtypes = ["f32", "f32", "i32"]}) {
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+    FailureOr<Type> derivative = getAutodiffDerivativeType(primal.getArgument(0).getType(), *module, "write");
+    ASSERT_TRUE(succeeded(derivative));
+    FailureOr<SmallVector<StringRef>> dtypes =
+        getAutodiffDerivativeLogicalLeafDtypes(primal.getArgument(0).getType(), *module, {"f32", "f32", "i32"});
+    ASSERT_TRUE(succeeded(dtypes));
+    EXPECT_EQ(*dtypes, SmallVector<StringRef>({"f32", "f32"}));
+
+    FailureOr<ValueAbiLayout> layout =
+        getAutodiffDerivativeValueLayout(primal.getArgument(0).getType(), *derivative, *module, *dtypes);
+    ASSERT_TRUE(succeeded(layout));
+    ASSERT_EQ(layout->leaves.size(), 2u);
+    ASSERT_EQ(layout->leaves[0].path.size(), 1u);
+    ASSERT_EQ(layout->leaves[1].path.size(), 1u);
+    EXPECT_EQ(*layout->leaves[0].path[0].field, "velocity");
+    EXPECT_EQ(*layout->leaves[1].path[0].field, "mass");
+    EXPECT_EQ(layout->leaves[0].dtype, "f32");
+    EXPECT_EQ(layout->leaves[1].dtype, "f32");
+}
+
+TEST_F(VernonStructuredVjpTest, ProgramVjpGroupsAggregateWrtPathsByBoundary) {
+    OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
+        R"mlir(
+module {
+  "vernon.struct"() {
+    sym_name = "Particle",
+    fields = ["velocity:tensor<2xf32>", "mass:f32", "tag:i32"]
+  } : () -> ()
+  func.func @primal(
+      %particles: !vernon.tensor_view<!vernon.struct<"Particle">, [1], "read", "device">
+          {vernon.source_name = "particles"}) {
+    func.return
+  }
+}
+)mlir",
+        ParserConfig(&context));
+    ASSERT_TRUE(module);
+    auto primal = module->lookupSymbol<func::FuncOp>("primal");
+
+    FailureOr<SmallVector<unsigned>> fields =
+        program::resolveProgramWrtBoundaryIndices(primal, {"particles.velocity", "particles.mass"});
+    ASSERT_TRUE(succeeded(fields));
+    EXPECT_EQ(*fields, SmallVector<unsigned>({0}));
+    FailureOr<SmallVector<unsigned>> root = program::resolveProgramWrtBoundaryIndices(primal, {"particles"});
+    ASSERT_TRUE(succeeded(root));
+    EXPECT_EQ(*root, SmallVector<unsigned>({0}));
+    EXPECT_TRUE(failed(program::resolveProgramWrtBoundaryIndices(primal, {"particles.tag"})));
+}
+
 TEST_F(VernonStructuredVjpTest, ProgramVjpMaterializesFanInAccumulation) {
     OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(
         R"mlir(

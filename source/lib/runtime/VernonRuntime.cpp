@@ -2,11 +2,14 @@
 #include "VernonExecutionGraph.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
+#include "runtime/autodiff/tape_allocator_abi.h"
+#include "runtime/backend_cpu.h"
 #include "runtime/compute_launch_planner.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime/program_manifest.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
 #include "runtime/tensor_bridge.h"
@@ -790,20 +793,22 @@ bool resolvePipelineTopology(VernonPipelineBundle &bundle, const Variant &varian
                 const size_t aliases = static_cast<size_t>(
                     std::count_if(stageUses.begin(), stageUses.end(),
                                   [&](const StageUse &candidate) { return candidate.owner == stageUse.owner; }));
-                std::optional<size_t> leaf;
-                if (aliases > 1) {
-                    const size_t leafIndex = static_cast<size_t>(
+                const bool explicitLeaf = binding->leaf.has_value();
+                std::optional<size_t> leaf =
+                    binding->leaf ? std::optional<size_t>(static_cast<size_t>(*binding->leaf)) : std::nullopt;
+                if (!leaf && aliases > 1)
+                    leaf = static_cast<size_t>(
                         std::count_if(stageUses.begin(), stageUses.begin() + static_cast<std::ptrdiff_t>(index),
                                       [&](const StageUse &candidate) { return candidate.owner == stageUse.owner; }));
+                if (leaf) {
                     const ProgramValueSlot &slot = topology->execution.values[binding->value];
-                    if (!slot.valueLayout || slot.valueLayout->leaves.size() != aliases ||
-                        leafIndex >= slot.valueLayout->leaves.size() ||
-                        slot.valueLayout->leaves[leafIndex].shape != stageUse.use->shape) {
+                    if (!slot.valueLayout || (!explicitLeaf && slot.valueLayout->leaves.size() != aliases) ||
+                        *leaf >= slot.valueLayout->leaves.size() ||
+                        slot.valueLayout->leaves[*leaf].shape != stageUse.use->shape) {
                         fail(bundle.context,
                              "Program node '" + node.name + "' aggregate leaf ABI does not match its root value");
                         return false;
                     }
-                    leaf = leafIndex;
                 }
                 resolvedBindings.push_back(VernonProgramStageBinding{binding->value, leaf});
             }
@@ -1059,9 +1064,10 @@ public:
     PipelineComputePass(const ProgramNode &node, VernonLoadedPipeline &pipeline,
                         std::vector<VernonPipelineArgument> arguments,
                         std::vector<std::vector<int64_t>> argumentStrides,
-                        const std::vector<vernon::execution::GraphBuffer> &resources)
+                        const std::vector<vernon::execution::GraphBuffer> &resources,
+                        const std::vector<VernonPipelineArgument> *arena, const ExecutableProgram *execution)
         : ComputePass(node.name), node_(node), pipeline_(pipeline), arguments_(std::move(arguments)),
-          argumentStrides_(std::move(argumentStrides)), resources_(resources) {}
+          argumentStrides_(std::move(argumentStrides)), resources_(resources), arena_(arena), execution_(execution) {}
 
     void declare() override {
         for (const ProgramResourceUse &use : node_.resources) {
@@ -1084,12 +1090,62 @@ public:
         invocation.argument_count = arguments_.size();
         invocation.compute_grid = {static_cast<uint32_t>(node_.grid[0]), static_cast<uint32_t>(node_.grid[1]),
                                    static_cast<uint32_t>(node_.grid[2])};
+        const bool unitStaticGrid =
+            invocation.compute_grid.x == 1 && invocation.compute_grid.y == 1 && invocation.compute_grid.z == 1;
+        const std::string &entry = pipeline_.variant.compute;
+        const bool elementwiseDispatch =
+            entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos;
+        if (unitStaticGrid && elementwiseDispatch) {
+            for (const VernonPipelineArgument &argument : arguments_) {
+                if (argument.kind != VERNON_PIPELINE_TENSOR ||
+                    (argument.tensor.storage != VERNON_TENSOR_HOST &&
+                     argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
+                    (argument.tensor.rank && !argument.tensor.shape))
+                    continue;
+                uint64_t count = 1;
+                for (uint32_t dimension = 0; dimension < argument.tensor.rank; ++dimension) {
+                    const uint64_t extent = argument.tensor.shape[dimension];
+                    if (!extent || count > std::numeric_limits<uint32_t>::max() / extent) {
+                        invocationDiagnostic(*pipeline_.context) =
+                            "linearized Program copy/add grid exceeds uint32 range";
+                        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+                    }
+                    count *= extent;
+                }
+                invocation.compute_grid = {static_cast<uint32_t>(count), 1, 1};
+                break;
+            }
+        }
         PlannedComputeLaunch plan;
         std::string error;
-        const uint32_t grid[3]{invocation.compute_grid.x, invocation.compute_grid.y, invocation.compute_grid.z};
         const uint32_t workgroup[3]{pipeline_.workgroupSize.x, pipeline_.workgroupSize.y, pipeline_.workgroupSize.z};
-        if (!validateDispatchContract(pipeline_.dispatchContract, grid, workgroup, error) ||
-            !planComputeInvocation(pipeline_.variant, pipeline_.workgroupSize, invocation, plan, error)) {
+        if (pipeline_.context && pipeline_.context->backend == VERNON_RUNTIME_CPU) {
+            VernonAdTapeAllocator *allocator = nullptr;
+            VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
+            const auto bindTape = [&](uint32_t valueId) {
+                if (!arena_ || !execution_ || valueId >= arena_->size() || valueId >= execution_->values.size() ||
+                    !isProgramAdTapeType(execution_->values[valueId].type))
+                    return;
+                const VernonPipelineArgument &argument = (*arena_)[valueId];
+                if (argument.kind != VERNON_PIPELINE_TENSOR || !argument.tensor.host_data ||
+                    argument.tensor.byte_size < sizeof(VernonAdTapeAllocator *) + sizeof(VernonAdRegionHandle))
+                    return;
+                const auto *bytes = static_cast<const uint8_t *>(argument.tensor.host_data);
+                std::memcpy(&allocator, bytes, sizeof(allocator));
+                std::memcpy(&root, bytes + sizeof(allocator), sizeof(root));
+            };
+            for (uint32_t operand : node_.operands)
+                bindTape(operand);
+            for (uint32_t result : node_.results)
+                bindTape(result);
+            vernon::runtime::setCpuProgramTape(pipeline_, allocator, root);
+        }
+        if (!planComputeInvocation(pipeline_.variant, pipeline_.workgroupSize, invocation, plan, error)) {
+            invocationDiagnostic(*pipeline_.context) = std::move(error);
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        }
+        const uint32_t grid[3]{plan.grid.x, plan.grid.y, plan.grid.z};
+        if (!validateDispatchContract(pipeline_.dispatchContract, grid, workgroup, error)) {
             invocationDiagnostic(*pipeline_.context) = std::move(error);
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         }
@@ -1110,6 +1166,8 @@ private:
     std::vector<VernonPipelineArgument> arguments_;
     std::vector<std::vector<int64_t>> argumentStrides_;
     const std::vector<vernon::execution::GraphBuffer> &resources_;
+    const std::vector<VernonPipelineArgument> *arena_{};
+    const ExecutableProgram *execution_{};
 };
 
 bool contiguousTensorStorage(const Parameter &parameter, PipelineOwnedTensor &owned, VernonPipelineArgument &argument) {
@@ -1220,8 +1278,8 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
             }
             arguments.push_back(argument);
         }
-        auto &pass = executionGraph.emplacePass<PipelineComputePass>(node, stage, std::move(arguments),
-                                                                     std::move(argumentStrides), resources);
+        auto &pass = executionGraph.emplacePass<PipelineComputePass>(
+            node, stage, std::move(arguments), std::move(argumentStrides), resources, &valueArguments, &execution);
         for (uint32_t dependency : node.dependencies) {
             if (dependency >= passes.size() || !passes[dependency])
                 return fail(pipeline.context, "Program node dependency is not materialized");

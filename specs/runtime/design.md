@@ -179,11 +179,14 @@ barriers, submission, completion, and transient descriptor/upload storage.
 Python `Texture` owns color image storage, including two-dimensional,
 three-dimensional, and six-face Cube resources. Three-dimensional textures use
 `(depth, height, width, channels)` host order and are shader resources rather
-than attachments. `RenderTarget` owns or groups two-dimensional attachment
-references and manages its optional depth attachment explicitly. Its
-`depth_texture` is a shader-readable resource view of that attachment; depth is
-not a public host-transfer `Texture` format. Immutable `SamplerState` objects
-bind shader `Sampler` parameters independently of image ownership.
+than attachments. Device-only and host-backed images use the same `Texture`
+resource type. `TextureView` retains its Texture and selects format,
+subresources, and color/depth/stencil aspects. Immutable `RenderTarget` values
+only aggregate two-dimensional attachment views; `RenderTarget.create` is a
+convenience factory, while `RenderTarget.from_attachments` composes existing
+resources. D32 depth is an ordinary device-only Texture rather than a
+RenderTarget-owned proxy. Immutable `SamplerState` objects bind shader
+`Sampler` parameters independently of image ownership.
 
 ## Reflection-driven structured Value binding
 
@@ -372,11 +375,11 @@ Rendering scopes carry explicit `Clear`, `Preserve`, or `Discard` load
 operations and `Preserve` or `Discard` store operations. Clear values belong to
 the attachment use, not the pipeline. An optional D32 attachment enables
 less-than depth testing and depth writes in Vulkan, D3D12, and OpenGL. Python
-keeps that attachment under `RenderTarget` ownership and exposes a
-shader-readable `depth_texture` reference when depth sampling is required.
-Importing the attachment through both its target and shader-resource identities
-resolves to one native graph resource, so attachment-to-sampling hazards remain
-visible.
+represents it as a device-only Texture with a depth-aspect TextureView.
+RenderTarget retains the view without allocating or owning a separate native
+image. Attachment and shader-resource views resolve through the same native
+image identity, so attachment-to-sampling hazards remain visible while
+subresource ranges remain distinct.
 
 ## PBR integration reference
 
@@ -644,10 +647,12 @@ graphics node
   draw
 ```
 
-An `Attachment` owns its image view/use, `load` (`load`, `clear`, or `discard`),
+An `Attachment` references its image view and owns its use policy: `load`
+(`load`, `clear`, or `discard`),
 the clear value required by `clear`, `store` (`store` or `discard`), and an
-optional resolve target. A `RenderTarget` is source convenience that internally
-allocates textures and aggregates attachments; it is not a public
+optional resolve target. A `RenderTarget` is source convenience that aggregates
+immutable attachment views; its `create` factory may allocate Texture resources,
+whereas `from_attachments` composes existing ones. It is not a public
 resource-aggregate ABI. `RenderState` owns blend, depth/stencil, raster, color
 write mask, and multisample state. Clear is attachment policy, never
 `RenderState`.

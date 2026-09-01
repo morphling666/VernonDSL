@@ -53,28 +53,14 @@ bool materializeRuntimeSignature(Signature &signature, const VernonAdValueSet &i
         input.byteSize = value->size;
         input.logicalShape.assign(value->shape, value->shape + value->rank);
     }
-    auto materializeDerivative = [&](ValueAbi &derivative) {
-        const auto primal = std::find_if(signature.inputs.begin(), signature.inputs.end(),
-                                         [&](const ValueAbi &value) { return value.path == derivative.path; });
-        if (primal == signature.inputs.end())
-            return false;
-        const size_t primalScalarSize = dtypeSize(primal->dtype);
-        const size_t derivativeScalarSize = dtypeSize(derivative.dtype);
-        if (!primalScalarSize || !derivativeScalarSize || primal->byteSize % primalScalarSize ||
-            primal->byteSize / primalScalarSize > SIZE_MAX / derivativeScalarSize)
-            return false;
-        derivative.byteSize = primal->byteSize / primalScalarSize * derivativeScalarSize;
-        derivative.logicalShape = primal->logicalShape;
-        return true;
-    };
     for (ValueAbi &output : signature.outputs)
-        if (!materializeDerivative(output))
+        if (!materializeDerivativeValueAbi(output, signature.inputs))
             return false;
     for (ValueAbi &cotangent : signature.cotangents)
-        if (!materializeDerivative(cotangent))
+        if (!materializeDerivativeValueAbi(cotangent, signature.inputs))
             return false;
     for (ValueAbi &gradient : signature.gradients)
-        if (!materializeDerivative(gradient))
+        if (!materializeDerivativeValueAbi(gradient, signature.inputs))
             return false;
     return true;
 }

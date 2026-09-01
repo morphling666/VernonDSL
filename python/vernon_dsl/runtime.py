@@ -25,27 +25,7 @@ from ._runtime.execution_graph import (
 from ._runtime.graph_autodiff import GraphBackwardSubmission, GraphPullback, VjpComputePass
 from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from ._runtime.resources import (
-    RenderTarget,
-    SamplerState,
-    TensorLayout,
-    TensorStorage,
-    TensorView,
-    Texture,
-    TextureFormat,
-    TextureView,
-    r8_unorm,
-    r11g11b10_float,
-    r16_float,
-    r32_float,
-    rg8_unorm,
-    rgb8_unorm,
-    rgba8_srgb,
-    rgba8_unorm,
-    rgba16_float,
-    rgba32_float,
-    sampler,
-)
+from ._runtime.sampler import SamplerState, sampler
 from ._runtime.session import (
     cpu,
     cuda,
@@ -56,6 +36,24 @@ from ._runtime.session import (
     opengles,
     register_external_opengl_context,
     vulkan,
+)
+from ._runtime.tensor import TensorLayout, TensorStorage, TensorView
+from ._runtime.texture import (
+    RenderTarget,
+    Texture,
+    TextureFormat,
+    TextureView,
+    d32_float,
+    r8_unorm,
+    r11g11b10_float,
+    r16_float,
+    r32_float,
+    rg8_unorm,
+    rgb8_unorm,
+    rgba8_srgb,
+    rgba8_unorm,
+    rgba16_float,
+    rgba32_float,
 )
 
 __all__ = [
@@ -93,6 +91,7 @@ __all__ = [
     "Texture",
     "TextureView",
     "TextureFormat",
+    "d32_float",
     "r11g11b10_float",
     "r16_float",
     "r32_float",

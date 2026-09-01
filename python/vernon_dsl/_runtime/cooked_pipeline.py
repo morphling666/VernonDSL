@@ -2,22 +2,14 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .resources import (
-    TensorStorage,
-    TensorView,
-    _dispatch_borrow_scope,
-    _NativeBindingCache,
-)
-
-
-def _session_state() -> Any:
-    return importlib.import_module("vernon_dsl._runtime.session")
+from .binding import _dispatch_borrow_scope, _NativeBindingCache
+from .resource_common import _session_state
+from .tensor import TensorStorage, TensorView
 
 
 @dataclass

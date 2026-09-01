@@ -440,7 +440,7 @@ bool parseExecutableProgram(const nlohmann::json &value, ExecutableProgram &prog
                     return false;
                 }
             for (const nlohmann::json &bindingValue : nodeValue["bindings"]) {
-                if (!bindingValue.is_object() || !hasOnlyKeys(bindingValue, {"parameter", "value"}) ||
+                if (!bindingValue.is_object() || !hasOnlyKeys(bindingValue, {"parameter", "value", "leaf"}) ||
                     !bindingValue.contains("parameter") || !bindingValue["parameter"].is_string() ||
                     !bindingValue.contains("value")) {
                     error = "executable program node value binding is invalid";
@@ -451,6 +451,14 @@ bool parseExecutableProgram(const nlohmann::json &value, ExecutableProgram &prog
                 if (!parseUint32(bindingValue["value"], binding.value)) {
                     error = "executable program node binding value must be uint32";
                     return false;
+                }
+                if (bindingValue.contains("leaf")) {
+                    uint32_t leaf = 0;
+                    if (!parseUint32(bindingValue["leaf"], leaf)) {
+                        error = "executable program node binding leaf must be uint32";
+                        return false;
+                    }
+                    binding.leaf = leaf;
                 }
                 node.bindings.push_back(std::move(binding));
             }

@@ -315,9 +315,10 @@ RenderState
 + multisample
 ```
 
-Clear 属于 `Attachment`，不属于 `RenderState`。`RenderTarget` 只是 source convenience：它可以在
-内部创建 Texture 并聚合 color/depth attachments，但 final manifest 不把 `RenderTarget` 或其他
-resource aggregate 暴露为 public ABI。它只保留规范化后的 graphics node：
+Clear 属于 `Attachment`，不属于 `RenderState`。`RenderTarget` 只是 source convenience：它聚合
+独立 Texture 的 color/depth views；`create` factory 可以创建 Texture，而 `from_attachments` 组合
+已有资源。final manifest 不把 `RenderTarget` 或其他 resource aggregate 暴露为 public ABI。它只
+保留规范化后的 graphics node：
 
 Resolve destination 的 load 隐式为 discard；multisample source 与 resolve destination 的 store
 policy 相互独立。

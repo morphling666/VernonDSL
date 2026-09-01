@@ -20,6 +20,12 @@ Type wrapAutodiffDerivativeTensorView(TensorViewType view, Type payload, StringR
 // primal TensorView access; the 3-argument form sets the AD resource ABI.
 FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module);
 FailureOr<Type> getAutodiffDerivativeType(Type type, ModuleOp module, StringRef tensorViewAccess);
+// Canonical dotted spelling shared by analysis and Program boundary matching.
+std::string appendValueAbiPath(StringRef root, ArrayRef<ValueAbiPathComponent> path);
+// Project primal logical dtypes onto the differentiable ABI leaves, in the
+// same order used by the derivative Value type.
+FailureOr<SmallVector<StringRef>> getAutodiffDerivativeLogicalLeafDtypes(Type primalType, ModuleOp module,
+                                                                         ArrayRef<StringRef> logicalLeafDtypes);
 // Physical Value ABI of a derivative payload. Validates that `derivativeType` is
 // a legal tangent of `primalType`. `layout_hash` uses the same pipeline Value ABI
 // as ordinary values; AD pairing is origin/signature, not a `tangent<>` identity.

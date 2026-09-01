@@ -6,8 +6,8 @@ from typing import Any
 
 import numpy as np
 
-from ._runtime.resources import TensorStorage, TensorView
-from ._runtime.resources import _logical_collection_shape as _resource_collection_shape
+from ._runtime.tensor import TensorStorage, TensorView
+from ._runtime.tensor import _logical_collection_shape as _resource_collection_shape
 
 
 def _logical_collection_shape(values: Any, element_type: Any) -> tuple[int, ...]:

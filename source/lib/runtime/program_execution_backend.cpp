@@ -221,29 +221,8 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
                 return reject(diagnostic, "PROGRAM_LAYOUT_HASH",
                               "/values/" + std::to_string(value.id) + "/value_layout",
                               "ValueLayout exceeds the runtime ABI");
-            auto layout = std::make_shared<vernon::runtime::ValueLayout>();
-            layout->layoutHash = value.layout->layoutHash;
-            layout->byteSize = static_cast<uint32_t>(value.layout->byteSize);
-            layout->alignment = static_cast<uint32_t>(value.layout->alignment);
-            layout->logicalType = value.type;
-            for (const LayoutLeaf &leaf : value.layout->leaves) {
-                ValueLeaf converted(leaf.dtype, static_cast<uint32_t>(leaf.scalarCount),
-                                    static_cast<uint32_t>(leaf.byteOffset));
-                converted.shape = leaf.shape;
-                for (const LayoutPathComponent &component : leaf.path) {
-                    ValuePathComponent path;
-                    if (!component.field.empty())
-                        path.field = component.field;
-                    if (component.index)
-                        path.index = *component.index;
-                    converted.path.push_back(std::move(path));
-                }
-                if (const std::optional<VernonDataType> dtype = pipelineDataType(converted.dtype))
-                    layout->abiLeaves.push_back(
-                        {static_cast<uint32_t>(*dtype), converted.scalarCount, converted.byteOffset});
-                layout->leaves.push_back(std::move(converted));
-            }
-            rebuildValueLayoutPathViews(*layout);
+            auto layout =
+                std::make_shared<vernon::runtime::ValueLayout>(materializeValueLayout(*value.layout, value.type));
             slot.valueLayout = std::move(layout);
             if (value.layout->leaves.size() == 1)
                 slot.dtype = value.layout->leaves.front().dtype;
@@ -398,7 +377,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
         std::vector<VernonProgramStageBinding> bindings;
         for (const TargetBinding &binding : node.plan.bindings)
             if (binding.source != SourceRepresentation::SystemValue)
-                bindings.push_back({binding.endpoint.value, std::nullopt});
+                bindings.push_back({binding.endpoint.value, binding.endpoint.leaf});
         topology->stageIndices.emplace(node.node->stage, topology->stages.size());
         topology->stages.push_back(VernonResolvedProgramStage{std::move(child), std::move(bindings)});
     }

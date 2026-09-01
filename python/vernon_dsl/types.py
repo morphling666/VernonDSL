@@ -6,6 +6,8 @@ from typing import Any, Self
 
 import numpy as np
 
+from ._dtypes import NUMPY_DTYPE_BY_SCALAR
+
 
 def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
     dtypes: list[np.dtype[Any]] = []
@@ -220,15 +222,7 @@ class _Scalar(type):
         super().__init__(class_name, bases, resolved_namespace)
 
     def __call__(cls, value: Any) -> Any:
-        dtypes = {
-            "bool": np.bool_,
-            "i32": np.int32,
-            "u32": np.uint32,
-            "f16": np.float16,
-            "f32": np.float32,
-            "f64": np.float64,
-        }
-        return dtypes[cls.name](value)
+        return NUMPY_DTYPE_BY_SCALAR[cls.name].type(value)
 
 
 class bool(np.bool_, metaclass=_Scalar):

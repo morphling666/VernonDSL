@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 
+from .._dtypes import scalar_name
 from ..frontend.model import ConcreteType
 from .mlir import emit_program
 from .model import GraphOperation, GraphValue, ParsedProgram, ProgramGraph, ProgramImplementation, ProgramType
@@ -37,15 +38,7 @@ def _program_resource_type(value_type: ConcreteType) -> ProgramType:
 
 def _scalar_type(value: Any) -> ProgramType:
     if isinstance(value, np.generic):
-        names = {
-            "bool": "bool",
-            "float16": "f16",
-            "float32": "f32",
-            "float64": "f64",
-            "int32": "i32",
-            "uint32": "u32",
-        }
-        name = names.get(str(value.dtype))
+        name = scalar_name(value.dtype)
         if name is None:
             raise TypeError(f"Program scalar value has unsupported dtype {value.dtype}")
         return ProgramType(ConcreteType("scalar", name))

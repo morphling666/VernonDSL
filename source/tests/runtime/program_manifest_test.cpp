@@ -53,6 +53,16 @@ TEST(ProgramManifest, ParsesAndValidatesExecutableGraph) {
     ASSERT_EQ(program.graphs.size(), 1u);
     ASSERT_EQ(program.graphs[0].nodes.size(), 1u);
 
+    manifest["graphs"][0]["nodes"][0]["bindings"][0]["leaf"] = 3;
+    program = {};
+    ASSERT_TRUE(vernon::runtime::parseExecutableProgram(manifest, program, error)) << error;
+    EXPECT_EQ(program.graphs[0].nodes[0].bindings[0].leaf, 3u);
+    manifest["graphs"][0]["nodes"][0]["bindings"][0]["leaf"] = -1;
+    program = {};
+    EXPECT_FALSE(vernon::runtime::parseExecutableProgram(manifest, program, error));
+    EXPECT_NE(error.find("leaf"), std::string::npos);
+    manifest = validExecutableProgram();
+
     manifest["graphs"][0]["nodes"][0]["dependencies"] = nlohmann::json::array({1});
     program = {};
     ASSERT_TRUE(vernon::runtime::parseExecutableProgram(manifest, program, error)) << error;

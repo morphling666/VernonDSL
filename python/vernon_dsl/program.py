@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from ._runtime.resources import TensorStorage, TensorView
+from ._runtime.tensor import TensorStorage, TensorView
 from .operation_graph import GraphBuffer, KernelParameter, OperationGraph
 
 
@@ -558,7 +558,8 @@ class _NativePrimalPlan:
 
     def invoke(self, calls: tuple[tuple[Any, tuple[Any, ...]], ...]) -> None:
         from ._runtime import session
-        from ._runtime.resources import TensorStorage, TensorView, _TextureResource
+        from ._runtime.tensor import TensorStorage, TensorView
+        from ._runtime.texture import _TextureResource
 
         prepared: dict[Any, Any] = {}
         borrows: list[tuple[str, Any, str]] = []
@@ -650,8 +651,8 @@ def _specialize_native_primal(calls: tuple[CapturedKernelCall, ...]) -> _NativeP
 
     if session._architecture == session.cpu:
         return None
+    from ._runtime.binding import _NativeBindingCache
     from ._runtime.execution_graph import ExecutionGraph, _NativePipelineComputePass
-    from ._runtime.resources import _NativeBindingCache
 
     graph = ExecutionGraph()
     parameter_rows: list[tuple[Any, ...]] = []
@@ -822,12 +823,17 @@ def execute_module_vjp(
     if not isinstance(specialization, ProgramAutodiffSpecialization):
         specialization = compile_program_autodiff(parsed_program, template)
         module._program_cache[key] = specialization
+    budget = getattr(module, "checkpoint_memory_budget", None)
+    if not isinstance(budget, int):
+        budget = None
     return specialization.invoke(
         dataclasses.replace(
             invocation,
             inputs=dict(live_inputs),
             outputs=_materialize_invocation_outputs(capture, outputs, live_inputs),
-        )
+        ),
+        checkpoint_memory_budget=budget,
+        checkpoint_policy=expression.planning_policy if budget is not None else "",
     )
 
 

@@ -54,6 +54,7 @@ struct ProgramResourceUse {
 struct ProgramValueBinding {
     std::string parameter;
     uint32_t value{UINT32_MAX};
+    std::optional<uint32_t> leaf;
 };
 
 struct ProgramNode {

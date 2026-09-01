@@ -96,7 +96,7 @@ def main() -> None:
     offsets = vd.storage.zeros(dtype=vd.f32, shape=(args.instances, 2))
     color = vd.Texture.zeros(shape=(args.size, args.size))
     object_id = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
+    target = vd.RenderTarget.from_attachments(colors={0: color, 1: object_id})
     base_x = np.linspace(-0.75, 0.75, args.instances, dtype=np.float32)
 
     frame = 0

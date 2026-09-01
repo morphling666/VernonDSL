@@ -46,6 +46,35 @@ FailureOr<Type> gradientDestType(Type type, Operation *scope) {
     return getAutodiffDerivativeType(type, module, "write");
 }
 
+ProgramLanguageAbi derivativeLanguageAbi(Type primalType, DictionaryAttr primalAttrs, Type derivativeType,
+                                         Operation *scope) {
+    ProgramLanguageAbi primalAbi = programLanguageAbiFromAttrs(primalAttrs, primalType);
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return {};
+    FailureOr<SmallVector<StringRef>> leaves =
+        getAutodiffDerivativeLogicalLeafDtypes(primalType, module, primalAbi.leaves);
+    if (failed(leaves))
+        return {};
+    ProgramLanguageAbi derivativeAbi;
+    derivativeAbi.leaves = std::move(*leaves);
+    if (derivativeAbi.leaves.size() == 1)
+        derivativeAbi.dtype = derivativeAbi.leaves.front();
+    if (failed(getAutodiffDerivativeValueLayout(primalType, derivativeType, module, derivativeAbi.leaves)))
+        return {};
+    return derivativeAbi;
+}
+
+ProgramLanguageAbi derivativeLanguageAbi(Value primal, Type derivativeType) {
+    if (primal.getType() == derivativeType)
+        return getProgramValueLanguageAbi(primal);
+    if (auto argument = dyn_cast<BlockArgument>(primal))
+        if (auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp()))
+            return derivativeLanguageAbi(primal.getType(), function.getArgAttrDict(argument.getArgNumber()),
+                                         derivativeType, function);
+    return {};
+}
+
 Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef name, ValueRange operands,
                              Type resultType, ArrayRef<NamedAttribute> attributes = {}) {
     OperationState state(location, IntrinsicOp::getOperationName());
@@ -86,13 +115,13 @@ Value createZero(OpBuilder &builder, Location location, Type type, Value like = 
                          ? createProgramIntrinsic(builder, location, "zeros_like", like, type)
                          : createProgramIntrinsic(builder, location, "zeros", {}, type);
         if (like)
-            applyProgramLanguageAbi(zero.getDefiningOp(), getProgramValueLanguageAbi(like));
+            applyProgramLanguageAbi(zero.getDefiningOp(), derivativeLanguageAbi(like, type));
         return zero;
     }
     if (isa<TensorType>(type)) {
         Value zero = createProgramIntrinsic(builder, location, "zeros", {}, type);
         if (like)
-            applyProgramLanguageAbi(zero.getDefiningOp(), getProgramValueLanguageAbi(like));
+            applyProgramLanguageAbi(zero.getDefiningOp(), derivativeLanguageAbi(like, type));
         return zero;
     }
     auto tensor = dyn_cast<RankedTensorType>(type);
@@ -196,6 +225,25 @@ StringRef resultSourceName(func::FuncOp function, unsigned result) {
         if (auto name = dyn_cast<StringAttr>(names[result]))
             return name.getValue();
     return {};
+}
+
+bool selectsDifferentiableBoundaryLeaf(Type boundaryType, ModuleOp module, StringRef suffix) {
+    if (suffix.empty())
+        return succeeded(getAutodiffDerivativeType(boundaryType, module));
+    Type layoutType = boundaryType;
+    if (auto view = dyn_cast<TensorViewType>(layoutType))
+        layoutType = view.getElementType();
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(layoutType, module);
+    if (failed(layout))
+        return false;
+    for (const ValueAbiLeaf &leaf : layout->leaves) {
+        if (failed(getAutodiffDerivativeScalarType(leaf.scalarType)))
+            continue;
+        const std::string leafPath = appendValueAbiPath({}, leaf.path);
+        if (leafPath == suffix || StringRef(leafPath).starts_with((suffix + ".").str()))
+            return true;
+    }
+    return false;
 }
 
 bool nestedComputeEmitsVjp(ComputeOp operation, ArrayRef<unsigned> activeOperands) {
@@ -359,7 +407,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
             abi = getProgramValueLanguageAbi(dest);
         } else {
             resultResourceSources.push_back(-1);
-            abi = getProgramValueLanguageAbi(context.getPrimalOperand(index));
+            abi = derivativeLanguageAbi(context.getPrimalOperand(index), *type);
         }
         resultTypes.push_back(*type);
         resultNames.push_back(name);
@@ -489,11 +537,16 @@ FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp p
     llvm::BitVector selected(primal.getNumArguments());
     SmallVector<unsigned> indices;
     for (StringRef path : publicPaths) {
-        auto boundary = boundaries.find(path);
-        if (path.empty() || boundary == boundaries.end() || selected.test(boundary->second)) {
+        auto [root, suffix] = path.split('.');
+        auto boundary = boundaries.find(root);
+        if (path.empty() || root.empty() || boundary == boundaries.end() ||
+            !selectsDifferentiableBoundaryLeaf(primal.getArgument(boundary->second).getType(),
+                                               primal->getParentOfType<ModuleOp>(), suffix)) {
             primal.emitError("Program VJP wrt path does not identify a unique primal boundary");
             return failure();
         }
+        if (selected.test(boundary->second))
+            continue;
         selected.set(boundary->second);
         indices.push_back(boundary->second);
     }
@@ -549,7 +602,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     forward->removeAttr("vernon.stage");
     moduleBuilder.insert(forward);
 
-    DenseSet<Operation *> activeNestedComputes;
+    llvm::DenseSet<Operation *> activeNestedComputes;
     {
         DenseMap<Value, char> live;
         for (Value result : returnOp.getOperands())
@@ -633,19 +686,20 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         if (StringRef name = resultSourceName(primal, index); !name.empty())
             backward.setArgAttr(argument, "vernon.source_name", builder.getStringAttr(name));
         backward.setArgAttr(argument, "vernon.autodiff_role", builder.getStringAttr("cotangent"));
-        applyProgramLanguageAbi(
-            backward, argument,
-            programLanguageAbiFromAttrs(primal.getResultAttrDict(index), backward.getArgument(argument).getType()),
-            false);
+        applyProgramLanguageAbi(backward, argument,
+                                derivativeLanguageAbi(primal.getResultTypes()[index], primal.getResultAttrDict(index),
+                                                      backward.getArgument(argument).getType(), primal),
+                                false);
     }
     for (auto [result, primalArgument] : llvm::enumerate(wrtIndices)) {
         if (StringRef name = sourceName(primal, primalArgument); !name.empty())
             backward.setResultAttr(result, "vernon.source_name", builder.getStringAttr(name));
         backward.setResultAttr(result, "vernon.autodiff_role", builder.getStringAttr("gradient"));
-        applyProgramLanguageAbi(
-            backward, static_cast<unsigned>(result),
-            programLanguageAbiFromAttrs(primal.getArgAttrDict(primalArgument), backward.getResultTypes()[result]),
-            true);
+        applyProgramLanguageAbi(backward, static_cast<unsigned>(result),
+                                derivativeLanguageAbi(primal.getArgument(primalArgument).getType(),
+                                                      primal.getArgAttrDict(primalArgument),
+                                                      backward.getResultTypes()[result], primal),
+                                true);
     }
     IRMapping primals;
     for (auto [source, target] :

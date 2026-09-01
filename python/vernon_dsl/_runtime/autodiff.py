@@ -12,8 +12,9 @@ from ..ad import ProgramExpression
 from ..bundle import make_target_options
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..frontend.structured_vjp import build_structured_vjp
+from .binding import _dispatch_borrow_scope, _NativeBindingCache
 from .kernel import Kernel, _session_state
-from .resources import TensorStorage, TensorView, _dispatch_borrow_scope, _NativeBindingCache
+from .tensor import TensorStorage, TensorView
 
 
 @dataclass

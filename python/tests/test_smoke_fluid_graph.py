@@ -103,7 +103,11 @@ def smoke_reference(
 
     difference = output_density - target
     loss = np.sum(difference * difference, dtype=np.float32)
-    return output_density, projected_velocity, np.float32(loss / np.float32(width * height))
+    return (
+        output_density,
+        projected_velocity,
+        np.float32(loss / np.float32(width * height)),
+    )
 
 
 class SmokeFluidGraphTests(unittest.TestCase):
@@ -201,7 +205,14 @@ class SmokeFluidGraphTests(unittest.TestCase):
 
     def test_available_gpu_backends_match_cpu(self) -> None:
         expected_density, expected_velocity, expected_loss, _, _ = self._run(vd.cpu, 17)
-        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
+        for architecture in (
+            vd.cuda,
+            vd.vulkan,
+            vd.directx,
+            vd.metal,
+            vd.opengl,
+            vd.opengles,
+        ):
             try:
                 vd.init(arch=architecture)
             except RuntimeError:
@@ -217,6 +228,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
         density, velocity, target = self._inputs(size)
 
         def gradient(architecture: Any) -> np.ndarray:
+            print(f"arch: {architecture}")
             vd.init(arch=architecture)
             simulation = SmokeFluidSimulation(
                 grid=size,
@@ -239,7 +251,15 @@ class SmokeFluidGraphTests(unittest.TestCase):
             return result["state_velocity"].to_numpy()
 
         expected = gradient(vd.cpu)
-        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
+        print(f"expected: {expected}")
+        for architecture in (
+            vd.cuda,
+            vd.vulkan,
+            vd.directx,
+            vd.metal,
+            vd.opengl,
+            vd.opengles,
+        ):
             try:
                 vd.init(arch=architecture)
             except RuntimeError:
@@ -346,6 +366,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
                     3.5,
                     "resident/logical regression tolerance is frozen at 3.5 for normal CI grids",
                 )
+            print(f"pass_telemetry: {pullback.pass_telemetry}")
             loss_telemetry = next(item for item in pullback.pass_telemetry if item["pass_name"].endswith(".smoke_loss"))
             self.assertEqual(loss_telemetry["control_history_kind"], "none")
             self.assertEqual(loss_telemetry["logical_residual_bytes"], 0)
@@ -371,7 +392,9 @@ class SmokeFluidGraphTests(unittest.TestCase):
             self.assertTrue(all(item["peak_temporary_tape_bytes"] > 0 for item in capture_telemetry))
             self.assertLessEqual(pullback.peak_runtime_managed_bytes, pullback.tape_context_limit_bytes)
 
-    def test_checkpointed_initial_velocity_gradient_matches_finite_difference(self) -> None:
+    def test_checkpointed_initial_velocity_gradient_matches_finite_difference(
+        self,
+    ) -> None:
         vd.init(arch=vd.cpu)
         size = 4
         generator = np.random.default_rng(481)

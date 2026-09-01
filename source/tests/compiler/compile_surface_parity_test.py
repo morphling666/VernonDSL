@@ -309,7 +309,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 runtime_module.Pipeline._cache.clear()
                 pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
                 position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
-                target = vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(16, 16)))
+                target = vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16))})
                 with mock.patch.multiple(
                     runtime_module,
                     _architecture=architecture,
@@ -395,7 +395,6 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)
-        frontend_tensor = vd.storage.from_numpy(source)
         frontend = scale._lower().frontend
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)

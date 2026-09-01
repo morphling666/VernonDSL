@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib
 import inspect
 import tempfile
 from collections.abc import Iterable, Mapping
@@ -11,6 +10,8 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from .._dtypes import scalar_name
+from .._mlir import first_generic_type_argument
 from ..bundle import (
     CompiledStage,
     PipelineCompileError,
@@ -21,9 +22,11 @@ from ..bundle import (
     parse_reflection_json,
 )
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
+from ..language.scalar_types import SCALAR_TYPES
 from ..language.stage_registry import validate_graphics_topology
 from ..render import RenderTargetUse
 from ..render import clear as clear_attachment
+from .binding import _DispatchBorrowLease, _NativeBindingCache
 from .execution_graph import (
     ColorAttachmentUse,
     DepthStencilAttachmentUse,
@@ -35,19 +38,10 @@ from .execution_graph import (
     RenderPass,
     StoreOperation,
 )
-from .resources import (
-    RenderTarget,
-    SamplerState,
-    TensorStorage,
-    TensorView,
-    _DispatchBorrowLease,
-    _NativeBindingCache,
-    _TextureResource,
-)
-
-
-def _session_state() -> Any:
-    return importlib.import_module("vernon_dsl._runtime.session")
+from .resource_common import _session_state
+from .sampler import SamplerState
+from .tensor import TensorStorage, TensorView
+from .texture import RenderTarget, _TextureResource
 
 
 @dataclass(frozen=True)
@@ -226,34 +220,10 @@ class Pipeline:
 
         def scalar_mlir_type(dtype: np.dtype[Any]) -> str:
             resolved = np.dtype(dtype)
-            names = {
-                np.dtype(np.float16): "f16",
-                np.dtype(np.float32): "f32",
-                np.dtype(np.float64): "f64",
-                np.dtype(np.int32): "i32",
-                np.dtype(np.uint32): "i32",
-            }
-            if resolved not in names:
+            scalar = scalar_name(resolved)
+            if scalar is None or scalar == "bool":
                 raise TypeError(f"graphics Program does not support runtime dtype {resolved}")
-            return names[resolved]
-
-        def peel_tensor_element(spelling: str) -> str | None:
-            text = spelling.strip()
-            if not text.startswith("!vernon.tensor<") or not text.endswith(">"):
-                return None
-            body = text[len("!vernon.tensor<") : -1]
-            depth = 0
-            split = -1
-            for index, character in enumerate(body):
-                if character in "<[":
-                    depth += 1
-                elif character in ">]":
-                    depth -= 1
-                elif character == "," and depth == 0:
-                    split = index
-            if split < 0:
-                return None
-            return body[:split].strip()
+            return SCALAR_TYPES[scalar].mlir
 
         def logical_type(name: str) -> str:
             role, row = reflected_arguments[name]
@@ -268,7 +238,7 @@ class Pipeline:
                     raise TypeError(f"vertex input {name!r} requires a leading invocation dimension")
                 cell = reflected
                 while True:
-                    peeled = peel_tensor_element(cell)
+                    peeled = first_generic_type_argument(cell, "!vernon.tensor")
                     if peeled is None:
                         break
                     cell = peeled
@@ -287,8 +257,9 @@ class Pipeline:
             return f'!vernon.texture<"2d", f32, "{format_name}", "read_write">'
 
         attachment_types = [attachment_type(texture) for _, texture in colors]
-        if target._depth_texture is not None:
-            attachment_types.append(attachment_type(target._depth_texture))
+        depth = target._depth_attachment()
+        if depth is not None:
+            attachment_types.append(attachment_type(depth))
         topology = {"triangles": "triangle_list", "lines": "line_list", "points": "point_list"}[self._topology.name]
         planned = compiler.plan_graphics_result(
             [request.frontend.mlir for request in requests],
@@ -349,8 +320,8 @@ class Pipeline:
             )
             for index, (_, texture) in enumerate(colors)
         ]
-        if target._depth_texture is not None:
-            shape_facts.append((request_id, "depth", list(target._depth_texture.shape)))
+        if depth is not None:
+            shape_facts.append((request_id, "depth", list(depth.shape)))
         for name, value in call_arguments.items():
             if isinstance(value, _TextureResource):
                 shape_facts.append((request_id, name, list(value.shape)))
@@ -400,7 +371,7 @@ class Pipeline:
                 canonical_json(
                     {
                         "target": [(location, value.shape, value.format.name) for location, value in colors],
-                        "depth": None if target._depth_texture is None else tuple(target._depth_texture.shape),
+                        "depth": None if depth is None else tuple(depth.shape),
                         "arguments": {
                             name: (tuple(value.shape), str(value.dtype))
                             for name, value in call_arguments.items()
@@ -438,13 +409,14 @@ class Pipeline:
         target: RenderTarget | None = None,
     ) -> _CompiledPipeline:
         state = _session_state()
+        depth = None if target is None else target._depth_attachment()
         invocation_identity = (
             canonical_json(
                 {
                     "target": [
                         (location, value.shape, value.format.name) for location, value in target._color_attachments()
                     ],
-                    "depth": None if target._depth_texture is None else tuple(target._depth_texture.shape),
+                    "depth": None if depth is None else tuple(depth.shape),
                     "arguments": {
                         name: (tuple(value.shape), str(value.dtype))
                         for name, value in (call_arguments or {}).items()
@@ -565,14 +537,14 @@ class Pipeline:
                 "colors": colors,
                 "depth": (
                     DepthStencilAttachmentUse(
-                        target,
+                        target.depth_view,
                         depth_load=depth_operation.load,
                         depth_store=depth_operation.store,
                         clear_depth=float(depth_operation.clear_value)
                         if depth_operation.load is LoadOperation.CLEAR
                         else 1.0,
                     )
-                    if target._depth_texture is not None and depth_operation is not None
+                    if target._depth_attachment() is not None and depth_operation is not None
                     else None
                 ),
                 "first_in_scope": True,
@@ -611,8 +583,9 @@ class Pipeline:
         dispatch_borrows.extend(
             (f"color_attachment_{location}", texture, "write") for location, texture in color_attachments
         )
-        if target._depth_texture is not None:
-            dispatch_borrows.append(("depth_attachment", target._depth_texture, "write"))
+        depth = target._depth_attachment()
+        if depth is not None:
+            dispatch_borrows.append(("depth_attachment", depth, "write"))
         output_locations = {output.location for output in outputs}
         attachment_locations = {location for location, _ in color_attachments}
         if attachment_locations != output_locations:
@@ -720,7 +693,7 @@ class Pipeline:
                 store_values[store],
                 list(attachment.clear_value),
             )
-        depth_attachment = plan.target._resident_depth_attachment()
+        depth_attachment = plan.target._depth_attachment()
         if depth_attachment is not None:
             attachment = plan.operations["depth"]
             if attachment is None:
@@ -731,9 +704,8 @@ class Pipeline:
                 else LoadOperation.PRESERVE
             )
             store = attachment.depth_store if last_in_scope else StoreOperation.PRESERVE
-            assert plan.target._depth_texture is not None
             builder.rhi_depth_attachment(
-                plan.target._depth_texture._resident_view(),
+                depth_attachment._resident_view(),
                 load_values[load],
                 store_values[store],
                 attachment.clear_depth,
@@ -759,8 +731,8 @@ class Pipeline:
             builder.encode(encoder._native)
         for _, texture in plan.color_attachments:
             texture._mark_device_dirty()
-        if plan.target._depth_texture is not None:
-            plan.target._depth_texture._mark_device_dirty()
+        if depth_attachment is not None:
+            depth_attachment._mark_device_dirty()
         if encoder is None:
             assert plan.lease is not None
             return native_submission, plan.lease
@@ -822,7 +794,7 @@ class Pipeline:
                     (location, clear_attachment((0.0, 0.0, 0.0, 0.0)))
                     for location, _ in legacy_target._color_attachments()
                 ),
-                clear_attachment(1.0) if legacy_target._depth_texture is not None else None,
+                clear_attachment(1.0) if legacy_target._depth_attachment() is not None else None,
             )
         if not isinstance(render, RenderTargetUse):
             raise TypeError("immediate graphics execution requires render=RenderTargetUse")

@@ -209,3 +209,87 @@ TEST(CompilerProgramFinalization, BindsGradientDestByRoleNotPrimalName) {
     EXPECT_TRUE(hasParameter(nodeBindings, "projected_velocity.x"));
     EXPECT_FALSE(hasParameter(nodeBindings, "projected_velocity"));
 }
+
+TEST(CompilerProgramFinalization, ExpandsAggregateGradientBindingToCanonicalLeafNames) {
+    const char *bindings = R"([
+  {
+    "parameter": "gradient.particles",
+    "value": 2,
+    "autodiff_role": "gradient",
+    "autodiff_source": "particles"
+  }
+])";
+    llvm::json::Value execution = executionWithBindings(bindings);
+    llvm::json::Value values = parse(R"([
+  {"id": 0},
+  {"id": 1},
+  {
+    "id": 2,
+    "value_layout": {
+      "leaves": [
+        {"path": ["mass"], "dtype": "f32"},
+        {"path": ["velocity"], "dtype": "f32"}
+      ]
+    }
+  }
+])");
+    (*execution.getAsObject())["values"] = std::move(*values.getAsArray());
+    llvm::json::Value request = requestWithBindings(bindings);
+    llvm::json::Value compiled = parse(R"({
+  "arguments": [
+    {
+      "vernon.source_name": "particles.mass",
+      "vernon.autodiff_role": "gradient",
+      "vernon.autodiff_source": "particles"
+    },
+    {
+      "vernon.source_name": "particles.velocity",
+      "vernon.autodiff_role": "gradient",
+      "vernon.autodiff_source": "particles"
+    }
+  ]
+})");
+    std::string error;
+    ASSERT_TRUE(vernon::compiler::normalizeProgramImplementationAbi(*execution.getAsObject(), *request.getAsObject(),
+                                                                    *compiled.getAsObject(), error))
+        << error;
+    const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
+    ASSERT_EQ(requestBindings->size(), 2u);
+    EXPECT_TRUE(hasParameter(requestBindings, "particles.mass"));
+    EXPECT_TRUE(hasParameter(requestBindings, "particles.velocity"));
+    for (const llvm::json::Value &binding : *requestBindings) {
+        EXPECT_EQ(binding.getAsObject()->getInteger("value"), 2);
+        const std::optional<llvm::StringRef> parameter = binding.getAsObject()->getString("parameter");
+        ASSERT_TRUE(parameter);
+        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *parameter == "particles.mass" ? 0 : 1);
+    }
+
+    const llvm::json::Array *nodeBindings = (*execution.getAsObject()->getArray("graphs"))[0]
+                                                .getAsObject()
+                                                ->getArray("nodes")
+                                                ->front()
+                                                .getAsObject()
+                                                ->getArray("bindings");
+    ASSERT_EQ(nodeBindings->size(), 2u);
+    EXPECT_TRUE(hasParameter(nodeBindings, "particles.mass"));
+    EXPECT_TRUE(hasParameter(nodeBindings, "particles.velocity"));
+    for (const llvm::json::Value &binding : *nodeBindings) {
+        EXPECT_EQ(binding.getAsObject()->getInteger("value"), 2);
+        const std::optional<llvm::StringRef> parameter = binding.getAsObject()->getString("parameter");
+        ASSERT_TRUE(parameter);
+        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *parameter == "particles.mass" ? 0 : 1);
+    }
+}
+
+TEST(CompilerProgramFinalization, ResolvesAggregateLeafByCanonicalPath) {
+    llvm::json::Value layout = parse(R"({
+  "leaves": [
+    {"path": ["mass"], "dtype": "f32"},
+    {"path": ["nested", "mass"], "dtype": "f32"}
+  ]
+})");
+    const llvm::json::Object &object = *layout.getAsObject();
+    EXPECT_EQ(vernon::compiler::resolveProgramValueLeafIndex(object, "particles", "particles.mass"), 0);
+    EXPECT_EQ(vernon::compiler::resolveProgramValueLeafIndex(object, "particles", "particles.nested.mass"), 1);
+    EXPECT_FALSE(vernon::compiler::resolveProgramValueLeafIndex(object, "particles", "other.mass"));
+}

@@ -50,7 +50,6 @@ def _vector_layout(dtype: str, shape: list[int]) -> dict[str, object]:
     count = 1
     for extent in shape:
         count *= extent
-    physical = "i32" if dtype == "u32" else dtype
     spelling = f"tensor<{'x'.join(str(extent) for extent in shape)}x{dtype}>"
     canonical = f"tensor({spelling},{scalar * count},{scalar})|dtypes={dtype}"
     return {

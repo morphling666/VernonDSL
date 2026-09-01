@@ -13,13 +13,13 @@ import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._native as native
 from vernon_dsl import CompileError, Compiler, compile_source
-from vernon_dsl._runtime.resources import (
+from vernon_dsl._runtime.binding import (
     _dispatch_borrow_scope,
     _DispatchBorrowLease,
-    _logical_collection_shape,
     _NativeBindingCache,
 )
 from vernon_dsl._runtime.session import RuntimeUnavailableError
+from vernon_dsl._runtime.tensor import _logical_collection_shape
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.analysis import typed_model_data
 from vernon_dsl.host_values import host_abi_layout
@@ -124,7 +124,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             storage._resident_buffer()
             self.assertEqual(uploads, [(0, 80)])
             uploads.clear()
@@ -151,7 +151,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             storage._resident_buffer()
             uploads.clear()
             backing[:] = np.full((8,), 2.0, dtype=np.float32).tobytes()
@@ -171,7 +171,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             buffer, transaction, uploads = storage._begin_planned_upload()
             self.assertIs(buffer, native_buffer)
             self.assertEqual(uploads, [(0, bytes(storage._array.nbytes))])
@@ -191,7 +191,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             _, upload, _ = storage._begin_planned_upload()
             upload._commit_planned_state()
             write = storage._begin_planned_device_write()
@@ -210,7 +210,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             write = storage._begin_planned_device_write()
             self.assertTrue(storage._planned_device_write_pending())
             self.assertIs(storage._resident_buffer(), native_buffer)
@@ -235,7 +235,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             storage._resident_buffer()
             backing[:] = np.full((1024,), 2.0, dtype=np.float32).tobytes()
             storage._mark_device_dirty()
@@ -267,7 +267,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         state._rhi_host.create_buffer.return_value = native_buffer
         state._runtime_generation = 7
 
-        with mock.patch("vernon_dsl._runtime.resources._session_state", return_value=state):
+        with mock.patch("vernon_dsl._runtime.tensor._session_state", return_value=state):
             storage._resident_buffer()
             uploads.clear()
             backing[:] = np.full((element_count,), 2.0, dtype=np.float32).tobytes()
@@ -772,7 +772,7 @@ class TensorViewFrontendTests(unittest.TestCase):
 
     def test_raw_buffer_is_runtime_interop_not_source_type(self) -> None:
         self.assertFalse(hasattr(vd, "RawBuffer"))
-        self.assertEqual(vd.interop.RawBuffer.__module__, "vernon_dsl._runtime.resources")
+        self.assertEqual(vd.interop.RawBuffer.__module__, "vernon_dsl._runtime.tensor")
         with self.assertRaisesRegex(CompileError, "unknown DSL type 'RawBuffer'"):
             compile_source(
                 "from vernon_dsl import *\n@kernel\ndef bad(value: RawBuffer) -> None:\n    pass\n",

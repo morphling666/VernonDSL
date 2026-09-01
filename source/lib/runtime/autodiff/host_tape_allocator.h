@@ -305,6 +305,7 @@ public:
     bool resetRecyclableConstruction();
     bool initializeReader(size_t lane, Reader &reader) const;
     bool isCompacted() const { return compacted_; }
+    bool hasDynamicLanes() const;
     ConstructionState constructionState() const { return constructionState_; }
     size_t constructionBytes() const;
     size_t logicalBytes() const;

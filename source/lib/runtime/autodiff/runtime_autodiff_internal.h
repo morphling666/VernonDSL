@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_policy.h"
+#include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
@@ -35,6 +36,16 @@ struct ValueAbi {
     size_t alignment{1};
     std::vector<uint64_t> logicalShape;
 };
+
+inline std::string canonicalValueLeafPath(const std::string &root, const ValueLeaf &leaf) {
+    std::string result = root;
+    for (const ValuePathComponent &component : leaf.path) {
+        if (!result.empty())
+            result.push_back('.');
+        result += component.field ? *component.field : std::to_string(component.index);
+    }
+    return result;
+}
 
 inline bool sameValueAbi(const ValueAbi &left, const ValueAbi &right) {
     return left.dtype == right.dtype && left.byteSize == right.byteSize && left.alignment == right.alignment &&
@@ -89,6 +100,9 @@ public:
                                const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
     virtual PullbackControlPlaneUsage controlPlaneUsage() const { return {}; }
+    virtual AutodiffPullbackCheckpointPlan checkpointPlan() const { return {}; }
+    virtual std::vector<AutodiffPullbackPassTelemetry> passTelemetry() const { return {}; }
+    virtual uint64_t peakRuntimeManagedBytes() const;
 };
 
 class DevicePullbackExecution : public PullbackExecution {
@@ -108,6 +122,7 @@ public:
 };
 
 size_t dtypeSize(VernonDataType dtype);
+bool materializeDerivativeValueAbi(ValueAbi &derivative, const std::vector<ValueAbi> &sources);
 bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
                              std::string &error);
 bool validLaunchSize(VernonLaunchSize grid);

@@ -193,6 +193,51 @@ struct PythonPullback {
     uint64_t temporaryAllocationTrafficBytes() const { return controlPlaneUsage().temporaryAllocationBytes; }
     uint64_t deviceWaitNanoseconds() const { return controlPlaneUsage().deviceWaitNanoseconds; }
     size_t tapeContextLimitBytes() const { return vernon::runtime::autodiffHostTapeContextLimit(runtime); }
+    uint64_t peakRuntimeManagedBytes() const {
+        return vernon::runtime::autodiffPullbackPeakRuntimeManagedBytes(handle);
+    }
+    nb::object checkpointPlan() const {
+        const vernon::runtime::AutodiffPullbackCheckpointPlan plan =
+            vernon::runtime::autodiffPullbackCheckpointPlan(handle);
+        if (!plan.present)
+            return nb::none();
+        nb::dict result;
+        result["peak_bytes"] = plan.peakBytes;
+        result["memory_budget"] = plan.memoryBudget;
+        result["logical_residual_bytes"] = plan.logicalResidualBytes;
+        result["retained_allocation_bytes"] = plan.retainedAllocationBytes;
+        result["initial_state_bytes"] = plan.initialStateBytes;
+        result["restoration_bytes"] = plan.restorationBytes;
+        result["transaction_bytes"] = plan.transactionBytes;
+        result["persistent_checkpoint_bytes"] = plan.persistentCheckpointBytes;
+        result["backward_value_bytes"] = plan.backwardValueBytes;
+        result["replay_cost"] = plan.replayCost;
+        result["recomputation_cost"] = plan.recomputationCost;
+        result["selected_policy"] = plan.selectedPolicy;
+        return result;
+    }
+    nb::list passTelemetry() const {
+        nb::list result;
+        for (const vernon::runtime::AutodiffPullbackPassTelemetry &item :
+             vernon::runtime::autodiffPullbackPassTelemetry(handle)) {
+            nb::dict telemetry;
+            telemetry["schedule_offset"] = item.scheduleOffset;
+            telemetry["pass_name"] = item.passName;
+            telemetry["residual_source_kind"] = item.residualSourceKind;
+            telemetry["control_history_kind"] = item.controlHistoryKind;
+            telemetry["estimated_tape_bytes"] = item.estimatedTapeBytes;
+            telemetry["logical_residual_bytes"] = item.logicalResidualBytes;
+            telemetry["resident_tape_bytes"] = item.residentTapeBytes;
+            telemetry["allocated_tape_bytes"] = item.allocatedTapeBytes;
+            telemetry["retained_allocation_bytes"] = item.retainedAllocationBytes;
+            telemetry["peak_temporary_tape_bytes"] = item.peakTemporaryTapeBytes;
+            telemetry["checkpoint_bytes"] = item.checkpointBytes;
+            telemetry["active_operation_count"] = item.activeOperationCount;
+            telemetry["recomputation_cost"] = item.recomputationCost;
+            result.append(std::move(telemetry));
+        }
+        return result;
+    }
     const std::vector<PythonAdMetadata> &gradientMetadata() const { return gradients; }
 
 private:
@@ -503,9 +548,16 @@ struct LoadedPipeline {
         return signature;
     }
 
-    nb::tuple programVjp(const nb::dict &inputs, const nb::dict &programBindings, nb::object pipelineOwner) {
+    nb::tuple programVjp(const nb::dict &inputs, const nb::dict &programBindings, nb::object pipelineOwner,
+                         const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
         if (!vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline))
             throw std::runtime_error("pipeline has no Program autodiff signature");
+        if (checkpointMemoryBudget.is_none())
+            vernon::runtime::autodiffSetProgramCheckpointPlan(pipeline, nullptr, checkpointPolicy);
+        else {
+            const uint64_t budget = nb::cast<uint64_t>(checkpointMemoryBudget);
+            vernon::runtime::autodiffSetProgramCheckpointPlan(pipeline, &budget, checkpointPolicy);
+        }
         const auto leafMetadata = [&](const char *kind, size_t index) {
             VernonAdValueMetadataView value{};
             value.struct_size = sizeof(value);
@@ -575,9 +627,12 @@ struct LoadedPipeline {
         VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
         VernonPullback *pullback = nullptr;
         const VernonStatus status = vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputSet, &outputSet, &pullback);
-        if (status != VERNON_STATUS_OK)
-            throw std::runtime_error("Program autodiff forward failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
+        if (status != VERNON_STATUS_OK) {
+            const std::string error = nativeStringView(vernonRuntimeGetLastError(runtime));
+            if (error.find("memory budget") != std::string::npos)
+                throw std::invalid_argument(error);
+            throw std::runtime_error("Program autodiff forward failed: " + error);
+        }
         std::unique_ptr<VernonPullback, decltype(&vernonPullbackDestroy)> pullbackOwner(pullback,
                                                                                         &vernonPullbackDestroy);
         for (PythonAdValue &output : outputValues)

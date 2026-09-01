@@ -10,16 +10,9 @@ from typing import Annotated, Any, get_args, get_origin, get_type_hints
 
 import numpy as np
 
+from ._dtypes import NUMPY_DTYPE_BY_SCALAR
+from .language.scalar_types import SCALAR_TYPES
 from .types import TypeExpr, _Scalar
-
-_DTYPES = {
-    "bool": np.bool_,
-    "i32": np.int32,
-    "u32": np.uint32,
-    "f16": np.float16,
-    "f32": np.float32,
-    "f64": np.float64,
-}
 
 
 @dataclass(frozen=True)
@@ -321,7 +314,7 @@ def unpack_tangent_value(schema: TangentSchema, value: Any) -> Any:
     if isinstance(schema, TangentZero):
         return None
     if isinstance(schema, TangentScalar):
-        return _DTYPES[schema.dtype.name](value)
+        return NUMPY_DTYPE_BY_SCALAR[schema.dtype.name].type(value)
     if isinstance(schema, TangentTensor):
         terminal = schema.child
         while isinstance(terminal, TangentTensor):
@@ -408,7 +401,7 @@ def _consume_native_layout(
     elif annotation is float:
         annotation = _Scalar("f32")
     if isinstance(annotation, _Scalar):
-        dtype = np.dtype(_DTYPES[annotation.name])
+        dtype = NUMPY_DTYPE_BY_SCALAR[annotation.name]
         if dtype.itemsize != node.size:
             raise RuntimeError("NumPy scalar size does not match the native canonical Value ABI")
         return HostAbiLayout(dtype, node.size, node.alignment)
@@ -461,8 +454,7 @@ def _native_value_abi_plan(annotation: Any) -> tuple[_NativeLayoutNode, ...]:
         elif value is float:
             value = _Scalar("f32")
         if isinstance(value, _Scalar):
-            spelling = "i1" if value.name == "bool" else "i32" if value.name in {"i32", "u32"} else value.name
-            return spelling, (value.name,)
+            return SCALAR_TYPES[value.name].mlir, (value.name,)
         if isinstance(value, TypeExpr):
             if value.name == "Tuple":
                 elements = tuple(describe(element, active) for element in value.arguments)
@@ -610,7 +602,7 @@ def unpack_host_value(annotation: Any, value: Any) -> Any:
     elif annotation is float:
         annotation = _Scalar("f32")
     if isinstance(annotation, _Scalar):
-        return _DTYPES[annotation.name](value)
+        return NUMPY_DTYPE_BY_SCALAR[annotation.name].type(value)
     if isinstance(annotation, TypeExpr):
         if annotation.name == "Tuple":
             return tuple(
@@ -645,7 +637,7 @@ def _shape_and_dtype(annotation: TypeExpr) -> tuple[tuple[int, ...], Any] | None
             and isinstance(shape, tuple)
             and all(isinstance(dimension, int) and dimension > 0 for dimension in shape)
         ):
-            return (shape, _DTYPES[scalar.name])
+            return (shape, NUMPY_DTYPE_BY_SCALAR[scalar.name].type)
     if name in {"Vector", "Matrix"}:
         rank = 1 if name == "Vector" else 2
         if (
@@ -653,7 +645,7 @@ def _shape_and_dtype(annotation: TypeExpr) -> tuple[tuple[int, ...], Any] | None
             and isinstance(arguments[0], _Scalar)
             and all(isinstance(dimension, int) and dimension > 0 for dimension in arguments[1:])
         ):
-            return (tuple(arguments[1:]), _DTYPES[arguments[0].name])
+            return (tuple(arguments[1:]), NUMPY_DTYPE_BY_SCALAR[arguments[0].name].type)
     return None
 
 
@@ -661,7 +653,7 @@ def coerce_host_value(annotation: Any, value: Any, field_name: str) -> Any:
     annotation = _base_annotation(annotation)
     if isinstance(annotation, _Scalar):
         try:
-            return _DTYPES[annotation.name](value)
+            return NUMPY_DTYPE_BY_SCALAR[annotation.name].type(value)
         except (TypeError, ValueError, OverflowError) as error:
             raise TypeError(f"field '{field_name}' requires {annotation.name}") from error
     if isinstance(annotation, TypeExpr):

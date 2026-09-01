@@ -3,6 +3,8 @@
 
 #include "llvm/Support/JSON.h"
 
+#include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -17,6 +19,9 @@ struct CanonicalComputeStage {
 
 bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json::Object &request,
                                        const llvm::json::Object &compiledEntry, std::string &error);
+
+std::optional<size_t> resolveProgramValueLeafIndex(const llvm::json::Object &layout, llvm::StringRef source,
+                                                   llvm::StringRef parameter);
 
 bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                                   const std::vector<CanonicalComputeStage> &compiledStages, llvm::json::Object &program,

@@ -68,6 +68,26 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 primalOutputs[publicPath(source.getValue())] = type;
         }
     }
+    const auto reflectDerivativeLayout =
+        [&](mlir::Type derivativeOf, mlir::Type derivativeType,
+            llvm::ArrayRef<llvm::StringRef> logicalDtypes) -> mlir::FailureOr<llvm::json::Object> {
+        mlir::FailureOr<mlir::vernon::ValueAbiLayout> layout =
+            mlir::vernon::getAutodiffDerivativeValueLayout(derivativeOf, derivativeType, module, logicalDtypes);
+        if (mlir::failed(layout))
+            return mlir::failure();
+        mlir::Type logicalType = derivativeType;
+        if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(logicalType))
+            logicalType = view.getElementType();
+        else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(logicalType))
+            logicalType = tensor.getElementType();
+        else if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(logicalType))
+            logicalType = tensor.getElementType();
+        std::string spelling;
+        llvm::raw_string_ostream stream(spelling);
+        logicalType.print(stream);
+        stream.flush();
+        return reflectCanonicalValueLayout(*layout, spelling);
+    };
     const auto reflectValue = [&](uint32_t id, llvm::StringRef name, mlir::Type type, bool external, bool output,
                                   bool authoritativeName = false, llvm::ArrayRef<llvm::StringRef> logicalDtypes = {},
                                   mlir::Type derivativeOf = {}, std::optional<llvm::StringRef> logicalDtype = {}) {
@@ -83,6 +103,15 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 (*reflectedValues[id])["external"] = true;
             if (output)
                 (*reflectedValues[id])["output"] = true;
+            if (derivativeOf) {
+                mlir::FailureOr<llvm::json::Object> layout = reflectDerivativeLayout(derivativeOf, type, logicalDtypes);
+                if (mlir::failed(layout)) {
+                    module.emitError("cannot reflect executable Program derivative Value ABI");
+                    invalid = true;
+                    return;
+                }
+                (*reflectedValues[id])["value_layout"] = std::move(*layout);
+            }
             return;
         }
         std::string spelling;
@@ -139,13 +168,17 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         llvm::SmallVector<llvm::StringRef> layoutDtypes(logicalDtypes.begin(), logicalDtypes.end());
         if (layoutDtypes.empty() && logicalDtype && !logicalDtype->empty())
             layoutDtypes.push_back(*logicalDtype);
-        if (derivativeOf &&
-            failed(mlir::vernon::getAutodiffDerivativeValueLayout(derivativeOf, type, module, layoutDtypes))) {
-            module.emitError("cannot reflect executable Program derivative Value ABI");
-            invalid = true;
-            return;
+        mlir::FailureOr<llvm::json::Object> valueLayout = mlir::failure();
+        if (derivativeOf) {
+            valueLayout = reflectDerivativeLayout(derivativeOf, type, layoutDtypes);
+            if (mlir::failed(valueLayout)) {
+                module.emitError("cannot reflect executable Program derivative Value ABI");
+                invalid = true;
+                return;
+            }
+        } else {
+            valueLayout = reflectCanonicalValueLayout(module, layoutType, layoutDtypes);
         }
-        mlir::FailureOr<llvm::json::Object> valueLayout = reflectCanonicalValueLayout(module, layoutType, layoutDtypes);
         if (mlir::failed(valueLayout)) {
             module.emitError("cannot reflect executable Program Value ABI");
             invalid = true;
@@ -259,6 +292,31 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             auto resultResourceSources =
                 operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.result_resource_sources");
             auto operandAccesses = operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.operand_accesses");
+            auto operandAutodiffRoles =
+                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.operand_autodiff_roles");
+            auto operandAutodiffSources =
+                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.operand_autodiff_sources");
+            auto resultAutodiffRoles = operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.result_autodiff_roles");
+            auto resultAutodiffSources =
+                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.result_autodiff_sources");
+            const auto derivativeOrigin = [&](mlir::ArrayAttr roles, mlir::ArrayAttr sources,
+                                              size_t index) -> mlir::Type {
+                if (!roles || !sources || index >= roles.size() || index >= sources.size())
+                    return {};
+                auto role = mlir::dyn_cast<mlir::StringAttr>(roles[index]);
+                auto source = mlir::dyn_cast<mlir::StringAttr>(sources[index]);
+                if (!role || !source)
+                    return {};
+                if (role.getValue() == "gradient") {
+                    auto found = primalInputs.find(publicPath(source.getValue()));
+                    return found == primalInputs.end() ? mlir::Type{} : found->second;
+                }
+                if (role.getValue() == "cotangent") {
+                    auto found = primalOutputs.find(publicPath(source.getValue()));
+                    return found == primalOutputs.end() ? mlir::Type{} : found->second;
+                }
+                return {};
+            };
             const size_t operandOffset =
                 mlir::isa<mlir::vernon::program::GraphicsOp>(operation) ? operation.getNumResults() : 0;
             if (!nodeId || !stage || !operandIds || !resultIds || !dependencies || !operandNames || !resultNames ||
@@ -304,7 +362,8 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 }
                 auto abi = mlir::vernon::program::getProgramValueLanguageAbi(operation.getOperand(index));
                 reflectValue(static_cast<uint32_t>(id), "value." + std::to_string(id),
-                             operation.getOperand(index).getType(), false, false, false, abi.leaves, {}, abi.dtype);
+                             operation.getOperand(index).getType(), false, false, false, abi.leaves,
+                             derivativeOrigin(operandAutodiffRoles, operandAutodiffSources, index), abi.dtype);
             }
             if (gridControlArguments)
                 for (int64_t argumentIndex : gridControlArguments.asArrayRef()) {
@@ -352,7 +411,8 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                         logicalDtypes.push_back(dtype);
                 }
                 reflectValue(static_cast<uint32_t>(id), "value." + std::to_string(id),
-                             operation.getResult(index).getType(), false, false, false, logicalDtypes);
+                             operation.getResult(index).getType(), false, false, false, logicalDtypes,
+                             derivativeOrigin(resultAutodiffRoles, resultAutodiffSources, index));
             }
             for (int64_t dependency : dependencies.asArrayRef())
                 reflectedDependencies.emplace_back(dependency);
@@ -360,13 +420,6 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             node["results"] = std::move(results);
             node["dependencies"] = std::move(reflectedDependencies);
             llvm::json::Array bindings;
-            auto operandAutodiffRoles =
-                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.operand_autodiff_roles");
-            auto operandAutodiffSources =
-                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.operand_autodiff_sources");
-            auto resultAutodiffRoles = operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.result_autodiff_roles");
-            auto resultAutodiffSources =
-                operation.getAttrOfType<mlir::ArrayAttr>("vernon_program.result_autodiff_sources");
             const auto binding = [&](mlir::Attribute name, int64_t id, mlir::ArrayAttr roles, mlir::ArrayAttr sources,
                                      size_t index) {
                 llvm::json::Object reflected{{"parameter", mlir::cast<mlir::StringAttr>(name).getValue().str()},

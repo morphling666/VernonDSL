@@ -8,7 +8,8 @@ from typing import Any
 from .autodiff import invalidate_loaded_vjps
 from .kernel import Kernel
 from .pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from .resources import TensorLayout, TensorStorage, TensorView, Texture
+from .tensor import TensorLayout, TensorStorage, TensorView
+from .texture import Texture
 
 try:
     from .. import _native

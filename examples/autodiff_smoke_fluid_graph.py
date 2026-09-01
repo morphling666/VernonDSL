@@ -162,7 +162,7 @@ class SmokeFluidRolloutModule(vd.Module):
         initial_density: vd.TensorStorage,
         initial_velocity: vd.TensorStorage,
         target_density: vd.TensorStorage,
-    ) -> vd.TensorStorage:
+    ) -> vd.TensorStorage | None:
         density = initial_density
         velocity = initial_velocity
         loss: vd.TensorStorage | None = None
@@ -171,7 +171,6 @@ class SmokeFluidRolloutModule(vd.Module):
             density = outputs.density
             velocity = outputs.velocity
             loss = outputs.loss
-        assert loss is not None
         return loss
 
 

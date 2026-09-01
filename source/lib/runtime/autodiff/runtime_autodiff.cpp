@@ -49,6 +49,22 @@ size_t dtypeSize(VernonDataType dtype) {
     }
 }
 
+bool materializeDerivativeValueAbi(ValueAbi &derivative, const std::vector<ValueAbi> &sources) {
+    const auto source = std::find_if(sources.begin(), sources.end(),
+                                     [&](const ValueAbi &value) { return value.path == derivative.path; });
+    if (source == sources.end())
+        return false;
+    const size_t sourceScalar = dtypeSize(source->dtype);
+    const size_t derivativeScalar = dtypeSize(derivative.dtype);
+    if (!sourceScalar || !derivativeScalar || source->byteSize % sourceScalar ||
+        (source->byteSize / sourceScalar &&
+         derivativeScalar > std::numeric_limits<size_t>::max() / (source->byteSize / sourceScalar)))
+        return false;
+    derivative.byteSize = (source->byteSize / sourceScalar) * derivativeScalar;
+    derivative.logicalShape = source->logicalShape;
+    return true;
+}
+
 bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
                              std::string &error) {
     const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
@@ -77,11 +93,7 @@ bool appendParameterValueAbi(const Parameter &parameter, const std::string &root
                 return error = "autodiff parameter leaf byte size overflows", false;
             bytes *= elementCount;
         }
-        std::string path = rootPath;
-        for (const ValuePathComponent &component : leaf.path) {
-            path.push_back('.');
-            path += component.field ? *component.field : std::to_string(component.index);
-        }
+        std::string path = canonicalValueLeafPath(rootPath, leaf);
         std::vector<uint64_t> shape = parameter.shape;
         shape.insert(shape.end(), leaf.shape.begin(), leaf.shape.end());
         ValueAbi candidate{std::move(path), *dtype, bytes, std::max<size_t>(layout.alignment, 1), std::move(shape)};
@@ -429,6 +441,42 @@ vernon::runtime::autodiffPullbackControlPlaneUsage(const VernonPullback *pullbac
             usage.atomicPublications,
             usage.temporaryAllocationBytes,
             usage.deviceWaitNanoseconds};
+}
+
+uint64_t vernon::runtime::ad::PullbackExecution::peakRuntimeManagedBytes() const {
+    const PullbackMemoryUsage usage = memoryUsage();
+    return std::max(std::max(usage.retainedAllocationBytes, usage.allocatedBytes), usage.peakTemporaryBytes);
+}
+
+vernon::runtime::AutodiffPullbackCheckpointPlan
+vernon::runtime::autodiffPullbackCheckpointPlan(const VernonPullback *pullback) {
+    if (!pullback || !pullback->execution)
+        return {};
+    return pullback->execution->checkpointPlan();
+}
+
+std::vector<vernon::runtime::AutodiffPullbackPassTelemetry>
+vernon::runtime::autodiffPullbackPassTelemetry(const VernonPullback *pullback) {
+    if (!pullback || !pullback->execution)
+        return {};
+    return pullback->execution->passTelemetry();
+}
+
+uint64_t vernon::runtime::autodiffPullbackPeakRuntimeManagedBytes(const VernonPullback *pullback) {
+    if (!pullback || !pullback->execution)
+        return 0;
+    return pullback->execution->peakRuntimeManagedBytes();
+}
+
+void vernon::runtime::autodiffSetProgramCheckpointPlan(VernonLoadedPipeline *pipeline, const uint64_t *memoryBudget,
+                                                       std::string_view policy) {
+    if (!pipeline || !pipeline->topology)
+        return;
+    if (memoryBudget)
+        pipeline->topology->programCheckpointMemoryBudget = *memoryBudget;
+    else
+        pipeline->topology->programCheckpointMemoryBudget.reset();
+    pipeline->topology->programCheckpointPolicy = std::string(policy);
 }
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {

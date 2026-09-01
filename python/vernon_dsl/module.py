@@ -8,21 +8,14 @@ from typing import Any
 
 import numpy as np
 
-from ._runtime.resources import TensorStorage, TensorView
+from ._dtypes import scalar_name
+from ._runtime.tensor import TensorStorage, TensorView
 
 
 def _tensor_dtype(value: TensorStorage) -> Any:
     if value._element_type is not None:
         return value._element_type
-    scalar_by_dtype = {
-        np.dtype(np.bool_): "bool",
-        np.dtype(np.int32): "i32",
-        np.dtype(np.uint32): "u32",
-        np.dtype(np.float16): "f16",
-        np.dtype(np.float32): "f32",
-        np.dtype(np.float64): "f64",
-    }
-    name = scalar_by_dtype.get(value.dtype)
+    name = scalar_name(value.dtype)
     if name is None:
         raise TypeError(f"cannot allocate a Module transient for dtype {value.dtype}")
     types = __import__("vernon_dsl.types", fromlist=[name])

@@ -13,6 +13,7 @@ from .autodiff import (
     _invoke_structured_pipeline,
     _retained_primal_allocation_bytes,
 )
+from .binding import _NativeBindingCache
 from .execution_graph import (
     CompiledExecutionGraph,
     ComputeEncoder,
@@ -23,7 +24,7 @@ from .execution_graph import (
     SubmissionState,
 )
 from .kernel import _session_state
-from .resources import TensorStorage, TensorView, _NativeBindingCache
+from .tensor import TensorStorage, TensorView
 
 _DerivativeEndpoint = GraphResource | ExecutionParameter
 

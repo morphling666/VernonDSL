@@ -43,7 +43,7 @@ def main() -> None:
     noise = load_rgba_texture(Path(__file__).parent / "assets" / "noise512.png")
     noise_sampler = vd.sampler(address="repeat")
     output = vd.Texture.zeros(shape=(options.size, options.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output)
+    target = vd.RenderTarget.from_attachments(colors={0: output})
     render_terrain = vd.pipeline(fullscreen_vertex, terrain_fragment)
     quality = {
         "smoke": (np.int32(64), np.int32(16), np.int32(2)),

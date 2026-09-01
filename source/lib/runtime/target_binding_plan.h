@@ -39,6 +39,7 @@ struct TargetEndpointIdentity {
     uint32_t portableSlot{UINT32_MAX};
     std::string access;
     uint32_t value{UINT32_MAX};
+    std::optional<size_t> leaf;
 };
 
 struct TargetNativeLocation {
@@ -117,6 +118,7 @@ struct ResolvedExecutablePlan {
     std::vector<ResolvedExecutableNode> nodes;
 };
 
+vernon::runtime::ValueLayout materializeValueLayout(const ValueLayout &layout, std::string logicalType = {});
 bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, const ResolvedStage &stage,
                             VernonRuntimeBackend backend, TargetBindingPlan &plan, Diagnostic &diagnostic);
 bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBackend backend,

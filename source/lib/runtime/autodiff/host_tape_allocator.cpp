@@ -1262,6 +1262,14 @@ size_t HostStaticTapeBatch::allocatedBytes() const {
            (dynamic ? dynamic->allocatedBytes() : 0);
 }
 
+bool HostStaticTapeBatch::hasDynamicLanes() const {
+    if (!compactedLaneKinds_.empty())
+        return std::any_of(compactedLaneKinds_.begin(), compactedLaneKinds_.end(),
+                           [](uint8_t kind) { return kind != 0; });
+    return std::any_of(lanes_.begin(), lanes_.end(),
+                       [](const LaneState &lane) { return lane.phase == LanePhase::Promoted; });
+}
+
 bool HostStaticTapeBatch::compact(bool retainConstructionStorage) {
     if (compacted_)
         return true;

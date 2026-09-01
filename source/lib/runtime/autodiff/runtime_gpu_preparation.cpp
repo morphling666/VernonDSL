@@ -34,15 +34,6 @@ bool checkedMultiply(size_t left, size_t right, size_t &result) {
     return true;
 }
 
-std::string leafPath(const std::string &root, const ValueLeaf &leaf) {
-    std::string result = root;
-    for (const ValuePathComponent &component : leaf.path) {
-        result.push_back('.');
-        result += component.field ? *component.field : std::to_string(component.index);
-    }
-    return result;
-}
-
 bool valueMatchesTemplate(const VernonAdValue &value, const ValueAbi &abi) {
     if (value.dtype != abi.dtype || !value.data || value.rank != abi.logicalShape.size() ||
         (value.rank && !value.shape))
@@ -174,7 +165,7 @@ const VernonAdValue *findParameterValue(const VernonAdValueSet &set, const Param
     if (!singleLeafParameter(parameter))
         return nullptr;
     const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
-    return findValue(set, leafPath(parameter.name, layout->leaves.front()));
+    return findValue(set, canonicalValueLeafPath(parameter.name, layout->leaves.front()));
 }
 
 const VernonAdValue *findParameterValues(const VernonAdValueSet &set, const Parameter &parameter) {
@@ -183,7 +174,7 @@ const VernonAdValue *findParameterValues(const VernonAdValueSet &set, const Para
         return nullptr;
     const VernonAdValue *representative = nullptr;
     for (const ValueLeaf &leaf : layout->leaves) {
-        const VernonAdValue *value = findValue(set, leafPath(parameter.name, leaf));
+        const VernonAdValue *value = findValue(set, canonicalValueLeafPath(parameter.name, leaf));
         if (!value)
             return nullptr;
         if (!representative)
@@ -358,7 +349,7 @@ bool stageForwardValues(const Signature &signature, const Variant &variant, Devi
                 if (!singleLeafParameter(value))
                     return false;
                 const ValueLayout &layout = value.valueLayout ? *value.valueLayout : value.elementLayout;
-                return leafPath(value.name, layout.leaves.front()) == output.path;
+                return canonicalValueLeafPath(value.name, layout.leaves.front()) == output.path;
             });
         if (parameter == variant.parameters.end())
             return false;
@@ -403,22 +394,11 @@ bool materializeRuntimeSignature(const Signature &source, const VernonAdValueSet
             return false;
         output = *input;
     }
-    const auto materializeDerivative = [](ValueAbi &abi, const std::vector<ValueAbi> &sources) {
-        const auto source =
-            std::find_if(sources.begin(), sources.end(), [&](const ValueAbi &value) { return value.path == abi.path; });
-        if (source == sources.end())
-            return false;
-        abi.logicalShape = source->logicalShape;
-        const size_t sourceScalar = dtypeSize(source->dtype);
-        const size_t derivativeScalar = dtypeSize(abi.dtype);
-        return sourceScalar && derivativeScalar && source->byteSize % sourceScalar == 0 &&
-               checkedMultiply(source->byteSize / sourceScalar, derivativeScalar, abi.byteSize);
-    };
     for (ValueAbi &cotangent : result.cotangents)
-        if (!materializeDerivative(cotangent, result.outputs))
+        if (!materializeDerivativeValueAbi(cotangent, result.outputs))
             return false;
     for (ValueAbi &gradient : result.gradients)
-        if (!materializeDerivative(gradient, result.inputs))
+        if (!materializeDerivativeValueAbi(gradient, result.inputs))
             return false;
     return true;
 }

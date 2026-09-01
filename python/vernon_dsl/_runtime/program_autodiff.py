@@ -8,7 +8,11 @@ from typing import Any, Mapping
 import numpy as np
 
 from .._shader_assets.artifact_io import write_external_artifact
-from .._shader_assets.cooking import _canonical_deployment, _compile_program_bundle_plan, _native_target
+from .._shader_assets.cooking import (
+    _canonical_deployment,
+    _compile_program_bundle_plan,
+    _native_target,
+)
 from ..bundle import CpuTargetOptions, canonical_json
 from ..storage import TensorStorage
 from . import session as state
@@ -22,6 +26,14 @@ def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
     for component in leaf_path[len(root) + 1 :].split("."):
         projection = projection[int(component)] if component.isdigit() else projection.field(component)
     return projection
+
+
+def _program_host_array(value: Any) -> np.ndarray:
+    if hasattr(value, "_native_host_array"):
+        return np.asarray(value._native_host_array())
+    if hasattr(value, "to_numpy"):
+        return np.asarray(value.to_numpy())
+    return np.asarray(value)
 
 
 class ProgramNativePullback:
@@ -44,7 +56,8 @@ class ProgramNativePullback:
             if len(paths) != 1:
                 raise ValueError("implicit Program cotangent requires exactly one output")
             output = self._outputs[paths[0]]
-            supplied: Any = np.ones(np.asarray(output).shape, dtype=np.asarray(output).dtype)
+            host = _program_host_array(output)
+            supplied: Any = np.ones(host.shape, dtype=host.dtype)
         elif isinstance(cotangents, Mapping):
             if set(cotangents) != set(paths):
                 raise ValueError("Program pullback requires exactly one cotangent per output")
@@ -73,7 +86,7 @@ class ProgramNativePullback:
             )
         )
         return {
-            path: value if isinstance(value, TensorStorage) else TensorStorage.from_numpy(np.asarray(value))
+            path: (value if isinstance(value, TensorStorage) else TensorStorage.from_numpy(np.asarray(value)))
             for path, value in gradients.items()
         }
 
@@ -101,6 +114,23 @@ class ProgramNativePullback:
     def peak_temporary_bytes(self) -> int:
         return int(self._native.peak_temporary_bytes)
 
+    @property
+    def tape_context_limit_bytes(self) -> int:
+        return int(self._native.tape_context_limit_bytes)
+
+    @property
+    def peak_runtime_managed_bytes(self) -> int:
+        return int(self._native.peak_runtime_managed_bytes)
+
+    @property
+    def checkpoint_plan(self) -> Mapping[str, Any] | None:
+        plan = self._native.checkpoint_plan
+        return dict(plan) if plan is not None else None
+
+    @property
+    def pass_telemetry(self) -> tuple[dict[str, Any], ...]:
+        return tuple(dict(item) for item in self._native.pass_telemetry)
+
 
 @dataclass
 class ProgramAutodiffSpecialization:
@@ -108,7 +138,13 @@ class ProgramAutodiffSpecialization:
     pipeline: Any
     directory: tempfile.TemporaryDirectory[str]
 
-    def invoke(self, invocation: Any) -> tuple[Any, ProgramNativePullback]:
+    def invoke(
+        self,
+        invocation: Any,
+        *,
+        checkpoint_memory_budget: int | None = None,
+        checkpoint_policy: str = "",
+    ) -> tuple[Any, ProgramNativePullback]:
         signature = self.pipeline.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
         if set(invocation.inputs) != expected_inputs:
@@ -117,7 +153,7 @@ class ProgramAutodiffSpecialization:
                 f"expected={sorted(expected_inputs)}, actual={sorted(invocation.inputs)}"
             )
         native_inputs = {
-            path: value._native_host_array() if hasattr(value, "_native_host_array") else value
+            path: (value._native_host_array() if hasattr(value, "_native_host_array") else value)
             for path, value in invocation.inputs.items()
         }
         from ..program import flatten_program_outputs
@@ -125,7 +161,12 @@ class ProgramAutodiffSpecialization:
         targets = flatten_program_outputs(invocation.outputs)
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
-        native_outputs, native_pullback = self.pipeline.program_vjp(native_inputs, program_bindings)
+        native_outputs, native_pullback = self.pipeline.program_vjp(
+            native_inputs,
+            program_bindings,
+            checkpoint_memory_budget=checkpoint_memory_budget,
+            checkpoint_policy=checkpoint_policy,
+        )
         derivative_groups = _pipeline_derivative_groups(self.pipeline)
         output_groups = tuple(group for group in derivative_groups if group.role == "cotangent")
         expected_output_leaves = {leaf for group in output_groups for leaf in group.leaf_paths}

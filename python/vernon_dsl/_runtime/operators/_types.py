@@ -5,68 +5,49 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-import numpy as np
-
-from ..resources import TensorStorage, TensorView
+from ..._dtypes import scalar_name as _scalar_name
+from ..._mlir import first_generic_type_argument, generic_type_arguments, ranked_tensor_parts
+from ...language.scalar_types import SCALAR_TYPES
+from ..tensor import TensorStorage, TensorView
 
 
 class ImplementationUnavailable(Exception):
     pass
 
 
-_SCALAR_BY_DTYPE = {
-    np.dtype(np.bool_): "bool",
-    np.dtype(np.int32): "i32",
-    np.dtype(np.uint32): "u32",
-    np.dtype(np.float16): "f16",
-    np.dtype(np.float32): "f32",
-    np.dtype(np.float64): "f64",
-}
-
-_SCALAR_ANNOTATIONS = {
-    "f16": "vd.f16",
-    "f32": "vd.f32",
-    "f64": "vd.f64",
-    "i32": "vd.i32",
-    "u32": "vd.u32",
-    "bool": "vd.bool",
-    "i1": "vd.bool",
-}
+_SCALAR_ANNOTATIONS = {name: f"vd.{name}" for name in SCALAR_TYPES} | {"i1": "vd.bool"}
 
 
 def scalar_name(value: TensorStorage | TensorView) -> str | None:
-    return _SCALAR_BY_DTYPE.get(np.dtype(value.dtype))
+    return _scalar_name(value.dtype)
 
 
-def _mlir_tensor_view_element(spelling: str) -> str | None:
-    marker = "tensor_view<"
-    start = spelling.find(marker)
-    if start < 0:
-        return None
-    body = spelling[start + len(marker) :]
-    depth = 0
-    for index, character in enumerate(body):
-        if character == "<":
-            depth += 1
-        elif character == ">":
-            depth -= 1
-        elif character == "," and depth == 0:
-            return body[:index].strip()
+def _python_type_annotation(element: str) -> str | None:
+    if element in _SCALAR_ANNOTATIONS:
+        return _SCALAR_ANNOTATIONS[element]
+    tensor = ranked_tensor_parts(element)
+    if tensor is not None:
+        shape, dtype = tensor
+        if dtype in _SCALAR_ANNOTATIONS and all(extent.isdigit() for extent in shape):
+            extents = tuple(int(extent) for extent in shape)
+            scalar = _SCALAR_ANNOTATIONS[dtype]
+            if len(extents) == 1:
+                return f"vd.Vector[{scalar}, {extents[0]}]"
+            return f"vd.Tensor[{scalar}, ({', '.join(str(extent) for extent in extents)},)]"
+    if element.startswith("tuple<") and element.endswith(">"):
+        arguments = generic_type_arguments(element, "tuple")
+        members = tuple(_python_type_annotation(argument) for argument in arguments or ())
+        if members and all(member is not None for member in members):
+            return f"vd.Tuple[{', '.join(member for member in members if member is not None)}]"
     return None
 
 
 def python_element_annotation(value: Mapping[str, Any]) -> str | None:
-    element = _mlir_tensor_view_element(str(value.get("type") or ""))
-    if element in _SCALAR_ANNOTATIONS:
-        return _SCALAR_ANNOTATIONS[element]
-    if element and element.startswith("tensor<") and element.endswith(">"):
-        parts = element[len("tensor<") : -1].split("x")
-        if len(parts) >= 2 and parts[-1] in _SCALAR_ANNOTATIONS and all(part.isdigit() for part in parts[:-1]):
-            extents = tuple(int(part) for part in parts[:-1])
-            scalar = _SCALAR_ANNOTATIONS[parts[-1]]
-            if len(extents) == 1:
-                return f"vd.Vector[{scalar}, {extents[0]}]"
-            return f"vd.Tensor[{scalar}, ({', '.join(str(extent) for extent in extents)},)]"
+    element = first_generic_type_argument(str(value.get("type") or ""), "!vernon.tensor_view")
+    if element:
+        annotation = _python_type_annotation(element)
+        if annotation is not None:
+            return annotation
     dtype = value.get("dtype")
     if isinstance(dtype, str) and dtype in _SCALAR_ANNOTATIONS:
         return _SCALAR_ANNOTATIONS[dtype]

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 from ._runtime.execution_graph import LoadOperation, StoreOperation
-from ._runtime.resources import RenderTarget
+from ._runtime.texture import RenderTarget
 
 
 @dataclass(frozen=True)

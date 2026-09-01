@@ -91,18 +91,6 @@ bool hasPathPrefix(ArrayRef<ValueAbiPathComponent> path, ArrayRef<ValueAbiPathCo
     return path.size() >= prefix.size() && llvm::equal(prefix, path.take_front(prefix.size()), samePathComponent);
 }
 
-std::string appendAbiPath(StringRef root, ArrayRef<ValueAbiPathComponent> path) {
-    std::string result = root.str();
-    for (const ValueAbiPathComponent &component : path) {
-        result.push_back('.');
-        if (component.field)
-            result.append(*component.field);
-        else
-            result.append(std::to_string(component.index));
-    }
-    return result;
-}
-
 FailureOr<SmallVector<StringRef>> getDtypes(ArrayAttr attribute) {
     SmallVector<StringRef> result;
     if (!attribute)
@@ -1033,7 +1021,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveWrt() {
         for (auto [leafIndex, leaf] : llvm::enumerate(values[*valueIndex].layout.leaves)) {
             if (!hasPathPrefix(leaf.path, prefix) || !isDifferentiable(leaf))
                 continue;
-            const std::string path = appendAbiPath(components.front(), leaf.path);
+            const std::string path = appendValueAbiPath(components.front(), leaf.path);
             if (!canonicalPaths.insert(path).second)
                 return emitFunctionError(Twine("duplicate canonical wrt leaf '") + path + "'");
             Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
@@ -1101,9 +1089,9 @@ LogicalResult AutodiffAnalysisBuilder::resolveResults() {
                 if (!node)
                     return emitFunctionError("differentiable result leaf cannot be projected to returned SSA value");
                 resultNodes.push_back(*node);
-                std::string path = appendAbiPath(root, leaf.path);
+                std::string path = appendValueAbiPath(root, leaf.path);
                 if (function.getNumResults() > 1 && root == "output")
-                    path = appendAbiPath(("output." + std::to_string(resultIndex)), leaf.path);
+                    path = appendValueAbiPath(("output." + std::to_string(resultIndex)), leaf.path);
                 result.activeResultLeaves.push_back(
                     AutodiffLeaf{value, static_cast<unsigned>(leafIndex), root.str(), std::move(path), leaf.scalarType,
                                  leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)
@@ -1182,7 +1170,7 @@ LogicalResult AutodiffAnalysisBuilder::resolveStorageOutputs() {
         for (auto [leafIndex, leaf] : llvm::enumerate(values[*valueIndex].layout.leaves)) {
             if (!hasPathPrefix(leaf.path, prefix) || !isDifferentiable(leaf))
                 continue;
-            std::string leafPath = appendAbiPath(components.front(), leaf.path);
+            std::string leafPath = appendValueAbiPath(components.front(), leaf.path);
             if (!canonicalPaths.insert(leafPath).second)
                 return emitFunctionError(Twine("duplicate canonical Storage output leaf '") + leafPath + "'");
             Type derivativeType = leaf.shape.empty() ? *getAutodiffDerivativeScalarType(leaf.scalarType)

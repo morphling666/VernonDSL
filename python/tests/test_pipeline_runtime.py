@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import json
 import types
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -54,16 +56,20 @@ from pipeline_shader import (
 
 
 def render_target(texture: vd.Texture) -> vd.RenderTarget:
-    return vd.RenderTarget(shape=texture.shape).attach_color(0, texture)
+    return vd.RenderTarget.from_attachments(colors={0: texture})
 
 
 def mrt_target(color: vd.Texture, object_id: vd.Texture) -> vd.RenderTarget:
-    return vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
+    return vd.RenderTarget.from_attachments(colors={0: color, 1: object_id})
 
 
 class RenderTargetTests(unittest.TestCase):
     def test_render_target_use_is_immutable_and_complete(self) -> None:
-        target = vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(16, 16))).attach_depth()
+        target = vd.RenderTarget.create(
+            shape=(16, 16),
+            color_formats={0: vd.rgba8_unorm},
+            depth_format=vd.d32_float,
+        )
         use = vd.render(
             target,
             color=vd.clear((0.1, 0.2, 0.3, 1.0)),
@@ -75,43 +81,88 @@ class RenderTargetTests(unittest.TestCase):
         self.assertEqual(use.colors[0][0], 0)
         self.assertEqual(use.colors[0][1].clear_value, (0.1, 0.2, 0.3, 1.0))
         self.assertEqual(use.render_area, (1, 2, 8, 9))
+        self.assertFalse(hasattr(target, "attach_color"))
+        self.assertFalse(hasattr(target, "attach_depth"))
         with self.assertRaisesRegex(TypeError, "either color or colors"):
             vd.render(target, color=vd.load(), colors={0: vd.load()})
 
-    def test_attachment_validation(self) -> None:
+    def test_from_attachments_views_ownership_and_validation(self) -> None:
         color = vd.Texture.zeros(shape=(16, 16))
-        with self.assertRaisesRegex(ValueError, "two positive dimensions"):
-            vd.RenderTarget(shape=(16, 0))
+        color_view = color.view()
+        depth = vd.Texture.device(shape=color.shape, format=vd.d32_float)
+        depth_view = depth.view()
+        target = vd.RenderTarget.from_attachments(colors={0: color_view}, depth=depth_view)
+
+        self.assertEqual(target.shape, color.shape)
+        self.assertIs(target.color_view(0), color_view)
+        self.assertIs(target.color_texture(0), color)
+        self.assertIs(target.depth_view, depth_view)
+        self.assertIs(target.depth_texture, depth)
+        with self.assertRaisesRegex(ValueError, "not occupied"):
+            target.color_view(1)
+        with self.assertRaisesRegex(ValueError, "not occupied"):
+            target.color_texture(1)
+        with self.assertRaisesRegex(RuntimeError, "no depth attachment"):
+            _ = vd.RenderTarget.from_attachments(colors={0: color}).depth_view
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            vd.RenderTarget.from_attachments(colors={})
         with self.assertRaisesRegex(ValueError, "dimensions"):
-            vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(8, 16)))
-
-        target = vd.RenderTarget(shape=(16, 16)).attach_color(0, color)
-        with self.assertRaisesRegex(ValueError, "already occupied"):
-            target.attach_color(0, color)
+            vd.RenderTarget.from_attachments(colors={0: color, 1: vd.Texture.zeros(shape=(8, 16))})
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            target.attach_color(-1, color)
+            vd.RenderTarget.from_attachments(colors={-1: color})
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            vd.RenderTarget.from_attachments(colors={True: color})
+        with self.assertRaisesRegex(ValueError, "two-dimensional color"):
+            vd.RenderTarget.from_attachments(colors={0: depth})
+        with self.assertRaisesRegex(ValueError, "two-dimensional depth"):
+            vd.RenderTarget.from_attachments(colors={}, depth=color)
+        with self.assertRaisesRegex(ValueError, "color_attachment usage"):
+            vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16), usage=("sampled",))})
+        with self.assertRaisesRegex(ValueError, "depth_stencil_attachment usage"):
+            vd.RenderTarget.from_attachments(
+                colors={},
+                depth=vd.Texture.device(shape=(16, 16), format=vd.d32_float, usage=("sampled",)),
+            )
 
-        target.attach_depth()
-        with self.assertRaisesRegex(ValueError, "already has"):
-            target.attach_depth()
-
-    def test_render_target_owned_depth_and_cube_texture_validation(self) -> None:
-        target = vd.RenderTarget(shape=(16, 16)).attach_depth()
+    def test_create_owned_attachments_and_transfer_validation(self) -> None:
+        target = vd.RenderTarget.create(
+            shape=(16, 16),
+            color_formats={0: vd.rgba16_float, 3: vd.r32_float},
+            depth_format=vd.d32_float,
+        )
         depth = target.depth_texture
         self.assertEqual(target.shape, (16, 16))
+        self.assertEqual(target.color_view(0).format, vd.rgba16_float)
+        self.assertEqual(target.color_texture(3).format, vd.r32_float)
+        self.assertIs(target.color_view(0).owner, target.color_texture(0))
+        self.assertIs(target.depth_view.owner, depth)
         self.assertEqual(depth.shape, (16, 16))
-        with self.assertRaisesRegex(RuntimeError, "cannot be uploaded"):
+        target_reference = weakref.ref(target)
+        del target
+        gc.collect()
+        self.assertIsNone(target_reference())
+        self.assertEqual(depth.format, vd.d32_float)
+        with self.assertRaisesRegex(RuntimeError, "transfer_destination"):
             depth.copy_from_numpy(np.zeros((16, 16), dtype=np.float32))
-        with self.assertRaisesRegex(RuntimeError, "readback is not exposed"):
+        with self.assertRaisesRegex(RuntimeError, "transfer_source"):
             depth.to_numpy()
+        with self.assertRaisesRegex(ValueError, "2 positive dimensions"):
+            vd.RenderTarget.create(shape=(16, 0))
+        with self.assertRaisesRegex(ValueError, "two-dimensional color"):
+            vd.RenderTarget.create(shape=(16, 16), color_formats={0: vd.d32_float})
+        with self.assertRaisesRegex(ValueError, "two-dimensional depth"):
+            vd.RenderTarget.create(shape=(16, 16), color_formats={}, depth_format=vd.rgba8_unorm)
+        with self.assertRaisesRegex(ValueError, "exactly one mip"):
+            vd.RenderTarget.from_attachments(
+                colors={0: vd.Texture.zeros(shape=(16, 16), mip_levels=2)},
+            )
 
         faces = np.zeros((6, 8, 8, 4), dtype=np.uint8)
         cube = vd.Texture.cube(faces)
         self.assertEqual(cube.shape, (8, 8))
         np.testing.assert_array_equal(cube.to_numpy(), faces)
 
-        with self.assertRaisesRegex(RuntimeError, "no depth attachment"):
-            _ = vd.RenderTarget(shape=(16, 16)).depth_texture
         with self.assertRaisesRegex(ValueError, "6"):
             vd.Texture.cube(np.zeros((5, 8, 8, 4), dtype=np.uint8))
 
@@ -128,8 +179,8 @@ class RenderTargetTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "3 positive dimensions"):
             vd.Texture.zeros(shape=(3, 4), dimension="3d")
-        with self.assertRaisesRegex(ValueError, "two positive dimensions"):
-            vd.RenderTarget(shape=texture.shape)
+        with self.assertRaisesRegex(ValueError, "two-dimensional"):
+            vd.RenderTarget.from_attachments(colors={0: texture})
 
     def test_texture_formats_mips_and_subregions(self) -> None:
         texture = vd.Texture.zeros(
@@ -175,7 +226,10 @@ def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
         np.array(((1.0, 0.0, 0.0, 1.0),) * 3 + ((0.0, 1.0, 0.0, 1.0),) * 3, dtype=np.float32)
     )
     target = vd.Texture.zeros(shape=(32, 32))
-    attachments = render_target(target).attach_depth()
+    attachments = vd.RenderTarget.from_attachments(
+        colors={0: target},
+        depth=vd.Texture.device(shape=target.shape, format=vd.d32_float),
+    )
 
     vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=attachments)
 
@@ -958,7 +1012,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exactly match"):
             render(position=positions, offset=offsets, indices=indices, target=render_target(color))
         with self.assertRaisesRegex(ValueError, "dimensions"):
-            vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, vd.Texture.zeros(shape=(16, 16)))
+            vd.RenderTarget.from_attachments(colors={0: color, 1: vd.Texture.zeros(shape=(16, 16))})
         with self.assertRaisesRegex(RuntimeError, "shape"):
             render(
                 position=positions,

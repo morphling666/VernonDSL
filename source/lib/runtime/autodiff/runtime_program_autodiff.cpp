@@ -141,8 +141,100 @@ struct ProgramResidualPlan {
     uint32_t replayEnd{};
 };
 
+execution::detail::AutodiffCheckpointPolicy programCheckpointPolicy(const std::string &name) {
+    if (name == "min_memory")
+        return execution::detail::AutodiffCheckpointPolicy::MinMemory;
+    if (name == "min_runtime")
+        return execution::detail::AutodiffCheckpointPolicy::MinRuntime;
+    return execution::detail::AutodiffCheckpointPolicy::Balanced;
+}
+
+std::string programPassName(const ProgramNode &node) {
+    std::string name = node.name;
+    const std::string_view suffixes[] = {".forward_with_tape", ".vjp"};
+    for (std::string_view suffix : suffixes)
+        if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            name.resize(name.size() - suffix.size());
+            break;
+        }
+    if (name.find('.') == std::string::npos)
+        name.insert(0, "program.");
+    return name;
+}
+
+std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const ProgramGraph &forward,
+                                                                       const ExecutableProgram &execution,
+                                                                       const std::vector<HostProgramValue> &storage,
+                                                                       const ProgramResidualPlan &plan) {
+    std::vector<char> retained(execution.values.size());
+    for (uint32_t value : plan.retainedValues)
+        if (value < retained.size())
+            retained[value] = 1;
+    std::vector<char> captured(execution.values.size());
+    for (uint32_t value : execution.residualCaptures())
+        if (value < captured.size())
+            captured[value] = 1;
+    std::vector<AutodiffPullbackPassTelemetry> telemetry;
+    telemetry.reserve(forward.nodes.size());
+    for (const ProgramNode &node : forward.nodes) {
+        AutodiffPullbackPassTelemetry item;
+        item.scheduleOffset = node.id;
+        item.passName = programPassName(node);
+        uint64_t estimated = 0;
+        uint64_t logical = 0;
+        uint64_t resident = 0;
+        uint64_t allocated = 0;
+        uint64_t retainedBytes = 0;
+        bool hasTape = false;
+        bool keptTape = false;
+        bool dynamicTape = false;
+        bool hasTensorResidual = false;
+        for (uint32_t value : node.results) {
+            if (value >= storage.size())
+                continue;
+            const HostProgramValue &slot = storage[value];
+            if (slot.tapeBatch) {
+                hasTape = true;
+                estimated += slot.tapeBatch->logicalBytes();
+                dynamicTape |= slot.tapeBatch->hasDynamicLanes();
+                if (value < retained.size() && retained[value]) {
+                    keptTape = true;
+                    logical += slot.tapeBatch->logicalBytes();
+                    const uint64_t residentBytes = slot.tapeBatch->isCompacted() ? slot.tapeBatch->logicalBytes()
+                                                                                 : slot.tapeBatch->residentBytes();
+                    resident += residentBytes;
+                    allocated += slot.tapeBatch->allocatedBytes();
+                    retainedBytes += slot.tapeBatch->allocatedBytes();
+                }
+            } else if (value < captured.size() && captured[value] && value < retained.size() && retained[value]) {
+                hasTensorResidual = true;
+                retainedBytes += slot.argument.tensor.byte_size;
+            }
+        }
+        item.estimatedTapeBytes = estimated;
+        item.logicalResidualBytes = dynamicTape ? logical : 0;
+        item.residentTapeBytes = dynamicTape ? resident : 0;
+        item.allocatedTapeBytes = dynamicTape ? allocated : 0;
+        item.retainedAllocationBytes = retainedBytes;
+        if (hasTape) {
+            const char *kind = dynamicTape ? "dynamic_capture" : "static_capture";
+            item.residualSourceKind = keptTape ? kind : std::string(kind) + "+pure_rematerialization";
+            item.controlHistoryKind = dynamicTape && keptTape ? "dynamic_capture" : "none";
+            item.peakTemporaryTapeBytes = std::max(allocated, estimated);
+            if (!item.peakTemporaryTapeBytes)
+                item.peakTemporaryTapeBytes = 1;
+        } else if (hasTensorResidual) {
+            item.residualSourceKind = "static_capture";
+            item.controlHistoryKind = "none";
+        }
+        telemetry.push_back(std::move(item));
+    }
+    return telemetry;
+}
+
 bool planProgramResiduals(const ExecutableProgram &execution, const Variant &variant,
                           const std::vector<HostProgramValue> &materialized, uint64_t memoryBudget,
+                          execution::detail::AutodiffCheckpointPolicy policy, bool rematerializeTapes,
                           ProgramResidualPlan &result, std::string &error) {
     const ProgramGraph *forward = findGraph(execution, "forward");
     if (!forward)
@@ -162,7 +254,7 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
     const auto materializedBytes = [&](uint32_t value, const ProgramValueSlot &slot,
                                        const Parameter *parameter) -> std::optional<size_t> {
         if (value < materialized.size() && materialized[value].tapeBatch)
-            return std::max<size_t>(materialized[value].tapeBatch->residentBytes(), 1);
+            return std::max<size_t>(materialized[value].tapeBatch->logicalBytes(), 1);
         if (value < materialized.size() && materialized[value].argument.tensor.byte_size)
             return materialized[value].argument.tensor.byte_size;
         if (isProgramAdTapeType(slot.type))
@@ -180,6 +272,8 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
     for (uint32_t value : execution.residualCaptures()) {
         if (!producers[value])
             continue;
+        if (rematerializeTapes && isProgramAdTapeType(execution.values[value].type))
+            continue;
         const ProgramValueSlot &slot = execution.values[value];
         const Parameter *parameter = findParameter(variant, slot.name);
         const std::optional<size_t> bytes = materializedBytes(value, slot, parameter);
@@ -191,13 +285,20 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
         node.forwardPeakBytes += *bytes;
     }
     if (!execution::detail::planDagAutodiffCheckpoints(nodes, memoryBudget, result.checkpoint, error, initialStateBytes,
-                                                       true, 0, true, 0, true, 0,
-                                                       execution::detail::AutodiffCheckpointPolicy::Balanced))
+                                                       true, 0, true, 0, true, 0, policy))
         return false;
     const uint32_t retainBegin =
         result.checkpoint.replaySegments.empty() ? 0 : result.checkpoint.replaySegments.back().beginStep;
     for (uint32_t value : execution.residualCaptures()) {
-        if (!producers[value] || *producers[value] >= retainBegin)
+        if (!producers[value]) {
+            result.retainedValues.push_back(value);
+            continue;
+        }
+        if (rematerializeTapes && isProgramAdTapeType(execution.values[value].type)) {
+            result.replayEnd = std::max(result.replayEnd, *producers[value] + 1);
+            continue;
+        }
+        if (*producers[value] >= retainBegin)
             result.retainedValues.push_back(value);
         else
             result.replayEnd = std::max(result.replayEnd, *producers[value] + 1);
@@ -208,6 +309,23 @@ bool planProgramResiduals(const ExecutableProgram &execution, const Variant &var
                 result.retainedValues.end())
                 result.retainedValues.push_back(value);
     std::sort(result.retainedValues.begin(), result.retainedValues.end());
+    return true;
+}
+
+bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonPipelineArgument> &values,
+                           std::string &error) {
+    if (values.size() < storage.size())
+        return error = "Program autodiff tape value arena is incomplete", false;
+    for (size_t value = 0; value < storage.size(); ++value) {
+        HostProgramValue &slot = storage[value];
+        if (!slot.tapeBatch)
+            continue;
+        if (!slot.tapeBatch->compact(true))
+            return error = "Program autodiff tape could not be compacted", false;
+        if (!fillTapeHostValue(slot, slot.tapeBatch, error))
+            return false;
+        values[value] = slot.argument;
+    }
     return true;
 }
 
@@ -662,11 +780,13 @@ public:
                     Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
                     std::vector<ProgramLeafBinding> gradientBindings, ProgramResidualPlan plan,
                     std::vector<std::vector<uint8_t>> residuals, std::vector<std::vector<uint64_t>> residualShapes,
-                    std::vector<std::shared_ptr<HostStaticTapeBatch>> tapeResiduals)
+                    std::vector<std::shared_ptr<HostStaticTapeBatch>> tapeResiduals,
+                    std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
           signature_(std::move(signature)), cotangentBindings_(std::move(cotangentBindings)),
           gradientBindings_(std::move(gradientBindings)), plan_(std::move(plan)), residuals_(std::move(residuals)),
-          residualShapes_(std::move(residualShapes)), tapeResiduals_(std::move(tapeResiduals)) {
+          residualShapes_(std::move(residualShapes)), tapeResiduals_(std::move(tapeResiduals)),
+          passTelemetry_(std::move(passTelemetry)) {
         rebuildVariantLayouts(variant_);
     }
 
@@ -730,6 +850,8 @@ public:
             const VernonStatus replayStatus = executePipelineProgramGraph(proxy, replay, values);
             if (replayStatus != VERNON_STATUS_OK)
                 return replayStatus;
+            if (!sealProgramTapeValues(storage, values, error))
+                return fail(*context_, error);
         }
         const VernonStatus status = executePipelineProgramGraph(proxy, *backward, values);
         if (status == VERNON_STATUS_OK &&
@@ -745,6 +867,7 @@ public:
 
     PullbackMemoryUsage memoryUsage() const override {
         MemoryAccounting memory;
+        memory.logicalPayloadBytes = plan_.checkpoint.logicalResidualBytes;
         const auto add = [](size_t &total, size_t bytes) {
             if (bytes > std::numeric_limits<size_t>::max() - total)
                 total = std::numeric_limits<size_t>::max();
@@ -754,17 +877,51 @@ public:
         for (const auto &batch : tapeResiduals_) {
             if (!batch)
                 continue;
-            add(memory.logicalPayloadBytes, batch->logicalBytes());
-            add(memory.residentBytes, batch->residentBytes());
+            // compact(true) keeps write descriptors for the packed Program tape ABI.
+            // Graph AD compact(false) drops that construction storage from resident.
+            add(memory.residentBytes, batch->isCompacted() ? batch->logicalBytes() : batch->residentBytes());
             add(memory.allocatedBytes, batch->allocatedBytes());
         }
-        for (const std::vector<uint8_t> &residual : residuals_)
+        for (size_t value = 0; value < residuals_.size(); ++value) {
+            const std::vector<uint8_t> &residual = residuals_[value];
+            if (residual.empty())
+                continue;
+            if (value >= tapeResiduals_.size() || !tapeResiduals_[value])
+                add(memory.residentBytes, residual.size());
             add(memory.retainedAllocationBytes, residual.size());
+        }
         add(memory.retainedAllocationBytes, memory.allocatedBytes);
         return pullbackMemoryUsage(memory);
     }
 
     PullbackControlPlaneUsage controlPlaneUsage() const override { return usage_; }
+
+    AutodiffPullbackCheckpointPlan checkpointPlan() const override {
+        AutodiffPullbackCheckpointPlan snapshot;
+        snapshot.present = true;
+        snapshot.peakBytes = plan_.checkpoint.peakBytes;
+        snapshot.memoryBudget = plan_.checkpoint.memoryBudget;
+        snapshot.logicalResidualBytes = plan_.checkpoint.logicalResidualBytes;
+        snapshot.retainedAllocationBytes = plan_.checkpoint.retainedAllocationBytes;
+        snapshot.initialStateBytes = plan_.checkpoint.initialStateBytes;
+        snapshot.restorationBytes = plan_.checkpoint.restorationBytes;
+        snapshot.transactionBytes = plan_.checkpoint.transactionBytes;
+        snapshot.persistentCheckpointBytes = plan_.checkpoint.persistentCheckpointBytes;
+        snapshot.backwardValueBytes = plan_.checkpoint.backwardValueBytes;
+        snapshot.replayCost = plan_.checkpoint.replayCost;
+        snapshot.recomputationCost = plan_.checkpoint.recomputationCost;
+        snapshot.selectedPolicy = plan_.checkpoint.selectedPolicy;
+        return snapshot;
+    }
+
+    std::vector<AutodiffPullbackPassTelemetry> passTelemetry() const override { return passTelemetry_; }
+
+    uint64_t peakRuntimeManagedBytes() const override {
+        const PullbackMemoryUsage usage = memoryUsage();
+        const uint64_t held =
+            std::max(std::max(usage.retainedAllocationBytes, usage.allocatedBytes), usage.peakTemporaryBytes);
+        return std::max(held, plan_.checkpoint.peakBytes);
+    }
 
 private:
     VernonRuntimeContext *context_;
@@ -777,6 +934,7 @@ private:
     std::vector<std::vector<uint8_t>> residuals_;
     std::vector<std::vector<uint64_t>> residualShapes_;
     std::vector<std::shared_ptr<HostStaticTapeBatch>> tapeResiduals_;
+    std::vector<AutodiffPullbackPassTelemetry> passTelemetry_;
     PullbackControlPlaneUsage usage_;
 };
 
@@ -880,8 +1038,13 @@ public:
         if (!transferLeaves(*outputs, signature_.outputs, outputBindings_, storage, true, error))
             return fail(*context_, error);
         ProgramResidualPlan plan;
-        if (!planProgramResiduals(topology->execution, variant_, storage,
-                                  context_->autodiffMemoryPolicy->invocationLimit(), plan, error))
+        uint64_t memoryBudget = context_->autodiffMemoryPolicy->invocationLimit();
+        const bool rematerializeTapes = topology->programCheckpointMemoryBudget.has_value();
+        if (rematerializeTapes)
+            memoryBudget = *topology->programCheckpointMemoryBudget;
+        if (!planProgramResiduals(topology->execution, variant_, storage, memoryBudget,
+                                  programCheckpointPolicy(topology->programCheckpointPolicy), rematerializeTapes, plan,
+                                  error))
             return fail(*context_, error);
         std::vector<std::vector<uint8_t>> residuals(topology->execution.values.size());
         std::vector<std::vector<uint64_t>> residualShapes(topology->execution.values.size());
@@ -903,9 +1066,11 @@ public:
             residuals[value].assign(data, data + slot.argument.tensor.byte_size);
             residualShapes[value] = slot.runtimeShape;
         }
-        pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, cotangentBindings_,
-                                                     gradientBindings_, std::move(plan), std::move(residuals),
-                                                     std::move(residualShapes), std::move(tapeResiduals));
+        std::vector<AutodiffPullbackPassTelemetry> telemetry =
+            collectProgramPassTelemetry(*forward, topology->execution, storage, plan);
+        pullback = std::make_unique<ProgramPullback>(
+            *context_, topology, variant_, signature_, cotangentBindings_, gradientBindings_, std::move(plan),
+            std::move(residuals), std::move(residualShapes), std::move(tapeResiduals), std::move(telemetry));
         return VERNON_STATUS_OK;
     }
 

@@ -320,7 +320,7 @@ def _compile_program_bundle_plan(
         variant,
         [(variant, execution, stages)],
         canonical_execution=canonical_execution,
-        canonical_program=canonical_program if isinstance(canonical_program, Mapping) else None,
+        canonical_program=(canonical_program if isinstance(canonical_program, Mapping) else None),
     )
     if not canonical_execution:
         return plan
@@ -496,7 +496,11 @@ def _canonical_deployment(
         stage_bindings[logical_stage] = logical_stage
     return (
         copy.deepcopy(dict(variant.execution)),
-        {"target": copy.deepcopy(plan.target.spec), "blobs": blobs, "artifacts": artifacts},
+        {
+            "target": copy.deepcopy(plan.target.spec),
+            "blobs": blobs,
+            "artifacts": artifacts,
+        },
         stage_bindings,
     )
 
@@ -602,7 +606,12 @@ def _canonical_kernel_deployment(
     }
     if isinstance(implementation, Mapping):
         artifact_system["artifacts"][compiled.id]["implementation"] = copy.deepcopy(dict(implementation))
-    return copy.deepcopy(dict(program)), artifact_system, {request_id: compiled.id}, compiled
+    return (
+        copy.deepcopy(dict(program)),
+        artifact_system,
+        {request_id: compiled.id},
+        compiled,
+    )
 
 
 def _canonical_graphics_deployment(

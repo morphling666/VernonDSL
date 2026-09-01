@@ -1,33 +1,20 @@
 from __future__ import annotations
 
 import copy
-import importlib
 import weakref
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Mapping
 
-from .resources import (
-    RawBuffer,
-    RenderTarget,
-    TensorStorage,
-    TensorView,
-    Texture,
-    TextureView,
-    _DispatchBorrowLease,
-    _TextureResource,
-)
-
-
-def _session_state() -> Any:
-    return importlib.import_module("vernon_dsl._runtime.session")
+from .binding import _DispatchBorrowLease
+from .resource_common import _session_state
+from .tensor import RawBuffer, TensorStorage, TensorView
+from .texture import RenderTarget, Texture, TextureView, _TextureResource
 
 
 def _resource_identity(value: Any) -> object:
     if isinstance(value, TensorView):
         return value.owner
-    if isinstance(value, _TextureResource):
-        return value
     return value
 
 
@@ -82,7 +69,7 @@ class ColorAttachmentUse:
 
 @dataclass(frozen=True)
 class DepthStencilAttachmentUse:
-    target: RenderTarget
+    texture: Texture | TextureView
     depth_load: LoadOperation = LoadOperation.CLEAR
     depth_store: StoreOperation = StoreOperation.PRESERVE
     clear_depth: float = 1.0
@@ -370,8 +357,9 @@ class RenderPass(ExecutionPass):
                 location,
                 ColorAttachmentUse(texture, color_load, color_store, _checked_clear_color(clear_color)),
             )
-        if target._has_depth:
-            self.depth(DepthStencilAttachmentUse(target, depth_load, depth_store, clear_depth))
+        depth = target._depth_attachment()
+        if depth is not None:
+            self.depth(DepthStencilAttachmentUse(depth, depth_load, depth_store, clear_depth))
 
     def color(self, location: int, attachment: ColorAttachmentUse) -> None:
         if not self._declaring or self._graph is None or self._native_pass is None:
@@ -382,12 +370,14 @@ class RenderPass(ExecutionPass):
             raise TypeError("attachment must be a ColorAttachmentUse")
         if location in self._colors:
             raise ValueError(f"color attachment location {location} is already declared")
-        if self._target is None:
-            self._target = RenderTarget(shape=attachment.texture.shape)
-        if attachment.texture.shape != self._target.shape:
+        colors = {candidate: use.texture for candidate, use in self._colors.items()}
+        colors[location] = attachment.texture
+        depth = None if self._depth is None else self._depth.texture
+        target = RenderTarget.from_attachments(colors=colors, depth=depth)
+        if self._target is not None and target.shape != self._target.shape:
             raise ValueError("all render attachments must have matching dimensions")
-        if location not in dict(self._target._color_attachments()):
-            self._target.attach_color(location, attachment.texture)
+        if self._target is None or dict(self._target._color_attachments()).get(location) is not attachment.texture:
+            self._target = target
         resource = self._graph.import_resource(attachment.texture)
         self._colors[location] = attachment
         self._borrow_uses.append((f"{self.name}.color[{location}]", attachment.texture, "write"))
@@ -408,19 +398,21 @@ class RenderPass(ExecutionPass):
             raise ValueError("depth/stencil attachment is already declared")
         if not 0.0 <= attachment.clear_depth <= 1.0:
             raise ValueError("clear depth must be between zero and one")
-        if self._target is not None and attachment.target is not self._target:
-            raise ValueError("depth and color attachments must belong to one RenderTarget")
-        self._target = attachment.target
+        colors = {location: use.texture for location, use in self._colors.items()}
+        target = RenderTarget.from_attachments(colors=colors, depth=attachment.texture)
+        if self._target is not None and target.shape != self._target.shape:
+            raise ValueError("depth and color attachments must have matching dimensions")
+        if self._target is None or self._target._depth_attachment() is not attachment.texture:
+            self._target = target
         self._depth = attachment
-        resource = self._graph.import_resource(attachment.target)
-        if attachment.target._depth_texture is not None:
-            self._borrow_uses.append(
-                (
-                    f"{self.name}.depth",
-                    attachment.target._depth_texture,
-                    "read" if attachment.read_only_depth else "write",
-                )
+        resource = self._graph.import_resource(attachment.texture)
+        self._borrow_uses.append(
+            (
+                f"{self.name}.depth",
+                attachment.texture,
+                "read" if attachment.read_only_depth else "write",
             )
+        )
         self._native_pass.depth(
             resource._native,
             _native_load(attachment.depth_load),
@@ -845,18 +837,14 @@ class ExecutionGraph:
             return existing
         state = _session_state()
         if state._architecture == state.cpu and isinstance(value, (TensorStorage, TensorView, RawBuffer)):
-            checkpoint_owner = _resource_identity(value)
+            checkpoint_owner = value.owner if isinstance(value, TensorView) else value
             native_resource = native_graph.import_host_buffer(identity, checkpoint_owner._array, exported)
         elif isinstance(value, _TextureResource):
             native_resource = native_graph.import_image(value._resident_view(), exported)
-        elif isinstance(value, RenderTarget):
-            if value._depth_texture is None:
-                raise ValueError("RenderTarget graph resources require a depth attachment")
-            native_resource = native_graph.import_image(value._depth_texture._resident_view(), exported)
         elif isinstance(value, (TensorStorage, TensorView, RawBuffer)):
             native_resource = native_graph.import_buffer(value._resident_buffer(), exported)
         else:
-            raise TypeError("execution graph resources must be Tensor, RawBuffer, Texture, or depth RenderTarget")
+            raise TypeError("execution graph resources must be Tensor, RawBuffer, or Texture")
         resource = GraphResource(native_resource.id, value, exported, self._owner, native_resource, self._generation)
         self._resources.append(resource)
         self._resource_by_identity[identity] = resource

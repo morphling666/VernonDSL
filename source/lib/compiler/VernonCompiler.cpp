@@ -442,6 +442,8 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
             llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
             const std::optional<llvm::StringRef> role = binding ? binding->getString("autodiff_role") : std::nullopt;
+            const std::optional<llvm::StringRef> autodiffSource =
+                binding ? binding->getString("autodiff_source") : std::nullopt;
             const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
             if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
                 continue;
@@ -455,12 +457,27 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             llvm::json::Object *parameterRow = parameterIt->second;
             std::optional<llvm::StringRef> expectedDtype = value->getString("dtype");
             llvm::json::Array *expectedShape = value->getArray("shape");
+            llvm::json::Array aggregateExpectedShape;
             if (expectedStage == "compute" && bindingCounts[*valueId] > 1) {
                 llvm::json::Object *layout = value->getObject("value_layout");
                 llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
-                const size_t ordinal = bindingOrdinals[(*valueId)]++;
-                llvm::json::Object *leaf =
-                    leaves && ordinal < leaves->size() ? (*leaves)[ordinal].getAsObject() : nullptr;
+                llvm::json::Object *leaf = nullptr;
+                const bool semanticProjection = autodiffSource && (role == "gradient" || role == "cotangent");
+                if (leaves && semanticProjection) {
+                    std::optional<size_t> leafIndex;
+                    if (const std::optional<int64_t> projected = binding->getInteger("leaf");
+                        projected && *projected >= 0)
+                        leafIndex = static_cast<size_t>(*projected);
+                    else
+                        leafIndex =
+                            vernon::compiler::resolveProgramValueLeafIndex(*layout, *autodiffSource, *parameter);
+                    if (leafIndex && *leafIndex < leaves->size())
+                        leaf = (*leaves)[*leafIndex].getAsObject();
+                }
+                if (!leaf && !semanticProjection) {
+                    const size_t ordinal = bindingOrdinals[(*valueId)]++;
+                    leaf = leaves && ordinal < leaves->size() ? (*leaves)[ordinal].getAsObject() : nullptr;
+                }
                 if (!leaf) {
                     result->status = VERNON_STATUS_VERIFICATION_ERROR;
                     result->diagnostics =
@@ -469,7 +486,13 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     return result.release();
                 }
                 expectedDtype = leaf->getString("dtype");
-                expectedShape = leaf->getArray("shape");
+                if (llvm::json::Array *ownerShape = value->getArray("shape"))
+                    for (const llvm::json::Value &extent : *ownerShape)
+                        aggregateExpectedShape.emplace_back(extent);
+                if (llvm::json::Array *leafShape = leaf->getArray("shape"))
+                    for (const llvm::json::Value &extent : *leafShape)
+                        aggregateExpectedShape.emplace_back(extent);
+                expectedShape = &aggregateExpectedShape;
             }
             std::optional<llvm::StringRef> actualDtype = parameterRow->getString("dtype");
             if (!actualDtype)
@@ -477,6 +500,22 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             llvm::json::Array *actualShape = parameterRow->getArray("shape");
             if (!actualShape)
                 actualShape = parameterRow->getArray("source_shape");
+            llvm::json::Array derivativeActualShape;
+            if (actualShape && bindingCounts[*valueId] > 1 && (role == "gradient" || role == "cotangent")) {
+                llvm::json::Object *layout = parameterRow->getObject("value_layout");
+                if (!layout)
+                    layout = parameterRow->getObject("element_layout");
+                llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
+                llvm::json::Object *leaf = leaves && leaves->size() == 1 ? (*leaves)[0].getAsObject() : nullptr;
+                llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr;
+                if (leafShape) {
+                    for (const llvm::json::Value &extent : *actualShape)
+                        derivativeActualShape.emplace_back(extent);
+                    for (const llvm::json::Value &extent : *leafShape)
+                        derivativeActualShape.emplace_back(extent);
+                    actualShape = &derivativeActualShape;
+                }
+            }
             const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
             const bool opaqueResource = parameterKind == "image" || parameterKind == "sampler";
             const bool graphicsVertexElement = expectedStage == "graphics" &&

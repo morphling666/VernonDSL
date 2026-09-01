@@ -27,15 +27,6 @@ bool singleLeafParameter(const Parameter &parameter) {
     return layout.leaves.size() == 1;
 }
 
-std::string leafPath(const std::string &root, const ValueLeaf &leaf) {
-    std::string result = root;
-    for (const ValuePathComponent &component : leaf.path) {
-        result.push_back('.');
-        result += component.field ? *component.field : std::to_string(component.index);
-    }
-    return result;
-}
-
 bool isReplaySegment(const Parameter &parameter) {
     return parameter.autodiffRole == AutodiffResourceRole::ReplaySegment;
 }
@@ -129,24 +120,32 @@ bool compatiblePhysicalShape(const BindingSpec &spec, const std::vector<uint64_t
     return true;
 }
 
-const ValueAbi *findDerivativeAbi(const Signature &signature, AutodiffResourceRole role, const std::string &path) {
+std::optional<size_t> derivativeAbiIndex(const Signature &signature, AutodiffResourceRole role,
+                                         const std::string &path) {
     const std::vector<ValueAbi> &values =
         role == AutodiffResourceRole::Cotangent ? signature.cotangents : signature.gradients;
     const auto found =
         std::find_if(values.begin(), values.end(), [&](const ValueAbi &value) { return value.path == path; });
-    return found == values.end() ? nullptr : &*found;
+    return found == values.end() ? std::nullopt
+                                 : std::optional<size_t>(static_cast<size_t>(std::distance(values.begin(), found)));
+}
+
+const ValueAbi *findDerivativeAbi(const Signature &signature, AutodiffResourceRole role, const std::string &path) {
+    const std::optional<size_t> index = derivativeAbiIndex(signature, role, path);
+    if (!index)
+        return nullptr;
+    const std::vector<ValueAbi> &values =
+        role == AutodiffResourceRole::Cotangent ? signature.cotangents : signature.gradients;
+    return &values[*index];
 }
 
 } // namespace
 
 bool findDerivativeAbi(const Signature &signature, AutodiffResourceRole role, const std::string &path, size_t &index) {
-    const std::vector<ValueAbi> &values =
-        role == AutodiffResourceRole::Cotangent ? signature.cotangents : signature.gradients;
-    const auto found =
-        std::find_if(values.begin(), values.end(), [&](const ValueAbi &value) { return value.path == path; });
-    if (found == values.end())
+    const std::optional<size_t> found = derivativeAbiIndex(signature, role, path);
+    if (!found)
         return false;
-    index = static_cast<size_t>(std::distance(values.begin(), found));
+    index = *found;
     return true;
 }
 
@@ -173,13 +172,14 @@ bool buildBindingSpecPlan(const Variant &variant, const Signature &signature, Bi
             binding.source = BindingSource::Launch;
         else {
             binding.sourceName = parameter.autodiffSource.empty() ? parameter.name : parameter.autodiffSource;
-            binding.sourcePath = binding.sourceName;
+            const bool derivative = parameter.autodiffRole == AutodiffResourceRole::Gradient ||
+                                    parameter.autodiffRole == AutodiffResourceRole::Cotangent;
+            binding.sourcePath = derivative ? parameter.name : binding.sourceName;
             if (singleLeafParameter(parameter)) {
                 const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
-                binding.sourcePath = leafPath(binding.sourceName, layout.leaves.front());
+                binding.sourcePath = canonicalValueLeafPath(binding.sourcePath, layout.leaves.front());
             }
-            if (parameter.autodiffRole == AutodiffResourceRole::Gradient ||
-                parameter.autodiffRole == AutodiffResourceRole::Cotangent) {
+            if (derivative) {
                 binding.source = BindingSource::Device;
                 binding.valueClass = BindingSpec::ValueClass::Derivative;
                 binding.derivativeRole = parameter.autodiffRole;

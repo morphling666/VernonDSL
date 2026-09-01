@@ -6,6 +6,7 @@
 #include "native_runtime.h"
 
 #include <algorithm>
+#include <string>
 
 void bindNativeCompiler(nb::module_ &module) {
     nb::class_<vernon::execution::detail::RhiCommandExecutionPlan>(module, "_CommandPlan").def(nb::init<>());
@@ -264,6 +265,10 @@ void bindNativeCompiler(nb::module_ &module) {
             [](const PythonPullback &value) { return std::max(value.logicalResidualBytes(), value.allocatedBytes()); })
         .def_prop_ro("recomputation_factor", [](const PythonPullback &) { return 1.0; })
         .def_prop_ro("peak_temporary_bytes", &PythonPullback::peakTemporaryBytes)
+        .def_prop_ro("tape_context_limit_bytes", &PythonPullback::tapeContextLimitBytes)
+        .def_prop_ro("peak_runtime_managed_bytes", &PythonPullback::peakRuntimeManagedBytes)
+        .def_prop_ro("checkpoint_plan", &PythonPullback::checkpointPlan)
+        .def_prop_ro("pass_telemetry", &PythonPullback::passTelemetry)
         .def_prop_ro("submission_count", &PythonPullback::submissionCount)
         .def_prop_ro("wait_count", &PythonPullback::waitCount)
         .def_prop_ro("readback_count", &PythonPullback::readbackCount)
@@ -345,10 +350,13 @@ void bindNativeCompiler(nb::module_ &module) {
             nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
         .def(
             "program_vjp",
-            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings) {
-                return pipeline.programVjp(inputs, bindings, nb::cast(&pipeline, nb::rv_policy::reference));
+            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings,
+               nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
+                return pipeline.programVjp(inputs, bindings, nb::cast(&pipeline, nb::rv_policy::reference),
+                                           checkpoint_memory_budget, checkpoint_policy);
             },
-            nb::arg("inputs"), nb::arg("bindings"))
+            nb::arg("inputs"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
+            nb::arg("checkpoint_policy") = std::string())
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("program_ad_signature", &LoadedPipeline::programAdSignature)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
