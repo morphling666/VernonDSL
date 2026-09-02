@@ -243,8 +243,10 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
                                       : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
                                       : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
                                                                     : tensor.access == VERNON_ACCESS_READ_WRITE;
-        if (tensor.struct_size < sizeof(VernonTensorView))
-            return fail(error, "pipeline Tensor argument structure is incomplete");
+        if (tensor.struct_size < sizeof(VernonTensorView)) {
+            error = "pipeline Tensor argument '" + parameter.name + "' structure is incomplete";
+            return false;
+        }
         if (!valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)))
             return fail(error, "pipeline Tensor argument element layout does not match reflection");
         if (tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible)

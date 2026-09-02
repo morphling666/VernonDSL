@@ -471,7 +471,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 Candidate candidate;
                 candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
                 candidate.layout.set = argument.descriptorSet;
-                candidate.layout.binding = argument.storageLeaves.size() <= 1
+                candidate.layout.binding = argument.storageLeaves.empty()
                                                ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
                                                : argument.storageLeaves[leafIndex].binding;
                 candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"

@@ -119,6 +119,9 @@ def reflected_parameters(
                 "address_space": row.get("address_space"),
                 "dimension": row.get("dimension"),
                 "binding_role": row.get("binding_role"),
+                "autodiff_role": row.get("vernon.autodiff_role"),
+                "autodiff_source": row.get("vernon.autodiff_source"),
+                "autodiff_carrier": row.get("vernon.autodiff_carrier"),
                 "sample_result_class": row.get("sample_result_class"),
                 "exact_storage_format": row.get("exact_storage_format"),
             }
@@ -221,6 +224,15 @@ def classify_parameter_use(use: Mapping[str, Any]) -> str:
     return "tensor"
 
 
+def _compatible_shape(logical: Sequence[Any], physical: Sequence[Any]) -> bool:
+    if len(logical) != len(physical):
+        return False
+    return all(
+        isinstance(expected, int) and isinstance(actual, int) and (expected <= 0 or actual <= 0 or expected == actual)
+        for expected, actual in zip(logical, physical, strict=True)
+    )
+
+
 def merge_program_value_uses(
     name: str,
     uses: Sequence[Mapping[str, Any]],
@@ -244,6 +256,11 @@ def merge_program_value_uses(
     physical_uses = [dict(use) for use in uses]
     normalized_uses: list[dict[str, Any]] = []
     for physical, projection in zip(physical_uses, projections, strict=True):
+        physical_owner_shape = physical.get("shape", [])
+        if physical.get("autodiff_carrier") == "invocation_linear" and isinstance(physical_owner_shape, list):
+            if physical.get("autodiff_role") != "cotangent" or len(physical_owner_shape) != len(owner_shape) + 1:
+                raise PipelineCompileError(f"Program value {name!r} has an invalid invocation carrier shape")
+            physical_owner_shape = physical_owner_shape[1:]
         layout = physical.get("value_layout", physical.get("element_layout"))
         if not isinstance(layout, Mapping):
             raise PipelineCompileError(f"Program value {name!r} has a physical use without ABI leaves")
@@ -253,18 +270,19 @@ def merge_program_value_uses(
         full_value = (
             len(leaves) == len(canonical_leaves)
             and layout.get("layout_hash") == canonical.get("layout_hash")
-            and physical.get("shape", []) == owner_shape
+            and _compatible_shape(owner_shape, physical_owner_shape)
         )
         projected_leaf_matches = False
         if projection is not None and projection < len(canonical_leaves) and len(leaves) == 1:
             projected_leaf = canonical_leaves[projection]
             physical_leaf = leaves[0]
             if isinstance(projected_leaf, Mapping) and isinstance(physical_leaf, Mapping):
+                logical_shape = [*owner_shape, *projected_leaf.get("shape", [])]
+                physical_shape = [*physical_owner_shape, *physical_leaf.get("shape", [])]
                 projected_leaf_matches = (
                     projected_leaf.get("dtype") == physical_leaf.get("dtype")
                     and projected_leaf.get("scalar_count") == physical_leaf.get("scalar_count")
-                    and [*owner_shape, *projected_leaf.get("shape", [])]
-                    == [*physical.get("shape", []), *physical_leaf.get("shape", [])]
+                    and _compatible_shape(logical_shape, physical_shape)
                 )
         if not full_value and not projected_leaf_matches:
             raise PipelineCompileError(f"Program value {name!r} has an incompatible aggregate leaf use")
@@ -354,6 +372,9 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
             "system_value",
             "location_span",
             "element_layout",
+            "autodiff_role",
+            "autodiff_source",
+            "autodiff_carrier",
         ):
             use.pop(key, None)
     return {key: value for key, value in parameter.items() if value is not None}

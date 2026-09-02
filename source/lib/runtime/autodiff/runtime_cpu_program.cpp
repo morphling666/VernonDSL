@@ -6,6 +6,7 @@
 #include "runtime/cpu_workgroup_dispatch.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/runtime_state.h"
+#include "runtime/shape_layout.h"
 #include "runtime/tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -269,20 +270,25 @@ bool parseProfile(const Stage &stage, HostProfileLayout &layout, std::string &er
                     path += component.field ? "." + *component.field : "." + std::to_string(component.index);
                 std::vector<uint64_t> leafShape;
                 leafShape.reserve(shape.size() + layoutLeaf.shape.size());
-                for (int64_t extent : shape)
-                    leafShape.push_back(extent < 0 ? 0 : static_cast<uint64_t>(extent));
+                const std::optional<shape::DeclaredShape> declared = shape::decodeReflectedShape(shape);
+                if (!declared) {
+                    error = "autodiff TensorView shape contains an invalid extent";
+                    return false;
+                }
+                leafShape = shape::encodeRuntimeContractShape(*declared);
                 leafShape.insert(leafShape.end(), layoutLeaf.shape.begin(), layoutLeaf.shape.end());
                 size_t byteSize = layoutLeaf.scalarCount * scalarSize;
-                for (int64_t extent : shape) {
-                    if (extent < 0) {
-                        byteSize = 0;
-                        break;
-                    }
-                    if (static_cast<uint64_t>(extent) > SIZE_MAX / byteSize) {
+                const std::optional<shape::ConcreteShape> concrete = shape::concrete(*declared);
+                if (!concrete) {
+                    byteSize = 0;
+                } else {
+                    size_t elements = 0;
+                    if (!shape::checkedElementCount(*concrete, elements) ||
+                        (elements && byteSize > SIZE_MAX / elements)) {
                         error = "autodiff TensorView element leaf size overflows";
                         return false;
                     }
-                    byteSize *= static_cast<size_t>(extent);
+                    byteSize *= elements;
                 }
                 tensorView.leaves.push_back({std::move(path), *dtype, byteSize, scalarSize, std::move(leafShape)});
             }

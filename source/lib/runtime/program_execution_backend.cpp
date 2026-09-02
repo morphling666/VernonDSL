@@ -297,13 +297,26 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
             convertedNode.id = node.id;
             convertedNode.kind = node.operation == "graphics" ? "render" : "compute";
             convertedNode.stage = node.stage;
-            convertedNode.name = node.name.empty() ? graph.direction + "." + std::to_string(node.id) : node.name;
+            convertedNode.name = graph.direction + "." + std::to_string(node.id);
+            if (!node.name.empty())
+                convertedNode.name += "." + node.name;
             convertedNode.operands = node.operands;
             convertedNode.results = node.results;
             if (resolvedGraph && node.id < resolvedGraph->predecessors.size())
                 convertedNode.dependencies = resolvedGraph->predecessors[node.id];
-            for (const EndpointBinding &binding : node.bindings)
-                convertedNode.bindings.push_back({binding.module + ":" + std::to_string(binding.index), binding.value});
+            for (const EndpointBinding &binding : node.bindings) {
+                uint32_t value = binding.value;
+                if (binding.tag == BindingTag::Resource) {
+                    if (binding.access >= node.accesses.size())
+                        return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/graphs",
+                                      "resource endpoint binding names an unknown access");
+                    const ResourceAccess &access = node.accesses[binding.access];
+                    value = access.kind == AccessKind::Read         ? access.value
+                            : access.kind == AccessKind::Initialize ? access.after
+                                                                    : access.before;
+                }
+                convertedNode.bindings.push_back({binding.module + ":" + std::to_string(binding.index), value});
+            }
             for (const ResourceAccess &access : node.accesses) {
                 ProgramResourceUse use;
                 if (access.kind == AccessKind::Read) {
@@ -341,17 +354,18 @@ bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram 
 
 } // namespace
 
-VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
+VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
+                                                 std::shared_ptr<const ResolvedProgram> program,
                                                  const ArtifactSystem &artifacts,
                                                  const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
     diagnostic = {};
     ResolvedExecutablePlan executable;
-    if (!buildResolvedExecutablePlan(program, context.backend, executable, diagnostic))
+    if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
         return nullptr;
     if (executable.nodes.size() == 1) {
         const ResolvedExecutableNode &node = executable.nodes.front();
         if (node.node->operation == "graphics")
-            return loadGraphicsProgramPipeline(context, program, artifacts, bundleRoot, *node.node, *node.stage,
+            return loadGraphicsProgramPipeline(context, *program, artifacts, bundleRoot, *node.node, *node.stage,
                                                diagnostic);
         return loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic);
     }
@@ -363,7 +377,8 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     auto topology = std::make_shared<VernonPipelineTopology>();
-    if (!convertExecutableProgram(program, topology->execution, diagnostic))
+    topology->resolvedProgram = std::move(program);
+    if (!convertExecutableProgram(*topology->resolvedProgram, topology->execution, diagnostic))
         return nullptr;
     topology->residualValues = topology->execution.residualCaptures();
     for (const ResolvedExecutableNode &node : executable.nodes) {
@@ -377,9 +392,10 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
         std::vector<VernonProgramStageBinding> bindings;
         for (const TargetBinding &binding : node.plan.bindings)
             if (binding.source != SourceRepresentation::SystemValue)
-                bindings.push_back({binding.endpoint.value, binding.endpoint.leaf});
+                bindings.push_back({binding.projection.value, binding.projection.leaf, binding});
         topology->stageIndices.emplace(node.node->stage, topology->stages.size());
-        topology->stages.push_back(VernonResolvedProgramStage{std::move(child), std::move(bindings)});
+        topology->stages.push_back(
+            VernonResolvedProgramStage{std::move(child), std::move(bindings), node.plan.dispatchMapping});
     }
     pipeline->topology = std::move(topology);
     const bool nativeProgramAutodiff =
@@ -419,7 +435,9 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
     ResolvedProgram resolved;
     if (!resolve(std::move(program), artifacts, stageBindings, resolved, diagnostic))
         return failed();
-    if (VernonLoadedPipeline *loaded = loadBackendProgramPipeline(context, resolved, artifacts, bundleRoot, diagnostic))
+    auto owner = std::make_shared<ResolvedProgram>(std::move(resolved));
+    if (VernonLoadedPipeline *loaded =
+            loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic))
         return loaded;
     return failed();
 }

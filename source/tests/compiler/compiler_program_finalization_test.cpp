@@ -157,6 +157,77 @@ TEST(CompilerProgramFinalization, RejectsKernelCotangentProgramDidNotBind) {
     EXPECT_EQ(error, "compiled kernel ABI requires unmapped Program value 'cotangent.divergence'");
 }
 
+TEST(CompilerProgramFinalization, ExpandsLogicalTapeBindingIntoPhysicalCarrierBundle) {
+    const char *bindings = R"([
+  {
+    "parameter": "tape",
+    "value": 0,
+    "autodiff_role": "tape",
+    "autodiff_source": "tape"
+  }
+])";
+    llvm::json::Value execution = executionWithBindings(bindings);
+    llvm::json::Value request = requestWithBindings(bindings);
+    llvm::json::Value compiled = parse(R"({
+  "arguments": [
+    {
+      "vernon.source_name": "__vernon_ad_tape",
+      "vernon.autodiff_role": "tape"
+    },
+    {
+      "vernon.source_name": "__vernon_ad_segment",
+      "vernon.autodiff_role": "replay_segment"
+    },
+    {
+      "vernon.source_name": "__vernon_ad_status",
+      "vernon.autodiff_role": "replay_status"
+    }
+  ]
+})");
+    std::string error;
+    ASSERT_TRUE(vernon::compiler::normalizeProgramImplementationAbi(*execution.getAsObject(), *request.getAsObject(),
+                                                                    *compiled.getAsObject(), error))
+        << error;
+    const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
+    EXPECT_TRUE(hasParameter(requestBindings, "__vernon_ad_tape"));
+    EXPECT_TRUE(hasParameter(requestBindings, "__vernon_ad_segment"));
+    EXPECT_TRUE(hasParameter(requestBindings, "__vernon_ad_status"));
+}
+
+TEST(CompilerProgramFinalization, AcceptsOnlyDeclaredCotangentInvocationCarrierShape) {
+    llvm::json::Value logical = parse(R"([-1, -1])");
+    llvm::json::Value direct = parse(R"([-1, -1])");
+    llvm::json::Value broadcast = parse(R"([-1, -1, -1])");
+    EXPECT_TRUE(
+        vernon::compiler::compatibleProgramBindingShape("cotangent", "", logical.getAsArray(), direct.getAsArray()));
+    EXPECT_FALSE(
+        vernon::compiler::compatibleProgramBindingShape("cotangent", "", logical.getAsArray(), broadcast.getAsArray()));
+    EXPECT_TRUE(vernon::compiler::compatibleProgramBindingShape("cotangent", "invocation_linear", logical.getAsArray(),
+                                                                broadcast.getAsArray()));
+    EXPECT_FALSE(vernon::compiler::compatibleProgramBindingShape("gradient", "invocation_linear", logical.getAsArray(),
+                                                                 broadcast.getAsArray()));
+    EXPECT_FALSE(vernon::compiler::compatibleProgramBindingShape("primal", "invocation_linear", logical.getAsArray(),
+                                                                 broadcast.getAsArray()));
+}
+
+TEST(CompilerProgramFinalization, ResolvesRootValueLeafWithoutSyntheticPath) {
+    llvm::json::Value layout = parse(R"({
+  "leaves": [
+    {
+      "path": [],
+      "dtype": "f32",
+      "byte_offset": 0,
+      "scalar_count": 1,
+      "shape": []
+    }
+  ]
+})");
+    ASSERT_NE(layout.getAsObject(), nullptr);
+    EXPECT_EQ(vernon::compiler::resolveProgramValueLeafIndex(*layout.getAsObject(), "output_loss", "output_loss"), 0u);
+    EXPECT_FALSE(
+        vernon::compiler::resolveProgramValueLeafIndex(*layout.getAsObject(), "output_loss", "other").has_value());
+}
+
 TEST(CompilerProgramFinalization, BindsGradientDestByRoleNotPrimalName) {
     const char *bindings = R"([
   {

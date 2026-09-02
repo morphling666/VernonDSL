@@ -1,6 +1,7 @@
 #include "program_execution_manifest.h"
 
 #include "content_hash.h"
+#include "shape_layout.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,6 +16,16 @@ namespace {
 bool fail(Diagnostic &diagnostic, std::string code, std::string phase, std::string path, std::string message) {
     diagnostic = {std::move(code), std::move(phase), std::move(path), std::move(message)};
     return false;
+}
+
+bool isTapeCarrierRole(std::string_view role) {
+    return role == "tape" || role == "replay_segment" || role == "replay_status" || role == "launch_metadata";
+}
+
+bool isResourceEndpointRole(std::string_view role) {
+    return role == "storage" || role == "image" || role == "sampled" || role == "sampler" || role == "vertex" ||
+           role == "primal" || role == "retained_primal" || role == "cotangent" || role == "gradient" ||
+           isTapeCarrierRole(role);
 }
 
 bool uint32Value(const nlohmann::json &value, uint32_t &result) {
@@ -92,21 +103,33 @@ bool parseShape(const nlohmann::json &value, std::vector<uint64_t> &result, Diag
                 const std::string &path, bool allowEmpty = true, bool allowDynamic = false) {
     if (!value.is_array() || (!allowEmpty && value.empty()))
         return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path, "expected a shape array");
+    std::vector<int64_t> reflected;
+    reflected.reserve(value.size());
     for (size_t index = 0; index < value.size(); ++index) {
-        if (allowDynamic && value[index].is_number_integer()) {
-            const auto signedExtent = value[index].get<int64_t>();
-            if (signedExtent == 0 || signedExtent == -1) {
-                result.push_back(0);
-                continue;
-            }
-        }
-        uint64_t extent = 0;
-        if (!uint64Value(value[index], extent) || !extent)
+        if (!value[index].is_number_integer())
             return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/" + std::to_string(index),
                         allowDynamic ? "TensorView extent must be a positive static size or dyn"
                                      : "phase-one compute requires positive static extents");
-        result.push_back(extent);
+        int64_t extent = 0;
+        if (value[index].is_number_unsigned()) {
+            const uint64_t unsignedExtent = value[index].get<uint64_t>();
+            if (unsignedExtent > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/" + std::to_string(index),
+                            "shape extent exceeds the signed reflection range");
+            extent = static_cast<int64_t>(unsignedExtent);
+        } else {
+            extent = value[index].get<int64_t>();
+        }
+        if ((!allowDynamic && extent <= 0) || (allowDynamic && extent != -1 && extent <= 0))
+            return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/" + std::to_string(index),
+                        allowDynamic ? "TensorView extent must be a positive static size or dyn"
+                                     : "phase-one compute requires positive static extents");
+        reflected.push_back(extent);
     }
+    const std::optional<shape::DeclaredShape> decoded = shape::decodeReflectedShape(reflected);
+    if (!decoded)
+        return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path, "shape contains an invalid extent");
+    result = shape::encodeRuntimeContractShape(*decoded);
     return true;
 }
 
@@ -1088,7 +1111,8 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/layout",
                                     "invalid sampler endpoint layout");
                 } else if (!exactObject(layout, {"tag", "view_rank", "element_layout_hash", "minimum_alignment"},
-                                        {"shape", "descriptor"}, diagnostic, endpointPath + "/layout") ||
+                                        {"shape", "descriptor", "autodiff_carrier"}, diagnostic,
+                                        endpointPath + "/layout") ||
                            !layout["tag"].is_string() || layout["tag"] != "buffer" ||
                            !uint32Value(layout["view_rank"], endpoint.viewRank) ||
                            !digestValue(layout["element_layout_hash"]) ||
@@ -1098,6 +1122,12 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                 }
                 endpoint.viewDescriptor =
                     !image && !sampler && (!layout.contains("descriptor") || layout["descriptor"] == true);
+                if (!image && !sampler && layout.contains("autodiff_carrier")) {
+                    if (!layout["autodiff_carrier"].is_string() || layout["autodiff_carrier"] != "invocation_linear")
+                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
+                                    endpointPath + "/layout/autodiff_carrier", "invalid autodiff carrier");
+                    endpoint.autodiffCarrier = layout["autodiff_carrier"].get<std::string>();
+                }
                 if (layout.contains("descriptor") && !layout["descriptor"].is_boolean())
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/layout/descriptor",
                                 "invalid descriptor marker");
@@ -1691,10 +1721,9 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                                                        : access.kind == AccessKind::Initialize ? "write"
                                                                                                : access.access;
                     if (physicalValue >= program.values.size() || program.values[physicalValue].type != endpoint.type ||
-                        (endpoint.role != "storage" && endpoint.role != "image" && endpoint.role != "sampled" &&
-                         endpoint.role != "sampler" && endpoint.role != "vertex") ||
+                        !isResourceEndpointRole(endpoint.role) ||
                         (endpoint.transport != "resource_handle" && endpoint.transport != "device_address") ||
-                        endpoint.access != requiredAccess)
+                        (!isTapeCarrierRole(endpoint.role) && endpoint.access != requiredAccess))
                         return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
                                     nodePath + "/bindings/" + std::to_string(bindingIndex),
                                     "resource binding ABI or access does not match reflection");

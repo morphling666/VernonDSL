@@ -6,6 +6,7 @@
 #include "pipeline_manifest.h"
 #include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
+#include "shape_layout.h"
 
 #include <optional>
 #include <string>
@@ -32,14 +33,48 @@ enum class TargetCarrier {
     Attachment,
 };
 
+enum class CarrierSemantic {
+    Value,
+    Resource,
+    TapeData,
+    ReplaySegment,
+    ReplayStatus,
+    LaunchMetadata,
+};
+
+enum class ViewAxisSource {
+    LogicalAxis,
+    Constant,
+    InvocationLinearCarrier,
+};
+
+enum class DispatchMapping {
+    StaticGrid,
+    FirstTensorElementCount,
+};
+
+struct ViewAxisTransform {
+    ViewAxisSource source{ViewAxisSource::LogicalAxis};
+    uint32_t logicalAxis{};
+    uint64_t constantExtent{1};
+    bool zeroStride{};
+};
+
+struct ViewTransform {
+    std::vector<ViewAxisTransform> axes;
+};
+
+struct ProgramProjection {
+    uint32_t value{UINT32_MAX};
+    std::optional<size_t> leaf;
+};
+
 struct TargetEndpointIdentity {
     std::string module;
     std::string interfaceKind;
     uint32_t index{};
     uint32_t portableSlot{UINT32_MAX};
     std::string access;
-    uint32_t value{UINT32_MAX};
-    std::optional<size_t> leaf;
 };
 
 struct TargetNativeLocation {
@@ -56,9 +91,12 @@ struct TargetPhysicalTransport {
 
 struct TargetBinding {
     TargetEndpointIdentity endpoint;
+    ProgramProjection projection;
     SourceRepresentation source{SourceRepresentation::ResourceHandle};
     TargetCarrier carrier{TargetCarrier::StorageBuffer};
+    CarrierSemantic semantic{CarrierSemantic::Resource};
     std::string name;
+    std::string sourceName;
     std::string kind;
     std::string reflectedKind;
     std::string role;
@@ -66,7 +104,8 @@ struct TargetBinding {
     std::string dimension;
     std::string imageFormat;
     std::string builtin;
-    std::vector<uint64_t> shape;
+    std::optional<ViewTransform> viewTransform;
+    shape::DeclaredShape shape;
     std::vector<int64_t> viewShape;
     std::optional<vernon::runtime::ValueLayout> wholeValueLayout;
     vernon::runtime::ValueLayout elementLayout;
@@ -106,6 +145,7 @@ struct TargetBindingPlan {
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
     std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
     std::vector<vernon::runtime::NativeResourceSlot> nativeSlots;
+    DispatchMapping dispatchMapping{DispatchMapping::StaticGrid};
 };
 
 struct ResolvedExecutableNode {

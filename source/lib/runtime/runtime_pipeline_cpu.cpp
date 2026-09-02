@@ -242,7 +242,19 @@ VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const Plan
                 value.payload.inline_value.data = tensor->tensorViewData;
                 value.payload.inline_value.size = tensor->tensorViewSize;
             } else {
-                return fail(*pipeline.context, "CPU inline binding requires host data");
+                std::string parameterName;
+                for (const Parameter &parameter : pipeline.variant.parameters)
+                    if (std::any_of(parameter.uses.begin(), parameter.uses.end(), [&](const ParameterUse &use) {
+                            return use.stage == "compute" && use.index == layout.argument_index;
+                        })) {
+                        parameterName = parameter.name;
+                        break;
+                    }
+                return fail(*pipeline.context, "CPU inline binding '" + parameterName + "' at " +
+                                                   std::to_string(layout.argument_index) + " requires host data of " +
+                                                   std::to_string(layout.element_size) +
+                                                   " bytes (TensorView descriptor has " +
+                                                   std::to_string(tensor ? tensor->tensorViewSize : 0) + ")");
             }
         }
     }

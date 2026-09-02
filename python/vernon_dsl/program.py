@@ -819,6 +819,7 @@ def execute_module_vjp(
     parsed_program = parse_program(
         invocation,
         vjp_wrt=expression.wrt,
+        autodiff_planning_policy=expression.planning_policy,
     )
     if not isinstance(specialization, ProgramAutodiffSpecialization):
         specialization = compile_program_autodiff(parsed_program, template)

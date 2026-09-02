@@ -13,7 +13,7 @@ from .._shader_assets.cooking import (
     _compile_program_bundle_plan,
     _native_target,
 )
-from ..bundle import CpuTargetOptions, canonical_json
+from ..bundle import canonical_json, make_target_options
 from ..storage import TensorStorage
 from . import session as state
 from .autodiff import _pipeline_derivative_groups
@@ -194,10 +194,13 @@ class ProgramAutodiffSpecialization:
 
 
 def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpecialization:
-    if state._architecture != state.cpu or state._native_runtime is None:
-        raise RuntimeError("interactive Program autodiff currently requires the CPU runtime")
+    if state._native_runtime is None:
+        raise RuntimeError(f"{state._architecture.name} Program autodiff requires the native runtime")
     native = state._native
-    target = CpuTargetOptions()
+    target = make_target_options(
+        state._architecture.name,
+        {"version": state._interactive_glsl_version()} if state._architecture in {state.opengl, state.opengles} else {},
+    )
     compiler = native.Compiler()
     retained_programs: list[tuple[Any, Any]] = []
     plan = _compile_program_bundle_plan(
@@ -208,7 +211,7 @@ def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpeci
         compiler=compiler,
         native=native,
         native_target=_native_target(native, target.target),
-        retained_programs=retained_programs,
+        retained_programs=retained_programs if state._architecture == state.cpu else None,
         canonical_execution=True,
     )
     directory = tempfile.TemporaryDirectory(prefix="vernon-program-ad-")

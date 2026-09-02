@@ -5,6 +5,7 @@
 #include "pipeline_bundle.h"
 #include "pipeline_manifest.h"
 #include "pipeline_metadata.h"
+#include "target_binding_plan.h"
 
 #include <cstddef>
 #include <memory>
@@ -18,6 +19,9 @@ namespace vernon::runtime::ad {
 class Executable;
 class AutodiffMemoryPolicy;
 } // namespace vernon::runtime::ad
+namespace vernon::runtime::program {
+struct ResolvedProgram;
+} // namespace vernon::runtime::program
 struct VernonPipelineTopology;
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
@@ -133,16 +137,19 @@ struct VernonLoadedPipeline {
 struct VernonProgramStageBinding {
     uint32_t value{};
     std::optional<size_t> leaf;
+    std::optional<vernon::runtime::program::TargetBinding> target;
 };
 
 struct VernonResolvedProgramStage {
     std::unique_ptr<VernonLoadedPipeline> pipeline;
     std::vector<VernonProgramStageBinding> bindings;
+    vernon::runtime::program::DispatchMapping dispatchMapping{vernon::runtime::program::DispatchMapping::StaticGrid};
 };
 
 struct VernonPipelineTopology {
     ~VernonPipelineTopology();
 
+    std::shared_ptr<const vernon::runtime::program::ResolvedProgram> resolvedProgram;
     vernon::runtime::ExecutableProgram execution;
     std::vector<uint32_t> residualValues;
     bool directDispatch{};

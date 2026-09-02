@@ -1,6 +1,7 @@
 #include "runtime_dispatch.h"
 
 #include "backend_cpu.h"
+#include "shape_layout.h"
 
 #include <nlohmann/json.hpp>
 
@@ -81,6 +82,12 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         if (!parseAutodiffResourceRole(argument, parameter.autodiffRole, error))
             return false;
         parameter.autodiffSource = argument.value("vernon.autodiff_source", "");
+        const std::string carrier = argument.value("vernon.autodiff_carrier", "");
+        if (!carrier.empty() && carrier != "invocation_linear") {
+            error = "compute artifact reflection contains an unknown autodiff carrier";
+            return false;
+        }
+        parameter.invocationCarrier = carrier == "invocation_linear";
         if (parameter.kind == "tensor") {
             if (argument.contains("element_layout")) {
                 if (!parsePipelineValueLayout(argument["element_layout"], parameter.elementLayout, error))
@@ -125,14 +132,22 @@ bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &en
         }
         if (argument.contains("shape") && argument["shape"].is_array())
             parameter.shape = argument["shape"].get<std::vector<uint64_t>>();
-        else if (argument.contains("source_shape") && argument["source_shape"].is_array())
+        else if (argument.contains("source_shape") && argument["source_shape"].is_array()) {
+            std::vector<int64_t> reflected;
             for (const auto &extent : argument["source_shape"]) {
-                if (!extent.is_number_integer() || extent.get<int64_t>() < -1) {
+                if (!extent.is_number_integer()) {
                     error = "TensorView source shape contains an invalid extent";
                     return false;
                 }
-                parameter.shape.push_back(extent.get<int64_t>() < 0 ? 0 : static_cast<uint64_t>(extent.get<int64_t>()));
+                reflected.push_back(extent.get<int64_t>());
             }
+            const std::optional<shape::DeclaredShape> decoded = shape::decodeReflectedShape(reflected);
+            if (!decoded) {
+                error = "TensorView source shape contains an invalid extent";
+                return false;
+            }
+            parameter.shape = shape::encodeRuntimeContractShape(*decoded);
+        }
         ParameterUse use;
         use.stage = "compute";
         use.index = static_cast<uint32_t>(reflectedIndex);

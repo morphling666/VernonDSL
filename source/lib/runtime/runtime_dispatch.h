@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+namespace vernon::runtime::ad {
+class ProgramValueArena;
+}
+
 namespace vernon::runtime {
 
 bool isOpenGLBackend(VernonRuntimeBackend backend);
@@ -45,6 +49,8 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
 VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
 VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
                                          const std::vector<VernonPipelineArgument> &values);
+VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+                                         ad::ProgramValueArena &arena);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);

@@ -216,10 +216,10 @@ bool buildBindingSpecPlan(const Variant &variant, const Signature &signature, Bi
                     return false;
                 }
                 const size_t logicalTensorRank = abi->logicalShape.size() - binding.leafShape.size();
-                if (binding.tensorViewRank == logicalTensorRank + 1 &&
-                    parameter.autodiffRole == AutodiffResourceRole::Cotangent)
-                    binding.carrierDimension = true;
-                else if (binding.tensorViewRank != logicalTensorRank) {
+                binding.carrierDimension = parameter.invocationCarrier;
+                const size_t expectedRank = logicalTensorRank + (binding.carrierDimension ? 1 : 0);
+                if ((binding.carrierDimension && parameter.autodiffRole != AutodiffResourceRole::Cotangent) ||
+                    binding.tensorViewRank != expectedRank) {
                     error =
                         "GPU autodiff derivative binding '" + parameter.name + "' has an invalid physical carrier rank";
                     return false;

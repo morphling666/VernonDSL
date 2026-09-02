@@ -23,6 +23,9 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
 std::optional<size_t> resolveProgramValueLeafIndex(const llvm::json::Object &layout, llvm::StringRef source,
                                                    llvm::StringRef parameter);
 
+bool compatibleProgramBindingShape(llvm::StringRef role, llvm::StringRef carrier, const llvm::json::Array *logical,
+                                   const llvm::json::Array *physical);
+
 bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                                   const std::vector<CanonicalComputeStage> &compiledStages, llvm::json::Object &program,
                                   llvm::json::Object &stageContracts, llvm::json::Object &targetImplementations,

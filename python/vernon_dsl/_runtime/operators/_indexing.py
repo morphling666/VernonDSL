@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 
 def view_shape_annotation(rank: int) -> str:
     if rank == 0:
@@ -14,7 +16,8 @@ def view_shape_annotation(rank: int) -> str:
 def element_token(element: str) -> str:
     if element.startswith("vd.") and "[" not in element:
         return element[3:]
-    return element.replace("[", "_").replace("]", "_").replace(", ", "x").replace(".", "_")
+    portable = element.replace(", ", "x")
+    return "_".join(part for part in re.split(r"[^A-Za-z0-9]+", portable) if part)
 
 
 def linear_index_target(rank: int) -> str:

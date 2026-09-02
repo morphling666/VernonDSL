@@ -145,6 +145,7 @@ struct Parameter {
     std::string exactStorageFormat;
     AutodiffResourceRole autodiffRole{AutodiffResourceRole::None};
     std::string autodiffSource;
+    bool invocationCarrier{};
     std::vector<uint64_t> shape;
     std::vector<ParameterUse> uses;
 };

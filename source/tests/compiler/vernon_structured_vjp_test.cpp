@@ -690,10 +690,13 @@ module {
         if (role.getValue() == "gradient") {
             ++gradientResources;
             EXPECT_TRUE(view.getShape().empty());
+            EXPECT_FALSE(result->backward.getArgAttr(index, "vernon.autodiff_carrier"));
             EXPECT_EQ(result->backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_source").getValue(), "x");
         } else if (role.getValue() == "cotangent") {
             ++carriedCotangents;
             EXPECT_EQ(view.getShape(), (ArrayRef<int64_t>{-1, 1}));
+            EXPECT_EQ(result->backward.getArgAttrOfType<StringAttr>(index, "vernon.autodiff_carrier").getValue(),
+                      "invocation_linear");
         }
     }
     EXPECT_EQ(gradientResources, 1u);

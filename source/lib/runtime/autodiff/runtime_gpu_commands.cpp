@@ -265,9 +265,10 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
     }
     if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Wait))
         return fail(context, "injected GPU command DAG wait failure", VERNON_STATUS_INTERNAL_ERROR);
-    return status == VERNON_RHI_STATUS_OK
-               ? VERNON_STATUS_OK
-               : fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
+    if (status == VERNON_RHI_STATUS_OK)
+        return VERNON_STATUS_OK;
+    const std::string detail = invocationDiagnostic(context);
+    return fail(context, detail.empty() ? "GPU autodiff command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
 }
 
 VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, VernonLaunchSize grid,

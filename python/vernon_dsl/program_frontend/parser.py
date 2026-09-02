@@ -219,6 +219,7 @@ def parse_program(
     invocation: Any,
     *,
     vjp_wrt: tuple[str, ...] = (),
+    autodiff_planning_policy: str | None = None,
 ) -> ParsedProgram:
     """Parse one captured Module specialization into a primal Program."""
 
@@ -227,7 +228,10 @@ def parse_program(
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]] = {}
     scalar_input_ids = _scalar_input_ids(invocation)
     for operation in invocation.graph.operations:
-        frontend = operation.kernel._lower(operation.features).frontend
+        frontend = operation.kernel._lower(
+            operation.features,
+            autodiff_planning_policy=autodiff_planning_policy,
+        ).frontend
         host_constants = _operation_host_constants(operation, invocation, scalar_input_ids)
         implementation = ProgramImplementation(
             operation.name,

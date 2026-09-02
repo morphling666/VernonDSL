@@ -228,7 +228,6 @@ class SmokeFluidGraphTests(unittest.TestCase):
         density, velocity, target = self._inputs(size)
 
         def gradient(architecture: Any) -> np.ndarray:
-            print(f"arch: {architecture}")
             vd.init(arch=architecture)
             simulation = SmokeFluidSimulation(
                 grid=size,
@@ -251,7 +250,6 @@ class SmokeFluidGraphTests(unittest.TestCase):
             return result["state_velocity"].to_numpy()
 
         expected = gradient(vd.cpu)
-        print(f"expected: {expected}")
         for architecture in (
             vd.cuda,
             vd.vulkan,
@@ -366,7 +364,6 @@ class SmokeFluidGraphTests(unittest.TestCase):
                     3.5,
                     "resident/logical regression tolerance is frozen at 3.5 for normal CI grids",
                 )
-            print(f"pass_telemetry: {pullback.pass_telemetry}")
             loss_telemetry = next(item for item in pullback.pass_telemetry if item["pass_name"].endswith(".smoke_loss"))
             self.assertEqual(loss_telemetry["control_history_kind"], "none")
             self.assertEqual(loss_telemetry["logical_residual_bytes"], 0)
@@ -466,6 +463,7 @@ class SmokeFluidGraphTests(unittest.TestCase):
         self.assertGreaterEqual(pullback.logical_residual_bytes, 0)
 
     def test_dynamic_checkpoint_runtime_enforces_physical_budget(self) -> None:
+        vd.init(arch=vd.cpu)
         size = 4
         density, velocity, target = self._inputs(size)
         velocity_storage = vd.storage.zeros(dtype=vd.Vector[vd.f32, 2], shape=(size, size))

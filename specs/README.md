@@ -54,9 +54,6 @@ Supporting future designs:
   build, linking, and browser deployment path.
 - [`autodiff.md`](autodiff.md) is the current autodiff contract; Program VJP
   follow-up is [`unified_program_vjp.md`](unified_program_vjp.md).
-- [`program_vjp_debug_priority.md`](program_vjp_debug_priority.md) is the
-  active debug ladder (which AD tests to green first) while finishing that
-  convergence; refresh its failure list as layers pass.
 - [`program_vjp_adjoint_ssa.md`](program_vjp_adjoint_ssa.md) is the interior
   adjoint rule for Program VJP: SSA handles, DPS TensorView add, kernel/public
   `read`/`write` ABI, no kernel that returns Storage.

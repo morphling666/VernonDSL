@@ -405,7 +405,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
             auto kernel = gpu::GPUFuncOp::create(moduleBuilder, source.getLoc(), source.getSymName(), functionType);
             kernel->setAttr(gpu::GPUDialect::getKernelFuncAttrName(), moduleBuilder.getUnitAttr());
             for (const auto &[sourceIndex, range] : sourceArgumentRanges)
-                for (StringRef name : {"vernon.autodiff_role", "vernon.autodiff_source"})
+                for (StringRef name : {"vernon.autodiff_role", "vernon.autodiff_source", "vernon.autodiff_carrier"})
                     if (Attribute value = source.getArgAttr(sourceIndex, name))
                         for (unsigned offset = 0; offset < range.second; ++offset)
                             kernel.setArgAttr(range.first + offset, name, value);

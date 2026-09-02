@@ -1,7 +1,10 @@
 #include "VernonRuntime.h"
 #include "VernonExecutionGraph.h"
+#include "execution_graph/execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/autodiff/program_value_arena.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
+#include "runtime/autodiff/runtime_gpu_commands.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "runtime/backend_cpu.h"
 #include "runtime/compute_launch_planner.h"
@@ -1059,18 +1062,73 @@ struct PipelineOwnedTensor {
     std::vector<int64_t> strides;
 };
 
+struct PipelineComputeResource {
+    uint32_t value{};
+    std::string access;
+};
+
+struct PipelineComputePassDescription {
+    std::string name;
+    uint64_t grid[3]{1, 1, 1};
+    std::vector<uint32_t> operands;
+    std::vector<uint32_t> results;
+    std::vector<PipelineComputeResource> resources;
+};
+
+PipelineComputePassDescription describeProgramNode(const ProgramNode &node) {
+    PipelineComputePassDescription description;
+    description.name = node.name;
+    std::copy(std::begin(node.grid), std::end(node.grid), description.grid);
+    description.operands = node.operands;
+    description.results = node.results;
+    description.resources.reserve(node.resources.size());
+    for (const ProgramResourceUse &resource : node.resources)
+        description.resources.push_back({resource.value, resource.access});
+    return description;
+}
+
+bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const uint64_t staticGrid[3],
+                        const std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize &grid,
+                        std::string &error) {
+    grid = {static_cast<uint32_t>(staticGrid[0]), static_cast<uint32_t>(staticGrid[1]),
+            static_cast<uint32_t>(staticGrid[2])};
+    if (mapping == vernon::runtime::program::DispatchMapping::StaticGrid)
+        return true;
+    for (const VernonPipelineArgument &argument : arguments) {
+        if (argument.kind != VERNON_PIPELINE_TENSOR || (argument.tensor.rank && !argument.tensor.shape))
+            continue;
+        uint64_t count = 1;
+        for (uint32_t dimension = 0; dimension < argument.tensor.rank; ++dimension) {
+            const uint64_t extent = argument.tensor.shape[dimension];
+            if (!extent || count > std::numeric_limits<uint32_t>::max() / extent) {
+                error = "linearized Program dispatch exceeds the portable uint32 range";
+                return false;
+            }
+            count *= extent;
+        }
+        grid = {static_cast<uint32_t>(count), 1, 1};
+        return true;
+    }
+    error = "linearized Program dispatch has no Tensor extent source";
+    return false;
+}
+
 class PipelineComputePass final : public vernon::execution::ComputePass {
 public:
     PipelineComputePass(const ProgramNode &node, VernonLoadedPipeline &pipeline,
                         std::vector<VernonPipelineArgument> arguments,
+                        std::vector<std::vector<uint64_t>> argumentShapes,
                         std::vector<std::vector<int64_t>> argumentStrides,
                         const std::vector<vernon::execution::GraphBuffer> &resources,
-                        const std::vector<VernonPipelineArgument> *arena, const ExecutableProgram *execution)
-        : ComputePass(node.name), node_(node), pipeline_(pipeline), arguments_(std::move(arguments)),
-          argumentStrides_(std::move(argumentStrides)), resources_(resources), arena_(arena), execution_(execution) {}
+                        const std::vector<VernonPipelineArgument> *arena, const ExecutableProgram *execution,
+                        vernon::runtime::program::DispatchMapping dispatchMapping)
+        : ComputePass(node.name), description_(describeProgramNode(node)), pipeline_(pipeline),
+          arguments_(std::move(arguments)), argumentShapes_(std::move(argumentShapes)),
+          argumentStrides_(std::move(argumentStrides)), resources_(resources), arena_(arena), execution_(execution),
+          dispatchMapping_(dispatchMapping) {}
 
     void declare() override {
-        for (const ProgramResourceUse &use : node_.resources) {
+        for (const PipelineComputeResource &use : description_.resources) {
             if (use.access == "read")
                 read(resources_.at(use.value));
             else if (use.access == "write")
@@ -1088,36 +1146,12 @@ public:
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = arguments_.data();
         invocation.argument_count = arguments_.size();
-        invocation.compute_grid = {static_cast<uint32_t>(node_.grid[0]), static_cast<uint32_t>(node_.grid[1]),
-                                   static_cast<uint32_t>(node_.grid[2])};
-        const bool unitStaticGrid =
-            invocation.compute_grid.x == 1 && invocation.compute_grid.y == 1 && invocation.compute_grid.z == 1;
-        const std::string &entry = pipeline_.variant.compute;
-        const bool elementwiseDispatch =
-            entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos;
-        if (unitStaticGrid && elementwiseDispatch) {
-            for (const VernonPipelineArgument &argument : arguments_) {
-                if (argument.kind != VERNON_PIPELINE_TENSOR ||
-                    (argument.tensor.storage != VERNON_TENSOR_HOST &&
-                     argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE) ||
-                    (argument.tensor.rank && !argument.tensor.shape))
-                    continue;
-                uint64_t count = 1;
-                for (uint32_t dimension = 0; dimension < argument.tensor.rank; ++dimension) {
-                    const uint64_t extent = argument.tensor.shape[dimension];
-                    if (!extent || count > std::numeric_limits<uint32_t>::max() / extent) {
-                        invocationDiagnostic(*pipeline_.context) =
-                            "linearized Program copy/add grid exceeds uint32 range";
-                        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-                    }
-                    count *= extent;
-                }
-                invocation.compute_grid = {static_cast<uint32_t>(count), 1, 1};
-                break;
-            }
-        }
         PlannedComputeLaunch plan;
         std::string error;
+        if (!resolveProgramGrid(dispatchMapping_, description_.grid, arguments_, invocation.compute_grid, error)) {
+            invocationDiagnostic(*pipeline_.context) = std::move(error);
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        }
         const uint32_t workgroup[3]{pipeline_.workgroupSize.x, pipeline_.workgroupSize.y, pipeline_.workgroupSize.z};
         if (pipeline_.context && pipeline_.context->backend == VERNON_RUNTIME_CPU) {
             VernonAdTapeAllocator *allocator = nullptr;
@@ -1134,9 +1168,9 @@ public:
                 std::memcpy(&allocator, bytes, sizeof(allocator));
                 std::memcpy(&root, bytes + sizeof(allocator), sizeof(root));
             };
-            for (uint32_t operand : node_.operands)
+            for (uint32_t operand : description_.operands)
                 bindTape(operand);
-            for (uint32_t result : node_.results)
+            for (uint32_t result : description_.results)
                 bindTape(result);
             vernon::runtime::setCpuProgramTape(pipeline_, allocator, root);
         }
@@ -1154,20 +1188,22 @@ public:
             std::string &detail = invocationDiagnostic(*pipeline_.context);
             if (detail.empty())
                 detail = "pipeline compute failed";
-            detail = node_.name + ": " + detail;
+            detail = description_.name + ": " + detail;
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
         }
         return VERNON_RHI_STATUS_OK;
     }
 
 private:
-    const ProgramNode &node_;
+    PipelineComputePassDescription description_;
     VernonLoadedPipeline &pipeline_;
     std::vector<VernonPipelineArgument> arguments_;
+    std::vector<std::vector<uint64_t>> argumentShapes_;
     std::vector<std::vector<int64_t>> argumentStrides_;
     const std::vector<vernon::execution::GraphBuffer> &resources_;
     const std::vector<VernonPipelineArgument> *arena_{};
     const ExecutableProgram *execution_{};
+    vernon::runtime::program::DispatchMapping dispatchMapping_;
 };
 
 bool contiguousTensorStorage(const Parameter &parameter, PipelineOwnedTensor &owned, VernonPipelineArgument &argument) {
@@ -1207,10 +1243,43 @@ bool contiguousTensorStorage(const Parameter &parameter, PipelineOwnedTensor &ow
 }
 
 VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
-                                             const std::vector<VernonPipelineArgument> &valueArguments) {
+                                             vernon::runtime::ad::ProgramValueArena &arena) {
+    const std::vector<VernonPipelineArgument> &valueArguments = arena.logicalArguments();
     const ExecutableProgram &execution = pipeline.topology->execution;
     if (valueArguments.size() != execution.values.size())
         return fail(pipeline.context, "Program graph value set does not match its execution topology");
+    if (pipeline.context->backend != VERNON_RUNTIME_CPU) {
+        vernon::execution::detail::RhiCommandExecutionPlan commandPlan;
+        std::vector<vernon::runtime::ad::MaterializedProgramArguments> materializedNodes;
+        materializedNodes.reserve(graph.nodes.size());
+        for (const ProgramNode &node : graph.nodes) {
+            const auto stageIndex = pipeline.topology->stageIndices.find(node.stage);
+            if (stageIndex == pipeline.topology->stageIndices.end())
+                return fail(pipeline.context, "pipeline node has no resolved kernel stage");
+            VernonResolvedProgramStage &resolvedStage = pipeline.topology->stages[stageIndex->second];
+            materializedNodes.emplace_back();
+            std::string materializationError;
+            if (!arena.materializeNodeArguments(execution, node, resolvedStage, materializedNodes.back(),
+                                                materializationError))
+                return fail(pipeline.context, std::move(materializationError));
+            vernon::execution::detail::RhiCommandExecutionPlan nodePlan;
+            VernonLaunchSize grid{};
+            std::string gridError;
+            if (!resolveProgramGrid(resolvedStage.dispatchMapping, node.grid, materializedNodes.back().arguments, grid,
+                                    gridError))
+                return fail(pipeline.context, std::move(gridError));
+            const VernonStatus planned = vernon::runtime::ad::gpu::buildPipelineCommandPlan(
+                *pipeline.context, {}, {}, *resolvedStage.pipeline, materializedNodes.back().arguments, grid, {},
+                vernon::execution::detail::CommandNodeKind::Derivative, nodePlan);
+            if (planned != VERNON_STATUS_OK)
+                return planned;
+            std::string compositionError;
+            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(nodePlan), true,
+                                                                          compositionError))
+                return fail(pipeline.context, std::move(compositionError));
+        }
+        return vernon::runtime::ad::gpu::executeCommandPlanAndWait(*pipeline.context, commandPlan);
+    }
     vernon::execution::ExecutionGraph executionGraph;
     std::vector<vernon::execution::GraphBuffer> resources;
     resources.reserve(valueArguments.size());
@@ -1222,11 +1291,17 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
             continue;
         }
         const VernonPipelineArgument &argument = valueArguments[index];
-        if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
-            !argument.tensor.host_data)
-            return fail(pipeline.context, "Program graph requires materialized host tensor values");
-        const uint64_t identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
-        resources.push_back(executionGraph.importHostBuffer(identity, execution.values[index].output));
+        if (argument.kind != VERNON_PIPELINE_TENSOR)
+            return fail(pipeline.context, "Program graph requires materialized tensor values");
+        if (argument.tensor.storage == VERNON_TENSOR_HOST && argument.tensor.host_data) {
+            const uint64_t identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
+            resources.push_back(executionGraph.importHostBuffer(identity, execution.values[index].output));
+            continue;
+        }
+        const VernonRhiBuffer device = arena.buffer(static_cast<uint32_t>(index));
+        if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+            return fail(pipeline.context, "Program graph requires a materialized host or RHI Storage backing");
+        resources.push_back(executionGraph.importBuffer(device, execution.values[index].output));
     }
     std::vector<vernon::execution::ExecutionPass *> passes(graph.nodes.size());
     for (const ProgramNode &node : graph.nodes) {
@@ -1235,51 +1310,13 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
             return fail(pipeline.context, "pipeline node has no resolved kernel stage");
         VernonResolvedProgramStage &resolvedStage = pipeline.topology->stages[stageIndex->second];
         VernonLoadedPipeline &stage = *resolvedStage.pipeline;
-        if (resolvedStage.bindings.size() != stage.variant.parameters.size())
-            return fail(pipeline.context, "resolved Program stage has an invalid binding plan");
-        std::vector<VernonPipelineArgument> arguments;
-        std::vector<std::vector<int64_t>> argumentStrides;
-        arguments.reserve(stage.variant.parameters.size());
-        argumentStrides.reserve(stage.variant.parameters.size());
-        for (size_t parameterIndex = 0; parameterIndex < stage.variant.parameters.size(); ++parameterIndex) {
-            const Parameter &parameter = stage.variant.parameters[parameterIndex];
-            const VernonProgramStageBinding &binding = resolvedStage.bindings[parameterIndex];
-            const uint32_t valueId = binding.value;
-            if (valueId >= valueArguments.size())
-                return fail(pipeline.context, "resolved Program stage binding exceeds the value arena");
-            VernonPipelineArgument argument = valueArguments[valueId];
-            argument.slot = parameter.slot;
-            argumentStrides.emplace_back();
-            if (binding.leaf) {
-                const ProgramValueSlot &slot = execution.values[valueId];
-                if (!slot.valueLayout || *binding.leaf >= slot.valueLayout->leaves.size())
-                    return fail(pipeline.context, "resolved Program stage leaf exceeds the canonical Value ABI");
-                const ValueLeaf &leaf = slot.valueLayout->leaves[*binding.leaf];
-                const ValueLayout &parameterLayout =
-                    parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
-                const std::vector<uint64_t> &parameterShape = parameter.shape;
-                argument.tensor.byte_offset += leaf.byteOffset;
-                argument.tensor.element_layout = valueLayoutView(parameterLayout);
-                argument.tensor.rank = static_cast<uint32_t>(parameterShape.size());
-                argument.tensor.shape = parameterShape.empty() ? nullptr : parameterShape.data();
-                std::vector<int64_t> &strides = argumentStrides.back();
-                strides.resize(parameterShape.size());
-                uint64_t stride = parameterLayout.byteSize;
-                for (size_t dimension = parameterShape.size(); dimension-- > 0;) {
-                    if (stride > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-                        return fail(pipeline.context, "Program aggregate leaf stride overflows");
-                    strides[dimension] = static_cast<int64_t>(stride);
-                    if (parameterShape[dimension] &&
-                        stride > std::numeric_limits<uint64_t>::max() / parameterShape[dimension])
-                        return fail(pipeline.context, "Program aggregate leaf footprint overflows");
-                    stride *= parameterShape[dimension];
-                }
-                argument.tensor.byte_strides = strides.empty() ? nullptr : strides.data();
-            }
-            arguments.push_back(argument);
-        }
+        vernon::runtime::ad::MaterializedProgramArguments materialized;
+        std::string materializationError;
+        if (!arena.materializeNodeArguments(execution, node, resolvedStage, materialized, materializationError))
+            return fail(pipeline.context, std::move(materializationError));
         auto &pass = executionGraph.emplacePass<PipelineComputePass>(
-            node, stage, std::move(arguments), std::move(argumentStrides), resources, &valueArguments, &execution);
+            node, stage, std::move(materialized.arguments), std::move(materialized.shapes),
+            std::move(materialized.strides), resources, &valueArguments, &execution, resolvedStage.dispatchMapping);
         for (uint32_t dependency : node.dependencies) {
             if (dependency >= passes.size() || !passes[dependency])
                 return fail(pipeline.context, "Program node dependency is not materialized");
@@ -1350,7 +1387,8 @@ VernonStatus executePipelineTopology(VernonLoadedPipeline &pipeline, const Verno
     if (std::find(populated.begin(), populated.end(), 0) != populated.end())
         return fail(pipeline.context, "Program invocation has an unmaterialized value");
 
-    return executePipelineProgramGraphImpl(pipeline, *forward, valueArguments);
+    vernon::runtime::ad::ProgramValueArena arena(valueArguments);
+    return executePipelineProgramGraphImpl(pipeline, *forward, arena);
 }
 
 VernonStatus encodePipelineInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation) {
@@ -1555,7 +1593,15 @@ VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &
     if (pipeline.context->backend != VERNON_RUNTIME_CPU)
         return fail(pipeline.context, "pipeline Program graph currently supports CPU compute execution",
                     VERNON_STATUS_UNSUPPORTED_TARGET);
-    return executePipelineProgramGraphImpl(pipeline, graph, values);
+    vernon::runtime::ad::ProgramValueArena arena(values);
+    return executePipelineProgramGraphImpl(pipeline, graph, arena);
+}
+
+VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+                                                          vernon::runtime::ad::ProgramValueArena &arena) {
+    if (!pipeline.topology)
+        return fail(pipeline.context, "resolved pipeline has no execution topology");
+    return executePipelineProgramGraphImpl(pipeline, graph, arena);
 }
 
 VernonPipelineTopology::~VernonPipelineTopology() {

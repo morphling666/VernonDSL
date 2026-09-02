@@ -1052,6 +1052,18 @@ size_t HostDynamicTapeBatch::residentBytes() const { return impl_->totalCharge.l
 
 size_t HostDynamicTapeBatch::allocatedBytes() const { return residentBytes(); }
 
+bool HostDynamicTapeBatch::hasControlHistory() const {
+    if (impl_->compacted)
+        return std::any_of(impl_->snapshotRecords.begin(), impl_->snapshotRecords.end(),
+                           [](const Impl::SnapshotRecord &record) { return record.childCount != 0; });
+    for (size_t index = 0; index < impl_->records.size(); ++index) {
+        const Impl::Record *record = impl_->records.at(index);
+        if (record && record->childCount)
+            return true;
+    }
+    return false;
+}
+
 HostStaticTapeBatch::Reader *HostStaticTapeBatch::Reader::owner(VernonAdTapeAllocator *allocator) {
     if (!allocator || allocator->struct_size != sizeof(VernonAdTapeAllocator) ||
         allocator->abi_version != VERNON_AD_TAPE_ALLOCATOR_ABI_VERSION || !allocator->user_data) {
@@ -1268,6 +1280,11 @@ bool HostStaticTapeBatch::hasDynamicLanes() const {
                            [](uint8_t kind) { return kind != 0; });
     return std::any_of(lanes_.begin(), lanes_.end(),
                        [](const LaneState &lane) { return lane.phase == LanePhase::Promoted; });
+}
+
+bool HostStaticTapeBatch::hasControlHistory() const {
+    const HostDynamicTapeBatch *dynamic = dynamicBatch();
+    return dynamic && dynamic->hasControlHistory();
 }
 
 bool HostStaticTapeBatch::compact(bool retainConstructionStorage) {

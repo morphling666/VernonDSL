@@ -1,5 +1,6 @@
 #include "runtime_gpu_argument_binding.h"
 
+#include "runtime/shape_layout.h"
 #include "runtime_autodiff_internal.h"
 
 #include <limits>
@@ -68,53 +69,30 @@ bool fillHostTensor(const Parameter &parameter, const HostValue &host, const std
 
 } // namespace
 
-bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter &parameter, const DeviceBuffer &buffer,
-                                  size_t logicalBytes, InternalBufferView &view,
-                                  std::vector<VernonPipelineArgument> &arguments) {
-    (void)context;
-    const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
-    if (!layout || layout->leaves.size() != 1 || !logicalBytes)
+bool materializeInternalBufferView(const shape::DeclaredShape &declaredShape, const ValueLayout &layout,
+                                   size_t logicalBytes, InternalBufferView &view) {
+    if (layout.leaves.size() != 1 || !logicalBytes)
         return false;
-    const ValueLeaf &leaf = layout->leaves.front();
+    const ValueLeaf &leaf = layout.leaves.front();
     const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
     const size_t scalarBytes = dtype ? dtypeSize(*dtype) : 0;
     size_t elementBytes = 0;
     if (!scalarBytes || !leaf.scalarCount ||
         !checkedMultiply(scalarBytes, static_cast<size_t>(leaf.scalarCount), elementBytes) || !elementBytes)
         return false;
-    view.shape = parameter.shape;
-    size_t dynamicDimensions = 0;
-    size_t staticElements = 1;
-    for (uint64_t extent : view.shape) {
-        if (!extent) {
-            ++dynamicDimensions;
-            continue;
-        }
-        if (!checkedMultiply(staticElements, static_cast<size_t>(extent), staticElements))
-            return false;
-    }
-    if (dynamicDimensions == 1) {
-        if (logicalBytes % elementBytes != 0 || logicalBytes / elementBytes % staticElements != 0)
-            return false;
-        const uint64_t dynamicExtent = logicalBytes / elementBytes / staticElements;
-        for (uint64_t &extent : view.shape)
-            if (!extent) {
-                extent = dynamicExtent;
-                break;
-            }
-    } else if (dynamicDimensions != 0) {
-        return false;
-    }
-    view.strides.resize(view.shape.size());
-    size_t stride = elementBytes;
-    for (size_t dimension = view.shape.size(); dimension-- > 0;) {
-        if (stride > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
-            return false;
-        view.strides[dimension] = static_cast<int64_t>(stride);
-        if (!checkedMultiply(stride, static_cast<size_t>(view.shape[dimension]), stride))
-            return false;
-    }
-    if (stride > logicalBytes)
+    size_t elements = 0;
+    return shape::resolveSingleDynamicExtent(declaredShape, elementBytes, logicalBytes, view.shape) &&
+           shape::rowMajorByteStrides(view.shape, elementBytes, view.strides) &&
+           shape::checkedElementCount(view.shape, elements) && elements <= logicalBytes / elementBytes;
+}
+
+bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter &parameter, const DeviceBuffer &buffer,
+                                  size_t logicalBytes, InternalBufferView &view,
+                                  std::vector<VernonPipelineArgument> &arguments) {
+    (void)context;
+    const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
+    if (!layout ||
+        !materializeInternalBufferView(shape::decodeRuntimeContractShape(parameter.shape), *layout, logicalBytes, view))
         return false;
     VernonRuntimeProviderResourceReference resource{};
     if (!buffer.reference(resource))

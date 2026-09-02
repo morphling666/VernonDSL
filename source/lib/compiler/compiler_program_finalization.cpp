@@ -335,9 +335,13 @@ bool identicalConcreteShape(const llvm::json::Array *left, const llvm::json::Arr
 }
 
 bool compatibleAbiShape(const llvm::json::Array *logical, const llvm::json::Array *physical) {
-    if (!logical || !physical || logical->size() != physical->size())
+    const size_t logicalRank = logical ? logical->size() : 0;
+    const size_t physicalRank = physical ? physical->size() : 0;
+    if (logicalRank != physicalRank)
         return false;
-    for (size_t index = 0; index < logical->size(); ++index) {
+    if (!logicalRank)
+        return true;
+    for (size_t index = 0; index < logicalRank; ++index) {
         const std::optional<int64_t> concrete = (*logical)[index].getAsInteger();
         const std::optional<int64_t> declared = (*physical)[index].getAsInteger();
         if (!concrete || !declared)
@@ -375,6 +379,17 @@ bool kernelTapeBuiltin(llvm::StringRef builtin) {
     return builtin == "ad_tape_allocator" || builtin == "ad_tape_root_region";
 }
 
+bool isTapeCarrierRole(llvm::StringRef role) {
+    return role == "tape" || role == "replay_segment" || role == "replay_status";
+}
+
+bool matchesAutodiffBinding(llvm::StringRef logicalRole, llvm::StringRef logicalSource,
+                            const InterfaceValue &physical) {
+    if (logicalRole == "tape")
+        return isTapeCarrierRole(physical.role);
+    return physical.role == logicalRole && physical.source == logicalSource;
+}
+
 bool compiledKernelHasTapeAbi(const llvm::json::Object &compiledEntry) {
     const auto scan = [](const llvm::json::Array *rows) {
         if (!rows)
@@ -384,7 +399,8 @@ bool compiledKernelHasTapeAbi(const llvm::json::Object &compiledEntry) {
             const std::optional<llvm::StringRef> builtin =
                 row ? (row->getString("vernon.builtin") ? row->getString("vernon.builtin") : row->getString("builtin"))
                     : std::nullopt;
-            if (builtin && kernelTapeBuiltin(*builtin))
+            const std::optional<llvm::StringRef> role = row ? row->getString("vernon.autodiff_role") : std::nullopt;
+            if ((builtin && kernelTapeBuiltin(*builtin)) || (role && isTapeCarrierRole(*role)))
                 return true;
         }
         return false;
@@ -452,6 +468,22 @@ struct LogicalResource {
 
 } // namespace
 
+bool compatibleProgramBindingShape(llvm::StringRef role, llvm::StringRef carrier, const llvm::json::Array *logical,
+                                   const llvm::json::Array *physical) {
+    if (compatibleAbiShape(logical, physical))
+        return true;
+    if (role != "cotangent" || carrier != "invocation_linear" || !logical || !physical ||
+        physical->size() != logical->size() + 1)
+        return false;
+    for (size_t index = 0; index < logical->size(); ++index) {
+        const std::optional<int64_t> expected = (*logical)[index].getAsInteger();
+        const std::optional<int64_t> actual = (*physical)[index + 1].getAsInteger();
+        if (!expected || !actual || (*expected > 0 && *actual > 0 && *expected != *actual))
+            return false;
+    }
+    return true;
+}
+
 std::optional<size_t> resolveProgramValueLeafIndex(const llvm::json::Object &layout, llvm::StringRef source,
                                                    llvm::StringRef parameter) {
     const llvm::json::Array *leaves = layout.getArray("leaves");
@@ -460,8 +492,13 @@ std::optional<size_t> resolveProgramValueLeafIndex(const llvm::json::Object &lay
     for (auto [leafIndex, leafValue] : llvm::enumerate(*leaves)) {
         const llvm::json::Object *leaf = leafValue.getAsObject();
         const llvm::json::Array *path = leaf ? leaf->getArray("path") : nullptr;
-        if (!path || path->empty())
+        if (!path)
             continue;
+        if (path->empty()) {
+            if (parameter == source)
+                return leafIndex;
+            continue;
+        }
         std::string canonical = source.str();
         for (const llvm::json::Value &component : *path) {
             canonical.push_back('.');
@@ -579,7 +616,7 @@ bool normalizeProgramImplementationAbi(llvm::json::Object &execution, llvm::json
         }
         std::vector<const InterfaceValue *> semantic;
         for (const InterfaceValue &value : interface)
-            if (value.role == *role && value.source == *source)
+            if (matchesAutodiffBinding(*role, *source, value))
                 semantic.push_back(&value);
         if (!semantic.empty()) {
             std::vector<std::string> names;
@@ -1697,9 +1734,12 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 llvm::json::Object stageContract{{"operation", "graphics"}, {"reflection", std::move(reflection)}};
                 const std::string contractHash = sha256(llvm::json::Value(copyObject(stageContract)));
                 stageContracts[requestId] = std::move(stageContract);
-                if (!implementationEndpoints.empty())
-                    targetImplementations[requestId] =
-                        llvm::json::Object{{"endpoints", std::move(implementationEndpoints)}};
+                if (!implementationEndpoints.empty()) {
+                    llvm::json::Object implementation{{"endpoints", std::move(implementationEndpoints)}};
+                    if (const llvm::json::Array *slots = compiledReflection.getArray("metal_resource_slots"))
+                        implementation["metal_resource_slots"] = copyArray(*slots);
+                    targetImplementations[requestId] = std::move(implementation);
+                }
                 stages[requestId] = llvm::json::Object{{"operation", "graphics"}, {"contract_hash", contractHash}};
 
                 const int64_t vertexCount = [&]() {
@@ -1758,6 +1798,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     !canonicalValueIds(*nodeResults, results, error))
                     return false;
                 canonicalNodes.emplace_back(llvm::json::Object{{"id", node->getInteger("id").value_or(0)},
+                                                               {"name", node->getString("name").value_or("").str()},
                                                                {"stage", requestId.str()},
                                                                {"operands", std::move(operands)},
                                                                {"results", std::move(results)},
@@ -1769,6 +1810,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
 
             std::map<std::string, const llvm::json::Object *> interface;
             std::set<std::string> endpointNames;
+            size_t logicalInterfaceCount = 0;
             const auto collect = [&](const llvm::json::Array *rows) {
                 if (!rows)
                     return true;
@@ -1784,6 +1826,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     if (!source || source->empty() || !endpointNames.insert(source->str()).second)
                         return false;
                     interface.emplace(source->str(), row);
+                    const std::optional<llvm::StringRef> role = row->getString("vernon.autodiff_role");
+                    if (!role || !isTapeCarrierRole(*role))
+                        ++logicalInterfaceCount;
                 }
                 return true;
             };
@@ -1796,7 +1841,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 namedBound.emplace(name, value);
             }
             if (!collect(compiledEntry.getArray("arguments")) || !collect(compiledEntry.getArray("results")) ||
-                interface.size() != namedBound.size()) {
+                logicalInterfaceCount != namedBound.size()) {
                 error = "compiled compute ABI source names must be unique and exactly cover logical bindings";
                 return false;
             }
@@ -1891,6 +1936,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 const bool resource = resourceIt != resources.end();
                 const llvm::StringRef endpointKind = row.getString("kind").value_or("");
                 const bool opaqueResourceEndpoint = endpointKind == "image" || endpointKind == "sampler";
+                const std::optional<llvm::StringRef> autodiffRole = row.getString("vernon.autodiff_role");
+                const bool tapeCarrier = logicalValue && isAdTapeType(logicalValue->getString("type").value_or("")) &&
+                                         autodiffRole && isTapeCarrierRole(*autodiffRole);
                 const llvm::json::Object *logicalLayout =
                     logicalValue ? logicalValue->getObject("value_layout") : nullptr;
                 const llvm::json::Array *logicalShape = logicalValue ? logicalValue->getArray("shape") : nullptr;
@@ -1912,7 +1960,9 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 const std::optional<llvm::StringRef> autodiffSource = row.getString("vernon.autodiff_source");
                 if (!opaqueResourceEndpoint && source && autodiffSource && logicalLayout && logicalLeaves &&
                     physicalLeaf && logicalShape &&
-                    compatibleAbiShape(logicalShape, physicalShape ? physicalShape : logicalShape)) {
+                    compatibleProgramBindingShape(autodiffRole.value_or(""),
+                                                  row.getString("vernon.autodiff_carrier").value_or(""), logicalShape,
+                                                  physicalShape ? physicalShape : logicalShape)) {
                     projectedLeafIndex = resolveProgramValueLeafIndex(*logicalLayout, *autodiffSource, *source);
                     const llvm::json::Object *projectedLeaf =
                         projectedLeafIndex && *projectedLeafIndex < logicalLeaves->size()
@@ -1925,7 +1975,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                     if (!projectedLeafMatches)
                         projectedLeafIndex.reset();
                 }
-                if (!opaqueMatches && !byteValueMatches && !projectedLeafMatches) {
+                if (!tapeCarrier && !opaqueMatches && !byteValueMatches && !projectedLeafMatches) {
                     error = "compiled compute endpoint layout/type/shape does not match logical value '" +
                             source->str() + "'";
                     return false;
@@ -1964,7 +2014,8 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 }
                 const std::optional<std::string> physicalAccess = reflectedAccess(row);
                 if ((!physicalAccess && interfaceKind != "result") ||
-                    (physicalAccess && !resourceAccessSatisfies(*physicalAccess, resourceIt->second.access))) {
+                    (physicalAccess && !tapeCarrier &&
+                     !resourceAccessSatisfies(*physicalAccess, resourceIt->second.access))) {
                     error =
                         "compiled compute resource access disagrees with logical access for '" + source->str() + "'";
                     return false;
@@ -2033,14 +2084,18 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                         {"descriptor", descriptor != nullptr},
                         {"element_layout_hash", wholeLayout->getString("layout_hash").value_or("").str()},
                         {"minimum_alignment", wholeLayout->getInteger("alignment").value_or(0)}};
+                    if (const std::optional<llvm::StringRef> carrier = row.getString("vernon.autodiff_carrier"))
+                        resourceLayout["autodiff_carrier"] = carrier->str();
                 }
                 llvm::json::Object endpoint{
                     {"tag", "resource"},
                     {"module", "compute"},
                     {"interface", interfaceKind.str()},
                     {"index", endpointIndex},
-                    {"role",
-                     row.getString("binding_role").value_or(endpointKind == "sampler" ? "sampler" : "storage").str()},
+                    {"role", autodiffRole ? autodiffRole->str()
+                                          : row.getString("binding_role")
+                                                .value_or(endpointKind == "sampler" ? "sampler" : "storage")
+                                                .str()},
                     {"type", logicalValue->getString("type").value_or("").str()},
                     {"layout", std::move(resourceLayout)},
                     {"address_space", row.getString("address_space").value_or("device").str()},
@@ -2172,9 +2227,12 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
             llvm::json::Object stageContract{{"operation", "compute"}, {"reflection", std::move(reflection)}};
             const std::string contractHash = sha256(llvm::json::Value(copyObject(stageContract)));
             stageContracts[requestId] = std::move(stageContract);
-            if (!implementationEndpoints.empty())
-                targetImplementations[requestId] =
-                    llvm::json::Object{{"endpoints", std::move(implementationEndpoints)}};
+            if (!implementationEndpoints.empty()) {
+                llvm::json::Object implementation{{"endpoints", std::move(implementationEndpoints)}};
+                if (const llvm::json::Array *slots = compiledReflection.getArray("metal_resource_slots"))
+                    implementation["metal_resource_slots"] = copyArray(*slots);
+                targetImplementations[requestId] = std::move(implementation);
+            }
             stages[requestId] = llvm::json::Object{{"operation", "compute"}, {"contract_hash", contractHash}};
             llvm::json::Array operands;
             llvm::json::Array results;
@@ -2182,6 +2240,7 @@ bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
                 return false;
             canonicalNodes.emplace_back(llvm::json::Object{
                 {"id", node->getInteger("id").value_or(0)},
+                {"name", node->getString("name").value_or("").str()},
                 {"stage", requestId.str()},
                 {"operands", std::move(operands)},
                 {"results", std::move(results)},

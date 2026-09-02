@@ -63,6 +63,7 @@ struct ReflectedEndpoint {
     std::string transport;
     std::string access;
     std::string builtin;
+    std::string autodiffCarrier;
     uint32_t viewRank{};
     std::vector<int64_t> viewShape;
     bool viewDescriptor{};

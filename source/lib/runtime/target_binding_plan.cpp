@@ -2,6 +2,7 @@
 
 #include "pipeline_metadata.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
+#include "shape_layout.h"
 #include "tensor_bridge.h"
 
 #include <algorithm>
@@ -17,6 +18,26 @@ namespace {
 bool reject(Diagnostic &diagnostic, std::string code, std::string path, std::string message) {
     diagnostic = {std::move(code), "target_binding", std::move(path), std::move(message)};
     return false;
+}
+
+AutodiffResourceRole autodiffResourceRole(std::string_view role) {
+    if (role == "tape")
+        return AutodiffResourceRole::Tape;
+    if (role == "replay_segment")
+        return AutodiffResourceRole::ReplaySegment;
+    if (role == "replay_status")
+        return AutodiffResourceRole::ReplayStatus;
+    if (role == "launch_metadata")
+        return AutodiffResourceRole::LaunchMetadata;
+    if (role == "cotangent")
+        return AutodiffResourceRole::Cotangent;
+    if (role == "gradient")
+        return AutodiffResourceRole::Gradient;
+    if (role == "primal")
+        return AutodiffResourceRole::Primal;
+    if (role == "retained_primal")
+        return AutodiffResourceRole::RetainedPrimal;
+    return AutodiffResourceRole::None;
 }
 
 const CompiledEndpointAbi *findCompiledAbi(const StageArtifact &stage, const ReflectedEndpoint &endpoint) {
@@ -282,11 +303,12 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     bool hasSlots = false;
     const bool compute = node.operation != "graphics";
     const std::string entry = stage.stage.modules.empty() ? std::string() : stage.stage.modules.front().entryPoint;
+    if (entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos)
+        plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
 
     for (const ReflectedEndpoint &endpoint : stage.stage.endpoints) {
         TargetBinding target;
-        target.endpoint = {endpoint.module, endpoint.interfaceKind, endpoint.index,
-                           UINT32_MAX,      endpoint.access,        UINT32_MAX};
+        target.endpoint = {endpoint.module, endpoint.interfaceKind, endpoint.index, UINT32_MAX, endpoint.access};
         target.role = endpoint.role;
         target.access = endpoint.access;
         target.dimension = endpoint.imageDimension;
@@ -303,7 +325,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                               "system value has an invalid portable carrier");
             target.source = SourceRepresentation::SystemValue;
+            target.semantic = CarrierSemantic::Value;
             target.name = endpoint.builtin;
+            target.sourceName = target.name;
             target.kind = "tensor";
             target.reflectedKind = "builtin";
             target.builtin = endpoint.builtin;
@@ -319,7 +343,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 target.carrier = compiled->valueTransport == "uniform_buffer"   ? TargetCarrier::UniformBuffer
                                  : compiled->valueTransport == "storage_buffer" ? TargetCarrier::StorageBuffer
                                                                                 : TargetCarrier::InlineValue;
-                target.shape = {2};
+                target.shape = {shape::Extent::fixed(2)};
                 LayoutLeaf scalar{{}, "f32", 0, 1, {}};
                 target.elementLayout =
                     materializeValueLayout(ValueLayout{"element", endpoint.layoutHash, 4, 4, {scalar}}, "f32");
@@ -340,8 +364,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                               "system value has an invalid portable carrier");
             const uint64_t scalarCount = valueSlot->byteSize / sizeof(uint32_t);
             target.carrier = backend == VERNON_RUNTIME_CPU ? TargetCarrier::InlineValue : TargetCarrier::StorageBuffer;
-            target.shape = scalarCount == 1 ? std::vector<uint64_t>{} : std::vector<uint64_t>{scalarCount};
-            LayoutLeaf leaf{{}, "u32", 0, scalarCount, target.shape};
+            target.shape =
+                scalarCount == 1 ? shape::DeclaredShape{} : shape::DeclaredShape{shape::Extent::fixed(scalarCount)};
+            LayoutLeaf leaf{{}, "u32", 0, scalarCount, shape::encodeRuntimeContractShape(target.shape)};
             program::ValueLayout layout{
                 "value", endpoint.layoutHash, valueSlot->byteSize, valueSlot->alignment, {leaf}};
             target.wholeValueLayout = materializeValueLayout(layout, endpoint.builtin);
@@ -370,9 +395,10 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
                           "endpoint binding references an unknown Program value");
         const Value &value = program.program.values[valueId];
-        target.endpoint.value = valueId;
-        target.endpoint.leaf = binding->leaf;
+        target.projection.value = valueId;
+        target.projection.leaf = binding->leaf;
         target.name = valueName(program, valueId);
+        target.sourceName = target.name;
         if (binding->leaf) {
             if (!value.layout || *binding->leaf >= value.layout->leaves.size())
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
@@ -383,15 +409,90 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             }
         }
         if (endpoint.role == "vertex" || !endpoint.viewShape.empty()) {
-            target.shape.clear();
-            target.shape.reserve(endpoint.viewShape.size());
-            for (int64_t extent : endpoint.viewShape)
-                target.shape.push_back(extent < 0 ? 0 : static_cast<uint64_t>(extent));
+            const std::optional<shape::DeclaredShape> decoded = shape::decodeReflectedShape(endpoint.viewShape);
+            if (!decoded)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                              "endpoint shape contains an invalid extent");
+            target.shape = *decoded;
         } else {
-            target.shape = value.shape;
+            target.shape = shape::decodeRuntimeContractShape(value.shape);
+        }
+        if (!endpoint.autodiffCarrier.empty()) {
+            if (endpoint.role != "cotangent" || endpoint.autodiffCarrier != "invocation_linear" ||
+                endpoint.viewShape.size() != value.shape.size() + 1)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                              "autodiff carrier is incompatible with its logical value");
+            ViewTransform transform;
+            transform.axes.push_back({ViewAxisSource::InvocationLinearCarrier, 0, 0, true});
+            for (uint32_t axis = 0; axis < value.shape.size(); ++axis)
+                transform.axes.push_back({ViewAxisSource::LogicalAxis, axis, 0, false});
+            target.viewTransform = std::move(transform);
+        } else if (endpoint.role == "cotangent" && endpoint.viewShape.size() != value.shape.size()) {
+            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                          "cotangent physical rank requires an explicit autodiff carrier");
         }
         target.kind = endpoint.role == "sampler" ? "sampler" : !endpoint.imageDimension.empty() ? "image" : "tensor";
         const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
+        const bool tapeCarrier = value.type.rfind("!vernon.ad_tape", 0) == 0 &&
+                                 (endpoint.role == "tape" || endpoint.role == "replay_segment" ||
+                                  endpoint.role == "replay_status" || endpoint.role == "launch_metadata");
+
+        if (tapeCarrier) {
+            if (backend == VERNON_RUNTIME_CPU || !compiled || !compiled->elementLayout || !endpoint.viewDescriptor)
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                              "opaque tape carrier lacks its GPU TensorView ABI");
+            std::vector<const EndpointAbiBinding *> storageBindings;
+            for (const EndpointAbiBinding &binding : endpoint.abiBindings)
+                if (binding.semantic == "storage_leaf")
+                    storageBindings.push_back(&binding);
+            const EndpointAbiBinding *offset = semantic(endpoint, "byte_offset");
+            if (storageBindings.size() != compiled->elementLayout->leaves.size() || !offset ||
+                compiled->elementLayout->leaves.empty())
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                              "opaque tape carrier has an incomplete storage ABI");
+            target.source = SourceRepresentation::ResourceHandle;
+            target.semantic = endpoint.role == "tape"             ? CarrierSemantic::TapeData
+                              : endpoint.role == "replay_segment" ? CarrierSemantic::ReplaySegment
+                              : endpoint.role == "replay_status"  ? CarrierSemantic::ReplayStatus
+                                                                  : CarrierSemantic::LaunchMetadata;
+            target.name += "." + endpoint.role;
+            target.carrier = TargetCarrier::StorageBuffer;
+            target.reflectedKind = "tensor";
+            target.elementLayout = *compiled->elementLayout;
+            target.endpoint.portableSlot = storageBindings.front()->slot;
+            target.native = {compiled->descriptorSet == UINT32_MAX ? 0 : compiled->descriptorSet,
+                             compiled->binding == UINT32_MAX ? storageBindings.front()->slot : compiled->binding,
+                             storageBindings.front()->slot};
+            for (size_t leaf = 0; leaf < target.elementLayout.leaves.size(); ++leaf) {
+                const vernon::runtime::ValueLeaf &layoutLeaf = target.elementLayout.leaves[leaf];
+                const uint64_t elementSize = scalarByteSize(layoutLeaf.dtype);
+                if (!elementSize)
+                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                  "opaque tape carrier has an unsupported element type");
+                target.storageLeaves.push_back({static_cast<size_t>(elementSize),
+                                                static_cast<size_t>(layoutLeaf.byteOffset),
+                                                storageBindings[leaf]->slot});
+                maximumSlot = std::max(maximumSlot, storageBindings[leaf]->slot);
+            }
+            TensorViewDescriptorUse descriptor;
+            descriptor.rank = endpoint.viewRank;
+            descriptor.offsetBinding = offset->slot;
+            for (uint32_t axis = 0; axis < endpoint.viewRank; ++axis) {
+                const EndpointAbiBinding *extent = semantic(endpoint, "extent", axis);
+                const EndpointAbiBinding *stride = semantic(endpoint, "byte_stride", axis);
+                if (!extent || !stride)
+                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                  "opaque tape carrier lacks an extent or stride ABI");
+                descriptor.extentBindings.push_back(extent->slot);
+                descriptor.strideBindings.push_back(stride->slot);
+                maximumSlot = std::max({maximumSlot, extent->slot, stride->slot});
+            }
+            maximumSlot = std::max(maximumSlot, offset->slot);
+            hasSlots = true;
+            target.tensorViewDescriptor = std::move(descriptor);
+            plan.bindings.push_back(std::move(target));
+            continue;
+        }
 
         if (target.kind == "sampler" || target.kind == "image") {
             const EndpointAbiBinding *resource = semantic(endpoint, target.kind == "sampler" ? "sampler" : "resource");
@@ -421,6 +522,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/values/" + std::to_string(valueId),
                               "typed target binding requires a canonical value layout");
             if (endpoint.tag == "value") {
+                target.semantic = CarrierSemantic::Value;
                 const EndpointAbiBinding *slot = semantic(endpoint, "value");
                 if (!slot)
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
@@ -488,8 +590,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                         indexedStorageBindings.emplace_back(*binding.axis, &binding);
                 std::sort(indexedStorageBindings.begin(), indexedStorageBindings.end(),
                           [](const auto &left, const auto &right) { return left.first < right.first; });
-                if (target.endpoint.leaf && (indexedStorageBindings.size() != 1 ||
-                                             indexedStorageBindings.front().first != *target.endpoint.leaf))
+                if (target.projection.leaf && (indexedStorageBindings.size() != 1 ||
+                                               indexedStorageBindings.front().first != *target.projection.leaf))
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "TensorView endpoint leaf binding disagrees with its storage projection");
                 std::vector<const EndpointAbiBinding *> storageBindings;
@@ -656,7 +758,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.reflectedKind = "builtin";
             target.builtin = compiled.builtin;
             target.access = "read";
-            target.endpoint = {"compute", "system_value", compiled.index, UINT32_MAX, "read", UINT32_MAX};
+            target.endpoint = {"compute", "system_value", compiled.index, UINT32_MAX, "read"};
+            target.sourceName = target.name;
             if (!assignCpuPhysical(cpuFrameOffset, &compiled, alignof(uintptr_t), sizeof(uintptr_t), target.physical,
                                    nullptr, diagnostic, "tape packed field"))
                 return false;
@@ -669,6 +772,10 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     if (backend == VERNON_RUNTIME_CPU)
         plan.packedArgumentsSize = cpuFrameOffset;
     if (backend == VERNON_RUNTIME_METAL && hasSlots) {
+        if (!stage.stage.nativeSlots.empty()) {
+            plan.nativeSlots = stage.stage.nativeSlots;
+            return true;
+        }
         std::set<uint32_t> imageSlots;
         for (const TargetBinding &binding : plan.bindings)
             if (binding.kind == "image")
@@ -704,9 +811,10 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         variant.program.emplace("compute", variant.compute);
     }
     for (const TargetBinding &binding : plan.bindings) {
+        const uint32_t runtimeArgumentIndex = static_cast<uint32_t>(reflection.arguments.size());
         ReflectedArgument argument;
         argument.sourceName = binding.name;
-        argument.index = binding.endpoint.index;
+        argument.index = runtimeArgumentIndex;
         argument.kind = binding.reflectedKind.empty() ? binding.kind : binding.reflectedKind;
         if (argument.kind == "tensor_value")
             argument.kind = "scalar";
@@ -719,10 +827,11 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         argument.storageLeaves = binding.storageLeaves;
         argument.tensorElementSize = binding.elementLayout.byteSize;
         argument.sourceShape = binding.viewShape;
-        if (!binding.shape.empty()) {
-            size_t elements = 1;
-            for (uint64_t extent : binding.shape)
-                elements *= static_cast<size_t>(extent);
+        if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(binding.shape);
+            concrete && !concrete->empty()) {
+            size_t elements = 0;
+            if (!shape::checkedElementCount(*concrete, elements))
+                return false;
             argument.tensorElements = elements;
             argument.tensorBytes = elements * argument.tensorElementSize;
         }
@@ -749,11 +858,16 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
             parameter.valueLayout = binding.wholeValueLayout;
         parameter.dimension = binding.dimension;
         parameter.bindingRole = binding.role;
+        parameter.autodiffRole = autodiffResourceRole(binding.role);
+        parameter.autodiffSource = binding.sourceName;
+        parameter.invocationCarrier =
+            binding.viewTransform && !binding.viewTransform->axes.empty() &&
+            binding.viewTransform->axes.front().source == ViewAxisSource::InvocationLinearCarrier;
         parameter.exactStorageFormat = binding.imageFormat;
-        parameter.shape = binding.shape;
+        parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
         ParameterUse use;
         use.stage = "compute";
-        use.index = binding.endpoint.index;
+        use.index = runtimeArgumentIndex;
         use.interfaceKind = binding.kind == "image" || binding.kind == "sampler" ? "resource"
                             : binding.source == SourceRepresentation::WholeValueBytes ||
                                     (binding.source == SourceRepresentation::ElementStream && binding.transport)
@@ -762,7 +876,7 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         use.dtype = binding.elementLayout.logicalType.empty() && !binding.elementLayout.leaves.empty()
                         ? binding.elementLayout.leaves.front().dtype
                         : binding.elementLayout.logicalType;
-        use.shape = binding.shape;
+        use.shape = parameter.shape;
         use.transport = plan.backend == VERNON_RUNTIME_CPU ? "host_value" : "storage_buffer";
         use.valueLayout = binding.wholeValueLayout;
         use.interfacePlan = binding.transport ? std::optional<InterfacePlan>(binding.transport->targetAbi)
@@ -862,13 +976,13 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
             parameter.elementLayout = binding.elementLayout;
             parameter.valueLayout = binding.wholeValueLayout;
             parameter.access = binding.access.empty() ? "read" : binding.access;
-            parameter.shape = binding.shape;
+            parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
             ParameterUse use;
             use.stage = binding.endpoint.module;
             use.interfaceKind = "uniform";
             use.index = binding.endpoint.index;
             use.dtype = "f32";
-            use.shape = binding.shape;
+            use.shape = parameter.shape;
             use.uniformName = "_vernon_resolution";
             use.binding = binding.native.binding != UINT32_MAX ? binding.native.binding : binding.endpoint.portableSlot;
             use.descriptorSet = binding.native.descriptorSet == UINT32_MAX ? 0 : binding.native.descriptorSet;
@@ -886,7 +1000,7 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
             variant.internalParameters.push_back(std::move(parameter));
             continue;
         }
-        auto found = parameterByValue.find(binding.endpoint.value);
+        auto found = parameterByValue.find(binding.projection.value);
         if (found == parameterByValue.end()) {
             vernon::runtime::Parameter parameter;
             parameter.slot = static_cast<uint32_t>(variant.parameters.size());
@@ -901,9 +1015,9 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
             if (binding.kind == "image" && binding.role == "sampled")
                 parameter.sampleResultClass = "float";
             if (binding.source != SourceRepresentation::WholeValueBytes)
-                parameter.shape = binding.shape;
+                parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
             variant.parameters.push_back(std::move(parameter));
-            found = parameterByValue.emplace(binding.endpoint.value, variant.parameters.size() - 1).first;
+            found = parameterByValue.emplace(binding.projection.value, variant.parameters.size() - 1).first;
         }
         vernon::runtime::Parameter &parameter = variant.parameters[found->second];
         ParameterUse use;
@@ -924,11 +1038,11 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
                             : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
                                                                               : "push_constant";
             use.interfacePlan = binding.transport->targetAbi;
-            use.shape = binding.shape;
+            use.shape = shape::encodeRuntimeContractShape(binding.shape);
         }
         if (binding.carrier == TargetCarrier::VertexBuffer) {
             use.dtype = binding.attributeLeaves.front().dtype;
-            use.shape = binding.shape;
+            use.shape = shape::encodeRuntimeContractShape(binding.shape);
             use.valueLayout = binding.elementLayout;
         }
         use.sampledImageBindings = binding.sampledImageBindings;

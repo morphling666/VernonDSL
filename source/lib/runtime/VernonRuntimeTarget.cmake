@@ -214,6 +214,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/shape_layout.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/tensor_bridge.cpp
@@ -266,6 +267,8 @@ function(vernon_add_runtime)
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_shape_resolver.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_arena.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_backward.cpp

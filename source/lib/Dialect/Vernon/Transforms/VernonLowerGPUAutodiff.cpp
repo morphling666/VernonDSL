@@ -619,6 +619,8 @@ private:
             function.getArgument(argumentIndex)
                 .setType(TensorViewType::get(context, view.getElementType(), carrierShape, view.getAccess(),
                                              view.getAddressSpace()));
+            function.setArgAttr(argumentIndex, "vernon.autodiff_carrier",
+                                StringAttr::get(context, "invocation_linear"));
             SmallVector<LoadOp> loads;
             function.walk([&](LoadOp load) {
                 if (load.getStorage() == function.getArgument(argumentIndex))

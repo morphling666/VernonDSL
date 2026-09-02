@@ -412,7 +412,12 @@ class Kernel:
         )
         return state, target, options
 
-    def _lower(self, features: tuple[str, ...] = ()) -> _LoweredKernel:
+    def _lower(
+        self,
+        features: tuple[str, ...] = (),
+        *,
+        autodiff_planning_policy: str | None = None,
+    ) -> _LoweredKernel:
         source = self._file.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(self._file))
         function = next(
@@ -437,6 +442,7 @@ class Kernel:
             (),
             constants,
             self._workgroup_size,
+            autodiff_planning_policy=autodiff_planning_policy,
         )
         frontend = Compiler().compile_request(request)
         specialized_tree = ast.parse(frontend.specialized_source, filename=str(self._file))

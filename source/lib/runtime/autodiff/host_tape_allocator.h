@@ -238,6 +238,7 @@ public:
     size_t logicalBytes() const;
     size_t residentBytes() const;
     size_t allocatedBytes() const;
+    bool hasControlHistory() const;
 
 private:
     class Impl;
@@ -306,6 +307,7 @@ public:
     bool initializeReader(size_t lane, Reader &reader) const;
     bool isCompacted() const { return compacted_; }
     bool hasDynamicLanes() const;
+    bool hasControlHistory() const;
     ConstructionState constructionState() const { return constructionState_; }
     size_t constructionBytes() const;
     size_t logicalBytes() const;

@@ -156,5 +156,4 @@ PYTHONPATH=python .venv/bin/python -m pytest \
 ```
 
 P2 is closed when those two fluid cases **cook**. Numeric pullback may lag one
-step. Existing green AD tests must stay green; do not drop below the floor in
-[`program_vjp_debug_priority.md`](program_vjp_debug_priority.md).
+step. Existing green AD tests must stay green.

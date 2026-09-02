@@ -518,11 +518,17 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             }
             const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
             const bool opaqueResource = parameterKind == "image" || parameterKind == "sampler";
+            const bool compatibleBindingShape =
+                expectedStage == "compute"
+                    ? vernon::compiler::compatibleProgramBindingShape(
+                          role.value_or(""), parameterRow->getString("vernon.autodiff_carrier").value_or(""),
+                          expectedShape, actualShape)
+                    : sameShape(expectedShape, actualShape);
             const bool graphicsVertexElement = expectedStage == "graphics" &&
                                                parameterRow->getArray("attribute_leaves") &&
                                                suffixShape(expectedShape, actualShape);
             if (!opaqueResource && ((expectedDtype && actualDtype && *expectedDtype != *actualDtype) ||
-                                    (!sameShape(expectedShape, actualShape) && !graphicsVertexElement))) {
+                                    (!compatibleBindingShape && !graphicsVertexElement))) {
                 auto shapeText = [](const llvm::json::Array *shape) {
                     if (!shape)
                         return std::string("[]");
