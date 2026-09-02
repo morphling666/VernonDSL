@@ -193,9 +193,29 @@ class ProgramAutodiffSpecialization:
         )
 
 
-def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpecialization:
+@dataclass
+class ProgramSpecialization:
+    template: Any
+    pipeline: Any
+    directory: tempfile.TemporaryDirectory[str]
+
+    def invoke(self, invocation: Any) -> Any:
+        from ..program import flatten_program_outputs
+
+        native_inputs = {
+            path: (value._native_host_array() if hasattr(value, "_native_host_array") else value)
+            for path, value in invocation.inputs.items()
+        }
+        targets = flatten_program_outputs(invocation.outputs)
+        bindings = dict(invocation.inputs)
+        bindings.update(targets)
+        self.pipeline.program_forward(native_inputs, bindings)
+        return invocation.outputs
+
+
+def _compile_program(parsed: Any) -> tuple[Any, tempfile.TemporaryDirectory[str]]:
     if state._native_runtime is None:
-        raise RuntimeError(f"{state._architecture.name} Program autodiff requires the native runtime")
+        raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
     native = state._native
     target = make_target_options(
         state._architecture.name,
@@ -212,7 +232,6 @@ def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpeci
         native=native,
         native_target=_native_target(native, target.target),
         retained_programs=retained_programs if state._architecture == state.cpu else None,
-        canonical_execution=True,
     )
     directory = tempfile.TemporaryDirectory(prefix="vernon-program-ad-")
     root = Path(directory.name)
@@ -234,11 +253,23 @@ def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpeci
         stage_bindings,
         [(stage.metadata["symbol"], stage.entry, result) for stage, result in retained_programs],
     )
+    return pipeline, directory
+
+
+def compile_program(parsed: Any, template: Any) -> ProgramSpecialization:
+    pipeline, directory = _compile_program(parsed)
+    return ProgramSpecialization(template, pipeline, directory)
+
+
+def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpecialization:
+    pipeline, directory = _compile_program(parsed)
     return ProgramAutodiffSpecialization(template, pipeline, directory)
 
 
 __all__ = [
     "ProgramAutodiffSpecialization",
+    "ProgramSpecialization",
     "ProgramNativePullback",
+    "compile_program",
     "compile_program_autodiff",
 ]

@@ -102,8 +102,7 @@ template <size_t N> bool hasOnlyKeys(const nlohmann::json &value, const std::str
     return true;
 }
 
-constexpr std::string_view kVariantKeys[] = {"key",    "program", "execution", "parameters", "internal_parameters",
-                                             "outputs"};
+constexpr std::string_view kVariantKeys[] = {"key", "program", "parameters", "internal_parameters", "outputs"};
 constexpr std::string_view kExternalParameterKeys[] = {
     "slot",
     "name",
@@ -1082,8 +1081,6 @@ bool Variant::validate(std::string &error) const {
             error = "sampler references an unknown sampled image binding";
             return false;
         }
-    if (executable)
-        return executable->validate(program, error);
     const bool computeTopology = !compute.empty() && program.size() == 1;
     const bool graphicsTopology = compute.empty() && !vertex.empty() && !fragment.empty() && program.size() == 2;
     if (!computeTopology && !graphicsTopology) {
@@ -1493,12 +1490,6 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         }
         variant.outputs.push_back(std::move(output));
     }
-    if (value.contains("execution")) {
-        ExecutableProgram executable;
-        if (!parseExecutableProgram(value["execution"], executable, error))
-            return false;
-        variant.executable = std::move(executable);
-    }
     for (const auto &[stage, artifact] : value["program"].items()) {
         if (!artifact.is_string() || artifact.get_ref<const std::string &>().empty()) {
             error = "pipeline program stage artifact id is invalid";
@@ -1517,48 +1508,6 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
         return false;
     }
     return variant.validate(error);
-}
-
-bool normalizeLegacySingleComputeExecution(const Variant &variant, ExecutableProgram &execution, std::string &error) {
-    if (variant.executable || variant.program.size() != 1 || variant.compute.empty() ||
-        variant.program.find("compute") == variant.program.end()) {
-        error = "pipeline variant is not a legacy single-compute topology";
-        return false;
-    }
-
-    execution = {};
-    ProgramGraph forward;
-    forward.name = "forward";
-    forward.direction = "forward";
-    ProgramNode node;
-    node.id = 0;
-    node.name = "compute";
-    node.kind = "compute";
-    node.stage = "compute";
-
-    for (const Parameter &parameter : variant.parameters) {
-        ProgramValueSlot value;
-        value.id = static_cast<uint32_t>(execution.values.size());
-        value.name = parameter.name;
-        const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
-        value.type = layout.logicalType.empty() ? parameter.kind : layout.logicalType;
-        value.dtype =
-            layout.leaves.empty() || layout.leaves.front().dtype.empty() ? "opaque" : layout.leaves.front().dtype;
-        value.shape = parameter.shape;
-        value.external = true;
-        value.output = parameter.access == "write" || parameter.access == "read_write";
-        execution.values.push_back(std::move(value));
-
-        const uint32_t valueId = static_cast<uint32_t>(execution.values.size() - 1);
-        forward.arguments.push_back(valueId);
-        execution.adSignature.inputs.push_back(ProgramAdSignatureBinding{valueId, parameter.name});
-        node.operands.push_back(valueId);
-        node.bindings.push_back(ProgramValueBinding{parameter.name, valueId});
-        node.resources.push_back(ProgramResourceUse{valueId, parameter.access});
-    }
-    forward.nodes.push_back(std::move(node));
-    execution.graphs.push_back(std::move(forward));
-    return execution.validate(variant.program, error);
 }
 
 bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error) {

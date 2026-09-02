@@ -154,85 +154,12 @@ class ShaderAssetManifestTests(unittest.TestCase):
             },
             CompiledArtifact("spirv", b"\x03\x02\x23\x07"),
         )
-        execution = {
-            "values": [
-                {
-                    "id": 0,
-                    "name": "input.source",
-                    "type": "tensor<4xf32>",
-                    "dtype": "f32",
-                    "shape": [4],
-                    "external": True,
-                    "output": False,
-                    "value_layout": {
-                        "logical_type": "tensor<4xf32>",
-                        "layout_hash": "tensor-layout",
-                        "byte_size": 16,
-                        "alignment": 4,
-                        "leaves": [],
-                    },
-                },
-                {
-                    "id": 1,
-                    "name": "output.result",
-                    "type": "tensor<4xf32>",
-                    "dtype": "f32",
-                    "shape": [4],
-                    "external": False,
-                    "output": True,
-                    "value_layout": {
-                        "logical_type": "tensor<4xf32>",
-                        "layout_hash": "tensor-layout",
-                        "byte_size": 16,
-                        "alignment": 4,
-                        "leaves": [],
-                    },
-                },
-            ],
-            "graphs": [
-                {
-                    "name": "forward",
-                    "direction": "forward",
-                    "arguments": [0],
-                    "results": [1],
-                    "nodes": [
-                        {
-                            "id": 0,
-                            "name": "square",
-                            "kind": "compute",
-                            "stage": "Module.square",
-                            "operands": [0],
-                            "results": [1],
-                            "dependencies": [],
-                            "bindings": [
-                                {"parameter": "source", "value": 0},
-                                {"parameter": "output", "value": 1},
-                            ],
-                            "resources": [
-                                {"value": 0, "access": "read"},
-                                {"value": 1, "access": "write"},
-                            ],
-                            "grid": [4, 1, 1],
-                        }
-                    ],
-                }
-            ],
-            "signature": {
-                "inputs": [{"path": "source", "value": 0}],
-                "outputs": [{"path": "output", "value": 1}],
-                "cotangents": [],
-                "gradients": [],
-                "captures": [],
-            },
-        }
-
         plan = build_program_bundle_plan(
             "modules/square",
             target,
             (),
-            [((), execution, {"Module.square": stage})],
-            canonical_execution=True,
-            canonical_program={
+            {"Module.square": stage},
+            {
                 "stages": {"Module.square": {"operation": "compute", "contract_hash": "0" * 64}},
                 "graphs": [
                     {
@@ -247,15 +174,12 @@ class ShaderAssetManifestTests(unittest.TestCase):
         )
 
         self.assertEqual(dict(plan.variants[0].program), {"Module.square": stage.id})
-        canonical = plan.variants[0].execution
+        canonical = plan.variants[0].canonical_program
         assert canonical is not None
         self.assertEqual(set(canonical["stages"]), {"Module.square"})
         self.assertNotIn("dependencies", canonical["graphs"][0]["nodes"][0])
         self.assertEqual(canonical["graphs"][0]["nodes"][0]["operation"]["workgroups"], [4, 1, 1])
-        self.assertEqual(
-            tuple((parameter["name"], parameter["slot"]) for parameter in plan.variants[0].parameters),
-            (("input.source", 0), ("output.result", 1)),
-        )
+        self.assertEqual(plan.variants[0].parameters, ())
 
     def test_pipeline_asset_promotes_an_imported_entry_without_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -681,10 +605,7 @@ asset = vd.pipeline_asset(
             )
             bundle = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertNotIn("features", bundle)
-            execution = bundle["variants"][0]["execution"]
-            self.assertEqual(execution["values"], [])
-            self.assertEqual(execution["graphs"][0]["direction"], "forward")
-            self.assertEqual(execution["graphs"][0]["nodes"][0]["stage"], "compute")
+            self.assertNotIn("execution", bundle["variants"][0])
             self.assertEqual(
                 bundle["target"],
                 {
@@ -1034,7 +955,8 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                 target="cpu",
             )
             bundle = json.loads(manifest.read_text(encoding="utf-8"))
-            program = bundle["variants"][0]["execution"]
+            self.assertEqual(bundle["type"], "program_bundle")
+            program = bundle["variants"][0]["program"]
             self.assertEqual(
                 set(program),
                 {
@@ -1111,7 +1033,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         host = native.RhiHost(backend)
                         runtime = host.create_runtime()
                         compiled_stages = []
-                    loaded = runtime.load_canonical_program(
+                    loaded = runtime.load_canonical_endpoint(
                         json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
                         json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
                         str(runtime_root),
@@ -1149,7 +1071,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         bad_artifacts["artifacts"][artifact_id]["contract_hash"] = contract_hash
                         bad_program["stages"][next(iter(bad_program["stages"]))]["contract_hash"] = contract_hash
                         with self.assertRaisesRegex(RuntimeError, "portable ABI slots|resource ABI slots"):
-                            runtime.load_canonical_program(
+                            runtime.load_canonical_endpoint(
                                 json.dumps(bad_program, sort_keys=True, separators=(",", ":")).encode(),
                                 json.dumps(bad_artifacts, sort_keys=True, separators=(",", ":")).encode(),
                                 str(runtime_root),
@@ -1162,7 +1084,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         artifact_path.write_bytes(b"broken")
                         try:
                             with self.assertRaisesRegex(RuntimeError, "PROGRAM_BLOB_AUTHENTICATION"):
-                                runtime.load_canonical_program(
+                                runtime.load_canonical_endpoint(
                                     json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
                                     json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
                                     str(runtime_root),
@@ -1216,8 +1138,7 @@ asset = vd.pipeline_asset(
             bundle = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(bundle["target"]["kind"], "vulkan")
             self.assertEqual(bundle["autodiff"]["profiles"][0]["residual_storage"], "none")
-            self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["direction"], "forward")
-            self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["nodes"][0]["stage"], "compute")
+            self.assertNotIn("execution", bundle["variants"][0])
 
     def test_gpu_captured_tape_vjp_cooks_static_and_dynamic_profiles(self) -> None:
         if not _native_available():
@@ -1254,7 +1175,7 @@ asset = vd.pipeline_asset(
                     profile = bundle["autodiff"]["profiles"][0]
                     self.assertEqual(profile["residual_storage"], expected_storage)
                     self.assertGreater(profile["static_tape_bytes_hint"], 0)
-                    self.assertEqual(bundle["variants"][0]["execution"]["graphs"][0]["direction"], "forward")
+                    self.assertNotIn("execution", bundle["variants"][0])
 
     def test_four_variants_share_unchanged_fragment(self) -> None:
         root = Path(__file__).parents[2]

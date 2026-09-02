@@ -2,7 +2,7 @@
 
 本文面向希望理解、集成或扩展 VernonDSL 的开发者，描述代码从上层
 Python DSL 到各后端产物的完整路径，以及语言、编译器、Runtime、RHI、
-ExecutionGraph 和离线 Cook 机制之间的边界。
+Program Command DAG 和离线 Cook 机制之间的边界。
 
 > 当前稳定发布线支持 Windows x64、Linux x64 和 Apple Silicon macOS。
 > 发布版 frontend 仍处于 language v3；
@@ -45,7 +45,7 @@ flowchart TD
     Bundle --> Cook["Offline Cook<br/>manifest + external artifacts"]
     Interactive --> Runtime["RuntimeCore + Provider + RHI"]
     Cook --> Runtime
-    Runtime --> Graph["ExecutionGraph<br/>schedule · hazards · barriers · scopes"]
+    Runtime --> Graph["internal Command DAG<br/>schedule · hazards · barriers · scopes"]
     Graph --> Device["CPU or GPU execution"]
 ```
 
@@ -353,7 +353,7 @@ RuntimeCore 并实现自己的 Provider，而不采用 VernonRHI。
 CPU Provider 直接执行 AOT/JIT entry，绕过 RHI。GPU Provider 将 prepared
 bindings 和 pipeline 操作编码到 RHI command encoder。GPU Runtime context
 由一个已创建的 RHI device 构造；Runtime、资源、command encoder 和
-ExecutionGraph 必须来自同一 device。
+Command DAG 中的资源和 encoder 必须来自同一 device。
 
 ### 5.3 VernonRHI
 
@@ -401,35 +401,34 @@ RHI backend 是否被编译进 binary 与运行机器上是否存在 loader/driv
 5. encoder finish 后统一 submit；
 6. submission completion 后释放 retained resources 和 transient allocations。
 
-Immediate invocation 创建一个临时 encoder 并提交一次。ExecutionGraph 则让多个
-pass 共用一个 encoder，在所有 compiled scopes 记录完成后只提交一次。
+Direct endpoint 创建一个临时 encoder 并提交一次。Program Command DAG 让多个
+node 共用一个 encoder，在所有 compiled scopes 记录完成后只提交一次。
 
 当前稳定 ABI 的 owned submission 是同步的，不公开多帧 in-flight 或异步
 completion API。代码中的 ring reuse、resource reclamation 和 borrowed command
 语义都建立在这一约束上。
 
-## 7. ExecutionGraph
+## 7. Program Command DAG
 
-ExecutionGraph 是 host orchestration graph，不是编译器内部数据流 IR，也不是
-PipelineAsset。它负责跨 invocation 的 pass ordering、hazard、barrier 和 render
-scope。
+Program resolver 将 canonical graph 降为 C++ 内部 Command DAG。它负责 node
+ordering、hazard、barrier 和 render scope；Python 不公开 graph builder 或 pass
+descriptor API。
 
-### 7.1 建图
+### 7.1 Lowering
 
-Host 将 RHI-backed Tensor、RawBuffer、Texture 或 depth target import 为
-GraphResource，再添加 RenderPass/ComputePass。每个 pass 声明：
+Canonical Program node 直接携带：
 
 - read/write resource use；
 - attachment load/store/clear；
-- 可选显式 dependency；
-- 实际 pipeline invocation callback。
+- SSA/resource-version dependencies；
+- 已解析 stage endpoint。
 
 同一个底层资源通过不同 view 再次 import 时共享 hazard identity，但 attachment
 view metadata 仍独立保留。
 
 ### 7.2 Compile
 
-Native graph compiler：
+Native Command DAG compiler：
 
 1. 验证 pass、resource ownership 和 dependency；
 2. 从 resource uses 推导 RAW、WAR、WAW hazard；
@@ -446,7 +445,7 @@ load/store 变化会强制拆分 scope。
 
 ### 7.3 Execute
 
-执行时 graph 按 compiled scope：
+执行时 Command DAG 按 compiled scope：
 
 - 应用 scope barriers；
 - 为 render scope 建立 attachment state；
@@ -471,7 +470,7 @@ Python decorated entry
   -> specialize / finalize               # native artifact; no launch extents
   -> Runtime load/resolve
   -> C++ bind (shape/strides from buffer)
-  -> direct invocation or ExecutionGraph
+  -> direct endpoint or internal Command DAG
 ```
 
 `vd.dyn` is not a compile-time size. Do not pass runtime tensor or GraphBuffer
@@ -546,8 +545,8 @@ artifact，只要其 stage 和 feature 被该 target 支持。
 
 Cooked output 包含：
 
-- 当前 pipeline 16 `PIPELINE_VERSION`，且所有 target 共用唯一 canonical
-  `*.pipeline.json` root schema；
+- 当前 pipeline 17 `PIPELINE_VERSION`，所有 target 共用 canonical
+  Program、ArtifactSystem 与 stage bindings；
 - pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
 - 每个 variant 的 stage map、parameter slots、internal parameters 和 outputs；
@@ -579,7 +578,7 @@ static-registration `.c`/`.h`，而不是可由 Runtime 随意 `dlopen` 的 LLVM
 registration function，并通过 module-hashed wrapper symbol 注册 entry。
 Runtime 验证 manifest 中的 symbol、target triple、object format、size 和
 digest，再解析已注册 entry。已移除的 `vernon-compile --compute-bundle` 和
-`compute.json` 不属于 pipeline 16 部署接口。
+`compute.json` 不属于 pipeline 17 部署接口。
 
 ### 9.5 Load、Resolve 与 Invoke
 
@@ -591,7 +590,7 @@ manifest + artifacts
   -> prepare backend layouts/pipelines
   -> cache VernonLoadedPipeline
   -> bind by stable slots
-  -> encode through direct invocation or ExecutionGraph
+  -> encode through direct endpoint or internal Command DAG
 ```
 
 Manifest parsing、artifact IO 和 pipeline preparation 都不应出现在 hot draw/
@@ -653,10 +652,10 @@ cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期
 ### 11.3 Multi-pass
 
 ```text
-PipelineAssets or interactive Pipelines
-  -> import shared resources
-  -> RenderPass / ComputePass declarations
-  -> ExecutionGraph compile
+Canonical Program or direct endpoint
+  -> resolve shared resources
+  -> lower Program nodes
+  -> internal Command DAG compile
   -> hazard schedule + barriers + fused scopes
   -> one RHI command encoder
   -> one submission
@@ -683,8 +682,8 @@ PipelineAssets or interactive Pipelines
 - `source/lib/rhi/`：统一 RHI 与 CUDA/Vulkan/D3D12/OpenGL/Metal backend；
 - `source/lib/execution_graph/`：native graph validation、schedule、hazard、
   scope 和 barrier planning；
-- `python/vernon_dsl/_runtime/`：Python session、resources、Kernel/Pipeline
-  invocation 和 ExecutionGraph facade；
+- `python/vernon_dsl/_runtime/`：Python session、resources 与 Kernel/Pipeline
+  direct endpoint invocation；
 - `specs/language/contract.md`：语言规范目标；
 - `specs/compiler/design.md`：compiler/cook 设计约束；
 - `specs/runtime/design.md`：runtime/RHI/execution 设计约束。

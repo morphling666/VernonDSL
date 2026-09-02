@@ -240,7 +240,13 @@ def main() -> None:
                 tint=tint_bindings[binding_index],
                 indices=index_bindings[binding_index],
                 topology=vd.triangles,
-                target=target,
+                render=vd.render(
+                    target,
+                    colors={
+                        0: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                        1: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                    },
+                ),
             )
 
             color_rgba = color.to_numpy()

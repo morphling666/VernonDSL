@@ -244,19 +244,9 @@ mlir::FailureOr<TargetPreparationResult> prepareTargetModule(PreparedModule &pre
     return result;
 }
 
-VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
-                         std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
-    mlir::ScopedDiagnosticHandler handler(
-        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-
-    llvm::StringRef text(source ? source : "", sourceSize);
-    mlir::ParserConfig parserConfig(&frontend.context, /*verifyAfterParse=*/false);
-    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
-    if (!module)
-        return VERNON_STATUS_PARSE_ERROR;
-    if (mlir::failed(mlir::verify(*module)))
-        return VERNON_STATUS_VERIFICATION_ERROR;
-
+static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::OwningOpRef<mlir::ModuleOp> module,
+                                          PreparedModulePtr &prepared, std::vector<Artifact> &artifacts,
+                                          std::string &reflection, std::string &diagnostics) {
     mlir::PassManager passManager(&frontend.context);
     bool hasProgramGraph = false;
     module->walk([&](mlir::func::FuncOp function) { hasProgramGraph |= function->hasAttr("vernon_program.graph"); });
@@ -333,6 +323,34 @@ VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t 
         return VERNON_STATUS_INTERNAL_ERROR;
     }
     return VERNON_STATUS_OK;
+}
+
+VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
+                         std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
+    mlir::ScopedDiagnosticHandler handler(
+        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+    llvm::StringRef text(source ? source : "", sourceSize);
+    mlir::ParserConfig parserConfig(&frontend.context, /*verifyAfterParse=*/false);
+    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
+    if (!module)
+        return VERNON_STATUS_PARSE_ERROR;
+    if (mlir::failed(mlir::verify(*module)))
+        return VERNON_STATUS_VERIFICATION_ERROR;
+    return prepareVerifiedModule(frontend, std::move(module), prepared, artifacts, reflection, diagnostics);
+}
+
+VernonStatus prepareProgramModule(CompilerFrontend &frontend, mlir::OwningOpRef<mlir::ModuleOp> module,
+                                  PreparedModulePtr &prepared, std::vector<Artifact> &artifacts,
+                                  std::string &reflection, std::string &diagnostics) {
+    mlir::ScopedDiagnosticHandler handler(
+        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+    if (!module) {
+        diagnostics = "Program module must be valid";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    if (mlir::failed(mlir::verify(*module)))
+        return VERNON_STATUS_VERIFICATION_ERROR;
+    return prepareVerifiedModule(frontend, std::move(module), prepared, artifacts, reflection, diagnostics);
 }
 
 } // namespace vernon::compiler

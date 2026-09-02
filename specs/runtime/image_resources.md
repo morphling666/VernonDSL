@@ -243,7 +243,7 @@ runtime shader compiler dependency.
 
 ## 8. Synchronization and hazards
 
-ExecutionGraph tracks hazards by parent image identity plus overlapping
+The private Command DAG tracks hazards by parent image identity plus overlapping
 subresource ranges. Views of disjoint mip or layer ranges may avoid false
 dependencies when the backend can express the required barriers. Overlapping
 uses preserve RAW, WAR, and WAW ordering.
@@ -269,7 +269,7 @@ The implementation must preserve these invariants:
 2. provider retain/release callbacks are mandatory;
 3. shader and attachment bindings accept image views only;
 4. descriptors are queried from retained resource records;
-5. ExecutionGraph retains every imported view and its parent and tracks hazards
+5. the Command DAG retains every imported view and its parent and tracks hazards
    by parent identity plus subresource overlap;
 6. backend state tracking and barriers preserve per-mip and per-layer state,
    with aspect planes tracked separately where the native API supports it;

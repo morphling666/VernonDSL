@@ -293,7 +293,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     def __init__(self) -> None:
                         self.loads: list[tuple[bytes, bytes]] = []
 
-                    def load_canonical_program(
+                    def load_canonical_endpoint(
                         self,
                         program: bytes,
                         artifacts: bytes,
@@ -321,7 +321,6 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     repeated = pipeline._compile({"position": position}, target)
                 self.assertIs(compiled, repeated)
                 self.assertEqual(pipeline.compile_count, 1)
-                self.assertEqual(compiled.bundle, b"")
                 self.assertTrue(compiled.canonical_program)
                 self.assertTrue(compiled.canonical_artifact_system)
                 self.assertEqual(capture.loads, [(compiled.canonical_program, compiled.canonical_artifact_system)])

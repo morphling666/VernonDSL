@@ -1041,9 +1041,9 @@ if(TARGET VernonDSLCompiler)
         add_test(NAME vernon-python-smoke-fluid-graph
                  COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
                          "test_smoke_fluid_graph.py")
-        add_test(NAME vernon-python-execution-graph
+        add_test(NAME vernon-python-module-program
                  COMMAND ${Python_EXECUTABLE} -m unittest discover -s "${VERNON_REPOSITORY_ROOT}/python/tests" -p
-                         "test_execution_graph.py")
+                         "test_program_execution.py")
         add_test(NAME vernon-python-autodiff-phase2-benchmark
                  COMMAND ${Python_EXECUTABLE} "${VERNON_REPOSITORY_ROOT}/scripts/benchmark_autodiff_smoke_phase2.py"
                          --grids 32 64 --output "${VERNON_TEST_BINARY_ROOT}/autodiff_phase2_benchmark_ci.json")
@@ -1057,7 +1057,7 @@ if(TARGET VernonDSLCompiler)
         set_tests_properties(
             vernon-python-test_storage_vjp_contract
             vernon-python-smoke-fluid-graph
-            vernon-python-execution-graph
+            vernon-python-module-program
             vernon-python-autodiff-phase2-benchmark
             vernon-python-atomic-reduction-benchmark
             PROPERTIES ENVIRONMENT

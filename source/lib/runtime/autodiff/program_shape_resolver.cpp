@@ -8,12 +8,12 @@ namespace {
 
 class Resolver {
 public:
-    Resolver(const ExecutableProgram &execution, const VernonPipelineTopology *topology,
+    Resolver(const program::Program &program, const VernonPipelineTopology *topology,
              std::vector<ProgramHostValue> &values)
-        : execution_(execution), topology_(topology), values_(values) {}
+        : program_(program), topology_(topology), values_(values) {}
 
     bool resolve(std::string &error) {
-        for (const ProgramValueSlot &value : execution_.values) {
+        for (const program::Value &value : program_.values) {
             const shape::DeclaredShape declared = shape::decodeRuntimeContractShape(value.shape);
             if (value.id < values_.size() && values_[value.id].concreteShape &&
                 !shape::matches(declared, *values_[value.id].concreteShape))
@@ -44,7 +44,7 @@ private:
                 if (!concrete)
                     continue;
                 const uint32_t value = binding.value;
-                if (value >= execution_.values.size())
+                if (value >= program_.values.size())
                     return error = "compiled stage binding refers to an invalid Program value", false;
                 if (!bind(value, *concrete, "compiled stage binding", error))
                     return false;
@@ -53,9 +53,9 @@ private:
     }
 
     bool propagateStorageAliases() {
-        for (const ProgramStorageSlot &storage : execution_.storages) {
+        for (const program::Storage &storage : program_.storages) {
             const shape::ConcreteShape *resolved = nullptr;
-            for (const ProgramValueSlot &value : execution_.values)
+            for (const program::Value &value : program_.values)
                 if (value.storage && *value.storage == storage.id && value.id < values_.size() &&
                     values_[value.id].concreteShape) {
                     resolved = &*values_[value.id].concreteShape;
@@ -63,7 +63,7 @@ private:
                 }
             if (!resolved)
                 continue;
-            for (const ProgramValueSlot &value : execution_.values)
+            for (const program::Value &value : program_.values)
                 if (value.storage && *value.storage == storage.id && value.id < values_.size() &&
                     !values_[value.id].concreteShape &&
                     shape::matches(shape::decodeRuntimeContractShape(value.shape), *resolved))
@@ -73,9 +73,9 @@ private:
     }
 
     bool bind(uint32_t value, const shape::ConcreteShape &concrete, const char *source, std::string &error) {
-        if (value >= execution_.values.size() || value >= values_.size())
+        if (value >= program_.values.size() || value >= values_.size())
             return error = std::string(source) + " refers to an invalid Program value", false;
-        if (!shape::matches(shape::decodeRuntimeContractShape(execution_.values[value].shape), concrete))
+        if (!shape::matches(shape::decodeRuntimeContractShape(program_.values[value].shape), concrete))
             return error = std::string(source) + " conflicts with the declared Program shape", false;
         if (values_[value].concreteShape && *values_[value].concreteShape != concrete)
             return error = std::string(source) + " conflicts with another concrete Program shape", false;
@@ -83,16 +83,16 @@ private:
         return true;
     }
 
-    const ExecutableProgram &execution_;
+    const program::Program &program_;
     const VernonPipelineTopology *topology_;
     std::vector<ProgramHostValue> &values_;
 };
 
 } // namespace
 
-bool resolveProgramShapes(const ExecutableProgram &execution, const VernonPipelineTopology *topology,
+bool resolveProgramShapes(const program::Program &program, const VernonPipelineTopology *topology,
                           std::vector<ProgramHostValue> &values, std::string &error) {
-    return Resolver(execution, topology, values).resolve(error);
+    return Resolver(program, topology, values).resolve(error);
 }
 
 } // namespace vernon::runtime::ad

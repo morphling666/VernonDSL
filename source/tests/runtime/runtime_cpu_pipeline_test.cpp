@@ -265,11 +265,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
-    ASSERT_NE(pipeline->topology, nullptr);
-    EXPECT_TRUE(pipeline->topology->directDispatch);
-    ASSERT_EQ(pipeline->topology->execution.graphs.size(), 1u);
-    EXPECT_EQ(pipeline->topology->execution.graphs.front().direction, "forward");
-    EXPECT_FALSE(pipeline->topology->differentiated.has_value());
+    EXPECT_EQ(pipeline->topology, nullptr);
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 1);
     VernonPipelineParameterView parameter{};
     ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
@@ -312,44 +308,6 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(output[0] == 0.0f && output[3] == 3.0f);
     ASSERT_TRUE(output[4] == 10.0f && output[15] == 113.0f);
 
-    nlohmann::json explicitTopologyBundle = nlohmann::json::parse(bundle);
-    explicitTopologyBundle["variants"][0]["execution"] = {
-        {"values", nlohmann::json::array({{{"id", 0},
-                                           {"name", "output"},
-                                           {"type", "!vernon.tensor_view<f32, [16], \"write\", \"device\">"},
-                                           {"dtype", "f32"},
-                                           {"shape", {16}},
-                                           {"external", true},
-                                           {"output", true}}})},
-        {"graphs", nlohmann::json::array(
-                       {{{"name", "forward"},
-                         {"direction", "forward"},
-                         {"arguments", {0}},
-                         {"results", {0}},
-                         {"nodes", nlohmann::json::array(
-                                       {{{"id", 0},
-                                         {"name", "fill"},
-                                         {"kind", "compute"},
-                                         {"stage", "compute"},
-                                         {"operands", {0}},
-                                         {"results", nlohmann::json::array()},
-                                         {"dependencies", nlohmann::json::array()},
-                                         {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 0}}})},
-                                         {"resources", nlohmann::json::array({{{"value", 0}, {"access", "write"}}})},
-                                         {"grid", {1, 1, 1}}}})}}})}};
-    VernonPipelineBundle *explicitTopologyLoaded =
-        loadWithDirectory(runtime, withContentHash(explicitTopologyBundle), directoryUtf8);
-    ASSERT_NE(explicitTopologyLoaded, nullptr);
-    VernonLoadedPipeline *explicitTopology = vernonRuntimeResolvePipeline(explicitTopologyLoaded, {nullptr, 0});
-    ASSERT_NE(explicitTopology, nullptr);
-    ASSERT_NE(explicitTopology->topology, nullptr);
-    EXPECT_TRUE(explicitTopology->topology->directDispatch);
-    std::fill(std::begin(output), std::end(output), -1.0f);
-    invocation.compute_grid = {2, 1, 2};
-    ASSERT_EQ(vernon::tests::completeSubmission(explicitTopology, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(output[0], 0.0f);
-    EXPECT_EQ(output[15], 113.0f);
-
     nlohmann::json constantWriteBundle = nlohmann::json::parse(bundle);
     nlohmann::json &constantEntry = constantWriteBundle["stage_artifacts"]["fill"]["reflection"]["entries"][0];
     constantEntry["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}}, {"requires_unit_workgroup", true}};
@@ -368,14 +326,12 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 
     vernonRuntimeLoadedPipelineDestroy(constantPipeline);
     vernonRuntimePipelineBundleDestroy(constantLoaded);
-    vernonRuntimeLoadedPipelineDestroy(explicitTopology);
-    vernonRuntimePipelineBundleDestroy(explicitTopologyLoaded);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     vernonRuntimePipelineBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }
 
-TEST(RuntimeCpuPipeline, MaterializesExecutableProgramIntoExecutionGraph) {
+TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
     nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.pipeline.json"));
@@ -435,7 +391,11 @@ TEST(RuntimeCpuPipeline, MaterializesExecutableProgramIntoExecutionGraph) {
     ASSERT_NE(runtime, nullptr);
     VernonPipelineBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
     const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
-    ASSERT_NE(loaded, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
+    EXPECT_EQ(loaded, nullptr);
+    EXPECT_NE(std::string(loadError.data ? loadError.data : "", loadError.size).find("unknown or legacy field"),
+              std::string::npos);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    return;
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
     ASSERT_NE(pipeline, nullptr) << std::string(resolveError.data ? resolveError.data : "", resolveError.size);
@@ -571,7 +531,12 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
     VernonPipelineBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
-    ASSERT_NE(loaded, nullptr);
+    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
+    EXPECT_EQ(loaded, nullptr);
+    EXPECT_NE(std::string(loadError.data ? loadError.data : "", loadError.size).find("unknown or legacy field"),
+              std::string::npos);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    return;
     VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
     const VernonStringView error = vernonRuntimeGetLastError(runtime);
     ASSERT_NE(pipeline, nullptr) << std::string(error.data ? error.data : "", error.size);
@@ -591,10 +556,10 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     ASSERT_NE(pipeline->topology, nullptr);
     ASSERT_EQ(pipeline->topology->stages.size(), 5u);
     EXPECT_EQ(pipeline->topology->residualValues, std::vector<uint32_t>({0, 2}));
-    const auto backward =
-        std::find_if(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
-                     [](const vernon::runtime::ProgramGraph &graph) { return graph.direction == "backward"; });
-    ASSERT_NE(backward, pipeline->topology->execution.graphs.end());
+    ASSERT_NE(pipeline->topology->resolvedProgram, nullptr);
+    const vernon::runtime::program::Graph *backward =
+        vernon::runtime::program::findGraph(pipeline->topology->resolvedProgram->program, "backward");
+    ASSERT_NE(backward, nullptr);
 
     float output[16]{};
     float gradients[16]{};

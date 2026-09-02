@@ -12,7 +12,6 @@
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 #include "runtime/pipeline_metadata.h"
-#include "runtime/program_manifest.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
 #include "runtime/tensor_bridge.h"
@@ -552,29 +551,10 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
                 return found != bundle->stages.end() && found->second.stage == kind;
             };
             for (const auto &[stage, id] : variant.program) {
-                std::string artifactKind = stage;
-                if (variant.executable) {
-                    artifactKind.clear();
-                    for (const ProgramGraph &graph : variant.executable->graphs)
-                        for (const ProgramNode &node : graph.nodes)
-                            if (node.stage == stage) {
-                                const std::string nodeKind = node.kind == "compute" ? "compute" : "graphics";
-                                if (artifactKind.empty())
-                                    artifactKind = nodeKind;
-                                else if (artifactKind != nodeKind) {
-                                    fail(context, "executable program stage is used with incompatible node kinds");
-                                    return nullptr;
-                                }
-                            }
-                }
-                if (artifactKind.empty() || !validStage(id, artifactKind)) {
+                if (!validStage(id, stage)) {
                     fail(context, "pipeline variant references an invalid program stage");
                     return nullptr;
                 }
-            }
-            if (variant.executable) {
-                bundle->variants.push_back(std::move(variant));
-                continue;
             }
             const bool computeProgram = variant.program.size() == 1 && !variant.compute.empty();
             const bool graphicsProgram =
@@ -718,122 +698,6 @@ bool stringViewEquals(VernonStringView view, const std::string &value) {
     return view.size == value.size() && (!view.size || std::memcmp(view.data, value.data(), view.size) == 0);
 }
 
-bool resolvePipelineTopology(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
-    if (!variant.executable)
-        return false;
-    auto topology = std::make_shared<VernonPipelineTopology>();
-    topology->execution = *variant.executable;
-    topology->residualValues = topology->execution.residualCaptures();
-
-    for (const ProgramGraph &graph : variant.executable->graphs) {
-        for (const ProgramNode &node : graph.nodes) {
-            if (node.kind != "compute") {
-                fail(bundle.context, "executable Program graphics nodes are not implemented",
-                     VERNON_STATUS_UNSUPPORTED_TARGET);
-                return false;
-            }
-            if (topology->stageIndices.find(node.stage) != topology->stageIndices.end())
-                continue;
-            const auto artifact = variant.program.find(node.stage);
-            if (artifact == variant.program.end()) {
-                fail(bundle.context, "Program node '" + node.name + "' has no implementation artifact");
-                return false;
-            }
-            auto child = std::make_unique<VernonLoadedPipeline>();
-            child->context = bundle.context;
-            child->variant.compute = artifact->second;
-            struct StageUse {
-                const Parameter *owner{};
-                const ParameterUse *use{};
-            };
-            std::vector<StageUse> stageUses;
-            const auto collectUses = [&](const std::vector<Parameter> &parameters) {
-                for (const Parameter &parameter : parameters)
-                    for (const ParameterUse &use : parameter.uses)
-                        if (use.stage == node.stage)
-                            stageUses.push_back(StageUse{&parameter, &use});
-            };
-            collectUses(variant.parameters);
-            collectUses(variant.internalParameters);
-            std::sort(stageUses.begin(), stageUses.end(),
-                      [](const StageUse &left, const StageUse &right) { return left.use->index < right.use->index; });
-            if (stageUses.size() != node.bindings.size()) {
-                fail(bundle.context, "Program node '" + node.name + "' stage ABI does not match its value bindings");
-                return false;
-            }
-            std::vector<VernonProgramStageBinding> resolvedBindings;
-            resolvedBindings.reserve(stageUses.size());
-            std::vector<bool> consumedBindings(node.bindings.size());
-            for (size_t index = 0; index < stageUses.size(); ++index) {
-                const StageUse &stageUse = stageUses[index];
-                const auto value = std::find_if(
-                    topology->execution.values.begin(), topology->execution.values.end(),
-                    [&](const ProgramValueSlot &candidate) { return candidate.name == stageUse.owner->name; });
-                const auto binding =
-                    std::find_if(node.bindings.begin(), node.bindings.end(), [&](const ProgramValueBinding &candidate) {
-                        const size_t bindingIndex = static_cast<size_t>(&candidate - node.bindings.data());
-                        return !consumedBindings[bindingIndex] && value != topology->execution.values.end() &&
-                               candidate.value == value->id;
-                    });
-                if (value == topology->execution.values.end() || binding == node.bindings.end()) {
-                    fail(bundle.context,
-                         "Program node '" + node.name + "' stage ABI is not bound to its canonical root value");
-                    return false;
-                }
-                consumedBindings[static_cast<size_t>(&*binding - node.bindings.data())] = true;
-                Parameter parameter = *stageUse.owner;
-                parameter.slot = static_cast<uint32_t>(index);
-                parameter.name = binding->parameter;
-                parameter.shape = stageUse.use->shape;
-                parameter.uses = {*stageUse.use};
-                parameter.uses.front().stage = "compute";
-                if (stageUse.use->valueLayout) {
-                    parameter.valueLayout.reset();
-                    parameter.elementLayout = *stageUse.use->valueLayout;
-                }
-                child->variant.parameters.push_back(std::move(parameter));
-
-                const size_t aliases = static_cast<size_t>(
-                    std::count_if(stageUses.begin(), stageUses.end(),
-                                  [&](const StageUse &candidate) { return candidate.owner == stageUse.owner; }));
-                const bool explicitLeaf = binding->leaf.has_value();
-                std::optional<size_t> leaf =
-                    binding->leaf ? std::optional<size_t>(static_cast<size_t>(*binding->leaf)) : std::nullopt;
-                if (!leaf && aliases > 1)
-                    leaf = static_cast<size_t>(
-                        std::count_if(stageUses.begin(), stageUses.begin() + static_cast<std::ptrdiff_t>(index),
-                                      [&](const StageUse &candidate) { return candidate.owner == stageUse.owner; }));
-                if (leaf) {
-                    const ProgramValueSlot &slot = topology->execution.values[binding->value];
-                    if (!slot.valueLayout || (!explicitLeaf && slot.valueLayout->leaves.size() != aliases) ||
-                        *leaf >= slot.valueLayout->leaves.size() ||
-                        slot.valueLayout->leaves[*leaf].shape != stageUse.use->shape) {
-                        fail(bundle.context,
-                             "Program node '" + node.name + "' aggregate leaf ABI does not match its root value");
-                        return false;
-                    }
-                }
-                resolvedBindings.push_back(VernonProgramStageBinding{binding->value, leaf});
-            }
-            const Stage &stage = bundle.stages.at(artifact->second);
-            child->workgroupSize = {stage.workgroup[0], stage.workgroup[1], stage.workgroup[2]};
-            child->dispatchContract = stage.dispatchContract;
-            child->readFootprints = stage.readFootprints;
-            child->writeFootprints = stage.writeFootprints;
-            if (!resolveBackendPipeline(bundle, child->variant, *child)) {
-                const std::string detail = invocationDiagnostic(*bundle.context);
-                fail(bundle.context, "cannot resolve Program stage '" + node.stage + "'" +
-                                         (detail.empty() ? std::string{} : ": " + detail));
-                return false;
-            }
-            topology->stageIndices.emplace(node.stage, topology->stages.size());
-            topology->stages.push_back(VernonResolvedProgramStage{std::move(child), std::move(resolvedBindings)});
-        }
-    }
-    pipeline.topology = std::move(topology);
-    return true;
-}
-
 void destroyPipelineImplementations(VernonLoadedPipeline &pipeline) {
     pipeline.topology.reset();
     if (pipeline.backendState)
@@ -894,17 +758,8 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
                 rebuildValueLayoutPathViews(*parameter.valueLayout);
             rebuildValueLayoutPathViews(parameter.elementLayout);
         }
-        if (isDirectPipelineTopology(*found)) {
-            if (!initializeDirectPipelineTopology(*found, *pipeline, invocationDiagnostic(*bundle->context)))
-                return nullptr;
-        } else if (found->executable) {
-            if (!resolvePipelineTopology(*bundle, *found, *pipeline))
-                return nullptr;
-        }
-        const bool nativeProgramAutodiff =
-            pipeline->topology &&
-            std::any_of(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
-                        [](const ProgramGraph &graph) { return graph.direction == "backward"; });
+        const bool nativeProgramAutodiff = pipeline->topology && pipeline->topology->resolvedProgram &&
+                                           program::findGraph(pipeline->topology->resolvedProgram->program, "backward");
         if (nativeProgramAutodiff) {
             const std::vector<AutodiffDerivativeGroup> derivativeGroups =
                 bundle->autodiff ? bundle->autodiff->derivativeGroups : std::vector<AutodiffDerivativeGroup>{};
@@ -1075,15 +930,29 @@ struct PipelineComputePassDescription {
     std::vector<PipelineComputeResource> resources;
 };
 
-PipelineComputePassDescription describeProgramNode(const ProgramNode &node) {
+extern "C++" std::string programNodeName(const program::Node &node) {
+    return "program." + std::to_string(node.id) + "." + (node.name.empty() ? node.stage : node.name);
+}
+
+extern "C++" PipelineComputePassDescription describeProgramNode(const program::Node &node) {
     PipelineComputePassDescription description;
-    description.name = node.name;
-    std::copy(std::begin(node.grid), std::end(node.grid), description.grid);
+    description.name = programNodeName(node);
+    for (size_t axis = 0; axis < 3; ++axis)
+        description.grid[axis] = node.compute.workgroups[axis].kind == program::ControlKind::Static
+                                     ? node.compute.workgroups[axis].value
+                                     : 0;
     description.operands = node.operands;
     description.results = node.results;
-    description.resources.reserve(node.resources.size());
-    for (const ProgramResourceUse &resource : node.resources)
-        description.resources.push_back({resource.value, resource.access});
+    description.resources.reserve(node.accesses.size());
+    for (const program::ResourceAccess &resource : node.accesses) {
+        const uint32_t value = resource.kind == program::AccessKind::Read         ? resource.value
+                               : resource.kind == program::AccessKind::Initialize ? resource.after
+                                                                                  : resource.before;
+        const std::string access = resource.kind == program::AccessKind::Read         ? "read"
+                                   : resource.kind == program::AccessKind::Initialize ? "write"
+                                                                                      : resource.access;
+        description.resources.push_back({value, access.empty() ? "read_write" : access});
+    }
     return description;
 }
 
@@ -1115,16 +984,16 @@ bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const
 
 class PipelineComputePass final : public vernon::execution::ComputePass {
 public:
-    PipelineComputePass(const ProgramNode &node, VernonLoadedPipeline &pipeline,
+    PipelineComputePass(const program::Node &node, VernonLoadedPipeline &pipeline,
                         std::vector<VernonPipelineArgument> arguments,
                         std::vector<std::vector<uint64_t>> argumentShapes,
                         std::vector<std::vector<int64_t>> argumentStrides,
                         const std::vector<vernon::execution::GraphBuffer> &resources,
-                        const std::vector<VernonPipelineArgument> *arena, const ExecutableProgram *execution,
+                        const std::vector<VernonPipelineArgument> *arena, const program::Program *program,
                         vernon::runtime::program::DispatchMapping dispatchMapping)
-        : ComputePass(node.name), description_(describeProgramNode(node)), pipeline_(pipeline),
+        : ComputePass(programNodeName(node)), description_(describeProgramNode(node)), pipeline_(pipeline),
           arguments_(std::move(arguments)), argumentShapes_(std::move(argumentShapes)),
-          argumentStrides_(std::move(argumentStrides)), resources_(resources), arena_(arena), execution_(execution),
+          argumentStrides_(std::move(argumentStrides)), resources_(resources), arena_(arena), program_(program),
           dispatchMapping_(dispatchMapping) {}
 
     void declare() override {
@@ -1157,8 +1026,8 @@ public:
             VernonAdTapeAllocator *allocator = nullptr;
             VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
             const auto bindTape = [&](uint32_t valueId) {
-                if (!arena_ || !execution_ || valueId >= arena_->size() || valueId >= execution_->values.size() ||
-                    !isProgramAdTapeType(execution_->values[valueId].type))
+                if (!arena_ || !program_ || valueId >= arena_->size() || valueId >= program_->values.size() ||
+                    !program::isTapeValueType(program_->values[valueId].type))
                     return;
                 const VernonPipelineArgument &argument = (*arena_)[valueId];
                 if (argument.kind != VERNON_PIPELINE_TENSOR || !argument.tensor.host_data ||
@@ -1202,7 +1071,7 @@ private:
     std::vector<std::vector<int64_t>> argumentStrides_;
     const std::vector<vernon::execution::GraphBuffer> &resources_;
     const std::vector<VernonPipelineArgument> *arena_{};
-    const ExecutableProgram *execution_{};
+    const program::Program *program_{};
     vernon::runtime::program::DispatchMapping dispatchMapping_;
 };
 
@@ -1242,30 +1111,44 @@ bool contiguousTensorStorage(const Parameter &parameter, PipelineOwnedTensor &ow
     return true;
 }
 
-VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, const program::Graph &graph,
                                              vernon::runtime::ad::ProgramValueArena &arena) {
+    if (!pipeline.topology || !pipeline.topology->resolvedProgram)
+        return fail(pipeline.context, "Program graph has no resolved canonical owner");
+    const program::ResolvedProgram &resolved = *pipeline.topology->resolvedProgram;
+    const program::Program &canonicalProgram = resolved.program;
     const std::vector<VernonPipelineArgument> &valueArguments = arena.logicalArguments();
-    const ExecutableProgram &execution = pipeline.topology->execution;
-    if (valueArguments.size() != execution.values.size())
+    if (valueArguments.size() != canonicalProgram.values.size())
         return fail(pipeline.context, "Program graph value set does not match its execution topology");
+    const auto canonicalGraph =
+        std::find_if(canonicalProgram.graphs.begin(), canonicalProgram.graphs.end(),
+                     [&](const program::Graph &candidate) { return candidate.direction == graph.direction; });
+    if (canonicalGraph == canonicalProgram.graphs.end())
+        return fail(pipeline.context, "Program graph is not part of its resolved owner");
+    const size_t graphIndex = static_cast<size_t>(canonicalGraph - canonicalProgram.graphs.begin());
+    if (graphIndex >= resolved.graphs.size())
+        return fail(pipeline.context, "Program graph has no resolved dependency plan");
+    const program::ResolvedGraph &resolvedGraph = resolved.graphs[graphIndex];
     if (pipeline.context->backend != VERNON_RUNTIME_CPU) {
         vernon::execution::detail::RhiCommandExecutionPlan commandPlan;
         std::vector<vernon::runtime::ad::MaterializedProgramArguments> materializedNodes;
         materializedNodes.reserve(graph.nodes.size());
-        for (const ProgramNode &node : graph.nodes) {
+        for (const program::Node &node : graph.nodes) {
             const auto stageIndex = pipeline.topology->stageIndices.find(node.stage);
             if (stageIndex == pipeline.topology->stageIndices.end())
                 return fail(pipeline.context, "pipeline node has no resolved kernel stage");
             VernonResolvedProgramStage &resolvedStage = pipeline.topology->stages[stageIndex->second];
             materializedNodes.emplace_back();
             std::string materializationError;
-            if (!arena.materializeNodeArguments(execution, node, resolvedStage, materializedNodes.back(),
+            if (!arena.materializeNodeArguments(canonicalProgram, node, resolvedStage, materializedNodes.back(),
                                                 materializationError))
                 return fail(pipeline.context, std::move(materializationError));
             vernon::execution::detail::RhiCommandExecutionPlan nodePlan;
             VernonLaunchSize grid{};
             std::string gridError;
-            if (!resolveProgramGrid(resolvedStage.dispatchMapping, node.grid, materializedNodes.back().arguments, grid,
+            const uint64_t staticGrid[3] = {node.compute.workgroups[0].value, node.compute.workgroups[1].value,
+                                            node.compute.workgroups[2].value};
+            if (!resolveProgramGrid(resolvedStage.dispatchMapping, staticGrid, materializedNodes.back().arguments, grid,
                                     gridError))
                 return fail(pipeline.context, std::move(gridError));
             const VernonStatus planned = vernon::runtime::ad::gpu::buildPipelineCommandPlan(
@@ -1283,8 +1166,8 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
     vernon::execution::ExecutionGraph executionGraph;
     std::vector<vernon::execution::GraphBuffer> resources;
     resources.reserve(valueArguments.size());
-    std::vector<char> used(execution.values.size());
-    vernon::runtime::markProgramGraphValues(graph, used);
+    std::vector<char> used(canonicalProgram.values.size());
+    program::markGraphValues(graph, used);
     for (size_t index = 0; index < valueArguments.size(); ++index) {
         if (index >= used.size() || !used[index]) {
             resources.push_back({});
@@ -1295,16 +1178,22 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
             return fail(pipeline.context, "Program graph requires materialized tensor values");
         if (argument.tensor.storage == VERNON_TENSOR_HOST && argument.tensor.host_data) {
             const uint64_t identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
-            resources.push_back(executionGraph.importHostBuffer(identity, execution.values[index].output));
+            const bool output =
+                std::any_of(graph.outputs.begin(), graph.outputs.end(),
+                            [&](const program::GraphOutput &candidate) { return candidate.value == index; });
+            resources.push_back(executionGraph.importHostBuffer(identity, output));
             continue;
         }
         const VernonRhiBuffer device = arena.buffer(static_cast<uint32_t>(index));
         if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
             return fail(pipeline.context, "Program graph requires a materialized host or RHI Storage backing");
-        resources.push_back(executionGraph.importBuffer(device, execution.values[index].output));
+        const bool output =
+            std::any_of(graph.outputs.begin(), graph.outputs.end(),
+                        [&](const program::GraphOutput &candidate) { return candidate.value == index; });
+        resources.push_back(executionGraph.importBuffer(device, output));
     }
     std::vector<vernon::execution::ExecutionPass *> passes(graph.nodes.size());
-    for (const ProgramNode &node : graph.nodes) {
+    for (const program::Node &node : graph.nodes) {
         const auto stageIndex = pipeline.topology->stageIndices.find(node.stage);
         if (stageIndex == pipeline.topology->stageIndices.end())
             return fail(pipeline.context, "pipeline node has no resolved kernel stage");
@@ -1312,12 +1201,15 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
         VernonLoadedPipeline &stage = *resolvedStage.pipeline;
         vernon::runtime::ad::MaterializedProgramArguments materialized;
         std::string materializationError;
-        if (!arena.materializeNodeArguments(execution, node, resolvedStage, materialized, materializationError))
+        if (!arena.materializeNodeArguments(canonicalProgram, node, resolvedStage, materialized, materializationError))
             return fail(pipeline.context, std::move(materializationError));
         auto &pass = executionGraph.emplacePass<PipelineComputePass>(
             node, stage, std::move(materialized.arguments), std::move(materialized.shapes),
-            std::move(materialized.strides), resources, &valueArguments, &execution, resolvedStage.dispatchMapping);
-        for (uint32_t dependency : node.dependencies) {
+            std::move(materialized.strides), resources, &valueArguments, &canonicalProgram,
+            resolvedStage.dispatchMapping);
+        if (node.id >= resolvedGraph.predecessors.size())
+            return fail(pipeline.context, "Program node has no resolved dependency entry");
+        for (uint32_t dependency : resolvedGraph.predecessors[node.id]) {
             if (dependency >= passes.size() || !passes[dependency])
                 return fail(pipeline.context, "Program node dependency is not materialized");
             pass.dependsOn(*passes[dependency]);
@@ -1343,13 +1235,10 @@ VernonStatus executePipelineTopology(VernonLoadedPipeline &pipeline, const Verno
     if (pipeline.context->backend != VERNON_RUNTIME_CPU)
         return fail(pipeline.context, "pipeline ExecutionGraph currently supports CPU compute execution",
                     VERNON_STATUS_UNSUPPORTED_TARGET);
-    const ExecutableProgram &execution = pipeline.topology->execution;
-    const ProgramGraph *forward = nullptr;
-    for (const ProgramGraph &graph : execution.graphs)
-        if (graph.direction == "forward") {
-            forward = &graph;
-            break;
-        }
+    if (!pipeline.topology->resolvedProgram)
+        return fail(pipeline.context, "resolved pipeline has no canonical Program");
+    const program::Program &canonicalProgram = pipeline.topology->resolvedProgram->program;
+    const program::Graph *forward = program::findGraph(canonicalProgram, "forward");
     if (!forward)
         return fail(pipeline.context, "executable Program has no forward graph");
     std::unordered_map<uint32_t, const VernonPipelineArgument *> supplied;
@@ -1359,14 +1248,14 @@ VernonStatus executePipelineTopology(VernonLoadedPipeline &pipeline, const Verno
     if (supplied.size() != pipeline.variant.parameters.size())
         return fail(pipeline.context, "Program invocation does not cover graph boundary values");
 
-    const size_t valueCount = execution.values.size();
+    const size_t valueCount = canonicalProgram.values.size();
     std::vector<VernonPipelineArgument> valueArguments(valueCount);
     std::vector<uint8_t> populated(valueCount);
     std::vector<PipelineOwnedTensor> owned(valueCount);
     const auto valueIdByName = [&](const std::string &name) -> std::optional<uint32_t> {
-        const auto found = std::find_if(execution.values.begin(), execution.values.end(),
-                                        [&](const ProgramValueSlot &value) { return value.name == name; });
-        return found == execution.values.end() ? std::nullopt : std::optional<uint32_t>(found->id);
+        const auto found = std::find_if(canonicalProgram.values.begin(), canonicalProgram.values.end(),
+                                        [&](const program::Value &value) { return value.name == name; });
+        return found == canonicalProgram.values.end() ? std::nullopt : std::optional<uint32_t>(found->id);
     };
     for (const Parameter &parameter : pipeline.variant.parameters) {
         const auto value = valueIdByName(parameter.name);
@@ -1586,7 +1475,7 @@ VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *conte
 
 } // extern "C"
 
-VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
                                                           const std::vector<VernonPipelineArgument> &values) {
     if (!pipeline.topology)
         return fail(pipeline.context, "resolved pipeline has no execution topology");
@@ -1597,7 +1486,7 @@ VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &
     return executePipelineProgramGraphImpl(pipeline, graph, arena);
 }
 
-VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
                                                           vernon::runtime::ad::ProgramValueArena &arena) {
     if (!pipeline.topology)
         return fail(pipeline.context, "resolved pipeline has no execution topology");

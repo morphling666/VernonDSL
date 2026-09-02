@@ -282,12 +282,6 @@ bool parseExtentComponent(const nlohmann::json &value, ControlComponent &compone
     return true;
 }
 
-const Graph *findGraph(const Program &program, std::string_view direction) {
-    const auto found = std::find_if(program.graphs.begin(), program.graphs.end(),
-                                    [&](const Graph &graph) { return graph.direction == direction; });
-    return found == program.graphs.end() ? nullptr : &*found;
-}
-
 bool stringArray(const nlohmann::json &value, std::vector<std::string> &result, Diagnostic &diagnostic,
                  const std::string &path, bool allowEmpty = true) {
     if (!value.is_array() || (!allowEmpty && value.empty()))
@@ -305,6 +299,46 @@ bool stringArray(const nlohmann::json &value, std::vector<std::string> &result, 
 }
 
 } // namespace
+
+const Graph *findGraph(const Program &program, std::string_view direction) {
+    const auto found = std::find_if(program.graphs.begin(), program.graphs.end(),
+                                    [&](const Graph &graph) { return graph.direction == direction; });
+    return found == program.graphs.end() ? nullptr : &*found;
+}
+
+std::vector<uint32_t> residualCaptures(const Program &program) {
+    std::vector<uint32_t> captures;
+    if (!program.residualContract)
+        return captures;
+    captures.reserve(program.residualContract->captures.size());
+    for (const ResidualCapture &capture : program.residualContract->captures)
+        captures.push_back(capture.value);
+    return captures;
+}
+
+void markGraphValues(const Graph &graph, std::vector<char> &live) {
+    const auto mark = [&](uint32_t value) {
+        if (value < live.size())
+            live[value] = 1;
+    };
+    for (const GraphInput &input : graph.inputs)
+        mark(input.value);
+    for (uint32_t capture : graph.captures)
+        mark(capture);
+    for (const GraphOutput &output : graph.outputs)
+        mark(output.value);
+    for (const Node &node : graph.nodes) {
+        for (uint32_t value : node.operands)
+            mark(value);
+        for (uint32_t value : node.results)
+            mark(value);
+    }
+}
+
+bool isTapeValueType(std::string_view type) {
+    return type == "!vernon.ad_tape" ||
+           (type.rfind("!vernon.ad_tape<", 0) == 0 && type.size() > 17 && type.back() == '>');
+}
 
 bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
     program = {};

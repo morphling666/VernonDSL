@@ -25,7 +25,7 @@ and milestone checklists.
    derivative signature, resolve algorithm, and fail-closed validation rule.
 6. [`autodiff_tutorial.md`](autodiff_tutorial.md) explains the implemented
    Phase 1/2 VJP stack from Tape IR and dynamic control flow through CPU
-   multithreading and ExecutionGraph VJP.
+   multithreading and canonical Program VJP.
 7. [`autodiff_cost_aware_residual_plan.md`](autodiff_cost_aware_residual_plan.md)
    records completed Phase 1/2 memory work and the active production-target
    residual-source, cost-model, and bounded-replay checklist.
@@ -110,9 +110,9 @@ The target Program contract is a static DAG of compute and graphics nodes only.
 Transfer and deployment control-flow nodes are not representable.
 `StorageDescriptor` is the resource authority; control metadata is entry-only,
 and resource results use ordinary public output signature entries.
-`VernonExecutionGraph` owns hazards, scheduling, render scopes, and submission
-below `ExecuteProgram`. Compiler-internal Program transforms remain distinct
-from that native command scheduler.
+The private runtime Command DAG owns hazards, scheduling, render scopes, and
+submission below `ExecuteProgram`. Compiler-internal Program transforms remain
+distinct from that native command scheduler.
 
 The graphics target architecture uses the same Program Value binding path as
 compute. Source/IR `RenderTarget`, `Attachment`, and `RenderState` builtins

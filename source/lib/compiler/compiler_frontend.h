@@ -147,4 +147,8 @@ mlir::FailureOr<TargetPreparationResult> prepareTargetModule(PreparedModule &pre
 VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
                          std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics);
 
+VernonStatus prepareProgramModule(CompilerFrontend &frontend, mlir::OwningOpRef<mlir::ModuleOp> module,
+                                  PreparedModulePtr &prepared, std::vector<Artifact> &artifacts,
+                                  std::string &reflection, std::string &diagnostics);
+
 } // namespace vernon::compiler

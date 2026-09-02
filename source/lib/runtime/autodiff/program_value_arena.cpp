@@ -1,6 +1,5 @@
 #include "program_value_arena.h"
 
-#include "runtime/program_manifest.h"
 #include "runtime/runtime_state.h"
 #include "runtime_gpu_argument_binding.h"
 
@@ -254,7 +253,7 @@ bool ProgramValueArena::downloadLogicalToHost(const std::vector<char> &required,
     return true;
 }
 
-bool ProgramValueArena::materializeNodeArguments(const ExecutableProgram &execution, const ProgramNode &node,
+bool ProgramValueArena::materializeNodeArguments(const program::Program &program, const program::Node &node,
                                                  const VernonResolvedProgramStage &stage,
                                                  MaterializedProgramArguments &output, std::string &error) const {
     if (!stage.pipeline || stage.bindings.size() != stage.pipeline->variant.parameters.size()) {
@@ -266,13 +265,19 @@ bool ProgramValueArena::materializeNodeArguments(const ExecutableProgram &execut
     output.shapes.reserve(stage.bindings.size());
     output.strides.reserve(stage.bindings.size());
     uint64_t dispatchInvocations = 1;
-    for (uint64_t extent : node.grid)
+    for (const program::ControlComponent &control : node.compute.workgroups) {
+        if (control.kind != program::ControlKind::Static) {
+            error = "Program dispatch requires a resolved static invocation shape";
+            return false;
+        }
+        const uint64_t extent = control.value;
         if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent) {
             error = "Program dispatch invocation count overflows";
             return false;
         } else {
             dispatchInvocations *= extent;
         }
+    }
     for (uint32_t extent :
          {stage.pipeline->workgroupSize.x, stage.pipeline->workgroupSize.y, stage.pipeline->workgroupSize.z})
         if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent) {
@@ -284,7 +289,7 @@ bool ProgramValueArena::materializeNodeArguments(const ExecutableProgram &execut
     for (size_t parameterIndex = 0; parameterIndex < stage.bindings.size(); ++parameterIndex) {
         const Parameter &parameter = stage.pipeline->variant.parameters[parameterIndex];
         const VernonProgramStageBinding &binding = stage.bindings[parameterIndex];
-        if (binding.value >= logicalArguments_.size() || binding.value >= execution.values.size()) {
+        if (binding.value >= logicalArguments_.size() || binding.value >= program.values.size()) {
             error = "resolved Program stage binding exceeds the value arena";
             return false;
         }
@@ -303,7 +308,7 @@ bool ProgramValueArena::materializeNodeArguments(const ExecutableProgram &execut
         output.strides.emplace_back();
         if (materialized.kind == VERNON_PIPELINE_TENSOR && materialized.tensor.rank) {
             const shape::DeclaredShape declared =
-                shape::decodeRuntimeContractShape(execution.values[binding.value].shape);
+                shape::decodeRuntimeContractShape(program.values[binding.value].shape);
             if (binding.value < hostValues_.size() && hostValues_[binding.value].concreteShape) {
                 output.shapes.back() = *hostValues_[binding.value].concreteShape;
                 output.strides.back() = hostValues_[binding.value].strides;
@@ -343,20 +348,21 @@ bool ProgramValueArena::materializeNodeArguments(const ExecutableProgram &execut
             materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
         }
         if (binding.leaf) {
-            const ProgramValueSlot &slot = execution.values[binding.value];
-            if (materialized.kind != VERNON_PIPELINE_TENSOR || !slot.valueLayout ||
-                *binding.leaf >= slot.valueLayout->leaves.size()) {
+            const program::Value &slot = program.values[binding.value];
+            if (materialized.kind != VERNON_PIPELINE_TENSOR || !slot.layout ||
+                *binding.leaf >= slot.layout->leaves.size()) {
                 error = "resolved Program stage leaf exceeds the canonical Value ABI";
                 return false;
             }
-            const ValueLeaf &leaf = slot.valueLayout->leaves[*binding.leaf];
+            const ValueLayout valueLayout = program::materializeValueLayout(*slot.layout, slot.type);
+            const ValueLeaf &leaf = valueLayout.leaves[*binding.leaf];
             const ValueLayout &parameterLayout =
                 parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
             materialized.tensor.byte_offset += leaf.byteOffset;
             materialized.tensor.element_layout = pipelineValueLayout(parameterLayout);
             const std::optional<shape::DeclaredShape> projectionShape =
                 logicalProjectionShape(parameter, binding.target ? &*binding.target : nullptr);
-            const bool wholeElementProjection = slot.valueLayout->leaves.size() == 1 && leaf.path.empty();
+            const bool wholeElementProjection = valueLayout.leaves.size() == 1 && leaf.path.empty();
             const bool materializedProjection =
                 projectionShape && parameterLayout.byteSize &&
                 (wholeElementProjection ? shape::materializeLeafProjection(output.shapes.back(), output.strides.back(),

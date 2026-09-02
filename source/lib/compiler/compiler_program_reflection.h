@@ -9,7 +9,7 @@
 namespace vernon::compiler {
 
 struct ProgramReflection {
-    llvm::json::Object execution;
+    llvm::json::Object plan;
     llvm::json::Array kernelCompileRequests;
 };
 

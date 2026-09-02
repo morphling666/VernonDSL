@@ -197,15 +197,14 @@ def _compile_program_bundle_plan(
     native: Any,
     native_target: Any,
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
-    canonical_execution: bool = False,
 ) -> BundlePlan:
     planned = compiler.plan_program_result(parsed.mlir)
     if not bool(planned.ok):
         raise PipelineCompileError(str(planned.diagnostics) or "Program planning failed")
     reflection = parse_reflection_json(planned.reflection)
-    execution = reflection.get("execution")
+    execution = reflection.get("program_plan")
     if not isinstance(execution, Mapping):
-        raise PipelineCompileError("Program compiler reflection has no execution graph")
+        raise PipelineCompileError("Program compiler reflection has no typed Program plan")
     requests = reflection.get("kernel_compile_requests")
     if not isinstance(requests, list):
         raise PipelineCompileError("Program compiler reflection has no kernel compile requests")
@@ -304,31 +303,20 @@ def _compile_program_bundle_plan(
     if not bool(finalized.ok):
         raise PipelineCompileError(str(finalized.diagnostics) or "Program finalization failed")
     finalized_reflection = parse_reflection_json(finalized.reflection)
-    execution = finalized_reflection.get("execution")
-    if not isinstance(execution, Mapping):
-        raise PipelineCompileError("finalized Program reflection has no execution graph")
     reflected_targets = {stage.target for stage in stages.values()}
     if len(reflected_targets) != 1:
         raise PipelineCompileError("Program stages disagree on their reflected target")
     canonical_program = finalized_reflection.get("canonical_program")
     contracts = finalized_reflection.get("stage_contracts")
-    if canonical_execution and (not isinstance(canonical_program, Mapping) or not isinstance(contracts, Mapping)):
+    if not isinstance(canonical_program, Mapping) or not isinstance(contracts, Mapping):
         raise PipelineCompileError("C++ Program finalization returned no canonical deployment")
     plan = build_program_bundle_plan(
         pipeline_id,
         reflected_targets.pop(),
         variant,
-        [(variant, execution, stages)],
-        canonical_execution=canonical_execution,
-        canonical_program=(canonical_program if isinstance(canonical_program, Mapping) else None),
+        stages,
+        canonical_program,
     )
-    if not canonical_execution:
-        return plan
-    assert isinstance(canonical_program, Mapping)
-    assert isinstance(contracts, Mapping)
-    canonical_stage_rows = canonical_program.get("stages")
-    if not isinstance(canonical_stage_rows, Mapping) or set(canonical_stage_rows) != set(stages):
-        raise PipelineCompileError("canonical Program stages do not exactly cover logical compute requests")
     if set(contracts) != set(stages) or any(not isinstance(contract, Mapping) for contract in contracts.values()):
         raise PipelineCompileError("canonical stage contracts do not exactly cover logical compute requests")
     contracts_by_implementation: dict[str, dict[str, Mapping[str, Any]]] = {}
@@ -424,10 +412,10 @@ def _canonical_deployment(
     if len(plan.variants) != 1:
         raise PipelineCompileError("canonical deployment currently requires exactly one variant")
     variant = plan.variants[0]
-    if variant.execution is None:
+    if variant.canonical_program is None:
         raise PipelineCompileError("canonical deployment has no Program")
     stages = {stage.id: stage for stage in plan.stages}
-    canonical_stage_rows = variant.execution.get("stages")
+    canonical_stage_rows = variant.canonical_program.get("stages")
     if not isinstance(canonical_stage_rows, Mapping):
         raise PipelineCompileError("canonical deployment has no logical stages")
     blobs: dict[str, Any] = {}
@@ -495,7 +483,7 @@ def _canonical_deployment(
             artifacts[logical_stage]["implementation"] = copy.deepcopy(dict(implementation))
         stage_bindings[logical_stage] = logical_stage
     return (
-        copy.deepcopy(dict(variant.execution)),
+        copy.deepcopy(dict(variant.canonical_program)),
         {
             "target": copy.deepcopy(plan.target.spec),
             "blobs": blobs,
@@ -723,7 +711,6 @@ def _compile_module_bundle_plan(
             native=native,
             native_target=native_target,
             retained_programs=retained_programs,
-            canonical_execution=True,
         )
         for variant in pipeline.variants
     ]

@@ -24,20 +24,12 @@ from ..bundle import (
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..language.scalar_types import SCALAR_TYPES
 from ..language.stage_registry import validate_graphics_topology
-from ..render import RenderTargetUse
-from ..render import clear as clear_attachment
-from .binding import _DispatchBorrowLease, _NativeBindingCache
-from .execution_graph import (
-    ColorAttachmentUse,
-    DepthStencilAttachmentUse,
-    ExecutionParameter,
-    ExecutionResources,
-    GraphicsEncoder,
+from ..render import (
     LoadOperation,
-    PipelineInvocation,
-    RenderPass,
+    RenderTargetUse,
     StoreOperation,
 )
+from .binding import _DispatchBorrowLease, _NativeBindingCache
 from .resource_common import _session_state
 from .sampler import SamplerState
 from .tensor import TensorStorage, TensorView
@@ -59,7 +51,6 @@ points = PrimitiveTopology("points", 1)
 class _CompiledPipeline:
     native: Any
     key: str
-    bundle: bytes
     target_identity: str
     native_generation: int
     canonical_directory: tempfile.TemporaryDirectory[str] | None = None
@@ -87,7 +78,6 @@ class _GraphicsInvocationPlan:
 class _PipelineStageRequest:
     frontend: FrontendCompileResult
     module: str
-    module_manifest: str
     entry: str
     target: TargetOptions
     native_target: Any
@@ -142,7 +132,6 @@ class Pipeline:
         return _PipelineStageRequest(
             frontend,
             f"python/{path.stem}",
-            canonical_json(frontend.semantic_inputs),
             entry,
             target,
             native_target,
@@ -295,7 +284,7 @@ class Pipeline:
                     compiled_stage_from_program(
                         result,
                         module=request.module,
-                        module_manifest=request.module_manifest,
+                        module_manifest=canonical_json(request.frontend.semantic_inputs),
                         entry=request.entry,
                         target=request.target,
                     )
@@ -351,7 +340,7 @@ class Pipeline:
         key = hashlib.sha256(program_bytes + artifact_bytes).hexdigest()
         cached = self._cache.get(key)
         if cached is None:
-            native = state._native_runtime.load_canonical_program(
+            native = state._native_runtime.load_canonical_endpoint(
                 program_bytes,
                 artifact_bytes,
                 directory.name,
@@ -361,7 +350,6 @@ class Pipeline:
             cached = _CompiledPipeline(
                 native,
                 key,
-                b"",
                 canonical_json(options.spec),
                 state._runtime_generation,
                 directory,
@@ -386,7 +374,7 @@ class Pipeline:
                 raise RuntimeError("graphics pipeline cache is missing its canonical Program")
             assert cached.canonical_directory is not None
             assert cached.canonical_stage_bindings is not None
-            cached.native = state._native_runtime.load_canonical_program(
+            cached.native = state._native_runtime.load_canonical_endpoint(
                 cached.canonical_program,
                 cached.canonical_artifact_system,
                 cached.canonical_directory.name,
@@ -456,7 +444,7 @@ class Pipeline:
                 assert self._compiled.canonical_artifact_system is not None
                 assert self._compiled.canonical_directory is not None
                 assert self._compiled.canonical_stage_bindings is not None
-                self._compiled.native = state._native_runtime.load_canonical_program(
+                self._compiled.native = state._native_runtime.load_canonical_endpoint(
                     self._compiled.canonical_program,
                     self._compiled.canonical_artifact_system,
                     self._compiled.canonical_directory.name,
@@ -479,17 +467,15 @@ class Pipeline:
     def _invoke_direct(
         self,
         arguments: dict[str, Any],
-        encoder: GraphicsEncoder | None,
         binding_cache: _NativeBindingCache,
-        binding_tokens: dict[str, int] | None = None,
         *,
-        immediate_render: RenderTargetUse | None = None,
+        render: RenderTargetUse,
     ) -> tuple[Any, _DispatchBorrowLease] | None:
-        plan = self._prepare_graphics_invocation(arguments, encoder, immediate_render)
+        plan = self._prepare_graphics_invocation(arguments, render)
         try:
             with binding_cache.invocation(plan.compiled.native) as builder:
-                self._bind_graphics_arguments(plan, builder, binding_cache, binding_tokens)
-                return self._encode_graphics_invocation(plan, builder, encoder)
+                self._bind_graphics_arguments(plan, builder, binding_cache)
+                return self._encode_graphics_invocation(plan, builder)
         except Exception:
             if plan.lease is not None:
                 plan.lease.release()
@@ -498,62 +484,43 @@ class Pipeline:
     def _prepare_graphics_invocation(
         self,
         arguments: dict[str, Any],
-        encoder: GraphicsEncoder | None,
-        immediate_render: RenderTargetUse | None,
+        render: RenderTargetUse,
     ) -> _GraphicsInvocationPlan:
         state = _session_state()
-        if encoder is None:
-            if immediate_render is None:
-                raise RuntimeError("direct graphics submission requires a render target")
-            target = immediate_render.target
-            color_operations = dict(immediate_render.colors)
-            target_locations = {location for location, _ in target._color_attachments()}
-            if set(color_operations) != target_locations:
-                raise ValueError("render color operations must exactly match RenderTarget color locations")
-            colors = {}
-            for location, texture in target._color_attachments():
-                operation = color_operations.get(location)
-                if operation is None:
-                    raise ValueError(f"render use has no operation for color attachment {location}")
-                clear_value = operation.clear_value
-                if operation.load is LoadOperation.CLEAR:
-                    if (
-                        not isinstance(clear_value, (tuple, list))
-                        or len(clear_value) != 4
-                        or any(not isinstance(component, (int, float)) for component in clear_value)
-                    ):
-                        raise TypeError("color clear values must contain four numeric components")
-                    normalized_clear = tuple(float(component) for component in clear_value)
-                else:
-                    normalized_clear = (0.0, 0.0, 0.0, 0.0)
-                colors[location] = ColorAttachmentUse(
-                    texture,
-                    operation.load,
-                    operation.store,
-                    normalized_clear,
+        target = render.target
+        color_operations = dict(render.colors)
+        target_locations = {location for location, _ in target._color_attachments()}
+        if set(color_operations) != target_locations:
+            raise ValueError("render color operations must exactly match RenderTarget color locations")
+        colors: dict[int, Any] = {}
+        for location, _ in target._color_attachments():
+            operation = color_operations[location]
+            clear_value = operation.clear_value
+            if operation.load is LoadOperation.CLEAR:
+                if (
+                    not isinstance(clear_value, (tuple, list))
+                    or len(clear_value) != 4
+                    or any(not isinstance(component, (int, float)) for component in clear_value)
+                ):
+                    raise TypeError("color clear values must contain four numeric components")
+                clear_value = tuple(float(component) for component in clear_value)
+            else:
+                clear_value = (0.0, 0.0, 0.0, 0.0)
+            colors[location] = (operation.load, operation.store, clear_value)
+        depth_operation = render.depth
+        operations = {
+            "colors": colors,
+            "depth": (
+                (
+                    depth_operation.load,
+                    depth_operation.store,
+                    float(depth_operation.clear_value) if depth_operation.load is LoadOperation.CLEAR else 1.0,
                 )
-            depth_operation = immediate_render.depth
-            operations = {
-                "colors": colors,
-                "depth": (
-                    DepthStencilAttachmentUse(
-                        target.depth_view,
-                        depth_load=depth_operation.load,
-                        depth_store=depth_operation.store,
-                        clear_depth=float(depth_operation.clear_value)
-                        if depth_operation.load is LoadOperation.CLEAR
-                        else 1.0,
-                    )
-                    if target._depth_attachment() is not None and depth_operation is not None
-                    else None
-                ),
-                "first_in_scope": True,
-                "last_in_scope": True,
-                "render_area": immediate_render.render_area,
-            }
-        else:
-            target = encoder.target
-            operations = encoder.attachment_operations
+                if target._depth_attachment() is not None and depth_operation is not None
+                else None
+            ),
+            "render_area": render.render_area,
+        }
         indices = arguments.pop("indices", None)
         topology = arguments.pop("topology", self._topology)
         if topology is not self._topology:
@@ -603,7 +570,7 @@ class Pipeline:
             raise TypeError("topology must be triangles, lines, or points")
         if state._native_runtime is None:
             raise RuntimeError(f"{state._architecture.name} pipeline execution requires the native runtime")
-        lease = _DispatchBorrowLease(dispatch_borrows) if encoder is None else None
+        lease = _DispatchBorrowLease(dispatch_borrows)
         return _GraphicsInvocationPlan(
             state,
             arguments,
@@ -622,7 +589,6 @@ class Pipeline:
         plan: _GraphicsInvocationPlan,
         builder: Any,
         binding_cache: _NativeBindingCache,
-        binding_tokens: dict[str, int] | None,
     ) -> None:
         state = plan.state
         for parameter in plan.parameters:
@@ -659,18 +625,14 @@ class Pipeline:
                 parameter,
                 value,
                 host_value=host_value,
-                binding_token=None if binding_tokens is None else binding_tokens.get(parameter.name),
             )
 
     def _encode_graphics_invocation(
         self,
         plan: _GraphicsInvocationPlan,
         builder: Any,
-        encoder: GraphicsEncoder | None,
     ) -> tuple[Any, _DispatchBorrowLease] | None:
         state = plan.state
-        first_in_scope = plan.operations["first_in_scope"]
-        last_in_scope = plan.operations["last_in_scope"]
         load_values = {
             LoadOperation.CLEAR: state._native.ATTACHMENT_CLEAR,
             LoadOperation.PRESERVE: state._native.ATTACHMENT_PRESERVE,
@@ -681,34 +643,25 @@ class Pipeline:
             StoreOperation.DISCARD: state._native.ATTACHMENT_DONT_CARE,
         }
         for location, texture in plan.color_attachments:
-            attachment = plan.operations["colors"][location]
-            load = (
-                attachment.load if first_in_scope or attachment.load is LoadOperation.CLEAR else LoadOperation.PRESERVE
-            )
-            store = attachment.store if last_in_scope else StoreOperation.PRESERVE
+            load, store, clear_value = plan.operations["colors"][location]
             builder.rhi_color_attachment(
                 location,
                 texture._resident_view(),
                 load_values[load],
                 store_values[store],
-                list(attachment.clear_value),
+                list(clear_value),
             )
         depth_attachment = plan.target._depth_attachment()
         if depth_attachment is not None:
             attachment = plan.operations["depth"]
             if attachment is None:
                 raise RuntimeError("depth attachment operations are missing while a depth target is bound")
-            load = (
-                attachment.depth_load
-                if first_in_scope or attachment.depth_load is LoadOperation.CLEAR
-                else LoadOperation.PRESERVE
-            )
-            store = attachment.depth_store if last_in_scope else StoreOperation.PRESERVE
+            load, store, clear_depth = attachment
             builder.rhi_depth_attachment(
                 depth_attachment._resident_view(),
                 load_values[load],
                 store_values[store],
-                attachment.clear_depth,
+                clear_depth,
             )
         if plan.indices is not None:
             builder.rhi_index_binding(plan.indices._resident_buffer(), plan.indices.shape[0])
@@ -718,84 +671,19 @@ class Pipeline:
             points: state._native.TOPOLOGY_POINT_LIST,
         }[plan.topology]
         builder.topology(native_topology)
-        if encoder is None and plan.operations.get("render_area") is not None:
+        if plan.operations.get("render_area") is not None:
             builder.viewport(*plan.operations["render_area"])
             builder.scissor(*plan.operations["render_area"])
-        if encoder is not None and encoder.viewport is not None:
-            builder.viewport(*encoder.viewport)
-        if encoder is not None and encoder.scissor is not None:
-            builder.scissor(*encoder.scissor)
-        if encoder is None:
-            native_submission = builder.submit()
-        else:
-            builder.encode(encoder._native)
+        native_submission = builder.submit()
         for _, texture in plan.color_attachments:
             texture._mark_device_dirty()
         if depth_attachment is not None:
             depth_attachment._mark_device_dirty()
-        if encoder is None:
-            assert plan.lease is not None
-            return native_submission, plan.lease
-        return None
-
-    def _declare_invocation(self, arguments: dict[str, Any], execution_pass: RenderPass) -> None:
-        indices = arguments.pop("indices", None)
-        arguments.pop("topology", None)
-        arguments.pop("target", None)
-        for value in arguments.values():
-            if isinstance(value, (_TextureResource, TensorStorage, TensorView)):
-                execution_pass.read(value)
-        if indices is not None:
-            execution_pass.read(indices)
-
-    def invocation(self, **arguments: Any) -> PipelineInvocation:
-        return self._invocation(dict(arguments), _NativeBindingCache())
-
-    def _invocation(
-        self,
-        captured: dict[str, Any],
-        binding_cache: _NativeBindingCache,
-    ) -> PipelineInvocation:
-        parameterized = any(isinstance(value, ExecutionParameter) for value in captured.values())
-
-        def invoke(encoder: GraphicsEncoder, resources: ExecutionResources | None) -> None:
-            binding_tokens: dict[str, int] | None = None
-            if parameterized:
-                if resources is None:
-                    raise RuntimeError("parameterized pipeline invocation requires execution resources")
-                resolved = {}
-                binding_tokens = {}
-                for name, value in captured.items():
-                    if isinstance(value, ExecutionParameter):
-                        resolved[name], binding_tokens[name] = resources._resolve_parameter_with_token(value)
-                    else:
-                        resolved[name] = value
-            else:
-                resolved = dict(captured)
-            self._invoke_direct(resolved, encoder, binding_cache, binding_tokens)
-
-        invocation = PipelineInvocation(
-            "graphics",
-            invoke,
-            lambda execution_pass: self._declare_invocation(dict(captured), execution_pass),
-        )
-        invocation._binding_cache = binding_cache
-        return invocation
+        assert plan.lease is not None
+        return native_submission, plan.lease
 
     def __call__(self, **arguments: Any) -> None:
         render = arguments.pop("render", None)
-        legacy_target = arguments.pop("target", None)
-        if render is not None and legacy_target is not None:
-            raise TypeError("graphics execution accepts render= or legacy target=, not both")
-        if render is None and isinstance(legacy_target, RenderTarget):
-            render = RenderTargetUse(
-                legacy_target,
-                tuple(
-                    (location, clear_attachment((0.0, 0.0, 0.0, 0.0)))
-                    for location, _ in legacy_target._color_attachments()
-                ),
-                clear_attachment(1.0) if legacy_target._depth_attachment() is not None else None,
-            )
         if not isinstance(render, RenderTargetUse):
             raise TypeError("immediate graphics execution requires render=RenderTargetUse")
         state = _session_state()
@@ -806,9 +694,8 @@ class Pipeline:
             )
         result = self._invoke_direct(
             dict(arguments),
-            None,
             self._direct_binding_cache,
-            immediate_render=render,
+            render=render,
         )
         if result is None:
             raise RuntimeError("direct graphics invocation did not produce a submission")

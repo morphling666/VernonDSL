@@ -6,8 +6,8 @@ VernonDSL 0.1.2 is the current stable cross-platform release target. The current
 version axes are:
 
 - release `0.1.2`;
-- compiler contract 12;
-- pipeline contract 16;
+- compiler contract 13;
+- pipeline contract 17;
 - released frontend version 3, with language v4 remaining a future target.
 
 The supported wheel matrix is CPython 3.11–3.14 on Windows x64, Linux x64, and
@@ -24,10 +24,10 @@ implementation plans and milestone checklists that it replaces.
 
 ### Stable Runtime and compatibility contracts
 
-- Runtime, RHI, and ExecutionGraph execution return explicit submissions with
+- Runtime and RHI execution return explicit submissions with
   state queries, waits, and deterministic destruction.
-- ExecutionGraph separates its one-shot mutable builder from a reusable
-  immutable compiled plan and per-run submission state.
+- Resolved Program lowers to an immutable private Command DAG with per-run
+  submission state.
 - Backends may complete submissions inline; concurrent execution is not yet a
   guaranteed capability.
 - Unsupported target capabilities fail explicitly instead of silently changing
@@ -185,7 +185,7 @@ permit removing queue waits or letting recorded work outlive its owners.
 - Cooked CPU regression coverage includes f64 primal/cotangent/gradient
   preservation, signed-stride aggregate outputs, strided gradient scatter,
   gather accumulation, and independent multi-output cotangents.
-- Compiler contract 12 and pipeline contract 16 freeze the current unified
+- Compiler contract 13 and pipeline contract 17 define the current unified
   autodiff and manifest boundary without compatibility readers.
 
 ## Future work
@@ -197,7 +197,7 @@ permit removing queue waits or letting recorded work outlive its owners.
   without capability skips on release hardware.
 - Run the trusted workflow dry run, verify the complete payload, create the
   immutable `v0.1.2` tag, publish, and verify the PyPI and GitHub artifacts.
-- Add fuzzing for source, manifest, reflection, TensorView, and ExecutionGraph
+- Add fuzzing for source, Program, ArtifactSystem, reflection, TensorView, and Command DAG
   inputs.
 - Publish benchmark history and stable regression thresholds.
 
@@ -230,7 +230,7 @@ The principal work is:
 
 - extend the implemented CPU structured Storage VJP contract to GPU dynamic
   tape and aggregate tangent execution without backend-specific grouping;
-- expose composed ExecutionGraph VJP beyond the current C++ GPU surface;
+- extend canonical Program VJP across the supported GPU surface;
 - define versioned custom VJPs for rasterization, visibility, depth, blend, and
   texture sampling before claiming cross-stage graphics differentiation;
 - complete cross-backend acceptance for workgroup storage, barriers, relaxed
@@ -251,7 +251,7 @@ transforms, Hessians, and HVPs are outside the initial public autodiff surface.
   storage, barriers, and relaxed workgroup atomics run on hardware rather than
   being covered only by compiler lowering and RHI barrier tests.
 - Expand texture/sampler, depth, blend, cull, indexed draw, instancing, owned/
-  borrowed encoder lifetime, and ExecutionGraph coverage on Metal hardware.
+  borrowed encoder lifetime, and Command DAG coverage on Metal hardware.
 - Run the already final-linked iOS arm64 smoke host on a physical device when a
   suitable device runner is available.
 - Finish provider layering cleanup where backend headers or cache state are
@@ -294,7 +294,7 @@ view lifetime handling, and build-time embedded DirectX 12 mip generation.
 Deferred reclamation activates only when at least one product requirement is
 accepted:
 
-1. recorded ExecutionGraph work may execute after the declaring call returns;
+1. recorded Program work may execute after the declaring call returns;
 2. multiple frames or submissions may remain in flight;
 3. queue synchronization is a measured material bottleneck;
 4. prepared bindings intentionally outlive their public wrappers.

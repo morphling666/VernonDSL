@@ -11,7 +11,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/raw_ostream.h"
 
 #include <string>
 
@@ -244,7 +243,6 @@ VernonStatus planComputeKernel(CompilerFrontend &frontend, const char *source, s
         builder, entry.getLoc(), operationResults, operationOperands, entry.getSymName(),
         llvm::ArrayRef<int64_t>{1, 1, 1}, builder.getArrayAttr({}), builder.getArrayAttr(operandNames),
         builder.getArrayAttr(operationResultNames));
-    compute->setAttr("vernon_program.kernel_bootstrap", builder.getUnitAttr());
     compute->setAttr("vernon_program.grid_control_arguments",
                      builder.getDenseI64ArrayAttr({static_cast<int64_t>(arguments.size()),
                                                    static_cast<int64_t>(arguments.size() + 1),
@@ -268,12 +266,9 @@ VernonStatus planComputeKernel(CompilerFrontend &frontend, const char *source, s
         returned.push_back(compute->getResult(index));
     mlir::func::ReturnOp::create(builder, entry.getLoc(), returned);
 
-    std::string programText;
-    llvm::raw_string_ostream stream(programText);
-    program->print(stream);
     builder.clearInsertionPoint();
     PreparedModulePtr prepared;
-    return prepareMlir(frontend, programText.data(), programText.size(), prepared, artifacts, reflection, diagnostics);
+    return prepareProgramModule(frontend, std::move(program), prepared, artifacts, reflection, diagnostics);
 }
 
 } // namespace vernon::compiler

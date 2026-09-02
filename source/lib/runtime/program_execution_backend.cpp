@@ -4,7 +4,6 @@
 #include "content_hash.h"
 #include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
-#include "program_manifest.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime_dispatch.h"
 #include "runtime_state.h"
@@ -17,7 +16,6 @@
 #include <fstream>
 #include <limits>
 #include <memory>
-#include <set>
 
 namespace vernon::runtime::program {
 namespace {
@@ -192,182 +190,38 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
     return pipeline;
 }
 
-bool convertExecutableProgram(const ResolvedProgram &program, ExecutableProgram &execution, Diagnostic &diagnostic) {
-    execution = {};
-    execution.values.resize(program.program.values.size());
-    std::set<uint32_t> userInputs;
-    std::set<uint32_t> userOutputs;
-    for (const Graph &graph : program.program.graphs) {
-        for (const GraphInput &input : graph.inputs)
-            if (input.kind == GraphInputKind::UserInput)
-                userInputs.insert(input.value);
-        for (const GraphOutput &output : graph.outputs)
-            userOutputs.insert(output.value);
-    }
-    for (const Value &value : program.program.values) {
-        if (value.id >= execution.values.size())
-            return reject(diagnostic, "PROGRAM_VALUE", "/values", "Program value id exceeds the value arena");
-        ProgramValueSlot slot;
-        slot.id = value.id;
-        slot.name = value.name;
-        slot.type = value.type;
-        slot.shape = value.shape;
-        slot.storage = value.storage;
-        slot.external = userInputs.count(value.id) != 0;
-        slot.output = userOutputs.count(value.id) != 0;
-        if (value.layout) {
-            if (value.layout->byteSize > std::numeric_limits<uint32_t>::max() ||
-                value.layout->alignment > std::numeric_limits<uint32_t>::max())
-                return reject(diagnostic, "PROGRAM_LAYOUT_HASH",
-                              "/values/" + std::to_string(value.id) + "/value_layout",
-                              "ValueLayout exceeds the runtime ABI");
-            auto layout =
-                std::make_shared<vernon::runtime::ValueLayout>(materializeValueLayout(*value.layout, value.type));
-            slot.valueLayout = std::move(layout);
-            if (value.layout->leaves.size() == 1)
-                slot.dtype = value.layout->leaves.front().dtype;
-        }
-        execution.values[value.id] = std::move(slot);
-    }
-    execution.storages.resize(program.program.storages.size());
-    for (const Storage &storage : program.program.storages) {
-        if (storage.id >= execution.storages.size())
-            return reject(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "/storages",
-                          "Program storage id exceeds the storage arena");
-        ProgramStorageSlot slot;
-        slot.id = storage.id;
-        slot.initialValue = storage.initialValue;
-        slot.owned = storage.ownership == StorageOwnership::Owned;
-        if (storage.descriptorKind == StorageDescriptorKind::Buffer) {
-            slot.byteLength = storage.buffer.byteLength;
-            const std::string graph = storage.initialValue < program.program.values.size()
-                                          ? program.program.values[storage.initialValue].origin.graph
-                                          : std::string();
-            for (const ControlComponent &extent : storage.buffer.byteLengthExtents) {
-                ProgramBufferExtent converted;
-                if (extent.kind == ControlKind::Static) {
-                    converted.isStatic = true;
-                    converted.staticValue = extent.value;
-                } else {
-                    converted.isStatic = false;
-                    converted.axis = extent.axis;
-                    if (!resolveControlValue(program.program, extent, graph, converted.value) ||
-                        (extent.kind != ControlKind::Capture &&
-                         program.program.values[converted.value].origin.kind == OriginKind::NodeResult))
-                        return reject(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE",
-                                      "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                                      "owned dyn like-source is not entry-available");
-                }
-                slot.byteLengthExtents.push_back(converted);
-            }
-        }
-        execution.storages[storage.id] = slot;
-    }
-    const auto convertBindings = [](const std::vector<SignatureBinding> &bindings) {
-        std::vector<ProgramAdSignatureBinding> converted;
-        converted.reserve(bindings.size());
-        for (const SignatureBinding &binding : bindings)
-            converted.push_back({binding.value, binding.path});
-        return converted;
-    };
-    execution.adSignature.inputs = convertBindings(program.program.signature.inputs);
-    execution.adSignature.outputs = convertBindings(program.program.signature.outputs);
-    execution.adSignature.cotangents = convertBindings(program.program.signature.cotangents);
-    execution.adSignature.gradients = convertBindings(program.program.signature.gradients);
-    execution.adSignature.declared = true;
-    if (program.program.residualContract) {
-        execution.adSignature.captures.reserve(program.program.residualContract->captures.size());
-        for (const ResidualCapture &capture : program.program.residualContract->captures)
-            execution.adSignature.captures.push_back(capture.value);
-    }
-    for (size_t graphIndex = 0; graphIndex < program.program.graphs.size(); ++graphIndex) {
-        const Graph &graph = program.program.graphs[graphIndex];
-        ProgramGraph converted;
-        converted.name = graph.name;
-        converted.direction = graph.direction;
-        converted.captures = graph.captures;
-        for (const GraphInput &input : graph.inputs)
-            if (input.kind == GraphInputKind::UserInput)
-                converted.arguments.push_back(input.value);
-        for (const GraphOutput &output : graph.outputs)
-            converted.results.push_back(output.value);
-        const ResolvedGraph *resolvedGraph = graphIndex < program.graphs.size() ? &program.graphs[graphIndex] : nullptr;
-        for (const Node &node : graph.nodes) {
-            ProgramNode convertedNode;
-            convertedNode.id = node.id;
-            convertedNode.kind = node.operation == "graphics" ? "render" : "compute";
-            convertedNode.stage = node.stage;
-            convertedNode.name = graph.direction + "." + std::to_string(node.id);
-            if (!node.name.empty())
-                convertedNode.name += "." + node.name;
-            convertedNode.operands = node.operands;
-            convertedNode.results = node.results;
-            if (resolvedGraph && node.id < resolvedGraph->predecessors.size())
-                convertedNode.dependencies = resolvedGraph->predecessors[node.id];
-            for (const EndpointBinding &binding : node.bindings) {
-                uint32_t value = binding.value;
-                if (binding.tag == BindingTag::Resource) {
-                    if (binding.access >= node.accesses.size())
-                        return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/graphs",
-                                      "resource endpoint binding names an unknown access");
-                    const ResourceAccess &access = node.accesses[binding.access];
-                    value = access.kind == AccessKind::Read         ? access.value
-                            : access.kind == AccessKind::Initialize ? access.after
-                                                                    : access.before;
-                }
-                convertedNode.bindings.push_back({binding.module + ":" + std::to_string(binding.index), value});
-            }
-            for (const ResourceAccess &access : node.accesses) {
-                ProgramResourceUse use;
-                if (access.kind == AccessKind::Read) {
-                    use.value = access.value;
-                    use.access = "read";
-                } else if (access.kind == AccessKind::Initialize) {
-                    use.value = access.after;
-                    use.access = "write";
-                } else {
-                    use.value = access.before;
-                    use.access = access.access.empty() ? "write" : access.access;
-                }
-                convertedNode.resources.push_back(std::move(use));
-            }
-            if (node.operation == "compute") {
-                for (size_t axis = 0; axis < 3; ++axis) {
-                    const ControlComponent &control = node.compute.workgroups[axis];
-                    const std::string path = "/graphs/" + std::to_string(graphIndex) + "/nodes/" +
-                                             std::to_string(node.id) + "/operation/workgroups/" + std::to_string(axis);
-                    if (control.kind != ControlKind::Static)
-                        return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", path,
-                                      "ExecutionGraph Program dispatch requires static workgroup counts");
-                    if (!control.value || control.value > std::numeric_limits<uint32_t>::max())
-                        return reject(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", path,
-                                      "workgroup count is outside uint32");
-                    convertedNode.grid[axis] = control.value;
-                }
-            }
-            converted.nodes.push_back(std::move(convertedNode));
-        }
-        execution.graphs.push_back(std::move(converted));
-    }
-    return true;
-}
-
 } // namespace
 
 VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
                                                  std::shared_ptr<const ResolvedProgram> program,
                                                  const ArtifactSystem &artifacts,
-                                                 const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
+                                                 const std::filesystem::path &bundleRoot, ProgramPipelineMode mode,
+                                                 Diagnostic &diagnostic) {
     diagnostic = {};
     ResolvedExecutablePlan executable;
     if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
         return nullptr;
-    if (executable.nodes.size() == 1) {
+    if (mode == ProgramPipelineMode::DirectEndpoint) {
+        if (executable.nodes.size() != 1) {
+            diagnostic.code = "PROGRAM_OPERATION_UNSUPPORTED";
+            diagnostic.phase = "resolve";
+            diagnostic.path = "/graphs/forward/nodes";
+            diagnostic.message = "direct Program endpoint must contain exactly one node";
+            return nullptr;
+        }
         const ResolvedExecutableNode &node = executable.nodes.front();
-        if (node.node->operation == "graphics")
-            return loadGraphicsProgramPipeline(context, *program, artifacts, bundleRoot, *node.node, *node.stage,
-                                               diagnostic);
-        return loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic);
+        VernonLoadedPipeline *pipeline =
+            node.node->operation == "graphics"
+                ? loadGraphicsProgramPipeline(context, *program, artifacts, bundleRoot, *node.node, *node.stage,
+                                              diagnostic)
+                : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic);
+        if (!pipeline)
+            return nullptr;
+        pipeline->topology = std::make_shared<VernonPipelineTopology>();
+        pipeline->topology->resolvedProgram = std::move(program);
+        pipeline->topology->residualValues = residualCaptures(pipeline->topology->resolvedProgram->program);
+        pipeline->topology->directDispatch = true;
+        return pipeline;
     }
     for (const ResolvedExecutableNode &node : executable.nodes)
         if (node.node->operation == "graphics")
@@ -378,9 +232,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     auto topology = std::make_shared<VernonPipelineTopology>();
     topology->resolvedProgram = std::move(program);
-    if (!convertExecutableProgram(*topology->resolvedProgram, topology->execution, diagnostic))
-        return nullptr;
-    topology->residualValues = topology->execution.residualCaptures();
+    topology->residualValues = residualCaptures(topology->resolvedProgram->program);
     for (const ResolvedExecutableNode &node : executable.nodes) {
         if (topology->stageIndices.find(node.node->stage) != topology->stageIndices.end())
             continue;
@@ -398,12 +250,9 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
             VernonResolvedProgramStage{std::move(child), std::move(bindings), node.plan.dispatchMapping});
     }
     pipeline->topology = std::move(topology);
-    const bool nativeProgramAutodiff =
-        std::any_of(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
-                    [](const ProgramGraph &graph) { return graph.direction == "backward"; });
-    if (nativeProgramAutodiff && !vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
+    if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
         return reject(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "/signature",
-                      invocationDiagnostic(context).empty() ? "Program autodiff topology is invalid"
+                      invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
                                                             : invocationDiagnostic(context)),
                nullptr;
     ++context.livePipelines;
@@ -414,7 +263,8 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
                                                  size_t programJsonSize, const char *artifactSystemJson,
                                                  size_t artifactSystemJsonSize,
                                                  const std::map<std::string, std::string> &stageBindings,
-                                                 const std::filesystem::path &bundleRoot, std::string &error) {
+                                                 const std::filesystem::path &bundleRoot, ProgramPipelineMode mode,
+                                                 std::string &error) {
     Diagnostic diagnostic;
     Program program;
     ArtifactSystem artifacts;
@@ -437,7 +287,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
         return failed();
     auto owner = std::make_shared<ResolvedProgram>(std::move(resolved));
     if (VernonLoadedPipeline *loaded =
-            loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic))
+            loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, mode, diagnostic))
         return loaded;
     return failed();
 }

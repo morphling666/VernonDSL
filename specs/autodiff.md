@@ -1,8 +1,8 @@
 # Autodiff design
 
 > **Status:** accepted contract and implemented compute VJP surface. Compiler
-> contract 12 and pipeline contract 16 provide deterministic
-> `primal`/`forward_with_tape`/`backward` profiles, typed derivative groups,
+> contract 13 and pipeline contract 17 provide canonical forward/backward
+> Program graphs, typed derivative groups,
 > checked dynamic tape, explicit accumulation plans, and invocation-time
 > `(x,y,z)` workgroup grids with physical invocation carriers. Structured CPU VJP supports
 > direct and cooked void Kernels with explicit Storage objectives, recursive
@@ -417,35 +417,12 @@ it does not differentiate the Texture handle.
 Rule-set identity participates in compiler and pipeline contracts, cache keys,
 reflection, and manifests.
 
-## 9. ExecutionGraph composition
+## 9. Program composition
 
-The following is the shipped pre-breaking composition behavior, retained here
-as implementation history. It is removed as a second AD topology by the
-coordinated Program release.
-
-Python `ExecutionGraph` builders may name differentiable resource or execution
-parameter inputs and Storage objective resources. A `VjpComputePass` binds one
-directly compiled or cooked structured CPU VJP to graph resources. Compilation
-snapshots the derivative signature with the immutable execution plan.
-Automatic checkpoint planning currently requires directly compiled passes,
-because the frozen pipeline contract does not expose cooked tape-size and
-replay-cost metadata; cooked graph VJPs remain available without checkpoint
-planning.
-
-In the target architecture, Program forward/backward/residual graphs are the
-only top-level AD topology. Native ExecutionGraph consumes that topology for
-hazards, checkpointing, replay, and submission; it does not discover a second
-reverse graph from passes or compose profile pullbacks.
-
-`CompiledExecutionGraph.vjp()` calls the native graph VJP entry and returns a
-`GraphPullback` retaining that submission, the plan, resources, checkpoints,
-and required pipeline pullbacks. The C++ graph core traverses scheduled
-differentiable passes in reverse order, replays bounded segments through the
-compiled scheduler, supplies zero cotangents to inactive local outputs, and
-deterministically accumulates contributions by logical graph identity. One
-scalar objective may omit its cotangent; multiple or structured objectives
-must provide an exact name-to-cotangent mapping. A non-differentiable write on
-an active reverse path is an error.
+Program forward, backward, and residual graphs are the only top-level AD
+topology. The C++ Command DAG executes resolved dependencies, checkpoint
+segments, replay, and deterministic fan-in. Python exposes Module VJP rather
+than pass objects or a second reverse graph.
 
 The canonical backward operation is `GraphPullback.submit()`, which returns a
 submission carrying named gradients. Native CPU execution may complete inline;
@@ -483,10 +460,8 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 12 and pipeline contract 16 remain the current shipped CPU
-VJP boundary until the coordinated release; their profile behavior above is
-historical implementation fact. The breaking Program release updates the
-contracts together and intentionally rejects all older profile manifests. It
+Compiler contract 13 and pipeline contract 17 are the current Program VJP
+boundary. The breaking release intentionally rejects all older profile manifests. It
 does not reinterpret, normalize, or retain them as a parallel loading path.
 The target CPU VJP has one Program/ResolveProgram/ExecuteProgram path.
 Differentiated graphics remains unsupported.

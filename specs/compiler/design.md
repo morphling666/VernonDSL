@@ -358,7 +358,7 @@ is rejected.
 
 Program semantic topology, attachment operations, resource transitions, and
 forward/backward/residual AD topology belong to typed Program IR. The native
-`VernonExecutionGraph` consumes the resolved static DAG and owns hazards,
+the private runtime Command DAG consumes the resolved static graph and owns hazards,
 barriers, render-scope fusion, scheduling, and submission; it does not define a
 parallel deployment or AD topology. The target Program contract contains only
 static compute and graphics DAG nodes. Transfer and deployment control-flow
@@ -367,7 +367,7 @@ remains Kernel IR.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
-Pipeline 16 records the required texture dimension; format remains
+Pipeline 17 records the required texture dimension; format remains
 unconstrained.
 
 A target is reported as available only after its complete lowering and
@@ -730,10 +730,8 @@ is part of the stable Apple Silicon macOS compute and offscreen graphics
 subset. DirectX DXIL stage artifacts resolve through the Windows D3D12 runtime
 backend.
 
-Current Pipeline 16 behavior remains historical until the coordinated contract
-release; version constants are not updated early. The release is intentionally
-artifact-incompatible: loaders do not reinterpret old pipeline or profile
-manifests as Programs. Primal Programs contain only a forward graph.
+Pipeline 17 is intentionally artifact-incompatible: loaders do not reinterpret
+old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
 Differentiated Programs contain forward and backward graphs plus residual and
 derivative signature metadata. CPU cooking writes the same Program, a
 content-addressed relocatable `.o`/`.obj`, and generated static-registration
@@ -837,7 +835,7 @@ representations; mutable inputs produce separate owned gradient Storage.
 Program VJP alone constructs the Program forward graph, backward graph, and
 residual contract, including fan-in accumulation. Kernel structured VJP is only
 a compute-node implementation transform and owns only its local tape ABI.
-`VernonExecutionGraph` executes the resolved Program topology; it does not
+The private runtime Command DAG executes the resolved Program topology; it does not
 compose node profiles into a second reverse topology.
 
 Vertex and instance Tensor inputs use one rank-independent attribute ABI.

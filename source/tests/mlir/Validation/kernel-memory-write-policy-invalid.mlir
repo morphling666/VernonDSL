@@ -3,7 +3,7 @@
 // CHECK-COUNT-12: ordinary device TensorView store is not proven lane-exclusive
 // CHECK: scatter_add 'disjoint' hint requires a lane-exclusive global invocation index proof
 
-module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
+module attributes {vernon.compiler_contract_version = 13 : i64, vernon.pipeline_version = 17 : i64} {
   func.func @unproven_store(
       %output: !vernon.tensor_view<f32, [-1], "write", "device"> {
         vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64

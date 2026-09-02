@@ -3,6 +3,7 @@
 
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/runtime_gpu_resources.h"
+#include "runtime/program_execution_manifest.h"
 #include "runtime/target_binding_plan.h"
 
 #include <array>
@@ -12,10 +13,6 @@
 
 struct VernonRuntimeContext;
 struct VernonResolvedProgramStage;
-
-namespace vernon::runtime {
-struct ExecutableProgram;
-}
 
 namespace vernon::runtime::ad {
 
@@ -50,7 +47,7 @@ public:
     bool downloadCarrier(uint32_t value, program::CarrierSemantic semantic, void *data, size_t byteSize,
                          std::string &error) const;
     bool downloadLogicalToHost(const std::vector<char> &required, std::string &error) const;
-    bool materializeNodeArguments(const ExecutableProgram &execution, const ProgramNode &node,
+    bool materializeNodeArguments(const program::Program &program, const program::Node &node,
                                   const VernonResolvedProgramStage &stage, MaterializedProgramArguments &output,
                                   std::string &error) const;
 

@@ -213,7 +213,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/program_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/shape_layout.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
@@ -395,7 +394,6 @@ function(vernon_add_runtime)
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRHI.hpp
-              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonExecutionGraph.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonTextureTypes.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonRuntime.hpp

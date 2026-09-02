@@ -45,8 +45,8 @@ bool parseAutodiffResourceRole(const nlohmann::json &argument, AutodiffResourceR
     return true;
 }
 
-bool buildDirectComputeVariant(const nlohmann::json &root, const std::string &entry, Variant &variant,
-                               ReflectedEntry &reflection, VernonRuntimeBackend backend, std::string &error) {
+bool materializeComputeEndpoint(const nlohmann::json &root, const std::string &entry, Variant &variant,
+                                ReflectedEntry &reflection, VernonRuntimeBackend backend, std::string &error) {
     if (!parseReflection(root, entry, reflection, backend, error))
         return false;
     const nlohmann::json *selected = nullptr;
@@ -231,38 +231,12 @@ bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backe
         return false;
     }
     ReflectedEntry entry;
-    return buildDirectComputeVariant(reflection, stage.entry, variant, entry, backend, error);
+    return materializeComputeEndpoint(reflection, stage.entry, variant, entry, backend, error);
 }
 
 bool isDirectPipelineTopology(const Variant &variant) {
-    if (variant.program.size() != 1 || variant.compute.empty() ||
-        variant.program.find("compute") == variant.program.end())
-        return false;
-    if (!variant.executable)
-        return true;
-    if (variant.executable->graphs.size() != 1)
-        return false;
-    const ProgramGraph &forward = variant.executable->graphs.front();
-    if (forward.direction != "forward" || forward.nodes.size() != 1)
-        return false;
-    const ProgramNode &node = forward.nodes.front();
-    return node.id == 0 && node.kind == "compute" && node.stage == "compute" && node.dependencies.empty();
-}
-
-bool initializeDirectPipelineTopology(const Variant &variant, VernonLoadedPipeline &pipeline, std::string &error) {
-    if (!isDirectPipelineTopology(variant)) {
-        error = "pipeline variant is not a direct single-compute topology";
-        return false;
-    }
-    auto topology = std::make_shared<VernonPipelineTopology>();
-    if (variant.executable)
-        topology->execution = *variant.executable;
-    else if (!normalizeLegacySingleComputeExecution(variant, topology->execution, error))
-        return false;
-    topology->residualValues = topology->execution.residualCaptures();
-    topology->directDispatch = true;
-    pipeline.topology = std::move(topology);
-    return true;
+    return variant.program.size() == 1 && !variant.compute.empty() &&
+           variant.program.find("compute") != variant.program.end();
 }
 
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
@@ -280,9 +254,8 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU,
-                                   invocationDiagnostic(context)) ||
-        !initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
+    if (!materializeComputeEndpoint(parsed, entry, pipeline->variant, reflection, VERNON_RUNTIME_CPU,
+                                    invocationDiagnostic(context)))
         return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
@@ -313,8 +286,6 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
-    if (!initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
-        return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
     pipeline->readFootprints = reflection.readFootprints;
@@ -336,8 +307,6 @@ VernonLoadedPipeline *loadBackendTypedComputePipeline(VernonRuntimeContext &cont
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
-    if (!initializeDirectPipelineTopology(pipeline->variant, *pipeline, invocationDiagnostic(context)))
-        return nullptr;
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
     pipeline->readFootprints = reflection.readFootprints;
@@ -390,7 +359,7 @@ bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact
     if (parsed.is_discarded())
         return false;
     const std::string entry(entryData, entrySize);
-    if (!buildDirectComputeVariant(parsed, entry, variant, reflection, context.backend, invocationDiagnostic(context)))
+    if (!materializeComputeEndpoint(parsed, entry, variant, reflection, context.backend, invocationDiagnostic(context)))
         return false;
     stage.stage = "compute";
     stage.entry = entry;

@@ -20,13 +20,6 @@ from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
 from .binding import _DispatchBorrowLease, _NativeBindingCache
-from .execution_graph import (
-    ComputeEncoder,
-    ComputePass,
-    ExecutionParameter,
-    ExecutionResources,
-    PipelineInvocation,
-)
 from .resource_common import _session_state
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
@@ -177,7 +170,7 @@ class Kernel:
             if state._architecture == state.cpu
             else []
         )
-        compiled.native = state._native_runtime.load_canonical_program(
+        compiled.native = state._native_runtime.load_canonical_endpoint(
             compiled.canonical_program,
             compiled.canonical_artifact_system,
             compiled.canonical_directory.name,
@@ -308,10 +301,6 @@ class Kernel:
 
         for name, value in zip(user_parameters, arguments, strict=True):
             parameter = typed_parameters[name]
-            if isinstance(value, ExecutionParameter):
-                if parameter.type.kind in {"tensor", "tensor_view", "texture", "sampler"}:
-                    raise TypeError("execution value parameters cannot replace kernel resources")
-                continue
             if parameter.type.kind != "tensor_view":
                 if parameter.type.kind == "tensor" and isinstance(value, (TensorStorage, TensorView)):
                     element = parameter.type.arguments[0]
@@ -524,7 +513,7 @@ class Kernel:
             raise RuntimeError(planned.diagnostics)
         plan_reflection = parse_reflection_json(planned.reflection)
         requests = plan_reflection.get("kernel_compile_requests")
-        execution = plan_reflection.get("execution")
+        execution = plan_reflection.get("program_plan")
         values = execution.get("values") if isinstance(execution, Mapping) else None
         if not isinstance(requests, list) or len(requests) != 1 or not isinstance(requests[0], Mapping):
             raise RuntimeError("direct kernel planning must produce exactly one compile request")
@@ -596,7 +585,6 @@ class Kernel:
         arguments: tuple[Any, ...],
         user_parameters: list[str],
         binding_cache: _NativeBindingCache,
-        binding_tokens: tuple[int | None, ...] | None = None,
     ) -> None:
         static_tensor_names = {
             argument.arg
@@ -604,10 +592,7 @@ class Kernel:
             if self._is_static_tensor_annotation(argument.annotation)
         }
         annotations = inspect.get_annotations(self._function, eval_str=True)
-        tokens = binding_tokens or (None,) * len(arguments)
-        for user_name, parameter, value, binding_token in zip(
-            user_parameters, compiled.native.parameters, arguments, tokens, strict=True
-        ):
+        for user_name, parameter, value in zip(user_parameters, compiled.native.parameters, arguments, strict=True):
             binding_cache.bind_argument(
                 builder,
                 compiled.native,
@@ -615,7 +600,6 @@ class Kernel:
                 value,
                 host_value=user_name in static_tensor_names,
                 annotation=annotations.get(user_name),
-                binding_token=binding_token,
             )
 
     @staticmethod
@@ -645,13 +629,9 @@ class Kernel:
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
         features: tuple[str, ...] = (),
-        encoder: ComputeEncoder | None = None,
         binding_cache: _NativeBindingCache | None = None,
-        binding_tokens: tuple[int | None, ...] | None = None,
         return_submission: bool = False,
     ) -> tuple[Any, _DispatchBorrowLease] | None:
-        if return_submission and encoder is not None:
-            raise ValueError("direct submission cannot encode into an existing command encoder")
         state = _session_state()
         lowered = self._lower(features)
         self._bind_launch(lowered, arguments)
@@ -692,18 +672,13 @@ class Kernel:
         lease = _DispatchBorrowLease(dispatch_borrows) if return_submission else None
         try:
             with binding_cache.invocation(compiled.native) as builder:
-                self._bind_direct_arguments(
-                    compiled, builder, arguments, user_parameters, binding_cache, binding_tokens
-                )
+                self._bind_direct_arguments(compiled, builder, arguments, user_parameters, binding_cache)
                 # The loaded single-node pipeline exposes the canonical Program's
                 # groups_x/y/z control arguments through this direct-dispatch facade.
                 builder.grid(*grid)
-                if encoder is None:
-                    submission = builder.submit()
-                    if not return_submission:
-                        submission.wait()
-                else:
-                    builder.encode(encoder._native)
+                submission = builder.submit()
+                if not return_submission:
+                    submission.wait()
         except Exception:
             if lease is not None:
                 lease.release()
@@ -753,80 +728,6 @@ class Kernel:
             native_submission.wait()
         finally:
             lease.release()
-
-    def _declare_invocation(
-        self,
-        arguments: tuple[Any, ...],
-        features: tuple[str, ...],
-        execution_pass: ComputePass,
-    ) -> None:
-        state = _session_state()
-        lowered = self._lower(features)
-        self._bind_launch(lowered, arguments)
-        compiled = self.specialize(features, lowered=lowered)
-        for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
-            if not isinstance(value, (TensorStorage, TensorView, _TextureResource)):
-                continue
-            if parameter.access == state._native.ACCESS_READ:
-                execution_pass.read(value)
-            elif parameter.access == state._native.ACCESS_WRITE:
-                execution_pass.write(value)
-            else:
-                execution_pass.read_write(value)
-
-    def invocation(
-        self,
-        *arguments: Any,
-        grid: tuple[int, int, int] | None = None,
-        features: tuple[str, ...] = (),
-    ) -> PipelineInvocation:
-        return self._invocation(tuple(arguments), grid, features, _NativeBindingCache())
-
-    def _invocation(
-        self,
-        captured: tuple[Any, ...],
-        grid: tuple[int, int, int] | None,
-        features: tuple[str, ...],
-        binding_cache: _NativeBindingCache,
-    ) -> PipelineInvocation:
-        parameterized = any(isinstance(value, ExecutionParameter) for value in captured)
-
-        def invoke(encoder: ComputeEncoder, resources: ExecutionResources | None) -> None:
-            state = _session_state()
-            binding_tokens: tuple[int | None, ...] | None = None
-            if parameterized:
-                if resources is None:
-                    raise RuntimeError("parameterized kernel invocation requires execution resources")
-                resolved_values: list[Any] = []
-                resolved_tokens: list[int | None] = []
-                for value in captured:
-                    if isinstance(value, ExecutionParameter):
-                        resolved, token = resources._resolve_parameter_with_token(value)
-                        resolved_values.append(resolved)
-                        resolved_tokens.append(token)
-                    else:
-                        resolved_values.append(value)
-                        resolved_tokens.append(None)
-                resolved = tuple(resolved_values)
-                binding_tokens = tuple(resolved_tokens)
-            else:
-                resolved = captured
-            self._invoke_direct(
-                resolved,
-                grid,
-                features,
-                None if state._architecture == state.cpu else encoder,
-                binding_cache,
-                binding_tokens,
-            )
-
-        invocation = PipelineInvocation(
-            "compute",
-            invoke,
-            lambda execution_pass: self._declare_invocation(captured, features, execution_pass),
-        )
-        invocation._binding_cache = binding_cache
-        return invocation
 
 
 atexit.register(Kernel.clear_cache)

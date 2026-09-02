@@ -38,7 +38,7 @@ and general browser Runtime support are later work.
 - C++ exceptions crossing an ABI boundary.
 - Passing C++ classes, STL containers, Python objects, or implicit ownership
   across the Host ABI.
-- Host-to-GPU kernel dispatch or ExecutionGraph construction from compiled Host
+- Host-to-GPU kernel dispatch or Command DAG construction from compiled Host
   code.
 - A browser Python runtime, WASM wheel, dynamic loader, or general browser
   plugin system.

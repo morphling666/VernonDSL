@@ -130,6 +130,7 @@ struct VernonLoadedPipeline {
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
     std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
     std::shared_ptr<VernonPipelineTopology> topology;
+    std::optional<VernonDifferentiatedPipeline> differentiated;
     void *backendState{};
     void (*destroyBackendState)(void *){};
 };
@@ -150,12 +151,10 @@ struct VernonPipelineTopology {
     ~VernonPipelineTopology();
 
     std::shared_ptr<const vernon::runtime::program::ResolvedProgram> resolvedProgram;
-    vernon::runtime::ExecutableProgram execution;
     std::vector<uint32_t> residualValues;
     bool directDispatch{};
     std::vector<VernonResolvedProgramStage> stages;
     std::unordered_map<std::string, size_t> stageIndices;
-    std::optional<VernonDifferentiatedPipeline> differentiated;
     std::optional<uint64_t> programCheckpointMemoryBudget;
     std::string programCheckpointPolicy;
 };

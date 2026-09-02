@@ -60,7 +60,7 @@ work independently:
 
 - Canonical compute synthesized legacy reflection JSON in
   `program_execution_backend.cpp::makeReflection`, then reparsed it through
-  `buildDirectComputeVariant`.
+  `materializeComputeEndpoint`.
 - Graphics and old direct paths used Python `bundle/parameters.py` to select
   `physical_layouts`, `interface_plan`, and transport metadata.
 
@@ -170,7 +170,7 @@ Parity tests must cover:
 Replace:
 
 ```text
-makeReflection -> legacy JSON -> buildDirectComputeVariant
+makeReflection -> endpoint reflection -> materializeComputeEndpoint
 ```
 
 with direct `buildTargetBindingPlan`.
@@ -259,7 +259,7 @@ Still on the **legacy cooked** path until contract release (do not delete yet):
 
 - `reflected_parameters` / `merge_parameter_uses` in `bundle/parameters.py`
   (used by `cook_pipeline_asset`);
-- `buildDirectComputeVariant` for old cooked bundles;
+- `materializeComputeEndpoint` for resolved one-node stage ABI;
 - `pipeline_manifest` parse;
 - duplicate Program vs Pipeline layout converters.
 

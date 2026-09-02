@@ -7,9 +7,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import vernon_dsl as vd
 
 if importlib.util.find_spec("cv2") is None:
     raise unittest.SkipTest("showcase helpers require the optional examples dependency")
+if not hasattr(vd, "ComputePass"):
+    raise unittest.SkipTest("showcase helpers still require the retired Python execution-graph API")
 
 EXAMPLES = Path(__file__).parents[2] / "examples"
 sys.path.insert(0, str(EXAMPLES))

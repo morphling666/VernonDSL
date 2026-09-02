@@ -3,6 +3,7 @@
 
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "program_execution_manifest.h"
 #include "runtime_state.h"
 
 #include <string>
@@ -40,16 +41,15 @@ bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact
 bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backend, Variant &variant,
                                   std::string &error);
 bool isDirectPipelineTopology(const Variant &variant);
-bool initializeDirectPipelineTopology(const Variant &variant, VernonLoadedPipeline &pipeline, std::string &error);
 
 bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
 void destroyBackendPipeline(VernonLoadedPipeline &pipeline);
 VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
                                    const PlannedGraphicsInvocation &plan);
 VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
-VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
                                          const std::vector<VernonPipelineArgument> &values);
-VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const ProgramGraph &graph,
+VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
                                          ad::ProgramValueArena &arena);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,

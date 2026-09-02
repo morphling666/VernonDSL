@@ -9,7 +9,6 @@ import vernon_dsl as vd
 from shader_lib.fullscreen import fullscreen_vertex
 from shader_lib.mandelbulb import mandelbulb_fragment
 from showcase_common import (
-    BatchRenderPass,
     FramePresenter,
     ShowcasePreset,
     architecture_from_name,
@@ -46,29 +45,6 @@ def main() -> None:
         "smoke": (np.int32(48), np.int32(9), np.int32(12)),
         "showoff": (np.int32(112), np.int32(18), np.int32(32)),
     }[options.preset]
-    graph = vd.ExecutionGraph()
-    camera_parameter = graph.parameter("camera_position")
-    time_parameter = graph.parameter("time")
-    power_parameter = graph.parameter("power")
-    invocation = render_mandelbulb.invocation(
-        position=positions,
-        camera_position=camera_parameter,
-        camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
-        time=time_parameter,
-        power=power_parameter,
-        max_steps=quality[0],
-        max_iterations=quality[1],
-        shadow_steps=quality[2],
-        topology=vd.triangles,
-    )
-    graph.add_pass(
-        BatchRenderPass(
-            "mandelbulb-raymarch",
-            target,
-            [invocation],
-            clear_color=(0.0, 0.0, 0.0, 1.0),
-        )
-    )
     presenter = FramePresenter(
         output,
         architecture=options.architecture,
@@ -76,29 +52,34 @@ def main() -> None:
         headless=options.headless,
         fps=options.fps,
     )
-    plan = graph.compile()
 
-    def frame_values(phase: float) -> dict[vd.ExecutionParameter, object]:
+    def frame_values(phase: float) -> dict[str, object]:
         angle = phase * 0.22 + 0.55
         camera = np.array(
             (3.15 * math.cos(angle), 0.48 + math.sin(phase * 0.17) * 0.12, 3.15 * math.sin(angle)),
             dtype=np.float32,
         )
         return {
-            camera_parameter: camera,
-            time_parameter: np.float32(phase),
-            power_parameter: np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
+            "camera_position": camera,
+            "time": np.float32(phase),
+            "power": np.float32(8.0 + math.sin(phase * 0.21) * 0.18),
         }
 
-    bindings = plan.create_bindings(frame_values(0.0))
     animation_frames: list[np.ndarray] = []
     frame = 0
     start = time.perf_counter()
     try:
         while options.frames == 0 or frame < options.frames:
             phase = float(time.perf_counter() - start if options.frames == 0 else frame / options.fps)
-            bindings.update(frame_values(phase))
-            plan.submit(bindings).wait()
+            render_mandelbulb(
+                position=positions,
+                camera_target=np.array((0.0, 0.0, 0.0), dtype=np.float32),
+                max_steps=quality[0],
+                max_iterations=quality[1],
+                shadow_steps=quality[2],
+                render=vd.render(target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
+                **frame_values(phase),
+            )
             frame += 1
             if not presenter.present():
                 break
@@ -112,15 +93,14 @@ def main() -> None:
         write_animation(options.animation_output, animation_frames, options.fps)
     if presenter.image is None:
         raise RuntimeError("Mandelbulb showcase did not render an image")
-    barrier_count = sum(len(scope.barriers) for scope in plan.scopes)
     emit_showcase_result(
         name="mandelbulb",
         options=options,
         image=presenter.image,
         rendered_frames=frame,
         elapsed_seconds=elapsed,
-        passes=len(plan.schedule),
-        barriers=barrier_count,
+        passes=1,
+        barriers=0,
     )
 
 

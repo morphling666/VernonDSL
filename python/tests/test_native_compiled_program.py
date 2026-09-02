@@ -220,14 +220,14 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(request["implementation_hint"], "Module.square")
         self.assertEqual(request["kind"], "compute")
         self.assertIn("vernon_program.compute", request["region_mlir"])
-        self.assertEqual(reflection["execution"]["graphs"][0]["nodes"][0]["stage"], "forward:0")
+        self.assertEqual(reflection["program_plan"]["graphs"][0]["nodes"][0]["stage"], "forward:0")
 
     def test_kernel_planner_bootstraps_explicit_dispatch_controls(self) -> None:
         plan = native.Compiler().plan_kernel_result(DIRECT_KERNEL_MODULE)
         self.assertTrue(plan.ok, plan.diagnostics)
         reflection = json.loads(plan.reflection)
         request = reflection["kernel_compile_requests"][0]
-        node = reflection["execution"]["graphs"][0]["nodes"][0]
+        node = reflection["program_plan"]["graphs"][0]["nodes"][0]
         self.assertEqual(
             node["grid"],
             [

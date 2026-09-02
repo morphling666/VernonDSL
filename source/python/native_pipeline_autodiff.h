@@ -548,6 +548,56 @@ struct LoadedPipeline {
         return signature;
     }
 
+    nb::dict programForward(const nb::dict &inputs, const nb::dict &programBindings) {
+        const auto leafMetadata = [&](bool input, size_t index) {
+            VernonAdValueMetadataView value{};
+            value.struct_size = sizeof(value);
+            const VernonStatus status = input ? vernonRuntimeLoadedPipelineGetAdInputByIndex(pipeline, index, &value)
+                                              : vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, index, &value);
+            if (status != VERNON_STATUS_OK)
+                throw std::runtime_error("cannot read Program value metadata");
+            PythonAdMetadata result;
+            result.path = nativeStringView(value.path);
+            result.binding = result.path;
+            result.dtype = value.dtype;
+            if (value.rank)
+                result.shape.assign(value.shape, value.shape + value.rank);
+            return result;
+        };
+        std::deque<PythonAdValue> inputValues;
+        std::vector<VernonAdValue> inputViews;
+        const size_t inputCount = vernonRuntimeLoadedPipelineGetAdInputCount(pipeline);
+        for (size_t index = 0; index < inputCount; ++index) {
+            const PythonAdMetadata reflected = leafMetadata(true, index);
+            nb::object leaf = resolveProgramInputLeaf(inputs, reflected.path);
+            inputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, leaf);
+            inputViews.push_back(inputValues.back().value);
+        }
+        VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
+
+        std::deque<PythonAdValue> outputValues;
+        std::vector<VernonAdValue> outputViews;
+        nb::dict outputs;
+        const size_t outputCount = vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline);
+        for (size_t index = 0; index < outputCount; ++index) {
+            const PythonAdMetadata reflected = leafMetadata(false, index);
+            nb::object leaf = resolveProgramInputLeaf(programBindings, reflected.path);
+            outputValues.emplace_back(reflected.path, reflected.dtype, reflected.shape, leaf, VERNON_ACCESS_WRITE);
+            outputViews.push_back(outputValues.back().value);
+            outputs[nb::str(reflected.path.c_str())] = outputValues.back().array;
+        }
+        VernonAdValueSet outputSet{sizeof(VernonAdValueSet), outputViews.data(), outputViews.size(), {}};
+        VernonPullback *pullback = nullptr;
+        const VernonStatus status = vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputSet, &outputSet, &pullback);
+        if (pullback)
+            vernonPullbackDestroy(pullback);
+        if (status != VERNON_STATUS_OK)
+            throw std::runtime_error("Program forward failed: " + nativeStringView(vernonRuntimeGetLastError(runtime)));
+        for (PythonAdValue &output : outputValues)
+            output.commit();
+        return outputs;
+    }
+
     nb::tuple programVjp(const nb::dict &inputs, const nb::dict &programBindings, nb::object pipelineOwner,
                          const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
         if (!vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline))

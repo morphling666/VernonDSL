@@ -5,8 +5,8 @@ and compute. A restricted, statically typed Python frontend lowers through
 shared semantic IR into target-specific CPU, CUDA, Vulkan, OpenGL, DirectX, and
 Metal artifacts.
 
-For an end-to-end explanation of the language, compiler backends, Runtime/RHI,
-ExecutionGraph, and offline cooking model, see
+For an end-to-end explanation of the language, compiler backends, Program
+runtime, RHI command scheduling, and offline cooking model, see
 [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ```python

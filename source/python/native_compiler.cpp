@@ -119,8 +119,7 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0)
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
-        .def("create_runtime", &createRhiRuntime, nb::keep_alive<0, 1>())
-        .def("create_execution_graph", [](RhiHost &host) { return createNativeExecutionGraph(host.state); });
+        .def("create_runtime", &createRhiRuntime, nb::keep_alive<0, 1>());
     nb::class_<RhiBuffer>(module, "RhiBuffer")
         .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
         .def("upload", &RhiBuffer::upload, nb::arg("data"), nb::arg("offset") = 0)
@@ -170,7 +169,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("array_layer_count", [](const RhiImageView &value) { return value.arrayLayerCount; })
         .def_prop_ro("aspects", [](const RhiImageView &value) { return value.aspects; });
     nb::class_<RhiSampler>(module, "RhiSampler");
-    bindNativeExecutionGraph(module);
     nb::class_<Runtime>(module, "Runtime")
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
         .def("load", &Runtime::load, nb::keep_alive<0, 1>())
@@ -179,8 +177,10 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
         .def("load_program_pipeline_asset", &Runtime::loadProgramPipelineAsset, nb::keep_alive<0, 1>())
-        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::keep_alive<0, 1>())
-        .def("create_execution_graph", &Runtime::createExecutionGraph);
+        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("program"), nb::arg("artifact_system"),
+             nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>())
+        .def("load_canonical_endpoint", &Runtime::loadCanonicalEndpoint, nb::arg("program"), nb::arg("artifact_system"),
+             nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
         .def_ro("name", &PipelineParameterMetadata::name)
@@ -348,6 +348,12 @@ void bindNativeCompiler(nb::module_ &module) {
                                     nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
             },
             nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
+        .def(
+            "program_forward",
+            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings) {
+                return pipeline.programForward(inputs, bindings);
+            },
+            nb::arg("inputs"), nb::arg("bindings"))
         .def(
             "program_vjp",
             [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings,

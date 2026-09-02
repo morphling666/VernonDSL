@@ -1,7 +1,6 @@
 #ifndef VERNON_PYTHON_NATIVE_RUNTIME_H
 #define VERNON_PYTHON_NATIVE_RUNTIME_H
 
-#include "native_execution_graph.h"
 #include "native_pipeline_autodiff.h"
 #include "runtime/program_execution_backend.h"
 
@@ -76,8 +75,6 @@ struct Runtime {
             throw;
         }
     }
-
-    nb::object createExecutionGraph() { return createNativeExecutionGraph(rhiHost); }
 
     std::unique_ptr<LoadedPipeline> load(const nb::bytes &artifact, const std::string &reflection,
                                          const std::string &entry) {
@@ -262,6 +259,23 @@ struct Runtime {
                                                          const std::string &directory,
                                                          const std::map<std::string, std::string> &stageBindings,
                                                          const nb::list &compiledStages) {
+        return loadCanonicalProgramImpl(programData, artifactSystemData, directory, stageBindings, compiledStages,
+                                        vernon::runtime::program::ProgramPipelineMode::Managed);
+    }
+
+    std::unique_ptr<LoadedPipeline> loadCanonicalEndpoint(const nb::bytes &programData,
+                                                          const nb::bytes &artifactSystemData,
+                                                          const std::string &directory,
+                                                          const std::map<std::string, std::string> &stageBindings,
+                                                          const nb::list &compiledStages) {
+        return loadCanonicalProgramImpl(programData, artifactSystemData, directory, stageBindings, compiledStages,
+                                        vernon::runtime::program::ProgramPipelineMode::DirectEndpoint);
+    }
+
+    std::unique_ptr<LoadedPipeline>
+    loadCanonicalProgramImpl(const nb::bytes &programData, const nb::bytes &artifactSystemData,
+                             const std::string &directory, const std::map<std::string, std::string> &stageBindings,
+                             const nb::list &compiledStages, vernon::runtime::program::ProgramPipelineMode mode) {
         namespace program = vernon::runtime::program;
         std::string error;
         std::vector<SharedCompileResult> retained;
@@ -277,7 +291,7 @@ struct Runtime {
                                       "cannot register canonical Program CPU entry ", retained, registered, interned);
             VernonLoadedPipeline *loaded = program::loadBackendProgramPipeline(
                 *handle, programData.c_str(), programData.size(), artifactSystemData.c_str(), artifactSystemData.size(),
-                stageBindings, directory, error);
+                stageBindings, directory, mode, error);
             if (!loaded)
                 throw std::runtime_error(error);
             auto pipeline = std::make_unique<LoadedPipeline>(this, handle, nullptr, loaded, std::move(retained));

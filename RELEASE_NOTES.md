@@ -1,7 +1,7 @@
 # VernonDSL 0.1.2 release notes
 
 VernonDSL 0.1.2 is the upcoming cross-platform release of the language,
-compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph APIs.
+compiler, offline cooker, and Program-based Runtime/RHI APIs.
 
 ## Highlights
 
@@ -10,16 +10,16 @@ compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph AP
 - Direct CPU compute dispatch and GPU-optional runtime execution.
 - Offscreen graphics pipelines, host readback, PipelineAsset cooking, and
   bundled VernonRuntime CMake sources.
-- Pipeline 16 unifies cooked compute, graphics, and differentiated assets under
-  the canonical `*.pipeline.json` schema. Differentiated manifests use an
-  optional root `autodiff` object.
+- Pipeline 17 makes canonical Program plus ArtifactSystem the only execution
+  package. Runtime topology, bindings, and autodiff signatures are resolved
+  from Program rather than a parallel pipeline manifest.
 - CPU automatic differentiation uses one structured ABI for direct and
   cooked execution, including dynamic/partially dynamic Storage shapes,
   reusable pullbacks, aggregate leaves, aliases, and zero extents.
 - GPU and graphics automatic differentiation and graph-level pullbacks are
   deferred and unsupported. Ordinary non-AD GPU compute and graphics support
   is unchanged.
-- CPU cooking emits that manifest, a relocatable `.o`/`.obj`, and generated
+- CPU cooking emits that package, a relocatable `.o`/`.obj`, and generated
   static-registration `.c`/`.h` sources. The native compiler's former
   `--compute-bundle`/`compute.json` packaging interface has been removed.
 - Terrain and Mandelbulb headless showcases with deterministic presets and
@@ -40,9 +40,8 @@ compiler, offline cooker, and submission-based Runtime/RHI and ExecutionGraph AP
   provide the required argument-buffer tier or encoder.
 - Graphics rendering is offscreen with host readback; VernonRuntime does not
   provide swapchain or window presentation.
-- Runtime, RHI, and ExecutionGraph execution return explicit submission
-  objects. ExecutionGraph now separates a mutable builder, immutable compiled
-  plan, and per-run submission state.
+- Module calls and VJPs execute canonical Programs; direct kernels and graphics
+  pipelines use their resolved one-node Program endpoint.
 - Dynamic TensorView shape, stride, and offset are invocation data and do not
   require recompilation.
 - CPU graphics, CUDA image/sampler resources, f16/f64 vertex attributes, and
@@ -61,7 +60,7 @@ repository's `python` directory and run commands with
 
 ## Compatibility and lifecycle
 
-This release uses compiler contract 12 and pipeline contract 16. Incompatible
+This release uses compiler contract 13 and pipeline contract 17. Incompatible
 artifacts are rejected rather than silently loaded. The stable API, ABI,
 deprecation, cache, support, and security policies are documented in
 [`PUBLIC_API.md`](PUBLIC_API.md), [`COMPATIBILITY.md`](COMPATIBILITY.md),

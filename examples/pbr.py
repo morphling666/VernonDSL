@@ -240,13 +240,6 @@ def main() -> None:
         environment_sampler = vd.sampler()
     render = vd.pipeline(pbr_vertex, pbr_fragment, features=features)
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment) if shadow_enabled else None
-    invocation: vd.PipelineInvocation | None = None
-    shadow_invocation: vd.PipelineInvocation | None = None
-    plan: vd.CompiledExecutionGraph | None = None
-
-    graph = vd.ExecutionGraph()
-    view_projection_parameter = graph.parameter("view_projection")
-    camera_position_parameter = graph.parameter("camera_position")
 
     projection = perspective(
         math.radians(48.0),
@@ -268,20 +261,12 @@ def main() -> None:
         light_view_projection = np.ascontiguousarray(light_projection @ light_view)
         if render_shadow is None:
             raise RuntimeError("shadow pipeline was not prepared")
-        shadow_invocation = render_shadow.invocation(
-            position=positions,
-            light_view_projection=light_view_projection,
-            topology=vd.triangles,
-        )
     render_arguments: dict[str, object] = {
         "position": positions,
         "normal": normals,
         "base_color": colors,
         "material": materials,
-        "view_projection": view_projection_parameter,
-        "camera_position": camera_position_parameter,
         "light_position": light_value,
-        "topology": vd.triangles,
     }
     if shadow_enabled:
         assert light_view_projection is not None
@@ -306,13 +291,6 @@ def main() -> None:
             environment_map=environment_map,
             environment_sampler=environment_sampler,
         )
-    invocation = render.invocation(**render_arguments)
-    if shadow_enabled:
-        assert shadow_target is not None and shadow_invocation is not None
-        graph.add_pass(vd.GraphicsInvocationPass("shadow", shadow_invocation, shadow_target))
-    graph.add_pass(vd.GraphicsInvocationPass("pbr", invocation, target))
-    plan = graph.compile()
-    bindings: vd.ExecutionBindings | None = None
     start_time = time.perf_counter()
     delay_ms = max(1, round(1000 / args.fps))
     frame = 0
@@ -327,15 +305,27 @@ def main() -> None:
             )
             view = look_at(camera, np.array((0.0, 0.45, 0.0), dtype=np.float32))
             view_projection = projection @ view
-            frame_values = {
-                view_projection_parameter: np.ascontiguousarray(view_projection),
-                camera_position_parameter: np.ascontiguousarray(camera),
-            }
-            if bindings is None:
-                bindings = plan.create_bindings(frame_values)
-            else:
-                bindings.update(frame_values)
-            plan.submit(bindings).wait()
+            if shadow_enabled:
+                assert render_shadow is not None and shadow_target is not None and light_view_projection is not None
+                render_shadow(
+                    position=positions,
+                    light_view_projection=light_view_projection,
+                    render=vd.render(
+                        shadow_target,
+                        color=vd.clear((1.0, 1.0, 1.0, 1.0)),
+                        depth=vd.clear(1.0),
+                    ),
+                )
+            render(
+                **render_arguments,
+                view_projection=np.ascontiguousarray(view_projection),
+                camera_position=np.ascontiguousarray(camera),
+                render=vd.render(
+                    target,
+                    color=vd.clear((0.02, 0.025, 0.04, 1.0)),
+                    depth=vd.clear(1.0),
+                ),
+            )
             rgba = color.to_numpy()
             if args.arch == "opengl":
                 rgba = np.flipud(rgba)
@@ -357,6 +347,7 @@ def main() -> None:
         f"backend={args.arch} frames={frame} "
         f"shadow={'off' if args.no_shadow else 'map'} "
         f"environment={'off' if args.no_cubemap else 'cubemap'} "
+        f"passes={2 if shadow_enabled else 1} barriers=0 "
         f"compiled={render.compile_count + (render_shadow.compile_count if render_shadow is not None else 0)}"
     )
 

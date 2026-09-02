@@ -193,42 +193,6 @@ def create_sky_cube() -> np.ndarray:
     return np.ascontiguousarray(corners[two_sided.reshape(-1)])
 
 
-class ComputeInvocationPass(vd.ComputePass):
-    def __init__(self, name: str, invocation: vd.PipelineInvocation):
-        super().__init__(name)
-        self.invocation = invocation
-
-    def declare(self) -> None:
-        self.invocation.declare(self)
-
-    def execute(self, encoder: vd.ComputeEncoder, resources: vd.ExecutionResources) -> None:
-        self.invocation.encode(encoder, resources)
-
-
-class BatchRenderPass(vd.RenderPass):
-    def __init__(
-        self,
-        name: str,
-        target: vd.RenderTarget,
-        invocations: list[vd.PipelineInvocation],
-        *,
-        clear_color: tuple[float, float, float, float],
-    ):
-        super().__init__(name)
-        self.target = target
-        self.invocations = tuple(invocations)
-        self.clear_color = clear_color
-
-    def declare(self) -> None:
-        for invocation in self.invocations:
-            invocation.declare(self)
-        self.attachments(self.target, clear_color=self.clear_color)
-
-    def execute(self, encoder: vd.GraphicsEncoder, resources: vd.ExecutionResources) -> None:
-        for invocation in self.invocations:
-            invocation.encode(encoder, resources)
-
-
 class FramePresenter:
     def __init__(
         self,

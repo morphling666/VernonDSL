@@ -418,6 +418,10 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
 bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic);
 bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<std::string, std::string> &stageBindings,
              ResolvedProgram &resolved, Diagnostic &diagnostic);
+const Graph *findGraph(const Program &program, std::string_view direction);
+std::vector<uint32_t> residualCaptures(const Program &program);
+void markGraphValues(const Graph &graph, std::vector<char> &live);
+bool isTapeValueType(std::string_view type);
 bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
                          uint32_t &valueId);
 bool execute(const ResolvedProgram &program, const Invocation &invocation, const StageExecutor &executor,

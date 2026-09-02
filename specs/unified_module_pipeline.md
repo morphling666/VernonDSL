@@ -157,8 +157,8 @@ Remove these types from the top-level Python API:
 - `ExecutionResources` and `PipelineInvocation`;
 - `VjpComputePass`.
 
-Users compose Programs with `Module`; private pass descriptors remain lowering products under `_runtime`. C++ may retain
-its native ExecutionGraph API.
+Users compose Programs with `Module`; scheduling lowers directly to the private
+C++ Command DAG without Python pass descriptors.
 
 ## 3. Frontend semantics
 

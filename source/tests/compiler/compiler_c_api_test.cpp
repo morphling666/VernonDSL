@@ -88,7 +88,7 @@ static void sample_texture(void *user_data, uintptr_t texture, float u, float v,
     out_rgba[3] = bias;
 }
 
-TEST(CompilerCApi, ReflectsExecutableProgramValueBindings) {
+TEST(CompilerCApi, ReflectsTypedProgramValueBindings) {
     static const char module[] = R"mlir(
 module {
   func.func @forward(
@@ -118,7 +118,7 @@ module {
         vernonCompileResultGetDiagnostics(analyzed).data, vernonCompileResultGetDiagnostics(analyzed).size);
     const VernonStringView reflected = vernonCompileResultGetReflection(analyzed);
     const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
-    const nlohmann::json &node = reflection.at("execution").at("graphs").at(0).at("nodes").at(0);
+    const nlohmann::json &node = reflection.at("program_plan").at("graphs").at(0).at("nodes").at(0);
     ASSERT_EQ(node.at("bindings").size(), 2u);
     EXPECT_EQ(node.at("bindings").at(0), nlohmann::json({{"parameter", "source"}, {"value", 0}}));
     EXPECT_EQ(node.at("bindings").at(1), nlohmann::json({{"parameter", "output"}, {"value", 1}}));
@@ -161,7 +161,7 @@ module {
         vernonCompileResultGetDiagnostics(analyzed).data, vernonCompileResultGetDiagnostics(analyzed).size);
     const VernonStringView reflected = vernonCompileResultGetReflection(analyzed);
     const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
-    const nlohmann::json &execution = reflection.at("execution");
+    const nlohmann::json &execution = reflection.at("program_plan");
     ASSERT_EQ(execution.at("values").size(), 4u);
     ASSERT_EQ(execution.at("graphs").size(), 2u);
     const nlohmann::json &backward = execution.at("graphs").at(1);
@@ -208,7 +208,7 @@ module {
     EXPECT_EQ(request.at("kind"), "compute");
     EXPECT_EQ(request.at("nodes"), nlohmann::json::array({0}));
     EXPECT_FALSE(request.at("region_mlir").get<std::string>().empty());
-    EXPECT_EQ(reflection.at("execution").at("graphs").at(0).at("nodes").at(0).at("stage"), "forward:0");
+    EXPECT_EQ(reflection.at("program_plan").at("graphs").at(0).at("nodes").at(0).at("stage"), "forward:0");
 
     static const char implementation[] = R"mlir(
 module {
@@ -527,7 +527,7 @@ module {
         vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
     const VernonStringView reflected = vernonCompileResultGetReflection(planned);
     const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
-    const nlohmann::json &execution = reflection.at("execution");
+    const nlohmann::json &execution = reflection.at("program_plan");
     const nlohmann::json &graph = execution.at("graphs").at(0);
     const nlohmann::json &node = graph.at("nodes").at(0);
     ASSERT_EQ(reflection.at("kernel_compile_requests").size(), 1u);
@@ -680,7 +680,7 @@ module {
     const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
     const nlohmann::json reflection =
         nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
-    const nlohmann::json &values = reflection.at("execution").at("values");
+    const nlohmann::json &values = reflection.at("program_plan").at("values");
     bool foundLike = false;
     for (const auto &value : values) {
         if (value.contains("like")) {
@@ -780,7 +780,7 @@ module {
     const VernonStringView plannedReflection = vernonCompileResultGetReflection(planned);
     const nlohmann::json reflection =
         nlohmann::json::parse(plannedReflection.data, plannedReflection.data + plannedReflection.size);
-    for (const auto &value : reflection.at("execution").at("values"))
+    for (const auto &value : reflection.at("program_plan").at("values"))
         EXPECT_FALSE(value.contains("like"));
 
     vernonCompileResultDestroy(planned);
@@ -970,7 +970,7 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
         vernonCompileResultGetDiagnostics(planned).data, vernonCompileResultGetDiagnostics(planned).size);
     const VernonStringView reflected = vernonCompileResultGetReflection(planned);
     const nlohmann::json reflection = nlohmann::json::parse(reflected.data, reflected.data + reflected.size);
-    const nlohmann::json &graphs = reflection.at("execution").at("graphs");
+    const nlohmann::json &graphs = reflection.at("program_plan").at("graphs");
     ASSERT_EQ(graphs.size(), 2u);
     EXPECT_EQ(graphs.at(0).at("direction"), "forward");
     EXPECT_EQ(graphs.at(1).at("direction"), "backward");
@@ -987,8 +987,8 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
         const auto hint = request.at("implementation_hint").get<std::string>();
         return hint.size() >= 4 && hint.compare(hint.size() - 4, 4, ".vjp") == 0;
     }));
-    EXPECT_EQ(reflection.at("execution").at("values").size(), 10u);
-    const nlohmann::json &signature = reflection.at("execution").at("signature");
+    EXPECT_EQ(reflection.at("program_plan").at("values").size(), 10u);
+    const nlohmann::json &signature = reflection.at("program_plan").at("signature");
     EXPECT_EQ(signature.at("inputs"), nlohmann::json::array({{{"value", 0}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("outputs"),
               nlohmann::json::array({{{"value", 1}, {"path", "left"}}, {{"value", 3}, {"path", "right"}}}));

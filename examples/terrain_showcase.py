@@ -9,7 +9,6 @@ import vernon_dsl as vd
 from shader_lib.fullscreen import fullscreen_vertex
 from shader_lib.terrain import terrain_fragment
 from showcase_common import (
-    BatchRenderPass,
     FramePresenter,
     ShowcasePreset,
     architecture_from_name,
@@ -53,31 +52,6 @@ def main() -> None:
     camera_target = np.array((25.0, -20.0, -65.0), dtype=np.float32)
     sun_direction = np.array((-2.0, 1.6, -4.0), dtype=np.float32)
     sun_direction /= np.linalg.norm(sun_direction)
-    graph = vd.ExecutionGraph()
-    time_parameter = graph.parameter("time")
-    invocation = render_terrain.invocation(
-        position=positions,
-        noise_texture=noise,
-        noise_sampler=noise_sampler,
-        time=time_parameter,
-        camera_position=camera_position,
-        camera_target=camera_target,
-        sun_direction=sun_direction,
-        screen_y_sign=np.float32(1.0 if options.architecture == "opengl" else -1.0),
-        ambient=np.float32(0.2),
-        max_steps=quality[0],
-        shadow_steps=quality[1],
-        ao_samples=quality[2],
-        topology=vd.triangles,
-    )
-    graph.add_pass(
-        BatchRenderPass(
-            "terrain-raymarch",
-            target,
-            [invocation],
-            clear_color=(0.0, 0.0, 0.0, 1.0),
-        )
-    )
     presenter = FramePresenter(
         output,
         architecture=options.architecture,
@@ -85,16 +59,27 @@ def main() -> None:
         headless=options.headless,
         fps=options.fps,
     )
-    plan = graph.compile()
-    bindings = plan.create_bindings({time_parameter: np.float32(0.0)})
     animation_frames: list[np.ndarray] = []
     frame = 0
     start = time.perf_counter()
     try:
         while options.frames == 0 or frame < options.frames:
             phase = np.float32(time.perf_counter() - start if options.frames == 0 else frame / options.fps)
-            bindings.update({time_parameter: phase})
-            plan.submit(bindings).wait()
+            render_terrain(
+                position=positions,
+                noise_texture=noise,
+                noise_sampler=noise_sampler,
+                time=phase,
+                camera_position=camera_position,
+                camera_target=camera_target,
+                sun_direction=sun_direction,
+                screen_y_sign=np.float32(1.0 if options.architecture == "opengl" else -1.0),
+                ambient=np.float32(0.2),
+                max_steps=quality[0],
+                shadow_steps=quality[1],
+                ao_samples=quality[2],
+                render=vd.render(target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
+            )
             frame += 1
             if not presenter.present():
                 break
@@ -108,15 +93,14 @@ def main() -> None:
         write_animation(options.animation_output, animation_frames, options.fps)
     if presenter.image is None:
         raise RuntimeError("Terrain showcase did not render an image")
-    barrier_count = sum(len(scope.barriers) for scope in plan.scopes)
     emit_showcase_result(
         name="terrain",
         options=options,
         image=presenter.image,
         rendered_frames=frame,
         elapsed_seconds=elapsed,
-        passes=len(plan.schedule),
-        barriers=barrier_count,
+        passes=1,
+        barriers=0,
     )
 
 

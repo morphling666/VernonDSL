@@ -549,155 +549,27 @@ class _TreeRecipe:
 
 
 @dataclass(frozen=True)
-class _NativePrimalPlan:
-    executable: Any
-    parameters: tuple[tuple[Any, ...], ...]
-    compiled: tuple[Any, ...]
-    user_parameters: tuple[tuple[str, ...], ...]
-    binding_caches: tuple[Any, ...]
-
-    def invoke(self, calls: tuple[tuple[Any, tuple[Any, ...]], ...]) -> None:
-        from ._runtime import session
-        from ._runtime.tensor import TensorStorage, TensorView
-        from ._runtime.texture import _TextureResource
-
-        prepared: dict[Any, Any] = {}
-        borrows: list[tuple[str, Any, str]] = []
-        access_names = {
-            session._native.ACCESS_READ: "read",
-            session._native.ACCESS_WRITE: "write",
-            session._native.ACCESS_READ_WRITE: "read_write",
-        }
-        for index, ((kernel, arguments), parameters, compiled, user_names, cache) in enumerate(
-            zip(
-                calls,
-                self.parameters,
-                self.compiled,
-                self.user_parameters,
-                self.binding_caches,
-                strict=True,
-            )
-        ):
-            with cache.invocation(compiled.native) as builder:
-                kernel._bind_direct_arguments(
-                    compiled,
-                    builder,
-                    arguments,
-                    list(user_names),
-                    cache,
-                )
-            for graph_parameter, native_parameter in zip(parameters, compiled.native.parameters, strict=True):
-                prepared[graph_parameter] = cache._prepared[native_parameter.slot][1]
-                value = arguments[user_names.index(native_parameter.name)]
-                if isinstance(value, (TensorStorage, TensorView, _TextureResource)):
-                    borrows.append(
-                        (
-                            f"{index}.{native_parameter.name}",
-                            value,
-                            access_names[native_parameter.access],
-                        )
-                    )
-        self.executable._submit_pipeline_bindings(prepared, borrows).wait()
-        if session._architecture != session.cpu:
-            for (_, arguments), compiled, user_names in zip(
-                calls,
-                self.compiled,
-                self.user_parameters,
-                strict=True,
-            ):
-                for native_parameter in compiled.native.parameters:
-                    value = arguments[user_names.index(native_parameter.name)]
-                    if native_parameter.access in {
-                        session._native.ACCESS_WRITE,
-                        session._native.ACCESS_READ_WRITE,
-                    } and isinstance(value, (TensorStorage, TensorView, _TextureResource)):
-                        value._mark_device_dirty()
-
-
-@dataclass(frozen=True)
 class _PrimalSpecialization:
     program: Any
     template: ProgramTemplate
+    invocation: ProgramInvocation
     signature: inspect.Signature
     allocations: tuple[_AllocationSpec, ...]
     calls: tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...]
     outputs: _TreeRecipe
-    native_plan: _NativePrimalPlan | None = None
+    native_program: Any
 
     def invoke(self, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
         inputs = self.signature.bind(*arguments, **keywords).arguments
         allocations = tuple(spec.create() for spec in self.allocations)
-        resolved_calls = tuple(
-            (
-                kernel,
-                tuple(recipe.resolve(inputs, allocations) for recipe in recipes),
+        outputs = self.outputs.resolve(inputs, allocations)
+        return self.native_program.invoke(
+            dataclasses.replace(
+                self.invocation,
+                inputs=dict(inputs),
+                outputs=outputs,
             )
-            for kernel, recipes, _, _ in self.calls
         )
-        if self.native_plan is not None:
-            self.native_plan.invoke(resolved_calls)
-            return self.outputs.resolve(inputs, allocations)
-        for kernel, recipes, grid, features in self.calls:
-            kernel(
-                *(recipe.resolve(inputs, allocations) for recipe in recipes),
-                grid=grid,
-                features=features,
-            )
-        return self.outputs.resolve(inputs, allocations)
-
-
-def _specialize_native_primal(calls: tuple[CapturedKernelCall, ...]) -> _NativePrimalPlan | None:
-    from ._runtime import session
-
-    if session._architecture == session.cpu:
-        return None
-    from ._runtime.binding import _NativeBindingCache
-    from ._runtime.execution_graph import ExecutionGraph, _NativePipelineComputePass
-
-    graph = ExecutionGraph()
-    parameter_rows: list[tuple[Any, ...]] = []
-    compiled_rows: list[Any] = []
-    user_parameter_rows: list[tuple[str, ...]] = []
-    caches: list[Any] = []
-    previous = None
-    for operation_index, call in enumerate(calls):
-        kernel = call.kernel
-        lowered = kernel._lower(call.features)
-        compiled = kernel.specialize(
-            call.features,
-            lowered=lowered,
-        )
-        if compiled.native is None:
-            raise RuntimeError(f"kernel {kernel.__name__!r} did not produce a native pipeline")
-        user_parameters = tuple(
-            name for name in inspect.signature(kernel._function).parameters if name not in compiled.builtin_names
-        )
-        parameters = tuple(
-            graph.parameter(f"{operation_index}.{parameter.name}") for parameter in compiled.native.parameters
-        )
-        execution_pass = _NativePipelineComputePass(
-            f"{operation_index}.{kernel.__name__}",
-            compiled.native,
-            parameters,
-            call.grid,
-        )
-        if previous is not None:
-            execution_pass.depends_on(previous)
-        graph.add_pass(execution_pass)
-        previous = execution_pass
-        parameter_rows.append(parameters)
-        compiled_rows.append(compiled)
-        user_parameter_rows.append(user_parameters)
-        caches.append(_NativeBindingCache())
-    if not calls:
-        return None
-    return _NativePrimalPlan(
-        graph.compile(),
-        tuple(parameter_rows),
-        tuple(compiled_rows),
-        tuple(user_parameter_rows),
-        tuple(caches),
-    )
 
 
 def _primal_specialization(
@@ -760,14 +632,18 @@ def _primal_specialization(
     )
     from .program_frontend import parse_program
 
+    parsed = parse_program(invocation)
+    from ._runtime.program_autodiff import compile_program
+
     return _PrimalSpecialization(
-        parse_program(invocation),
+        parsed,
         invocation.template,
+        invocation,
         inspect.signature(module.forward),
         allocations,
         calls,
         tree(outputs),
-        _specialize_native_primal(capture.calls),
+        compile_program(parsed, invocation.template),
     )
 
 

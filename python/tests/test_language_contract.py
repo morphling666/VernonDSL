@@ -60,6 +60,25 @@ class LanguageVersionTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(vd, name))
 
+    def test_callback_execution_graph_api_is_removed(self) -> None:
+        retired = (
+            "CompiledExecutionGraph",
+            "ComputeEncoder",
+            "ComputePass",
+            "ExecutionGraph",
+            "ExecutionPass",
+            "GraphicsEncoder",
+            "PipelineInvocation",
+            "RenderPass",
+            "VjpComputePass",
+        )
+        for name in retired:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(vd, name))
+                self.assertFalse(hasattr(vd.runtime, name))
+        self.assertFalse(hasattr(vd.Kernel, "invocation"))
+        self.assertFalse(hasattr(vd.Pipeline, "invocation"))
+
     def test_tensor_values_and_tensor_view_resources_are_distinct(self) -> None:
         element = ConcreteType("scalar", "f32")
         tensor = ConcreteType("tensor", "Tensor", (element, 4))

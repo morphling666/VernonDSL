@@ -386,7 +386,7 @@ class ModuleTests(unittest.TestCase):
         np.testing.assert_array_equal(first.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(second.to_numpy(), np.array([9.0], dtype=np.float32))
 
-    def test_gpu_primal_cache_hit_executes_native_program_graph(self) -> None:
+    def test_gpu_primal_cache_hit_executes_canonical_program(self) -> None:
         try:
             vd.init(arch=vd.metal)
         except RuntimeUnavailableError:
@@ -395,7 +395,7 @@ class ModuleTests(unittest.TestCase):
             module = FanIn()
             module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
             specialization = next(iter(module._program_cache.values()))
-            self.assertIsNotNone(specialization.native_plan)
+            self.assertIsNotNone(specialization.native_program)
             with mock.patch(
                 "vernon_dsl._runtime.kernel.Kernel.__call__",
                 side_effect=AssertionError("native cache hit called Python Kernel.__call__"),

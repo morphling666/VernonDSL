@@ -2,6 +2,7 @@
 
 #include "host_tape_allocator.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime/program_execution_manifest.h"
 #include "runtime/runtime_state.h"
 #include "runtime_direct_autodiff.h"
 
@@ -18,13 +19,11 @@
 namespace {
 
 VernonDifferentiatedPipeline *differentiatedPipeline(VernonLoadedPipeline *pipeline) {
-    return pipeline && pipeline->topology && pipeline->topology->differentiated ? &*pipeline->topology->differentiated
-                                                                                : nullptr;
+    return pipeline && pipeline->differentiated ? &*pipeline->differentiated : nullptr;
 }
 
 const VernonDifferentiatedPipeline *differentiatedPipeline(const VernonLoadedPipeline *pipeline) {
-    return pipeline && pipeline->topology && pipeline->topology->differentiated ? &*pipeline->topology->differentiated
-                                                                                : nullptr;
+    return pipeline && pipeline->differentiated ? &*pipeline->differentiated : nullptr;
 }
 
 } // namespace
@@ -242,7 +241,7 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profiles,
                              VernonLoadedPipeline &pipeline) {
-    if (!bundle.context || !bundle.autodiff || !pipeline.topology)
+    if (!bundle.context || !bundle.autodiff)
         return false;
     const Stage &primal = bundle.stages.at(profiles.primal);
     const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
@@ -263,8 +262,7 @@ bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile
     if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
                                                   executable->signature()))
         return false;
-    pipeline.topology->differentiated =
-        VernonDifferentiatedPipeline{std::move(executable), bundle.autodiff->derivativeGroups};
+    pipeline.differentiated = VernonDifferentiatedPipeline{std::move(executable), bundle.autodiff->derivativeGroups};
     return true;
 }
 
@@ -379,13 +377,11 @@ bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size
     return true;
 }
 
-const vernon::runtime::ExecutableProgram *programExecution(const VernonLoadedPipeline *pipeline) {
-    if (!pipeline || !pipeline->topology || !pipeline->topology->differentiated)
+const vernon::runtime::program::Program *programExecution(const VernonLoadedPipeline *pipeline) {
+    if (!pipeline || !pipeline->topology || !pipeline->topology->resolvedProgram || !pipeline->differentiated)
         return nullptr;
-    const auto backward =
-        std::find_if(pipeline->topology->execution.graphs.begin(), pipeline->topology->execution.graphs.end(),
-                     [](const vernon::runtime::ProgramGraph &graph) { return graph.direction == "backward"; });
-    return backward == pipeline->topology->execution.graphs.end() ? nullptr : &pipeline->topology->execution;
+    const vernon::runtime::program::Program &program = pipeline->topology->resolvedProgram->program;
+    return vernon::runtime::program::findGraph(program, "backward") ? &program : nullptr;
 }
 
 } // namespace
@@ -497,20 +493,20 @@ uint8_t vernonRuntimeLoadedPipelineHasProgramAutodiff(const VernonLoadedPipeline
 size_t vernonRuntimeLoadedPipelineGetProgramAdValueCount(const VernonLoadedPipeline *pipeline,
                                                          VernonProgramAdBoundary boundary) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const vernon::runtime::ExecutableProgram *execution = programExecution(pipeline);
+    const vernon::runtime::program::Program *execution = programExecution(pipeline);
     if (!execution)
         return 0;
     switch (boundary) {
     case VERNON_PROGRAM_AD_INPUT:
-        return execution->adSignature.inputs.size();
+        return execution->signature.inputs.size();
     case VERNON_PROGRAM_AD_OUTPUT:
-        return execution->adSignature.outputs.size();
+        return execution->signature.outputs.size();
     case VERNON_PROGRAM_AD_COTANGENT:
-        return execution->adSignature.cotangents.size();
+        return execution->signature.cotangents.size();
     case VERNON_PROGRAM_AD_GRADIENT:
-        return execution->adSignature.gradients.size();
+        return execution->signature.gradients.size();
     case VERNON_PROGRAM_AD_CAPTURE:
-        return execution->adSignature.captures.size();
+        return execution->residualContract ? execution->residualContract->captures.size() : 0;
     default:
         return 0;
     }
@@ -520,31 +516,31 @@ VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoa
                                                                  VernonProgramAdBoundary boundary, size_t index,
                                                                  VernonProgramAdValueView *view) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const vernon::runtime::ExecutableProgram *execution = programExecution(pipeline);
+    const vernon::runtime::program::Program *execution = programExecution(pipeline);
     if (!execution || !view || view->struct_size < sizeof(*view))
         return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
-    const vernon::runtime::ProgramAdSignatureBinding *binding = nullptr;
+    const vernon::runtime::program::SignatureBinding *binding = nullptr;
     uint32_t capture = UINT32_MAX;
     switch (boundary) {
     case VERNON_PROGRAM_AD_INPUT:
-        if (index < execution->adSignature.inputs.size())
-            binding = &execution->adSignature.inputs[index];
+        if (index < execution->signature.inputs.size())
+            binding = &execution->signature.inputs[index];
         break;
     case VERNON_PROGRAM_AD_OUTPUT:
-        if (index < execution->adSignature.outputs.size())
-            binding = &execution->adSignature.outputs[index];
+        if (index < execution->signature.outputs.size())
+            binding = &execution->signature.outputs[index];
         break;
     case VERNON_PROGRAM_AD_COTANGENT:
-        if (index < execution->adSignature.cotangents.size())
-            binding = &execution->adSignature.cotangents[index];
+        if (index < execution->signature.cotangents.size())
+            binding = &execution->signature.cotangents[index];
         break;
     case VERNON_PROGRAM_AD_GRADIENT:
-        if (index < execution->adSignature.gradients.size())
-            binding = &execution->adSignature.gradients[index];
+        if (index < execution->signature.gradients.size())
+            binding = &execution->signature.gradients[index];
         break;
     case VERNON_PROGRAM_AD_CAPTURE:
-        if (index < execution->adSignature.captures.size())
-            capture = execution->adSignature.captures[index];
+        if (execution->residualContract && index < execution->residualContract->captures.size())
+            capture = execution->residualContract->captures[index].value;
         break;
     default:
         break;
@@ -552,13 +548,27 @@ VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoa
     const uint32_t valueId = binding ? binding->value : capture;
     if (valueId >= execution->values.size())
         return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
-    const vernon::runtime::ProgramValueSlot &slot = execution->values[valueId];
+    const vernon::runtime::program::Value &slot = execution->values[valueId];
     const std::string &path = binding ? binding->path : slot.name;
+    const bool external = std::any_of(
+        execution->graphs.begin(), execution->graphs.end(), [&](const vernon::runtime::program::Graph &graph) {
+            return std::any_of(
+                graph.inputs.begin(), graph.inputs.end(), [&](const vernon::runtime::program::GraphInput &input) {
+                    return input.kind == vernon::runtime::program::GraphInputKind::UserInput && input.value == valueId;
+                });
+        });
+    const bool output = std::any_of(execution->graphs.begin(), execution->graphs.end(),
+                                    [&](const vernon::runtime::program::Graph &graph) {
+                                        return std::any_of(graph.outputs.begin(), graph.outputs.end(),
+                                                           [&](const vernon::runtime::program::GraphOutput &candidate) {
+                                                               return candidate.value == valueId;
+                                                           });
+                                    });
     *view = {sizeof(*view),
              {path.data(), path.size()},
              valueId,
-             static_cast<uint8_t>(slot.external),
-             static_cast<uint8_t>(slot.output),
+             static_cast<uint8_t>(external),
+             static_cast<uint8_t>(output),
              {}};
     return VERNON_STATUS_OK;
 }
@@ -682,8 +692,14 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
         const VernonStatus status = executable->forward({}, computeGrid, *inputs, outputs, execution);
         if (status != VERNON_STATUS_OK)
             return status;
-        if (!execution)
-            return fail(pipeline->context, "autodiff forward produced no pullback", VERNON_STATUS_INTERNAL_ERROR);
+        if (!execution) {
+            const bool forwardOnlyProgram =
+                pipeline->topology && pipeline->topology->resolvedProgram &&
+                !vernon::runtime::program::findGraph(pipeline->topology->resolvedProgram->program, "backward");
+            return forwardOnlyProgram
+                       ? VERNON_STATUS_OK
+                       : fail(pipeline->context, "autodiff forward produced no pullback", VERNON_STATUS_INTERNAL_ERROR);
+        }
         result->execution = std::move(execution);
         *pullback = result.release();
         return VERNON_STATUS_OK;

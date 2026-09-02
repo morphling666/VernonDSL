@@ -1502,7 +1502,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
     if (mlir::failed(programReflection))
         return mlir::failure();
     if (*programReflection) {
-        root["execution"] = std::move((*programReflection)->execution);
+        root["program_plan"] = std::move((*programReflection)->plan);
         root["kernel_compile_requests"] = std::move((*programReflection)->kernelCompileRequests);
     }
     root["artifacts"] = llvm::json::Array();

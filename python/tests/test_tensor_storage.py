@@ -425,20 +425,12 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         texture.upload(values)
         np.testing.assert_array_equal(texture.download(), values)
 
-    def test_submission_retains_borrows_until_completion(self) -> None:
+    def test_dispatch_lease_retains_borrows_until_release(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
         lease = _DispatchBorrowLease([("output", storage, "write")])
-
-        class PendingSubmission:
-            state = 0
-
-            def wait(self) -> None:
-                self.state = 1
-
-        submission = vd.ExecutionSubmission(PendingSubmission(), object(), lease)
         with self.assertRaisesRegex(RuntimeError, "host mutation"):
             storage.copy_from_numpy(np.ones((4,), dtype=np.float32))
-        submission.wait()
+        lease.release()
         storage.copy_from_numpy(np.ones((4,), dtype=np.float32))
 
     def test_outstanding_dispatch_borrows_are_region_aware(self) -> None:

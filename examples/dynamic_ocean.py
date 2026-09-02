@@ -18,8 +18,6 @@ from shader_lib.ocean import (
 from shader_lib.pbr import pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
 from shader_lib.showcase import sky_fragment, sky_vertex
 from showcase_common import (
-    BatchRenderPass,
-    ComputeInvocationPass,
     FramePresenter,
     architecture_from_name,
     create_sky_cube,
@@ -209,68 +207,14 @@ def main() -> None:
         @ look_at(light_position, np.array((0.0, -0.1, 0.0), dtype=np.float32))
     )
     half_step = np.float32(0.5 / args.fps)
-    graph = vd.ExecutionGraph()
-    phase_parameter = graph.parameter("phase")
-    view_projection_parameter = graph.parameter("view_projection")
-    camera_parameter = graph.parameter("camera_position")
-    wave_arguments = (
-        np.uint32(args.grid),
-        half_step,
-        phase_parameter,
-        np.float32(args.wave_speed),
-        np.float32(args.damping),
-    )
-    wave_ab = step_ocean.invocation(
-        height_a,
-        velocity_a,
-        height_b,
-        velocity_b,
-        *wave_arguments,
-        grid=((vertex_count + 63) // 64, 1, 1),
-    )
-    wave_ba = step_ocean.invocation(
-        height_b,
-        velocity_b,
-        height_a,
-        velocity_a,
-        *wave_arguments,
-        grid=((vertex_count + 63) // 64, 1, 1),
-    )
-    mesh = build_ocean_mesh.invocation(
-        height_a,
-        positions,
-        normals,
-        colors,
-        materials,
-        np.uint32(args.grid),
-        np.float32(args.extent),
-        phase_parameter,
-        grid=((vertex_count + 63) // 64, 1, 1),
-    )
-    expand = expand_indexed_mesh.invocation(
-        positions,
-        normals,
-        colors,
-        materials,
-        indices,
-        draw_positions,
-        draw_normals,
-        draw_colors,
-        draw_materials,
-        grid=((draw_count + 63) // 64, 1, 1),
-    )
+    compute_grid = ((vertex_count + 63) // 64, 1, 1)
+    expand_grid = ((draw_count + 63) // 64, 1, 1)
     common_shadow = {
         "light_view_projection": light_view_projection,
         "topology": vd.triangles,
     }
-    shadow_invocations = [
-        render_shadow.invocation(position=draw_positions, **common_shadow),
-        render_shadow.invocation(position=seabed_positions, **common_shadow),
-    ]
     common_pbr: dict[str, object] = {
-        "view_projection": view_projection_parameter,
         "light_view_projection": light_view_projection,
-        "camera_position": camera_parameter,
         "light_position": light_position,
         "shadow_depth_scale": np.float32(0.5 if args.arch == "opengl" else 1.0),
         "shadow_depth_bias": np.float32(0.5 if args.arch == "opengl" else 0.0),
@@ -282,72 +226,6 @@ def main() -> None:
         "environment_sampler": environment_sampler,
         "topology": vd.triangles,
     }
-    main_invocations = [
-        render_sky.invocation(
-            direction=sky_positions,
-            view_projection=view_projection_parameter,
-            camera_position=camera_parameter,
-            environment_map=environment_map,
-            environment_sampler=environment_sampler,
-            topology=vd.triangles,
-        ),
-        render_ocean.invocation(
-            position=draw_positions,
-            normal=draw_normals,
-            surface_data=draw_colors,
-            view_projection=view_projection_parameter,
-            camera_position=camera_parameter,
-            light_position=light_position,
-            environment_map=environment_map,
-            environment_sampler=environment_sampler,
-            normal_map=normal_map,
-            normal_sampler=normal_sampler,
-            phase=phase_parameter,
-            topology=vd.triangles,
-        ),
-        render.invocation(
-            position=seabed_positions,
-            normal=seabed_normals,
-            base_color=seabed_colors,
-            material=seabed_materials,
-            **common_pbr,
-        ),
-    ]
-    graph.add_pass(ComputeInvocationPass("ocean-wave-a-to-b", wave_ab))
-    graph.add_pass(ComputeInvocationPass("ocean-wave-b-to-a", wave_ba))
-    graph.add_pass(ComputeInvocationPass("ocean-mesh-rebuild", mesh))
-    graph.add_pass(ComputeInvocationPass("ocean-draw-expand", expand))
-    graph.add_pass(
-        BatchRenderPass(
-            "ocean-shadow",
-            shadow_target,
-            shadow_invocations,
-            clear_color=(1.0, 1.0, 1.0, 1.0),
-        )
-    )
-    graph.add_pass(
-        BatchRenderPass(
-            "ocean-pbr",
-            target,
-            main_invocations,
-            clear_color=(0.001, 0.004, 0.013, 1.0),
-        )
-    )
-    plan = graph.compile()
-
-    def frame_values(phase: np.float32) -> dict[vd.ExecutionParameter, object]:
-        angle = float(phase) * 0.13 + 0.72
-        camera = np.array((5.15 * math.cos(angle), 1.12, 5.15 * math.sin(angle)), dtype=np.float32)
-        view_projection = np.ascontiguousarray(
-            projection @ look_at(camera, np.array((0.0, 0.02, 0.0), dtype=np.float32))
-        )
-        return {
-            phase_parameter: phase,
-            view_projection_parameter: view_projection,
-            camera_parameter: camera,
-        }
-
-    bindings = plan.create_bindings(frame_values(np.float32(0.0)))
     presenter = FramePresenter(
         output,
         architecture=args.arch,
@@ -360,16 +238,116 @@ def main() -> None:
     try:
         while args.frames == 0 or frame < args.frames:
             phase = np.float32(time.perf_counter() - start if args.frames == 0 else frame / args.fps)
-            bindings.update(frame_values(phase))
-            plan.submit(bindings).wait()
+            angle = float(phase) * 0.13 + 0.72
+            camera = np.array((5.15 * math.cos(angle), 1.12, 5.15 * math.sin(angle)), dtype=np.float32)
+            view_projection = np.ascontiguousarray(
+                projection @ look_at(camera, np.array((0.0, 0.02, 0.0), dtype=np.float32))
+            )
+            wave_arguments = (
+                np.uint32(args.grid),
+                half_step,
+                phase,
+                np.float32(args.wave_speed),
+                np.float32(args.damping),
+            )
+            step_ocean(
+                height_a,
+                velocity_a,
+                height_b,
+                velocity_b,
+                *wave_arguments,
+                grid=compute_grid,
+            )
+            step_ocean(
+                height_b,
+                velocity_b,
+                height_a,
+                velocity_a,
+                *wave_arguments,
+                grid=compute_grid,
+            )
+            build_ocean_mesh(
+                height_a,
+                positions,
+                normals,
+                colors,
+                materials,
+                np.uint32(args.grid),
+                np.float32(args.extent),
+                phase,
+                grid=compute_grid,
+            )
+            expand_indexed_mesh(
+                positions,
+                normals,
+                colors,
+                materials,
+                indices,
+                draw_positions,
+                draw_normals,
+                draw_colors,
+                draw_materials,
+                grid=expand_grid,
+            )
+            render_shadow(
+                position=draw_positions,
+                **common_shadow,
+                render=vd.render(
+                    shadow_target,
+                    color=vd.clear((1.0, 1.0, 1.0, 1.0)),
+                    depth=vd.clear(1.0),
+                ),
+            )
+            render_shadow(
+                position=seabed_positions,
+                **common_shadow,
+                render=vd.render(shadow_target, color=vd.load(), depth=vd.load()),
+            )
+            render_sky(
+                direction=sky_positions,
+                view_projection=view_projection,
+                camera_position=camera,
+                environment_map=environment_map,
+                environment_sampler=environment_sampler,
+                topology=vd.triangles,
+                render=vd.render(
+                    target,
+                    color=vd.clear((0.001, 0.004, 0.013, 1.0)),
+                    depth=vd.clear(1.0),
+                ),
+            )
+            render_ocean(
+                position=draw_positions,
+                normal=draw_normals,
+                surface_data=draw_colors,
+                view_projection=view_projection,
+                camera_position=camera,
+                light_position=light_position,
+                environment_map=environment_map,
+                environment_sampler=environment_sampler,
+                normal_map=normal_map,
+                normal_sampler=normal_sampler,
+                phase=phase,
+                topology=vd.triangles,
+                render=vd.render(target, color=vd.load(), depth=vd.load()),
+            )
+            render(
+                position=seabed_positions,
+                normal=seabed_normals,
+                base_color=seabed_colors,
+                material=seabed_materials,
+                view_projection=view_projection,
+                camera_position=camera,
+                **common_pbr,
+                render=vd.render(target, color=vd.load(), depth=vd.load()),
+            )
             frame += 1
             if not presenter.present():
                 break
     finally:
         presenter.close()
     presenter.write(args.output)
-    barrier_count = sum(len(scope.barriers) for scope in plan.scopes)
-    print(f"backend={args.arch} frames={frame} grid={args.grid} passes={len(plan.schedule)} barriers={barrier_count}")
+    print(f"backend={args.arch} frames={frame} grid={args.grid} passes=9 barriers=0")
 
 
 if __name__ == "__main__":

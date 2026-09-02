@@ -1,6 +1,6 @@
 #include "runtime/autodiff/program_shape_resolver.h"
 #include "runtime/autodiff/program_value_arena.h"
-#include "runtime/program_manifest.h"
+#include "runtime/program_execution_manifest.h"
 #include "runtime/shape_layout.h"
 
 #include <gtest/gtest.h>
@@ -57,13 +57,22 @@ TEST(ShapeLayout, LeafProjectionPreservesConcreteOwnerStrides) {
 }
 
 TEST(ProgramShapeResolver, PropagatesOnlyAcrossExplicitStorageAliases) {
-    ExecutableProgram execution;
-    execution.values = {
-        ProgramValueSlot{0, "source", "", "", {2, 0}, {}, 0},
-        ProgramValueSlot{1, "alias", "", "", {0, 3}, {}, 0},
-        ProgramValueSlot{2, "unrelated", "", "", {2, 3}, {}, std::nullopt},
-    };
-    execution.storages = {ProgramStorageSlot{0, 0, 0}};
+    program::Program execution;
+    execution.values.resize(3);
+    execution.values[0].id = 0;
+    execution.values[0].name = "source";
+    execution.values[0].shape = {2, 0};
+    execution.values[0].storage = 0;
+    execution.values[1].id = 1;
+    execution.values[1].name = "alias";
+    execution.values[1].shape = {0, 3};
+    execution.values[1].storage = 0;
+    execution.values[2].id = 2;
+    execution.values[2].name = "unrelated";
+    execution.values[2].shape = {2, 3};
+    execution.storages.resize(1);
+    execution.storages[0].id = 0;
+    execution.storages[0].initialValue = 0;
     std::vector<ad::ProgramHostValue> values(execution.values.size());
     values[0].concreteShape = ConcreteShape{2, 3};
 
@@ -74,8 +83,11 @@ TEST(ProgramShapeResolver, PropagatesOnlyAcrossExplicitStorageAliases) {
 }
 
 TEST(ProgramShapeResolver, RejectsConflictingConcreteBindings) {
-    ExecutableProgram execution;
-    execution.values = {ProgramValueSlot{0, "value", "", "", {2, 0}}};
+    program::Program execution;
+    execution.values.resize(1);
+    execution.values[0].id = 0;
+    execution.values[0].name = "value";
+    execution.values[0].shape = {2, 0};
     std::vector<ad::ProgramHostValue> values(1);
     values[0].concreteShape = ConcreteShape{3, 4};
 

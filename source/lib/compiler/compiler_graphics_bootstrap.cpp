@@ -12,7 +12,6 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include "llvm/Support/raw_ostream.h"
 
 namespace vernon::compiler {
 namespace {
@@ -200,15 +199,11 @@ VernonStatus planGraphicsProgram(CompilerFrontend &frontend, const std::vector<G
         builder, loc, parsedAttachments, graphicsOperands, builder.getStringAttr("interactive.graphics"),
         builder.getStringAttr(topology), builder.getArrayAttr(featureAttrs), builder.getArrayAttr(operandNameAttrs),
         builder.getArrayAttr(resultNameAttrs), builder.getI32IntegerAttr(static_cast<int32_t>(colorCount)));
-    graphics->setAttr("vernon_program.graphics_bootstrap", builder.getUnitAttr());
     mlir::func::ReturnOp::create(builder, loc, graphics.getResults());
 
-    std::string programText;
-    llvm::raw_string_ostream stream(programText);
-    program->print(stream);
     builder.clearInsertionPoint();
     PreparedModulePtr prepared;
-    return prepareMlir(frontend, programText.data(), programText.size(), prepared, artifacts, reflection, diagnostics);
+    return prepareProgramModule(frontend, std::move(program), prepared, artifacts, reflection, diagnostics);
 }
 
 } // namespace vernon::compiler

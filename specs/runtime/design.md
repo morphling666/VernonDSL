@@ -142,9 +142,8 @@ artifact. D3D12 sampled depth uses an R32 typeless allocation with a D32 DSV
 and R32 float SRV; Vulkan and OpenGL use their native D32 sampled depth
 formats.
 
-This section records Pipeline 16 only. The coordinated Program release replaces
-the per-shader records with one graphics StageArtifact per Program node,
-containing ordered vertex and fragment modules as specified by
+Pipeline 17 represents each graphics operation as one StageArtifact containing
+ordered vertex and fragment modules, as specified by
 `program_execution_manifest.md`.
 
 ## Python native module
@@ -233,7 +232,7 @@ GPU invocation always records through one VernonRHI command encoder. A
 non-null provider encoder resolves to the encoder's active native command list,
 command buffer, context, or stream; provider draw and dispatch callbacks record
 commands but never finish or submit it. Immediate invocation creates an
-ephemeral encoder, records once, finishes, and submits once. ExecutionGraph
+ephemeral encoder, records once, finishes, and submits once. The private Command DAG
 uses the same contract across all compiled scopes and submits once after the
 last scope. Successful submission consumes the encoder and transfers command
 statistics, cleanup actions, and retained resources to a generation-checked
@@ -256,7 +255,7 @@ preserving the same state and lifetime model. True queue overlap remains the
 [`asynchronous GPU resource lifetime`](../roadmap.md#asynchronous-gpu-resource-lifetime)
 roadmap phase.
 
-ExecutionGraph render scopes own the first attachment load operations and the
+Command DAG render scopes own the first attachment load operations and the
 last attachment store operations. Providers consume those scope operations
 instead of per-draw values. Vulkan encodes them in dynamic rendering or a
 compatible fallback render pass; D3D12 and OpenGL apply final discard when the
@@ -264,7 +263,7 @@ scope ends. Vulkan barriers map resource state plus explicit stage/access
 masks, OpenGL emits one merged destination barrier, and D3D12 emits UAV
 barriers for same-state write hazards.
 
-ExecutionGraph resource identity combines the owning graph with the RHI
+Command DAG resource identity combines the owning Program with the RHI
 resource kind, slot, and generation. Re-importing one RHI image through
 different views shares one hazard identity while each attachment retains its
 view metadata. Render-pass fusion follows attachment continuity: compatible
@@ -577,33 +576,23 @@ stage topology with an explicit unsupported-target result when that backend
 does not implement it. Manifest parsing must not hard-code vertex-plus-fragment
 as the only representable topology.
 
-Pipeline 16 uses one canonical `*.pipeline.json` schema for compute and
-graphics. Its optional root `autodiff` object contains differentiated-program
-metadata; it is absent for ordinary primal-only assets. Pipeline-13
+Pipeline 17 packages canonical Program, ArtifactSystem, and stage bindings.
+Primal and differentiated topology share this representation; a backward graph
+and Program signature describe autodiff when present. Pipeline-16
 transform/profile fields are not current aliases.
 
-The current `PIPELINE_VERSION` manifest binds each variant directly through its
-`program` stage-to-artifact map. It contains either one compute program or one
-graphics-stage tuple; it has no dispatch/barrier/draw step list and cannot
-encode host orchestration.
+Resolved Program owns multi-node orchestration above VernonRHI. Its typed nodes
+and resource-version effects lower to the private C++ Command DAG, which infers
+RAW, WAR, and WAW edges, produces deterministic barriers, and fuses compatible
+render scopes. There is no public Python graph-builder or pass-descriptor API.
 
-`VernonExecutionGraph` owns multi-program orchestration above VernonRHI.
-Class-based render and compute passes declare resource uses separately from
-execution. Compilation infers RAW, WAR, and WAW edges, culls dead passes,
-produces deterministic scheduling and barriers, and fuses adjacent compatible
-render passes. Runtime pipeline invocations encode bindings and draw/dispatch
-commands into the graph-provided typed encoder; attachment ownership and clear
-policy remain outside Runtime.
-
-Graph VJP composes resolved differentiated Programs. Each Program contributes
-its explicit forward graph, backward graph, residual contract, public
-cotangent/gradient boundary, and resource-version effects to the native
-ExecutionGraph planner. `CompiledExecutionGraph.vjp()` returns a pullback that
-retains the immutable resolved plans, forward submission, primal resources, and
-Program-owned residual state. Applying it schedules the declared backward
-graphs and deterministic fan-in by graph resource identity. An omitted
-cotangent is valid only for one scalar objective. Non-differentiable writes on
-an active reverse path are rejected explicitly.
+Program VJP consumes the explicit forward graph, backward graph, residual
+contract, public cotangent/gradient boundary, and resource-version effects.
+The native pullback retains the immutable resolved Program, forward submission,
+primal resources, and Program-owned residual state. Applying it schedules the
+declared backward graph and deterministic fan-in by resource identity. An
+omitted cotangent is valid only for one scalar objective. Non-differentiable
+writes on an active reverse path are rejected explicitly.
 
 The pullback's canonical backward operation is `submit()`. CPU and statically
 linked cooked CPU entries may finish that backward submission inline; the
@@ -715,7 +704,7 @@ For Program graphics nodes, the immutable resolved node directly contains the
 normalized attachment, state, and draw fields. Shader-visible sampled/storage
 resources use normal resolved endpoint bindings. Color/depth attachments are
 not shader arguments; their attachment transitions map fragment output
-locations/aspects to exact image Storage before/after versions. ExecutionGraph
+locations/aspects to exact image Storage before/after versions. The Command DAG
 combines these semantic edges with load/store/clear/resolve policy, performs
 subresource hazard analysis by parent image plus aspect/mip/layer range, and
 may fuse adjacent draws when attachment continuity is preserved and no hazard
@@ -857,8 +846,8 @@ ResourceTransition resolves one physical endpoint to distinct before/after
 logical instances. Runtime may execute it in place only inside a transaction
 that preserves rollback and capture semantics.
 Attachment transitions also create distinct semantic versions, but their
-physical visibility, extraction, and failure behavior belong to
-ExecutionGraph. A single physical write cannot be declared in both effect
+physical visibility, extraction, and failure behavior belong to the private
+Command DAG. A single physical write cannot be declared in both effect
 domains.
 
 For a differentiated invocation, successful forward execution creates one

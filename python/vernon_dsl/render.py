@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Mapping
 
-from ._runtime.execution_graph import LoadOperation, StoreOperation
 from ._runtime.texture import RenderTarget
+
+
+class LoadOperation(Enum):
+    CLEAR = "clear"
+    PRESERVE = "preserve"
+    DISCARD = "discard"
+
+
+class StoreOperation(Enum):
+    PRESERVE = "preserve"
+    DISCARD = "discard"
 
 
 @dataclass(frozen=True)
@@ -72,4 +83,13 @@ def render(
     return RenderTargetUse(target, tuple(sorted(selected.items())), depth, render_area)
 
 
-__all__ = ["AttachmentOperation", "RenderTargetUse", "clear", "load", "preserve", "render"]
+__all__ = [
+    "AttachmentOperation",
+    "LoadOperation",
+    "RenderTargetUse",
+    "StoreOperation",
+    "clear",
+    "load",
+    "preserve",
+    "render",
+]

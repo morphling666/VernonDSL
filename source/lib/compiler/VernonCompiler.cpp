@@ -216,7 +216,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
     llvm::Expected<llvm::json::Value> parsedPlan = llvm::json::parse(llvm::StringRef(plan ? plan : "", planSize));
     llvm::json::Object *root = parsedPlan ? parsedPlan->getAsObject() : nullptr;
     llvm::json::Array *requests = root ? root->getArray("kernel_compile_requests") : nullptr;
-    llvm::json::Object *execution = root ? root->getObject("execution") : nullptr;
+    llvm::json::Object *execution = root ? root->getObject("program_plan") : nullptr;
     llvm::json::Array *values = execution ? execution->getArray("values") : nullptr;
     if (!requests || !values) {
         result->status = VERNON_STATUS_INVALID_ARGUMENT;
@@ -608,6 +608,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
     if (!targetImplementations.empty())
         (*root)["target_implementations"] = std::move(targetImplementations);
     root->erase("kernel_compile_requests");
+    root->erase("program_plan");
     std::string finalized;
     llvm::raw_string_ostream stream(finalized);
     stream << llvm::json::Value(std::move(*root));

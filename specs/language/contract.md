@@ -337,10 +337,9 @@ call graph and are checked against the concrete entry stage. Shared
 Resource operations. Kernels and graphics entries may perform effects allowed
 by their stage and parameter access modes. Host runtime allocation, uploads, dispatch,
 downloads, and resource lifetime are not parsed device-language expressions.
-Multi-program ordering, render-pass state, resource transitions, and
-cross-backend synchronization are Runtime host-orchestration semantics,
-specified by `VernonExecutionGraph` in `specs/runtime/design.md`. They are not
-current language semantics.
+Multi-node ordering, render state, resource transitions, and cross-backend
+synchronization are canonical Program and Runtime Command DAG semantics. They
+are not shader-language semantics.
 
 ## 6. Functions, interfaces, and specialization
 
@@ -503,9 +502,9 @@ sampling. Missing rules are errors. Texture rules may differentiate
 coordinates and texel data explicitly exposed as Storage; Texture handles and
 sampler state remain non-differentiable.
 
-`VernonExecutionGraph` remains host orchestration. Applying `vd.ad.vjp` to an
-ExecutionGraph composes already cooked node VJP profiles into a reverse
-execution plan; it does not turn the graph into another shader asset.
+Applying `vd.ad.vjp` to a Module produces explicit forward, backward, and
+residual Program topology. Runtime executes that topology without a separate
+host pass graph.
 
 JVP, full-Jacobian materialization, convenience `grad` aliases, implicit
 gradient accumulation, nested transforms, Hessians, and Hessian-vector

@@ -7,13 +7,13 @@ VernonDSL 0.1.2 treats the following installed interfaces as public:
 - the `vernon-compile-python` and `vernon-cook-pipeline` command-line tools;
 - application-facing C declarations in `VernonCommon.h`,
   `VernonGraphicsState.h`, `VernonOpenGLContext.h`, `VernonRHI.h`,
-  `VernonExecutionGraph.h`, `VernonRuntime.h`, `VernonVersions.h`,
+  `VernonRuntime.h`, `VernonVersions.h`,
   `vernon-c/Common.h`, and `vernon-c/Runtime.h`;
 - the `VernonRHI.hpp` and `VernonRuntime.hpp` C++ wrappers;
 - the standalone CMake project bundled under `vernon_dsl/runtime_src` and its
   documented Runtime targets;
-- canonical `*.pipeline.json` manifests and artifacts accepted by compiler
-  contract 12 and pipeline contract 16.
+- canonical Program bundles and artifacts accepted by compiler contract 13 and
+  pipeline contract 17.
 
 The wheel does not install a prebuilt `lib/cmake/VernonRuntime` package into the
 environment. Embedders locate `vernon_dsl/runtime_src` and configure that
@@ -51,9 +51,8 @@ are stable once published in a 0.1 release. Unreleased API drafts may be
 replaced without compatibility wrappers before their first release.
 
 Execution is submission-based. Runtime pipelines use
-`vernonRuntimePipelineSubmit`, RHI command encoders are consumed by
-`vernonRhiDeviceSubmit`, and Python/C++ execution graphs compile into immutable
-plans whose `submit()` method returns a submission. A submission may already be
+`vernonRuntimePipelineSubmit`, and RHI command encoders are consumed by
+`vernonRhiDeviceSubmit`. A submission may already be
 complete; callers use its state query or `wait()` method. C callers explicitly
 destroy submission/completion handles, while C++ and Python submissions use
 managed lifetime. Submission destruction and device shutdown drain unfinished
@@ -66,19 +65,8 @@ released before that signal. All borrowed completions must be signaled before
 destroying the Vernon RHI device.
 
 Python `Kernel(...)` and graphics `Pipeline(...)` calls are synchronous
-convenience operations. Explicit asynchronous execution is exposed through
-compiled execution plans and their `submit()` method, rather than requiring
-direct-call users to manage submissions.
-
-Python execution graphs declare logical differentiable resources or execution
-value parameters and objective resources with
-`ExecutionGraph.differentiable_input()` and `ExecutionGraph.objective()`.
-A `VjpComputePass` reuses a structured direct or cooked CPU VJP. Calling
-`CompiledExecutionGraph.vjp()` runs the forward plan and returns a
-`GraphPullback`; its `submit()` method returns a backward submission whose
-`gradients` mapping is available after `wait()`. Calling the pullback directly
-is the synchronous shorthand. Omitting the cotangent is supported only for one
-scalar objective.
+convenience operations. Module execution and VJP are resolved from canonical
+Program; the native Command DAG is not exposed as a Python pass API.
 
 Sparse host updates use `vernonRhiDeviceUploadBufferRanges`, which validates a
 complete range list before mutation and lets each backend execute the list as

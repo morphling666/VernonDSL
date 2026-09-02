@@ -2,7 +2,7 @@
 //
 // CHECK-COUNT-2: device TensorView write followed by a workgroup barrier and cross-lane or unproven read
 
-module attributes {vernon.compiler_contract_version = 12 : i64, vernon.pipeline_version = 16 : i64} {
+module attributes {vernon.compiler_contract_version = 13 : i64, vernon.pipeline_version = 17 : i64} {
   func.func @cross_lane_device_epoch(
       %scratch: !vernon.tensor_view<f32, [-1, -1, -1], "read_write", "device"> {
         vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64

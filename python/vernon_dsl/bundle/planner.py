@@ -16,8 +16,6 @@ from .parameters import (
     internal_parameters,
     merge_internal_parameter_uses,
     merge_parameter_uses,
-    merge_program_value_uses,
-    reflected_parameters,
     validate_graphics_interfaces,
 )
 from .reflection import (
@@ -36,86 +34,6 @@ from .serialize import (
     with_content_hash,
 )
 from .types import BundlePlan, CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions, VariantPlan
-
-
-def _parameter_dtype(parameter: Mapping[str, Any]) -> str:
-    dtype = parameter.get("dtype")
-    if isinstance(dtype, str) and dtype:
-        return dtype
-    for layout_name in ("value_layout", "element_layout"):
-        layout = parameter.get(layout_name)
-        if not isinstance(layout, Mapping):
-            continue
-        leaves = layout.get("leaves")
-        if isinstance(leaves, list) and leaves and isinstance(leaves[0], Mapping):
-            dtype = leaves[0].get("dtype")
-            if isinstance(dtype, str) and dtype:
-                return dtype
-    return "opaque"
-
-
-def _single_compute_execution(
-    records: Mapping[str, Mapping[str, Any]],
-    parameters: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    record = records["compute"]
-    values: list[dict[str, Any]] = []
-    bindings: list[dict[str, Any]] = []
-    resources: list[dict[str, Any]] = []
-    results: list[int] = []
-    for value_id, parameter in enumerate(parameters):
-        access = parameter.get("access")
-        if access not in {"read", "write", "read_write"}:
-            raise PipelineCompileError("compute pipeline parameter has no canonical resource access")
-        output = access in {"write", "read_write"}
-        values.append(
-            {
-                "id": value_id,
-                "name": parameter["name"],
-                "type": parameter.get("type", parameter.get("kind", "opaque")),
-                "dtype": _parameter_dtype(parameter),
-                "shape": list(parameter.get("shape", ())),
-                **(
-                    {"value_layout": copy.deepcopy(parameter["value_layout"])}
-                    if "value_layout" in parameter
-                    else {"value_layout": copy.deepcopy(parameter["element_layout"])}
-                    if "element_layout" in parameter
-                    else {}
-                ),
-                "external": True,
-                "output": output,
-            }
-        )
-        bindings.append({"parameter": parameter["name"], "value": value_id})
-        resources.append({"value": value_id, "access": access})
-        if output:
-            results.append(value_id)
-    node = {
-        "id": 0,
-        "name": str(record["entry"]),
-        "kind": "compute",
-        "stage": "compute",
-        "operands": list(range(len(values))),
-        "results": [],
-        "dependencies": [],
-        "bindings": bindings,
-        "resources": resources,
-        # Standalone dispatch geometry remains invocation-time state. The
-        # validated single-node fast path ignores this topology placeholder.
-        "grid": [1, 1, 1],
-    }
-    return {
-        "values": values,
-        "graphs": [
-            {
-                "name": "forward",
-                "direction": "forward",
-                "arguments": list(range(len(values))),
-                "results": results,
-                "nodes": [node],
-            }
-        ],
-    }
 
 
 def plan_variant(
@@ -147,14 +65,13 @@ def plan_variant(
         parameters.append(parameter)
     internal_rows = [merge_internal_parameter_uses(name, internal[name]) for name in sorted(internal)]
     stage_ids = {stage: str(record["id"]) for stage, record in records.items()}
-    execution = _single_compute_execution(records, parameters) if "compute" in records else None
     return VariantPlan(
         tuple(key),
         stage_ids,
         tuple(parameters),
         tuple(internal_rows),
         tuple(fragment_outputs(records)),
-        execution,
+        None,
     )
 
 
@@ -202,239 +119,58 @@ def build_bundle_plan(
 def build_program_bundle_plan(
     pipeline_id: str,
     target: TargetOptions,
-    features: Sequence[str],
-    variants: Sequence[tuple[Sequence[str], Mapping[str, Any], Mapping[str, CompiledStage]]],
-    *,
-    canonical_execution: bool = False,
-    canonical_program: Mapping[str, Any] | None = None,
+    key: Sequence[str],
+    stages: Mapping[str, CompiledStage],
+    canonical_program: Mapping[str, Any],
 ) -> BundlePlan:
-    """Compose executable Program graphs with their selected kernel stages.
+    """Package one compiler-finalized Program variant and its stage artifacts."""
 
-    ``canonical_program`` installs compiler-finalized execution directly.
-    Canonical execution is never synthesized in Python.
-    """
-    if canonical_execution and canonical_program is None:
-        raise PipelineCompileError("canonical execution requires C++ finalized Program output")
-    planned_variants: list[VariantPlan] = []
+    canonical_stages = canonical_program.get("stages")
+    if not isinstance(canonical_stages, Mapping):
+        raise PipelineCompileError("canonical Program has no stage contracts")
+    if set(canonical_stages) != set(stages):
+        missing = sorted(set(canonical_stages) - set(stages))
+        unused = sorted(set(stages) - set(canonical_stages))
+        detail = []
+        if missing:
+            detail.append("missing " + ", ".join(repr(value) for value in missing))
+        if unused:
+            detail.append("unused " + ", ".join(repr(value) for value in unused))
+        raise PipelineCompileError("Program implementation stages do not match its contracts: " + "; ".join(detail))
+
+    stage_bindings: dict[str, str] = {}
     unique_stages: dict[str, CompiledStage] = {}
-    for key, execution, stages in variants:
-        graph_values = execution.get("values")
-        graphs = execution.get("graphs")
-        if not isinstance(graph_values, list) or not isinstance(graphs, list) or not graphs:
-            raise PipelineCompileError("Program compiler reflection has no executable graph")
-        values_by_id = {
-            value["id"]: value
-            for value in graph_values
-            if isinstance(value, Mapping) and isinstance(value.get("id"), int)
-        }
-        if len(values_by_id) != len(graph_values):
-            raise PipelineCompileError("Program compiler reflection contains invalid values")
-        boundary_ids: set[int] = set()
-        referenced: dict[str, str] = {}
-        stage_nodes: dict[str, Mapping[str, Any]] = {}
-        for graph in graphs:
-            if not isinstance(graph, Mapping) or not isinstance(graph.get("nodes"), list):
-                raise PipelineCompileError("Program compiler reflection contains an invalid graph")
-            for field in ("arguments", "results"):
-                ids = graph.get(field)
-                if not isinstance(ids, list) or any(not isinstance(value_id, int) for value_id in ids):
-                    raise PipelineCompileError("Program compiler reflection contains invalid graph boundaries")
-                boundary_ids.update(ids)
-            for node in graph["nodes"]:
-                if not isinstance(node, Mapping):
-                    raise PipelineCompileError("Program compiler reflection contains an invalid node")
-                stage = node.get("stage")
-                kind = node.get("kind")
-                if not isinstance(stage, str) or not stage or kind not in {"compute", "render"}:
-                    raise PipelineCompileError("Program compiler reflection contains an invalid node implementation")
-                implementation_kind = "compute" if kind == "compute" else "graphics"
-                previous = referenced.setdefault(stage, implementation_kind)
-                if previous != implementation_kind:
-                    raise PipelineCompileError(f"Program stage {stage!r} is used by incompatible node kinds")
-                stage_nodes[stage] = node
-        if set(stages) != set(referenced):
-            missing = sorted(set(referenced) - set(stages))
-            unused = sorted(set(stages) - set(referenced))
-            detail = []
-            if missing:
-                detail.append("missing " + ", ".join(repr(value) for value in missing))
-            if unused:
-                detail.append("unused " + ", ".join(repr(value) for value in unused))
-            raise PipelineCompileError("Program implementation stages do not match its graph: " + "; ".join(detail))
-        program: dict[str, str] = {}
-        records: dict[str, dict[str, Any]] = {}
-        program_leaf_projections: dict[tuple[str, int], int] = {}
-        for name, stage in stages.items():
-            expected = referenced[name]
-            if stage.stage != expected:
-                raise PipelineCompileError(
-                    f"Program stage {name!r} requires {expected}, compiler produced {stage.stage}"
-                )
-            try:
-                validate_stage_target(stage.stage, target.target)
-            except ValueError as error:
-                raise PipelineCompileError(str(error)) from None
-            if stage.target.spec != target.spec:
-                raise PipelineCompileError(f"Program stage {name!r} target does not match the bundle target")
-            program[name] = stage.id
-            unique_stages[stage.id] = stage
-            interface = copy.deepcopy(dict(stage.interface))
-            node = stage_nodes[name]
-            raw_bindings = node.get("bindings")
-            if not isinstance(raw_bindings, list):
-                raise PipelineCompileError(f"Program stage {name!r} has no value bindings")
-            bindings = {
-                binding["parameter"]: binding
-                for binding in raw_bindings
-                if isinstance(binding, Mapping)
-                and isinstance(binding.get("parameter"), str)
-                and isinstance(binding.get("value"), int)
-            }
-            for row in interface.get("arguments", []):
-                if not isinstance(row, dict):
-                    continue
-                parameter = row.get("vernon.source_name")
-                binding = bindings.get(parameter)
-                if binding is None and row.get("vernon.autodiff_role") == "cotangent":
-                    binding = bindings.get(f"cotangent.{parameter}")
-                value_id = binding.get("value") if binding is not None else None
-                value = values_by_id.get(value_id)
-                if value is not None:
-                    endpoint = row.get("index")
-                    if isinstance(parameter, str) and isinstance(endpoint, int):
-                        leaf = binding.get("leaf") if binding is not None else None
-                        if leaf is not None:
-                            if not isinstance(leaf, int) or leaf < 0:
-                                raise PipelineCompileError(
-                                    f"Program stage {name!r} parameter {parameter!r} has an invalid leaf projection"
-                                )
-                            program_leaf_projections[(name, endpoint)] = leaf
-                    row["vernon.source_name"] = value["name"]
-            records[name] = {
-                "id": stage.id,
-                "entry": stage.entry,
-                "stage": stage.stage,
-                "target": stage.target.target,
-                "interface": interface,
-            }
-        reflected_external, reflected_internal = reflected_parameters(records)
-        value_ids_by_name = {value["name"]: value_id for value_id, value in values_by_id.items()}
+    for name, stage in stages.items():
+        contract = canonical_stages[name]
+        operation = contract.get("operation") if isinstance(contract, Mapping) else None
+        expected = "compute" if operation == "compute" else "graphics" if operation == "graphics" else None
+        if expected is None:
+            raise PipelineCompileError(f"canonical Program stage {name!r} has an invalid operation")
+        if stage.stage != expected:
+            raise PipelineCompileError(f"Program stage {name!r} requires {expected}, compiler produced {stage.stage}")
+        try:
+            validate_stage_target(stage.stage, target.target)
+        except ValueError as error:
+            raise PipelineCompileError(str(error)) from None
+        if stage.target.spec != target.spec:
+            raise PipelineCompileError(f"Program stage {name!r} target does not match the bundle target")
+        stage_bindings[name] = stage.id
+        unique_stages[stage.id] = stage
 
-        def attach_value_layout(
-            name: str,
-            parameter: dict[str, Any],
-            *,
-            value_ids_by_name: Mapping[str, int] = value_ids_by_name,
-            values_by_id: Mapping[int, Mapping[str, Any]] = values_by_id,
-        ) -> None:
-            value_id = value_ids_by_name.get(name)
-            if value_id is None:
-                return
-            value = values_by_id.get(value_id)
-            if value is None:
-                return
-            value_type = value.get("type")
-            if isinstance(value_type, str) and (
-                value_type == "!vernon.ad_tape"
-                or value_type.startswith("!vernon.ad_tape<")
-                or value_type.startswith("!vernon.texture<")
-                or value_type.startswith("!vernon.sampler")
-            ):
-                return
-            layout = parameter.get("value_layout", parameter.get("element_layout"))
-            if layout is None:
-                raise PipelineCompileError(f"Program value {name!r} has no canonical layout")
-            canonical = value.get("value_layout")
-            if not isinstance(canonical, Mapping):
-                raise PipelineCompileError(f"Program value {name!r} has no compiler-authoritative canonical layout")
-            parameter.pop("element_layout", None)
-            parameter["value_layout"] = copy.deepcopy(canonical)
-            parameter["type"] = value["type"]
-            parameter["shape"] = copy.deepcopy(value["shape"])
-            parameter.pop("address_space", None)
-
-        def preserve_released_tensor_layout(name: str, parameter: dict[str, Any]) -> None:
-            if canonical_execution or parameter.get("kind") != "tensor":
-                return
-            if "value_layout" in parameter:
-                parameter["element_layout"] = parameter.pop("value_layout")
-
-        def leaf_projections_for(
-            uses: Sequence[Mapping[str, Any]],
-            *,
-            program_leaf_projections: Mapping[tuple[str, int], int] = program_leaf_projections,
-        ) -> list[int | None]:
-            projections: list[int | None] = []
-            for use in uses:
-                stage = use.get("stage")
-                index = use.get("index")
-                projections.append(
-                    program_leaf_projections.get((stage, index))
-                    if isinstance(stage, str) and isinstance(index, int)
-                    else None
-                )
-            return projections
-
-        external_rows: list[dict[str, Any]] = []
-        internal_rows: list[dict[str, Any]] = []
-        for slot, name in enumerate(
-            sorted(
-                (name for name in reflected_external if value_ids_by_name.get(name) in boundary_ids),
-                key=lambda candidate: value_ids_by_name[candidate],
-            )
-        ):
-            uses = reflected_external[name]
-            parameter = merge_program_value_uses(
-                name,
-                uses,
-                values_by_id.get(value_ids_by_name.get(name, -1)),
-                leaf_projections_for(uses),
-            )
-            parameter["slot"] = slot
-            preserve_released_tensor_layout(name, parameter)
-            if canonical_execution:
-                attach_value_layout(name, parameter)
-            external_rows.append(parameter)
-        for name in sorted(
-            (name for name in reflected_external if value_ids_by_name.get(name) not in boundary_ids),
-            key=lambda candidate: value_ids_by_name[candidate],
-        ):
-            uses = reflected_external[name]
-            parameter = merge_program_value_uses(
-                name,
-                uses,
-                values_by_id.get(value_ids_by_name.get(name, -1)),
-                leaf_projections_for(uses),
-            )
-            parameter["source"] = "program_value"
-            preserve_released_tensor_layout(name, parameter)
-            if canonical_execution:
-                attach_value_layout(name, parameter)
-            internal_rows.append(parameter)
-        for name in sorted(reflected_internal):
-            parameter = merge_internal_parameter_uses(name, reflected_internal[name])
-            preserve_released_tensor_layout(name, parameter)
-            if canonical_execution:
-                attach_value_layout(name, parameter)
-            internal_rows.append(parameter)
-        planned_variants.append(
-            VariantPlan(
-                tuple(key),
-                program,
-                tuple(external_rows),
-                tuple(internal_rows),
-                (),
-                copy.deepcopy(dict(canonical_program))
-                if canonical_execution and canonical_program is not None
-                else copy.deepcopy(dict(execution)),
-            )
-        )
+    variant = VariantPlan(
+        tuple(key),
+        stage_bindings,
+        (),
+        (),
+        (),
+        copy.deepcopy(dict(canonical_program)),
+    )
     return BundlePlan(
         pipeline_id,
         target,
-        tuple(sorted(set(features))),
-        tuple(planned_variants),
-        tuple(unique_stages[key] for key in sorted(unique_stages)),
+        tuple(sorted(set(key))),
+        (variant,),
+        tuple(unique_stages[stage_id] for stage_id in sorted(unique_stages)),
     )
 
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import hashlib
 import json
 from typing import Any, Mapping
 
-from .types import BundlePlan, CompiledArtifact, PipelineCompileError
+from .types import PIPELINE_VERSION, BundlePlan, CompiledArtifact, PipelineCompileError
 
 
 def canonical_json(value: Any) -> str:
@@ -47,6 +48,36 @@ def materialize_bundle(
     plan: BundlePlan,
     artifact_descriptors: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
+    if plan.variants and all(
+        variant.canonical_program is not None and isinstance(variant.canonical_program.get("stages"), Mapping)
+        for variant in plan.variants
+    ):
+        from .._shader_assets.cooking import _canonical_deployment
+
+        variants = []
+        for variant in plan.variants:
+            variant_plan = dataclasses.replace(plan, variants=(variant,))
+            program, artifact_system, stage_bindings = _canonical_deployment(
+                variant_plan,
+                artifact_descriptors,
+            )
+            variants.append(
+                {
+                    "key": list(variant.key),
+                    "program": dict(program),
+                    "artifact_system": dict(artifact_system),
+                    "stage_bindings": dict(stage_bindings),
+                }
+            )
+        return with_content_hash(
+            {
+                "pipeline_version": PIPELINE_VERSION,
+                "type": "program_bundle",
+                "id": plan.pipeline_id,
+                "target": plan.target.spec,
+                "variants": variants,
+            }
+        )
     document = plan.logical_dict()
     records = document["stage_artifacts"]
     if set(records) != set(artifact_descriptors):
