@@ -178,8 +178,11 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                     std::any_of(parameter.uses.begin(), parameter.uses.end(),
                                 [](const ParameterUse &use) { return use.interfaceKind == "input"; });
                 const size_t offset = allowLeading && argument.tensor.rank == parameter.shape.size() + 1 ? 1 : 0;
-                if (argument.tensor.rank != parameter.shape.size() + offset)
-                    return fail(error, "pipeline Tensor rank does not match layout");
+                if (argument.tensor.rank != parameter.shape.size() + offset) {
+                    error = "pipeline Tensor '" + parameter.name + "' rank " + std::to_string(argument.tensor.rank) +
+                            " does not match layout rank " + std::to_string(parameter.shape.size());
+                    return false;
+                }
                 for (size_t dimension = 0; dimension < parameter.shape.size(); ++dimension)
                     if (parameter.shape[dimension] &&
                         parameter.shape[dimension] != argument.tensor.shape[dimension + offset])

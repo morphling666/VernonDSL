@@ -349,7 +349,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.endpoint.portableSlot = valueSlot->slot;
             if (!compute) {
                 const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
-                if (endpoint.builtin != "resolution" || !compiled || !compiled->interfacePlan)
+                if (endpoint.builtin != "resolution" || !compiled || !compiled->interfacePlan ||
+                    !compiled->interfacePlan->root)
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "graphics resolution is missing the compiled physical plan");
                 if (valueSlot->byteSize != 8)
@@ -369,8 +370,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                  compiled->binding == UINT32_MAX ? valueSlot->slot : compiled->binding, UINT32_MAX};
                 target.physical = {0, static_cast<size_t>(valueSlot->byteSize),
                                    static_cast<size_t>(valueSlot->alignment)};
-                target.transport =
-                    TargetPhysicalTransport{*target.wholeValueLayout, *compiled->interfacePlan, target.native};
+                target.transport = TargetPhysicalTransport{*compiled->interfacePlan, target.native};
                 plan.bindings.push_back(std::move(target));
                 continue;
             }
@@ -396,8 +396,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 target.physical = {0, static_cast<size_t>(valueSlot->byteSize),
                                    static_cast<size_t>(valueSlot->alignment)};
             }
-            target.transport = TargetPhysicalTransport{
-                *target.wholeValueLayout, std::move(physical), {0, valueSlot->slot, valueSlot->slot}};
+            target.transport = TargetPhysicalTransport{std::move(physical), {0, valueSlot->slot, valueSlot->slot}};
             plan.bindings.push_back(std::move(target));
             continue;
         }
@@ -413,6 +412,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         const Value &value = program.program.values[valueId];
         target.projection.value = valueId;
         target.projection.leaf = binding->leaf;
+        target.valueType = value.canonicalType;
         target.name = valueName(program, valueId);
         target.sourceName = target.name;
         if (binding->leaf) {
@@ -546,54 +546,27 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint whole-value ABI disagrees with its Program Value");
                 target.wholeValueLayout = materializeValueLayout(*value.layout, value.type);
-                if (!compute) {
-                    if (!compiled || !compiled->interfacePlan)
-                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                      "graphics value endpoint is missing the compiled physical plan");
-                    target.source = SourceRepresentation::WholeValueBytes;
-                    target.reflectedKind = value.shape.empty() ? "scalar" : "tensor_value";
-                    target.elementLayout = *target.wholeValueLayout;
-                    target.carrier = compiled->valueTransport == "uniform_buffer"   ? TargetCarrier::UniformBuffer
-                                     : compiled->valueTransport == "storage_buffer" ? TargetCarrier::StorageBuffer
-                                                                                    : TargetCarrier::InlineValue;
-                    target.native = {compiled->descriptorSet == UINT32_MAX ? 0 : compiled->descriptorSet,
-                                     compiled->binding == UINT32_MAX ? slot->slot : compiled->binding, UINT32_MAX};
-                    target.transport =
-                        TargetPhysicalTransport{*target.wholeValueLayout, *compiled->interfacePlan, target.native};
+                if (!compiled || !compiled->interfacePlan || !compiled->interfacePlan->root)
+                    return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                  "value endpoint is missing the compiler-selected physical plan");
+                target.source = SourceRepresentation::WholeValueBytes;
+                target.reflectedKind = value.canonicalType.rankedValue ? "tensor_value" : "scalar";
+                target.elementLayout = *target.wholeValueLayout;
+                target.carrier = compiled->valueTransport == "uniform_buffer"   ? TargetCarrier::UniformBuffer
+                                 : compiled->valueTransport == "storage_buffer" ? TargetCarrier::StorageBuffer
+                                                                                : TargetCarrier::InlineValue;
+                target.native = {compiled->descriptorSet == UINT32_MAX ? 0 : compiled->descriptorSet,
+                                 compiled->binding == UINT32_MAX ? slot->slot : compiled->binding, UINT32_MAX};
+                InterfacePlan physical = *compiled->interfacePlan;
+                if (backend == VERNON_RUNTIME_CPU) {
+                    if (!assignCpuPhysical(cpuFrameOffset(target), compiled, value.layout->alignment,
+                                           value.layout->byteSize, target.physical, &physical, diagnostic, "value"))
+                        return false;
                 } else {
-                    std::optional<program::ValueLayout> element = elementValueLayout(value, endpoint, *slot);
-                    if (!element)
-                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                      "value endpoint whole-value ABI disagrees with its Program Value");
-                    target.source = value.shape.empty() ? SourceRepresentation::WholeValueBytes
-                                                        : SourceRepresentation::ElementStream;
-                    target.reflectedKind = value.shape.empty() ? "scalar" : "tensor_value";
-                    target.elementLayout = materializeValueLayout(*element, value.type);
-                    target.carrier = TargetCarrier::StorageBuffer;
-                    InterfacePlan physical;
-                    if (compiled && compiled->interfacePlan &&
-                        compiled->interfacePlan->kind != InterfacePlanKind::NativeUniform)
-                        physical = *compiled->interfacePlan;
-                    else {
-                        TransportNode root = target.source == SourceRepresentation::WholeValueBytes
-                                                 ? valueTransport(*value.layout)
-                                                 : shapedValueTransport(*element, value.shape, value.layout->byteSize);
-                        physical = computeValuePlan(root, value.layout->layoutHash, backend);
-                    }
-                    if (!physical.root)
-                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
-                                      "compute value endpoint is missing its physical transport tree");
-                    if (backend == VERNON_RUNTIME_CPU) {
-                        if (!assignCpuPhysical(cpuFrameOffset(target), compiled, value.layout->alignment,
-                                               value.layout->byteSize, target.physical, &physical, diagnostic, "value"))
-                            return false;
-                    } else {
-                        target.physical = {0, static_cast<size_t>(physical.root->size),
-                                           static_cast<size_t>(physical.root->alignment)};
-                    }
-                    target.transport = TargetPhysicalTransport{
-                        *target.wholeValueLayout, std::move(physical), {0, slot->slot, slot->slot}};
+                    target.physical = {0, static_cast<size_t>(physical.root->size),
+                                       static_cast<size_t>(physical.root->alignment)};
                 }
+                target.transport = TargetPhysicalTransport{std::move(physical), target.native};
                 target.endpoint.portableSlot = slot->slot;
                 maximumSlot = std::max(maximumSlot, slot->slot);
                 hasSlots = true;
@@ -716,10 +689,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                            value.layout->byteSize, target.physical, &physical, diagnostic,
                                            "TensorView value"))
                         return false;
-                    target.transport =
-                        TargetPhysicalTransport{*target.wholeValueLayout,
-                                                std::move(physical),
-                                                {0, storageBindings.front()->slot, storageBindings.front()->slot}};
+                    target.transport = TargetPhysicalTransport{
+                        std::move(physical), {0, storageBindings.front()->slot, storageBindings.front()->slot}};
                 }
             }
         }
@@ -814,8 +785,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     return true;
 }
 
-bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &variant, ReflectedEntry &reflection,
-                                  Diagnostic &diagnostic) {
+static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &variant,
+                                              ReflectedEntry &reflection, Diagnostic &diagnostic) {
     diagnostic = {};
     variant = {};
     reflection = {};
@@ -897,7 +868,10 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         use.dtype = binding.elementLayout.logicalType.empty() && !binding.elementLayout.leaves.empty()
                         ? binding.elementLayout.leaves.front().dtype
                         : binding.elementLayout.logicalType;
-        use.shape = parameter.shape;
+        use.shape = binding.source == SourceRepresentation::WholeValueBytes && binding.valueType &&
+                            binding.valueType->rankedValue
+                        ? binding.valueType->innerShape
+                        : parameter.shape;
         use.transport = plan.backend == VERNON_RUNTIME_CPU ? "host_value" : "storage_buffer";
         use.valueLayout = binding.wholeValueLayout;
         use.interfacePlan = binding.transport ? std::optional<InterfacePlan>(binding.transport->targetAbi)
@@ -1017,7 +991,8 @@ bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBa
     return true;
 }
 
-bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant &variant, Diagnostic &diagnostic) {
+static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &variant,
+                                               Diagnostic &diagnostic) {
     diagnostic = {};
     variant = {};
     std::map<uint32_t, size_t> parameterByValue;
@@ -1068,8 +1043,7 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
             parameter.exactStorageFormat = binding.imageFormat;
             if (binding.kind == "image" && binding.role == "sampled")
                 parameter.sampleResultClass = "float";
-            if (binding.source != SourceRepresentation::WholeValueBytes)
-                parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
+            parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
             variant.parameters.push_back(std::move(parameter));
             found = parameterByValue.emplace(binding.projection.value, variant.parameters.size() - 1).first;
         }
@@ -1092,7 +1066,10 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
                             : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
                                                                               : "push_constant";
             use.interfacePlan = binding.transport->targetAbi;
-            use.shape = shape::encodeRuntimeContractShape(binding.shape);
+            use.shape = binding.source == SourceRepresentation::WholeValueBytes && binding.valueType &&
+                                binding.valueType->rankedValue
+                            ? binding.valueType->innerShape
+                            : parameter.shape;
         }
         if (binding.carrier == TargetCarrier::VertexBuffer) {
             use.dtype = binding.attributeLeaves.front().dtype;
@@ -1128,6 +1105,18 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
               });
     rebuildVariantLayoutViews(variant);
     return true;
+}
+
+bool buildExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &view, ReflectedEntry &reflection,
+                                Diagnostic &diagnostic) {
+    if (plan.operation == "graphics") {
+        reflection = {};
+        return buildGraphicsExecutableBindingView(plan, view, diagnostic);
+    }
+    if (plan.operation == "compute")
+        return buildComputeExecutableBindingView(plan, view, reflection, diagnostic);
+    return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs",
+                  "TargetBindingPlan has an unsupported operation");
 }
 
 } // namespace vernon::runtime::program

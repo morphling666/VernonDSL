@@ -146,6 +146,44 @@ bool parseShape(const nlohmann::json &value, std::vector<uint64_t> &result, Diag
     return true;
 }
 
+bool parseCanonicalValueType(std::string_view type, CanonicalValueType &parsed) {
+    parsed = {};
+    if (type.rfind("tensor<", 0) != 0 && type.rfind("vector<", 0) != 0) {
+        if (type.find('<') == std::string_view::npos)
+            parsed.dtype = std::string(type);
+        return true;
+    }
+    if (type.size() < 9 || type.back() != '>')
+        return false;
+    const std::string_view body = type.substr(7, type.size() - 8);
+    size_t begin = 0;
+    while (true) {
+        const size_t separator = body.find('x', begin);
+        if (separator == std::string_view::npos)
+            break;
+        const std::string_view extent = body.substr(begin, separator - begin);
+        if (extent.empty() ||
+            !std::all_of(extent.begin(), extent.end(), [](char value) { return value >= '0' && value <= '9'; }))
+            break;
+        uint64_t parsedExtent = 0;
+        for (char digit : extent) {
+            const uint64_t value = static_cast<uint64_t>(digit - '0');
+            if (parsedExtent > (std::numeric_limits<uint64_t>::max() - value) / 10)
+                return false;
+            parsedExtent = parsedExtent * 10 + value;
+        }
+        if (!parsedExtent)
+            return false;
+        parsed.innerShape.push_back(parsedExtent);
+        begin = separator + 1;
+    }
+    if (begin == body.size())
+        return false;
+    parsed.dtype = std::string(body.substr(begin));
+    parsed.rankedValue = true;
+    return !parsed.dtype.empty();
+}
+
 bool sortedUnique(const std::vector<uint32_t> &values) {
     return std::is_sorted(values.begin(), values.end()) &&
            std::adjacent_find(values.begin(), values.end()) == values.end();
@@ -566,6 +604,9 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             return false;
         parsed.name = row.value("name", "");
         parsed.type = row["type"].get<std::string>();
+        if (!parseCanonicalValueType(parsed.type, parsed.canonicalType))
+            return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", path + "/type",
+                        "Value has an invalid canonical tensor type");
         if (row.contains("shape") && !parseShape(row["shape"], parsed.shape, diagnostic, path + "/shape", true, true))
             return false;
         if (row.contains("storage")) {
@@ -580,6 +621,12 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                 return false;
             parsed.layout = std::move(layout);
         }
+        if (parsed.canonicalType.rankedValue && parsed.layout && parsed.layout->scope == "value" &&
+            parsed.layout->leaves.size() == 1 && parsed.layout->leaves.front().path.empty() &&
+            (parsed.layout->leaves.front().dtype != parsed.canonicalType.dtype ||
+             parsed.layout->leaves.front().shape != parsed.canonicalType.innerShape))
+            return fail(diagnostic, "PROGRAM_LAYOUT_HASH", "parse", path + "/value_layout",
+                        "canonical tensor type disagrees with its ValueLayout");
         program.values.push_back(std::move(parsed));
     }
 

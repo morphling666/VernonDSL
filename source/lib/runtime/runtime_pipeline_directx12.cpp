@@ -228,20 +228,6 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
             candidate.binding.externalSlot = parameter.slot;
             if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
-                const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                uint64_t valueCount = 1;
-                for (uint64_t dimension : shape) {
-                    if (!dimension || valueCount > UINT32_MAX / dimension) {
-                        supported = false;
-                        break;
-                    }
-                    valueCount *= dimension;
-                }
-                if (!supported || !dtype) {
-                    supported = false;
-                    break;
-                }
-                const size_t elementSize = dataTypeSize(*dtype);
                 if (!use.interfacePlan || !use.interfacePlan->root) {
                     supported = false;
                     break;
@@ -257,8 +243,6 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                 }
                 candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = static_cast<uint32_t>(valueCount);
-                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
                 const uint64_t physicalAlignment = use.interfacePlan->root->alignment;
                 if (!physicalAlignment || physicalAlignment > UINT32_MAX) {
                     supported = false;
@@ -273,7 +257,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
                     parameter.valueLayout
                         ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
                         : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
-                if (!packing || packing->elementSize != elementSize) {
+                if (!packing || packing->elementSize != canonical.byteSize) {
                     supported = false;
                     break;
                 }

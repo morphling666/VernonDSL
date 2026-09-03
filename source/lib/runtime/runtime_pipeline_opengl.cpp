@@ -13,10 +13,30 @@
 #include <cstring>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 namespace vernon::runtime {
+
+bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
+                                     OpenGLNativeUniformShape &result) {
+    result = {};
+    if (shape.empty()) {
+        result.scalarCount = 1;
+        return dtype == "f32" || dtype == "i32" || dtype == "u32";
+    }
+    if (shape.size() == 1 && shape[0] >= 1 && shape[0] <= 4) {
+        result.scalarCount = static_cast<uint32_t>(shape[0]);
+        return dtype == "f32" || dtype == "i32" || dtype == "u32";
+    }
+    if (dtype != "f32" || shape.size() != 2 || shape[0] < 2 || shape[0] > 4 || shape[1] < 2 || shape[1] > 4)
+        return false;
+    result.scalarCount = static_cast<uint32_t>(shape[0] * shape[1]);
+    result.matrixColumns = static_cast<uint32_t>(shape[1]);
+    return true;
+}
+
 namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
@@ -244,24 +264,9 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                     const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                     const uint64_t physicalSize = use.interfacePlan->root->size;
-                    uint64_t valueCount = 1;
-                    for (uint64_t dimension : shape) {
-                        if (dimension == 0 || valueCount > UINT32_MAX / dimension) {
-                            valueCount = 0;
-                            break;
-                        }
-                        valueCount *= dimension;
-                    }
-                    if (shape.empty() && physicalSize && physicalSize % sizeof(uint32_t) == 0)
-                        valueCount = physicalSize / sizeof(uint32_t);
                     const bool buffered = use.transport == "uniform_buffer" || use.transport == "storage_buffer";
-                    const bool scalarOrVector = shape.empty() || (shape.size() == 1 && shape[0] <= 4);
-                    const bool floatingMatrix = use.dtype == "f32" && shape.size() == 2 && shape[0] >= 2 &&
-                                                shape[0] <= 4 && shape[1] >= 2 && shape[1] <= 4;
-                    const bool nativeInline =
-                        ((use.dtype == "f32" || use.dtype == "i32" || use.dtype == "u32") && scalarOrVector) ||
-                        floatingMatrix;
-                    if (!dtype || valueCount == 0 || (!buffered && !nativeInline)) {
+                    OpenGLNativeUniformShape nativeShape;
+                    if (!dtype || (!buffered && !resolveOpenGLNativeUniformShape(use.dtype, shape, nativeShape))) {
                         representationError = "OpenGL uniform layout is unsupported";
                         useRhiGraphics = false;
                         break;
@@ -276,8 +281,8 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     }
                     candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                     candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                    candidate.layout.element_count = static_cast<uint32_t>(valueCount);
-                    candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[1]) : 1;
+                    candidate.layout.element_count = buffered ? 0 : nativeShape.scalarCount;
+                    candidate.layout.vector_count = buffered ? 0 : nativeShape.matrixColumns;
                     candidate.layout.numeric_type = static_cast<uint32_t>(*dtype);
                     candidate.layout.binding = use.binding;
                     candidate.layout.set = use.descriptorSet;

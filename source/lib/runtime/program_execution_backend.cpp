@@ -112,8 +112,9 @@ VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context,
     TargetBindingPlan bindingPlan;
     if (!buildTargetBindingPlan(program, node, resolvedStage, context.backend, bindingPlan, diagnostic))
         return nullptr;
-    Variant variant;
-    if (!materializeGraphicsTargetBindingPlan(bindingPlan, variant, diagnostic))
+    ExecutableBindingView variant;
+    ReflectedEntry reflection;
+    if (!buildExecutableBindingView(bindingPlan, variant, reflection, diagnostic))
         return nullptr;
 
     VernonPipelineBundle bundle;
@@ -160,9 +161,9 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
         return reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
                       "compute node has no resolved code module"),
                nullptr;
-    Variant variant;
+    ExecutableBindingView variant;
     ReflectedEntry reflection;
-    if (!materializeTargetBindingPlan(node.plan, variant, reflection, diagnostic))
+    if (!buildExecutableBindingView(node.plan, variant, reflection, diagnostic))
         return nullptr;
     std::vector<uint8_t> moduleBytes;
     // CPU code modules are relocatable objects linked by the embedding

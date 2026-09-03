@@ -5,7 +5,18 @@
 #include "graphics_invocation_planner.h"
 #include "runtime_state.h"
 
+#include <string_view>
+#include <vector>
+
 namespace vernon::runtime {
+
+struct OpenGLNativeUniformShape {
+    uint32_t scalarCount{};
+    uint32_t matrixColumns{1};
+};
+
+bool resolveOpenGLNativeUniformShape(std::string_view dtype, const std::vector<uint64_t> &shape,
+                                     OpenGLNativeUniformShape &result);
 
 bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
 void destroyCpuPipeline(VernonLoadedPipeline &pipeline);

@@ -194,6 +194,10 @@ struct Variant {
     bool validate(std::string &error) const;
 };
 
+// Backend-neutral binding representation consumed by every pipeline backend.
+// Pipeline manifests parse into it; Program plans project into it exactly once.
+using ExecutableBindingView = Variant;
+
 struct AutodiffLaunchPlan {
     VernonLaunchSize workgroupSize{1, 1, 1};
 };

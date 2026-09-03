@@ -268,12 +268,6 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 use.interfacePlan->root) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                uint64_t count = 1;
-                for (uint64_t dimension : shape) {
-                    if (!dimension || count > UINT32_MAX / dimension)
-                        return false;
-                    count *= dimension;
-                }
                 if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
                     !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
                     return false;
@@ -282,8 +276,6 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                                                                             : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
                 candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = static_cast<uint32_t>(count);
-                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
                 candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;

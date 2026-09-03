@@ -81,7 +81,6 @@ struct TargetNativeLocation {
 };
 
 struct TargetPhysicalTransport {
-    vernon::runtime::ValueLayout canonicalProjection;
     vernon::runtime::InterfacePlan targetAbi;
     TargetNativeLocation native;
 };
@@ -103,6 +102,7 @@ struct TargetBinding {
     std::string imageFormat;
     std::string builtin;
     std::optional<ViewTransform> viewTransform;
+    std::optional<CanonicalValueType> valueType;
     shape::DeclaredShape shape;
     std::vector<int64_t> viewShape;
     std::optional<vernon::runtime::ValueLayout> wholeValueLayout;
@@ -162,10 +162,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                             VernonRuntimeBackend backend, TargetBindingPlan &plan, Diagnostic &diagnostic);
 bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBackend backend,
                                  ResolvedExecutablePlan &plan, Diagnostic &diagnostic);
-bool materializeTargetBindingPlan(const TargetBindingPlan &plan, vernon::runtime::Variant &variant,
-                                  vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
-bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, vernon::runtime::Variant &variant,
-                                          Diagnostic &diagnostic);
+bool buildExecutableBindingView(const TargetBindingPlan &plan, vernon::runtime::ExecutableBindingView &view,
+                                vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
 
 } // namespace vernon::runtime::program
 

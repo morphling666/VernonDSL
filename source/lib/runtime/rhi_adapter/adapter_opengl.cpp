@@ -12,6 +12,7 @@
 #include <mutex>
 #include <new>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -367,7 +368,16 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                                       source.binding != UINT32_MAX && source.element_size != 0;
             if (!inlineValue && !uniformBuffer && !storageBuffer && !sampledImage && !storageImage && !sampler &&
                 !vertexBuffer)
-                return fail(adapter, "OpenGL adapter pipeline layout contains an unsupported binding");
+                return fail(adapter, "OpenGL adapter pipeline layout binding " + std::to_string(index) +
+                                         " is unsupported (kind=" + std::to_string(source.kind) +
+                                         ", interface=" + std::to_string(source.interface_kind) +
+                                         ", stage_mask=" + std::to_string(source.stage_mask) +
+                                         ", binding=" + std::to_string(source.binding) +
+                                         ", element_size=" + std::to_string(source.element_size) +
+                                         ", element_count=" + std::to_string(source.element_count) +
+                                         ", vector_count=" + std::to_string(source.vector_count) +
+                                         ", numeric_type=" + std::to_string(source.numeric_type) +
+                                         ", name_size=" + std::to_string(source.name.size) + ")");
             PreparedLayout::Entry entry;
             entry.layout = source;
             if (source.name.data && source.name.size)
@@ -1286,7 +1296,7 @@ VernonRuntimeRhiAdapter *createOpenGLRhiAdapter(VernonRhiDevice device, VernonRh
     adapter->rhiBackend = backend;
     if (!adapter->backend.adopt(state.get(), &rhi_adapter::backendOps))
         return nullptr;
-    (void)state.release();
+    [[maybe_unused]] auto *adoptedState = state.release();
     rhi_adapter::initializeOpenGLProvider(*adapter);
     return adapter.release();
 }

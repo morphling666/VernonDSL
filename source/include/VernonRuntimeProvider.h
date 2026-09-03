@@ -102,6 +102,7 @@ typedef struct VernonRuntimeProviderBindingLayoutEntry {
     VernonRuntimeProviderBindingInterface interface_kind;
     VernonStringView name;
     uint32_t element_count;
+    /* OpenGL native-uniform column count; zero for buffered/non-OpenGL bindings. */
     uint32_t vector_count;
     uint32_t divisor;
     uint32_t element_alignment;

@@ -245,10 +245,17 @@ struct ValueLayout {
     std::vector<LayoutLeaf> leaves;
 };
 
+struct CanonicalValueType {
+    std::string dtype;
+    std::vector<uint64_t> innerShape;
+    bool rankedValue{};
+};
+
 struct Value {
     uint32_t id{};
     std::string name;
     std::string type;
+    CanonicalValueType canonicalType;
     std::vector<uint64_t> shape;
     Origin origin;
     std::optional<uint32_t> storage;

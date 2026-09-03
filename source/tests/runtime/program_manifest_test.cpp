@@ -1,6 +1,8 @@
 #include "runtime/autodiff/program_publication.h"
 #include "runtime/content_hash.h"
 #include "runtime/program_execution_manifest.h"
+#include "runtime/runtime_pipeline_backend.h"
+#include "runtime/target_binding_plan.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -106,6 +108,132 @@ TEST(ProgramPublication, ProgramOwnerIdentityControlsBindingReuse) {
     EXPECT_FALSE(bindings.bind(sharedOwner, hostTensor(&second, sizeof(second)), error));
     EXPECT_TRUE(bindings.bind({vernon::runtime::program::ProgramOwnerKind::Storage, 8},
                               hostTensor(&second, sizeof(second)), error));
+}
+
+TEST(ProgramTargetBinding, PreservesCanonicalNumericShapeAcrossComputeAndGraphics) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+
+    ValueLeaf matrixLeaf{"f32", 6, 0};
+    matrixLeaf.shape = {2, 3};
+    vernon::runtime::ValueLayout matrixLayout{"tensor<2x3xf32>", "", "matrix-layout", 24, 4, {matrixLeaf}};
+    TransportNode matrixCarrier;
+    matrixCarrier.kind = TransportNodeKind::Array;
+    matrixCarrier.size = 24;
+    matrixCarrier.alignment = 4;
+    matrixCarrier.shape = {3, 2};
+    matrixCarrier.byteStrides = {8, 4};
+    InterfacePlan nativeUniform;
+    nativeUniform.kind = InterfacePlanKind::NativeUniform;
+    nativeUniform.profile = "opengl_native_uniform";
+    nativeUniform.canonicalLayoutHash = matrixLayout.layoutHash;
+    nativeUniform.root = matrixCarrier;
+
+    TargetBinding binding;
+    binding.endpoint = {"vertex", "argument", 4, 4, "read"};
+    binding.projection.value = 0;
+    binding.source = SourceRepresentation::WholeValueBytes;
+    binding.carrier = TargetCarrier::InlineValue;
+    binding.name = "view_projection";
+    binding.kind = "tensor";
+    binding.access = "read";
+    binding.valueType = CanonicalValueType{"f32", {2, 3}, true};
+    binding.wholeValueLayout = matrixLayout;
+    binding.elementLayout = matrixLayout;
+    binding.transport = TargetPhysicalTransport{nativeUniform, {0, 4, UINT32_MAX}};
+    binding.native = {0, 4, UINT32_MAX};
+
+    TargetBindingPlan plan;
+    plan.backend = VERNON_RUNTIME_OPENGL;
+    plan.operation = "graphics";
+    plan.bindings.push_back(std::move(binding));
+
+    ExecutableBindingView variant;
+    ReflectedEntry reflection;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildExecutableBindingView(plan, variant, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(variant.parameters.size(), 1u);
+    EXPECT_TRUE(variant.parameters[0].shape.empty());
+    ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
+    EXPECT_EQ(variant.parameters[0].uses[0].shape, std::vector<uint64_t>({2, 3}));
+
+    plan.operation = "compute";
+    ASSERT_TRUE(buildExecutableBindingView(plan, variant, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(variant.parameters.size(), 1u);
+    EXPECT_TRUE(variant.parameters[0].shape.empty());
+    ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
+    EXPECT_EQ(variant.parameters[0].uses[0].shape, std::vector<uint64_t>({2, 3}));
+}
+
+TEST(ProgramTargetBinding, ProjectsOnlyOpenGLNativeUniformMatrixMetadata) {
+    using vernon::runtime::OpenGLNativeUniformShape;
+    using vernon::runtime::resolveOpenGLNativeUniformShape;
+
+    const auto expectShape = [&](std::string_view dtype, std::vector<uint64_t> shape, uint32_t scalars,
+                                 uint32_t columns) {
+        OpenGLNativeUniformShape result;
+        ASSERT_TRUE(resolveOpenGLNativeUniformShape(dtype, shape, result));
+        EXPECT_EQ(result.scalarCount, scalars);
+        EXPECT_EQ(result.matrixColumns, columns);
+    };
+    expectShape("f32", {}, 1, 1);
+    expectShape("f32", {2}, 2, 1);
+    expectShape("i32", {3}, 3, 1);
+    expectShape("u32", {4}, 4, 1);
+    expectShape("f32", {2, 3}, 6, 3);
+    expectShape("f32", {3, 2}, 6, 2);
+    expectShape("f32", {4, 4}, 16, 4);
+
+    OpenGLNativeUniformShape rejected;
+    EXPECT_FALSE(resolveOpenGLNativeUniformShape("i32", {2, 2}, rejected));
+    EXPECT_FALSE(resolveOpenGLNativeUniformShape("f32", {10, 10}, rejected));
+}
+
+TEST(ProgramTargetBinding, PreservesCompilerSelectedBufferCarrierForLargeMatrices) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+
+    ValueLeaf leaf{"f32", 100, 0};
+    leaf.shape = {10, 10};
+    vernon::runtime::ValueLayout layout{"tensor<10x10xf32>", "", "large-matrix-layout", 400, 4, {leaf}};
+    TransportNode root;
+    root.kind = TransportNodeKind::Array;
+    root.size = 400;
+    root.alignment = 16;
+    root.shape = {10, 10};
+    root.byteStrides = {40, 4};
+    InterfacePlan buffer;
+    buffer.kind = InterfacePlanKind::ByteTransport;
+    buffer.profile = "std430_storage_buffer";
+    buffer.canonicalLayoutHash = layout.layoutHash;
+    buffer.root = root;
+
+    TargetBinding binding;
+    binding.endpoint = {"fragment", "argument", 0, 0, "read"};
+    binding.projection.value = 0;
+    binding.source = SourceRepresentation::WholeValueBytes;
+    binding.carrier = TargetCarrier::StorageBuffer;
+    binding.name = "large_matrix";
+    binding.kind = "tensor";
+    binding.access = "read";
+    binding.valueType = CanonicalValueType{"f32", {10, 10}, true};
+    binding.wholeValueLayout = layout;
+    binding.elementLayout = layout;
+    binding.transport = TargetPhysicalTransport{buffer, {0, 0, UINT32_MAX}};
+
+    TargetBindingPlan plan;
+    plan.backend = VERNON_RUNTIME_OPENGL;
+    plan.operation = "graphics";
+    plan.bindings.push_back(std::move(binding));
+    ExecutableBindingView view;
+    ReflectedEntry reflection;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildExecutableBindingView(plan, view, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(view.parameters.size(), 1u);
+    ASSERT_EQ(view.parameters[0].uses.size(), 1u);
+    EXPECT_TRUE(view.parameters[0].shape.empty());
+    EXPECT_EQ(view.parameters[0].uses[0].shape, std::vector<uint64_t>({10, 10}));
+    EXPECT_EQ(view.parameters[0].uses[0].transport, "storage_buffer");
 }
 
 TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
@@ -312,6 +440,12 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     vernon::runtime::program::ArtifactSystem artifacts;
     vernon::runtime::program::Diagnostic diagnostic;
     ASSERT_TRUE(vernon::runtime::program::parse(manifest, program, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(program.values.size(), 3u);
+    EXPECT_TRUE(program.values[0].canonicalType.rankedValue);
+    EXPECT_EQ(program.values[0].canonicalType.dtype, "f32");
+    EXPECT_EQ(program.values[0].canonicalType.innerShape, std::vector<uint64_t>({256}));
+    EXPECT_FALSE(program.values[2].canonicalType.rankedValue);
+    EXPECT_EQ(program.values[2].canonicalType.dtype, "u32");
     ASSERT_EQ(program.abi.boundarySlots.size(), 2u);
     EXPECT_EQ(program.abi.boundarySlots[0].path, "x");
     EXPECT_EQ(program.abi.boundarySlots[0].category, vernon::runtime::program::BoundaryCategory::StorageView);

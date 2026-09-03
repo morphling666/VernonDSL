@@ -443,7 +443,7 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
         for (const auto *entry : inlineEntries) {
             if (!entry->element_size || entry->element_size % sizeof(uint32_t) != 0)
                 return fail(adapter, "D3D12 inline uniform size is invalid");
-            const bool registerAggregate = entry->vector_count > 1 || entry->element_size > 16;
+            const bool registerAggregate = entry->element_size > 16;
             if (registerAggregate || valueSize % 16 + entry->element_size > 16) {
                 if (valueSize > UINT32_MAX - 15)
                     return fail(adapter, "D3D12 root-constant layout size overflow");

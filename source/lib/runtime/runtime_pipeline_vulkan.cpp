@@ -240,15 +240,8 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
             if (parameter.kind == "tensor" && use.interfaceKind == "uniform") {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                uint64_t count = 1;
-                for (uint64_t dimension : shape) {
-                    if (!dimension || count > UINT32_MAX / dimension)
-                        return false;
-                    count *= dimension;
-                }
                 if (!dtype)
                     return false;
-                const size_t elementSize = dataTypeSize(*dtype);
                 if (!use.interfacePlan || !use.interfacePlan->root)
                     return false;
                 candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
@@ -262,8 +255,6 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
                     return false;
                 candidate.layout.element_size = static_cast<uint32_t>(physicalSize);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = static_cast<uint32_t>(count);
-                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
                 const uint64_t physicalAlignment = use.interfacePlan->root->alignment;
                 if (!physicalAlignment || physicalAlignment > UINT32_MAX)
                     return false;
