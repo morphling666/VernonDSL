@@ -17,9 +17,26 @@ add_library(
     compiler_frontend.cpp
     compiler_graphics_bootstrap.cpp
     compiler_internal.cpp
+    compiler_json.cpp
     compiler_kernel_bootstrap.cpp
+    compiler_program_abi.cpp
+    compiler_program_assembly.cpp
+    compiler_program_boundary.cpp
+    compiler_program_builtin.cpp
+    compiler_program_capture.cpp
+    compiler_program_compute.cpp
+    compiler_program_derivative.cpp
     compiler_program_finalization.cpp
+    compiler_program_graph.cpp
+    compiler_program_graphics.cpp
+    compiler_program_implementation.cpp
+    compiler_program_lowering.cpp
+    compiler_program_publication.cpp
     compiler_program_reflection.cpp
+    compiler_program_serializer.cpp
+    compiler_program_stage.cpp
+    compiler_program_storage.cpp
+    compiler_program_tape.cpp
     compiler_reflection.cpp
     compiler_spirv.cpp
     VernonCompiler.cpp

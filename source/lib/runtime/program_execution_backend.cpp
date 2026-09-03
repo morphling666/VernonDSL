@@ -143,11 +143,7 @@ VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context,
     auto pipeline = std::make_unique<VernonLoadedPipeline>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
-    for (vernon::runtime::Parameter &parameter : pipeline->variant.parameters) {
-        if (parameter.valueLayout)
-            rebuildValueLayoutPathViews(*parameter.valueLayout);
-        rebuildValueLayoutPathViews(parameter.elementLayout);
-    }
+    rebuildVariantLayoutViews(pipeline->variant);
     if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
         return reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
                       invocationDiagnostic(context)),
@@ -169,7 +165,12 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
     if (!materializeTargetBindingPlan(node.plan, variant, reflection, diagnostic))
         return nullptr;
     std::vector<uint8_t> moduleBytes;
-    if (!loadModuleBytes(artifacts, stage.artifact, bundleRoot, moduleBytes, diagnostic))
+    // CPU code modules are relocatable objects linked by the embedding
+    // application. The runtime resolves their registered entry point and must
+    // not read or load the original object file. GPU backends still consume
+    // their shader module bytes here.
+    if (context.backend != VERNON_RUNTIME_CPU &&
+        !loadModuleBytes(artifacts, stage.artifact, bundleRoot, moduleBytes, diagnostic))
         return nullptr;
     const std::string &entryName = stage.stage.modules.front().entryPoint;
     VernonCpuEntryPoint cpuEntry{};
@@ -251,7 +252,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
     }
     pipeline->topology = std::move(topology);
     if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
-        return reject(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "/signature",
+        return reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
                       invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
                                                             : invocationDiagnostic(context)),
                nullptr;

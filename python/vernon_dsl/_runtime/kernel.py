@@ -19,7 +19,7 @@ from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
-from .binding import _DispatchBorrowLease, _NativeBindingCache
+from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .resource_common import _session_state
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
@@ -74,7 +74,7 @@ class Kernel:
         self._entry = function.__name__
         self._workgroup_size = workgroup_size
         self._globals = function.__globals__
-        self._direct_binding_caches: dict[tuple[Any, ...], _NativeBindingCache] = {}
+        self._direct_binding_caches: dict[tuple[Any, ...], _PersistentBindingTable] = {}
         self.compile_count = 0
         self._instances.add(self)
 
@@ -584,7 +584,7 @@ class Kernel:
         builder: Any,
         arguments: tuple[Any, ...],
         user_parameters: list[str],
-        binding_cache: _NativeBindingCache,
+        binding_cache: _PersistentBindingTable,
     ) -> None:
         static_tensor_names = {
             argument.arg
@@ -629,7 +629,7 @@ class Kernel:
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
         features: tuple[str, ...] = (),
-        binding_cache: _NativeBindingCache | None = None,
+        binding_cache: _PersistentBindingTable | None = None,
         return_submission: bool = False,
     ) -> tuple[Any, _DispatchBorrowLease] | None:
         state = _session_state()
@@ -663,7 +663,7 @@ class Kernel:
         if compiled.native is None:
             raise RuntimeError("kernel native program is not loaded")
         if binding_cache is None:
-            binding_cache = _NativeBindingCache()
+            binding_cache = _PersistentBindingTable()
         dispatch_borrows = [
             (name, value, parameter_accesses[name])
             for name, value in zip(user_parameters, arguments, strict=True)
@@ -713,7 +713,7 @@ class Kernel:
             features,
             tuple(self._argument_signature(value) for value in arguments),
         )
-        binding_cache = self._direct_binding_caches.setdefault(cache_key, _NativeBindingCache())
+        binding_cache = self._direct_binding_caches.setdefault(cache_key, _PersistentBindingTable())
         result = self._invoke_direct(
             arguments,
             grid,

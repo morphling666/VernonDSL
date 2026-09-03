@@ -12,7 +12,7 @@ from ..ad import ProgramExpression
 from ..bundle import make_target_options
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..frontend.structured_vjp import build_structured_vjp
-from .binding import _dispatch_borrow_scope, _NativeBindingCache
+from .binding import _dispatch_borrow_scope, _PersistentBindingTable
 from .kernel import Kernel, _session_state
 from .tensor import TensorStorage, TensorView
 
@@ -112,7 +112,7 @@ class CookedVjpPipeline:
     _features: tuple[str, ...]
     _native: Any = None
     _runtime_generation: int = -1
-    _binding_cache: _NativeBindingCache = field(default_factory=_NativeBindingCache, init=False, repr=False)
+    _binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
     def _load(self) -> None:
         state = _session_state()
@@ -120,7 +120,7 @@ class CookedVjpPipeline:
             raise RuntimeError("cooked structured VJP assets require the native runtime")
         if self._native is not None and self._runtime_generation == state._runtime_generation:
             return
-        native = state._native_runtime.load_pipeline_asset(
+        native = state._native_runtime.load_cooked_asset(
             self._bundle,
             self._directory,
             list(self._features),
@@ -212,7 +212,7 @@ def _invoke_structured_pipeline(
     *,
     encoder: Any | None = None,
     command_plan: Any | None = None,
-    binding_cache: _NativeBindingCache | None = None,
+    binding_cache: _PersistentBindingTable | None = None,
 ) -> tuple[Any, _StructuredPullback]:
     _validate_grid(grid)
     derivative_groups = _pipeline_derivative_groups(pipeline)

@@ -40,6 +40,7 @@ struct ReflectedArgument {
     std::string sourceName;
     std::string kind;
     std::string builtin;
+    bool result{};
     uint32_t index{UINT32_MAX};
     PhysicalArgumentLayout physical;
     size_t tensorBytes{};
@@ -66,6 +67,7 @@ struct PackedArgumentsLayout {
 struct ReflectedEntry {
     std::vector<ReflectedArgument> arguments;
     std::optional<PackedArgumentsLayout> packedArguments;
+    std::optional<PackedArgumentsLayout> packedResults;
     uint32_t workgroup[3]{1, 1, 1};
     DispatchContract dispatchContract;
     std::vector<TensorViewWriteFootprint> readFootprints;

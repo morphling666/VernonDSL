@@ -15,7 +15,28 @@ def main() -> int:
 
     document = json.loads(arguments.manifest.read_text(encoding="utf-8"))
     output = arguments.manifest.parent
-    artifacts = sorted(Path(record["artifact"]["path"]) for record in document["stage_artifacts"].values())
+    if document.get("type") == "program_bundle":
+        variants = document.get("variants")
+        if not isinstance(variants, list) or len(variants) != 1:
+            raise ValueError("cooked Program fixture must contain exactly one variant")
+        artifact_system = variants[0].get("artifact_system")
+        blobs = artifact_system.get("blobs") if isinstance(artifact_system, dict) else None
+        records = artifact_system.get("artifacts") if isinstance(artifact_system, dict) else None
+        if not isinstance(blobs, dict) or not isinstance(records, dict):
+            raise ValueError("cooked Program fixture has no canonical artifact system")
+        digests = {
+            module["blob"]
+            for record in records.values()
+            for module in record.get("modules", ())
+            if module.get("format") == "relocatable_object"
+        }
+        artifacts = sorted(
+            Path(blobs[digest]["location"]["uri"])
+            for digest in digests
+            if digest in blobs and blobs[digest].get("location", {}).get("tag") == "external"
+        )
+    else:
+        artifacts = sorted(Path(record["artifact"]["path"]) for record in document["stage_artifacts"].values())
     if len(artifacts) != 3:
         raise ValueError("cooked autodiff fixture must contain primal, forward, and backward objects")
     for index, artifact in enumerate(artifacts):

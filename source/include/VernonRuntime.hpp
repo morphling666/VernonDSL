@@ -561,6 +561,122 @@ private:
     VernonPullback *handle_{};
 };
 
+class ProgramExecutable {
+public:
+    ProgramExecutable() = default;
+    ProgramExecutable(const ProgramExecutable &) = default;
+    ProgramExecutable &operator=(const ProgramExecutable &) = default;
+    ProgramExecutable(ProgramExecutable &&other) noexcept = default;
+    ProgramExecutable &operator=(ProgramExecutable &&other) noexcept = default;
+
+    static ProgramExecutable load(VernonRuntimeContext *context, const void *bundle, size_t bundleSize,
+                                  VernonFeatureSetView features = {nullptr, 0},
+                                  const VernonPipelineBundleLoadOptions *options = nullptr) {
+        VernonLoadedPipeline *handle =
+            vernonRuntimeLoadProgramBundleWithOptions(context, bundle, bundleSize, features, options);
+        if (!handle)
+            throw std::runtime_error("failed to load Program bundle");
+        return ProgramExecutable(handle);
+    }
+
+    explicit operator bool() const noexcept { return static_cast<bool>(handle_); }
+    VernonLoadedPipeline *get() const noexcept { return handle_.get(); }
+
+private:
+    explicit ProgramExecutable(VernonLoadedPipeline *handle) : handle_(handle, vernonRuntimeLoadedPipelineDestroy) {}
+
+    std::shared_ptr<VernonLoadedPipeline> handle_;
+    friend class ProgramInstance;
+};
+
+class ProgramInvocation {
+public:
+    ProgramInvocation() = default;
+    explicit ProgramInvocation(VernonProgramInvocation *handle) : handle_(handle) {}
+    ProgramInvocation(const ProgramInvocation &) = delete;
+    ProgramInvocation &operator=(const ProgramInvocation &) = delete;
+    ProgramInvocation(ProgramInvocation &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    ProgramInvocation &operator=(ProgramInvocation &&other) noexcept {
+        if (this != &other) {
+            vernonRuntimeProgramInvocationDestroy(handle_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+    ~ProgramInvocation() { vernonRuntimeProgramInvocationDestroy(handle_); }
+
+    ProgramInvocation &bind(const VernonProgramBindingToken &token, const VernonPipelineArgument &argument,
+                            const VernonProgramResourceLease *lease = nullptr, uint64_t uploadBytes = 0,
+                            uint64_t uploadRanges = 0) {
+        if (!handle_ || vernonRuntimeProgramInvocationBind(handle_, &token, &argument, lease, uploadBytes,
+                                                           uploadRanges) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind Program invocation");
+        return *this;
+    }
+
+    Pullback forward(bool retainPullback = true) {
+        if (!handle_)
+            throw std::logic_error("Program invocation is empty");
+        VernonPullback *pullback = nullptr;
+        if (vernonRuntimeProgramInvocationForward(handle_, retainPullback ? &pullback : nullptr) != VERNON_STATUS_OK)
+            throw std::runtime_error("Program invocation failed");
+        return Pullback(pullback);
+    }
+
+    void rollback() {
+        if (handle_)
+            vernonRuntimeProgramInvocationRollback(handle_);
+    }
+
+    VernonProgramInvocation *get() const noexcept { return handle_; }
+
+private:
+    VernonProgramInvocation *handle_{};
+};
+
+class ProgramInstance {
+public:
+    explicit ProgramInstance(ProgramExecutable &executable)
+        : executable_(executable.handle_), handle_(vernonRuntimeProgramInstanceCreate(executable_.get())) {
+        if (!handle_)
+            throw std::runtime_error("failed to create Program instance");
+    }
+    ProgramInstance(const ProgramInstance &) = delete;
+    ProgramInstance &operator=(const ProgramInstance &) = delete;
+    ProgramInstance(ProgramInstance &&other) noexcept
+        : executable_(std::move(other.executable_)), handle_(std::exchange(other.handle_, nullptr)) {}
+    ProgramInstance &operator=(ProgramInstance &&other) noexcept {
+        if (this != &other) {
+            vernonRuntimeProgramInstanceDestroy(handle_);
+            executable_ = std::move(other.executable_);
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+    ~ProgramInstance() { vernonRuntimeProgramInstanceDestroy(handle_); }
+
+    ProgramInvocation begin() {
+        VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(handle_);
+        if (!invocation)
+            throw std::runtime_error("failed to begin Program invocation");
+        return ProgramInvocation(invocation);
+    }
+
+    VernonProgramBindingTelemetry telemetry() const {
+        VernonProgramBindingTelemetry result{};
+        result.struct_size = sizeof(result);
+        if (vernonRuntimeProgramInstanceGetTelemetry(handle_, &result) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to query Program binding telemetry");
+        return result;
+    }
+
+    VernonProgramInstance *get() const noexcept { return handle_; }
+
+private:
+    std::shared_ptr<VernonLoadedPipeline> executable_;
+    VernonProgramInstance *handle_{};
+};
+
 inline Pullback vjp(VernonLoadedPipeline *pipeline, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
                     VernonLaunchSize computeGrid) {
     VernonPullback *pullback = nullptr;

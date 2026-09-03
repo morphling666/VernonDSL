@@ -22,29 +22,38 @@ struct MaterializedProgramArguments {
     std::vector<std::vector<int64_t>> strides;
 };
 
+enum class ProgramValueOwnership {
+    OwnedInvocation,
+    BorrowedHost,
+    BorrowedDevice,
+    RetainedResidual,
+    TapeCarrier,
+};
+
 struct ProgramHostValue {
     std::vector<uint8_t> owned;
     std::vector<int64_t> strides;
     std::optional<shape::ConcreteShape> concreteShape;
     VernonPipelineArgument argument{};
     std::shared_ptr<HostStaticTapeBatch> tapeBatch;
+    ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};
 };
 
-class ProgramValueArena {
+class ProgramInvocationFrame {
 public:
-    ProgramValueArena() = default;
-    explicit ProgramValueArena(const std::vector<VernonPipelineArgument> &hostArguments);
-    explicit ProgramValueArena(std::vector<ProgramHostValue> hostValues);
+    ProgramInvocationFrame() = default;
+    explicit ProgramInvocationFrame(const std::vector<VernonPipelineArgument> &hostArguments);
+    explicit ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues);
 
     bool materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required, std::string &error);
     bool restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error);
-    bool adoptRetainedValue(uint32_t value, const ProgramValueArena &retained, std::string &error);
+    bool adoptRetainedValue(uint32_t value, const ProgramInvocationFrame &retained, std::string &error);
     bool allocateCarrier(VernonRuntimeContext &context, uint32_t value, const program::TargetBinding &binding,
                          size_t byteSize, std::vector<uint64_t> shape, std::vector<int64_t> strides,
                          std::string &error);
-    bool uploadCarrier(uint32_t value, program::CarrierSemantic semantic, const void *data, size_t byteSize,
+    bool uploadCarrier(uint32_t value, program_plan::TapeCarrier carrier, const void *data, size_t byteSize,
                        std::string &error);
-    bool downloadCarrier(uint32_t value, program::CarrierSemantic semantic, void *data, size_t byteSize,
+    bool downloadCarrier(uint32_t value, program_plan::TapeCarrier carrier, void *data, size_t byteSize,
                          std::string &error) const;
     bool downloadLogicalToHost(const std::vector<char> &required, std::string &error) const;
     bool materializeNodeArguments(const program::Program &program, const program::Node &node,
@@ -69,9 +78,9 @@ private:
         std::vector<int64_t> strides;
     };
 
-    static size_t carrierIndex(program::CarrierSemantic semantic);
-    Carrier *carrier(uint32_t value, program::CarrierSemantic semantic);
-    const Carrier *carrier(uint32_t value, program::CarrierSemantic semantic) const;
+    static size_t carrierIndex(program_plan::TapeCarrier carrier);
+    Carrier *carrier(uint32_t value, program_plan::TapeCarrier carrier);
+    const Carrier *carrier(uint32_t value, program_plan::TapeCarrier carrier) const;
     void rebindLogicalDescriptor(uint32_t value);
 
     std::vector<ProgramHostValue> hostValues_;

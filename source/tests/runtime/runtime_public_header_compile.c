@@ -11,6 +11,9 @@ void vernon_runtime_public_c_header_compile_check(void) {
     VernonAdValueSet ad_values = {0};
     VernonAdValueMetadataView ad_metadata = {0};
     VernonAdDerivativeGroupView ad_group = {0};
+    VernonProgramBindingToken binding_token = {0};
+    VernonProgramResourceLease resource_lease = {0};
+    VernonProgramBindingTelemetry binding_telemetry = {0};
 
     options.struct_size = sizeof(options);
     callbacks.struct_size = sizeof(callbacks);
@@ -19,6 +22,9 @@ void vernon_runtime_public_c_header_compile_check(void) {
     ad_values.struct_size = sizeof(ad_values);
     ad_metadata.struct_size = sizeof(ad_metadata);
     ad_group.struct_size = sizeof(ad_group);
+    binding_token.struct_size = sizeof(binding_token);
+    resource_lease.struct_size = sizeof(resource_lease);
+    binding_telemetry.struct_size = sizeof(binding_telemetry);
     (void)options;
     (void)callbacks;
     (void)bundle_options;
@@ -27,4 +33,7 @@ void vernon_runtime_public_c_header_compile_check(void) {
     (void)ad_values;
     (void)ad_metadata;
     (void)ad_group;
+    (void)binding_token;
+    (void)resource_lease;
+    (void)binding_telemetry;
 }

@@ -208,11 +208,14 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/autodiff_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/dirty_index_set.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_instance.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/shape_layout.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_metadata.cpp
@@ -266,7 +269,13 @@ function(vernon_add_runtime)
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_boundary_binder.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_invocation_frame_builder.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_publication.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_residual_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_shape_resolver.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_lifecycle.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_materializer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_arena.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
@@ -297,6 +306,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/cpu_workgroup_dispatch.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_boundary_view.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp
@@ -358,6 +368,14 @@ function(vernon_add_runtime)
        "web")
         target_link_libraries(VernonRuntime PRIVATE ${CMAKE_DL_LIBS})
     endif()
+    # Runtime deployment is compiler-independent. CPU AOT entries are linked by the embedding application and resolved
+    # through the static registry; LLVM, MLIR, and ORC must never become runtime link dependencies.
+    foreach(_vernon_runtime_only_target IN ITEMS VernonRuntime VernonRuntimeInternals VernonRuntimeCore)
+        get_target_property(_vernon_runtime_links ${_vernon_runtime_only_target} LINK_LIBRARIES)
+        if(_vernon_runtime_links MATCHES "(^|;)(LLVM[^;]*|MLIR[^;]*|[^;]*ORC[^;]*)")
+            message(FATAL_ERROR "${_vernon_runtime_only_target} must not link LLVM, MLIR, or ORC")
+        endif()
+    endforeach()
     if(BUILD_TESTING)
         target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_TESTING=1)
     endif()

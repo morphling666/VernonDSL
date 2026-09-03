@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Mapping, Sequence
+from importlib import import_module
 from typing import Any, Protocol
 
 from .._runtime.operators import (
     ImplementationUnavailable,
-    elementwise_kernel,
-    python_element_annotation,
+    program_element_type,
 )
 from .model import ProgramImplementation
 
@@ -167,8 +167,12 @@ BuiltinLowerer = Callable[
 class BuiltinDslProvider:
     """Provider for built-in Program semantic operations."""
 
-    def __init__(self, lowerers: Sequence[BuiltinLowerer] = ()):
-        self._lowerers = (*lowerers, _lower_builtin_add, _lower_builtin_copy)
+    def __init__(self, lowerers: Sequence[BuiltinLowerer] = (), native: Any | None = None):
+        if native is None:
+            native = import_module("vernon_dsl._native")
+
+        self._lowerers = tuple(lowerers)
+        self._native = native
 
     def lower(
         self,
@@ -179,7 +183,7 @@ class BuiltinDslProvider:
             implementation = lowerer(request, values)
             if implementation is not None:
                 return implementation
-        return None
+        return _lower_builtin_add(request, values, self._native) or _lower_builtin_copy(request, values, self._native)
 
 
 class ProviderChain:
@@ -230,27 +234,45 @@ def _lower_builtin_elementwise(
     callee: str,
     operation: str,
     parameters: tuple[str, ...],
+    native: Any,
 ) -> ProgramImplementation | None:
     if request.get("implementation_hint") != callee:
         return None
     bindings = _abi_bindings(request, operation)
     reflected = [_request_value(bindings, values, name) for name in parameters]
     shapes = {tuple(value.get("shape", ())) for value in reflected}
-    annotations = {python_element_annotation(value) for value in reflected}
-    if len(shapes) != 1 or len(annotations) != 1 or None in annotations:
+    element_types = {program_element_type(value) for value in reflected}
+    if len(shapes) != 1 or len(element_types) != 1 or None in element_types:
         raise ImplementationUnavailable(f"built-in {operation} requires equal-shape tensors of one element type")
     shape = next(iter(shapes))
-    element = next(iter(annotations))
-    assert element is not None
+    element_type = next(iter(element_types))
+    assert element_type is not None
     if not all(isinstance(extent, int) for extent in shape):
         raise ImplementationUnavailable(f"built-in {operation} requires a ranked TensorView")
-    kernel = elementwise_kernel(operation, element, len(shape))
-    return ProgramImplementation(callee, kernel._entry, "compute", kernel._lower().frontend.mlir)
+    layouts = [value.get("value_layout") for value in reflected]
+    layout_identity = {
+        layout.get("layout_hash")
+        for layout in layouts
+        if isinstance(layout, Mapping) and isinstance(layout.get("layout_hash"), str)
+    }
+    if len(layout_identity) != 1 or any(not isinstance(layout, Mapping) for layout in layouts):
+        raise ImplementationUnavailable(f"built-in {operation} requires one canonical ValueLayout")
+    leaves = next(layout["leaves"] for layout in layouts if isinstance(layout, Mapping))
+    if not isinstance(leaves, list) or any(
+        not isinstance(leaf, Mapping) or not isinstance(leaf.get("dtype"), str) for leaf in leaves
+    ):
+        raise ImplementationUnavailable(f"built-in {operation} has invalid ValueLayout leaves")
+    leaf_dtypes = tuple(str(leaf["dtype"]) for leaf in leaves)
+    if operation == "add" and any(not dtype.startswith("f") for dtype in leaf_dtypes):
+        raise ImplementationUnavailable("built-in add requires floating tangent leaves")
+    entry, mlir = native._build_program_builtin(operation, element_type, len(shape), leaf_dtypes)
+    return ProgramImplementation(callee, entry, "compute", mlir)
 
 
 def _lower_builtin_add(
     request: Mapping[str, Any],
     values: Mapping[int, Mapping[str, Any]],
+    native: Any,
 ) -> ProgramImplementation | None:
     return _lower_builtin_elementwise(
         request,
@@ -258,12 +280,14 @@ def _lower_builtin_add(
         callee="vernon.builtin.add",
         operation="add",
         parameters=("output", "left", "right"),
+        native=native,
     )
 
 
 def _lower_builtin_copy(
     request: Mapping[str, Any],
     values: Mapping[int, Mapping[str, Any]],
+    native: Any,
 ) -> ProgramImplementation | None:
     return _lower_builtin_elementwise(
         request,
@@ -271,6 +295,7 @@ def _lower_builtin_copy(
         callee="vernon.builtin.copy",
         operation="copy",
         parameters=("output", "source"),
+        native=native,
     )
 
 

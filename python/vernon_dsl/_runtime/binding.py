@@ -15,34 +15,63 @@ from .tensor import RawBuffer, TensorStorage, TensorView, _borrow_ranges_may_ove
 from .texture import TextureView, _TextureResource
 
 
-class _NativeBindingCache:
-    """Caches immutable native arguments while still performing dirty resource residency checks."""
+class _PersistentBindingTable:
+    """Owns native transactional persistent bindings for one executable."""
 
     def __init__(self) -> None:
         self._native_pipeline: Any | None = None
-        self._prepared: dict[int, tuple[tuple[Any, ...], Any]] = {}
+        self._instance: Any | None = None
+        self._transactions = threading.local()
         self._lock = threading.RLock()
+
+    def _native_instance(self, native_pipeline: Any) -> Any:
+        with self._lock:
+            if self._instance is None or self._native_pipeline is not native_pipeline:
+                self._native_pipeline = native_pipeline
+                self._instance = native_pipeline.program_instance()
+            return self._instance
 
     def clear(self) -> None:
         with self._lock:
             self._native_pipeline = None
-            self._prepared.clear()
+            self._instance = None
 
     @contextmanager
     def invocation(self, native_pipeline: Any) -> Iterator[Any]:
-        with self._lock:
-            if native_pipeline is not self._native_pipeline:
-                self._native_pipeline = native_pipeline
-                self._prepared.clear()
-            yield native_pipeline.invocation_builder()
+        transaction = self._native_instance(native_pipeline).begin_invocation()
+        if getattr(self._transactions, "current", None) is not None:
+            raise RuntimeError("persistent binding invocations cannot be nested on one thread")
+        self._transactions.current = transaction
+        try:
+            yield transaction.builder
+        except BaseException:
+            transaction.rollback()
+            raise
+        else:
+            transaction.commit()
+        finally:
+            self._transactions.current = None
 
-    def _bind(self, builder: Any, parameter: Any, token: tuple[Any, ...], prepare: Any) -> Any:
-        cached = self._prepared.get(parameter.slot)
-        if cached is None or cached[0] != token:
-            cached = (token, prepare())
-            self._prepared[parameter.slot] = cached
-        builder.prepared_argument(cached[1])
-        return cached[1]
+    @property
+    def telemetry(self) -> dict[str, int]:
+        with self._lock:
+            return {} if self._instance is None else dict(self._instance.telemetry)
+
+    def _bind(
+        self,
+        builder: Any,
+        parameter: Any,
+        token: tuple[Any, ...],
+        prepare: Any,
+        *,
+        upload_bytes: int = 0,
+        upload_ranges: int = 0,
+        eager_upload: bool = False,
+    ) -> None:
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("binding update requires an active invocation transaction")
+        transaction.bind(parameter.slot, token, prepare, upload_bytes, upload_ranges, eager_upload)
 
     def bind_argument(
         self,
@@ -70,10 +99,13 @@ class _NativeBindingCache:
                     builder,
                     parameter,
                     token,
-                    lambda: builder.prepare_host_tensor(parameter.name, array),
+                    lambda: builder.prepare_host_tensor(parameter.slot, array),
                 )
             if state._rhi_host is None:
                 raise RuntimeError("device Tensor arguments require a GPU RHI host")
+            owner = value.owner if isinstance(value, TensorView) else value
+            dirty_tracker = getattr(owner, "_dirty_ranges", None)
+            dirty_ranges = tuple(dirty_tracker.ranges) if dirty_tracker is not None else ()
             buffer = value._resident_buffer()
             layout = value.layout
             token = (
@@ -89,43 +121,48 @@ class _NativeBindingCache:
                 parameter,
                 token,
                 lambda: builder.prepare_rhi_tensor(
-                    parameter.name,
+                    parameter.slot,
                     buffer,
                     parameter.access,
                     list(value.shape),
                     list(layout.byte_strides),
                     layout.byte_offset,
                 ),
+                upload_bytes=sum(end - begin for begin, end in dirty_ranges),
+                upload_ranges=len(dirty_ranges),
+                eager_upload=True,
             )
         if isinstance(value, _TextureResource):
             if state._architecture == state.cpu:
                 raise TypeError("CPU kernels do not support Texture arguments")
             if state._rhi_host is None:
                 raise RuntimeError("Texture arguments require a GPU RHI host")
+            owner = value.owner if isinstance(value, TextureView) else value
+            dirty_mips = tuple(owner._host_dirty_mips)
+            upload_bytes = sum(owner._mip_arrays[level].nbytes for level in dirty_mips)
             view = value._resident_view()
             return self._bind(
                 builder,
                 parameter,
                 ("rhi-texture", id(view)),
-                lambda: builder.prepare_rhi_texture(parameter.name, view),
+                lambda: builder.prepare_rhi_texture(parameter.slot, view),
+                upload_bytes=upload_bytes,
+                upload_ranges=len(dirty_mips),
+                eager_upload=True,
             )
 
         execution_token = ("execution-value", binding_token) if binding_token is not None else None
-        cached = self._prepared.get(parameter.slot)
-        if execution_token is not None and cached is not None and cached[0] == execution_token:
-            builder.prepared_argument(cached[1])
-            return
-
         value_type = type(value)
         struct_type = (
             annotation
             if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct"
             else (value_type if getattr(value_type, "__vernon_dsl__", (None, {}))[0] == "struct" else None)
         )
-        if struct_type is not None:
-            layout = host_abi_layout(struct_type)
+        canonical_annotation = annotation if annotation is not None else struct_type
+        if canonical_annotation is not None:
+            layout = host_abi_layout(canonical_annotation)
             host_array = np.empty((), dtype=layout.dtype)
-            host_array[()] = pack_host_value(struct_type, value, parameter.name)
+            host_array[()] = pack_host_value(canonical_annotation, value, parameter.name)
         else:
             numpy_dtypes = {
                 state._native.DATA_BOOL: NUMPY_DTYPE_BY_SCALAR["bool"],
@@ -169,7 +206,9 @@ class _NativeBindingCache:
             builder,
             parameter,
             token,
-            lambda: builder.prepare_host_tensor(parameter.name, host_array),
+            lambda: builder.prepare_host_tensor(parameter.slot, host_array),
+            upload_bytes=int(host_array.nbytes),
+            upload_ranges=1,
         )
 
     def bind_sampler(self, builder: Any, native_pipeline: Any, parameter: Any, sampler: SamplerState) -> None:
@@ -178,7 +217,7 @@ class _NativeBindingCache:
             builder,
             parameter,
             ("rhi-sampler", id(resident)),
-            lambda: builder.prepare_rhi_sampler(parameter.name, resident),
+            lambda: builder.prepare_rhi_sampler(parameter.slot, resident),
         )
 
 
@@ -265,6 +304,21 @@ class _DispatchBorrowLease:
         try:
             for owner in self._owners:
                 owner._active_borrows[:] = [active for active in owner._active_borrows if active[0] is not token]
+        finally:
+            for owner in reversed(self._owners):
+                owner._borrow_lock.release()
+
+    def release_writes(self) -> None:
+        token = self._token
+        if token is None:
+            return
+        for owner in self._owners:
+            owner._borrow_lock.acquire()
+        try:
+            for owner in self._owners:
+                owner._active_borrows[:] = [
+                    active for active in owner._active_borrows if active[0] is not token or active[2] == "read"
+                ]
         finally:
             for owner in reversed(self._owners):
                 owner._borrow_lock.release()

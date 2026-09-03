@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -50,6 +51,16 @@ def program_strided_square_sum(
     output[0] = source[0] * source[0] + source[1] * source[1]
 
 
+@vd.kernel(workgroup_size=(2, 2, 2))
+def program_texture_round_trip(
+    image: vd.Texture["3d", vd.rgba32_float, vd.read_write],  # noqa: F722
+    gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin("global_invocation_id")],
+) -> None:
+    coordinate = vd.Vector([vd.i32(gid[0]), vd.i32(gid[1]), vd.i32(gid[2])])
+    value = vd.texture_load(image, coordinate)
+    vd.texture_store(image, coordinate, value + vd.Vector([1.0, 2.0, 3.0, 4.0]))
+
+
 @vd.kernel(workgroup_size=(1, 1, 1))
 def program_cube(
     source: vd.TensorView[vd.f32, (1,), vd.read],
@@ -74,6 +85,45 @@ def program_scale(
     output: vd.TensorView[vd.f32, (1,), vd.write],
 ) -> None:
     output[0] = source[0] * factor
+
+
+@vd.struct(shared=True)
+class ProgramValueRecord:
+    weight: vd.f32
+    offset: vd.Vector[vd.f32, 2]
+
+
+@vd.struct
+class GpuParticle:
+    velocity: vd.Vector[vd.f32, 2]
+    mass: vd.f32
+    tag: vd.i32
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def gpu_particle_objective(
+    particles: vd.TensorView[GpuParticle, (1,), vd.read],
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
+) -> None:
+    particle = particles[0]
+    loss[0] = (
+        particle.velocity.x * particle.velocity.x
+        + particle.velocity.y * particle.velocity.y
+        + particle.mass * particle.mass
+    )
+
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def program_value_parameters(
+    output: vd.TensorView[vd.f32, (1,), vd.write],
+    scalar: vd.f32,
+    vector: vd.Vector[vd.f32, 2],
+    matrix: vd.Matrix[vd.f32, 2, 2],
+    pair: vd.Tuple[vd.f32, vd.Vector[vd.f32, 2]],
+    tensor: vd.Tensor[vd.f32, (2,)],
+    record: ProgramValueRecord,
+) -> None:
+    output[0] = scalar + vector[1] + matrix[1, 0] + pair[0] + pair[1][0] + tensor[1] + record.weight + record.offset[0]  # pyright: ignore[reportIndexIssue]
 
 
 @dataclass
@@ -106,6 +156,17 @@ class IncrementChain(vd.Module):
 class ParameterizedIncrement(vd.Module):
     def forward(self, source: vd.TensorStorage, amount: vd.f32) -> vd.TensorStorage:
         output = vd.empty_like(source)
+        program_add_parameter(output, source, amount, grid=(4, 1, 1))
+        return output
+
+
+class PersistentlyBoundIncrement(vd.Module):
+    def forward(
+        self,
+        output: vd.TensorStorage,
+        source: vd.TensorStorage,
+        amount: vd.f32,
+    ) -> vd.TensorStorage:
         program_add_parameter(output, source, amount, grid=(4, 1, 1))
         return output
 
@@ -156,6 +217,21 @@ class Scale(vd.Module):
         return output
 
 
+class ValueParameters(vd.Module):
+    def forward(
+        self,
+        scalar: vd.f32,
+        vector: vd.Vector[vd.f32, 2],
+        matrix: vd.Matrix[vd.f32, 2, 2],
+        pair: vd.Tuple[vd.f32, vd.Vector[vd.f32, 2]],
+        tensor: vd.Tensor[vd.f32, (2,)],
+        record: ProgramValueRecord,
+    ) -> vd.TensorStorage:
+        output = vd.zeros(dtype=vd.f32, shape=(1,))
+        program_value_parameters(output, scalar, vector, matrix, pair, tensor, record, grid=(1, 1, 1))
+        return output
+
+
 class StridedSquareSum(vd.Module):
     def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
         output = vd.zeros(dtype=vd.f32, shape=(1,))
@@ -163,10 +239,29 @@ class StridedSquareSum(vd.Module):
         return output
 
 
+class TextureRoundTrip(vd.Module):
+    def forward(
+        self,
+        image: vd.Texture["3d", vd.rgba32_float, vd.read_write],  # noqa: F722
+        marker: vd.TensorStorage,
+    ) -> vd.TensorStorage:
+        output = vd.empty_like(marker)
+        program_increment(output, marker, grid=(1, 1, 1))
+        program_texture_round_trip(image, grid=(1, 1, 1))
+        return output
+
+
 class AggregateObjective(vd.Module):
     def forward(self, particles: vd.TensorStorage) -> vd.TensorStorage:
         loss = vd.zeros(dtype=vd.f32, shape=(1,))
         aggregate_storage_objective(particles, loss, grid=(1, 1, 1))
+        return loss
+
+
+class GpuAggregateObjective(vd.Module):
+    def forward(self, particles: vd.TensorStorage) -> vd.TensorStorage:
+        loss = vd.zeros(dtype=vd.f32, shape=(1,))
+        gpu_particle_objective(particles, loss, grid=(1, 1, 1))
         return loss
 
 
@@ -213,6 +308,10 @@ class ProgramExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         vd.init(arch=vd.cpu)
 
+    def test_module_vjp_rejects_forward_only_texture_resources(self) -> None:
+        with self.assertRaisesRegex(TypeError, "Texture and Sampler are forward-only resources"):
+            vd.ad.vjp(TextureRoundTrip(), wrt=("marker",), outputs=("output",))
+
     def test_module_orders_dependent_kernels(self) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
         module = IncrementChain()
@@ -233,6 +332,21 @@ class ProgramExecutionTests(unittest.TestCase):
 
         np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 5.0)
+        self.assertEqual(len(module._program_cache), 1)
+
+    def test_module_allows_concurrent_invocation_snapshots(self) -> None:
+        module = ParameterizedIncrement()
+        module(vd.storage.from_numpy(np.arange(4, dtype=np.float32)), np.float32(0.0))
+
+        def invoke(index: int) -> np.ndarray:
+            source = vd.storage.from_numpy(np.arange(4, dtype=np.float32) + index)
+            return module(source, np.float32(index)).to_numpy()
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            actual = tuple(executor.map(invoke, range(8)))
+
+        for index, value in enumerate(actual):
+            np.testing.assert_array_equal(value, np.arange(4, dtype=np.float32) + 2 * index)
 
     def test_single_kernel_vjp_supports_direct_and_module_surfaces(self) -> None:
         source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
@@ -338,6 +452,23 @@ class ProgramExecutionTests(unittest.TestCase):
         np.testing.assert_array_equal(output.to_numpy(), np.array([12.0], dtype=np.float32))
         gradient = pullback({"output": np.ones((1,), dtype=np.float32)})["factor"]
         self.assertEqual(float(np.asarray(gradient)), 4.0)
+
+    def test_module_binds_all_abi_stable_value_categories(self) -> None:
+        transformed = ValueParameters()
+        arguments = (
+            vd.f32(1),
+            vd.Vector([2.0, 3.0]),
+            vd.Matrix([[4.0, 5.0], [6.0, 7.0]]),
+            (vd.f32(8), vd.Vector([9.0, 10.0])),
+            vd.Tensor([11.0, 12.0]),
+            ProgramValueRecord(vd.f32(13), vd.Vector([14.0, 15.0])),  # type: ignore[call-arg]
+        )
+
+        first = transformed(*arguments)
+        second = transformed(vd.f32(2), *arguments[1:])
+
+        np.testing.assert_array_equal(first.to_numpy(), np.array([66.0], dtype=np.float32))
+        np.testing.assert_array_equal(second.to_numpy(), np.array([67.0], dtype=np.float32))
 
     def test_aggregate_vjp_supports_direct_and_module_root_paths(self) -> None:
         direct_particles = particle_storage()
@@ -467,6 +598,55 @@ class ProgramGpuExecutionTests(unittest.TestCase):
             np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32),
         )
 
+    def test_gpu_module_binds_texture_as_forward_resource(self) -> None:
+        image = vd.Texture.from_numpy(
+            np.zeros((2, 2, 2, 4), dtype=np.float32),
+            dimension="3d",
+            format=vd.rgba32_float,
+            usage=("storage", "transfer_source", "transfer_destination"),
+        )
+        marker = vd.storage.from_numpy(np.array([7.0], dtype=np.float32))
+
+        result = TextureRoundTrip()(image, marker)
+
+        np.testing.assert_array_equal(result.to_numpy(), np.array([8.0], dtype=np.float32))
+        expected = np.zeros((2, 2, 2, 4), dtype=np.float32)
+        expected[...] = [1.0, 2.0, 3.0, 4.0]
+        np.testing.assert_array_equal(image.to_numpy(), expected)
+
+    def test_gpu_module_reuses_unchanged_value_and_storage_bindings(self) -> None:
+        source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
+        output = vd.storage.from_numpy(np.full(4, -1.0, dtype=np.float32))
+        module = PersistentlyBoundIncrement()
+
+        first = module(output, source, np.float32(2.0)).to_numpy().copy()
+        specialization = next(iter(module._program_cache.values()))
+        first_telemetry = dict(specialization.native_program.binding_telemetry)
+        unchanged = module(output, source, np.float32(2.0)).to_numpy().copy()
+        unchanged_telemetry = dict(specialization.native_program.binding_telemetry)
+        changed = module(output, source, np.float32(5.0)).to_numpy().copy()
+        changed_telemetry = dict(specialization.native_program.binding_telemetry)
+        source.copy_from_numpy(np.arange(4, dtype=np.float32) + 10.0)
+        dirty_storage = module(output, source, np.float32(5.0)).to_numpy().copy()
+        dirty_telemetry = dict(specialization.native_program.binding_telemetry)
+
+        np.testing.assert_array_equal(first, np.arange(4, dtype=np.float32) + 2.0)
+        np.testing.assert_array_equal(unchanged, np.arange(4, dtype=np.float32) + 2.0)
+        np.testing.assert_array_equal(changed, np.arange(4, dtype=np.float32) + 5.0)
+        np.testing.assert_array_equal(dirty_storage, np.arange(4, dtype=np.float32) + 15.0)
+        self.assertEqual(unchanged_telemetry["prepare_count"] - first_telemetry["prepare_count"], 0)
+        self.assertEqual(unchanged_telemetry["upload_bytes"] - first_telemetry["upload_bytes"], 0)
+        self.assertEqual(unchanged_telemetry["upload_ranges"] - first_telemetry["upload_ranges"], 0)
+        self.assertEqual(changed_telemetry["prepare_count"] - unchanged_telemetry["prepare_count"], 1)
+        self.assertEqual(changed_telemetry["upload_bytes"] - unchanged_telemetry["upload_bytes"], 4)
+        self.assertEqual(changed_telemetry["upload_ranges"] - unchanged_telemetry["upload_ranges"], 1)
+        self.assertEqual(dirty_telemetry["prepare_count"] - changed_telemetry["prepare_count"], 0)
+        self.assertEqual(
+            dirty_telemetry["upload_bytes"] - changed_telemetry["upload_bytes"],
+            source.to_numpy().nbytes,
+        )
+        self.assertEqual(dirty_telemetry["upload_ranges"] - changed_telemetry["upload_ranges"], 1)
+
     def test_gpu_module_vjp_accumulates_branch_fan_in(self) -> None:
         outputs, pullback = vd.ad.vjp(
             FanOut(),
@@ -485,15 +665,25 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
 
     def test_gpu_module_vjp_preserves_structured_storage_gradients(self) -> None:
+        particles = vd.storage.zeros(dtype=GpuParticle, shape=(1,))
+        values = particles.to_numpy()
+        values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float32)
+        values["mass"][0] = np.float32(4.0)
+        values["tag"][0] = np.int32(7)
+        particles.copy_from_numpy(values)
         output, pullback = vd.ad.vjp(
-            AggregateObjective(),
+            GpuAggregateObjective(),
             wrt=("particles",),
             outputs=("output",),
-        )(particle_storage())
+        )(particles)
 
         np.testing.assert_array_equal(output.to_numpy(), np.array([29.0], dtype=np.float32))
         gradient = pullback({"output": np.ones((1,), dtype=np.float32)})["particles"]
-        assert_particle_gradient(self, gradient)
+        np.testing.assert_array_equal(
+            gradient["velocity"].to_numpy(),
+            np.array([[4.0, -6.0]], dtype=np.float32),
+        )
+        np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
 
 
 if __name__ == "__main__":

@@ -246,10 +246,12 @@ if(TARGET VernonRuntime)
         VernonRuntimeTests
         runtime/compute_launch_planner_test.cpp
         runtime/directx_command_state_test.cpp
+        runtime/dirty_range_set_test.cpp
         runtime/execution_command_model_test.cpp
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
         runtime/pipeline_manifest_requirements_test.cpp
+        runtime/program_instance_test.cpp
         runtime/program_manifest_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
@@ -310,6 +312,7 @@ if(TARGET VernonRuntime)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
         set(gpu_autodiff_fixture_targets)
+        set(module_program_gpu_fixture_targets)
         if(VERNON_ENABLE_VULKAN_RUNTIME)
             vernon_add_pipeline_test_bundle(
                 gpu-autodiff-vulkan
@@ -318,6 +321,13 @@ if(TARGET VernonRuntime)
                 autodiff_gpu_vulkan_fixture
                 gpu_autodiff_vulkan_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                module-program-vulkan
+                vulkan
+                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+                module_program_vulkan_fixture
+                module_program_vulkan_manifest)
+            list(APPEND module_program_gpu_fixture_targets vernon-module-program-vulkan-test-bundle)
             vernon_add_pipeline_test_bundle(
                 gpu-autodiff-vulkan-non-power-of-two
                 vulkan
@@ -341,6 +351,13 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_cuda_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-test-bundle)
             vernon_add_pipeline_test_bundle(
+                module-program-cuda
+                cuda
+                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+                module_program_cuda_fixture
+                module_program_cuda_manifest)
+            list(APPEND module_program_gpu_fixture_targets vernon-module-program-cuda-test-bundle)
+            vernon_add_pipeline_test_bundle(
                 gpu-autodiff-cuda-non-power-of-two
                 cuda
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -362,6 +379,13 @@ if(TARGET VernonRuntime)
                 autodiff_gpu_directx_fixture
                 gpu_autodiff_directx_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-test-bundle)
+            vernon_add_pipeline_test_bundle(
+                module-program-directx
+                directx
+                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+                module_program_directx_fixture
+                module_program_directx_manifest)
+            list(APPEND module_program_gpu_fixture_targets vernon-module-program-directx-test-bundle)
             vernon_add_pipeline_test_bundle(
                 gpu-autodiff-directx-non-power-of-two
                 directx
@@ -385,6 +409,13 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_metal_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-test-bundle)
             vernon_add_pipeline_test_bundle(
+                module-program-metal
+                metal
+                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+                module_program_metal_fixture
+                module_program_metal_manifest)
+            list(APPEND module_program_gpu_fixture_targets vernon-module-program-metal-test-bundle)
+            vernon_add_pipeline_test_bundle(
                 gpu-autodiff-metal-non-power-of-two
                 metal
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -405,6 +436,13 @@ if(TARGET VernonRuntime)
             autodiff_gpu_opengl_fixture
             gpu_autodiff_opengl_manifest)
         list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-test-bundle)
+        vernon_add_pipeline_test_bundle(
+            module-program-opengl
+            opengl
+            "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+            module_program_opengl_fixture
+            module_program_opengl_manifest)
+        list(APPEND module_program_gpu_fixture_targets vernon-module-program-opengl-test-bundle)
         vernon_add_pipeline_test_bundle(
             gpu-autodiff-opengl-non-power-of-two
             opengl
@@ -427,6 +465,14 @@ if(TARGET VernonRuntime)
             vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
             cooked_autodiff_fixture_target)
+        vernon_add_cpu_autodiff_fixture(
+            module-program-cooked
+            module_program_cooked_fixture
+            module_program_cooked_fixture.pipeline.json
+            "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
+            vernonRegisterModuleProgramFixture
+            module_program_cooked_manifest
+            module_program_cooked_fixture_target)
         vernon_add_cpu_autodiff_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
@@ -563,6 +609,16 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2MixedAliasFixture
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
+        add_executable(VernonModuleProgramRuntimeTests runtime/runtime_module_program_c_api_test.cpp)
+        target_link_libraries(VernonModuleProgramRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
+                                                                      ${module_program_cooked_fixture_target})
+        target_compile_definitions(VernonModuleProgramRuntimeTests
+                                   PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cooked_manifest}")
+        set_target_properties(VernonModuleProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                         "${CMAKE_BINARY_DIR}/source")
+        vernon_stage_target_files(VernonModuleProgramRuntimeTests VernonRuntime)
+        vernon_discover_gtests(VernonModuleProgramRuntimeTests)
+
         if(gpu_autodiff_fixture_targets)
             add_executable(VernonGpuAutodiffTests runtime/runtime_gpu_autodiff_test.cpp)
             target_include_directories(VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
@@ -615,6 +671,41 @@ if(TARGET VernonRuntime)
                                                                     "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonGpuAutodiffTests VernonRuntime VernonRHI)
             vernon_discover_gtests(VernonGpuAutodiffTests)
+        endif()
+        if(module_program_gpu_fixture_targets)
+            add_executable(VernonModuleProgramGpuRuntimeTests runtime/runtime_module_program_gpu_c_api_test.cpp)
+            target_link_libraries(VernonModuleProgramGpuRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
+                                                                             Vernon::RHI)
+            target_include_directories(VernonModuleProgramGpuRuntimeTests
+                                       PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
+            if(VERNON_ENABLE_VULKAN_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleProgramGpuRuntimeTests
+                    PRIVATE VERNON_MODULE_PROGRAM_VULKAN_MANIFEST="${module_program_vulkan_manifest}")
+            endif()
+            if(VERNON_ENABLE_CUDA_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleProgramGpuRuntimeTests
+                    PRIVATE VERNON_MODULE_PROGRAM_CUDA_MANIFEST="${module_program_cuda_manifest}")
+            endif()
+            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleProgramGpuRuntimeTests
+                    PRIVATE VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST="${module_program_directx_manifest}")
+            endif()
+            if(VERNON_ENABLE_METAL_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleProgramGpuRuntimeTests
+                    PRIVATE VERNON_MODULE_PROGRAM_METAL_MANIFEST="${module_program_metal_manifest}")
+            endif()
+            target_compile_definitions(
+                VernonModuleProgramGpuRuntimeTests
+                PRIVATE VERNON_MODULE_PROGRAM_OPENGL_MANIFEST="${module_program_opengl_manifest}")
+            set_target_properties(VernonModuleProgramGpuRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                                "${CMAKE_BINARY_DIR}/source")
+            vernon_stage_target_files(VernonModuleProgramGpuRuntimeTests VernonRuntime VernonRHI)
+            vernon_discover_gtests(VernonModuleProgramGpuRuntimeTests)
         endif()
 
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)

@@ -8,6 +8,7 @@
 #include "target_binding_plan.h"
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -18,6 +19,7 @@
 namespace vernon::runtime::ad {
 class Executable;
 class AutodiffMemoryPolicy;
+size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &policy);
 } // namespace vernon::runtime::ad
 namespace vernon::runtime::program {
 struct ResolvedProgram;
@@ -36,6 +38,8 @@ struct VernonRuntimeContext {
     std::shared_ptr<vernon::runtime::ad::AutodiffMemoryPolicy> autodiffMemoryPolicy;
     std::mutex cpuEntriesMutex;
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
+    std::mutex referencedRhiBuffersMutex;
+    std::map<std::pair<uint64_t, uint64_t>, VernonRhiBuffer> referencedRhiBuffers;
 };
 
 namespace vernon::runtime {
@@ -151,6 +155,9 @@ struct VernonPipelineTopology {
     ~VernonPipelineTopology();
 
     std::shared_ptr<const vernon::runtime::program::ResolvedProgram> resolvedProgram;
+    // Stable leaf/path backing for C-ABI reflection. Slot identity, role,
+    // category, access, shape and ownership remain exclusively in ProgramABI.
+    std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
     std::vector<uint32_t> residualValues;
     bool directDispatch{};
     std::vector<VernonResolvedProgramStage> stages;

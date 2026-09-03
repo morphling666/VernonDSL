@@ -123,6 +123,9 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                     plan.hostTensorStorage.push_back(std::move(*packed));
                     argument = ComputeScalarArgument{plan.hostTensorStorage.back().data(),
                                                      plan.hostTensorStorage.back().size()};
+                    if (use.interfaceKind == "result")
+                        plan.resultCommits.push_back(
+                            {plan.hostTensorStorage.size() - 1, supplied.tensor, std::move(*layout)});
                 }
             }
             if (use.tensorViewDescriptor) {
@@ -302,6 +305,18 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
             if (tensorViewsHaveWritableOverlap(*tensors[left], *tensors[right]))
                 return fail(error, "pipeline Tensor arguments have incompatible physical overlap");
     return planComputeArguments(variant, arguments, workgroup, invocation, plan, error);
+}
+
+bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error) {
+    for (const ResultCommitPlan &publication : plan.resultCommits) {
+        if (publication.storageIndex >= plan.hostTensorStorage.size() ||
+            !unpackTensor(plan.hostTensorStorage[publication.storageIndex], publication.destination,
+                          publication.layout)) {
+            error = "compute Value result does not match its canonical host destination";
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace vernon::runtime

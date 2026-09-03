@@ -9,8 +9,12 @@
 #include <string>
 #include <vector>
 
+struct VernonLoadedPipeline;
+struct VernonPipelineBundle;
+struct VernonRuntimeContext;
+
 namespace vernon::runtime::ad {
-class ProgramValueArena;
+class ProgramInvocationFrame;
 }
 
 namespace vernon::runtime {
@@ -48,12 +52,12 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
                                    const PlannedGraphicsInvocation &plan);
 VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
 VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
-                                         const std::vector<VernonPipelineArgument> &values);
-VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
-                                         ad::ProgramValueArena &arena);
+                                         ad::ProgramInvocationFrame &frame);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);
+bool resolveBackendRhiBufferReference(VernonRuntimeContext &context,
+                                      const VernonRuntimeProviderResourceReference &reference, VernonRhiBuffer &output);
 VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,
                                           VernonRuntimeProviderResourceReference &output);
 VernonStatus referenceBackendRhiSampler(VernonRuntimeContext &context, VernonRhiSampler sampler,

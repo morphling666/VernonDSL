@@ -7,9 +7,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .binding import _dispatch_borrow_scope, _NativeBindingCache
+from .binding import _dispatch_borrow_scope, _PersistentBindingTable
 from .resource_common import _session_state
+from .sampler import SamplerState
 from .tensor import TensorStorage, TensorView
+from .texture import _TextureResource
 
 
 @dataclass
@@ -23,7 +25,7 @@ class CookedPipeline:
     _native: Any = None
     _runtime_generation: int = -1
     _program_bundle: bool = False
-    _binding_cache: _NativeBindingCache = field(default_factory=_NativeBindingCache, init=False, repr=False)
+    _binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
     def _load(self) -> None:
         state = _session_state()
@@ -31,35 +33,12 @@ class CookedPipeline:
             raise RuntimeError("cooked pipeline assets require the native runtime")
         if self._native is not None and self._runtime_generation == state._runtime_generation:
             return
-        document = json.loads(self._bundle)
-        if document.get("type") == "program_bundle":
-            variants = document.get("variants")
-            if not isinstance(variants, list):
-                raise RuntimeError("cooked Program bundle has no variants")
-            selected = next(
-                (
-                    variant
-                    for variant in variants
-                    if isinstance(variant, dict) and tuple(variant.get("key", ())) == self._features
-                ),
-                None,
-            )
-            if selected is None:
-                raise RuntimeError("cooked Program bundle has no matching feature variant")
-            self._native = state._native_runtime.load_canonical_program(
-                json.dumps(selected["program"], sort_keys=True, separators=(",", ":")).encode(),
-                json.dumps(selected["artifact_system"], sort_keys=True, separators=(",", ":")).encode(),
-                self._directory,
-                dict(selected["stage_bindings"]),
-                [],
-            )
-            self._program_bundle = True
-        else:
-            self._native = state._native_runtime.load_pipeline_asset(
-                self._bundle,
-                self._directory,
-                list(self._features),
-            )
+        self._native = state._native_runtime.load_cooked_asset(
+            self._bundle,
+            self._directory,
+            list(self._features),
+        )
+        self._program_bundle = self._native.is_managed_program
         self._runtime_generation = state._runtime_generation
 
     @property
@@ -102,7 +81,36 @@ class CookedPipeline:
 
         state = _session_state()
         if self._program_bundle:
-            self._native.program_forward(bindings, bindings)
+            parameters = {parameter.slot: parameter for parameter in self._native.parameters}
+            slots = tuple(
+                slot for slot in self._native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
+            )
+            if set(parameters) != {slot["slot"] for slot in slots}:
+                raise RuntimeError("cooked Program parameters do not match compiler-emitted ProgramABI")
+            access_names = {
+                state._native.ACCESS_READ: "read",
+                state._native.ACCESS_WRITE: "write",
+                state._native.ACCESS_READ_WRITE: "read_write",
+            }
+            resolved = [(parameters[slot["slot"]], bindings[slot["path"]]) for slot in slots]
+            borrows = [
+                (parameter.name, value, access_names[parameter.access])
+                for parameter, value in resolved
+                if isinstance(value, (TensorStorage, TensorView, _TextureResource))
+            ]
+            with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
+                for parameter, value in resolved:
+                    if parameter.kind == state._native.PIPELINE_SAMPLER:
+                        if not isinstance(value, SamplerState):
+                            raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
+                        self._binding_cache.bind_sampler(builder, self._native, parameter, value)
+                    else:
+                        self._binding_cache.bind_argument(builder, self._native, parameter, value)
+                self._native.program_forward_bound(builder)
+            if state._architecture != state.cpu:
+                for parameter, value in resolved:
+                    if parameter.access != state._native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
+                        value._mark_device_dirty()
             return
         access_names = {
             state._native.ACCESS_READ: "read",
@@ -160,23 +168,7 @@ def _source_parameter_order(bundle: bytes) -> tuple[str, ...]:
         return ()
     artifacts = manifest.get("stage_artifacts")
     if manifest.get("type") == "program_bundle":
-        variants = manifest.get("variants")
-        if not isinstance(variants, list) or not variants:
-            return ()
-        program = variants[0].get("program")
-        signature = program.get("signature") if isinstance(program, dict) else None
-        if not isinstance(signature, dict):
-            return ()
-        names: list[str] = []
-        for kind in ("inputs", "outputs"):
-            rows = signature.get(kind)
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                path = row.get("path") if isinstance(row, dict) else None
-                if isinstance(path, str) and path not in names:
-                    names.append(path)
-        return tuple(names)
+        return ()
     if not isinstance(artifacts, dict):
         return ()
     for artifact in artifacts.values():

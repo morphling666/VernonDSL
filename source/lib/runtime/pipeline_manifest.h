@@ -227,6 +227,7 @@ bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);
+void rebuildVariantLayoutViews(Variant &variant);
 bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
                               std::string &error);
 bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required);

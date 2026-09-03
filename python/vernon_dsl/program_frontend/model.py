@@ -14,7 +14,7 @@ class ProgramType:
 
 
 @dataclass(frozen=True)
-class GraphValue:
+class MlirValue:
     name: str
     type: ProgramType
     role: str
@@ -22,23 +22,13 @@ class GraphValue:
 
 
 @dataclass(frozen=True)
-class GraphOperation:
+class MlirOperation:
     id: int
     kind: str
     name: str
     operands: tuple[tuple[str, str], ...]
     results: tuple[tuple[str, str], ...]
     attributes: tuple[tuple[str, str], ...] = ()
-
-
-@dataclass(frozen=True)
-class ProgramGraph:
-    name: str
-    direction: str
-    values: tuple[GraphValue, ...]
-    arguments: tuple[GraphValue, ...]
-    results: tuple[GraphValue, ...]
-    operations: tuple[GraphOperation, ...]
 
 
 @dataclass(frozen=True)
@@ -52,10 +42,8 @@ class ProgramImplementation:
 
 @dataclass(frozen=True)
 class ParsedProgram:
-    """Program-level forward/backward graphs and their canonical MLIR."""
+    """Compiler inputs derived from one canonical captured OperationGraph."""
 
-    forward: ProgramGraph
-    backward: ProgramGraph | None
     mlir: str
     implementations: tuple[ProgramImplementation, ...] = ()
     provenance: tuple[str, ...] = ()
@@ -77,10 +65,9 @@ class ParsedProgram:
 
 
 __all__ = [
-    "GraphOperation",
-    "GraphValue",
+    "MlirOperation",
+    "MlirValue",
     "ParsedProgram",
-    "ProgramGraph",
     "ProgramImplementation",
     "ProgramType",
 ]

@@ -16,14 +16,27 @@ bool parseAutodiffResourceRole(const nlohmann::json &argument, AutodiffResourceR
     const std::string value = argument.value("vernon.autodiff_role", "");
     if (value.empty())
         return true;
-    if (value == "input")
+    if (const std::optional<program_plan::TapeCarrier> carrier = program_plan::tapeCarrierFromRoleName(value)) {
+        switch (*carrier) {
+        case program_plan::TapeCarrier::TapeData:
+            role = AutodiffResourceRole::Tape;
+            break;
+        case program_plan::TapeCarrier::ReplaySegment:
+            role = AutodiffResourceRole::ReplaySegment;
+            break;
+        case program_plan::TapeCarrier::ReplayStatus:
+            role = AutodiffResourceRole::ReplayStatus;
+            break;
+        case program_plan::TapeCarrier::LaunchMetadata:
+            role = AutodiffResourceRole::LaunchMetadata;
+            break;
+        }
+    } else if (value == "input")
         role = AutodiffResourceRole::Input;
     else if (value == "storage")
         role = AutodiffResourceRole::Storage;
     else if (value == "output")
         role = AutodiffResourceRole::Output;
-    else if (value == "tape")
-        role = AutodiffResourceRole::Tape;
     else if (value == "cotangent")
         role = AutodiffResourceRole::Cotangent;
     else if (value == "gradient")
@@ -32,12 +45,6 @@ bool parseAutodiffResourceRole(const nlohmann::json &argument, AutodiffResourceR
         role = AutodiffResourceRole::Primal;
     else if (value == "retained_primal")
         role = AutodiffResourceRole::RetainedPrimal;
-    else if (value == "replay_segment")
-        role = AutodiffResourceRole::ReplaySegment;
-    else if (value == "replay_status")
-        role = AutodiffResourceRole::ReplayStatus;
-    else if (value == "launch_metadata")
-        role = AutodiffResourceRole::LaunchMetadata;
     else {
         error = "compute artifact reflection contains an unknown autodiff resource role";
         return false;

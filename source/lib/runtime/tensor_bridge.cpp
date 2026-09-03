@@ -620,6 +620,24 @@ std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, c
     return packed;
 }
 
+bool unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor, const TensorCopyPlan &layout) {
+    if (tensor.storage != VERNON_TENSOR_HOST || tensor.rank != 0 || !layout.shape.empty() ||
+        !layout.byteStrides.empty() || packed.size() != layout.byteSize ||
+        tensor.element_layout.byte_size != layout.elementSize || !tensorFitsAllocation(tensor))
+        return false;
+    if (!tensor.host_data)
+        return false;
+    uint8_t *destination = static_cast<uint8_t *>(const_cast<void *>(tensor.host_data)) + tensor.byte_offset;
+    for (const CopyOperation &operation : layout.operations) {
+        if (operation.destinationOffset > packed.size() ||
+            operation.size > packed.size() - operation.destinationOffset ||
+            operation.sourceOffset > layout.elementSize || operation.size > layout.elementSize - operation.sourceOffset)
+            return false;
+        std::memcpy(destination + operation.sourceOffset, packed.data() + operation.destinationOffset, operation.size);
+    }
+    return true;
+}
+
 std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor) {
     const size_t elementSize = valueLayoutValid(tensor.element_layout) ? tensor.element_layout.byte_size : 0;
     const std::optional<size_t> packedSize = tensorLogicalByteSize(tensor);

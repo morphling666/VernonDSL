@@ -39,13 +39,16 @@ private:
                 const Parameter &parameter = stage.pipeline->variant.parameters[index];
                 if (binding.leaf || parameter.invocationCarrier || (binding.target && binding.target->viewTransform))
                     continue;
+                const uint32_t value = binding.value;
+                if (value >= program_.values.size())
+                    return error = "compiled stage binding refers to an invalid Program value", false;
+                if (program::isTapeValueType(program_.values[value].type) ||
+                    (program_.values[value].layout && program_.values[value].shape.empty()))
+                    continue;
                 const std::optional<shape::ConcreteShape> concrete =
                     shape::concrete(shape::decodeRuntimeContractShape(parameter.shape));
                 if (!concrete)
                     continue;
-                const uint32_t value = binding.value;
-                if (value >= program_.values.size())
-                    return error = "compiled stage binding refers to an invalid Program value", false;
                 if (!bind(value, *concrete, "compiled stage binding", error))
                     return false;
             }
@@ -75,8 +78,23 @@ private:
     bool bind(uint32_t value, const shape::ConcreteShape &concrete, const char *source, std::string &error) {
         if (value >= program_.values.size() || value >= values_.size())
             return error = std::string(source) + " refers to an invalid Program value", false;
-        if (!shape::matches(shape::decodeRuntimeContractShape(program_.values[value].shape), concrete))
-            return error = std::string(source) + " conflicts with the declared Program shape", false;
+        if (!shape::matches(shape::decodeRuntimeContractShape(program_.values[value].shape), concrete)) {
+            const auto format = [](const auto &values) {
+                std::string result = "[";
+                for (size_t index = 0; index < values.size(); ++index) {
+                    if (index)
+                        result += ", ";
+                    result += std::to_string(values[index]);
+                }
+                return result + "]";
+            };
+            return error = std::string(source) + " for value '" + program_.values[value].name + "' (" +
+                           program_.values[value].type +
+                           (program_.values[value].layout ? ", canonical layout" : ", no canonical layout") +
+                           ") has shape " + format(concrete) + " but the Program declares " +
+                           format(program_.values[value].shape),
+                   false;
+        }
         if (values_[value].concreteShape && *values_[value].concreteShape != concrete)
             return error = std::string(source) + " conflicts with another concrete Program shape", false;
         values_[value].concreteShape = concrete;

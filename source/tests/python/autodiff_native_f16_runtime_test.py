@@ -14,7 +14,7 @@ def main() -> None:
     from vernon_dsl import _native
 
     runtime = _native.Runtime(_native.RuntimeBackend.CPU)
-    pipeline = runtime.load_pipeline_asset(manifest.read_bytes(), str(manifest.parent), [])
+    pipeline = runtime.load_cooked_asset(manifest.read_bytes(), str(manifest.parent), [])
 
     objective = vd.storage.zeros(dtype=vd.f16, shape=(1,))
     output, pullback = pipeline.vjp({"x": np.float16(1.5), "output": objective}, (1, 1, 1))

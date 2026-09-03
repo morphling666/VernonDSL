@@ -281,6 +281,22 @@ static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::Owni
         if (mlir::failed(indices))
             return VERNON_STATUS_VERIFICATION_ERROR;
         options.wrtBoundaryIndices = std::move(*indices);
+        if (auto outputs = (*module)->getAttrOfType<mlir::ArrayAttr>("vernon_program.vjp_outputs")) {
+            publicPaths.clear();
+            for (mlir::Attribute value : outputs) {
+                auto name = mlir::dyn_cast<mlir::StringAttr>(value);
+                if (!name) {
+                    (*module).emitError("Program VJP output paths must be strings");
+                    return VERNON_STATUS_VERIFICATION_ERROR;
+                }
+                publicPaths.push_back(name.getValue());
+            }
+            mlir::FailureOr<llvm::SmallVector<unsigned>> outputIndices =
+                mlir::vernon::program::resolveProgramCotangentBoundaryIndices(primal, publicPaths);
+            if (mlir::failed(outputIndices))
+                return VERNON_STATUS_VERIFICATION_ERROR;
+            options.cotangentBoundaryIndices = std::move(*outputIndices);
+        }
         programVjp = std::move(options);
     }
     if (hasProgramGraph) {

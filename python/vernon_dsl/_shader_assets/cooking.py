@@ -11,7 +11,7 @@ from typing import Any, Mapping
 
 from .._runtime.operators import ImplementationUnavailable
 from .._versions import PIPELINE_VERSION
-from ..ad import ProgramTransformSpec
+from ..ad import ProgramTransformSpec, _capability_diagnostic
 from ..bundle import (
     BundlePlan,
     CompiledStage,
@@ -225,7 +225,7 @@ def _compile_program_bundle_plan(
         (
             CapturedDslProvider(implementations),
             CapturedVjpDslProvider(implementations, native),
-            BuiltinDslProvider(),
+            BuiltinDslProvider(native=native),
         )
     )
     vjp_requests: list[Mapping[str, Any]] = []
@@ -695,11 +695,20 @@ def _compile_module_bundle_plan(
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
 ) -> BundlePlan:
     from ..module import Module
-    from ..program import _parse_module_program
+    from ..program import ModuleVjpExpression, _parse_module_program
 
-    if not isinstance(declaration.program, Module):
+    expression = declaration.program
+    module = expression.module if isinstance(expression, ModuleVjpExpression) else expression
+    if not isinstance(module, Module):
         raise PipelineCompileError("pipeline asset declared a host Program that is not a Vernon Module")
-    parsed = _parse_module_program(declaration.program)
+    parsed = _parse_module_program(
+        module,
+        vjp_wrt=expression.wrt if isinstance(expression, ModuleVjpExpression) else None,
+        vjp_outputs=expression.outputs if isinstance(expression, ModuleVjpExpression) else None,
+        autodiff_planning_policy=(
+            expression.planning_policy if isinstance(expression, ModuleVjpExpression) else "min_memory"
+        ),
+    )
     compiler = native.Compiler()
     variant_plans = [
         _compile_program_bundle_plan(
@@ -741,9 +750,7 @@ def cook_pipeline_asset(
         target = make_target_options(target)
     target_name = target.target
     if pipeline.transform is not None and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
-        raise PipelineCompileError(
-            "graphics VJP asset cooking is not supported; automatic differentiation requires a compute pipeline"
-        )
+        raise PipelineCompileError(_capability_diagnostic("graphics_vjp"))
     if target_name == "cpu" and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
         raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
     for stage in pipeline.stages:
@@ -774,8 +781,6 @@ def cook_pipeline_asset(
     compile_cache: dict[tuple[str, str, str, str], CompiledStage] = {}
     compiler = native.Compiler()
     if pipeline.program_kind == "module":
-        if pipeline.transform is not None:
-            raise PipelineCompileError("Module VJP asset cooking is not enabled until canonical primal Programs ship")
         declaration = _load_pipeline_asset_declaration(source, descriptor_name)
         plan = _compile_module_bundle_plan(
             declaration,

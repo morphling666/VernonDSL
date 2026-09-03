@@ -578,7 +578,7 @@ as the only representable topology.
 
 Pipeline 17 packages canonical Program, ArtifactSystem, and stage bindings.
 Primal and differentiated topology share this representation; a backward graph
-and Program signature describe autodiff when present. Pipeline-16
+and ProgramABI describe autodiff when present. Pipeline-16
 transform/profile fields are not current aliases.
 
 Resolved Program owns multi-node orchestration above VernonRHI. Its typed nodes
@@ -615,7 +615,7 @@ compatibility normalizer.
 Standalone compute, standalone graphics, and Module inputs all produce one
 Program object and follow `ResolveProgram` then `ExecuteProgram`. Standalone
 inputs are one-node Programs. The object directly contains `stages`,
-`parameters`, `storages`, `values`, `graphs`, and `signature`; there is no
+`parameters`, `storages`, `values`, `graphs`, and `abi`; there is no
 profile manifest, name-binding table, direct topology, `structural_inputs`,
 `configure`, or `graphics_config` channel. The target Program graphs are static
 compute/graphics DAGs. Transfer nodes and deployment control-flow nodes are not
@@ -784,7 +784,7 @@ limits.
 The normative serialized schema and resolve checks are defined by
 [`../program_execution_manifest.md`](../program_execution_manifest.md).
 The breaking Program object directly contains `stages`, `parameters`,
-`storages`, `values`, `graphs`, and `signature`. `ResolveProgram` is the only
+`storages`, `values`, `graphs`, and `abi`. `ResolveProgram` is the only
 loader/binder and resolves every stage through the artifact system; it does not
 accept old manifests, synthesize Programs from direct artifacts, or bind by
 name. `ExecuteProgram` accepts only the resulting immutable resolved Program.
@@ -816,7 +816,7 @@ are runtime state, not serialized topology.
 physical layout, extent, lifetime, and ownership. Entry control metadata may
 select launch/draw behavior but cannot create resource authority or override a
 descriptor. Resource values, including caller-visible buffers and textures,
-are published through ordinary `signature.outputs`; Runtime has no separate
+are published through ordinary ProgramABI output slots; Runtime has no separate
 resource-output ownership channel.
 
 The target Program resolver accepts only static DAGs whose nodes are compute or

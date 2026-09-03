@@ -26,6 +26,10 @@ and milestone checklists.
 6. [`autodiff_tutorial.md`](autodiff_tutorial.md) explains the implemented
    Phase 1/2 VJP stack from Tape IR and dynamic control flow through CPU
    multithreading and canonical Program VJP.
+   [`module_program_test_gaps.md`](module_program_test_gaps.md) is the active
+   Module/Program capability and regression contract for input parity,
+   persistent binding, output selection, opaque resources, and acceptance
+   gates.
 7. [`autodiff_cost_aware_residual_plan.md`](autodiff_cost_aware_residual_plan.md)
    records completed Phase 1/2 memory work and the active production-target
    residual-source, cost-model, and bounded-replay checklist.
@@ -80,7 +84,7 @@ canonical deployment path:
 
 ```text
 source executable
-  -> Program { stages, parameters, storages, values, graphs, signature }
+  -> Program { stages, parameters, storages, values, graphs, abi }
   -> ResolveProgram
   -> ExecuteProgram
 ```

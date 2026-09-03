@@ -271,6 +271,25 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
     return fail(context, detail.empty() ? "GPU autodiff command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
 }
 
+VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies) {
+    if (copies.empty())
+        return VERNON_STATUS_OK;
+    execution::detail::RhiCommandExecutionPlan plan;
+    appendCopyBindings(plan.bindings, copies);
+    auto transferContext = std::make_shared<TransferCommandContext>(context, copies, std::vector<DeviceBufferUpload>{});
+    execution::detail::CommandNode transfer;
+    transfer.kind = execution::detail::CommandNodeKind::Transfer;
+    transfer.queue = execution::detail::CommandQueueClass::Transfer;
+    appendCopyAccesses(transfer, copies);
+    plan.commands.nodes.push_back(std::move(transfer));
+    plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
+    plan.retainedContexts.push_back(std::move(transferContext));
+    std::string error;
+    if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
+        return fail(context, std::move(error));
+    return executeCommandPlanAndWait(context, plan);
+}
+
 VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, VernonLaunchSize grid,
                                               std::vector<VernonPipelineArgument> &arguments,
                                               const std::vector<DeviceBufferUpload> &uploadsBefore,

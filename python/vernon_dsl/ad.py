@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+from importlib import import_module
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, cast
 
 from .bundle import canonical_json
 from .language.stage_registry import GRAPHICS_STAGES, validate_graphics_topology
@@ -15,11 +16,12 @@ _PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
 _RULE_NAMES = ("rasterization", "visibility", "depth", "blend", "texture")
 
 
-def _canonical_paths(
-    values: tuple[str, ...] | list[str],
-    *,
-    label: str,
-) -> tuple[str, ...]:
+def _capability_diagnostic(name: str) -> str:
+    capability = import_module("vernon_dsl._native")._program_capability(name)
+    return f"{capability['code']}: {capability['diagnostic']}"
+
+
+def _ordered_paths(values: tuple[str, ...] | list[str], *, label: str) -> tuple[str, ...]:
     if not isinstance(values, (tuple, list)) or not values:
         raise ValueError(f"{label} must be a non-empty tuple or list of canonical source paths")
     paths = tuple(values)
@@ -27,7 +29,20 @@ def _canonical_paths(
         raise ValueError(f"{label} entries must be canonical source paths")
     if len(set(paths)) != len(paths):
         raise ValueError(f"{label} paths must be unique")
-    return tuple(sorted(paths))
+    return paths
+
+
+@dataclass(frozen=True)
+class BoundarySelection:
+    ordered_paths: tuple[str, ...]
+
+    @classmethod
+    def create(cls, values: tuple[str, ...] | list[str], *, label: str) -> BoundarySelection:
+        return cls(_ordered_paths(values, label=label))
+
+    @property
+    def canonical_key(self) -> tuple[str, ...]:
+        return tuple(sorted(self.ordered_paths))
 
 
 @dataclass(frozen=True)
@@ -82,12 +97,12 @@ class ProgramTransformSpec:
             raise ValueError("unsupported derivative rules version")
         if (self.rule_set is None) != (self.rule_set_identity is None):
             raise ValueError("rule set name and identity must be provided together")
-        object.__setattr__(self, "wrt", _canonical_paths(self.wrt, label="wrt"))
+        object.__setattr__(self, "wrt", BoundarySelection.create(self.wrt, label="wrt").ordered_paths)
         if self.output_cotangents:
             object.__setattr__(
                 self,
                 "output_cotangents",
-                _canonical_paths(self.output_cotangents, label="outputs"),
+                BoundarySelection.create(self.output_cotangents, label="outputs").ordered_paths,
             )
 
     def to_dict(self) -> dict[str, Any]:
@@ -148,12 +163,26 @@ def vjp(
     if isinstance(program, Module):
         if rules is not None:
             raise ValueError("Module VJP does not accept graphics custom rules")
+        from .types import TypeExpr
+
+        for path, child in program.named_modules():
+            definition = child._module_definition
+            for name in definition.signature.parameters:
+                annotation = definition.resolved_annotations.get(name)
+                if annotation is None:
+                    continue
+                if isinstance(annotation, TypeExpr) and annotation.name in {"Texture", "Sampler"}:
+                    qualified = f"{path}.{name}" if path else name
+                    raise TypeError(
+                        f"Module VJP does not support {annotation.name} parameter {qualified!r}; "
+                        f"{_capability_diagnostic('opaque_resource_vjp')}"
+                    )
         from .program import ModuleVjpExpression
 
         return ModuleVjpExpression(
             program,
-            wrt=_canonical_paths(wrt, label="wrt"),
-            outputs=(_canonical_paths(outputs, label="outputs") if outputs is not None else None),
+            wrt=BoundarySelection.create(wrt, label="wrt").ordered_paths,
+            outputs=(BoundarySelection.create(outputs, label="outputs").ordered_paths if outputs is not None else None),
             planning_policy=planning_policy,
         )
     if isinstance(program, ProgramExpression):
@@ -164,7 +193,7 @@ def vjp(
         kinds = [getattr(value, "__vernon_dsl__", (None,))[0] for value in program]
         if any(kind not in GRAPHICS_STAGES for kind in kinds):
             raise TypeError("graphics VJP program must contain only graphics entry stages")
-        validate_graphics_topology(kinds)
+        validate_graphics_topology(cast(list[str], kinds))
         if rules is None:
             raise ValueError("graphics VJP requires a named custom rule set")
         if outputs is not None:
@@ -178,15 +207,18 @@ def vjp(
             raise ValueError("compute VJP requires non-empty writable Storage outputs")
     if rules is not None and not isinstance(rules, RuleSet):
         raise TypeError("rules must be declared with vd.ad.rule_set")
+    wrt_selection = BoundarySelection.create(wrt, label="wrt")
     spec = ProgramTransformSpec(
         "vjp",
-        tuple(wrt),
+        wrt_selection.canonical_key,
         rule_set=rules.id if rules is not None else None,
         rule_set_identity=rules.digest if rules is not None else None,
-        output_cotangents=(_canonical_paths(outputs, label="outputs") if outputs is not None else ()),
+        output_cotangents=(
+            BoundarySelection.create(outputs, label="outputs").canonical_key if outputs is not None else ()
+        ),
         planning_policy=planning_policy,
     )
     return ProgramExpression(program, spec, rules)
 
 
-__all__ = ["ProgramExpression", "ProgramTransformSpec", "RuleSet", "rule_set", "vjp"]
+__all__ = ["BoundarySelection", "ProgramExpression", "ProgramTransformSpec", "RuleSet", "rule_set", "vjp"]

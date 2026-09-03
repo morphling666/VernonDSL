@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import inspect
 import operator
-import textwrap
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 from ..module import Module
-from ..operation_graph import GraphBuffer
+from ..operation_graph import GraphBuffer, GraphResourceInput, GraphValueInput
 from ..storage import TensorStorage, _logical_collection_shape
 from ..storage import empty as storage_empty
 from ..storage import empty_like as storage_empty_like
@@ -21,6 +18,8 @@ from ..storage import from_values as storage_from_values
 from ..storage import tangent_zeros as storage_tangent_zeros
 from ..storage import zeros as storage_zeros
 from ..storage import zeros_like as storage_zeros_like
+from .model import SemanticCategory
+from .runtime_types import RuntimeParameterDescriptor
 
 _COMPARE = {
     ast.Eq: operator.eq,
@@ -78,24 +77,29 @@ class _ForwardReturn(Exception):
         self.value = value
 
 
-@dataclass(frozen=True)
-class ModuleParameterType:
-    dtype: Any
-    shape: tuple[int, ...]
-    access: str = "read_write"
-    as_view: bool = False
-
-
 def interpret_module_forward(
     module: Module,
-    parameter_types: Mapping[str, ModuleParameterType],
+    parameter_types: Mapping[str, RuntimeParameterDescriptor],
 ) -> tuple[Any, Any]:
     from ..program import ProgramCapture
 
-    inputs = {
-        name: GraphBuffer(parameter_type.dtype, parameter_type.shape, parameter_type.access, parameter_type.as_view)
-        for name, parameter_type in parameter_types.items()
-    }
+    inputs: dict[str, Any] = {}
+    for name, parameter_type in parameter_types.items():
+        if parameter_type.kind is SemanticCategory.STORAGE:
+            storage = parameter_type.storage_metadata
+            inputs[name] = GraphBuffer(
+                storage.dtype,
+                storage.shape,
+                storage.access,
+                storage.as_view,
+                parameter_type.logical,
+            )
+        elif parameter_type.kind is SemanticCategory.VALUE:
+            inputs[name] = GraphValueInput(name, parameter_type)
+        elif parameter_type.kind is SemanticCategory.RESOURCE:
+            inputs[name] = GraphResourceInput(name, parameter_type)
+        else:
+            raise TypeError(f"unknown Module parameter kind {parameter_type.kind!r}")
     capture = ProgramCapture(module, inputs)
     interpreter = _ForwardInterpreter(capture, module)
     outputs = interpreter.interpret(module, dict(inputs))
@@ -106,6 +110,10 @@ def _is_graph(value: Any) -> bool:
     return isinstance(value, GraphBuffer)
 
 
+def _is_program_argument(value: Any) -> bool:
+    return isinstance(value, (GraphBuffer, GraphResourceInput, GraphValueInput))
+
+
 def _require_graph(value: Any, *, what: str) -> GraphBuffer:
     if not isinstance(value, GraphBuffer):
         raise TypeError(f"{what} requires a Program buffer")
@@ -113,7 +121,7 @@ def _require_graph(value: Any, *, what: str) -> GraphBuffer:
 
 
 def _contains_graph(value: Any) -> bool:
-    if _is_graph(value):
+    if _is_program_argument(value):
         return True
     if isinstance(value, (tuple, list)):
         return any(_contains_graph(member) for member in value)
@@ -126,25 +134,19 @@ def _contains_graph(value: Any) -> bool:
 
 def _require_comptime(value: Any, *, what: str) -> Any:
     if _contains_graph(value):
-        raise TypeError(f"Module.forward() {what} must be host-static; got a Program Storage or TensorView")
+        raise TypeError(f"Module.forward() {what} must be host-static; got a Program invocation argument")
     return value
 
 
 def _forward_function(module: Module) -> Any:
-    function = module.forward
-    return getattr(function, "__func__", function)
+    return type(module)._module_definition.original_function
 
 
 def _parse_forward(module: Module) -> ast.FunctionDef:
-    function = _forward_function(module)
-    try:
-        source = textwrap.dedent(inspect.getsource(function))
-        tree = ast.parse(source)
-    except (OSError, TypeError, SyntaxError) as error:
-        raise TypeError(f"cannot parse {type(module).__name__}.forward: {error}") from error
-    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.FunctionDef):
-        raise TypeError(f"{type(module).__name__}.forward must be a function definition")
-    return tree.body[0]
+    definition = type(module)._module_definition
+    if definition.forward_ast is None:
+        raise TypeError(definition.forward_ast_error or f"cannot parse {type(module).__name__}.forward")
+    return definition.forward_ast
 
 
 def _is_kernel(value: Any) -> bool:
@@ -281,10 +283,10 @@ class _ForwardInterpreter:
             if isinstance(expression.value, ast.Name) and expression.value.id == "self":
                 return getattr(owner, expression.attr)
             base = self._expr(expression.value, owner, locals_, globals_)
-            if _is_graph(base):
+            if _is_program_argument(base):
                 raise TypeError(
-                    f"Module.forward() cannot read attribute {expression.attr!r} from Program Storage; "
-                    "use vd.empty_like()/vd.zeros_like() or a host-static Module attribute"
+                    f"Module.forward() cannot read attribute {expression.attr!r} from a Program argument; "
+                    "use it in a Kernel call or use a host-static Module attribute"
                 )
             return getattr(base, expression.attr)
         if isinstance(expression, ast.Tuple):
@@ -338,8 +340,8 @@ class _ForwardInterpreter:
         if isinstance(expression, ast.Subscript):
             value = self._expr(expression.value, owner, locals_, globals_)
             index = self._expr(expression.slice, owner, locals_, globals_)
-            if _is_graph(value):
-                raise TypeError("Module.forward() cannot index Program Storage; use a Kernel")
+            if _is_program_argument(value):
+                raise TypeError("Module.forward() cannot index a Program argument; use a Kernel")
             _require_comptime(index, what="subscript")
             return value[index]
         if isinstance(expression, ast.Slice):
@@ -386,7 +388,7 @@ class _ForwardInterpreter:
             return self._allocate(allocator, args, keywords)
         if isinstance(callee, Module):
             child_name = attr_name if attr_name is not None else type(callee).__name__
-            bound = inspect.signature(callee.forward).bind(*args, **keywords)
+            bound = type(callee)._module_definition.signature.bind(*args, **keywords)
             bound.apply_defaults()
             self.capture.enter_module(child_name)
             try:
@@ -411,7 +413,7 @@ class _ForwardInterpreter:
             return callee(*args, **keywords)
         if any(_contains_graph(value) for value in (*args, *keywords.values())):
             raise TypeError(
-                f"{getattr(callee, '__name__', type(callee).__name__)} cannot take Program Storage arguments "
+                f"{getattr(callee, '__name__', type(callee).__name__)} cannot take Program invocation arguments "
                 "in Module.forward(); call a Kernel, child Module, or vd.empty/vd.zeros/vd.from_values"
             )
         if not callable(callee):
@@ -446,4 +448,4 @@ class _ForwardInterpreter:
         raise RuntimeError(f"unknown Program allocation {kind!r}")
 
 
-__all__ = ["ModuleParameterType", "interpret_module_forward"]
+__all__ = ["interpret_module_forward"]

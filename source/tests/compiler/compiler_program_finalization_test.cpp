@@ -1,4 +1,13 @@
-#include "compiler_program_finalization.h"
+#include "VernonProgramCapabilities.h"
+#include "compiler_program_boundary.h"
+#include "compiler_program_derivative.h"
+#include "compiler_program_graph.h"
+#include "compiler_program_implementation.h"
+#include "compiler_program_publication.h"
+#include "compiler_program_serializer.h"
+#include "compiler_program_stage.h"
+#include "compiler_program_storage.h"
+#include "compiler_program_tape.h"
 
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/JSON.h"
@@ -7,6 +16,18 @@
 #include <string>
 
 namespace {
+
+TEST(ProgramCapabilities, CurrentReleaseUsesStableUnsupportedDecisions) {
+    using namespace vernon::program_capabilities;
+    EXPECT_TRUE(get(Id::ComputeVjp).supported);
+    EXPECT_TRUE(get(Id::GraphicsTextureSampling).supported);
+    EXPECT_FALSE(get(Id::ComputeSamplerBinding).supported);
+    EXPECT_EQ(get(Id::ComputeSamplerBinding).diagnosticCode, "PROGRAM_COMPUTE_SAMPLER_UNSUPPORTED");
+    EXPECT_FALSE(get(Id::GraphicsVjp).supported);
+    EXPECT_FALSE(get(Id::OpaqueResourceVjp).supported);
+    EXPECT_TRUE(get(Id::CpuF16).supported);
+    EXPECT_FALSE(get(Id::GpuF16).supported);
+}
 
 llvm::json::Value parse(llvm::StringRef text) {
     auto parsed = llvm::json::parse(text);
@@ -92,6 +113,139 @@ bool hasParameter(const llvm::json::Array *bindings, llvm::StringRef name) {
 }
 
 } // namespace
+
+TEST(CompilerProgramDerivativePlanner, SelectsLongestPrimalAndTypedValuePath) {
+    using namespace vernon::compiler;
+    const std::vector<ProgramBoundaryIdentity> boundaries{
+        {0, "result", ProgramBoundaryRole::Output},
+        {1, "result.inner", ProgramBoundaryRole::Output},
+        {2, "result.inner.2", ProgramBoundaryRole::Cotangent},
+    };
+    std::vector<ProgramDerivativeProjectionPlan> projections;
+    std::string error;
+    ASSERT_TRUE(planProgramDerivativeProjections(boundaries, projections, error)) << error;
+    ASSERT_EQ(projections.size(), 1u);
+    EXPECT_EQ(projections[0].primal.slot, 1);
+    ASSERT_EQ(projections[0].valuePath.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<uint32_t>(projections[0].valuePath[0]));
+    EXPECT_EQ(std::get<uint32_t>(projections[0].valuePath[0]), 2u);
+}
+
+TEST(CompilerProgramDerivativePlanner, RejectsUnprojectableDerivative) {
+    using namespace vernon::compiler;
+    const std::vector<ProgramBoundaryIdentity> boundaries{
+        {0, "source", ProgramBoundaryRole::Input},
+        {1, "other", ProgramBoundaryRole::Gradient},
+    };
+    std::vector<ProgramDerivativeProjectionPlan> projections;
+    std::string error;
+    EXPECT_FALSE(planProgramDerivativeProjections(boundaries, projections, error));
+    EXPECT_NE(error.find("cannot project derivative boundary"), std::string::npos);
+}
+
+TEST(CompilerProgramBoundaryPlanner, AccessAndPublicationAreIndependentTypedPlans) {
+    using namespace vernon::compiler;
+    llvm::json::Value document = parse(R"({
+      "signature": {
+        "inputs": [{"path": "state", "value": 0}],
+        "outputs": [{"path": "result", "value": 1}],
+        "cotangents": [],
+        "gradients": []
+      },
+      "values": [
+        {"id": 0, "type": "tensor<1xf32>", "shape": [1], "storage": 0},
+        {"id": 1, "type": "tensor<1xf32>", "shape": [1], "storage": 0}
+      ],
+      "storages": [{
+        "id": 0,
+        "descriptor": {"tag": "buffer", "byte_length": 4, "alignment": 4, "memory": "device", "usage": ["storage"]}
+      }],
+      "graphs": [{
+        "direction": "forward",
+        "nodes": [{"accesses": [{"storage": 0, "access": "read_write"}]}]
+      }]
+    })");
+    llvm::json::Object *root = document.getAsObject();
+    ASSERT_NE(root, nullptr);
+    ProgramBoundaryPlan boundaries;
+    std::string error;
+    ASSERT_TRUE(planProgramBoundaries(*root->getObject("signature"), *root->getArray("values"),
+                                      *root->getArray("storages"), *root->getArray("graphs"), boundaries, error))
+        << error;
+    ASSERT_EQ(boundaries.slots.size(), 2u);
+    EXPECT_EQ(boundaries.slots[0].access, ProgramBoundaryAccess::ReadWrite);
+    const ProgramPublicationPlan publication = planProgramPublications(boundaries);
+    ASSERT_EQ(publication.targets.size(), 1u);
+    EXPECT_EQ(publication.targets[0].slot, boundaries.slots[1].identity.slot);
+    llvm::json::Array serialized = serializeProgramBoundarySlots(boundaries, publication);
+    EXPECT_EQ(serialized[0].getAsObject()->get("publication"), nullptr);
+    EXPECT_EQ(serialized[1].getAsObject()->getString("publication"), "commit_after_success");
+}
+
+TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
+    using namespace vernon::compiler;
+    llvm::json::Value values = parse(R"([
+      {
+        "id": 4,
+        "type": "!vernon.ad_tape<16>",
+        "origin": {"tag": "node_result", "graph": "forward", "node": 0}
+      }
+    ])");
+    llvm::json::Value graphs = parse(R"([
+      {"direction": "forward"},
+      {"direction": "backward"}
+    ])");
+    const std::vector<ProgramTapePlan> plans = planProgramTapes(*values.getAsArray(), *graphs.getAsArray());
+    ASSERT_EQ(plans.size(), 1u);
+    EXPECT_TRUE(plans[0].forwardProducer);
+    EXPECT_TRUE(plans[0].backwardConsumer);
+    EXPECT_EQ(plans[0].requiredCarriers,
+              std::vector<ProgramTapeCarrier>({ProgramTapeCarrier::TapeData, ProgramTapeCarrier::ReplaySegment}));
+}
+
+TEST(CompilerProgramSerializer, SerializesPlanWithoutDerivingFields) {
+    using namespace vernon::compiler;
+    CanonicalProgramSerializationPlan plan;
+    plan.stages["stage"] = llvm::json::Object{{"operation", "compute"}};
+    plan.abi["boundary_slots"] = llvm::json::Array();
+    llvm::json::Object serialized = serializeCanonicalProgram(std::move(plan));
+    ASSERT_NE(serialized.getObject("stages"), nullptr);
+    EXPECT_EQ(serialized.get("signature"), nullptr);
+    ASSERT_NE(serialized.getObject("abi"), nullptr);
+    EXPECT_EQ(serialized.get("residual_contract"), nullptr);
+}
+
+TEST(CompilerProgramLinker, ProducesTypedBoundaryIdsAndChecksStageCoverage) {
+    using namespace vernon::compiler;
+    llvm::json::Value graphs = parse(R"([
+      {
+        "name": "forward",
+        "direction": "forward",
+        "arguments": [3],
+        "results": [4],
+        "nodes": [{"id": 0}]
+      }
+    ])");
+    CanonicalProgramLinkPlan plan;
+    std::string error;
+    ASSERT_TRUE(linkCanonicalProgram(*graphs.getAsArray(), 1, plan, error)) << error;
+    ASSERT_EQ(plan.graphs.size(), 1u);
+    EXPECT_EQ(plan.graphs[0].arguments, std::vector<int64_t>({3}));
+    EXPECT_EQ(plan.graphs[0].results, std::vector<int64_t>({4}));
+    EXPECT_FALSE(linkCanonicalProgram(*graphs.getAsArray(), 0, plan, error));
+    EXPECT_NE(error.find("do not exactly cover"), std::string::npos);
+}
+
+TEST(CompilerProgramStorageAliasPlanner, ProducesTypedOwnerGroupsAndRejectsCycles) {
+    using namespace vernon::compiler;
+    ProgramStorageAliasPlan plan;
+    std::string error;
+    ASSERT_TRUE(planProgramStorageAliases({{0, 0}, {1, 0}, {2, 2}}, plan, error)) << error;
+    EXPECT_EQ(plan.ownerByValue.at(1), ProgramStorageOwnerId{0});
+    EXPECT_EQ(plan.versionsByOwner.at(ProgramStorageOwnerId{0}), std::vector<int64_t>({0, 1}));
+    EXPECT_FALSE(planProgramStorageAliases({{0, 1}, {1, 0}}, plan, error));
+    EXPECT_NE(error.find("cycle"), std::string::npos);
+}
 
 TEST(CompilerProgramFinalization, OmitsInactiveNestedVjpCotangents) {
     llvm::json::Value execution = executionWithBindings(kBindings);

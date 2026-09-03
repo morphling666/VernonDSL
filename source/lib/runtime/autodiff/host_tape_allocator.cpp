@@ -9,6 +9,11 @@
 #include <utility>
 
 namespace vernon::runtime::ad {
+
+size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &policy) {
+    return policy ? policy->contextLimit() : 0;
+}
+
 namespace {
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION

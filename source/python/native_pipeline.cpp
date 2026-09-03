@@ -1,5 +1,7 @@
 #include "native_pipeline.h"
 
+#include <future>
+
 std::string nativeStringView(VernonStringView view) {
     return view.data ? std::string(view.data, view.size) : std::string();
 }
@@ -76,6 +78,27 @@ std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText,
         throw std::invalid_argument(diagnostics.empty() ? "structured VJP transform failed" : diagnostics);
     }
     return transformedResult;
+}
+
+std::pair<std::string, std::string> buildProgramBuiltin(const std::string &operation, const std::string &elementType,
+                                                        uint32_t rank, const std::vector<std::string> &leafDtypes) {
+    std::vector<VernonStringView> leaves;
+    leaves.reserve(leafDtypes.size());
+    for (const std::string &leaf : leafDtypes)
+        leaves.push_back({leaf.data(), leaf.size()});
+    VernonPythonProgramBuiltin *result = vernonCompilerBuildPythonProgramBuiltin(
+        {operation.data(), operation.size()}, {elementType.data(), elementType.size()}, rank, leaves.data(),
+        leaves.size());
+    if (!result)
+        throw std::bad_alloc();
+    const VernonPythonProgramBuiltinView view = vernonCompilerGetPythonProgramBuiltinView(result);
+    const std::string diagnostics = nativeStringView(view.diagnostics);
+    const std::string entry = nativeStringView(view.entry);
+    const std::string module = nativeStringView(view.module);
+    vernonCompilerDestroyPythonProgramBuiltin(result);
+    if (view.status != VERNON_STATUS_OK)
+        throw std::invalid_argument(diagnostics.empty() ? "Program built-in lowering failed" : diagnostics);
+    return {entry, module};
 }
 
 std::string specializeKernelHostConstants(const std::string &moduleText, const std::string &entry,

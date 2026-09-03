@@ -1,5 +1,6 @@
 #include "compiler_spirv.h"
 
+#include "VernonProgramCapabilities.h"
 #include "compiler_dispatch.h"
 #include "compiler_frontend.h"
 #include "compiler_reflection.h"
@@ -253,7 +254,8 @@ bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::v
         return false;
     }
     if (moduleUsesF16(module.get())) {
-        diagnostics = "GPU targets do not currently support f16";
+        const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
+        diagnostics = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
         return false;
     }
 

@@ -1,6 +1,7 @@
 #ifndef VERNON_RUNTIME_PROGRAM_EXECUTION_MANIFEST_H
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_MANIFEST_H
 
+#include "VernonProgramPlanTypes.h"
 #include "pipeline_bundle.h"
 #include "pipeline_manifest.h"
 
@@ -337,19 +338,109 @@ struct Graph {
     std::vector<Node> nodes;
 };
 
-struct SignatureBinding {
-    std::string path;
-    uint32_t value{};
-    std::optional<uint32_t> primal;
-    std::optional<std::string> disposition;
+enum class BoundaryRole {
+    Input,
+    Output,
+    Cotangent,
+    Gradient,
 };
 
-struct Signature {
-    std::vector<SignatureBinding> inputs;
-    std::vector<SignatureBinding> outputs;
-    std::vector<SignatureBinding> cotangents;
-    std::vector<SignatureBinding> gradients;
+enum class BoundaryDirection {
+    Input,
+    Output,
 };
+
+enum class BoundaryCategory {
+    Value,
+    StorageView,
+    Texture,
+    Sampler,
+};
+
+enum class BoundaryAccess {
+    Read,
+    Write,
+    ReadWrite,
+};
+
+struct BoundaryStorage {
+    uint32_t id{};
+    StorageDescriptorKind descriptorKind{StorageDescriptorKind::Buffer};
+    BufferDescriptor buffer;
+    ImageDescriptor image;
+    std::string opaqueContractHash;
+};
+
+enum class ProgramOwnerKind {
+    Value,
+    Storage,
+};
+
+struct ProgramOwnerId {
+    ProgramOwnerKind kind{ProgramOwnerKind::Value};
+    uint32_t id{};
+};
+
+enum class BoundaryPublication {
+    None,
+    CommitAfterSuccess,
+};
+
+struct BoundarySlot {
+    uint32_t id{};
+    std::string path;
+    uint32_t value{};
+    BoundaryRole role{BoundaryRole::Input};
+    BoundaryDirection direction{BoundaryDirection::Input};
+    BoundaryCategory category{BoundaryCategory::Value};
+    BoundaryAccess access{BoundaryAccess::Read};
+    std::string logicalType;
+    std::vector<uint64_t> outerShape;
+    ProgramOwnerId aliasOwner;
+    BoundaryPublication publication{BoundaryPublication::None};
+    std::optional<ValueLayout> layout;
+    std::optional<BoundaryStorage> storage;
+};
+
+struct PublicationTarget {
+    uint32_t slot{};
+    uint32_t value{};
+    BoundaryRole role{BoundaryRole::Output};
+    ProgramOwnerId aliasOwner;
+};
+
+struct PublicationPlan {
+    std::vector<PublicationTarget> targets;
+};
+
+struct BoundaryReference {
+    uint32_t slot{};
+    std::string path;
+};
+
+struct DerivativeProjection {
+    BoundaryReference derivative;
+    BoundaryReference primal;
+    std::vector<LayoutPathComponent> valuePath;
+};
+
+struct TapePlan {
+    uint32_t value{};
+    bool forwardProducer{};
+    bool backwardConsumer{};
+    std::vector<vernon::program_plan::TapeCarrier> requiredCarriers;
+    std::vector<vernon::program_plan::TapeCarrier> optionalCarriers;
+};
+
+struct ProgramAbi {
+    std::vector<BoundarySlot> boundarySlots;
+    std::vector<DerivativeProjection> derivativeProjections;
+    std::vector<TapePlan> tapePlans;
+    PublicationPlan publication;
+};
+
+PublicationPlan derivePublicationPlan(const std::vector<BoundarySlot> &slots);
+const PublicationTarget *findPublicationTarget(const ProgramAbi &abi, uint32_t slot);
 
 struct ResidualCapture {
     uint32_t value{};
@@ -365,7 +456,7 @@ struct Program {
     std::vector<Storage> storages;
     std::vector<Value> values;
     std::vector<Graph> graphs;
-    Signature signature;
+    ProgramAbi abi;
     std::optional<ResidualContract> residualContract;
 };
 

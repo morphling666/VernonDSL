@@ -5,6 +5,8 @@
 #include "compiler_internal.h"
 #include "compiler_kernel_bootstrap.h"
 #include "compiler_program_finalization.h"
+#include "compiler_program_implementation.h"
+#include "compiler_program_stage.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -428,12 +430,6 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             result->diagnostics = "Program request has no ABI bindings";
             return result.release();
         }
-        std::map<int64_t, size_t> bindingCounts;
-        for (const llvm::json::Value &bindingValue : *bindings)
-            if (const llvm::json::Object *binding = bindingValue.getAsObject())
-                if (std::optional<int64_t> valueId = binding->getInteger("value"))
-                    ++bindingCounts[*valueId];
-        std::map<int64_t, size_t> bindingOrdinals;
         for (llvm::json::Value &bindingValue : *bindings) {
             if (expectedStage == "graphics")
                 break;
@@ -458,41 +454,47 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             std::optional<llvm::StringRef> expectedDtype = value->getString("dtype");
             llvm::json::Array *expectedShape = value->getArray("shape");
             llvm::json::Array aggregateExpectedShape;
-            if (expectedStage == "compute" && bindingCounts[*valueId] > 1) {
+            if (expectedStage == "compute" && (!expectedShape || expectedShape->empty()) &&
+                !value->getInteger("storage"))
+                if (llvm::json::Object *layout = value->getObject("value_layout"))
+                    if (llvm::json::Array *leaves = layout->getArray("leaves"); leaves && leaves->size() == 1)
+                        if (llvm::json::Object *leaf = (*leaves)[0].getAsObject())
+                            if (llvm::json::Array *leafShape = leaf->getArray("shape")) {
+                                expectedShape = leafShape;
+                                expectedDtype = leaf->getString("dtype");
+                            }
+            std::optional<size_t> projectedLeafIndex;
+            if (expectedStage == "compute") {
                 llvm::json::Object *layout = value->getObject("value_layout");
                 llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
-                llvm::json::Object *leaf = nullptr;
-                const bool semanticProjection = autodiffSource && (role == "gradient" || role == "cotangent");
-                if (leaves && semanticProjection) {
-                    std::optional<size_t> leafIndex;
-                    if (const std::optional<int64_t> projected = binding->getInteger("leaf");
-                        projected && *projected >= 0)
-                        leafIndex = static_cast<size_t>(*projected);
+                const std::optional<int64_t> explicitLeaf = binding->getInteger("leaf");
+                if (explicitLeaf) {
+                    if (*explicitLeaf < 0)
+                        projectedLeafIndex = std::numeric_limits<size_t>::max();
                     else
-                        leafIndex =
-                            vernon::compiler::resolveProgramValueLeafIndex(*layout, *autodiffSource, *parameter);
-                    if (leafIndex && *leafIndex < leaves->size())
-                        leaf = (*leaves)[*leafIndex].getAsObject();
+                        projectedLeafIndex = static_cast<size_t>(*explicitLeaf);
+                } else if (layout && autodiffSource && (role == "gradient" || role == "cotangent")) {
+                    projectedLeafIndex =
+                        vernon::compiler::resolveProgramValueLeafIndex(*layout, *autodiffSource, *parameter);
                 }
-                if (!leaf && !semanticProjection) {
-                    const size_t ordinal = bindingOrdinals[(*valueId)]++;
-                    leaf = leaves && ordinal < leaves->size() ? (*leaves)[ordinal].getAsObject() : nullptr;
-                }
-                if (!leaf) {
+                if (projectedLeafIndex && (!leaves || *projectedLeafIndex >= leaves->size())) {
                     result->status = VERNON_STATUS_VERIFICATION_ERROR;
                     result->diagnostics =
-                        "Program aggregate binding does not match its canonical Value ABI for request '" + requestId +
+                        "Program leaf projection does not match its canonical Value ABI for request '" + requestId +
                         "'";
                     return result.release();
                 }
-                expectedDtype = leaf->getString("dtype");
-                if (llvm::json::Array *ownerShape = value->getArray("shape"))
-                    for (const llvm::json::Value &extent : *ownerShape)
-                        aggregateExpectedShape.emplace_back(extent);
-                if (llvm::json::Array *leafShape = leaf->getArray("shape"))
-                    for (const llvm::json::Value &extent : *leafShape)
-                        aggregateExpectedShape.emplace_back(extent);
-                expectedShape = &aggregateExpectedShape;
+                if (projectedLeafIndex) {
+                    llvm::json::Object *leaf = (*leaves)[*projectedLeafIndex].getAsObject();
+                    expectedDtype = leaf ? leaf->getString("dtype") : std::nullopt;
+                    if (llvm::json::Array *ownerShape = value->getArray("shape"))
+                        for (const llvm::json::Value &extent : *ownerShape)
+                            aggregateExpectedShape.emplace_back(extent);
+                    if (llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr)
+                        for (const llvm::json::Value &extent : *leafShape)
+                            aggregateExpectedShape.emplace_back(extent);
+                    expectedShape = &aggregateExpectedShape;
+                }
             }
             std::optional<llvm::StringRef> actualDtype = parameterRow->getString("dtype");
             if (!actualDtype)
@@ -501,7 +503,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             if (!actualShape)
                 actualShape = parameterRow->getArray("source_shape");
             llvm::json::Array derivativeActualShape;
-            if (actualShape && bindingCounts[*valueId] > 1 && (role == "gradient" || role == "cotangent")) {
+            if (actualShape && projectedLeafIndex) {
                 llvm::json::Object *layout = parameterRow->getObject("value_layout");
                 if (!layout)
                     layout = parameterRow->getObject("element_layout");
@@ -527,8 +529,18 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             const bool graphicsVertexElement = expectedStage == "graphics" &&
                                                parameterRow->getArray("attribute_leaves") &&
                                                suffixShape(expectedShape, actualShape);
-            if (!opaqueResource && ((expectedDtype && actualDtype && *expectedDtype != *actualDtype) ||
-                                    (!compatibleBindingShape && !graphicsVertexElement))) {
+            llvm::json::Object *expectedLayout = value->getObject("value_layout");
+            llvm::json::Object *actualLayout = parameterRow->getObject("value_layout");
+            const std::optional<llvm::StringRef> expectedLayoutHash =
+                expectedLayout ? expectedLayout->getString("layout_hash") : std::nullopt;
+            const std::optional<llvm::StringRef> actualLayoutHash =
+                actualLayout ? actualLayout->getString("layout_hash") : std::nullopt;
+            const bool canonicalValueLayoutMatches = expectedStage == "compute" && parameterKind == "tensor_value" &&
+                                                     !projectedLeafIndex && expectedLayoutHash && actualLayoutHash &&
+                                                     *expectedLayoutHash == *actualLayoutHash;
+            if (!opaqueResource && !canonicalValueLayoutMatches &&
+                ((expectedDtype && actualDtype && *expectedDtype != *actualDtype) ||
+                 (!compatibleBindingShape && !graphicsVertexElement))) {
                 auto shapeText = [](const llvm::json::Array *shape) {
                     if (!shape)
                         return std::string("[]");

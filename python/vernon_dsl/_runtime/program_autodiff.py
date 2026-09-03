@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import tempfile
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import numpy as np
 
@@ -14,9 +15,12 @@ from .._shader_assets.cooking import (
     _native_target,
 )
 from ..bundle import canonical_json, make_target_options
-from ..storage import TensorStorage
+from ..storage import TensorStorage, TensorView
 from . import session as state
 from .autodiff import _pipeline_derivative_groups
+from .binding import _DispatchBorrowLease, _PersistentBindingTable
+from .sampler import SamplerState
+from .texture import _TextureResource
 
 
 def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
@@ -36,17 +40,94 @@ def _program_host_array(value: Any) -> np.ndarray:
     return np.asarray(value)
 
 
+@contextmanager
+def _bound_program_invocation(
+    pipeline: Any,
+    cache: _PersistentBindingTable,
+    invocation: Any,
+    targets: Mapping[str, Any],
+    *,
+    retain_borrows: bool = False,
+) -> Iterator[tuple[Any, list[Any], _DispatchBorrowLease]]:
+    parameters = tuple(pipeline.parameters)
+    parameters_by_slot = {parameter.slot: parameter for parameter in parameters}
+    if len(parameters_by_slot) != len(parameters):
+        raise RuntimeError("Program compiler ABI contains duplicate public slots")
+    boundary_slots = tuple(
+        slot for slot in pipeline.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
+    )
+    if set(parameters_by_slot) != {slot["slot"] for slot in boundary_slots}:
+        raise RuntimeError("Program invocation parameters do not match compiler-emitted ProgramABI")
+
+    def binding(slot: Mapping[str, Any]) -> tuple[str, Any]:
+        path = slot["path"]
+        values = invocation.inputs if slot["role"] == "input" else targets
+        if path not in values:
+            raise RuntimeError(f"Program invocation is missing boundary value {path!r}")
+        return path, values[path]
+
+    access_names = {
+        state._native.ACCESS_READ: "read",
+        state._native.ACCESS_WRITE: "write",
+        state._native.ACCESS_READ_WRITE: "read_write",
+    }
+    resolved = [(parameters_by_slot[slot["slot"]], slot, *binding(slot)) for slot in boundary_slots]
+    borrows = [
+        (path, value, access_names[parameter.access])
+        for parameter, _, path, value in resolved
+        if isinstance(value, (TensorStorage, TensorView, _TextureResource))
+    ]
+    written: list[Any] = []
+    lease = _DispatchBorrowLease(borrows)
+    succeeded = False
+    try:
+        with cache.invocation(pipeline) as builder:
+            for parameter, _, path, value in resolved:
+                if parameter.kind == state._native.PIPELINE_SAMPLER:
+                    if not isinstance(value, SamplerState):
+                        raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
+                    cache.bind_sampler(builder, pipeline, parameter, value)
+                else:
+                    cache.bind_argument(
+                        builder,
+                        pipeline,
+                        parameter,
+                        value,
+                        annotation=invocation.input_annotations.get(path),
+                    )
+                if (
+                    state._architecture != state.cpu
+                    and parameter.access != state._native.ACCESS_READ
+                    and hasattr(value, "_mark_device_dirty")
+                ):
+                    written.append(value)
+            yield builder, written, lease
+        succeeded = True
+    finally:
+        if retain_borrows and succeeded:
+            lease.release_writes()
+        else:
+            lease.release()
+
+
 class ProgramNativePullback:
     def __init__(
         self,
         native: Any,
         signature: Mapping[str, Any],
         outputs: Mapping[str, Any],
+        inputs: Mapping[str, Any],
         derivative_groups: tuple[Any, ...],
+        lease: _DispatchBorrowLease,
     ) -> None:
         self._native = native
         self._signature = signature
         self._outputs = dict(outputs)
+        self._inputs = dict(inputs)
+        self._lease = lease
+        self._storage_gradients = {
+            path for path, value in inputs.items() if isinstance(value, (TensorStorage, TensorView))
+        }
         self._gradient_groups = tuple(group for group in derivative_groups if group.role == "gradient")
         self._cotangent_groups = tuple(group for group in derivative_groups if group.role == "cotangent")
 
@@ -76,19 +157,31 @@ class ProgramNativePullback:
                         leaf: _program_storage_leaf(value, root, leaf)._native_host_array() for leaf in group.leaf_paths
                     }
             supplied = grouped_cotangents
-        gradients = dict(
-            self._native.apply_grouped(
-                supplied,
-                self._gradient_groups,
-                self._cotangent_groups,
-                (),
-                False,
+        try:
+            gradients = dict(
+                self._native.apply_grouped(
+                    supplied,
+                    self._gradient_groups,
+                    self._cotangent_groups,
+                    (),
+                    False,
+                )
             )
-        )
+        finally:
+            self._lease.release()
         return {
-            path: (value if isinstance(value, TensorStorage) else TensorStorage.from_numpy(np.asarray(value)))
+            path: (
+                value
+                if isinstance(value, TensorStorage) or path not in self._storage_gradients
+                else TensorStorage.from_numpy(np.asarray(value))
+            )
             for path, value in gradients.items()
         }
+
+    def __del__(self) -> None:
+        lease = getattr(self, "_lease", None)
+        if lease is not None:
+            lease.release()
 
     @property
     def logical_residual_bytes(self) -> int:
@@ -137,6 +230,11 @@ class ProgramAutodiffSpecialization:
     template: Any
     pipeline: Any
     directory: tempfile.TemporaryDirectory[str]
+    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+
+    @property
+    def binding_telemetry(self) -> Mapping[str, int]:
+        return self.binding_cache.telemetry
 
     def invoke(
         self,
@@ -152,45 +250,42 @@ class ProgramAutodiffSpecialization:
                 "Program invocation inputs do not match compiler ABI: "
                 f"expected={sorted(expected_inputs)}, actual={sorted(invocation.inputs)}"
             )
-        native_inputs = {
-            path: (value._native_host_array() if hasattr(value, "_native_host_array") else value)
-            for path, value in invocation.inputs.items()
-        }
         from ..program import flatten_program_outputs
 
         targets = flatten_program_outputs(invocation.outputs)
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
-        native_outputs, native_pullback = self.pipeline.program_vjp(
-            native_inputs,
-            program_bindings,
-            checkpoint_memory_budget=checkpoint_memory_budget,
-            checkpoint_policy=checkpoint_policy,
-        )
+        with _bound_program_invocation(
+            self.pipeline,
+            self.binding_cache,
+            invocation,
+            targets,
+            retain_borrows=True,
+        ) as (builder, written, lease):
+            native_outputs, native_pullback = self.pipeline.program_vjp_bound(
+                builder,
+                program_bindings,
+                checkpoint_memory_budget=checkpoint_memory_budget,
+                checkpoint_policy=checkpoint_policy,
+            )
+            for value in written:
+                value._mark_device_dirty()
         derivative_groups = _pipeline_derivative_groups(self.pipeline)
-        output_groups = tuple(group for group in derivative_groups if group.role == "cotangent")
-        expected_output_leaves = {leaf for group in output_groups for leaf in group.leaf_paths}
-        if set(native_outputs) != expected_output_leaves:
+        pullback = ProgramNativePullback(
+            native_pullback,
+            signature,
+            targets,
+            invocation.inputs,
+            derivative_groups,
+            lease,
+        )
+        expected_output_leaves = {row["path"] for row in signature["outputs"]}
+        if native_outputs and set(native_outputs) != expected_output_leaves:
             raise RuntimeError(
                 "Program outputs do not match compiler ABI: "
                 f"expected={sorted(expected_output_leaves)}, actual={sorted(native_outputs)}"
             )
-        for group in output_groups:
-            path = group.declared_path
-            target = targets[path]
-            for leaf_path in group.leaf_paths:
-                source = np.asarray(native_outputs[leaf_path])
-                destination = _program_storage_leaf(target, path, leaf_path)
-                if isinstance(destination, TensorStorage) or hasattr(destination, "copy_from_numpy"):
-                    destination.copy_from_numpy(source)
-                else:
-                    np.copyto(destination._native_host_array(), source)
-        return invocation.outputs, ProgramNativePullback(
-            native_pullback,
-            signature,
-            targets,
-            derivative_groups,
-        )
+        return invocation.outputs, pullback
 
 
 @dataclass
@@ -198,18 +293,24 @@ class ProgramSpecialization:
     template: Any
     pipeline: Any
     directory: tempfile.TemporaryDirectory[str]
+    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+
+    @property
+    def binding_telemetry(self) -> Mapping[str, int]:
+        return self.binding_cache.telemetry
 
     def invoke(self, invocation: Any) -> Any:
         from ..program import flatten_program_outputs
 
-        native_inputs = {
-            path: (value._native_host_array() if hasattr(value, "_native_host_array") else value)
-            for path, value in invocation.inputs.items()
-        }
         targets = flatten_program_outputs(invocation.outputs)
-        bindings = dict(invocation.inputs)
-        bindings.update(targets)
-        self.pipeline.program_forward(native_inputs, bindings)
+        with _bound_program_invocation(self.pipeline, self.binding_cache, invocation, targets) as (
+            builder,
+            written,
+            _,
+        ):
+            self.pipeline.program_forward_bound(builder)
+            for value in written:
+                value._mark_device_dirty()
         return invocation.outputs
 
 

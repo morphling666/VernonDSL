@@ -12,7 +12,7 @@ import numpy as np
 from .._dtypes import scalar_name
 from ..frontend.model import ConcreteType
 from .mlir import emit_program
-from .model import GraphOperation, GraphValue, ParsedProgram, ProgramGraph, ProgramImplementation, ProgramType
+from .model import MlirOperation, MlirValue, ParsedProgram, ProgramImplementation, ProgramType
 
 
 def _quoted(value: str) -> str:
@@ -21,6 +21,10 @@ def _quoted(value: str) -> str:
 
 def _string_array(values: tuple[str, ...]) -> str:
     return "[" + ", ".join(_quoted(value) for value in values) + "]"
+
+
+def _i64_array(values: tuple[int, ...] | list[str]) -> str:
+    return "array<i64: " + ", ".join(str(value) for value in values) + ">" if values else "array<i64>"
 
 
 def _program_resource_type(value_type: ConcreteType) -> ProgramType:
@@ -32,6 +36,8 @@ def _program_resource_type(value_type: ConcreteType) -> ProgramType:
         # of one owner stay the same TensorView cell + view shape.
         return ProgramType(ConcreteType("tensor_view", "TensorView", (element, shape, "read_write", "device")))
     if value_type.kind == "tensor":
+        return ProgramType(value_type)
+    if value_type.kind in {"texture", "sampler"}:
         return ProgramType(value_type)
     raise TypeError(f"Program resource parameter has unsupported logical type {value_type.kind!r}")
 
@@ -71,68 +77,69 @@ def _constant_attribute(value: Any) -> str:
     raise TypeError(f"Program constant has unsupported type {type(value).__name__}")
 
 
-def _scalar_input_ids(invocation: Any) -> set[int]:
-    ids: set[int] = set()
-    for name, value in invocation.inputs.items():
-        if name in invocation.graph.inputs:
-            continue
-        try:
-            _scalar_type(value)
-        except TypeError:
-            continue
-        ids.add(id(value))
-    return ids
+def _value_input_types(invocation: Any) -> dict[int, ProgramType]:
+    from ..operation_graph import GraphValueInput
+
+    return {
+        id(value): ProgramType(value.logical)
+        for value in invocation.inputs.values()
+        if isinstance(value, GraphValueInput)
+    }
 
 
 def _operation_host_constants(
     node: Any,
     invocation: Any,
-    scalar_input_ids: set[int],
+    value_input_ids: set[int],
 ) -> tuple[tuple[str, int | float | bool], ...]:
     constants: list[tuple[str, int | float | bool]] = []
     for parameter in node.parameters:
         if parameter.name in node.inputs:
             continue
         supplied = invocation.slots[node.binding_slots[parameter.name]]
-        if id(supplied) in scalar_input_ids:
+        if id(supplied) in value_input_ids:
             continue
         constants.append((parameter.name, _host_constant_value(supplied)))
     return tuple(constants)
 
 
-def _forward_graph(
+def _lower_forward_function(
     invocation: Any,
     resource_types: Mapping[int, ProgramType],
-    direction: str,
-) -> ProgramGraph:
+) -> tuple[
+    tuple[MlirValue, ...],
+    tuple[MlirValue, ...],
+    tuple[MlirValue, ...],
+    tuple[MlirOperation, ...],
+]:
     from ..operation_graph import AllocOp, KernelCallOp
 
     graph = invocation.graph
-    values: dict[str, GraphValue] = {
-        f"%v{value.id}": GraphValue(f"%v{value.id}", resource_types[value.id], "resource", value.id)
+    values: dict[str, MlirValue] = {
+        f"%v{value.id}": MlirValue(f"%v{value.id}", resource_types[value.id], "resource", value.id)
         for value in graph.values
     }
-    arguments: list[GraphValue] = []
+    arguments: list[MlirValue] = []
     for name, value_id in graph.inputs.items():
         ssa = f"%v{value_id}"
         if all(argument.name != ssa for argument in arguments):
-            arguments.append(GraphValue(ssa, values[ssa].type, f"input.{name}", value_id))
+            arguments.append(MlirValue(ssa, values[ssa].type, f"input.{name}", value_id))
 
-    scalar_inputs: dict[int, str] = {}
+    value_input_types = _value_input_types(invocation)
+    value_inputs: dict[int, str] = {}
     for index, (name, value) in enumerate(invocation.inputs.items()):
         if name in graph.inputs:
             continue
-        try:
-            value_type = _scalar_type(value)
-        except TypeError:
+        value_type = value_input_types.get(id(value))
+        if value_type is None:
             continue
         ssa = f"%arg{index}"
-        graph_value = GraphValue(ssa, value_type, f"input.{name}", -1)
+        graph_value = MlirValue(ssa, value_type, f"input.{name}", -1)
         values[ssa] = graph_value
         arguments.append(graph_value)
-        scalar_inputs[id(value)] = ssa
+        value_inputs[id(value)] = ssa
 
-    operations: list[GraphOperation] = []
+    operations: list[MlirOperation] = []
     for node in graph.nodes:
         if isinstance(node, AllocOp):
             operands = (("source", f"%v{node.like}"),) if node.like is not None else ()
@@ -140,7 +147,7 @@ def _forward_graph(
             if node.values is not None:
                 attributes.append(("payload", _quoted(json.dumps(node.values))))
             operations.append(
-                GraphOperation(
+                MlirOperation(
                     node.id,
                     "vernon.intrinsic",
                     node.name,
@@ -162,7 +169,7 @@ def _forward_graph(
                 continue
             slot = node.binding_slots[parameter.name]
             supplied = invocation.slots[slot]
-            ssa = scalar_inputs.get(id(supplied))
+            ssa = value_inputs.get(id(supplied))
             if ssa is None:
                 constant_names.append(parameter.name)
                 constant_values.append(_constant_attribute(supplied))
@@ -175,7 +182,7 @@ def _forward_graph(
         for result_name in result_names:
             resource_sources.append(str(operand_names.index(result_name)) if result_name in operand_names else "-1")
         operations.append(
-            GraphOperation(
+            MlirOperation(
                 node.id,
                 "vernon_program.compute",
                 node.name,
@@ -183,7 +190,7 @@ def _forward_graph(
                 results,
                 (
                     ("callee", _quoted(node.name)),
-                    ("grid", "array<i64: " + ", ".join(str(value) for value in node.grid) + ">"),
+                    ("grid", _i64_array(node.grid)),
                     ("features", _string_array(node.features)),
                     ("operand_names", _string_array(operand_names)),
                     ("result_names", _string_array(result_names)),
@@ -193,7 +200,7 @@ def _forward_graph(
                     ),
                     (
                         "vernon_program.result_resource_sources",
-                        "array<i64: " + ", ".join(resource_sources) + ">",
+                        _i64_array(resource_sources),
                     ),
                     ("constant_names", _string_array(tuple(constant_names))),
                     ("constant_values", "[" + ", ".join(constant_values) + "]"),
@@ -202,12 +209,10 @@ def _forward_graph(
         )
 
     results = [
-        GraphValue(f"%v{value_id}", values[f"%v{value_id}"].type, f"output.{path}", value_id)
+        MlirValue(f"%v{value_id}", values[f"%v{value_id}"].type, f"output.{path}", value_id)
         for path, value_id in graph.outputs.items()
     ]
-    return ProgramGraph(
-        direction,
-        direction,
+    return (
         tuple(values.values()),
         tuple(arguments),
         tuple(results),
@@ -219,20 +224,28 @@ def parse_program(
     invocation: Any,
     *,
     vjp_wrt: tuple[str, ...] = (),
+    vjp_outputs: tuple[str, ...] | None = None,
     autodiff_planning_policy: str | None = None,
 ) -> ParsedProgram:
     """Parse one captured Module specialization into a primal Program."""
 
     implementations: dict[str, ProgramImplementation] = {}
-    resource_types: dict[int, ProgramType] = {}
+    missing_types = tuple(value.id for value in invocation.graph.values if value.type.logical is None)
+    if missing_types:
+        raise ValueError(f"Program values have no capture-authoritative logical types: {missing_types}")
+    resource_types: dict[int, ProgramType] = {
+        value.id: _program_resource_type(value.type.logical)
+        for value in invocation.graph.values
+        if value.type.logical is not None
+    }
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]] = {}
-    scalar_input_ids = _scalar_input_ids(invocation)
+    value_input_ids = set(_value_input_types(invocation))
     for operation in invocation.graph.operations:
         frontend = operation.kernel._lower(
             operation.features,
             autodiff_planning_policy=autodiff_planning_policy,
         ).frontend
-        host_constants = _operation_host_constants(operation, invocation, scalar_input_ids)
+        host_constants = _operation_host_constants(operation, invocation, value_input_ids)
         implementation = ProgramImplementation(
             operation.name,
             operation.kernel._entry,
@@ -271,31 +284,14 @@ def parse_program(
                     f"Program callee {operation.name!r} has no logical type for resource {parameter.name!r}"
                 )
             value_type = _program_resource_type(typed.type)
-            previous_type = resource_types.get(value_id)
-            if previous_type is not None and previous_type != value_type:
-                raise ValueError(f"Program value {value_id} has conflicting logical resource types")
-            resource_types[value_id] = value_type
-    owner_types: dict[int, ProgramType] = {}
-    for value in invocation.graph.values:
-        value_type = resource_types.get(value.id)
-        if value_type is None:
-            continue
-        previous_type = owner_types.get(value.owner)
-        if previous_type is not None and previous_type != value_type:
-            raise ValueError(f"Program resource owner {value.owner} has conflicting logical types")
-        owner_types[value.owner] = value_type
-    for value in invocation.graph.values:
-        if value.id not in resource_types and value.owner in owner_types:
-            resource_types[value.id] = owner_types[value.owner]
-    missing_types = sorted(value.id for value in invocation.graph.values if value.id not in resource_types)
-    if missing_types:
-        raise ValueError(f"Program values have no compiler-authoritative logical types: {missing_types}")
+            invocation.graph.refine_logical_type(value_id, value_type.logical)
+    resource_types = {
+        value.id: _program_resource_type(value.type.logical)
+        for value in invocation.graph.values
+        if value.type.logical is not None
+    }
 
-    forward = _forward_graph(
-        invocation,
-        resource_types,
-        "primal" if vjp_wrt else "forward",
-    )
+    values, arguments, results, operations = _lower_forward_function(invocation, resource_types)
     sources = {
         inspect.getsourcefile(function)
         for operation in invocation.graph.operations
@@ -303,10 +299,17 @@ def parse_program(
     }
     provenance = tuple(sorted(source for source in sources if source is not None))
     canonical_structs = tuple(sorted(structs.items()))
-    mlir = emit_program(forward, None, vjp_wrt=vjp_wrt, structs=canonical_structs)
+    mlir = emit_program(
+        values,
+        arguments,
+        results,
+        operations,
+        direction="primal" if vjp_wrt else "forward",
+        vjp_wrt=vjp_wrt,
+        vjp_outputs=vjp_outputs,
+        structs=canonical_structs,
+    )
     return ParsedProgram(
-        forward,
-        None,
         mlir,
         tuple(implementations[name] for name in sorted(implementations)),
         provenance,

@@ -1,39 +1,31 @@
 # Autodiff design
 
-> **Status:** accepted contract and implemented compute VJP surface. Compiler
-> contract 13 and pipeline contract 17 provide canonical forward/backward
-> Program graphs, typed derivative groups,
-> checked dynamic tape, explicit accumulation plans, and invocation-time
-> `(x,y,z)` workgroup grids with physical invocation carriers. Structured CPU VJP supports
-> direct and cooked void Kernels with explicit Storage objectives, recursive
+> **Status:** accepted contract and implemented compute Program VJP surface.
+> Canonical forward/backward Program graphs, typed derivative groups, checked
+> dynamic tape, explicit accumulation plans, persistent boundary binding, and
+> invocation-time `(x,y,z)` carriers are implemented. Direct Kernel VJP is a
+> one-node Program; Module VJP uses the same runtime invocation frame and
+> pullback implementation. CPU supports recursive
 > Scalar/Tensor/Tuple/Struct Storage elements, dynamic and signed-stride
-> TensorViews, mutable scratch versioning, structured branches and loops,
-> runtime gather/scatter accumulation, reusable pullbacks, and fresh packed
-> tangent owners. Direct and cooked execution normalize the same native
-> derivative metadata and share one structured CPU executable and pullback
-> implementation.
+> TensorViews, mutable scratch versioning, structured control flow,
+> gather/scatter accumulation, reusable pullbacks, and packed tangent owners.
+> Available GPU backends support the covered compute Program VJP surface,
+> including structured Storage gradients and non-contiguous views.
 >
-> Structured CPU VJP is the only supported autodiff execution and cooking path.
-> Execution graphs compose structured CPU pipeline pullbacks in the native C++
-> graph scheduler. Browser wasm32 graph VJP, GPU and graphics autodiff,
-> graphics backward lowering, custom compute VJPs,
-> higher-order AD, persistent `.grad`, and unrestricted temporal
-> differentiation remain deferred. GPU targets may still compile and run
-> ordinary non-AD compute and graphics pipelines.
-
-> **Breaking architecture target:** The profile and direct/cooked descriptions
-> below are historical facts about the currently implemented structured-kernel
-> VJP path, not future deployment alternatives. The coordinated release makes
-> every standalone compute executable a one-node Program and expresses VJP only
-> as Program forward/backward graphs linked by residual state. Kernel structured
-> VJP remains a compute-node implementation detail. After that release, Runtime
-> does not load an old profile manifest or normalize it into a Program. See
-> [`unified_program_vjp.md`](unified_program_vjp.md).
+> Graphics VJP, browser wasm32 Program VJP, custom compute VJPs, higher-order
+> AD, persistent `.grad`, and unrestricted temporal differentiation remain
+> deferred. Module VJP rejects every Texture or Sampler parameter; compute
+> sampling through Sampler is unsupported, while graphics forward supports
+> Texture/Sampler. GPU `f16` remains unsupported on every backend in the
+> current contract and requires a future versioned capability change.
+> No capability failure may silently widen, switch backend, or use a legacy
+> profile executor.
 
 This document defines Vernon's first public automatic-differentiation model.
 The design uses reverse-mode vector-Jacobian products (VJPs) and preserves the
-Value/Storage/Resource split. The implemented surface differentiates CPU
-Kernels; differentiated graphics stages remain future work.
+Value/Storage/Resource split. The implemented surface differentiates compute
+Programs on CPU and supported GPU backends; differentiated graphics stages
+remain future work.
 
 ## 1. Design principles
 
@@ -241,12 +233,11 @@ leaves by the declared output or `wrt` path and packs aggregate Storage through
 its reflected `TangentLayout`; leaf paths are not separate public Storage
 owners. Every Program variant must expose identical groups and leaf paths.
 
-The serialized Program stores derivative authority only in Signature.
-`ResolveProgram` projects one canonical typed derivative-group table in
-gradient-then-cotangent order, validates canonical paths, unique group
-ownership, and the executable signature once, and stores the table in
+The serialized Program stores derivative authority only in ProgramABI boundary
+slots and derivative projections. `ResolveProgram` validates canonical paths
+and unique group ownership once and stores the executable projection in
 ResolvedProgram. Interactive and cooked APIs read groups from ResolvedProgram;
-neither has a second direct/cooked grouping or execution model.
+neither has a second signature, grouping, or execution model.
 
 The public C Runtime exposes indexed reflection rather than a scalar-output
 special case:

@@ -29,7 +29,7 @@ from ..render import (
     RenderTargetUse,
     StoreOperation,
 )
-from .binding import _DispatchBorrowLease, _NativeBindingCache
+from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .resource_common import _session_state
 from .sampler import SamplerState
 from .tensor import TensorStorage, TensorView
@@ -108,7 +108,7 @@ class Pipeline:
         self._fragment = stages[-1]
         self._compiled: _CompiledPipeline | None = None
         self._compiled_generation = -1
-        self._direct_binding_cache = _NativeBindingCache()
+        self._direct_binding_cache = _PersistentBindingTable()
         self.compile_count = 0
         _session_state()._runtime_children.add(self)
 
@@ -467,7 +467,7 @@ class Pipeline:
     def _invoke_direct(
         self,
         arguments: dict[str, Any],
-        binding_cache: _NativeBindingCache,
+        binding_cache: _PersistentBindingTable,
         *,
         render: RenderTargetUse,
     ) -> tuple[Any, _DispatchBorrowLease] | None:
@@ -588,7 +588,7 @@ class Pipeline:
         self,
         plan: _GraphicsInvocationPlan,
         builder: Any,
-        binding_cache: _NativeBindingCache,
+        binding_cache: _PersistentBindingTable,
     ) -> None:
         state = plan.state
         for parameter in plan.parameters:

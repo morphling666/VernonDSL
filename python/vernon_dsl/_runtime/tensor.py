@@ -155,42 +155,30 @@ def _coalesced_byte_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int
     return result
 
 
-_MAX_DIRTY_BYTE_RANGES = 4096
-
-
 class _DirtyRangeSet:
-    """Exact coalesced byte ranges awaiting host-to-device transfer."""
+    """Python resource adapter for runtime-owned dirty byte tracking."""
 
     def __init__(self, byte_size: int, *, dirty: bool = False):
-        self._byte_size = byte_size
-        self._ranges = [(0, byte_size)] if dirty and byte_size else []
+        self._native = _session_state()._native._DirtyRangeSet(byte_size, dirty)
 
     @property
     def ranges(self) -> tuple[tuple[int, int], ...]:
-        return tuple(self._ranges)
+        return tuple(self._native.ranges)
 
     def mark(self, ranges: list[tuple[int, int]], *, allow_full: bool) -> None:
-        if not ranges:
-            return
-        dirty = _coalesced_byte_ranges([*self._ranges, *ranges])
-        if allow_full and (
-            len(dirty) > _MAX_DIRTY_BYTE_RANGES or sum(end - begin for begin, end in dirty) * 2 >= self._byte_size
-        ):
-            dirty = [(0, self._byte_size)]
-        self._ranges = dirty
+        self._native.mark(ranges, allow_full)
 
     def should_promote_full(self, ranges: list[tuple[int, int]]) -> bool:
-        dirty = _coalesced_byte_ranges([*self._ranges, *ranges])
-        return len(dirty) > _MAX_DIRTY_BYTE_RANGES or sum(end - begin for begin, end in dirty) * 2 >= self._byte_size
+        return self._native.should_promote_full(ranges)
 
     def mark_all(self) -> None:
-        self._ranges = [(0, self._byte_size)] if self._byte_size else []
+        self._native.mark_all()
 
     def clear(self) -> None:
-        self._ranges.clear()
+        self._native.clear()
 
     def __bool__(self) -> bool:
-        return bool(self._ranges)
+        return bool(self._native)
 
 
 def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[int, int]]:

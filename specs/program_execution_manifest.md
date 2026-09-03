@@ -31,7 +31,8 @@ operations. It contains these authorities:
 3. `storages` is the sole byte-resource and resource-descriptor authority.
 4. `values` defines the logical value ABI and immutable value versions.
 5. `graphs` defines dataflow, resource access, and operation metadata.
-6. `signature` defines the public call ABI.
+6. `abi` is the sole public call, derivative projection, tape, alias-owner,
+   and publication authority.
 7. `residual_contract`, when present, defines forward-to-backward captures.
 
 The Program object and every ABI object it contains are platform-neutral.
@@ -42,8 +43,8 @@ Metal indices, GL locations, register numbers, native handles, and native
 pipeline-state objects are forbidden manifest data.
 
 Names are diagnostic labels and never identity. IDs, artifact keys, Parameter
-paths, Signature paths, and array position are identity where this document
-says so.
+paths, ProgramABI slot IDs and paths, and array position are identity where
+this document says so.
 
 The Program graph is semantic SSA. A write creates a new Value ID for the
 same Storage ID. A backend MAY update physical memory in place only when the
@@ -94,7 +95,8 @@ Array order is semantic and canonical as follows:
 - graph `inputs` are ordered by boundary class in this exact order:
   `user_input`, `cotangent`, `parameter`, `allocation`, `constant`, `storage`,
   records within a class are ordered by slot or Value ID;
-- graph `outputs` and signature arrays are public ABI order;
+- graph `outputs` and ProgramABI boundary-role subsequences are public ABI
+  order;
 - node `operands` and `results` are ordered Value IDs with no duplicates;
 - node `bindings` are ordered by module ordinal (`compute` = 0, `vertex` = 1,
   `fragment` = 2), interface ordinal (`argument` = 0, `result` = 1), then
@@ -475,18 +477,18 @@ from different targets.
   "shape_constraints": [],
   "alias_preconditions": [],
   "graphs": [],
-  "signature": {
-    "inputs": [],
-    "outputs": [],
-    "cotangents": [],
-    "gradients": []
+  "abi": {
+    "boundary_slots": [],
+    "derivative_projections": [],
+    "tape_plans": []
   }
 }
 ```
 
 Required members are `stages`, `parameters`, `storages`, `values`,
 `shape_symbols`, `shape_constraints`, `alias_preconditions`, `graphs`, and
-`signature`. `residual_contract` is required exactly when a backward graph
+`abi`. A serialized `signature` member is forbidden; loaders do not accept a
+compatibility projection. `residual_contract` is required exactly when a backward graph
 exists and forbidden otherwise, including when its captures and shape-symbol
 arrays would both be empty.
 
@@ -719,7 +721,7 @@ Origin is exactly one of:
 ```
 
 Argument slots are contiguous within each invocation boundary and agree with
-GraphInput and Signature order. ParameterOrigin agrees with `parameters`.
+GraphInput and ProgramABI boundary-slot order. ParameterOrigin agrees with `parameters`.
 AllocationOrigin is allowed only for owned Storage.
 
 NodeResultOrigin names the unique producing node and is valid for ordinary
@@ -910,8 +912,8 @@ Storage and changes ownership only after the entire invocation commits
 successfully. On failure, ownership remains with the Program and no output is
 published. Borrowed output lifetime MUST cover the caller-visible borrow.
 
-All public resources are ordinary `user_output` values and ordinary Signature
-outputs. There is no separate resource-output boundary class.
+All public resources are ordinary `user_output` values and ordinary ProgramABI
+output slots. There is no separate resource-output boundary class.
 
 Nodes are in canonical topological order. Edges are derived from operands,
 results, accesses, and attachment versions. Node IDs are graph-local,
@@ -1321,30 +1323,67 @@ For direct draw, `tag` and `vertex_count` are required; `instance_count`,
 `base_vertex` is a signed int32 literal or a ControlValueRef to an entry
 signed integer; every other draw integer must fit uint32.
 
-## 12. Signature and residual contract
+## 12. ProgramABI and residual contract
 
-Signature is:
+ProgramABI is:
 
 ```json
 {
-  "inputs": [{"path": "x", "value": 0}],
-  "outputs": [{"path": "y", "value": 1, "disposition": "borrow"}],
-  "cotangents": [],
-  "gradients": []
+  "boundary_slots": [
+    {
+      "id": 0,
+      "path": "x",
+      "value": 0,
+      "role": "input",
+      "direction": "input",
+      "category": "value",
+      "access": "read",
+      "logical_type": "f32",
+      "outer_shape": [],
+      "alias_owner": "value:0",
+      "value_layout": {
+        "scope": "value",
+        "layout_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "byte_size": 4,
+        "alignment": 4,
+        "leaves": [
+          {"path":[],"dtype":"f32","byte_offset":0,"scalar_count":1,"shape":[]}
+        ]
+      }
+    }
+  ],
+  "derivative_projections": [],
+  "tape_plans": []
 }
 ```
 
-Paths are non-empty public ABI strings and unique in each array. Signature
-inputs correspond exactly to forward `user_input` boundaries. Outputs
-correspond exactly to forward `user_output` boundaries, including resource
-outputs and matching dispositions. Cotangents and gradients correspond
-exactly to backward boundaries. Every cotangent and gradient entry contains
-required `path`, `value`, and `primal`; `primal` names its paired forward
-output or input respectively, and paths must match.
+`boundary_slots` is the sole ordered public ABI. IDs are contiguous array
+indices. Paths are non-empty. Role is `input`, `output`, `cotangent`, or
+`gradient`; input and cotangent roles require input direction, while output
+and gradient roles require output direction. The role subsequences correspond
+exactly, in order, to forward inputs, forward outputs, backward inputs, and
+backward outputs respectively.
 
-Parameters do not appear in Signature. They are bound through `parameters`.
-State updates are not public values unless also listed as an explicit
-user output.
+Each slot names one declared Value and repeats its canonical logical type,
+outer shape, and ValueLayout when present. Category is `value`,
+`storage_view`, `texture`, or `sampler`; access is `read`, `write`, or
+`read_write`. Resource slots also contain the matching `storage_id` and
+`storage_descriptor`. `alias_owner` is exactly `value:<id>` for value slots or
+`storage:<id>` for resource slots. Every output-direction slot contains
+`"publication":"commit_after_success"`; input-direction slots never contain
+publication.
+
+Each derivative slot has exactly one `derivative_projections` record containing
+`derivative:{slot,path}`, `primal:{slot,path}`, and a canonical `value_path`.
+Cotangents project from forward outputs and gradients project from forward
+inputs. Each `!vernon.ad_tape` Value has exactly one ordered `tape_plans`
+record describing its forward producer, backward consumer, required carriers
+`["tape_data","replay_segment"]`, and optional carriers
+`["launch_metadata","replay_status"]`.
+
+Parameters do not appear in ProgramABI boundary slots. They are bound through
+`parameters`. State updates are not public values unless also represented by
+an explicit output boundary slot.
 
 ResidualContract is:
 
@@ -1431,12 +1470,9 @@ to the primal's canonical leaves. Aggregate derivative packing, offsets,
 alignment, and paths are therefore fully represented by the derivative
 Value's ordinary ValueLayout.
 
-ResolveProgram derives a canonical DerivativeGroup table rather than
-serializing duplicate authority. Each record is exactly
-`{kind, path, primal, derivative}`, where `kind` is `gradient` or `cotangent`;
-records are ordered by Signature gradients first and then cotangents, each in
-public ABI order. The table is a pure projection of Signature and is rejected
-internally if any pairing differs.
+ResolveProgram derives its executable derivative groups directly from
+ProgramABI boundary slots and derivative projections. It does not reconstruct,
+accept, or compare a second signature representation.
 
 ResolveProgram also materializes the validated replay plan from
 ResidualContract: selected captures, replay slices, required capture frontier,
@@ -1489,7 +1525,14 @@ uses the entry parameter directly.
       "operation": {"tag": "compute", "workgroups": [{"control": {"parameter": 0}}, 1, 1]}
     }]
   }],
-  "signature": {"inputs": [{"path": "x", "value": 0}], "outputs": [{"path": "y", "value": 1, "disposition": "transfer"}], "cotangents": [], "gradients": []}
+  "abi": {
+    "boundary_slots": [
+      {"id": 0, "path": "x", "value": 0, "role": "input", "direction": "input", "category": "storage_view", "access": "read", "logical_type": "tensor<256xf32>", "outer_shape": [256], "alias_owner": "storage:0", "value_layout": {"scope": "element", "layout_hash": "95f54cae607cf7751c0ec4327f86b0982056823c49534e9d8dddd66fc98c5f07", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "f32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}, "storage_id": 0, "storage_descriptor": {"tag": "buffer", "byte_length": 1024, "alignment": 16, "memory": "device", "usage": ["storage"]}},
+      {"id": 1, "path": "y", "value": 1, "role": "output", "direction": "output", "category": "storage_view", "access": "write", "logical_type": "tensor<256xf32>", "outer_shape": [256], "alias_owner": "storage:1", "value_layout": {"scope": "element", "layout_hash": "95f54cae607cf7751c0ec4327f86b0982056823c49534e9d8dddd66fc98c5f07", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "f32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}, "storage_id": 1, "storage_descriptor": {"tag": "buffer", "byte_length": 1024, "alignment": 16, "memory": "device", "usage": ["storage"]}, "publication": "commit_after_success"}
+    ],
+    "derivative_projections": [],
+    "tape_plans": []
+  }
 }
 ```
 
@@ -1541,7 +1584,15 @@ result resource transfers only after successful commit.
       }
     }]
   }],
-  "signature": {"inputs": [{"path": "width", "value": 0}, {"path": "height", "value": 1}], "outputs": [{"path": "color", "value": 4, "disposition": "transfer"}], "cotangents": [], "gradients": []}
+  "abi": {
+    "boundary_slots": [
+      {"id": 0, "path": "width", "value": 0, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:0", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
+      {"id": 1, "path": "height", "value": 1, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:1", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
+      {"id": 2, "path": "color", "value": 4, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba16_float>", "outer_shape": [], "alias_owner": "storage:0", "storage_id": 0, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"argument": 0}}, {"control": {"argument": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}, "publication": "commit_after_success"}
+    ],
+    "derivative_projections": [],
+    "tape_plans": []
+  }
 }
 ```
 
@@ -1586,7 +1637,13 @@ ConstantOrigin view.
       {"id": 1, "stage": "draw_mesh", "operands": [0, 3, 4, 5, 6, 7], "results": [8], "bindings": [{"module": "vertex", "interface": "argument", "index": 0, "tag": "resource", "access": 0}], "accesses": [{"tag": "read", "storage": 1, "value": 3}, {"tag": "read", "storage": 2, "value": 4, "view": 5}, {"tag": "attachment", "storage": 3, "before": 6, "after": 8, "view": 7}], "operation": {"tag": "graphics", "attachments": {"colors": [{"location": 0, "access": 2, "load": {"tag": "discard"}, "store": "store"}], "depth_stencil": null, "render_area": {"x": 0, "y": 0, "width": 640, "height": 480}, "layer_count": 1}, "state": {"raster": {"front_face": "counter_clockwise", "cull_mode": "back", "fill_mode": "fill"}, "depth_stencil": {"depth_test": false, "depth_write": false, "depth_compare": "always", "stencil_test": false}, "multisample": {"sample_mask": 4294967295, "alpha_to_coverage": false}, "blend": [{"location": 0, "enabled": false, "write_mask": ["a", "b", "g", "r"]}], "viewport": null, "scissor": null}, "draw": {"tag": "indexed", "index_access": 1, "index_count": 3, "instance_count": {"control": {"parameter": 0}}}}}
     ]
   }],
-  "signature": {"inputs": [], "outputs": [{"path": "color", "value": 8, "disposition": "transfer"}], "cotangents": [], "gradients": []}
+  "abi": {
+    "boundary_slots": [
+      {"id": 0, "path": "color", "value": 8, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba8_unorm>", "outer_shape": [], "alias_owner": "storage:3", "storage_id": 3, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [640, 480, 1], "format": "rgba8_unorm", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment"]}, "publication": "commit_after_success"}
+    ],
+    "derivative_projections": [],
+    "tape_plans": []
+  }
 }
 ```
 
@@ -1607,7 +1664,7 @@ Resolve is pure with respect to caller resources and backend execution:
 2. Select exactly one variant and validate its aggregate Runtime requirements
    before external code I/O.
 3. Validate IDs, array ordering, origins, Storage descriptors, ValueLayout,
-   graph boundaries, exact operand/result closure, and Signature.
+   graph boundaries, exact operand/result closure, and ProgramABI.
 4. Resolve every logical stage ID through variant `stage_bindings` to one
    StageArtifact and validate its operation, contract hash, modules, and
    reflection.
@@ -1809,12 +1866,12 @@ A conforming implementation rejects at least:
 - a Storage version without exactly one producer and valid predecessor;
 - a forked Storage version chain, duplicate successor, invalid access view, or
   omitted overlapping-reader anti-dependency in the resolved execution plan;
-- a public resource not represented as ordinary user output and Signature
+- a public resource not represented as ordinary user output and ProgramABI
   output;
 - resource output without `borrow` or `transfer`, or transfer of borrowed
   Storage;
 - ownership becoming visible before successful commit;
-- Signature and graph-boundary disagreement;
+- ProgramABI and graph-boundary disagreement;
 - backward captures or symbol witnesses differing from ResidualContract.
 
 ### 19.1 Key negative fixtures
@@ -2080,7 +2137,7 @@ lowered as follows; this table is target ABI, not serialized reflection:
   pointer parameters; value slots are pointer parameters to the declared bytes.
 - DirectX: slot `S` is register index `S`, space 0, in the register class
   implied by endpoint role. Value slots are SRV byte-address buffers. The root
-  signature is derived from this sequence.
+  ProgramABI boundary order is derived from this sequence.
 - OpenGL and OpenGL ES: slot `S` is interface binding `S`; resources use the
   endpoint-implied interface class and value slots use shader-storage blocks.
 

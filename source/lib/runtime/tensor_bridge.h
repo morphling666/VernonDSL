@@ -61,6 +61,7 @@ std::optional<TensorCopyPlan> compileElementStreamCopyPlan(const VernonValueLayo
                                                            const TransportNode &physicalStream);
 
 std::optional<std::vector<uint8_t>> packTensor(const VernonTensorView &tensor, const TensorCopyPlan &plan);
+bool unpackTensor(const std::vector<uint8_t> &packed, const VernonTensorView &tensor, const TensorCopyPlan &plan);
 
 std::optional<std::vector<uint8_t>> packTensorRowMajor(const VernonTensorView &tensor);
 

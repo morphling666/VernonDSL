@@ -6,6 +6,7 @@
 #include "host_tape_allocator.h"
 #include "runtime/backend_cpu.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime_autodiff_policy.h"
 
 #include <optional>
 #include <string>

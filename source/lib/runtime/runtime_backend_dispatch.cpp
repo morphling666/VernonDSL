@@ -187,7 +187,27 @@ VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiB
     VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context);
     if (!adapter)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return vernonRuntimeRhiAdapterReferenceBuffer(adapter, buffer, offset, size, &output);
+    const VernonStatus status = vernonRuntimeRhiAdapterReferenceBuffer(adapter, buffer, offset, size, &output);
+    if (status == VERNON_STATUS_OK) {
+        const std::lock_guard<std::mutex> lock(context.referencedRhiBuffersMutex);
+        context.referencedRhiBuffers[{output.identity, output.resource.value}] = buffer;
+    }
+    return status;
+}
+
+bool resolveBackendRhiBufferReference(VernonRuntimeContext &context,
+                                      const VernonRuntimeProviderResourceReference &reference,
+                                      VernonRhiBuffer &output) {
+    const std::lock_guard<std::mutex> lock(context.referencedRhiBuffersMutex);
+    const auto found = context.referencedRhiBuffers.find({reference.identity, reference.resource.value});
+    if (found == context.referencedRhiBuffers.end())
+        return false;
+    if (!vernonRhiDeviceIsBufferValid(context.rhiDevice, found->second)) {
+        context.referencedRhiBuffers.erase(found);
+        return false;
+    }
+    output = found->second;
+    return true;
 }
 
 VernonStatus referenceBackendRhiImageView(VernonRuntimeContext &context, VernonRhiImageView view,

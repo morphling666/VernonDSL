@@ -8,6 +8,7 @@ extern "C" {
 
 typedef struct VernonPythonValueAbiPlan VernonPythonValueAbiPlan;
 typedef struct VernonPythonStructuredVjp VernonPythonStructuredVjp;
+typedef struct VernonPythonProgramBuiltin VernonPythonProgramBuiltin;
 
 typedef struct VernonPythonValueAbiNodeView {
     uint64_t byte_size;
@@ -50,6 +51,13 @@ typedef struct VernonPythonStructuredVjpView {
     uint32_t whole_dispatch_retention_permitted;
 } VernonPythonStructuredVjpView;
 
+typedef struct VernonPythonProgramBuiltinView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView entry;
+    VernonStringView module;
+} VernonPythonProgramBuiltinView;
+
 /*
  * Private bridge for the in-tree Python extension. It is exported from the
  * compiler DLL but is not installed and is not part of the public C ABI.
@@ -71,6 +79,13 @@ VERNON_DSL_CAPI VernonStatus vernonCompilerFinalizePythonStructuredVjp(VernonPyt
 VERNON_DSL_CAPI void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result);
 VERNON_DSL_CAPI VernonPythonStructuredVjpView
 vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result);
+
+VERNON_DSL_CAPI VernonPythonProgramBuiltin *
+vernonCompilerBuildPythonProgramBuiltin(VernonStringView operation, VernonStringView element_type, uint32_t rank,
+                                        const VernonStringView *leaf_dtypes, size_t leaf_dtype_count);
+VERNON_DSL_CAPI void vernonCompilerDestroyPythonProgramBuiltin(VernonPythonProgramBuiltin *result);
+VERNON_DSL_CAPI VernonPythonProgramBuiltinView
+vernonCompilerGetPythonProgramBuiltinView(const VernonPythonProgramBuiltin *result);
 
 typedef struct VernonPythonSpecializedKernel VernonPythonSpecializedKernel;
 

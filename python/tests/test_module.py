@@ -118,6 +118,31 @@ class ScaleByHostConstant(vd.Module):
         return output
 
 
+def _builtin_program_value(value_id: int, dtype: str, shape: list[int]) -> dict[str, object]:
+    rank_shape = ", ".join("-1" for _ in shape)
+    return {
+        "id": value_id,
+        "type": f'!vernon.tensor_view<{dtype}, [{rank_shape}], "read_write", "device">',
+        "dtype": dtype,
+        "shape": shape,
+        "value_layout": {
+            "scope": "element",
+            "layout_hash": f"test-{dtype}",
+            "byte_size": 4,
+            "alignment": 4,
+            "leaves": [
+                {
+                    "path": [],
+                    "dtype": dtype,
+                    "byte_offset": 0,
+                    "scalar_count": 1,
+                    "shape": [],
+                }
+            ],
+        },
+    }
+
+
 class ModuleTests(unittest.TestCase):
     def test_direct_provider_returns_original_frontend_implementation(self) -> None:
         provider = DirectKernelDslProvider("module { func.func @direct() }", "direct")
@@ -132,11 +157,7 @@ class ModuleTests(unittest.TestCase):
         self.assertIsNone(provider.lower({"kind": "render", "implementation_hint": "direct"}, {}))
 
     def test_fusion_dsl_provider_lowers_builtin_add_request(self) -> None:
-        values = {
-            0: {"id": 0, "dtype": "f32", "shape": [4]},
-            1: {"id": 1, "dtype": "f32", "shape": [4]},
-            2: {"id": 2, "dtype": "f32", "shape": [4]},
-        }
+        values = {index: _builtin_program_value(index, "f32", [4]) for index in range(3)}
         request = {
             "implementation_hint": "vernon.builtin.add",
             "bindings": [
@@ -157,11 +178,7 @@ class ModuleTests(unittest.TestCase):
     def test_fusion_dsl_provider_lowers_rank_two_builtin_add_with_view_shape(
         self,
     ) -> None:
-        values = {
-            0: {"id": 0, "dtype": "f32", "shape": [2, 3]},
-            1: {"id": 1, "dtype": "f32", "shape": [2, 3]},
-            2: {"id": 2, "dtype": "f32", "shape": [2, 3]},
-        }
+        values = {index: _builtin_program_value(index, "f32", [2, 3]) for index in range(3)}
         request = {
             "implementation_hint": "vernon.builtin.add",
             "bindings": [
@@ -183,11 +200,7 @@ class ModuleTests(unittest.TestCase):
         self.assertNotIn("2x3", implementation.mlir)
 
     def test_fusion_dsl_provider_lowers_dynamic_rank_builtin_add(self) -> None:
-        values = {
-            0: {"id": 0, "dtype": "f32", "shape": [-1, -1]},
-            1: {"id": 1, "dtype": "f32", "shape": [-1, -1]},
-            2: {"id": 2, "dtype": "f32", "shape": [-1, -1]},
-        }
+        values = {index: _builtin_program_value(index, "f32", [-1, -1]) for index in range(3)}
         request = {
             "implementation_hint": "vernon.builtin.add",
             "bindings": [
@@ -205,10 +218,7 @@ class ModuleTests(unittest.TestCase):
         self.assertIn("[-1, -1]", implementation.mlir)
 
     def test_fusion_dsl_provider_lowers_builtin_copy_request(self) -> None:
-        values = {
-            0: {"id": 0, "dtype": "f32", "shape": [4]},
-            1: {"id": 1, "dtype": "f32", "shape": [4]},
-        }
+        values = {index: _builtin_program_value(index, "f32", [4]) for index in range(2)}
         request = {
             "implementation_hint": "vernon.builtin.copy",
             "bindings": [
@@ -233,10 +243,7 @@ class ModuleTests(unittest.TestCase):
                     {"parameter": "output", "value": 1},
                 ],
             },
-            {
-                0: {"id": 0, "dtype": "f32", "shape": [1]},
-                1: {"id": 1, "dtype": "f32", "shape": [1]},
-            },
+            {index: _builtin_program_value(index, "f32", [1]) for index in range(2)},
         )
         rank_two = BuiltinDslProvider().lower(
             {
@@ -246,10 +253,7 @@ class ModuleTests(unittest.TestCase):
                     {"parameter": "output", "value": 1},
                 ],
             },
-            {
-                0: {"id": 0, "dtype": "f32", "shape": [-1, -1]},
-                1: {"id": 1, "dtype": "f32", "shape": [-1, -1]},
-            },
+            {index: _builtin_program_value(index, "f32", [-1, -1]) for index in range(2)},
         )
 
         self.assertIsNotNone(rank_one)
@@ -386,6 +390,38 @@ class ModuleTests(unittest.TestCase):
         np.testing.assert_array_equal(first.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(second.to_numpy(), np.array([9.0], dtype=np.float32))
 
+    def test_module_definition_is_immutable_and_shared_by_class(self) -> None:
+        first = AnnotatedSquare()
+        second = AnnotatedSquare()
+        definition = type(first)._module_definition
+
+        self.assertIs(definition, type(second)._module_definition)
+        self.assertIs(definition.original_function, AnnotatedSquare.__dict__["forward"])
+        self.assertEqual(tuple(definition.signature.parameters), ("source",))
+        self.assertIn("source", definition.resolved_annotations)
+        self.assertEqual(definition.source_identity[2], "AnnotatedSquare.forward")
+        with self.assertRaises(AttributeError):
+            definition.__setattr__("signature", definition.signature)
+
+    def test_vjp_cache_hit_does_not_recapture_or_reparse(self) -> None:
+        module = AnnotatedSquare()
+        transformed = vd.ad.vjp(module, wrt=("source",), outputs=("output",))
+        transformed(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)).view(access="read"))
+
+        with (
+            mock.patch(
+                "vernon_dsl.program._capture_module",
+                side_effect=AssertionError("VJP cache hit recaptured forward"),
+            ),
+            mock.patch(
+                "vernon_dsl.program_frontend.parse_program",
+                side_effect=AssertionError("VJP cache hit reparsed Program"),
+            ),
+        ):
+            output, _ = transformed(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)).view(access="read"))
+
+        np.testing.assert_array_equal(output.to_numpy(), np.array([9.0], dtype=np.float32))
+
     def test_gpu_primal_cache_hit_executes_canonical_program(self) -> None:
         try:
             vd.init(arch=vd.metal)
@@ -416,27 +452,15 @@ class ModuleTests(unittest.TestCase):
 
         parsed = _parse_module_program(FanIn())
 
-        self.assertEqual(parsed.forward.arguments[0].role, "input.source")
-        logical_type = parsed.forward.arguments[0].type.logical
-        self.assertEqual(logical_type.arguments[0].name, "f32")
-        self.assertEqual(logical_type.arguments[1:], ((1,), "read_write", "device"))
-        self.assertEqual(
-            tuple(
-                operation.name for operation in parsed.forward.operations if operation.kind == "vernon_program.compute"
-            ),
-            (
-                "FanIn.square.module_square",
-                "FanIn.cube.module_cube",
-            ),
-        )
-        self.assertEqual(
-            tuple(operation.name for operation in parsed.forward.operations if operation.kind == "vernon.intrinsic"),
-            ("empty_like", "empty_like"),
-        )
-        self.assertEqual(parsed.forward.operations[0].operands[0][0], "source")
-        self.assertIsNone(parsed.backward)
         self.assertIn("func.func @forward", parsed.mlir)
-        self.assertIn('name = "empty_like"', parsed.mlir)
+        self.assertNotIn("func.func @backward", parsed.mlir)
+        self.assertIn(
+            '%v0: !vernon.tensor_view<f32, [1], "read_write", "device"> {vernon.source_name = "source"',
+            parsed.mlir,
+        )
+        self.assertIn('debug_name = "FanIn.square.module_square"', parsed.mlir)
+        self.assertIn('debug_name = "FanIn.cube.module_cube"', parsed.mlir)
+        self.assertEqual(parsed.mlir.count('debug_name = "empty_like"'), 2)
         self.assertIn('operand_names = ["source", "output"]', parsed.mlir)
         self.assertEqual(
             tuple((implementation.callee, implementation.entry) for implementation in parsed.implementations),
@@ -462,7 +486,6 @@ class ModuleTests(unittest.TestCase):
         parsed = _parse_module_program(AggregateCopy())
 
         self.assertEqual(parsed.structs[0][0], "ModulePair")
-        self.assertEqual(parsed.forward.arguments[0].type.logical.arguments[0].name, "ModulePair")
         self.assertIn('"vernon.struct"()', parsed.mlir)
         self.assertIn(
             '!vernon.tensor_view<!vernon.struct<"ModulePair">, [1], "read_write", "device">',
@@ -480,7 +503,8 @@ class ModuleTests(unittest.TestCase):
             _parse_module_program(Ambiguous())
 
     def test_forward_rejects_host_from_numpy(self) -> None:
-        from vernon_dsl.frontend.module_ast import ModuleParameterType, interpret_module_forward
+        from vernon_dsl.frontend.module_ast import interpret_module_forward
+        from vernon_dsl.frontend.runtime_types import RuntimeParameterDescriptor
 
         class HostAlloc(vd.Module):
             def forward(self, source: vd.TensorStorage) -> vd.TensorStorage:
@@ -489,7 +513,7 @@ class ModuleTests(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "host session"):
             interpret_module_forward(
                 HostAlloc(),
-                {"source": ModuleParameterType(vd.f32, (1,))},
+                {"source": RuntimeParameterDescriptor.storage(vd.f32, (1,))},
             )
 
     def test_typed_storage_activity_drives_program_dependencies(self) -> None:

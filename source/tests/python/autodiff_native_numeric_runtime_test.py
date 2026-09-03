@@ -26,7 +26,7 @@ def run_numeric_acceptance(runtime, manifest: Path) -> None:
     import numpy as np
     import vernon_dsl as vd
 
-    pipeline = runtime.load_pipeline_asset(manifest.read_bytes(), str(manifest.parent), [])
+    pipeline = runtime.load_cooked_asset(manifest.read_bytes(), str(manifest.parent), [])
 
     def invoke(native_inputs):
         storages = {}

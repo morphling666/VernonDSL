@@ -262,10 +262,18 @@ module {
     EXPECT_EQ(canonical.at("graphs").at(0).at("nodes").at(0).at("accesses"), nlohmann::json::array());
     EXPECT_EQ(canonical.at("graphs").at(0).at("nodes").at(0).at("operation").at("workgroups"),
               nlohmann::json::array({1, 1, 1}));
-    EXPECT_EQ(canonical.at("signature").at("inputs"), nlohmann::json::array({{{"path", "source"}, {"value", 0}}}));
-    EXPECT_EQ(canonical.at("signature").at("outputs"),
-              nlohmann::json::array({{{"path", "output"}, {"value", 1}, {"disposition", "transfer"}}}));
-    EXPECT_FALSE(canonical.at("signature").contains("captures"));
+    EXPECT_FALSE(canonical.contains("signature"));
+    const nlohmann::json &abi = canonical.at("abi");
+    ASSERT_EQ(abi.at("boundary_slots").size(), 2u);
+    EXPECT_EQ(abi.at("boundary_slots").at(0).at("id"), 0);
+    EXPECT_EQ(abi.at("boundary_slots").at(0).at("path"), "source");
+    EXPECT_EQ(abi.at("boundary_slots").at(0).at("direction"), "input");
+    EXPECT_EQ(abi.at("boundary_slots").at(0).at("category"), "value");
+    EXPECT_EQ(abi.at("boundary_slots").at(0).at("logical_type"), "f32");
+    EXPECT_TRUE(abi.at("boundary_slots").at(0).contains("value_layout"));
+    EXPECT_EQ(abi.at("boundary_slots").at(1).at("id"), 1);
+    EXPECT_EQ(abi.at("boundary_slots").at(1).at("direction"), "output");
+    EXPECT_TRUE(abi.at("derivative_projections").empty());
     const nlohmann::json &contract = finalizedJson.at("stage_contracts").at(requestId);
     EXPECT_EQ(contract.at("operation"), "compute");
     EXPECT_EQ(canonical.at("stages").at(requestId).at("contract_hash"), canonical_sha256(contract));
@@ -484,6 +492,11 @@ module {
     EXPECT_EQ(node.at("operation").at("tag"), "graphics");
     EXPECT_EQ(node.at("operation").at("attachments").at("render_area").at("width"), 32);
     EXPECT_EQ(node.at("operation").at("attachments").at("render_area").at("height"), 64);
+    const nlohmann::json &targetAbi = canonical.at("abi").at("boundary_slots").at(0);
+    EXPECT_EQ(targetAbi.at("category"), "texture");
+    EXPECT_EQ(targetAbi.at("outer_shape"), nlohmann::json::array({64, 32}));
+    EXPECT_EQ(targetAbi.at("storage_id"), 0);
+    EXPECT_EQ(targetAbi.at("storage_descriptor").at("tag"), "image");
     const nlohmann::json &contract = result.at("stage_contracts").at(requestId);
     EXPECT_EQ(contract.at("operation"), "graphics");
     EXPECT_EQ(contract.at("reflection").at("graphics").at("topology"), "triangle_list");
@@ -934,6 +947,13 @@ module {
         if (capture.at("value") == 2)
             capturedNodeResult = true;
     EXPECT_TRUE(capturedNodeResult);
+    const nlohmann::json &projections = canonical.at("abi").at("derivative_projections");
+    ASSERT_EQ(projections.size(), 2u);
+    EXPECT_EQ(projections.at(0).at("derivative"), nlohmann::json({{"slot", 2}, {"path", "output"}}));
+    EXPECT_EQ(projections.at(0).at("primal"), nlohmann::json({{"slot", 1}, {"path", "output"}}));
+    EXPECT_TRUE(projections.at(0).at("value_path").empty());
+    EXPECT_EQ(projections.at(1).at("derivative"), nlohmann::json({{"slot", 3}, {"path", "source"}}));
+    EXPECT_EQ(projections.at(1).at("primal"), nlohmann::json({{"slot", 0}, {"path", "source"}}));
 
     vernonCompileResultDestroy(finalized);
     vernonCompileResultDestroy(compiled);

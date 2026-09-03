@@ -18,8 +18,21 @@ bool fail(Diagnostic &diagnostic, std::string code, std::string phase, std::stri
     return false;
 }
 
-bool isTapeCarrierRole(std::string_view role) {
-    return role == "tape" || role == "replay_segment" || role == "replay_status" || role == "launch_metadata";
+bool isTapeCarrierRole(std::string_view role) { return program_plan::tapeCarrierFromRoleName(role).has_value(); }
+
+bool parseTapeCarriers(const nlohmann::json &rows, std::vector<program_plan::TapeCarrier> &carriers) {
+    if (!rows.is_array())
+        return false;
+    for (const nlohmann::json &row : rows) {
+        if (!row.is_string())
+            return false;
+        const std::optional<program_plan::TapeCarrier> carrier =
+            program_plan::tapeCarrierFromPlanName(row.get<std::string>());
+        if (!carrier)
+            return false;
+        carriers.push_back(*carrier);
+    }
+    return true;
 }
 
 bool isResourceEndpointRole(std::string_view role) {
@@ -306,6 +319,20 @@ const Graph *findGraph(const Program &program, std::string_view direction) {
     return found == program.graphs.end() ? nullptr : &*found;
 }
 
+PublicationPlan derivePublicationPlan(const std::vector<BoundarySlot> &slots) {
+    PublicationPlan plan;
+    for (const BoundarySlot &slot : slots)
+        if (slot.publication == BoundaryPublication::CommitAfterSuccess)
+            plan.targets.push_back({slot.id, slot.value, slot.role, slot.aliasOwner});
+    return plan;
+}
+
+const PublicationTarget *findPublicationTarget(const ProgramAbi &abi, uint32_t slot) {
+    const auto found = std::find_if(abi.publication.targets.begin(), abi.publication.targets.end(),
+                                    [&](const PublicationTarget &target) { return target.slot == slot; });
+    return found == abi.publication.targets.end() ? nullptr : &*found;
+}
+
 std::vector<uint32_t> residualCaptures(const Program &program) {
     std::vector<uint32_t> captures;
     if (!program.residualContract)
@@ -345,7 +372,7 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     diagnostic = {};
     if (!exactObject(value,
                      {"stages", "parameters", "storages", "values", "shape_symbols", "shape_constraints",
-                      "alias_preconditions", "graphs", "signature"},
+                      "alias_preconditions", "graphs", "abi"},
                      {"residual_contract"}, diagnostic, ""))
         return false;
     if (!value["stages"].is_object() || !value["parameters"].is_array() || !value["storages"].is_array() ||
@@ -791,45 +818,222 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         program.graphs.push_back(std::move(graph));
     }
 
-    const auto &signature = value["signature"];
-    if (!exactObject(signature, {"inputs", "outputs", "cotangents", "gradients"}, {}, diagnostic, "/signature"))
-        return false;
-    const auto parseSignature = [&](std::string_view field, std::vector<SignatureBinding> &bindings, bool output,
-                                    bool derivative) {
-        const auto &rows = signature[std::string(field)];
-        const std::string basePath = "/signature/" + std::string(field);
-        if (!rows.is_array())
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "parse", basePath, "expected an array");
-        for (size_t index = 0; index < rows.size(); ++index) {
-            const auto &row = rows[index];
-            const std::string path = basePath + "/" + std::to_string(index);
-            SignatureBinding binding;
-            const std::initializer_list<std::string_view> optional =
-                output && derivative ? std::initializer_list<std::string_view>{"disposition", "primal"}
-                : output             ? std::initializer_list<std::string_view>{"disposition"}
-                : derivative         ? std::initializer_list<std::string_view>{"primal"}
-                                     : std::initializer_list<std::string_view>{};
-            if (!exactObject(row, {"path", "value"}, optional, diagnostic, path) || !row["path"].is_string() ||
-                row["path"].get_ref<const std::string &>().empty() || !uint32Value(row["value"], binding.value))
-                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "parse", path, "invalid Signature binding");
-            binding.path = row["path"].get<std::string>();
-            if (row.contains("disposition"))
-                binding.disposition = row["disposition"].get<std::string>();
-            if (row.contains("primal")) {
-                uint32_t primal = 0;
-                if (!uint32Value(row["primal"], primal))
-                    return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "parse", path + "/primal", "invalid primal");
-                binding.primal = primal;
-            }
-            bindings.push_back(std::move(binding));
+    const auto &abi = value["abi"];
+    if (!exactObject(abi, {"boundary_slots", "derivative_projections", "tape_plans"}, {}, diagnostic, "/abi") ||
+        !abi["boundary_slots"].is_array() || !abi["derivative_projections"].is_array() || !abi["tape_plans"].is_array())
+        return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", "/abi", "invalid ProgramABI");
+    for (size_t index = 0; index < abi["boundary_slots"].size(); ++index) {
+        const auto &row = abi["boundary_slots"][index];
+        const std::string path = "/abi/boundary_slots/" + std::to_string(index);
+        BoundarySlot slot;
+        if (!exactObject(row,
+                         {"id", "path", "value", "role", "direction", "category", "access", "logical_type",
+                          "outer_shape", "alias_owner"},
+                         {"value_layout", "storage_id", "storage_descriptor", "publication"}, diagnostic, path) ||
+            !uint32Value(row["id"], slot.id) || slot.id != index || !row["path"].is_string() ||
+            row["path"].get_ref<const std::string &>().empty() || !uint32Value(row["value"], slot.value) ||
+            !row["role"].is_string() || !row["direction"].is_string() || !row["category"].is_string() ||
+            !row["access"].is_string() || !row["logical_type"].is_string() ||
+            row["logical_type"].get_ref<const std::string &>().empty() || !row["alias_owner"].is_string() ||
+            row["alias_owner"].get_ref<const std::string &>().empty() ||
+            !parseShape(row["outer_shape"], slot.outerShape, diagnostic, path + "/outer_shape", true, true))
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "invalid ProgramABI boundary slot");
+        slot.path = row["path"].get<std::string>();
+        const std::string role = row["role"].get<std::string>();
+        if (role == "input")
+            slot.role = BoundaryRole::Input;
+        else if (role == "output")
+            slot.role = BoundaryRole::Output;
+        else if (role == "cotangent")
+            slot.role = BoundaryRole::Cotangent;
+        else if (role == "gradient")
+            slot.role = BoundaryRole::Gradient;
+        else
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/role",
+                        "unknown ProgramABI boundary role");
+        const std::string direction = row["direction"].get<std::string>();
+        if (direction == "input")
+            slot.direction = BoundaryDirection::Input;
+        else if (direction == "output")
+            slot.direction = BoundaryDirection::Output;
+        else
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/direction",
+                        "unknown ProgramABI boundary direction");
+        const BoundaryDirection roleDirection = slot.role == BoundaryRole::Input || slot.role == BoundaryRole::Cotangent
+                                                    ? BoundaryDirection::Input
+                                                    : BoundaryDirection::Output;
+        if (slot.direction != roleDirection || slot.value >= program.values.size())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
+                        "ProgramABI boundary role, direction, or Value is inconsistent");
+        const Value &logicalValue = program.values[slot.value];
+        slot.logicalType = row["logical_type"].get<std::string>();
+        const std::string aliasOwner = row["alias_owner"].get<std::string>();
+        if (slot.logicalType != logicalValue.type || slot.outerShape != logicalValue.shape)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
+                        "ProgramABI logical type or outer shape does not match its Value");
+        const std::string category = row["category"].get<std::string>();
+        if (category == "value")
+            slot.category = BoundaryCategory::Value;
+        else if (category == "storage_view")
+            slot.category = BoundaryCategory::StorageView;
+        else if (category == "texture")
+            slot.category = BoundaryCategory::Texture;
+        else if (category == "sampler")
+            slot.category = BoundaryCategory::Sampler;
+        else
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/category",
+                        "unknown ProgramABI boundary category");
+        const std::string access = row["access"].get<std::string>();
+        if (access == "read")
+            slot.access = BoundaryAccess::Read;
+        else if (access == "write")
+            slot.access = BoundaryAccess::Write;
+        else if (access == "read_write")
+            slot.access = BoundaryAccess::ReadWrite;
+        else
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/access",
+                        "unknown ProgramABI boundary access");
+        if (row.contains("value_layout")) {
+            ValueLayout layout;
+            if (!parseLayout(row["value_layout"], layout, diagnostic, path + "/value_layout"))
+                return false;
+            if (!logicalValue.layout || layout.layoutHash != logicalValue.layout->layoutHash ||
+                layout.scope != logicalValue.layout->scope)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
+                            "ProgramABI layout does not match its Value");
+            slot.layout = std::move(layout);
+        } else if (logicalValue.layout) {
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
+                        "ProgramABI omitted a canonical Value layout");
         }
-        return true;
-    };
-    if (!parseSignature("inputs", program.signature.inputs, false, false) ||
-        !parseSignature("outputs", program.signature.outputs, true, false) ||
-        !parseSignature("cotangents", program.signature.cotangents, false, true) ||
-        !parseSignature("gradients", program.signature.gradients, true, true))
-        return false;
+        const bool hasStorageId = row.contains("storage_id");
+        const bool hasDescriptor = row.contains("storage_descriptor");
+        if (hasStorageId != hasDescriptor || hasStorageId != logicalValue.storage.has_value() ||
+            (slot.category == BoundaryCategory::Value) != !hasStorageId)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
+                        "ProgramABI resource storage metadata is incomplete");
+        if (hasStorageId) {
+            BoundaryStorage boundaryStorage;
+            if (!uint32Value(row["storage_id"], boundaryStorage.id) || boundaryStorage.id >= program.storages.size() ||
+                boundaryStorage.id != *logicalValue.storage ||
+                row["storage_descriptor"] != value["storages"][boundaryStorage.id]["descriptor"])
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/storage_descriptor",
+                            "ProgramABI storage descriptor does not match its Storage");
+            const Storage &storage = program.storages[boundaryStorage.id];
+            boundaryStorage.descriptorKind = storage.descriptorKind;
+            boundaryStorage.buffer = storage.buffer;
+            boundaryStorage.image = storage.image;
+            boundaryStorage.opaqueContractHash = storage.opaqueContractHash;
+            const BoundaryCategory expectedCategory =
+                storage.descriptorKind == StorageDescriptorKind::Buffer  ? BoundaryCategory::StorageView
+                : storage.descriptorKind == StorageDescriptorKind::Image ? BoundaryCategory::Texture
+                                                                         : BoundaryCategory::Sampler;
+            if (slot.category != expectedCategory)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/category",
+                            "ProgramABI category does not match its storage descriptor");
+            slot.storage = std::move(boundaryStorage);
+        }
+        const std::string expectedAlias = hasStorageId ? "storage:" + std::to_string(*logicalValue.storage)
+                                                       : "value:" + std::to_string(logicalValue.id);
+        if (aliasOwner != expectedAlias)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/alias_owner",
+                        "ProgramABI alias owner does not match its logical Value");
+        slot.aliasOwner = hasStorageId ? ProgramOwnerId{ProgramOwnerKind::Storage, *logicalValue.storage}
+                                       : ProgramOwnerId{ProgramOwnerKind::Value, logicalValue.id};
+        if (slot.direction == BoundaryDirection::Output) {
+            if (!row.contains("publication") || !row["publication"].is_string() ||
+                row["publication"] != "commit_after_success")
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                            "ProgramABI output requires commit-after-success publication");
+            slot.publication = BoundaryPublication::CommitAfterSuccess;
+        } else if (row.contains("publication")) {
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                        "ProgramABI input cannot declare output publication");
+        }
+        program.abi.boundarySlots.push_back(std::move(slot));
+    }
+    program.abi.publication = derivePublicationPlan(program.abi.boundarySlots);
+
+    std::set<uint32_t> projectedDerivatives;
+    for (size_t index = 0; index < abi["derivative_projections"].size(); ++index) {
+        const auto &row = abi["derivative_projections"][index];
+        const std::string path = "/abi/derivative_projections/" + std::to_string(index);
+        DerivativeProjection projection;
+        if (!exactObject(row, {"derivative", "primal", "value_path"}, {}, diagnostic, path) ||
+            !exactObject(row["derivative"], {"slot", "path"}, {}, diagnostic, path + "/derivative") ||
+            !exactObject(row["primal"], {"slot", "path"}, {}, diagnostic, path + "/primal") ||
+            !uint32Value(row["derivative"]["slot"], projection.derivative.slot) ||
+            !uint32Value(row["primal"]["slot"], projection.primal.slot) || !row["derivative"]["path"].is_string() ||
+            !row["primal"]["path"].is_string() || !row["value_path"].is_array() ||
+            projection.derivative.slot >= program.abi.boundarySlots.size() ||
+            projection.primal.slot >= program.abi.boundarySlots.size())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "invalid derivative projection");
+        projection.derivative.path = row["derivative"]["path"].get<std::string>();
+        projection.primal.path = row["primal"]["path"].get<std::string>();
+        const BoundarySlot &derivative = program.abi.boundarySlots[projection.derivative.slot];
+        const BoundarySlot &primal = program.abi.boundarySlots[projection.primal.slot];
+        const bool roleMatch = (derivative.role == BoundaryRole::Cotangent && primal.role == BoundaryRole::Output) ||
+                               (derivative.role == BoundaryRole::Gradient && primal.role == BoundaryRole::Input);
+        if (!projectedDerivatives.insert(projection.derivative.slot).second ||
+            projection.derivative.path != derivative.path || projection.primal.path != primal.path || !roleMatch)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
+                        "derivative projection does not reference compatible boundary slots and paths");
+        for (size_t component = 0; component < row["value_path"].size(); ++component) {
+            LayoutPathComponent parsed;
+            const auto &componentValue = row["value_path"][component];
+            if (componentValue.is_string() && !componentValue.get_ref<const std::string &>().empty())
+                parsed.field = componentValue.get<std::string>();
+            else if (!uint32Value(componentValue, parsed.index.emplace()))
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse",
+                            path + "/value_path/" + std::to_string(component), "invalid projection path component");
+            projection.valuePath.push_back(std::move(parsed));
+        }
+        std::string projectedPath = projection.primal.path;
+        for (const LayoutPathComponent &component : projection.valuePath) {
+            projectedPath.push_back('.');
+            projectedPath += component.index ? std::to_string(*component.index) : component.field;
+        }
+        if (projectedPath != projection.derivative.path)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_path",
+                        "projection path does not resolve to the derivative boundary path");
+        program.abi.derivativeProjections.push_back(std::move(projection));
+    }
+    const size_t derivativeCount = static_cast<size_t>(
+        std::count_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(), [](const BoundarySlot &slot) {
+            return slot.role == BoundaryRole::Cotangent || slot.role == BoundaryRole::Gradient;
+        }));
+    if (program.abi.derivativeProjections.size() != derivativeCount)
+        return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", "/abi/derivative_projections",
+                    "every derivative boundary slot requires exactly one projection");
+
+    std::vector<uint32_t> tapeValues;
+    for (const Value &logicalValue : program.values)
+        if (isTapeValueType(logicalValue.type))
+            tapeValues.push_back(logicalValue.id);
+    if (abi["tape_plans"].size() != tapeValues.size())
+        return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", "/abi/tape_plans",
+                    "typed tape plans must exactly cover Program tape values");
+    for (size_t index = 0; index < abi["tape_plans"].size(); ++index) {
+        const auto &row = abi["tape_plans"][index];
+        const std::string path = "/abi/tape_plans/" + std::to_string(index);
+        TapePlan plan;
+        if (!exactObject(row,
+                         {"value", "forward_producer", "backward_consumer", "required_carriers", "optional_carriers"},
+                         {}, diagnostic, path) ||
+            !uint32Value(row["value"], plan.value) || plan.value != tapeValues[index] ||
+            !row["forward_producer"].is_boolean() || !row["backward_consumer"].is_boolean() ||
+            !parseTapeCarriers(row["required_carriers"], plan.requiredCarriers) ||
+            !parseTapeCarriers(row["optional_carriers"], plan.optionalCarriers) ||
+            plan.requiredCarriers != std::vector<program_plan::TapeCarrier>{program_plan::TapeCarrier::TapeData,
+                                                                            program_plan::TapeCarrier::ReplaySegment} ||
+            plan.optionalCarriers != std::vector<program_plan::TapeCarrier>{program_plan::TapeCarrier::LaunchMetadata,
+                                                                            program_plan::TapeCarrier::ReplayStatus})
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "invalid typed tape plan");
+        plan.forwardProducer = row["forward_producer"].get<bool>();
+        plan.backwardConsumer = row["backward_consumer"].get<bool>();
+        program.abi.tapePlans.push_back(std::move(plan));
+    }
+
     const bool hasBackward = program.graphs.size() == 2;
     if (hasBackward != value.contains("residual_contract"))
         return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", "/residual_contract",
@@ -1834,7 +2038,7 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
         }
         for (size_t index = 0; index < graph.outputs.size(); ++index)
             if (graph.outputs[index].value >= producers.size() || !producers[graph.outputs[index].value])
-                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
+                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "resolve",
                             graphPath + "/outputs/" + std::to_string(index), "output has no producer");
         resolved.graphs.push_back(std::move(resolvedGraph));
     }
@@ -1854,42 +2058,53 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                 ++count;
         return count;
     };
-    const auto matchUserInputs = [&](const Graph &graph, const std::vector<SignatureBinding> &bindings,
-                                     const std::string &field) {
-        if (bindings.size() != userInputCount(graph))
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature/" + field,
-                        "Signature does not match graph user inputs");
-        for (size_t index = 0; index < bindings.size(); ++index) {
+    const auto boundaries = [&](BoundaryRole role) {
+        std::vector<const BoundarySlot *> result;
+        for (const BoundarySlot &slot : program.abi.boundarySlots)
+            if (slot.role == role)
+                result.push_back(&slot);
+        return result;
+    };
+    const auto matchUserInputs = [&](const Graph &graph, BoundaryRole role, const std::string &field) {
+        const std::vector<const BoundarySlot *> slots = boundaries(role);
+        if (slots.size() != userInputCount(graph))
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve", "/abi/" + field,
+                        "ProgramABI does not match graph user inputs");
+        for (size_t index = 0; index < slots.size(); ++index) {
             const auto input = std::find_if(graph.inputs.begin(), graph.inputs.end(), [&](const GraphInput &candidate) {
                 return candidate.kind == GraphInputKind::UserInput && candidate.slot == index;
             });
-            if (input == graph.inputs.end() || bindings[index].value != input->value)
-                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
-                            "/signature/" + field + "/" + std::to_string(index), "input boundary mismatch");
+            if (input == graph.inputs.end() || slots[index]->value != input->value)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve",
+                            "/abi/" + field + "/" + std::to_string(index), "input boundary mismatch");
         }
         return true;
     };
-    const auto matchOutputs = [&](const Graph &graph, const std::vector<SignatureBinding> &bindings,
-                                  const std::string &field) {
-        if (bindings.size() != graph.outputs.size())
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature/" + field,
-                        "Signature does not match graph outputs");
-        for (size_t index = 0; index < graph.outputs.size(); ++index)
-            if (bindings[index].value != graph.outputs[index].value ||
-                bindings[index].disposition != graph.outputs[index].disposition)
-                return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve",
-                            "/signature/" + field + "/" + std::to_string(index), "output boundary mismatch");
+    const auto matchOutputs = [&](const Graph &graph, BoundaryRole role, const std::string &field) {
+        const std::vector<const BoundarySlot *> slots = boundaries(role);
+        if (slots.size() != graph.outputs.size())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve", "/abi/" + field,
+                        "ProgramABI does not match graph outputs");
+        for (size_t index = 0; index < graph.outputs.size(); ++index) {
+            const PublicationTarget *publication = findPublicationTarget(program.abi, slots[index]->id);
+            if (slots[index]->value != graph.outputs[index].value || !publication ||
+                publication->value != slots[index]->value || publication->role != role ||
+                publication->aliasOwner.kind != slots[index]->aliasOwner.kind ||
+                publication->aliasOwner.id != slots[index]->aliasOwner.id)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve",
+                            "/abi/" + field + "/" + std::to_string(index), "output boundary mismatch");
+        }
         return true;
     };
-    if (!matchUserInputs(*forward, program.signature.inputs, "inputs") ||
-        !matchOutputs(*forward, program.signature.outputs, "outputs"))
+    if (!matchUserInputs(*forward, BoundaryRole::Input, "inputs") ||
+        !matchOutputs(*forward, BoundaryRole::Output, "outputs"))
         return false;
     if (!backward) {
-        if (!program.signature.cotangents.empty() || !program.signature.gradients.empty())
-            return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "resolve", "/signature",
-                        "Signature does not match forward graph boundaries");
-    } else if (!matchUserInputs(*backward, program.signature.cotangents, "cotangents") ||
-               !matchOutputs(*backward, program.signature.gradients, "gradients")) {
+        if (!boundaries(BoundaryRole::Cotangent).empty() || !boundaries(BoundaryRole::Gradient).empty())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve", "/abi",
+                        "ProgramABI does not match forward graph boundaries");
+    } else if (!matchUserInputs(*backward, BoundaryRole::Cotangent, "cotangents") ||
+               !matchOutputs(*backward, BoundaryRole::Gradient, "gradients")) {
         return false;
     }
 
@@ -2007,18 +2222,23 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
     if (program.graphs.size() != 1 || resolved.graphs.size() != 1)
         return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "execute", "/graphs",
                     "phase-one execution requires one forward graph");
-    if (invocation.arguments.size() != program.signature.inputs.size())
-        return fail(diagnostic, "PROGRAM_SIGNATURE_MISMATCH", "invocation_entry", "/signature/inputs",
-                    "invocation argument count does not match Signature");
+    const size_t inputCount =
+        static_cast<size_t>(std::count_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
+                                          [](const BoundarySlot &slot) { return slot.role == BoundaryRole::Input; }));
+    if (invocation.arguments.size() != inputCount)
+        return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "invocation_entry", "/abi/boundary_slots",
+                    "invocation argument count does not match ProgramABI inputs");
     if (invocation.parameters.size() != program.parameters.size())
         return fail(diagnostic, "PROGRAM_PARAMETER_BINDING", "invocation_entry", "/parameters",
                     "instance parameter count does not match Program parameters");
 
     std::vector<std::vector<uint8_t>> owned(program.storages.size());
     std::vector<InvocationBuffer> storageBuffers(program.storages.size());
-    std::map<uint32_t, size_t> signatureInput;
-    for (size_t index = 0; index < program.signature.inputs.size(); ++index)
-        signatureInput.emplace(program.signature.inputs[index].value, index);
+    std::map<uint32_t, size_t> abiInput;
+    size_t inputIndex = 0;
+    for (const BoundarySlot &slot : program.abi.boundarySlots)
+        if (slot.role == BoundaryRole::Input)
+            abiInput.emplace(slot.value, inputIndex++);
     try {
         for (const Storage &storage : program.storages) {
             if (storage.lifetime != StorageLifetime::Invocation)
@@ -2035,8 +2255,8 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
                 return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
                             "/storages/" + std::to_string(storage.id) + "/mutability",
                             "phase-one execution does not yet provide transactional borrowed writes");
-            const auto input = signatureInput.find(storage.initialValue);
-            if (input == signatureInput.end())
+            const auto input = abiInput.find(storage.initialValue);
+            if (input == abiInput.end())
                 return fail(diagnostic, "PROGRAM_STORAGE_INITIAL_VALUE", "invocation_entry",
                             "/storages/" + std::to_string(storage.id) + "/initial_value",
                             "borrowed Storage has no public input provider");
@@ -2112,17 +2332,26 @@ bool execute(const ResolvedProgram &resolved, const Invocation &invocation, cons
     }
 
     try {
-        result.outputs.reserve(graph.outputs.size());
-        for (size_t index = 0; index < graph.outputs.size(); ++index) {
-            const GraphOutput &output = graph.outputs[index];
-            const Value &value = program.values[output.value];
+        const auto publishedOutputCount = static_cast<size_t>(
+            std::count_if(program.abi.publication.targets.begin(), program.abi.publication.targets.end(),
+                          [](const PublicationTarget &target) { return target.role == BoundaryRole::Output; }));
+        result.outputs.reserve(publishedOutputCount);
+        for (const PublicationTarget &publication : program.abi.publication.targets) {
+            if (publication.role != BoundaryRole::Output)
+                continue;
+            const auto output =
+                std::find_if(graph.outputs.begin(), graph.outputs.end(),
+                             [&](const GraphOutput &candidate) { return candidate.value == publication.value; });
+            if (output == graph.outputs.end())
+                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
+                            "PublicationPlan target is not a forward graph output");
+            const Value &value = program.values[publication.value];
             if (!value.storage)
-                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit",
-                            "/graphs/0/outputs/" + std::to_string(index), "phase-one output must be storage-backed");
+                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
+                            "phase-one output must be storage-backed");
             const Storage &storage = program.storages[*value.storage];
-            if (output.disposition != "transfer" || storage.ownership != StorageOwnership::Owned)
-                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit",
-                            "/graphs/0/outputs/" + std::to_string(index),
+            if (output->disposition != "transfer" || storage.ownership != StorageOwnership::Owned)
+                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
                             "phase-one output must transfer owned Storage");
             result.outputs.push_back(std::move(owned[storage.id]));
         }

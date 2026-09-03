@@ -7,6 +7,9 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .frontend.model import ConcreteType
+from .frontend.runtime_types import RuntimeParameterDescriptor
+
 
 class OperationKind(Enum):
     ALLOC = "alloc"
@@ -21,12 +24,46 @@ class GraphBuffer:
     shape: tuple[int, ...]
     access: str
     as_view: bool = False
+    logical: ConcreteType | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class GraphValueInput:
+    """Typed invocation Value that remains a Program argument."""
+
+    name: str
+    descriptor: RuntimeParameterDescriptor
+
+    @property
+    def annotation(self) -> Any:
+        return self.descriptor.annotation
+
+    @property
+    def logical(self) -> ConcreteType:
+        return self.descriptor.logical
+
+
+@dataclass(frozen=True, eq=False)
+class GraphResourceInput:
+    """Typed non-storage resource imported by one Program invocation."""
+
+    name: str
+    descriptor: RuntimeParameterDescriptor
+
+    @property
+    def annotation(self) -> Any:
+        return self.descriptor.annotation
+
+    @property
+    def logical(self) -> ConcreteType:
+        return self.descriptor.logical
 
 
 @dataclass(frozen=True)
 class ResourceType:
     shape: tuple[int, ...]
     dtype: str
+    logical: ConcreteType | None = None
 
 
 @dataclass(frozen=True)
@@ -71,11 +108,17 @@ class KernelCallOp:
 
 
 def _resource_owner(value: Any) -> Any | None:
-    return value if isinstance(value, GraphBuffer) else None
+    return value if isinstance(value, (GraphBuffer, GraphResourceInput)) else None
 
 
 def _resource_type(value: Any) -> ResourceType:
-    return ResourceType(tuple(value.shape), str(getattr(value, "dtype", value)))
+    if isinstance(value, GraphResourceInput):
+        return ResourceType((), value.logical.mlir, value.logical)
+    return ResourceType(
+        tuple(value.shape),
+        str(getattr(value, "dtype", value)),
+        value.logical,
+    )
 
 
 class OperationGraph:
@@ -189,6 +232,24 @@ class OperationGraph:
             raise ValueError("resource is not present in this Program graph")
         return self._owner_ids[id(owner)]
 
+    def refine_logical_type(self, value_id: int, logical: ConcreteType) -> None:
+        """Attach compiler-resolved type information to every version of one owner."""
+
+        if value_id < 0 or value_id >= len(self._values):
+            raise ValueError(f"Program value {value_id} is not present in this graph")
+        owner = self._values[value_id].owner
+        for index, value in enumerate(self._values):
+            if value.owner != owner:
+                continue
+            resource_type = ResourceType(value.type.shape, value.type.dtype, logical)
+            self._values[index] = ResourceVersion(
+                value.id,
+                value.owner,
+                value.version,
+                resource_type,
+                value.producer,
+            )
+
     def _owner(self, value: Any) -> int:
         owner = _resource_owner(value)
         assert owner is not None
@@ -252,6 +313,8 @@ class OperationGraph:
 __all__ = [
     "AllocOp",
     "GraphBuffer",
+    "GraphResourceInput",
+    "GraphValueInput",
     "KernelCallOp",
     "KernelParameter",
     "OperationGraph",

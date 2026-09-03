@@ -1,9 +1,12 @@
 #include "native_compiler.h"
 
 #include "VernonExecutionGraph.h"
+#include "VernonProgramCapabilities.h"
 #include "execution_graph/execution_graph_internal.h"
 #include "native_command_retention.h"
 #include "native_runtime.h"
+#include "runtime/dirty_index_set.h"
+#include "runtime/dirty_range_set.h"
 
 #include <algorithm>
 #include <string>
@@ -14,6 +17,20 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("_retain_completion", &retainPythonCommandCompletion, nb::arg("transaction"));
     module.def("target_available", &targetAvailable, nb::arg("target"));
     module.def("target_capabilities", &targetCapabilities, nb::arg("target"));
+    module.def(
+        "_program_capability",
+        [](const std::string &name) {
+            for (const vernon::program_capabilities::Entry &entry : vernon::program_capabilities::matrix)
+                if (entry.name == name) {
+                    nb::dict result;
+                    result["supported"] = entry.supported;
+                    result["code"] = std::string(entry.diagnosticCode);
+                    result["diagnostic"] = std::string(entry.diagnostic);
+                    return result;
+                }
+            throw std::invalid_argument("unknown Program capability");
+        },
+        nb::arg("name"));
     nb::enum_<VernonStatus>(module, "Status")
         .value("OK", VERNON_STATUS_OK)
         .value("INVALID_ARGUMENT", VERNON_STATUS_INVALID_ARGUMENT)
@@ -84,6 +101,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("profiles", &StructuredVjp::profiles, nb::arg("identity"));
     module.def("_build_structured_vjp", &buildStructuredVjp, nb::arg("module"), nb::arg("entry"), nb::arg("wrt_paths"),
                nb::arg("output_paths"), nb::arg("forward_symbol"), nb::arg("backward_symbol"));
+    module.def("_build_program_builtin", &buildProgramBuiltin, nb::arg("operation"), nb::arg("element_type"),
+               nb::arg("rank"), nb::arg("leaf_dtypes"));
     module.def("_specialize_kernel_constants", &specializeKernelHostConstants, nb::arg("module"), nb::arg("entry"),
                nb::arg("names"), nb::arg("values"));
     nb::class_<Compiler>(module, "Compiler")
@@ -175,8 +194,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
         .def("load_autodiff", &Runtime::loadAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
-        .def("load_pipeline_asset", &Runtime::loadPipelineAsset, nb::keep_alive<0, 1>())
-        .def("load_program_pipeline_asset", &Runtime::loadProgramPipelineAsset, nb::keep_alive<0, 1>())
+        .def("load_cooked_asset", &Runtime::loadCookedAsset, nb::keep_alive<0, 1>())
         .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("program"), nb::arg("artifact_system"),
              nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>())
         .def("load_canonical_endpoint", &Runtime::loadCanonicalEndpoint, nb::arg("program"), nb::arg("artifact_system"),
@@ -208,6 +226,25 @@ void bindNativeCompiler(nb::module_ &module) {
     nb::class_<PythonRuntimeSubmission>(module, "Submission")
         .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("state", &PythonRuntimeSubmission::state);
+    nb::class_<vernon::runtime::DirtyRangeSet>(module, "_DirtyRangeSet")
+        .def(nb::init<size_t, bool>(), nb::arg("byte_size"), nb::arg("dirty") = false)
+        .def_prop_ro("ranges", &vernon::runtime::DirtyRangeSet::ranges)
+        .def("mark", &vernon::runtime::DirtyRangeSet::mark, nb::arg("ranges"), nb::arg("allow_full"))
+        .def("should_promote_full", &vernon::runtime::DirtyRangeSet::shouldPromoteFull, nb::arg("ranges"))
+        .def("mark_all", &vernon::runtime::DirtyRangeSet::markAll)
+        .def("clear", &vernon::runtime::DirtyRangeSet::clear)
+        .def("__bool__", [](const vernon::runtime::DirtyRangeSet &ranges) { return !ranges.empty(); });
+    nb::class_<vernon::runtime::DirtyIndexSet>(module, "_DirtyIndexSet")
+        .def(nb::init<size_t>(), nb::arg("count"))
+        .def_prop_ro("indices", &vernon::runtime::DirtyIndexSet::indices)
+        .def("__contains__", &vernon::runtime::DirtyIndexSet::contains)
+        .def("add", &vernon::runtime::DirtyIndexSet::add)
+        .def("discard", &vernon::runtime::DirtyIndexSet::discard)
+        .def("update", &vernon::runtime::DirtyIndexSet::update)
+        .def("difference_update", &vernon::runtime::DirtyIndexSet::difference)
+        .def("mark_all", &vernon::runtime::DirtyIndexSet::markAll)
+        .def("clear", &vernon::runtime::DirtyIndexSet::clear)
+        .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
     nb::class_<PreparedPipelineArgument>(module, "_PreparedPipelineArgument");
     nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
         .def("prepare_host_tensor", &PipelineInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
@@ -252,6 +289,15 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("encode", [](PipelineInvocationBuilder &builder,
                           const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
         .def("submit", [](PipelineInvocationBuilder &builder) { return builder.submit(); });
+    nb::class_<PythonProgramInvocationAdapter>(module, "_ProgramInvocation")
+        .def_prop_ro("builder", &PythonProgramInvocationAdapter::builderView, nb::rv_policy::reference_internal)
+        .def("bind", &PythonProgramInvocationAdapter::bind, nb::arg("slot"), nb::arg("token"), nb::arg("prepare"),
+             nb::arg("upload_bytes") = 0, nb::arg("upload_ranges") = 0, nb::arg("eager_upload") = false)
+        .def("commit", &PythonProgramInvocationAdapter::commit)
+        .def("rollback", &PythonProgramInvocationAdapter::rollback);
+    nb::class_<PythonProgramInstanceAdapter>(module, "ProgramInstance")
+        .def("begin_invocation", &PythonProgramInstanceAdapter::beginInvocation, nb::keep_alive<0, 1>())
+        .def_prop_ro("telemetry", &PythonProgramInstanceAdapter::telemetryView);
     nb::class_<PythonPullback>(module, "Pullback")
         .def("__call__", &PythonPullback::apply, nb::arg("cotangent") = nb::none())
         .def("apply_logical", &PythonPullback::applyLogical, nb::arg("cotangent"))
@@ -277,6 +323,13 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("device_wait_nanoseconds", &PythonPullback::deviceWaitNanoseconds);
     nb::class_<LoadedPipeline>(module, "LoadedPipeline")
         .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
+        .def(
+            "program_instance",
+            [](LoadedPipeline &pipeline) {
+                return std::make_unique<PythonProgramInstanceAdapter>(pipeline.owner, pipeline.runtime,
+                                                                      pipeline.pipeline);
+            },
+            nb::keep_alive<0, 1>())
         .def(
             "submit",
             [](LoadedPipeline &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
@@ -348,23 +401,21 @@ void bindNativeCompiler(nb::module_ &module) {
                                     nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
             },
             nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
+        .def("program_forward_bound", &LoadedPipeline::programForwardBound, nb::arg("builder"),
+             nb::call_guard<nb::gil_scoped_release>())
         .def(
-            "program_forward",
-            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings) {
-                return pipeline.programForward(inputs, bindings);
-            },
-            nb::arg("inputs"), nb::arg("bindings"))
-        .def(
-            "program_vjp",
-            [](LoadedPipeline &pipeline, const nb::dict &inputs, const nb::dict &bindings,
+            "program_vjp_bound",
+            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder, const nb::dict &bindings,
                nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
-                return pipeline.programVjp(inputs, bindings, nb::cast(&pipeline, nb::rv_policy::reference),
-                                           checkpoint_memory_budget, checkpoint_policy);
+                return pipeline.programVjpBound(builder, bindings, nb::cast(&pipeline, nb::rv_policy::reference),
+                                                checkpoint_memory_budget, checkpoint_policy);
             },
-            nb::arg("inputs"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
+            nb::arg("builder"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
             nb::arg("checkpoint_policy") = std::string())
         .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
         .def_prop_ro("program_ad_signature", &LoadedPipeline::programAdSignature)
+        .def_prop_ro("program_abi", &LoadedPipeline::programAbi)
+        .def_prop_ro("is_managed_program", &LoadedPipeline::isManagedProgram)
         .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
         .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)
         .def_prop_ro("write_footprints", &LoadedPipeline::writeFootprints)

@@ -43,7 +43,7 @@ def _python_type_annotation(element: str) -> str | None:
 
 
 def python_element_annotation(value: Mapping[str, Any]) -> str | None:
-    element = first_generic_type_argument(str(value.get("type") or ""), "!vernon.tensor_view")
+    element = program_element_type(value)
     if element:
         annotation = _python_type_annotation(element)
         if annotation is not None:
@@ -52,6 +52,10 @@ def python_element_annotation(value: Mapping[str, Any]) -> str | None:
     if isinstance(dtype, str) and dtype in _SCALAR_ANNOTATIONS:
         return _SCALAR_ANNOTATIONS[dtype]
     return None
+
+
+def program_element_type(value: Mapping[str, Any]) -> str | None:
+    return first_generic_type_argument(str(value.get("type") or ""), "!vernon.tensor_view")
 
 
 def as_view(value: TensorStorage | TensorView, access: str) -> TensorView:
@@ -64,5 +68,6 @@ __all__ = [
     "ImplementationUnavailable",
     "as_view",
     "python_element_annotation",
+    "program_element_type",
     "scalar_name",
 ]

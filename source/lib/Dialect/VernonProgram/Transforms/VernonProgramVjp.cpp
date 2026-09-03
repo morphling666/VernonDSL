@@ -553,6 +553,44 @@ FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp p
     return indices;
 }
 
+FailureOr<SmallVector<unsigned>> resolveProgramCotangentBoundaryIndices(func::FuncOp primal,
+                                                                        ArrayRef<StringRef> publicPaths) {
+    llvm::StringMap<unsigned> boundaries;
+    for (unsigned index = 0; index < primal.getNumResults(); ++index) {
+        StringRef name = resultSourceName(primal, index);
+        if (name.empty() || !boundaries.try_emplace(name, index).second) {
+            primal.emitError("Program VJP primal results require unique source names");
+            return failure();
+        }
+    }
+    llvm::BitVector selected(primal.getNumResults());
+    SmallVector<unsigned> indices;
+    for (StringRef path : publicPaths) {
+        auto boundary = boundaries.end();
+        StringRef suffix;
+        for (auto candidate = boundaries.begin(); candidate != boundaries.end(); ++candidate) {
+            StringRef name = candidate->getKey();
+            if (path != name && !(path.starts_with(name) && path.size() > name.size() && path[name.size()] == '.'))
+                continue;
+            if (boundary == boundaries.end() || name.size() > boundary->getKey().size()) {
+                boundary = candidate;
+                suffix = path.size() == name.size() ? StringRef{} : path.drop_front(name.size() + 1);
+            }
+        }
+        if (path.empty() || boundary == boundaries.end() ||
+            !selectsDifferentiableBoundaryLeaf(primal.getResultTypes()[boundary->second],
+                                               primal->getParentOfType<ModuleOp>(), suffix)) {
+            primal.emitError("Program VJP output path does not identify a unique primal boundary");
+            return failure();
+        }
+        if (selected.test(boundary->second))
+            continue;
+        selected.set(boundary->second);
+        indices.push_back(boundary->second);
+    }
+    return indices;
+}
+
 LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &options) {
     if (!llvm::hasSingleElement(primal.getBody()))
         return primal.emitError("Program VJP requires one straight-line entry block");
@@ -592,6 +630,18 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     for (unsigned index : wrtIndices)
         if (failed(derivativeType(primal.getArgument(index).getType(), primal)))
             return primal.emitError("Program VJP wrt argument is not differentiable");
+    SmallVector<unsigned> cotangentIndices(options.cotangentBoundaryIndices);
+    if (cotangentIndices.empty())
+        for (unsigned index = 0; index < primal.getNumResults(); ++index)
+            cotangentIndices.push_back(index);
+    llvm::BitVector selectedCotangents(primal.getNumResults());
+    for (unsigned index : cotangentIndices) {
+        if (index >= primal.getNumResults() || selectedCotangents.test(index))
+            return primal.emitError("Program VJP requires unique valid output boundary indices");
+        selectedCotangents.set(index);
+        if (failed(cotangentType(primal.getResultTypes()[index], primal)))
+            return primal.emitError("Program VJP selected result is not differentiable");
+    }
 
     OpBuilder moduleBuilder(primal);
     IRMapping cloneMap;
@@ -605,8 +655,8 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     llvm::DenseSet<Operation *> activeNestedComputes;
     {
         DenseMap<Value, char> live;
-        for (Value result : returnOp.getOperands())
-            live[result] = 1;
+        for (unsigned index : cotangentIndices)
+            live[returnOp.getOperand(index)] = 1;
         for (Operation *operation : llvm::reverse(primalOperations)) {
             if (!llvm::any_of(operation->getResults(), [&](Value result) { return live.contains(result); }))
                 continue;
@@ -650,14 +700,14 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             primalToForward[primalOp.getResult(index)] = forwardOp.getResult(index);
 
     SmallVector<Type> backwardArguments;
-    backwardArguments.reserve(retainedValues.size() + primal.getNumResults());
+    backwardArguments.reserve(retainedValues.size() + cotangentIndices.size());
     for (Value retained : retainedValues)
         backwardArguments.push_back(retained.getType());
-    for (Type result : primal.getResultTypes()) {
-        FailureOr<Type> derivative = cotangentType(result, primal);
+    for (unsigned index : cotangentIndices) {
+        FailureOr<Type> derivative = cotangentType(primal.getResultTypes()[index], primal);
         if (failed(derivative)) {
             forward.erase();
-            return primal.emitError("Program VJP result is not differentiable");
+            return primal.emitError("Program VJP selected result is not differentiable");
         }
         backwardArguments.push_back(*derivative);
     }
@@ -681,8 +731,8 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         backward.setArgAttr(index, kCaptureForwardValueAttr, builder.getI32IntegerAttr(index));
         applyProgramLanguageAbi(backward, index, getProgramValueLanguageAbi(retainedValues[index]), false);
     }
-    for (unsigned index = 0; index < primal.getNumResults(); ++index) {
-        const unsigned argument = retainedValues.size() + index;
+    for (auto [cotangent, index] : llvm::enumerate(cotangentIndices)) {
+        const unsigned argument = retainedValues.size() + cotangent;
         if (StringRef name = resultSourceName(primal, index); !name.empty())
             backward.setArgAttr(argument, "vernon.source_name", builder.getStringAttr(name));
         backward.setArgAttr(argument, "vernon.autodiff_role", builder.getStringAttr("cotangent"));
@@ -712,8 +762,9 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
 
     DenseMap<Value, Value> adjoints;
     const unsigned cotangentBase = retainedValues.size();
-    for (auto [index, result] : llvm::enumerate(returnOp.getOperands())) {
-        Value publicCotangent = entry->getArgument(cotangentBase + index);
+    for (auto [cotangent, index] : llvm::enumerate(cotangentIndices)) {
+        Value result = returnOp.getOperand(index);
+        Value publicCotangent = entry->getArgument(cotangentBase + cotangent);
         FailureOr<Type> interior = derivativeType(result.getType(), primal);
         if (failed(interior))
             return primal.emitError("Program VJP result is not differentiable");

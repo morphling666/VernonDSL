@@ -717,7 +717,7 @@ The target `vernon-cook-pipeline` command emits exactly one Program object and
 content-addressed external StageArtifacts, exactly one per selected stage ID;
 nodes may share a stage ID, and a graphics StageArtifact contains both shader
 modules. The Program directly contains
-`stages`, `parameters`, `storages`, `values`, `graphs`, and `signature`.
+`stages`, `parameters`, `storages`, `values`, `graphs`, and `abi`.
 `stages` identify portable StageContracts; variant `stage_bindings` select
 target StageArtifacts without creating a second name-binding authority. The
 command compiles in process through
@@ -733,13 +733,13 @@ backend.
 Pipeline 17 is intentionally artifact-incompatible: loaders do not reinterpret
 old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
 Differentiated Programs contain forward and backward graphs plus residual and
-derivative signature metadata. CPU cooking writes the same Program, a
+ProgramABI derivative-projection metadata. CPU cooking writes the same Program, a
 content-addressed relocatable `.o`/`.obj`, and generated static-registration
 `.c`/`.h` sources.
 
 `StorageDescriptor` is the sole authority for resource allocation identity,
 layout, extent, lifetime, and ownership. Program control metadata is entry-only
-and cannot override it. Resources use ordinary public output signature entries.
+and cannot override it. Resources use ordinary public ProgramABI output slots.
 The cooker emits no copied `parameters`/`internal_parameters`/`uses` tracks and
 no compatibility name-binding table.
 

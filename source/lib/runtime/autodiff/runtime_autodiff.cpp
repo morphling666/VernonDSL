@@ -1,6 +1,5 @@
 #include "runtime_autodiff_internal.h"
 
-#include "host_tape_allocator.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/runtime_state.h"
@@ -64,14 +63,13 @@ bool materializeDerivativeValueAbi(ValueAbi &derivative, const std::vector<Value
     return true;
 }
 
-bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
-                             std::string &error) {
-    const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+bool appendValueLayoutAbi(const ValueLayout &layout, const std::vector<uint64_t> &shape, const std::string &rootPath,
+                          std::vector<ValueAbi> &values, std::string &error) {
     if (layout.leaves.empty())
         return error = "autodiff parameter has no canonical Value layout", false;
     size_t elementCount = 1;
     bool dynamicShape = false;
-    for (uint64_t extent : parameter.shape) {
+    for (uint64_t extent : shape) {
         if (!extent) {
             dynamicShape = true;
             continue;
@@ -93,9 +91,10 @@ bool appendParameterValueAbi(const Parameter &parameter, const std::string &root
             bytes *= elementCount;
         }
         std::string path = canonicalValueLeafPath(rootPath, leaf);
-        std::vector<uint64_t> shape = parameter.shape;
-        shape.insert(shape.end(), leaf.shape.begin(), leaf.shape.end());
-        ValueAbi candidate{std::move(path), *dtype, bytes, std::max<size_t>(layout.alignment, 1), std::move(shape)};
+        std::vector<uint64_t> logicalShape = shape;
+        logicalShape.insert(logicalShape.end(), leaf.shape.begin(), leaf.shape.end());
+        ValueAbi candidate{std::move(path), *dtype, bytes, std::max<size_t>(layout.alignment, 1),
+                           std::move(logicalShape)};
         const auto existing = std::find_if(values.begin(), values.end(),
                                            [&](const ValueAbi &value) { return value.path == candidate.path; });
         if (existing != values.end()) {
@@ -106,6 +105,12 @@ bool appendParameterValueAbi(const Parameter &parameter, const std::string &root
         }
     }
     return true;
+}
+
+bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
+                             std::string &error) {
+    const ValueLayout &layout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+    return appendValueLayoutAbi(layout, parameter.shape, rootPath, values, error);
 }
 
 bool validLaunchSize(VernonLaunchSize grid) { return grid.x != 0 && grid.y != 0 && grid.z != 0; }
@@ -220,13 +225,16 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature) {
     const auto matches = [&](AutodiffDerivativeRole role, const std::vector<ValueAbi> &values) {
-        const std::vector<std::string> expected = autodiffDerivativeLeafPaths(groups, role);
+        std::vector<std::string> expected = autodiffDerivativeLeafPaths(groups, role);
         if (expected.size() != values.size())
             return false;
-        for (size_t index = 0; index < values.size(); ++index)
-            if (expected[index] != values[index].path)
-                return false;
-        return true;
+        std::vector<std::string> actual;
+        actual.reserve(values.size());
+        for (const ValueAbi &value : values)
+            actual.push_back(value.path);
+        std::sort(expected.begin(), expected.end());
+        std::sort(actual.begin(), actual.end());
+        return expected == actual;
     };
     if (!matches(AutodiffDerivativeRole::Gradient, signature.gradients)) {
         invocationDiagnostic(context) = "autodiff gradient groups do not match the executable signature";
@@ -291,6 +299,32 @@ VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
         invocationDiagnostic(*pipeline.context) = "deferred autodiff forward produced no pullback";
         return VERNON_STATUS_INTERNAL_ERROR;
     }
+    result->execution = std::move(execution);
+    pullback = result.release();
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus forwardProgramInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+                                      VernonPullback *&pullback) {
+    pullback = nullptr;
+    const auto *differentiated = differentiatedPipeline(&pipeline);
+    auto *executable = differentiated ? differentiated->executable.get() : nullptr;
+    if (!executable || invocation.struct_size < sizeof(VernonPipelineInvocation) ||
+        invocation.abi_version != VERNON_PIPELINE_VERSION || (invocation.argument_count && !invocation.arguments)) {
+        invocationDiagnostic(*pipeline.context) = "invalid canonical Program invocation";
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    std::unique_ptr<PullbackExecution> execution;
+    const ForwardExecutionTarget target{{}, &invocation, nullptr};
+    const VernonStatus status = executable->forward(target, {1, 1, 1}, inputs, &outputs, execution);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    if (!execution)
+        return VERNON_STATUS_OK;
+    auto result = std::make_unique<VernonPullback>();
+    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
     result->execution = std::move(execution);
     pullback = result.release();
     return VERNON_STATUS_OK;
@@ -382,6 +416,31 @@ const vernon::runtime::program::Program *programExecution(const VernonLoadedPipe
         return nullptr;
     const vernon::runtime::program::Program &program = pipeline->topology->resolvedProgram->program;
     return vernon::runtime::program::findGraph(program, "backward") ? &program : nullptr;
+}
+
+std::optional<vernon::runtime::program::BoundaryRole> programBoundaryRole(VernonProgramAdBoundary boundary) {
+    using vernon::runtime::program::BoundaryRole;
+    switch (boundary) {
+    case VERNON_PROGRAM_AD_INPUT:
+        return BoundaryRole::Input;
+    case VERNON_PROGRAM_AD_OUTPUT:
+        return BoundaryRole::Output;
+    case VERNON_PROGRAM_AD_COTANGENT:
+        return BoundaryRole::Cotangent;
+    case VERNON_PROGRAM_AD_GRADIENT:
+        return BoundaryRole::Gradient;
+    default:
+        return std::nullopt;
+    }
+}
+
+const vernon::runtime::program::BoundarySlot *programBoundaryAt(const vernon::runtime::program::Program &program,
+                                                                vernon::runtime::program::BoundaryRole role,
+                                                                size_t index) {
+    for (const vernon::runtime::program::BoundarySlot &slot : program.abi.boundarySlots)
+        if (slot.role == role && index-- == 0)
+            return &slot;
+    return nullptr;
 }
 
 } // namespace
@@ -476,7 +535,7 @@ void vernon::runtime::autodiffSetProgramCheckpointPlan(VernonLoadedPipeline *pip
 }
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
-    return context && context->autodiffMemoryPolicy ? context->autodiffMemoryPolicy->contextLimit() : 0;
+    return context ? ad::autodiffMemoryContextLimit(context->autodiffMemoryPolicy) : 0;
 }
 
 VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *context) {
@@ -496,20 +555,14 @@ size_t vernonRuntimeLoadedPipelineGetProgramAdValueCount(const VernonLoadedPipel
     const vernon::runtime::program::Program *execution = programExecution(pipeline);
     if (!execution)
         return 0;
-    switch (boundary) {
-    case VERNON_PROGRAM_AD_INPUT:
-        return execution->signature.inputs.size();
-    case VERNON_PROGRAM_AD_OUTPUT:
-        return execution->signature.outputs.size();
-    case VERNON_PROGRAM_AD_COTANGENT:
-        return execution->signature.cotangents.size();
-    case VERNON_PROGRAM_AD_GRADIENT:
-        return execution->signature.gradients.size();
-    case VERNON_PROGRAM_AD_CAPTURE:
+    if (boundary == VERNON_PROGRAM_AD_CAPTURE)
         return execution->residualContract ? execution->residualContract->captures.size() : 0;
-    default:
+    const std::optional<vernon::runtime::program::BoundaryRole> role = programBoundaryRole(boundary);
+    if (!role)
         return 0;
-    }
+    return static_cast<size_t>(
+        std::count_if(execution->abi.boundarySlots.begin(), execution->abi.boundarySlots.end(),
+                      [&](const vernon::runtime::program::BoundarySlot &slot) { return slot.role == *role; }));
 }
 
 VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoadedPipeline *pipeline,
@@ -519,31 +572,13 @@ VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(const VernonLoa
     const vernon::runtime::program::Program *execution = programExecution(pipeline);
     if (!execution || !view || view->struct_size < sizeof(*view))
         return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
-    const vernon::runtime::program::SignatureBinding *binding = nullptr;
+    const vernon::runtime::program::BoundarySlot *binding = nullptr;
     uint32_t capture = UINT32_MAX;
-    switch (boundary) {
-    case VERNON_PROGRAM_AD_INPUT:
-        if (index < execution->signature.inputs.size())
-            binding = &execution->signature.inputs[index];
-        break;
-    case VERNON_PROGRAM_AD_OUTPUT:
-        if (index < execution->signature.outputs.size())
-            binding = &execution->signature.outputs[index];
-        break;
-    case VERNON_PROGRAM_AD_COTANGENT:
-        if (index < execution->signature.cotangents.size())
-            binding = &execution->signature.cotangents[index];
-        break;
-    case VERNON_PROGRAM_AD_GRADIENT:
-        if (index < execution->signature.gradients.size())
-            binding = &execution->signature.gradients[index];
-        break;
-    case VERNON_PROGRAM_AD_CAPTURE:
+    if (boundary == VERNON_PROGRAM_AD_CAPTURE) {
         if (execution->residualContract && index < execution->residualContract->captures.size())
             capture = execution->residualContract->captures[index].value;
-        break;
-    default:
-        break;
+    } else if (const std::optional<vernon::runtime::program::BoundaryRole> role = programBoundaryRole(boundary)) {
+        binding = programBoundaryAt(*execution, *role, index);
     }
     const uint32_t valueId = binding ? binding->value : capture;
     if (valueId >= execution->values.size())
@@ -673,6 +708,28 @@ VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(const VernonLoa
     return VERNON_STATUS_OK;
 }
 
+VernonStatus vernonRuntimeProgramForward(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation,
+                                         VernonPullback **outputPullback) {
+    try {
+        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+        if (outputPullback)
+            *outputPullback = nullptr;
+        if (!pipeline || !pipeline->context || !invocation)
+            return fail(pipeline ? pipeline->context : nullptr, "Program forward requires a pipeline and invocation");
+        VernonPullback *pullback = nullptr;
+        const VernonStatus status = vernon::runtime::ad::forwardProgramInvocation(*pipeline, *invocation, pullback);
+        if (status != VERNON_STATUS_OK)
+            return status;
+        if (outputPullback)
+            *outputPullback = pullback;
+        else if (pullback)
+            vernonPullbackDestroy(pullback);
+        return VERNON_STATUS_OK;
+    } catch (const std::exception &exception) {
+        return fail(pipeline ? pipeline->context : nullptr, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
 VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize computeGrid,
                                      const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                      VernonPullback **pullback) {
@@ -681,6 +738,9 @@ VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunc
         vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
         if (pullback)
             *pullback = nullptr;
+        if (pipeline && pipeline->topology && pipeline->topology->resolvedProgram)
+            return fail(pipeline->context,
+                        "managed Program forward requires VernonPipelineInvocation and vernonRuntimeProgramForward");
         const auto *differentiated = differentiatedPipeline(pipeline);
         auto *executable = differentiated ? differentiated->executable.get() : nullptr;
         if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||

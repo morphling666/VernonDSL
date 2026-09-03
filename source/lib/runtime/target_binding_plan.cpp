@@ -1,5 +1,6 @@
 #include "target_binding_plan.h"
 
+#include "VernonProgramCapabilities.h"
 #include "pipeline_metadata.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "shape_layout.h"
@@ -21,14 +22,18 @@ bool reject(Diagnostic &diagnostic, std::string code, std::string path, std::str
 }
 
 AutodiffResourceRole autodiffResourceRole(std::string_view role) {
-    if (role == "tape")
-        return AutodiffResourceRole::Tape;
-    if (role == "replay_segment")
-        return AutodiffResourceRole::ReplaySegment;
-    if (role == "replay_status")
-        return AutodiffResourceRole::ReplayStatus;
-    if (role == "launch_metadata")
-        return AutodiffResourceRole::LaunchMetadata;
+    if (const std::optional<program_plan::TapeCarrier> carrier = program_plan::tapeCarrierFromRoleName(role)) {
+        switch (*carrier) {
+        case program_plan::TapeCarrier::TapeData:
+            return AutodiffResourceRole::Tape;
+        case program_plan::TapeCarrier::ReplaySegment:
+            return AutodiffResourceRole::ReplaySegment;
+        case program_plan::TapeCarrier::ReplayStatus:
+            return AutodiffResourceRole::ReplayStatus;
+        case program_plan::TapeCarrier::LaunchMetadata:
+            return AutodiffResourceRole::LaunchMetadata;
+        }
+    }
     if (role == "cotangent")
         return AutodiffResourceRole::Cotangent;
     if (role == "gradient")
@@ -215,9 +220,9 @@ bool vertexFormat(std::string_view format, std::string &dtype, uint32_t &compone
 }
 
 std::string valueName(const ResolvedProgram &program, uint32_t valueId) {
-    for (const SignatureBinding &binding : program.program.signature.inputs)
-        if (binding.value == valueId)
-            return binding.path;
+    for (const BoundarySlot &slot : program.program.abi.boundarySlots)
+        if (slot.role == BoundaryRole::Input && slot.value == valueId)
+            return slot.path;
     return valueId < program.program.values.size() ? program.program.values[valueId].name : std::string{};
 }
 
@@ -298,7 +303,11 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     for (const CodeModule &module : stage.stage.modules)
         plan.modules.push_back({module.role, module.entryPoint, module.format});
 
-    uint64_t cpuFrameOffset = 0;
+    uint64_t cpuArgumentFrameOffset = 0;
+    uint64_t cpuResultFrameOffset = 0;
+    const auto cpuFrameOffset = [&](const TargetBinding &binding) -> uint64_t & {
+        return binding.endpoint.interfaceKind == "result" ? cpuResultFrameOffset : cpuArgumentFrameOffset;
+    };
     uint32_t maximumSlot = 0;
     bool hasSlots = false;
     const bool compute = node.operation != "graphics";
@@ -307,6 +316,12 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
 
     for (const ReflectedEndpoint &endpoint : stage.stage.endpoints) {
+        if (compute && endpoint.role == "sampler") {
+            const program_capabilities::Entry &capability =
+                program_capabilities::get(program_capabilities::Id::ComputeSamplerBinding);
+            return reject(diagnostic, std::string(capability.diagnosticCode), "/endpoints",
+                          std::string(capability.diagnostic));
+        }
         TargetBinding target;
         target.endpoint = {endpoint.module, endpoint.interfaceKind, endpoint.index, UINT32_MAX, endpoint.access};
         target.role = endpoint.role;
@@ -373,8 +388,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.elementLayout = *target.wholeValueLayout;
             InterfacePlan physical = computeValuePlan(leafTransport(leaf), endpoint.layoutHash, backend);
             if (backend == VERNON_RUNTIME_CPU) {
-                if (!assignCpuPhysical(cpuFrameOffset, findCompiledAbi(stage.stage, endpoint), valueSlot->alignment,
-                                       valueSlot->byteSize, target.physical, &physical, diagnostic, "system value"))
+                if (!assignCpuPhysical(cpuFrameOffset(target), findCompiledAbi(stage.stage, endpoint),
+                                       valueSlot->alignment, valueSlot->byteSize, target.physical, &physical,
+                                       diagnostic, "system value"))
                     return false;
             } else {
                 target.physical = {0, static_cast<size_t>(valueSlot->byteSize),
@@ -433,11 +449,11 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         target.kind = endpoint.role == "sampler" ? "sampler" : !endpoint.imageDimension.empty() ? "image" : "tensor";
         const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
-        const bool tapeCarrier = value.type.rfind("!vernon.ad_tape", 0) == 0 &&
-                                 (endpoint.role == "tape" || endpoint.role == "replay_segment" ||
-                                  endpoint.role == "replay_status" || endpoint.role == "launch_metadata");
+        const std::optional<program_plan::TapeCarrier> tapeCarrier =
+            program_plan::tapeCarrierFromRoleName(endpoint.role);
+        const bool typedTapeCarrier = value.type.rfind("!vernon.ad_tape", 0) == 0 && tapeCarrier;
 
-        if (tapeCarrier) {
+        if (typedTapeCarrier) {
             if (backend == VERNON_RUNTIME_CPU || !compiled || !compiled->elementLayout || !endpoint.viewDescriptor)
                 return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                               "opaque tape carrier lacks its GPU TensorView ABI");
@@ -451,10 +467,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                               "opaque tape carrier has an incomplete storage ABI");
             target.source = SourceRepresentation::ResourceHandle;
-            target.semantic = endpoint.role == "tape"             ? CarrierSemantic::TapeData
-                              : endpoint.role == "replay_segment" ? CarrierSemantic::ReplaySegment
-                              : endpoint.role == "replay_status"  ? CarrierSemantic::ReplayStatus
-                                                                  : CarrierSemantic::LaunchMetadata;
+            target.semantic = CarrierSemantic::Tape;
+            target.tapeCarrier = tapeCarrier;
             target.name += "." + endpoint.role;
             target.carrier = TargetCarrier::StorageBuffer;
             target.reflectedKind = "tensor";
@@ -513,8 +527,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             maximumSlot = std::max(maximumSlot, resource->slot);
             hasSlots = true;
             if (backend == VERNON_RUNTIME_CPU) {
-                if (!assignCpuPhysical(cpuFrameOffset, compiled, alignof(uintptr_t), sizeof(uintptr_t), target.physical,
-                                       nullptr, diagnostic, "resource"))
+                if (!assignCpuPhysical(cpuFrameOffset(target), compiled, alignof(uintptr_t), sizeof(uintptr_t),
+                                       target.physical, nullptr, diagnostic, "resource"))
                     return false;
             }
         } else {
@@ -570,7 +584,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                         return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                       "compute value endpoint is missing its physical transport tree");
                     if (backend == VERNON_RUNTIME_CPU) {
-                        if (!assignCpuPhysical(cpuFrameOffset, compiled, value.layout->alignment,
+                        if (!assignCpuPhysical(cpuFrameOffset(target), compiled, value.layout->alignment,
                                                value.layout->byteSize, target.physical, &physical, diagnostic, "value"))
                             return false;
                     } else {
@@ -691,15 +705,16 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     if (backend == VERNON_RUNTIME_CPU) {
                         const uint64_t descriptorSize =
                             static_cast<uint64_t>(2 + 2 * endpoint.viewRank) * sizeof(uintptr_t);
-                        if (!assignCpuPhysical(cpuFrameOffset, compiled, alignof(uintptr_t), descriptorSize,
+                        if (!assignCpuPhysical(cpuFrameOffset(target), compiled, alignof(uintptr_t), descriptorSize,
                                                target.physical, nullptr, diagnostic, "TensorView descriptor"))
                             return false;
                     }
                 } else if (backend == VERNON_RUNTIME_CPU) {
                     InterfacePlan physical =
                         computeValuePlan(valueTransport(*value.layout), value.layout->layoutHash, backend);
-                    if (!assignCpuPhysical(cpuFrameOffset, compiled, value.layout->alignment, value.layout->byteSize,
-                                           target.physical, &physical, diagnostic, "TensorView value"))
+                    if (!assignCpuPhysical(cpuFrameOffset(target), compiled, value.layout->alignment,
+                                           value.layout->byteSize, target.physical, &physical, diagnostic,
+                                           "TensorView value"))
                         return false;
                     target.transport =
                         TargetPhysicalTransport{*target.wholeValueLayout,
@@ -760,8 +775,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             target.access = "read";
             target.endpoint = {"compute", "system_value", compiled.index, UINT32_MAX, "read"};
             target.sourceName = target.name;
-            if (!assignCpuPhysical(cpuFrameOffset, &compiled, alignof(uintptr_t), sizeof(uintptr_t), target.physical,
-                                   nullptr, diagnostic, "tape packed field"))
+            if (!assignCpuPhysical(cpuFrameOffset(target), &compiled, alignof(uintptr_t), sizeof(uintptr_t),
+                                   target.physical, nullptr, diagnostic, "tape packed field"))
                 return false;
             plan.bindings.push_back(std::move(target));
         }
@@ -770,7 +785,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     for (const GraphicsFragmentOutput &output : stage.stage.fragmentOutputs)
         plan.outputs.push_back({output.location, output.type});
     if (backend == VERNON_RUNTIME_CPU)
-        plan.packedArgumentsSize = cpuFrameOffset;
+        plan.packedArgumentsSize = cpuArgumentFrameOffset;
+    if (backend == VERNON_RUNTIME_CPU)
+        plan.packedResultsSize = cpuResultFrameOffset;
     if (backend == VERNON_RUNTIME_METAL && hasSlots) {
         if (!stage.stage.nativeSlots.empty()) {
             plan.nativeSlots = stage.stage.nativeSlots;
@@ -806,6 +823,8 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
     reflection.dispatchContract = plan.dispatch;
     if (plan.backend == VERNON_RUNTIME_CPU)
         reflection.packedArguments = PackedArgumentsLayout{static_cast<size_t>(plan.packedArgumentsSize)};
+    if (plan.backend == VERNON_RUNTIME_CPU && plan.packedResultsSize)
+        reflection.packedResults = PackedArgumentsLayout{static_cast<size_t>(plan.packedResultsSize)};
     if (!plan.modules.empty()) {
         variant.compute = plan.modules.front().entryPoint;
         variant.program.emplace("compute", variant.compute);
@@ -819,6 +838,7 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         if (argument.kind == "tensor_value")
             argument.kind = "scalar";
         argument.builtin = binding.builtin;
+        argument.result = binding.endpoint.interfaceKind == "result";
         argument.physical = binding.physical;
         if (!argument.physical.alignment)
             argument.physical.alignment = 1;
@@ -868,7 +888,8 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         ParameterUse use;
         use.stage = "compute";
         use.index = runtimeArgumentIndex;
-        use.interfaceKind = binding.kind == "image" || binding.kind == "sampler" ? "resource"
+        use.interfaceKind = binding.endpoint.interfaceKind == "result"             ? "result"
+                            : binding.kind == "image" || binding.kind == "sampler" ? "resource"
                             : binding.source == SourceRepresentation::WholeValueBytes ||
                                     (binding.source == SourceRepresentation::ElementStream && binding.transport)
                                 ? "value"
@@ -885,9 +906,6 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
         use.descriptorSet = 0;
         use.binding = binding.endpoint.portableSlot;
         parameter.uses.push_back(std::move(use));
-        rebuildValueLayoutPathViews(parameter.elementLayout);
-        if (parameter.valueLayout)
-            rebuildValueLayoutPathViews(*parameter.valueLayout);
         variant.parameters.push_back(std::move(parameter));
     }
 
@@ -923,12 +941,51 @@ bool materializeTargetBindingPlan(const TargetBindingPlan &plan, Variant &varian
             reflection.writeFootprints.push_back(std::move(footprint));
         }
     }
+    rebuildVariantLayoutViews(variant);
     return true;
 }
 
 bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBackend backend,
                                  ResolvedExecutablePlan &plan, Diagnostic &diagnostic) {
     plan = {};
+    const bool hasBackward = findGraph(program.program, "backward") != nullptr;
+    if (hasBackward) {
+        const bool graphicsVjp =
+            std::any_of(program.program.graphs.begin(), program.program.graphs.end(), [](const Graph &graph) {
+                return graph.direction == "backward" &&
+                       std::any_of(graph.nodes.begin(), graph.nodes.end(),
+                                   [](const Node &node) { return node.operation == "graphics"; });
+            });
+        if (graphicsVjp) {
+            const program_capabilities::Entry &capability =
+                program_capabilities::get(program_capabilities::Id::GraphicsVjp);
+            return reject(diagnostic, std::string(capability.diagnosticCode), "/graphs",
+                          std::string(capability.diagnostic));
+        }
+        const bool opaqueVjp = std::any_of(program.program.abi.boundarySlots.begin(),
+                                           program.program.abi.boundarySlots.end(), [](const BoundarySlot &slot) {
+                                               return slot.category == BoundaryCategory::Texture ||
+                                                      slot.category == BoundaryCategory::Sampler;
+                                           });
+        if (opaqueVjp) {
+            const program_capabilities::Entry &capability =
+                program_capabilities::get(program_capabilities::Id::OpaqueResourceVjp);
+            return reject(diagnostic, std::string(capability.diagnosticCode), "/abi/boundary_slots",
+                          std::string(capability.diagnostic));
+        }
+    }
+    if (backend != VERNON_RUNTIME_CPU) {
+        const bool usesF16 =
+            std::any_of(program.program.values.begin(), program.program.values.end(), [](const Value &value) {
+                return value.layout && std::any_of(value.layout->leaves.begin(), value.layout->leaves.end(),
+                                                   [](const LayoutLeaf &leaf) { return leaf.dtype == "f16"; });
+            });
+        if (usesF16) {
+            const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
+            return reject(diagnostic, std::string(capability.diagnosticCode), "/values",
+                          std::string(capability.diagnostic));
+        }
+    }
     for (const Graph &graph : program.program.graphs) {
         for (const Node &node : graph.nodes) {
             const auto resolvedStage = program.stages.find(node.stage);
@@ -993,9 +1050,6 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
                 use.interfacePlan = binding.transport->targetAbi;
                 use.valueLayout = binding.wholeValueLayout;
             }
-            rebuildValueLayoutPathViews(parameter.elementLayout);
-            if (parameter.valueLayout)
-                rebuildValueLayoutPathViews(*parameter.valueLayout);
             parameter.uses.push_back(std::move(use));
             variant.internalParameters.push_back(std::move(parameter));
             continue;
@@ -1072,6 +1126,7 @@ bool materializeGraphicsTargetBindingPlan(const TargetBindingPlan &plan, Variant
               [](const vernon::runtime::Parameter &left, const vernon::runtime::Parameter &right) {
                   return left.name < right.name;
               });
+    rebuildVariantLayoutViews(variant);
     return true;
 }
 

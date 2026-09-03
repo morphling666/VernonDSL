@@ -7,23 +7,25 @@ from collections.abc import Mapping
 
 from ..frontend.abi import value_leaves
 from ..frontend.model import ConcreteType
-from .model import GraphOperation, GraphValue, ProgramGraph
+from .model import MlirOperation, MlirValue
 
 
 def _string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
-def _type(value: GraphValue) -> str:
+def _type(value: MlirValue) -> str:
     return value.type.logical.mlir
 
 
 def _interface_attributes(
-    value: GraphValue,
+    value: MlirValue,
     structs: Mapping[str, tuple[tuple[str, ConcreteType], ...]],
 ) -> str:
     source_name = value.role.split(".", 1)[-1]
     logical = value.type.logical
+    if logical.kind in {"texture", "sampler"}:
+        return f" {{vernon.source_name = {_string(source_name)}}}"
     element = logical.arguments[0] if logical.kind in {"tensor", "tensor_view", "tensor_view_abi"} else logical
     assert isinstance(element, ConcreteType)
     leaves = value_leaves(element, structs.__getitem__)
@@ -35,18 +37,20 @@ def _interface_attributes(
 
 
 def _leaf_dtypes(
-    value: GraphValue,
+    value: MlirValue,
     structs: Mapping[str, tuple[tuple[str, ConcreteType], ...]],
 ) -> str:
     logical = value.type.logical
+    if logical.kind in {"texture", "sampler"}:
+        return "[]"
     element = logical.arguments[0] if logical.kind in {"tensor", "tensor_view", "tensor_view_abi"} else logical
     assert isinstance(element, ConcreteType)
     return "[" + ", ".join(_string(leaf.dtype) for leaf in value_leaves(element, structs.__getitem__)) + "]"
 
 
 def _operation(
-    operation: GraphOperation,
-    types: dict[str, GraphValue],
+    operation: MlirOperation,
+    types: dict[str, MlirValue],
     structs: Mapping[str, tuple[tuple[str, ConcreteType], ...]],
 ) -> str:
     operands = ", ".join(name for _, name in operation.operands)
@@ -70,14 +74,19 @@ def _operation(
 
 
 def emit_graph(
-    graph: ProgramGraph,
+    name: str,
+    direction: str,
+    values: tuple[MlirValue, ...],
+    arguments: tuple[MlirValue, ...],
+    results: tuple[MlirValue, ...],
+    operations: tuple[MlirOperation, ...],
     structs: Mapping[str, tuple[tuple[str, ConcreteType], ...]],
 ) -> str:
-    all_values = {value.name: value for value in graph.values}
-    if len(all_values) != len(graph.values):
+    all_values = {value.name: value for value in values}
+    if len(all_values) != len(values):
         raise ValueError("Program graph contains duplicate SSA value names")
-    available = {value.name for value in graph.arguments}
-    for operation in graph.operations:
+    available = {value.name for value in arguments}
+    for operation in operations:
         for _, operand in operation.operands:
             if operand not in available:
                 raise ValueError(f"Program operation {operation.name!r} consumes unavailable value {operand!r}")
@@ -87,50 +96,53 @@ def emit_graph(
             if result in available:
                 raise ValueError(f"Program SSA value {result!r} has multiple definitions")
             available.add(result)
-    if any(value.name not in available for value in graph.results):
+    if any(value.name not in available for value in results):
         raise ValueError("Program graph returns an unavailable SSA value")
 
-    arguments = ", ".join(
-        f"{value.name}: {_type(value)}{_interface_attributes(value, structs)}" for value in graph.arguments
+    argument_text = ", ".join(
+        f"{value.name}: {_type(value)}{_interface_attributes(value, structs)}" for value in arguments
     )
-    argument_names = ", ".join(_string(value.role) for value in graph.arguments)
-    result_names = ", ".join(_string(value.role) for value in graph.results)
-    result_values = ", ".join(value.name for value in graph.results)
-    result_types = ", ".join(_type(value) for value in graph.results)
-    attributed_result_types = ", ".join(
-        f"{_type(value)}{_interface_attributes(value, structs)}" for value in graph.results
-    )
-    function_results = f" -> ({attributed_result_types})" if graph.results else ""
+    argument_names = ", ".join(_string(value.role) for value in arguments)
+    result_names = ", ".join(_string(value.role) for value in results)
+    result_values = ", ".join(value.name for value in results)
+    result_types = ", ".join(_type(value) for value in results)
+    attributed_result_types = ", ".join(f"{_type(value)}{_interface_attributes(value, structs)}" for value in results)
+    function_results = f" -> ({attributed_result_types})" if results else ""
     lines = [
-        f"  func.func @{graph.name}({arguments}){function_results} attributes "
+        f"  func.func @{name}({argument_text}){function_results} attributes "
         + "{"
-        + f"vernon_program.graph = {_string(graph.direction)}, "
+        + f"vernon_program.graph = {_string(direction)}, "
         + f"vernon_program.argument_names = [{argument_names}], "
         + f"vernon_program.result_names = [{result_names}]"
         + "} {",
-        *(_operation(operation, all_values, structs) for operation in graph.operations),
-        f"    func.return {result_values} : {result_types}" if graph.results else "    func.return",
+        *(_operation(operation, all_values, structs) for operation in operations),
+        f"    func.return {result_values} : {result_types}" if results else "    func.return",
         "  }",
     ]
     return "\n".join(lines)
 
 
 def emit_program(
-    forward: ProgramGraph,
-    backward: ProgramGraph | None,
+    values: tuple[MlirValue, ...],
+    arguments: tuple[MlirValue, ...],
+    results: tuple[MlirValue, ...],
+    operations: tuple[MlirOperation, ...],
     *,
+    direction: str,
     vjp_wrt: tuple[str, ...] = (),
+    vjp_outputs: tuple[str, ...] | None = None,
     structs: tuple[tuple[str, tuple[tuple[str, ConcreteType], ...]], ...] = (),
 ) -> str:
     struct_map = dict(structs)
-    graphs = [emit_graph(forward, struct_map)]
-    if backward is not None:
-        graphs.append(emit_graph(backward, struct_map))
-    attributes = (
-        " attributes {vernon_program.vjp_wrt = [" + ", ".join(_string(name) for name in vjp_wrt) + "]}"
-        if vjp_wrt
-        else ""
-    )
+    graph = emit_graph(direction, direction, values, arguments, results, operations, struct_map)
+    module_attributes: list[str] = []
+    if vjp_wrt:
+        module_attributes.append("vernon_program.vjp_wrt = [" + ", ".join(_string(name) for name in vjp_wrt) + "]")
+        if vjp_outputs is not None:
+            module_attributes.append(
+                "vernon_program.vjp_outputs = [" + ", ".join(_string(name) for name in vjp_outputs) + "]"
+            )
+    attributes = " attributes {" + ", ".join(module_attributes) + "}" if module_attributes else ""
     declarations = [
         '  "vernon.struct"() {'
         + f"sym_name = {_string(name)}, "
@@ -141,7 +153,7 @@ def emit_program(
         + "]} : () -> ()"
         for name, fields in structs
     ]
-    body = "\n".join([*declarations, *graphs])
+    body = "\n".join([*declarations, graph])
     return f"module{attributes} {{\n{body}\n}}\n"
 
 

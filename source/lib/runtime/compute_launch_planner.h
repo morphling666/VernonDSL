@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "pipeline_manifest.h"
+#include "tensor_bridge.h"
 
 #include <cstdint>
 #include <optional>
@@ -45,9 +46,16 @@ struct ComputeBindingSource {
     uint32_t dimension{};
 };
 
+struct ResultCommitPlan {
+    size_t storageIndex{};
+    VernonTensorView destination{};
+    TensorCopyPlan layout;
+};
+
 struct PlannedComputeLaunch {
     std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
+    std::vector<ResultCommitPlan> resultCommits;
     VernonLaunchSize grid{};
     VernonRuntimeProviderObject commandEncoder{};
 };
@@ -57,6 +65,7 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
 
 bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
                            const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error);
+bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime
 

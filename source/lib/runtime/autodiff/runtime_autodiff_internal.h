@@ -2,7 +2,6 @@
 #define VERNON_RUNTIME_RUNTIME_AUTODIFF_INTERNAL_H
 
 #include "VernonRuntime.h"
-#include "runtime/autodiff/runtime_autodiff_policy.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
@@ -25,6 +24,9 @@ struct RhiCommandExecutionPlan;
 
 namespace vernon::runtime {
 class ContextLease;
+}
+namespace vernon::runtime::program {
+class InvocationSnapshot;
 }
 
 namespace vernon::runtime::ad {
@@ -123,6 +125,8 @@ public:
 
 size_t dtypeSize(VernonDataType dtype);
 bool materializeDerivativeValueAbi(ValueAbi &derivative, const std::vector<ValueAbi> &sources);
+bool appendValueLayoutAbi(const ValueLayout &layout, const std::vector<uint64_t> &shape, const std::string &rootPath,
+                          std::vector<ValueAbi> &values, std::string &error);
 bool appendParameterValueAbi(const Parameter &parameter, const std::string &rootPath, std::vector<ValueAbi> &values,
                              std::string &error);
 bool validLaunchSize(VernonLaunchSize grid);
@@ -167,6 +171,7 @@ bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
 struct VernonPullback {
     std::shared_ptr<vernon::runtime::ContextLease> contextLease;
     std::unique_ptr<vernon::runtime::ad::PullbackExecution> execution;
+    std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> programSnapshot;
 };
 
 #endif

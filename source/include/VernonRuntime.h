@@ -26,6 +26,8 @@ typedef struct VernonPipelineBundle VernonPipelineBundle;
 typedef struct VernonLoadedPipeline VernonLoadedPipeline;
 typedef struct VernonPullback VernonPullback;
 typedef struct VernonSubmission VernonSubmission;
+typedef struct VernonProgramInstance VernonProgramInstance;
+typedef struct VernonProgramInvocation VernonProgramInvocation;
 
 typedef enum VernonSubmissionState {
     VERNON_SUBMISSION_PENDING = 0,
@@ -269,6 +271,28 @@ typedef struct VernonPipelineInvocation {
     uint32_t stencil_reference;
 } VernonPipelineInvocation;
 
+typedef struct VernonProgramBindingToken {
+    uint32_t struct_size;
+    const void *data;
+    size_t size;
+} VernonProgramBindingToken;
+
+typedef struct VernonProgramResourceLease {
+    uint32_t struct_size;
+    void *object;
+    void (*retain)(void *object);
+    void (*release)(void *object);
+} VernonProgramResourceLease;
+
+typedef struct VernonProgramBindingTelemetry {
+    uint32_t struct_size;
+    uint64_t prepare_count;
+    uint64_t reuse_count;
+    uint64_t rollback_count;
+    uint64_t upload_bytes;
+    uint64_t upload_ranges;
+} VernonProgramBindingTelemetry;
+
 typedef struct VernonPipelineParameterView {
     uint32_t slot;
     VernonStringView name;
@@ -408,16 +432,30 @@ typedef struct VernonPipelineBundleLoadOptions {
     uint32_t reserved[4];
 } VernonPipelineBundleLoadOptions;
 
+typedef enum VernonExecutableBundleKind {
+    VERNON_EXECUTABLE_BUNDLE_PIPELINE = 0,
+    VERNON_EXECUTABLE_BUNDLE_PROGRAM = 1
+} VernonExecutableBundleKind;
+
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeExecutableBundleInspectKind(const void *bundle, size_t bundle_size,
+                                                                          VernonExecutableBundleKind *kind);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundle, size_t bundle_size,
                                                                           VernonRuntimeBackend *target);
+/* Loads a cooked single-kernel pipeline or Module Program bundle. CPU
+ * relocatable objects must already be linked and registered by the host. */
 VERNON_RUNTIME_CAPI VernonPipelineBundle *
 vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
                                            const VernonPipelineBundleLoadOptions *options);
+VERNON_RUNTIME_CAPI VernonLoadedPipeline *
+vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
+                                          VernonFeatureSetView features,
+                                          const VernonPipelineBundleLoadOptions *options);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle);
 VERNON_RUNTIME_CAPI void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle);
 VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
                                                                        VernonFeatureSetView features);
 VERNON_RUNTIME_CAPI void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI uint8_t vernonRuntimeLoadedPipelineIsManagedProgram(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetParameterCount(const VernonLoadedPipeline *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(const VernonLoadedPipeline *pipeline,
                                                                                 size_t index,
@@ -465,6 +503,26 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipelin
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder,
                                                              VernonLoadedPipeline *pipeline,
                                                              const VernonPipelineInvocation *invocation);
+/* Executes a compiler-emitted managed Program using its ProgramABI boundary slots.
+ * output_pullback may be null when the caller does not retain autodiff state. */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramForward(VernonLoadedPipeline *pipeline,
+                                                             const VernonPipelineInvocation *invocation,
+                                                             VernonPullback **output_pullback);
+VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
+VERNON_RUNTIME_CAPI VernonProgramInvocation *
+vernonRuntimeProgramInstanceBeginInvocation(VernonProgramInstance *instance);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocation,
+                                                                    const VernonProgramBindingToken *token,
+                                                                    const VernonPipelineArgument *argument,
+                                                                    const VernonProgramResourceLease *lease,
+                                                                    uint64_t upload_bytes, uint64_t upload_ranges);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
+                                                                       VernonPullback **output_pullback);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationDestroy(VernonProgramInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInstanceGetTelemetry(const VernonProgramInstance *instance,
+                                                                          VernonProgramBindingTelemetry *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetState(const VernonSubmission *submission,
                                                           VernonSubmissionState *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submission);

@@ -1,11 +1,112 @@
+#include "runtime/autodiff/program_publication.h"
 #include "runtime/content_hash.h"
-#include "runtime/pipeline_manifest.h"
 #include "runtime/program_execution_manifest.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
 namespace {
+
+VernonPipelineArgument hostTensor(void *data, size_t size) {
+    VernonPipelineArgument argument{};
+    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_HOST;
+    argument.tensor.host_data = data;
+    argument.tensor.byte_size = size;
+    return argument;
+}
+
+struct BoundarySpec {
+    const char *path;
+    uint32_t value;
+    const char *role;
+    const char *direction;
+};
+
+void setProgramAbi(nlohmann::json &manifest, std::initializer_list<BoundarySpec> boundaries) {
+    nlohmann::json slots = nlohmann::json::array();
+    for (const BoundarySpec &boundary : boundaries) {
+        const uint32_t valueId = boundary.value;
+        const auto &value = manifest["values"][valueId];
+        nlohmann::json slot{{"id", slots.size()},
+                            {"path", boundary.path},
+                            {"value", valueId},
+                            {"role", boundary.role},
+                            {"direction", boundary.direction},
+                            {"logical_type", value["type"]},
+                            {"alias_owner", "value:" + std::to_string(valueId)},
+                            {"outer_shape", value.value("shape", nlohmann::json::array())}};
+        if (std::string_view(boundary.direction) == "output")
+            slot["publication"] = "commit_after_success";
+        if (value.contains("value_layout"))
+            slot["value_layout"] = value["value_layout"];
+        if (value.contains("storage")) {
+            const uint32_t storageId = value["storage"].get<uint32_t>();
+            const auto &storage = manifest["storages"][storageId];
+            const bool input = std::string_view(boundary.direction) == "input";
+            const std::string tag = storage["descriptor"]["tag"];
+            slot["category"] = tag == "buffer" ? "storage_view" : tag == "image" ? "texture" : "sampler";
+            slot["storage_id"] = storageId;
+            slot["alias_owner"] = "storage:" + std::to_string(storageId);
+            slot["storage_descriptor"] = storage["descriptor"];
+            slot["access"] = input && storage["mutability"] == "mutable" ? "read_write" : input ? "read" : "write";
+        } else {
+            slot["category"] = "value";
+            slot["access"] = std::string(boundary.direction) == "input" ? "read" : "write";
+        }
+        slots.push_back(std::move(slot));
+    }
+    manifest["abi"] = {{"boundary_slots", std::move(slots)},
+                       {"derivative_projections", nlohmann::json::array()},
+                       {"tape_plans", nlohmann::json::array()}};
+}
+
+TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
+    float firstSource = 3.0f;
+    float secondSource = 4.0f;
+    float firstDestination = -1.0f;
+    float secondDestination = -2.0f;
+    std::vector<vernon::runtime::ad::ProgramHostValue> storage(2);
+    storage[0].argument = hostTensor(&firstSource, sizeof(firstSource));
+    storage[1].argument = hostTensor(&secondSource, sizeof(secondSource));
+
+    std::vector<vernon::runtime::program::PublicationTarget> targets{
+        {0,
+         0,
+         vernon::runtime::program::BoundaryRole::Output,
+         {vernon::runtime::program::ProgramOwnerKind::Storage, 0}},
+        {1,
+         1,
+         vernon::runtime::program::BoundaryRole::Output,
+         {vernon::runtime::program::ProgramOwnerKind::Storage, 1}},
+    };
+    std::vector<vernon::runtime::ad::PendingProgramPublication> publications{
+        {&targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt},
+        {&targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2), std::nullopt},
+    };
+    std::string error;
+    EXPECT_FALSE(vernon::runtime::ad::commitProgramPublications(storage, publications, error));
+    EXPECT_EQ(firstDestination, -1.0f);
+    EXPECT_EQ(secondDestination, -2.0f);
+
+    publications[1].destination = hostTensor(&secondDestination, sizeof(secondDestination));
+    ASSERT_TRUE(vernon::runtime::ad::commitProgramPublications(storage, publications, error)) << error;
+    EXPECT_EQ(firstDestination, firstSource);
+    EXPECT_EQ(secondDestination, secondSource);
+}
+
+TEST(ProgramPublication, ProgramOwnerIdentityControlsBindingReuse) {
+    float first = 1.0f;
+    float second = 2.0f;
+    const vernon::runtime::program::ProgramOwnerId sharedOwner{vernon::runtime::program::ProgramOwnerKind::Storage, 7};
+    vernon::runtime::ad::ProgramOwnerBindings bindings;
+    std::string error;
+    ASSERT_TRUE(bindings.bind(sharedOwner, hostTensor(&first, sizeof(first)), error));
+    EXPECT_FALSE(bindings.bind(sharedOwner, hostTensor(&second, sizeof(second)), error));
+    EXPECT_TRUE(bindings.bind({vernon::runtime::program::ProgramOwnerKind::Storage, 8},
+                              hostTensor(&second, sizeof(second)), error));
+}
 
 TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     const std::string f32LayoutHash = "95f54cae607cf7751c0ec4327f86b0982056823c49534e9d8dddd66fc98c5f07";
@@ -103,12 +204,8 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
                                                           {{"tag", "initialize"}, {"storage", 1}, {"after", 1}}})},
                       {"operation",
                        {{"tag", "compute"},
-                        {"workgroups", nlohmann::json::array({{{"control", {{"parameter", 0}}}}, 1, 1})}}}}})}}})},
-        {"signature",
-         {{"inputs", nlohmann::json::array({{{"path", "x"}, {"value", 0}}})},
-          {"outputs", nlohmann::json::array({{{"path", "y"}, {"value", 1}, {"disposition", "transfer"}}})},
-          {"cotangents", nlohmann::json::array()},
-          {"gradients", nlohmann::json::array()}}}};
+                        {"workgroups", nlohmann::json::array({{{"control", {{"parameter", 0}}}}, 1, 1})}}}}})}}})}};
+    setProgramAbi(manifest, {{"x", 0, "input", "input"}, {"y", 1, "output", "output"}});
 
     nlohmann::json reflection{
         {"required_features", nlohmann::json::array()},
@@ -215,6 +312,20 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     vernon::runtime::program::ArtifactSystem artifacts;
     vernon::runtime::program::Diagnostic diagnostic;
     ASSERT_TRUE(vernon::runtime::program::parse(manifest, program, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(program.abi.boundarySlots.size(), 2u);
+    EXPECT_EQ(program.abi.boundarySlots[0].path, "x");
+    EXPECT_EQ(program.abi.boundarySlots[0].category, vernon::runtime::program::BoundaryCategory::StorageView);
+    ASSERT_TRUE(program.abi.boundarySlots[0].storage);
+    EXPECT_EQ(program.abi.boundarySlots[0].storage->id, 0u);
+    EXPECT_TRUE(program.abi.derivativeProjections.empty());
+    ASSERT_EQ(program.abi.publication.targets.size(), 1u);
+    EXPECT_EQ(program.abi.publication.targets[0].slot, program.abi.boundarySlots[1].id);
+    EXPECT_EQ(program.abi.publication.targets[0].value, program.abi.boundarySlots[1].value);
+    EXPECT_EQ(program.abi.publication.targets[0].aliasOwner.kind, vernon::runtime::program::ProgramOwnerKind::Storage);
+    EXPECT_EQ(program.abi.publication.targets[0].aliasOwner.id, 1u);
+    std::vector<vernon::runtime::program::BoundarySlot> unpublishedSlots = program.abi.boundarySlots;
+    unpublishedSlots[1].publication = vernon::runtime::program::BoundaryPublication::None;
+    EXPECT_TRUE(vernon::runtime::program::derivePublicationPlan(unpublishedSlots).targets.empty());
     ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(artifactSystem, artifacts, diagnostic))
         << diagnostic.message;
     vernon::runtime::program::ResolvedProgram resolved;
@@ -257,6 +368,14 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     EXPECT_EQ(output[0], 0.0f);
     EXPECT_EQ(output[17], 34.0f);
     EXPECT_EQ(output[255], 510.0f);
+    const vernon::runtime::program::StageExecutor failingExecutor =
+        [](const vernon::runtime::program::StageInvocation &, vernon::runtime::program::Diagnostic &error) {
+            error = {"TEST_STAGE_FAILURE", "execute", "", "intentional stage failure"};
+            return false;
+        };
+    ASSERT_FALSE(vernon::runtime::program::execute(resolved, invocation, failingExecutor, execution, diagnostic));
+    EXPECT_EQ(diagnostic.code, "TEST_STAGE_FAILURE");
+    EXPECT_TRUE(execution.outputs.empty());
 
     nlohmann::json multiManifest = manifest;
     multiManifest["stages"]["bias"] = {{"operation", "compute"}, {"contract_hash", contractHash}};
@@ -293,7 +412,7 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
          {"operation",
           {{"tag", "compute"}, {"workgroups", nlohmann::json::array({{{"control", {{"parameter", 0}}}}, 1, 1})}}}});
     multiManifest["graphs"][0]["outputs"][0]["value"] = 3;
-    multiManifest["signature"]["outputs"][0]["value"] = 3;
+    setProgramAbi(multiManifest, {{"x", 0, "input", "input"}, {"y", 3, "output", "output"}});
 
     nlohmann::json multiArtifactSystem = artifactSystem;
     multiArtifactSystem["artifacts"]["bias-artifact"] = multiArtifactSystem["artifacts"]["scale-artifact"];
@@ -318,6 +437,17 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     EXPECT_EQ(output[0], 1.0f);
     EXPECT_EQ(output[17], 35.0f);
     EXPECT_EQ(output[255], 511.0f);
+
+    nlohmann::json missingAbi = manifest;
+    missingAbi.erase("abi");
+    EXPECT_FALSE(vernon::runtime::program::parse(missingAbi, program, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/abi");
+
+    nlohmann::json legacySignature = manifest;
+    legacySignature["signature"] = nlohmann::json::object();
+    EXPECT_FALSE(vernon::runtime::program::parse(legacySignature, program, diagnostic));
+    EXPECT_EQ(diagnostic.code, "PROGRAM_UNKNOWN_FIELD");
+    EXPECT_EQ(diagnostic.path, "/signature");
 
     manifest["graphs"][0]["nodes"][0]["dependencies"] = nlohmann::json::array();
     EXPECT_FALSE(vernon::runtime::program::parse(manifest, program, diagnostic));
@@ -396,12 +526,8 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                           {"render_area", {{"x", 0}, {"y", 0}, {"width", 32}, {"height", 32}}},
                           {"layer_count", 1}}},
                         {"state", nlohmann::json::object()},
-                        {"draw", {{"tag", "direct"}, {"vertex_count", 3}, {"instance_count", 1}}}}}}})}}})},
-        {"signature",
-         {{"inputs", nlohmann::json::array({{{"path", "target"}, {"value", 0}}})},
-          {"outputs", nlohmann::json::array({{{"path", "target"}, {"value", 1}, {"disposition", "transfer"}}})},
-          {"cotangents", nlohmann::json::array()},
-          {"gradients", nlohmann::json::array()}}}};
+                        {"draw", {{"tag", "direct"}, {"vertex_count", 3}, {"instance_count", 1}}}}}}})}}})}};
+    setProgramAbi(manifest, {{"target", 0, "input", "input"}, {"target", 1, "output", "output"}});
     const std::string codeBytes = "test";
     const std::string codeHash = vernon::runtime::sha256Hex(codeBytes.data(), codeBytes.size());
     nlohmann::json artifactSystem{{"target", {{"kind", "metal"}, {"options", {{"platform", "macos"}}}}},

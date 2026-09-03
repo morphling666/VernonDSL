@@ -968,7 +968,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                     "shape_constraints",
                     "alias_preconditions",
                     "graphs",
-                    "signature",
+                    "abi",
                 },
             )
             self.assertEqual(len(program["graphs"]), 1)
@@ -1025,6 +1025,11 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         compiled_stages = [
                             (stage.metadata["symbol"], stage.entry, result) for stage, result in retained
                         ]
+                        # CPU objects are link-time inputs. Interactive ORC
+                        # produces the registered entry addresses above; the
+                        # runtime must not read the original object files.
+                        for descriptor in descriptors.values():
+                            (runtime_root / descriptor["path"]).unlink()
                     else:
                         runtime_backend = getattr(native.RuntimeBackend, target_name.upper())
                         if not native.runtime_available(runtime_backend):
@@ -1079,6 +1084,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                                 compiled_stages,
                             )
 
+                    else:
                         artifact_path = runtime_root / descriptors[next(iter(descriptors))]["path"]
                         original_bytes = artifact_path.read_bytes()
                         artifact_path.write_bytes(b"broken")

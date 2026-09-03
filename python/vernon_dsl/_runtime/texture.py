@@ -11,6 +11,38 @@ from ..types import TypeExpr
 from .resource_common import _session_state
 
 
+class _DirtyMipSet:
+    """Set-like adapter for runtime-owned texture dirty state."""
+
+    def __init__(self, mip_levels: int, dirty: Any = ()) -> None:
+        self._native = _session_state()._native._DirtyIndexSet(mip_levels)
+        self.update(dirty)
+
+    def __iter__(self) -> Any:
+        return iter(self._native.indices)
+
+    def __contains__(self, mip_level: object) -> bool:
+        return isinstance(mip_level, int) and not isinstance(mip_level, bool) and mip_level in self._native
+
+    def __bool__(self) -> bool:
+        return bool(self._native)
+
+    def add(self, mip_level: int) -> None:
+        self._native.add(mip_level)
+
+    def discard(self, mip_level: int) -> None:
+        self._native.discard(mip_level)
+
+    def update(self, mip_levels: Any) -> None:
+        self._native.update(list(mip_levels))
+
+    def difference_update(self, mip_levels: Any) -> None:
+        self._native.difference_update(list(mip_levels))
+
+    def clear(self) -> None:
+        self._native.clear()
+
+
 class _TextureResource:
     @property
     def shape(self) -> tuple[int, ...]:
@@ -207,8 +239,8 @@ class Texture(_TextureResource):
         self._native_texture: Any | None = None
         self._native_view: Any | None = None
         self._native_generation = -1
-        self._host_dirty_mips = set(self._mip_arrays)
-        self._device_dirty_mips: set[int] = set()
+        self._host_dirty_mips = _DirtyMipSet(mip_levels, self._mip_arrays)
+        self._device_dirty_mips = _DirtyMipSet(mip_levels)
         _session_state()._runtime_children.add(self)
 
     @staticmethod
@@ -595,7 +627,8 @@ class Texture(_TextureResource):
             )
             self._native_view = None
             self._native_generation = state._runtime_generation
-            self._host_dirty_mips = set(self._mip_arrays)
+            self._host_dirty_mips.clear()
+            self._host_dirty_mips.update(self._mip_arrays)
             self._device_dirty_mips.clear()
         assert self._native_texture is not None
         for mip_level in sorted(self._host_dirty_mips):

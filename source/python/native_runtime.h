@@ -232,26 +232,29 @@ struct Runtime {
         return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
     }
 
-    std::unique_ptr<LoadedPipeline> loadProgramPipelineAsset(const nb::bytes &data, const std::string &directory,
-                                                             const std::vector<std::string> &features,
-                                                             const nb::list &compiledStages) {
-        std::vector<SharedCompileResult> retained;
-        std::vector<std::pair<std::string, VernonCpuEntryPoint>> entries;
-        std::vector<std::shared_ptr<InternedCpuJit>> interned;
-        registerInternedCpuStages(compiledStages, "compiled Program stage metadata is invalid",
-                                  "compiled Program CPU entry ", "cannot register compiled Program CPU entry ",
-                                  retained, entries, interned);
-        try {
-            std::unique_ptr<LoadedPipeline> pipeline = loadPipelineAsset(data, directory, features);
-            pipeline->internedCpuJits = std::move(interned);
-            pipeline->retainedResults = std::move(retained);
-            pipeline->registeredCpuEntries = std::move(entries);
-            return pipeline;
-        } catch (...) {
-            for (const auto &[symbol, entry] : entries)
-                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
-            throw;
-        }
+    std::unique_ptr<LoadedPipeline> loadCookedAsset(const nb::bytes &data, const std::string &directory,
+                                                    const std::vector<std::string> &features) {
+        VernonExecutableBundleKind kind{};
+        if (vernonRuntimeExecutableBundleInspectKind(data.c_str(), data.size(), &kind) != VERNON_STATUS_OK)
+            throw std::runtime_error("cooked asset is neither a Pipeline nor Program bundle");
+        return kind == VERNON_EXECUTABLE_BUNDLE_PROGRAM ? loadProgramAsset(data, directory, features)
+                                                        : loadPipelineAsset(data, directory, features);
+    }
+
+    std::unique_ptr<LoadedPipeline> loadProgramAsset(const nb::bytes &data, const std::string &directory,
+                                                     const std::vector<std::string> &features) {
+        VernonPipelineBundleLoadOptions options{};
+        options.struct_size = sizeof(options);
+        options.bundle_directory = directory.c_str();
+        std::vector<const char *> names;
+        for (const std::string &feature : features)
+            names.push_back(feature.c_str());
+        VernonLoadedPipeline *pipeline = vernonRuntimeLoadProgramBundleWithOptions(
+            handle, data.c_str(), data.size(), {names.data(), names.size()}, &options);
+        if (!pipeline)
+            throw std::runtime_error("cannot load Program bundle: " +
+                                     nativeStringView(vernonRuntimeGetLastError(handle)));
+        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
     }
 
     std::unique_ptr<LoadedPipeline> loadCanonicalProgram(const nb::bytes &programData,

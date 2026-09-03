@@ -1,5 +1,6 @@
 #include "VernonCpuWorkgroupABI.h"
 #include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/program_value_arena.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/content_hash.h"
 #include "runtime/runtime_dispatch.h"
@@ -179,7 +180,11 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     std::string objectCanonical = objectBundle.dump(-1, ' ', false);
     objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
     const std::string missingObjectManifest = objectBundle.dump(-1, ' ', false);
-    VernonPipelineBundle *missingObjectLoaded = loadWithDirectory(runtime, missingObjectManifest, directoryUtf8);
+    // The object is a link-time input, not a runtime artifact. A deployed
+    // application carries the linked symbol and metadata, but not the .o/.obj.
+    ASSERT_TRUE(std::filesystem::remove(objectPath));
+    VernonPipelineBundle *missingObjectLoaded = vernonRuntimeLoadPipelineBundleWithOptions(
+        runtime, missingObjectManifest.data(), missingObjectManifest.size(), nullptr);
     ASSERT_TRUE(missingObjectLoaded);
     EXPECT_EQ(vernonRuntimeResolvePipeline(missingObjectLoaded, {nullptr, 0}), nullptr);
     const VernonStringView missingRegistrationError = vernonRuntimeGetLastError(runtime);
@@ -196,7 +201,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     const std::string objectManifest = objectBundle.dump(-1, ' ', false);
     ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({"vernon_test_fill", std::strlen("vernon_test_fill")},
                                                     staticallyLinkedFill) == VERNON_STATUS_OK);
-    VernonPipelineBundle *objectLoaded = loadWithDirectory(runtime, objectManifest, directoryUtf8);
+    VernonPipelineBundle *objectLoaded =
+        vernonRuntimeLoadPipelineBundleWithOptions(runtime, objectManifest.data(), objectManifest.size(), nullptr);
     ASSERT_TRUE(objectLoaded);
     VernonLoadedPipeline *objectPipeline = vernonRuntimeResolvePipeline(objectLoaded, {nullptr, 0});
     ASSERT_TRUE(objectPipeline);
@@ -535,89 +541,6 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     EXPECT_EQ(loaded, nullptr);
     EXPECT_NE(std::string(loadError.data ? loadError.data : "", loadError.size).find("unknown or legacy field"),
               std::string::npos);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-    return;
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
-    const VernonStringView error = vernonRuntimeGetLastError(runtime);
-    ASSERT_NE(pipeline, nullptr) << std::string(error.data ? error.data : "", error.size);
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline));
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_INPUT), 0u);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_OUTPUT), 1u);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_COTANGENT), 0u);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_GRADIENT), 1u);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, VERNON_PROGRAM_AD_CAPTURE), 2u);
-    VernonProgramAdValueView reflectedGradient{};
-    reflectedGradient.struct_size = sizeof(reflectedGradient);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(pipeline, VERNON_PROGRAM_AD_GRADIENT, 0,
-                                                                  &reflectedGradient),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(std::string(reflectedGradient.path.data, reflectedGradient.path.size), "gradient");
-    EXPECT_EQ(reflectedGradient.value_id, 1u);
-    ASSERT_NE(pipeline->topology, nullptr);
-    ASSERT_EQ(pipeline->topology->stages.size(), 5u);
-    EXPECT_EQ(pipeline->topology->residualValues, std::vector<uint32_t>({0, 2}));
-    ASSERT_NE(pipeline->topology->resolvedProgram, nullptr);
-    const vernon::runtime::program::Graph *backward =
-        vernon::runtime::program::findGraph(pipeline->topology->resolvedProgram->program, "backward");
-    ASSERT_NE(backward, nullptr);
-
-    float output[16]{};
-    float gradients[16]{};
-    float residualStorage[16]{};
-    const uint64_t shape[] = {16};
-    const int64_t strides[] = {sizeof(float)};
-    std::vector<VernonPipelineArgument> values(3);
-    for (auto [index, storage] : {std::pair{0u, output}, std::pair{1u, gradients}, std::pair{2u, residualStorage}}) {
-        VernonPipelineParameterView parameter{};
-        ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &parameter), VERNON_STATUS_OK);
-        VernonPipelineArgument &argument = values[index];
-        argument.slot = index;
-        argument.kind = VERNON_PIPELINE_TENSOR;
-        argument.tensor.struct_size = sizeof(VernonTensorView);
-        argument.tensor.storage = VERNON_TENSOR_HOST;
-        argument.tensor.host_data = storage;
-        argument.tensor.element_layout = parameter.element_layout;
-        argument.tensor.access = VERNON_ACCESS_WRITE;
-        argument.tensor.rank = 1;
-        argument.tensor.shape = shape;
-        argument.tensor.byte_strides = strides;
-        argument.tensor.byte_size = sizeof(output);
-    }
-    ASSERT_EQ(vernon::runtime::executePipelineProgramGraph(*pipeline, *backward, values), VERNON_STATUS_OK);
-    EXPECT_EQ(gradients[0], 0.0f);
-    EXPECT_EQ(gradients[15], 113.0f);
-
-    std::fill(std::begin(output), std::end(output), -1.0f);
-    pipeline->context->autodiffMemoryPolicy =
-        std::make_shared<vernon::runtime::ad::AutodiffMemoryPolicy>(sizeof(output), sizeof(output));
-    VernonAdValue outputValue{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output, sizeof(output), 1, shape};
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), &outputValue, 1, {}};
-    VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK);
-    ASSERT_NE(pullback, nullptr);
-    EXPECT_EQ(output[15], 113.0f);
-    const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
-    EXPECT_EQ(memory.logicalResidualBytes, 2 * sizeof(output));
-    EXPECT_EQ(memory.residentBytes, sizeof(output));
-
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    std::fill(std::begin(gradients), std::end(gradients), -1.0f);
-    VernonAdValue gradientValue{
-        sizeof(VernonAdValue), {"gradient", 8}, VERNON_DATA_F32, gradients, sizeof(gradients), 1, shape};
-    VernonAdValueSet gradientSet{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
-    const VernonPullbackApplyOptions noTemporaryMemory{
-        sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, 0, {}};
-    ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, nullptr, &gradientSet, &noTemporaryMemory),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(gradients[15], -1.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradientSet), VERNON_STATUS_OK);
-    EXPECT_EQ(gradients[15], 113.0f);
-    std::fill(std::begin(gradients), std::end(gradients), -1.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, nullptr, &gradientSet), VERNON_STATUS_OK);
-    EXPECT_EQ(gradients[15], 113.0f);
-    vernonPullbackDestroy(pullback);
-    vernonRuntimePipelineBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 #endif

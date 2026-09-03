@@ -132,8 +132,6 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             layoutType = {};
         } else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(type)) {
             element = tensor.getElementType();
-            for (int64_t extent : tensor.getShape())
-                shape.emplace_back(extent);
         } else if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
             element = tensor.getElementType();
             if (!tensor.hasStaticShape()) {
@@ -141,8 +139,6 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 invalid = true;
                 return;
             }
-            for (int64_t extent : tensor.getShape())
-                shape.emplace_back(extent);
         }
         std::string dtype;
         if (logicalDtype && !logicalDtype->empty())

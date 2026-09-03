@@ -949,6 +949,18 @@ void rebuildValueLayoutPathViews(ValueLayout &layout) {
     }
 }
 
+void rebuildVariantLayoutViews(Variant &variant) {
+    const auto rebuild = [](Parameter &parameter) {
+        if (parameter.valueLayout)
+            rebuildValueLayoutPathViews(*parameter.valueLayout);
+        rebuildValueLayoutPathViews(parameter.elementLayout);
+    };
+    for (Parameter &parameter : variant.parameters)
+        rebuild(parameter);
+    for (Parameter &parameter : variant.internalParameters)
+        rebuild(parameter);
+}
+
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
     return parseValueLayout(value, layout, error);
 }

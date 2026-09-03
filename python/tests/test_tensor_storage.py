@@ -16,7 +16,7 @@ from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl._runtime.binding import (
     _dispatch_borrow_scope,
     _DispatchBorrowLease,
-    _NativeBindingCache,
+    _PersistentBindingTable,
 )
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl._runtime.tensor import _logical_collection_shape
@@ -39,9 +39,15 @@ class NestedRecord:
 
 
 class TensorStorageRuntimeTests(unittest.TestCase):
-    def test_native_binding_cache_prepares_only_changed_execution_tokens(self) -> None:
-        cache = _NativeBindingCache()
+    def test_persistent_binding_table_commits_typed_updates(self) -> None:
+        cache = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
         builder = mock.Mock()
+        pipeline = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.builder = builder
         builder.prepare_host_tensor.side_effect = lambda *_: object()
         parameter = SimpleNamespace(
             slot=0,
@@ -50,15 +56,33 @@ class TensorStorageRuntimeTests(unittest.TestCase):
             shape=(),
         )
 
-        cache.bind_argument(builder, object(), parameter, np.float32(2.0), binding_token=11)
-        cache.bind_argument(builder, object(), parameter, np.float32(2.0), binding_token=11)
-        cache.bind_argument(builder, object(), parameter, np.float32(5.0), binding_token=12)
+        with cache.invocation(pipeline) as active:
+            self.assertIs(active, builder)
+            cache.bind_argument(builder, pipeline, parameter, np.float32(2.0), binding_token=11)
 
-        self.assertEqual(builder.prepare_host_tensor.call_count, 2)
-        self.assertEqual(builder.prepared_argument.call_count, 3)
-        cache.clear()
-        cache.bind_argument(builder, object(), parameter, np.float32(5.0), binding_token=12)
-        self.assertEqual(builder.prepare_host_tensor.call_count, 3)
+        pipeline.program_instance.assert_called_once_with()
+        instance.begin_invocation.assert_called_once_with()
+        transaction.bind.assert_called_once()
+        self.assertEqual(transaction.bind.call_args.args[:2], (0, ("execution-value", 11)))
+        transaction.commit.assert_called_once_with()
+        transaction.rollback.assert_not_called()
+
+    def test_persistent_binding_table_rolls_back_failed_invocation(self) -> None:
+        table = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
+        pipeline = mock.Mock()
+        builder = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.builder = builder
+
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
+            with table.invocation(pipeline):
+                raise RuntimeError("dispatch failed")
+
+        transaction.rollback.assert_called_once_with()
+        transaction.commit.assert_not_called()
 
     def test_nested_host_layout_uses_one_complete_native_plan(self) -> None:
         with mock.patch.object(native, "_plan_value_abi", wraps=native._plan_value_abi) as planner:

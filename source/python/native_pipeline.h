@@ -5,10 +5,12 @@
 #include "VernonRuntime.h"
 #include "compiler_python_bridge.h"
 #include "native_rhi.h"
+#include "runtime/program_instance.h"
 #include "runtime/tensor_bridge.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/array.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
@@ -18,13 +20,10 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
-#include <future>
-#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -126,6 +125,8 @@ std::unique_ptr<StructuredVjp> buildStructuredVjp(const std::string &moduleText,
                                                   const std::vector<std::string> &wrtPaths,
                                                   const std::vector<std::string> &outputPaths,
                                                   const std::string &forwardSymbol, const std::string &backwardSymbol);
+std::pair<std::string, std::string> buildProgramBuiltin(const std::string &operation, const std::string &elementType,
+                                                        uint32_t rank, const std::vector<std::string> &leafDtypes);
 
 std::string specializeKernelHostConstants(const std::string &moduleText, const std::string &entry,
                                           const std::vector<std::string> &names, const nb::list &values);
@@ -680,6 +681,132 @@ struct PipelineInvocationBuilder {
     VernonLaunchSize computeGrid{};
     uint32_t viewport[4]{};
     uint32_t scissor[4]{};
+};
+
+inline void appendBindingTokenField(std::string &result, char tag, const char *data, size_t size) {
+    result += tag;
+    result += std::to_string(size);
+    result += ':';
+    result.append(data, size);
+}
+
+inline void appendCanonicalBindingToken(std::string &result, PyObject *value) {
+    if (PyTuple_Check(value)) {
+        const Py_ssize_t count = PyTuple_GET_SIZE(value);
+        result += 't';
+        result += std::to_string(count);
+        result += ':';
+        for (Py_ssize_t index = 0; index < count; ++index)
+            appendCanonicalBindingToken(result, PyTuple_GET_ITEM(value, index));
+        return;
+    }
+    if (PyBytes_Check(value)) {
+        char *data = nullptr;
+        Py_ssize_t size = 0;
+        if (PyBytes_AsStringAndSize(value, &data, &size) != 0)
+            throw nb::python_error();
+        appendBindingTokenField(result, 'b', data, static_cast<size_t>(size));
+        return;
+    }
+    if (PyUnicode_Check(value)) {
+        Py_ssize_t size = 0;
+        const char *data = PyUnicode_AsUTF8AndSize(value, &size);
+        if (!data)
+            throw nb::python_error();
+        appendBindingTokenField(result, 's', data, static_cast<size_t>(size));
+        return;
+    }
+    if (PyLong_Check(value)) {
+        nb::object text = nb::steal<nb::object>(PyObject_Str(value));
+        if (!text.is_valid())
+            throw nb::python_error();
+        Py_ssize_t size = 0;
+        const char *data = PyUnicode_AsUTF8AndSize(text.ptr(), &size);
+        if (!data)
+            throw nb::python_error();
+        appendBindingTokenField(result, 'i', data, static_cast<size_t>(size));
+        return;
+    }
+    throw std::invalid_argument("Program binding token must contain only tuple, string, integer, or bytes fields");
+}
+
+inline std::string canonicalBindingToken(const nb::object &value) {
+    std::string result;
+    appendCanonicalBindingToken(result, value.ptr());
+    return result;
+}
+
+struct PythonPreparedBindingLease {
+    explicit PythonPreparedBindingLease(nb::object value) : prepared(std::move(value)) {}
+    nb::object prepared;
+};
+
+// Nanobind owns only Python object conversion. Transactional binding state,
+// token comparison, snapshots, telemetry, and payload leases live in the
+// runtime ProgramInstance referenced by this adapter.
+struct PythonProgramInvocationAdapter {
+    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline,
+                                   vernon::runtime::program::ProgramInstance &instance)
+        : builder(std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline)),
+          transaction(instance.beginInvocation()) {}
+    PythonProgramInvocationAdapter(const PythonProgramInvocationAdapter &) = delete;
+    PythonProgramInvocationAdapter &operator=(const PythonProgramInvocationAdapter &) = delete;
+
+    PipelineInvocationBuilder &builderView() const { return *builder; }
+
+    void bind(uint32_t slot, const nb::object &token, const nb::callable &prepare, uint64_t uploadBytes = 0,
+              uint64_t uploadRanges = 0, bool eagerUpload = false) {
+        const std::string key = canonicalBindingToken(token);
+        if (eagerUpload)
+            transaction->observeUploads(uploadBytes, uploadRanges);
+        if (const std::shared_ptr<void> *payload = transaction->find(slot, key)) {
+            auto lease = std::static_pointer_cast<PythonPreparedBindingLease>(*payload);
+            builder->preparedArgument(*nb::cast<PreparedPipelineArgument *>(lease->prepared));
+            return;
+        }
+        nb::object prepared = prepare();
+        auto *argument = nb::cast<PreparedPipelineArgument *>(prepared);
+        if (!argument)
+            throw std::invalid_argument("binding prepare callback did not return a prepared argument");
+        builder->preparedArgument(*argument);
+        if (!eagerUpload)
+            transaction->observeUploads(uploadBytes, uploadRanges);
+        transaction->stage(slot, key, std::make_shared<PythonPreparedBindingLease>(std::move(prepared)), 0, 0);
+    }
+
+    void commit() { snapshot = transaction->commit(); }
+    void rollback() { transaction->rollback(); }
+
+    std::unique_ptr<PipelineInvocationBuilder> builder;
+    std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
+    std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
+};
+
+struct PythonProgramInstanceAdapter {
+    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline)
+        : owner(owner), runtime(runtime), pipeline(pipeline), nativeInstance(pipeline) {}
+    PythonProgramInstanceAdapter(const PythonProgramInstanceAdapter &) = delete;
+    PythonProgramInstanceAdapter &operator=(const PythonProgramInstanceAdapter &) = delete;
+
+    std::unique_ptr<PythonProgramInvocationAdapter> beginInvocation() {
+        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, pipeline, nativeInstance);
+    }
+
+    nb::dict telemetryView() const {
+        const vernon::runtime::program::BindingTelemetry telemetry = nativeInstance.telemetry();
+        nb::dict result;
+        result["prepare_count"] = telemetry.prepareCount;
+        result["reuse_count"] = telemetry.reuseCount;
+        result["rollback_count"] = telemetry.rollbackCount;
+        result["upload_bytes"] = telemetry.uploadBytes;
+        result["upload_ranges"] = telemetry.uploadRanges;
+        return result;
+    }
+
+    Runtime *owner{};
+    VernonRuntimeContext *runtime{};
+    VernonLoadedPipeline *pipeline{};
+    vernon::runtime::program::ProgramInstance nativeInstance;
 };
 
 const char *numpyDtypeName(VernonDataType dtype);

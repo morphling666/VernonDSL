@@ -4,7 +4,7 @@ Kernel function compilation lives in :mod:`vernon_dsl.frontend`; this package
 only models scheduling-level forward and backward graphs.
 """
 
-from .model import GraphOperation, GraphValue, ParsedProgram, ProgramGraph, ProgramImplementation, ProgramType
+from .model import MlirOperation, MlirValue, ParsedProgram, ProgramImplementation, ProgramType
 from .parser import parse_program
 from .providers import (
     BuiltinDslProvider,
@@ -15,14 +15,13 @@ from .providers import (
 )
 
 __all__ = [
-    "GraphOperation",
-    "GraphValue",
+    "MlirOperation",
+    "MlirValue",
     "BuiltinDslProvider",
     "CapturedDslProvider",
     "CapturedVjpDslProvider",
     "DirectKernelDslProvider",
     "ParsedProgram",
-    "ProgramGraph",
     "ProgramImplementation",
     "ProgramType",
     "ProviderChain",

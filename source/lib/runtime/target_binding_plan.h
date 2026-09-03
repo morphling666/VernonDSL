@@ -36,10 +36,7 @@ enum class TargetCarrier {
 enum class CarrierSemantic {
     Value,
     Resource,
-    TapeData,
-    ReplaySegment,
-    ReplayStatus,
-    LaunchMetadata,
+    Tape,
 };
 
 enum class ViewAxisSource {
@@ -95,6 +92,7 @@ struct TargetBinding {
     SourceRepresentation source{SourceRepresentation::ResourceHandle};
     TargetCarrier carrier{TargetCarrier::StorageBuffer};
     CarrierSemantic semantic{CarrierSemantic::Resource};
+    std::optional<vernon::program_plan::TapeCarrier> tapeCarrier;
     std::string name;
     std::string sourceName;
     std::string kind;
@@ -139,6 +137,7 @@ struct TargetBindingPlan {
     uint32_t workgroupSize[3]{1, 1, 1};
     vernon::runtime::DispatchContract dispatch;
     uint64_t packedArgumentsSize{};
+    uint64_t packedResultsSize{};
     std::vector<TargetBinding> bindings;
     std::vector<TargetOutput> outputs;
     std::vector<TargetModule> modules;

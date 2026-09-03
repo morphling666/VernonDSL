@@ -2,6 +2,7 @@
 
 #include "compiler_frontend.h"
 #include "compiler_internal.h"
+#include "compiler_program_builtin.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
@@ -85,7 +86,48 @@ struct VernonPythonSpecializedKernel {
     std::string module;
 };
 
+struct VernonPythonProgramBuiltin {
+    VernonStatus status{VERNON_STATUS_INTERNAL_ERROR};
+    std::string diagnostics;
+    std::string entry;
+    std::string module;
+};
+
 extern "C" {
+
+VernonPythonProgramBuiltin *vernonCompilerBuildPythonProgramBuiltin(VernonStringView operation,
+                                                                    VernonStringView elementType, uint32_t rank,
+                                                                    const VernonStringView *leafDtypes,
+                                                                    size_t leafDtypeCount) {
+    std::unique_ptr<VernonPythonProgramBuiltin> result(new (std::nothrow) VernonPythonProgramBuiltin());
+    if (!result)
+        return nullptr;
+    if ((!operation.data && operation.size) || (!elementType.data && elementType.size) ||
+        (!leafDtypes && leafDtypeCount)) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "Program built-in inputs must be valid";
+        return result.release();
+    }
+    std::vector<std::string> leaves;
+    leaves.reserve(leafDtypeCount);
+    for (size_t index = 0; index < leafDtypeCount; ++index)
+        leaves.emplace_back(leafDtypes[index].data ? leafDtypes[index].data : "", leafDtypes[index].size);
+    result->status = vernon::compiler::buildProgramBuiltinMlir(
+                         llvm::StringRef(operation.data ? operation.data : "", operation.size),
+                         llvm::StringRef(elementType.data ? elementType.data : "", elementType.size), rank, leaves,
+                         result->entry, result->module, result->diagnostics)
+                         ? VERNON_STATUS_OK
+                         : VERNON_STATUS_INVALID_ARGUMENT;
+    return result.release();
+}
+
+void vernonCompilerDestroyPythonProgramBuiltin(VernonPythonProgramBuiltin *result) { delete result; }
+
+VernonPythonProgramBuiltinView vernonCompilerGetPythonProgramBuiltinView(const VernonPythonProgramBuiltin *result) {
+    return result ? VernonPythonProgramBuiltinView{result->status, viewOf(result->diagnostics), viewOf(result->entry),
+                                                   viewOf(result->module)}
+                  : VernonPythonProgramBuiltinView{VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}};
+}
 
 VernonPythonValueAbiPlan *vernonCompilerPlanPythonValueAbi(VernonStringView module,
                                                            const VernonStringView *logicalDtypes,
@@ -350,7 +392,7 @@ void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result)
 VernonPythonStructuredVjpView vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result) {
     if (!result)
         return {
-            VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, {}};
+            VERNON_STATUS_INVALID_ARGUMENT, {}, {}, {}, 0, 0, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, {}, 0};
     return {result->status,
             viewOf(result->diagnostics),
             viewOf(result->forwardModule),

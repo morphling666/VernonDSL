@@ -52,10 +52,10 @@ std::optional<shape::DeclaredShape> logicalProjectionShape(const Parameter &para
 
 } // namespace
 
-ProgramValueArena::ProgramValueArena(const std::vector<VernonPipelineArgument> &hostArguments)
+ProgramInvocationFrame::ProgramInvocationFrame(const std::vector<VernonPipelineArgument> &hostArguments)
     : logicalArguments_(hostArguments), logicalBuffers_(hostArguments.size()), carriers_(hostArguments.size()) {}
 
-ProgramValueArena::ProgramValueArena(std::vector<ProgramHostValue> hostValues)
+ProgramInvocationFrame::ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues)
     : hostValues_(std::move(hostValues)), logicalArguments_(hostValues_.size()), logicalBuffers_(hostValues_.size()),
       carriers_(hostValues_.size()) {
     for (size_t value = 0; value < hostValues_.size(); ++value) {
@@ -64,10 +64,10 @@ ProgramValueArena::ProgramValueArena(std::vector<ProgramHostValue> hostValues)
     }
 }
 
-bool ProgramValueArena::materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required,
-                                          std::string &error) {
+bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required,
+                                               std::string &error) {
     if (required.size() != logicalArguments_.size()) {
-        error = "Program device arena requirement set does not match its values";
+        error = "Program invocation frame requirement set does not match its values";
         return false;
     }
     struct HostBacking {
@@ -80,6 +80,9 @@ bool ProgramValueArena::materializeDevice(VernonRuntimeContext &context, const s
         if (!required[value])
             continue;
         const VernonPipelineArgument &argument = logicalArguments_[value];
+        if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
+                                           hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
+            continue;
         if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
@@ -92,7 +95,7 @@ bool ProgramValueArena::materializeDevice(VernonRuntimeContext &context, const s
         (void)identity;
         backing.device = std::make_shared<gpu::DeviceBuffer>(context, backing.bytes);
         if (!backing.device->valid() || !backing.device->upload(backing.data, backing.bytes)) {
-            error = "Program device arena could not allocate or upload a Storage backing";
+            error = "Program invocation frame could not allocate or upload a Storage backing";
             return false;
         }
     }
@@ -100,18 +103,21 @@ bool ProgramValueArena::materializeDevice(VernonRuntimeContext &context, const s
         if (!required[value])
             continue;
         VernonPipelineArgument &argument = logicalArguments_[value];
+        if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
+                                           hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
+            continue;
         if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
         const auto found = backings.find(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
         if (found == backings.end()) {
-            error = "Program device arena lost a Storage backing";
+            error = "Program invocation frame lost a Storage backing";
             return false;
         }
         logicalBuffers_[value] = found->second.device;
         VernonRuntimeProviderResourceReference reference{};
         if (!found->second.device->reference(reference)) {
-            error = "Program device arena could not reference a Storage backing";
+            error = "Program invocation frame could not reference a Storage backing";
             return false;
         }
         argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
@@ -121,7 +127,7 @@ bool ProgramValueArena::materializeDevice(VernonRuntimeContext &context, const s
     return true;
 }
 
-bool ProgramValueArena::restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error) {
+bool ProgramInvocationFrame::restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error) {
     if (required.size() != logicalArguments_.size() || hostValues_.size() != logicalArguments_.size()) {
         error = "Program device restore set does not match its values";
         return false;
@@ -134,7 +140,7 @@ bool ProgramValueArena::restoreDeviceValuesFromHost(const std::vector<char> &req
         const VernonTensorView &host = hostValues_[value].argument.tensor;
         if (!host.host_data || host.byte_offset || host.byte_size != logicalBuffers_[value]->size() ||
             !logicalBuffers_[value]->upload(host.host_data, host.byte_size)) {
-            error = "Program device arena cannot restore a Storage backing";
+            error = "Program invocation frame cannot restore a Storage backing";
             return false;
         }
         restored.push_back(logicalBuffers_[value].get());
@@ -142,23 +148,31 @@ bool ProgramValueArena::restoreDeviceValuesFromHost(const std::vector<char> &req
     return true;
 }
 
-bool ProgramValueArena::adoptRetainedValue(uint32_t value, const ProgramValueArena &retained, std::string &error) {
+bool ProgramInvocationFrame::adoptRetainedValue(uint32_t value, const ProgramInvocationFrame &retained,
+                                                std::string &error) {
     if (value >= logicalArguments_.size() || value >= retained.logicalArguments_.size()) {
-        error = "Program retained Value exceeds its arena";
+        error = "Program retained Value exceeds its invocation frame";
         return false;
     }
-    if (retained.logicalBuffers_[value]) {
+    const VernonPipelineArgument &retainedArgument = retained.logicalArguments_[value];
+    const bool externalResource = retainedArgument.kind != VERNON_PIPELINE_TENSOR ||
+                                  retainedArgument.tensor.storage == VERNON_TENSOR_RHI_RESOURCE;
+    if (retained.logicalBuffers_[value] || externalResource) {
         logicalBuffers_[value] = retained.logicalBuffers_[value];
-        logicalArguments_[value] = retained.logicalArguments_[value];
+        logicalArguments_[value] = retainedArgument;
     }
-    carriers_[value] = retained.carriers_[value];
-    if (value < hostValues_.size() && value < retained.hostValues_.size())
+    for (size_t index = 0; index < carriers_[value].size(); ++index)
+        if (retained.carriers_[value][index].buffer)
+            carriers_[value][index] = retained.carriers_[value][index];
+    if (value < hostValues_.size() && value < retained.hostValues_.size()) {
         hostValues_[value].concreteShape = retained.hostValues_[value].concreteShape;
+        hostValues_[value].strides = retained.hostValues_[value].strides;
+    }
     rebindLogicalDescriptor(value);
     return true;
 }
 
-void ProgramValueArena::rebindLogicalDescriptor(uint32_t value) {
+void ProgramInvocationFrame::rebindLogicalDescriptor(uint32_t value) {
     if (value >= hostValues_.size() || value >= logicalArguments_.size())
         return;
     ProgramHostValue &host = hostValues_[value];
@@ -176,14 +190,15 @@ void ProgramValueArena::rebindLogicalDescriptor(uint32_t value) {
     }
 }
 
-bool ProgramValueArena::allocateCarrier(VernonRuntimeContext &context, uint32_t value,
-                                        const program::TargetBinding &binding, size_t byteSize,
-                                        std::vector<uint64_t> shape, std::vector<int64_t> strides, std::string &error) {
+bool ProgramInvocationFrame::allocateCarrier(VernonRuntimeContext &context, uint32_t value,
+                                             const program::TargetBinding &binding, size_t byteSize,
+                                             std::vector<uint64_t> shape, std::vector<int64_t> strides,
+                                             std::string &error) {
     if (value >= carriers_.size() || !byteSize || shape.size() != strides.size()) {
         error = "Program carrier allocation has an invalid value or layout";
         return false;
     }
-    Carrier *slot = carrier(value, binding.semantic);
+    Carrier *slot = binding.tapeCarrier ? carrier(value, *binding.tapeCarrier) : nullptr;
     if (!slot) {
         error = "Program carrier allocation has an unsupported semantic";
         return false;
@@ -213,9 +228,9 @@ bool ProgramValueArena::allocateCarrier(VernonRuntimeContext &context, uint32_t 
     return true;
 }
 
-bool ProgramValueArena::uploadCarrier(uint32_t value, program::CarrierSemantic semantic, const void *data,
-                                      size_t byteSize, std::string &error) {
-    Carrier *slot = carrier(value, semantic);
+bool ProgramInvocationFrame::uploadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, const void *data,
+                                           size_t byteSize, std::string &error) {
+    Carrier *slot = carrier(value, carrierKind);
     if (!slot || !slot->buffer || byteSize > slot->buffer->size() || !slot->buffer->upload(data, byteSize)) {
         error = "Program carrier upload exceeds its device allocation";
         return false;
@@ -223,9 +238,9 @@ bool ProgramValueArena::uploadCarrier(uint32_t value, program::CarrierSemantic s
     return true;
 }
 
-bool ProgramValueArena::downloadCarrier(uint32_t value, program::CarrierSemantic semantic, void *data, size_t byteSize,
-                                        std::string &error) const {
-    const Carrier *slot = carrier(value, semantic);
+bool ProgramInvocationFrame::downloadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, void *data,
+                                             size_t byteSize, std::string &error) const {
+    const Carrier *slot = carrier(value, carrierKind);
     if (!slot || !slot->buffer || byteSize > slot->buffer->size() || !slot->buffer->download(data, byteSize)) {
         error = "Program carrier readback exceeds its device allocation";
         return false;
@@ -233,7 +248,7 @@ bool ProgramValueArena::downloadCarrier(uint32_t value, program::CarrierSemantic
     return true;
 }
 
-bool ProgramValueArena::downloadLogicalToHost(const std::vector<char> &required, std::string &error) const {
+bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &required, std::string &error) const {
     if (required.size() != logicalArguments_.size()) {
         error = "Program device readback set does not match its values";
         return false;
@@ -246,16 +261,16 @@ bool ProgramValueArena::downloadLogicalToHost(const std::vector<char> &required,
             !logicalBuffers_[value]->download(host.argument.tensor.byte_offset,
                                               const_cast<void *>(host.argument.tensor.host_data),
                                               host.argument.tensor.byte_size)) {
-            error = "Program device arena could not download a logical value";
+            error = "Program invocation frame could not download a logical value";
             return false;
         }
     }
     return true;
 }
 
-bool ProgramValueArena::materializeNodeArguments(const program::Program &program, const program::Node &node,
-                                                 const VernonResolvedProgramStage &stage,
-                                                 MaterializedProgramArguments &output, std::string &error) const {
+bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &program, const program::Node &node,
+                                                      const VernonResolvedProgramStage &stage,
+                                                      MaterializedProgramArguments &output, std::string &error) const {
     if (!stage.pipeline || stage.bindings.size() != stage.pipeline->variant.parameters.size()) {
         error = "resolved Program stage has an invalid binding plan";
         return false;
@@ -290,7 +305,7 @@ bool ProgramValueArena::materializeNodeArguments(const program::Program &program
         const Parameter &parameter = stage.pipeline->variant.parameters[parameterIndex];
         const VernonProgramStageBinding &binding = stage.bindings[parameterIndex];
         if (binding.value >= logicalArguments_.size() || binding.value >= program.values.size()) {
-            error = "resolved Program stage binding exceeds the value arena";
+            error = "resolved Program stage binding exceeds the invocation frame";
             return false;
         }
         const VernonPipelineArgument *source = argument(binding.value, binding.target ? &*binding.target : nullptr);
@@ -332,13 +347,26 @@ bool ProgramValueArena::materializeNodeArguments(const program::Program &program
             materialized.tensor.shape = output.shapes.back().data();
             materialized.tensor.byte_strides = output.strides.back().data();
         }
-        if (binding.target && binding.target->semantic != program::CarrierSemantic::Value &&
-            binding.target->semantic != program::CarrierSemantic::Resource) {
+        if (binding.target && binding.target->semantic == program::CarrierSemantic::Tape) {
+            const shape::DeclaredShape &declared = binding.target->shape;
+            if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared)) {
+                size_t elements = 0;
+                size_t bytes = 0;
+                if (!shape::checkedElementCount(*concrete, elements) || !binding.target->elementLayout.byteSize ||
+                    elements > std::numeric_limits<size_t>::max() / binding.target->elementLayout.byteSize ||
+                    (bytes = elements * binding.target->elementLayout.byteSize) > materialized.tensor.resource.size) {
+                    error = "resolved Program carrier stage-local view exceeds its retained allocation";
+                    return false;
+                }
+                materialized.tensor.byte_size = bytes;
+            }
             gpu::InternalBufferView view;
             if (materialized.kind != VERNON_PIPELINE_TENSOR ||
                 !gpu::materializeInternalBufferView(binding.target->shape, binding.target->elementLayout,
                                                     materialized.tensor.byte_size, view)) {
-                error = "resolved Program carrier has an incompatible stage-local view";
+                error = "resolved Program carrier '" + binding.target->name + "' (role " + binding.target->role +
+                        ", bytes " + std::to_string(materialized.tensor.byte_size) +
+                        ") has an incompatible stage-local view";
                 return false;
             }
             output.shapes.back() = std::move(view.shape);
@@ -438,24 +466,26 @@ bool ProgramValueArena::materializeNodeArguments(const program::Program &program
     return true;
 }
 
-const VernonPipelineArgument *ProgramValueArena::argument(uint32_t value, const program::TargetBinding *binding) const {
+const VernonPipelineArgument *ProgramInvocationFrame::argument(uint32_t value,
+                                                               const program::TargetBinding *binding) const {
     if (value >= logicalArguments_.size())
         return nullptr;
     if (binding) {
-        if (const Carrier *physical = carrier(value, binding->semantic))
+        if (const Carrier *physical = binding->tapeCarrier ? carrier(value, *binding->tapeCarrier) : nullptr)
             if (physical->buffer)
                 return &physical->argument;
     }
     return &logicalArguments_[value];
 }
 
-VernonPipelineArgument *ProgramValueArena::argument(uint32_t value, const program::TargetBinding *binding) {
-    return const_cast<VernonPipelineArgument *>(static_cast<const ProgramValueArena &>(*this).argument(value, binding));
+VernonPipelineArgument *ProgramInvocationFrame::argument(uint32_t value, const program::TargetBinding *binding) {
+    return const_cast<VernonPipelineArgument *>(
+        static_cast<const ProgramInvocationFrame &>(*this).argument(value, binding));
 }
 
-VernonRhiBuffer ProgramValueArena::buffer(uint32_t value, const program::TargetBinding *binding) const {
+VernonRhiBuffer ProgramInvocationFrame::buffer(uint32_t value, const program::TargetBinding *binding) const {
     if (binding)
-        if (const Carrier *physical = carrier(value, binding->semantic))
+        if (const Carrier *physical = binding->tapeCarrier ? carrier(value, *binding->tapeCarrier) : nullptr)
             if (physical->buffer)
                 return physical->buffer->handle();
     if (value < logicalBuffers_.size() && logicalBuffers_[value])
@@ -467,25 +497,27 @@ VernonRhiBuffer ProgramValueArena::buffer(uint32_t value, const program::TargetB
     return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
-size_t ProgramValueArena::carrierIndex(program::CarrierSemantic semantic) {
-    if (semantic == program::CarrierSemantic::TapeData)
+size_t ProgramInvocationFrame::carrierIndex(program_plan::TapeCarrier carrierKind) {
+    if (carrierKind == program_plan::TapeCarrier::TapeData)
         return 0;
-    if (semantic == program::CarrierSemantic::ReplaySegment)
+    if (carrierKind == program_plan::TapeCarrier::ReplaySegment)
         return 1;
-    if (semantic == program::CarrierSemantic::ReplayStatus)
+    if (carrierKind == program_plan::TapeCarrier::ReplayStatus)
         return 2;
-    if (semantic == program::CarrierSemantic::LaunchMetadata)
+    if (carrierKind == program_plan::TapeCarrier::LaunchMetadata)
         return 3;
     return invalidCarrier;
 }
 
-ProgramValueArena::Carrier *ProgramValueArena::carrier(uint32_t value, program::CarrierSemantic semantic) {
-    const size_t index = carrierIndex(semantic);
+ProgramInvocationFrame::Carrier *ProgramInvocationFrame::carrier(uint32_t value,
+                                                                 program_plan::TapeCarrier carrierKind) {
+    const size_t index = carrierIndex(carrierKind);
     return value < carriers_.size() && index != invalidCarrier ? &carriers_[value][index] : nullptr;
 }
 
-const ProgramValueArena::Carrier *ProgramValueArena::carrier(uint32_t value, program::CarrierSemantic semantic) const {
-    const size_t index = carrierIndex(semantic);
+const ProgramInvocationFrame::Carrier *ProgramInvocationFrame::carrier(uint32_t value,
+                                                                       program_plan::TapeCarrier carrierKind) const {
+    const size_t index = carrierIndex(carrierKind);
     return value < carriers_.size() && index != invalidCarrier ? &carriers_[value][index] : nullptr;
 }
 
