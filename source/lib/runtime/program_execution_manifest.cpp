@@ -2,10 +2,12 @@
 
 #include "content_hash.h"
 #include "shape_layout.h"
+#include "target_implementation_metadata.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -82,6 +84,84 @@ bool uint64Value(const nlohmann::json &value, uint64_t &result) {
 }
 
 bool exactObject(const nlohmann::json &value, std::initializer_list<std::string_view> required,
+                 std::initializer_list<std::string_view> optional, Diagnostic &diagnostic, const std::string &path);
+
+template <typename Enum>
+bool enumName(const nlohmann::json &value, std::initializer_list<std::string_view> names, Enum &result) {
+    if (!value.is_string())
+        return false;
+    const std::string_view name = value.get_ref<const std::string &>();
+    size_t ordinal = 0;
+    for (std::string_view candidate : names) {
+        if (name == candidate) {
+            result = static_cast<Enum>(ordinal);
+            return true;
+        }
+        ++ordinal;
+    }
+    return false;
+}
+
+bool parseStencilFace(const nlohmann::json &value, VernonStencilFaceState &face, Diagnostic &diagnostic,
+                      const std::string &path) {
+    if (!exactObject(value, {"stencil_fail", "depth_fail", "pass_operation", "compare"}, {}, diagnostic, path) ||
+        !enumName(value["stencil_fail"],
+                  {"KEEP", "ZERO", "REPLACE", "INCREMENT_CLAMP", "DECREMENT_CLAMP", "INVERT", "INCREMENT_WRAP",
+                   "DECREMENT_WRAP"},
+                  face.stencil_fail) ||
+        !enumName(value["depth_fail"],
+                  {"KEEP", "ZERO", "REPLACE", "INCREMENT_CLAMP", "DECREMENT_CLAMP", "INVERT", "INCREMENT_WRAP",
+                   "DECREMENT_WRAP"},
+                  face.depth_fail) ||
+        !enumName(value["pass_operation"],
+                  {"KEEP", "ZERO", "REPLACE", "INCREMENT_CLAMP", "DECREMENT_CLAMP", "INVERT", "INCREMENT_WRAP",
+                   "DECREMENT_WRAP"},
+                  face.pass) ||
+        !enumName(value["compare"],
+                  {"NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"},
+                  face.compare))
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path, "invalid stencil face state");
+    return true;
+}
+
+bool parseColorBlend(const nlohmann::json &value, VernonColorBlendState &blend, Diagnostic &diagnostic,
+                     const std::string &path) {
+    if (!exactObject(value,
+                     {"enabled", "source_color", "destination_color", "color_operation", "source_alpha",
+                      "destination_alpha", "alpha_operation", "write_mask"},
+                     {}, diagnostic, path) ||
+        !value["enabled"].is_boolean() ||
+        !enumName(value["source_color"],
+                  {"ZERO", "ONE", "SOURCE_COLOR", "ONE_MINUS_SOURCE_COLOR", "DESTINATION_COLOR",
+                   "ONE_MINUS_DESTINATION_COLOR", "SOURCE_ALPHA", "ONE_MINUS_SOURCE_ALPHA", "DESTINATION_ALPHA",
+                   "ONE_MINUS_DESTINATION_ALPHA"},
+                  blend.source_color_factor) ||
+        !enumName(value["destination_color"],
+                  {"ZERO", "ONE", "SOURCE_COLOR", "ONE_MINUS_SOURCE_COLOR", "DESTINATION_COLOR",
+                   "ONE_MINUS_DESTINATION_COLOR", "SOURCE_ALPHA", "ONE_MINUS_SOURCE_ALPHA", "DESTINATION_ALPHA",
+                   "ONE_MINUS_DESTINATION_ALPHA"},
+                  blend.destination_color_factor) ||
+        !enumName(value["color_operation"], {"ADD", "SUBTRACT", "REVERSE_SUBTRACT", "MINIMUM", "MAXIMUM"},
+                  blend.color_operation) ||
+        !enumName(value["source_alpha"],
+                  {"ZERO", "ONE", "SOURCE_COLOR", "ONE_MINUS_SOURCE_COLOR", "DESTINATION_COLOR",
+                   "ONE_MINUS_DESTINATION_COLOR", "SOURCE_ALPHA", "ONE_MINUS_SOURCE_ALPHA", "DESTINATION_ALPHA",
+                   "ONE_MINUS_DESTINATION_ALPHA"},
+                  blend.source_alpha_factor) ||
+        !enumName(value["destination_alpha"],
+                  {"ZERO", "ONE", "SOURCE_COLOR", "ONE_MINUS_SOURCE_COLOR", "DESTINATION_COLOR",
+                   "ONE_MINUS_DESTINATION_COLOR", "SOURCE_ALPHA", "ONE_MINUS_SOURCE_ALPHA", "DESTINATION_ALPHA",
+                   "ONE_MINUS_DESTINATION_ALPHA"},
+                  blend.destination_alpha_factor) ||
+        !enumName(value["alpha_operation"], {"ADD", "SUBTRACT", "REVERSE_SUBTRACT", "MINIMUM", "MAXIMUM"},
+                  blend.alpha_operation) ||
+        !uint32Value(value["write_mask"], blend.write_mask) || (blend.write_mask & ~VERNON_RHI_COLOR_WRITE_ALL))
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path, "invalid color blend state");
+    blend.blend_enabled = value["enabled"].get<bool>();
+    return true;
+}
+
+bool exactObject(const nlohmann::json &value, std::initializer_list<std::string_view> required,
                  std::initializer_list<std::string_view> optional, Diagnostic &diagnostic, const std::string &path) {
     if (!value.is_object())
         return fail(diagnostic, "PROGRAM_UNKNOWN_FIELD", "parse", path, "expected an object");
@@ -94,6 +174,120 @@ bool exactObject(const nlohmann::json &value, std::initializer_list<std::string_
         if (std::find(required.begin(), required.end(), key) == required.end() &&
             std::find(optional.begin(), optional.end(), key) == optional.end())
             return fail(diagnostic, "PROGRAM_UNKNOWN_FIELD", "parse", path + "/" + item.key(), "unknown member");
+    }
+    return true;
+}
+
+bool parseGraphicsPipelineState(const nlohmann::json &value, GraphicsPipelineState &state, Diagnostic &diagnostic,
+                                const std::string &path) {
+    if (!exactObject(value, {"topology", "rasterization", "depth_stencil", "color_blends"}, {}, diagnostic, path) ||
+        !enumName(value["topology"], {"triangle_list", "line_list", "point_list"}, state.topology))
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path, "invalid graphics pipeline state");
+    const auto &raster = value["rasterization"];
+    if (!exactObject(raster, {"cull_mode", "front_face", "depth_clamp", "depth_bias_constant", "depth_bias_slope"}, {},
+                     diagnostic, path + "/rasterization") ||
+        !enumName(raster["cull_mode"], {"NONE", "FRONT", "BACK"}, state.rasterization.cull_mode) ||
+        !enumName(raster["front_face"], {"COUNTER_CLOCKWISE", "CLOCKWISE"}, state.rasterization.front_face) ||
+        !raster["depth_clamp"].is_boolean() || !raster["depth_bias_constant"].is_number() ||
+        !raster["depth_bias_slope"].is_number())
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/rasterization",
+                    "invalid rasterization state");
+    state.rasterization.depth_clamp = raster["depth_clamp"].get<bool>();
+    state.rasterization.depth_bias_constant = raster["depth_bias_constant"].get<float>();
+    state.rasterization.depth_bias_slope = raster["depth_bias_slope"].get<float>();
+    if (!std::isfinite(state.rasterization.depth_bias_constant) || !std::isfinite(state.rasterization.depth_bias_slope))
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/rasterization",
+                    "rasterization bias must be finite");
+    state.rasterization.depth_bias_enabled =
+        state.rasterization.depth_bias_constant != 0.0f || state.rasterization.depth_bias_slope != 0.0f;
+
+    const auto &depth = value["depth_stencil"];
+    if (!exactObject(depth,
+                     {"depth_test", "depth_write", "depth_compare", "stencil_test", "front", "back",
+                      "stencil_read_mask", "stencil_write_mask"},
+                     {}, diagnostic, path + "/depth_stencil") ||
+        !depth["depth_test"].is_boolean() || !depth["depth_write"].is_boolean() ||
+        !depth["stencil_test"].is_boolean() ||
+        !enumName(depth["depth_compare"],
+                  {"NEVER", "LESS", "EQUAL", "LESS_EQUAL", "GREATER", "NOT_EQUAL", "GREATER_EQUAL", "ALWAYS"},
+                  state.depthStencil.depth_compare) ||
+        !uint32Value(depth["stencil_read_mask"], state.depthStencil.stencil_read_mask) ||
+        !uint32Value(depth["stencil_write_mask"], state.depthStencil.stencil_write_mask) ||
+        state.depthStencil.stencil_read_mask > 0xff || state.depthStencil.stencil_write_mask > 0xff ||
+        !parseStencilFace(depth["front"], state.depthStencil.front, diagnostic, path + "/depth_stencil/front") ||
+        !parseStencilFace(depth["back"], state.depthStencil.back, diagnostic, path + "/depth_stencil/back"))
+        return false;
+    state.depthStencil.depth_test = depth["depth_test"].get<bool>();
+    state.depthStencil.depth_write = depth["depth_write"].get<bool>();
+    state.depthStencil.stencil_test = depth["stencil_test"].get<bool>();
+
+    const auto &blends = value["color_blends"];
+    if (!blends.is_array())
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/color_blends",
+                    "color blends must be an array");
+    for (size_t index = 0; index < blends.size(); ++index) {
+        const auto &entry = blends[index];
+        uint32_t location{};
+        VernonColorBlendState blend{};
+        const std::string entryPath = path + "/color_blends/" + std::to_string(index);
+        if (!entry.is_array() || entry.size() != 2 || !uint32Value(entry[0], location) ||
+            !parseColorBlend(entry[1], blend, diagnostic, entryPath + "/1") ||
+            !state.colorBlends.emplace(location, blend).second)
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", entryPath,
+                        "invalid or duplicate color blend location");
+    }
+    return true;
+}
+
+bool parseTextureFormat(const nlohmann::json &value, VernonTextureFormat &format) {
+    return enumName(value,
+                    {"rgba8_unorm", "rgba8_srgb", "rgba16_float", "rgba32_float", "r8_unorm", "r16_float", "r32_float",
+                     "rg8_unorm", "rgb8_unorm", "r11g11b10_float", "d32_float", "d32_float_s8_uint"},
+                    format);
+}
+
+bool parseAttachmentSignature(const nlohmann::json &value, bool color, GraphicsAttachmentSignature &signature,
+                              Diagnostic &diagnostic, const std::string &path) {
+    const std::initializer_list<std::string_view> required =
+        color ? std::initializer_list<std::string_view>{"location", "access", "formats", "sample_counts"}
+              : std::initializer_list<std::string_view>{"access", "formats", "sample_counts", "aspects"};
+    if (!exactObject(value, required, {}, diagnostic, path) || !uint32Value(value["access"], signature.access) ||
+        !value["formats"].is_array() || value["formats"].empty() || !value["sample_counts"].is_array() ||
+        value["sample_counts"].empty())
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path,
+                    "invalid graphics attachment signature");
+    if (color) {
+        if (!uint32Value(value["location"], signature.location))
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/location",
+                        "invalid color attachment location");
+        signature.aspects = VERNON_IMAGE_ASPECT_COLOR;
+    } else {
+        if (!value["aspects"].is_array() || value["aspects"].empty())
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/aspects",
+                        "invalid depth/stencil aspects");
+        for (const auto &aspect : value["aspects"]) {
+            if (aspect == "depth")
+                signature.aspects |= VERNON_IMAGE_ASPECT_DEPTH;
+            else if (aspect == "stencil")
+                signature.aspects |= VERNON_IMAGE_ASPECT_STENCIL;
+            else
+                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/aspects",
+                            "unknown depth/stencil aspect");
+        }
+    }
+    for (const auto &formatValue : value["formats"]) {
+        VernonTextureFormat format{};
+        if (!parseTextureFormat(formatValue, format))
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/formats",
+                        "unknown attachment format");
+        signature.formats.push_back(format);
+    }
+    for (const auto &sampleValue : value["sample_counts"]) {
+        uint32_t samples{};
+        if (!uint32Value(sampleValue, samples) || !samples)
+            return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", path + "/sample_counts",
+                        "invalid attachment sample count");
+        signature.sampleCounts.push_back(samples);
     }
     return true;
 }
@@ -674,6 +868,12 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                     !uint32Value(inputValue["value"], input.value) || !uint32Value(inputValue["slot"], input.slot))
                     return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", inputPath, "invalid user input");
                 input.kind = GraphInputKind::UserInput;
+            } else if (tag == "invocation_control") {
+                if (!exactObject(inputValue, {"tag", "value"}, {}, diagnostic, inputPath) ||
+                    !uint32Value(inputValue["value"], input.value))
+                    return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", inputPath,
+                                "invalid invocation control input");
+                input.kind = GraphInputKind::InvocationControl;
             } else if (tag == "parameter") {
                 if (!exactObject(inputValue, {"tag", "value", "parameter"}, {}, diagnostic, inputPath) ||
                     !uint32Value(inputValue["value"], input.value) ||
@@ -817,45 +1017,82 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             if (!operation.is_object() || !operation.contains("tag") || !operation["tag"].is_string())
                 return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation",
                             "node operation requires a tag");
-            node.operation = operation["tag"].get<std::string>();
-            if (node.operation == "compute") {
+            const std::string operationTag = operation["tag"].get<std::string>();
+            if (operationTag == "compute") {
+                ComputeOperation compute;
                 if (!exactObject(operation, {"tag", "workgroups"}, {}, diagnostic, nodePath + "/operation") ||
                     !operation["workgroups"].is_array() || operation["workgroups"].size() != 3)
                     return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation",
                                 "compute node must be a direct dispatch");
                 for (size_t axis = 0; axis < 3; ++axis)
-                    if (!parseControl(operation["workgroups"][axis], node.compute.workgroups[axis], diagnostic,
+                    if (!parseControl(operation["workgroups"][axis], compute.workgroups[axis], diagnostic,
                                       nodePath + "/operation/workgroups/" + std::to_string(axis)))
                         return false;
-            } else if (node.operation == "graphics") {
-                if (!exactObject(operation, {"tag", "attachments", "state", "draw"}, {}, diagnostic,
-                                 nodePath + "/operation") ||
-                    !operation["attachments"].is_object() || !operation["draw"].is_object())
+                node.operation = std::move(compute);
+            } else if (operationTag == "graphics") {
+                GraphicsOperation graphics;
+                if (!exactObject(operation, {"tag", "pipeline_state", "render_pass", "draw", "dynamic_state"}, {},
+                                 diagnostic, nodePath + "/operation") ||
+                    !parseGraphicsPipelineState(operation["pipeline_state"], graphics.pipelineState, diagnostic,
+                                                nodePath + "/operation/pipeline_state"))
                     return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation",
                                 "invalid graphics operation");
-                const auto &attachments = operation["attachments"];
-                if (!exactObject(attachments, {"colors", "depth_stencil", "render_area", "layer_count"}, {}, diagnostic,
-                                 nodePath + "/operation/attachments") ||
-                    !attachments["colors"].is_array())
-                    return false;
-                for (size_t colorIndex = 0; colorIndex < attachments["colors"].size(); ++colorIndex) {
-                    const auto &color = attachments["colors"][colorIndex];
-                    uint32_t access = 0;
-                    if (!color.is_object() || !color.contains("access") || !uint32Value(color["access"], access))
+                const auto &renderPass = operation["render_pass"];
+                if (!exactObject(renderPass, {"control", "colors", "depth_stencil"}, {}, diagnostic,
+                                 nodePath + "/operation/render_pass") ||
+                    !uint32Value(renderPass["control"], graphics.renderPassControl) || !renderPass["colors"].is_array())
+                    return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse",
+                                nodePath + "/operation/render_pass", "invalid graphics render-pass control");
+                if (renderPass["colors"].empty() && renderPass["depth_stencil"].is_null())
+                    return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse",
+                                nodePath + "/operation/render_pass",
+                                "graphics render pass requires a color or depth-stencil attachment");
+                for (size_t colorIndex = 0; colorIndex < renderPass["colors"].size(); ++colorIndex) {
+                    GraphicsAttachmentSignature signature;
+                    if (!parseAttachmentSignature(renderPass["colors"][colorIndex], true, signature, diagnostic,
+                                                  nodePath + "/operation/render_pass/colors/" +
+                                                      std::to_string(colorIndex)) ||
+                        signature.location != colorIndex)
                         return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "parse",
-                                    nodePath + "/operation/attachments/colors/" + std::to_string(colorIndex),
-                                    "invalid color attachment access");
-                    node.graphics.attachmentAccesses.push_back(access);
+                                    nodePath + "/operation/render_pass/colors/" + std::to_string(colorIndex),
+                                    "color attachment locations must be contiguous from zero");
+                    graphics.colorAttachments.push_back(std::move(signature));
                 }
+                if (!renderPass["depth_stencil"].is_null()) {
+                    GraphicsAttachmentSignature signature;
+                    if (!parseAttachmentSignature(renderPass["depth_stencil"], false, signature, diagnostic,
+                                                  nodePath + "/operation/render_pass/depth_stencil"))
+                        return false;
+                    graphics.depthStencilAttachment = std::move(signature);
+                }
+                if (graphics.pipelineState.colorBlends.size() != graphics.colorAttachments.size())
+                    return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse",
+                                nodePath + "/operation/pipeline_state/color_blends",
+                                "pipeline state must define one blend for every color attachment");
+                for (size_t location = 0; location < graphics.colorAttachments.size(); ++location)
+                    if (!graphics.pipelineState.colorBlends.count(static_cast<uint32_t>(location)))
+                        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse",
+                                    nodePath + "/operation/pipeline_state/color_blends",
+                                    "pipeline color blend locations must be contiguous from zero");
                 const auto &draw = operation["draw"];
-                if (!exactObject(draw, {"tag", "vertex_count", "instance_count"}, {}, diagnostic,
+                if (!exactObject(draw, {"control", "default"}, {}, diagnostic, nodePath + "/operation/draw") ||
+                    !uint32Value(draw["control"], graphics.drawCommandControl) || !draw["default"].is_object())
+                    return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation/draw",
+                                "invalid graphics draw control");
+                const auto &defaultDraw = draw["default"];
+                if (!exactObject(defaultDraw, {"tag", "vertex_count", "instance_count"}, {}, diagnostic,
                                  nodePath + "/operation/draw") ||
-                    draw.value("tag", "") != "direct" ||
-                    !uint64Value(draw["vertex_count"], node.graphics.vertexCount) ||
-                    !uint64Value(draw["instance_count"], node.graphics.instanceCount) || !node.graphics.vertexCount ||
-                    !node.graphics.instanceCount)
+                    defaultDraw.value("tag", "") != "direct" ||
+                    !uint32Value(defaultDraw["vertex_count"], graphics.vertexCount) ||
+                    !uint32Value(defaultDraw["instance_count"], graphics.instanceCount) || !graphics.instanceCount)
                     return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation/draw",
                                 "invalid direct draw");
+                const auto &dynamicState = operation["dynamic_state"];
+                if (!exactObject(dynamicState, {"control"}, {}, diagnostic, nodePath + "/operation/dynamic_state") ||
+                    !uint32Value(dynamicState["control"], graphics.dynamicStateControl))
+                    return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse",
+                                nodePath + "/operation/dynamic_state", "invalid graphics dynamic-state control");
+                node.operation = std::move(graphics);
             } else {
                 return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", nodePath + "/operation/tag",
                             "unknown operation tag");
@@ -1579,50 +1816,16 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
         if (row.contains("implementation")) {
             const auto &implementation = row["implementation"];
             const std::string implementationPath = path + "/implementation";
-            if (!exactObject(implementation, {"endpoints"}, {"metal_resource_slots"}, diagnostic, implementationPath) ||
-                !implementation["endpoints"].is_array())
+            if (!exactObject(implementation, {"target", "metadata", "endpoints"}, {}, diagnostic, implementationPath) ||
+                !implementation["target"].is_string() || implementation["target"] != stage.backend ||
+                !implementation["metadata"].is_object() || !implementation["endpoints"].is_array())
                 return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", implementationPath,
                             "invalid target implementation table");
-            if (implementation.contains("metal_resource_slots")) {
-                const auto &slots = implementation["metal_resource_slots"];
-                if (!slots.is_array())
-                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
-                                implementationPath + "/metal_resource_slots", "Metal resource slots must be an array");
-                for (size_t slotIndex = 0; slotIndex < slots.size(); ++slotIndex) {
-                    const auto &slot = slots[slotIndex];
-                    const std::string slotPath =
-                        implementationPath + "/metal_resource_slots/" + std::to_string(slotIndex);
-                    vernon::runtime::NativeResourceSlot parsed;
-                    if (!slot.is_object() ||
-                        !exactObject(slot,
-                                     {"entry_point", "stage", "kind", "name", "argument_buffer_index", "member_id",
-                                      "direct_buffer_index", "count"},
-                                     {"set", "binding"}, diagnostic, slotPath) ||
-                        !slot["entry_point"].is_string() || !slot["stage"].is_string() || !slot["kind"].is_string() ||
-                        !slot["name"].is_string() ||
-                        !uint32Value(slot["argument_buffer_index"], parsed.argumentBufferIndex) ||
-                        !uint32Value(slot["member_id"], parsed.memberId) ||
-                        !uint32Value(slot["direct_buffer_index"], parsed.directBufferIndex) ||
-                        !uint32Value(slot["count"], parsed.count) || !parsed.count)
-                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", slotPath,
-                                    "invalid Metal resource slot");
-                    parsed.entry = slot["entry_point"].get<std::string>();
-                    parsed.stage = slot["stage"].get<std::string>();
-                    parsed.kind = slot["kind"].get<std::string>();
-                    parsed.name = slot["name"].get<std::string>();
-                    if (slot.contains("set") && !uint32Value(slot["set"], parsed.set))
-                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", slotPath + "/set",
-                                    "invalid Metal resource set");
-                    if (slot.contains("binding") && !uint32Value(slot["binding"], parsed.binding))
-                        return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", slotPath + "/binding",
-                                    "invalid Metal resource binding");
-                    if (!slot.contains("set"))
-                        parsed.set = UINT32_MAX;
-                    if (!slot.contains("binding"))
-                        parsed.binding = UINT32_MAX;
-                    stage.nativeSlots.push_back(std::move(parsed));
-                }
-            }
+            const auto &metadata = implementation["metadata"];
+            std::string targetError;
+            if (!parseTargetImplementationMetadata(stage.backend, metadata, stage.nativeSlots, targetError))
+                return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", implementationPath + "/metadata",
+                            std::move(targetError));
             for (size_t index = 0; index < implementation["endpoints"].size(); ++index) {
                 const auto &rowValue = implementation["endpoints"][index];
                 const std::string endpointPath = implementationPath + "/endpoints/" + std::to_string(index);
@@ -1873,6 +2076,8 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                 (input.kind == GraphInputKind::UserInput && input.slot == nextUserSlot++ &&
                  value.origin.kind == OriginKind::Argument && value.origin.graph == graph.direction &&
                  value.origin.slot == input.slot) ||
+                (input.kind == GraphInputKind::InvocationControl && value.origin.kind == OriginKind::Argument &&
+                 value.origin.graph == graph.direction) ||
                 (input.kind == GraphInputKind::Parameter && input.parameter < program.parameters.size() &&
                  program.parameters[input.parameter].value == input.value &&
                  value.origin.kind == OriginKind::Parameter) ||
@@ -1900,10 +2105,26 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
             const Node &node = graph.nodes[nodeIndex];
             const std::string nodePath = graphPath + "/nodes/" + std::to_string(nodeIndex);
             const auto stage = program.stages.find(node.stage);
-            if (node.id != nodeIndex || stage == program.stages.end() || stage->second.operation != node.operation)
+            const std::string_view operationName =
+                executionKind(node) == ExecutionKind::Compute ? "compute" : "graphics";
+            if (node.id != nodeIndex || stage == program.stages.end() || stage->second.operation != operationName)
                 return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", nodePath + "/stage",
                             "Node references an unknown or incompatible stage");
             usedStages.insert(node.stage);
+            if (executionKind(node) == ExecutionKind::Graphics) {
+                const GraphicsOperation &graphics = graphicsOperation(node);
+                const auto project = [&](const GraphicsAttachmentSignature &attachment) {
+                    if (attachment.access >= node.accesses.size())
+                        return;
+                    resolvedGraph.controlResources.push_back({node.id, graphics.renderPassControl,
+                                                              node.accesses[attachment.access].storage,
+                                                              attachment.location, attachment.aspects});
+                };
+                for (const GraphicsAttachmentSignature &attachment : graphics.colorAttachments)
+                    project(attachment);
+                if (graphics.depthStencilAttachment)
+                    project(*graphics.depthStencilAttachment);
+            }
             const StageArtifact &stageArtifact = resolved.stages.at(node.stage).stage;
             std::vector<const ReflectedEndpoint *> bindableEndpoints;
             for (const ReflectedEndpoint &endpoint : stageArtifact.endpoints)
@@ -2014,8 +2235,8 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                                     "resource binding ABI or access does not match reflection");
                 }
             }
-            if (node.operation == "compute") {
-                for (const ControlComponent &control : node.compute.workgroups) {
+            if (executionKind(node) == ExecutionKind::Compute) {
+                for (const ControlComponent &control : computeOperation(node).workgroups) {
                     if (control.kind == ControlKind::Parameter) {
                         if (control.reference >= program.parameters.size())
                             return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
@@ -2034,10 +2255,23 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                     }
                 }
             } else {
-                for (uint32_t attachment : node.graphics.attachmentAccesses)
-                    if (attachment >= node.accesses.size() || node.accesses[attachment].kind != AccessKind::Attachment)
-                        return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operation/attachments",
-                                    "graphics attachment does not select an attachment access");
+                const GraphicsOperation &graphics = graphicsOperation(node);
+                const auto validateAttachment = [&](const GraphicsAttachmentSignature &attachment) {
+                    return attachment.access < node.accesses.size() &&
+                           node.accesses[attachment.access].kind == AccessKind::Attachment;
+                };
+                if (!std::all_of(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
+                                 validateAttachment) ||
+                    (graphics.depthStencilAttachment && !validateAttachment(*graphics.depthStencilAttachment)))
+                    return fail(diagnostic, "PROGRAM_ACCESS_CHAIN", "resolve", nodePath + "/operation/attachments",
+                                "graphics attachment does not select an attachment access");
+                for (const auto &[location, blend] : graphics.pipelineState.colorBlends) {
+                    (void)blend;
+                    if (location >= graphics.colorAttachments.size())
+                        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "resolve",
+                                    nodePath + "/operation/pipeline_state/color_blends",
+                                    "color blend names an absent attachment");
+                }
             }
             if (std::vector<uint32_t>(expectedOperands.begin(), expectedOperands.end()) != node.operands ||
                 std::vector<uint32_t>(expectedResults.begin(), expectedResults.end()) != node.results)
@@ -2181,233 +2415,6 @@ bool resolveControlValue(const Program &program, const ControlComponent &control
         }
     }
     return false;
-}
-
-bool evaluateOwnedBufferLength(const Program &program, const Storage &storage,
-                               const std::vector<InvocationBuffer> &storageBuffers, uint64_t &byteLength,
-                               Diagnostic &diagnostic) {
-    byteLength = storage.buffer.byteLength;
-    if (byteLength)
-        return true;
-    if (storage.buffer.byteLengthExtents.empty())
-        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                    "owned Storage requires a static byte_length or like-source extents");
-    if (storage.initialValue >= program.values.size() || !program.values[storage.initialValue].layout ||
-        !program.values[storage.initialValue].layout->byteSize)
-        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                    "owned dyn Storage has no element layout");
-    const std::string &graph = program.values[storage.initialValue].origin.graph;
-    uint32_t likeValue = UINT32_MAX;
-    uint64_t staticProduct = 1;
-    for (size_t axis = 0; axis < storage.buffer.byteLengthExtents.size(); ++axis) {
-        const ControlComponent &extent = storage.buffer.byteLengthExtents[axis];
-        if (extent.kind == ControlKind::Static) {
-            if (!extent.value || staticProduct > std::numeric_limits<uint64_t>::max() / extent.value)
-                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                            "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length/" +
-                                std::to_string(axis),
-                            "owned dyn extent overflows");
-            staticProduct *= extent.value;
-            continue;
-        }
-        uint32_t valueId = UINT32_MAX;
-        if (!resolveControlValue(program, extent, graph, valueId) ||
-            (extent.kind != ControlKind::Capture && program.values[valueId].origin.kind == OriginKind::NodeResult))
-            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
-                        "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length/" + std::to_string(axis),
-                        "owned dyn like-source is not entry-available");
-        if (likeValue == UINT32_MAX)
-            likeValue = valueId;
-        else if (likeValue != valueId)
-            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
-                        "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                        "owned dyn buffer extents must share one like-source");
-    }
-    if (likeValue == UINT32_MAX) {
-        byteLength = staticProduct * program.values[storage.initialValue].layout->byteSize;
-        return byteLength != 0;
-    }
-    if (!program.values[likeValue].storage || *program.values[likeValue].storage >= storageBuffers.size() ||
-        !storageBuffers[*program.values[likeValue].storage].data || !program.values[likeValue].layout ||
-        !program.values[likeValue].layout->byteSize)
-        return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
-                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                    "owned dyn like-source is not bound");
-    const uint64_t likeBytes = storageBuffers[*program.values[likeValue].storage].byteLength;
-    const uint64_t likeCell = program.values[likeValue].layout->byteSize;
-    uint64_t likeStatic = 1;
-    for (uint64_t extent : program.values[likeValue].shape)
-        if (extent) {
-            if (likeStatic > std::numeric_limits<uint64_t>::max() / extent)
-                return false;
-            likeStatic *= extent;
-        }
-    if (!likeCell || likeBytes % likeCell || (likeBytes / likeCell) % likeStatic)
-        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                    "owned dyn like-source byte length does not match its layout");
-    const uint64_t likeDyn = (likeBytes / likeCell) / likeStatic;
-    const uint64_t ownedCell = program.values[storage.initialValue].layout->byteSize;
-    if (!likeDyn || staticProduct > std::numeric_limits<uint64_t>::max() / likeDyn ||
-        ownedCell > std::numeric_limits<uint64_t>::max() / (staticProduct * likeDyn))
-        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                    "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                    "owned dyn allocation overflows");
-    byteLength = ownedCell * staticProduct * likeDyn;
-    return true;
-}
-
-bool execute(const ResolvedProgram &resolved, const Invocation &invocation, const StageExecutor &executor,
-             ExecutionResult &result, Diagnostic &diagnostic) {
-    result = {};
-    diagnostic = {};
-    if (!executor)
-        return fail(diagnostic, "PROGRAM_RUNTIME_FAILURE", "execute", "", "target StageExecutor is missing");
-    const Program &program = resolved.program;
-    if (program.graphs.size() != 1 || resolved.graphs.size() != 1)
-        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "execute", "/graphs",
-                    "phase-one execution requires one forward graph");
-    const size_t inputCount =
-        static_cast<size_t>(std::count_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
-                                          [](const BoundarySlot &slot) { return slot.role == BoundaryRole::Input; }));
-    if (invocation.arguments.size() != inputCount)
-        return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "invocation_entry", "/abi/boundary_slots",
-                    "invocation argument count does not match ProgramABI inputs");
-    if (invocation.parameters.size() != program.parameters.size())
-        return fail(diagnostic, "PROGRAM_PARAMETER_BINDING", "invocation_entry", "/parameters",
-                    "instance parameter count does not match Program parameters");
-
-    std::vector<std::vector<uint8_t>> owned(program.storages.size());
-    std::vector<InvocationBuffer> storageBuffers(program.storages.size());
-    std::map<uint32_t, size_t> abiInput;
-    size_t inputIndex = 0;
-    for (const BoundarySlot &slot : program.abi.boundarySlots)
-        if (slot.role == BoundaryRole::Input)
-            abiInput.emplace(slot.value, inputIndex++);
-    try {
-        for (const Storage &storage : program.storages) {
-            if (storage.lifetime != StorageLifetime::Invocation)
-                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "instance_bind",
-                            "/storages/" + std::to_string(storage.id) + "/lifetime",
-                            "phase-one execution supports invocation Storage");
-            if (storage.descriptorKind != StorageDescriptorKind::Buffer)
-                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
-                            "/storages/" + std::to_string(storage.id) + "/descriptor",
-                            "generic byte-buffer execution does not support image or opaque Storage");
-            if (storage.ownership == StorageOwnership::Owned)
-                continue;
-            if (storage.mutability != StorageMutability::ReadOnly)
-                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
-                            "/storages/" + std::to_string(storage.id) + "/mutability",
-                            "phase-one execution does not yet provide transactional borrowed writes");
-            const auto input = abiInput.find(storage.initialValue);
-            if (input == abiInput.end())
-                return fail(diagnostic, "PROGRAM_STORAGE_INITIAL_VALUE", "invocation_entry",
-                            "/storages/" + std::to_string(storage.id) + "/initial_value",
-                            "borrowed Storage has no public input provider");
-            const InvocationBuffer supplied = invocation.arguments[input->second];
-            if (!supplied.data || (storage.buffer.byteLength && supplied.byteLength < storage.buffer.byteLength))
-                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "invocation_entry",
-                            "/storages/" + std::to_string(storage.id) + "/descriptor/byte_length",
-                            "borrowed buffer provider is too small");
-            storageBuffers[storage.id] = supplied;
-        }
-        for (const Storage &storage : program.storages) {
-            if (storage.ownership != StorageOwnership::Owned)
-                continue;
-            uint64_t byteLength = 0;
-            if (!evaluateOwnedBufferLength(program, storage, storageBuffers, byteLength, diagnostic))
-                return false;
-            owned[storage.id].resize(static_cast<size_t>(byteLength));
-            storageBuffers[storage.id] = {owned[storage.id].data(), owned[storage.id].size()};
-        }
-    } catch (const std::bad_alloc &) {
-        return fail(diagnostic, "PROGRAM_RUNTIME_FAILURE", "invocation_entry", "/storages",
-                    "cannot allocate owned Program Storage");
-    }
-
-    const Graph &graph = program.graphs.front();
-    for (const Node &node : graph.nodes) {
-        StageInvocation stageInvocation;
-        stageInvocation.stage = &resolved.stages.at(node.stage);
-        stageInvocation.node = &node;
-        for (size_t axis = 0; axis < 3; ++axis) {
-            const ControlComponent &control = node.compute.workgroups[axis];
-            uint64_t count = control.value;
-            if (control.kind == ControlKind::Parameter)
-                count = invocation.parameters[control.reference];
-            else if (control.kind == ControlKind::Argument)
-                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "invocation_entry",
-                            "/graphs/0/nodes/" + std::to_string(node.id) + "/operation/workgroups/" +
-                                std::to_string(axis),
-                            "by-value argument controls require the Value ABI materializer");
-            if (!count || count > std::numeric_limits<uint32_t>::max())
-                return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "invocation_entry",
-                            "/graphs/0/nodes/" + std::to_string(node.id) + "/operation/workgroups/" +
-                                std::to_string(axis),
-                            "workgroup count is outside uint32");
-            stageInvocation.workgroups[axis] = static_cast<uint32_t>(count);
-        }
-        for (size_t bindingIndex = 0; bindingIndex < node.bindings.size(); ++bindingIndex) {
-            const EndpointBinding &binding = node.bindings[bindingIndex];
-            if (binding.tag != BindingTag::Resource)
-                return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "execute",
-                            "/graphs/0/nodes/" + std::to_string(node.id) + "/bindings/" + std::to_string(bindingIndex),
-                            "phase-one execution supports resource endpoints");
-            const ResourceAccess &access = node.accesses[binding.access];
-            const InvocationBuffer storage = storageBuffers[access.storage];
-            const std::string accessMode = access.kind == AccessKind::Read         ? "read"
-                                           : access.kind == AccessKind::Initialize ? "write"
-                                                                                   : access.access;
-            const uint32_t valueId = access.kind == AccessKind::Initialize ? access.after
-                                     : access.kind == AccessKind::Write    ? access.before
-                                                                           : access.value;
-            stageInvocation.resources.push_back(
-                {storage.data, storage.byteLength, accessMode, program.values[valueId].shape});
-        }
-        Diagnostic targetDiagnostic;
-        if (!executor(stageInvocation, targetDiagnostic)) {
-            if (targetDiagnostic)
-                diagnostic = std::move(targetDiagnostic);
-            else
-                fail(diagnostic, "PROGRAM_RUNTIME_FAILURE", "execute", "/graphs/0/nodes/" + std::to_string(node.id),
-                     "target stage execution failed");
-            return false;
-        }
-    }
-
-    try {
-        const auto publishedOutputCount = static_cast<size_t>(
-            std::count_if(program.abi.publication.targets.begin(), program.abi.publication.targets.end(),
-                          [](const PublicationTarget &target) { return target.role == BoundaryRole::Output; }));
-        result.outputs.reserve(publishedOutputCount);
-        for (const PublicationTarget &publication : program.abi.publication.targets) {
-            if (publication.role != BoundaryRole::Output)
-                continue;
-            const auto output =
-                std::find_if(graph.outputs.begin(), graph.outputs.end(),
-                             [&](const GraphOutput &candidate) { return candidate.value == publication.value; });
-            if (output == graph.outputs.end())
-                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
-                            "PublicationPlan target is not a forward graph output");
-            const Value &value = program.values[publication.value];
-            if (!value.storage)
-                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
-                            "phase-one output must be storage-backed");
-            const Storage &storage = program.storages[*value.storage];
-            if (output->disposition != "transfer" || storage.ownership != StorageOwnership::Owned)
-                return fail(diagnostic, "PROGRAM_RESOURCE_OUTPUT", "commit", "/abi/publication",
-                            "phase-one output must transfer owned Storage");
-            result.outputs.push_back(std::move(owned[storage.id]));
-        }
-    } catch (const std::bad_alloc &) {
-        result = {};
-        return fail(diagnostic, "PROGRAM_RUNTIME_FAILURE", "commit", "/graphs/0/outputs",
-                    "cannot publish Program outputs");
-    }
-    return true;
 }
 
 } // namespace vernon::runtime::program

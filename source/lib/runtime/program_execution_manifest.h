@@ -9,11 +9,11 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <map>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <variant>
 #include <vector>
 
 namespace vernon::runtime::program {
@@ -264,6 +264,7 @@ struct Value {
 
 enum class GraphInputKind {
     UserInput,
+    InvocationControl,
     Parameter,
     Allocation,
 };
@@ -317,11 +318,38 @@ struct ComputeOperation {
     ControlComponent workgroups[3];
 };
 
-struct GraphicsOperation {
-    std::vector<uint32_t> attachmentAccesses;
-    uint64_t vertexCount{};
-    uint64_t instanceCount{};
+enum class ExecutionKind {
+    Compute,
+    Graphics,
 };
+
+struct GraphicsAttachmentSignature {
+    uint32_t location{};
+    uint32_t access{};
+    std::vector<VernonTextureFormat> formats;
+    std::vector<uint32_t> sampleCounts;
+    uint32_t aspects{};
+};
+
+struct GraphicsPipelineState {
+    VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
+    VernonRasterizationState rasterization{};
+    VernonDepthStencilState depthStencil{};
+    std::map<uint32_t, VernonColorBlendState> colorBlends;
+};
+
+struct GraphicsOperation {
+    GraphicsPipelineState pipelineState;
+    std::vector<GraphicsAttachmentSignature> colorAttachments;
+    std::optional<GraphicsAttachmentSignature> depthStencilAttachment;
+    uint32_t vertexCount{};
+    uint32_t instanceCount{};
+    uint32_t renderPassControl{};
+    uint32_t drawCommandControl{};
+    uint32_t dynamicStateControl{};
+};
+
+using NodeOperation = std::variant<ComputeOperation, GraphicsOperation>;
 
 struct Node {
     uint32_t id{};
@@ -331,10 +359,18 @@ struct Node {
     std::vector<uint32_t> results;
     std::vector<EndpointBinding> bindings;
     std::vector<ResourceAccess> accesses;
-    std::string operation;
-    ComputeOperation compute;
-    GraphicsOperation graphics;
+    NodeOperation operation;
 };
+
+inline ExecutionKind executionKind(const Node &node) {
+    return std::holds_alternative<ComputeOperation>(node.operation) ? ExecutionKind::Compute : ExecutionKind::Graphics;
+}
+
+inline const ComputeOperation &computeOperation(const Node &node) { return std::get<ComputeOperation>(node.operation); }
+
+inline const GraphicsOperation &graphicsOperation(const Node &node) {
+    return std::get<GraphicsOperation>(node.operation);
+}
 
 struct Graph {
     std::string name;
@@ -469,6 +505,14 @@ struct Program {
 
 struct ResolvedGraph {
     std::vector<std::vector<uint32_t>> predecessors;
+    struct ControlResourceProjection {
+        uint32_t node{};
+        uint32_t control{};
+        uint32_t storage{};
+        uint32_t location{};
+        uint32_t aspects{};
+    };
+    std::vector<ControlResourceProjection> controlResources;
 };
 
 struct ResolvedStage {
@@ -482,36 +526,6 @@ struct ResolvedProgram {
     std::vector<ResolvedGraph> graphs;
 };
 
-struct InvocationBuffer {
-    void *data{};
-    size_t byteLength{};
-};
-
-struct Invocation {
-    std::vector<InvocationBuffer> arguments;
-    std::vector<uint64_t> parameters;
-};
-
-struct StageResource {
-    void *data{};
-    size_t byteLength{};
-    std::string access;
-    std::vector<uint64_t> shape;
-};
-
-struct StageInvocation {
-    const ResolvedStage *stage{};
-    const Node *node{};
-    uint32_t workgroups[3]{1, 1, 1};
-    std::vector<StageResource> resources;
-};
-
-using StageExecutor = std::function<bool(const StageInvocation &, Diagnostic &)>;
-
-struct ExecutionResult {
-    std::vector<std::vector<uint8_t>> outputs;
-};
-
 bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic);
 bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic);
 bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<std::string, std::string> &stageBindings,
@@ -522,8 +536,6 @@ void markGraphValues(const Graph &graph, std::vector<char> &live);
 bool isTapeValueType(std::string_view type);
 bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
                          uint32_t &valueId);
-bool execute(const ResolvedProgram &program, const Invocation &invocation, const StageExecutor &executor,
-             ExecutionResult &result, Diagnostic &diagnostic);
 
 } // namespace vernon::runtime::program
 

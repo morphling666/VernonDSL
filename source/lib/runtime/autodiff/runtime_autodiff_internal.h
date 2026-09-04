@@ -24,7 +24,8 @@ struct RhiCommandExecutionPlan;
 
 namespace vernon::runtime {
 class ContextLease;
-}
+struct ProgramInvocationContext;
+} // namespace vernon::runtime
 namespace vernon::runtime::program {
 class InvocationSnapshot;
 }
@@ -89,6 +90,7 @@ struct ForwardExecutionTarget {
     VernonRuntimeProviderObject encoder{};
     const VernonPipelineInvocation *invocation{};
     execution::detail::RhiCommandExecutionPlan *commandPlan{};
+    const ProgramInvocationContext *programContext{};
 
     bool externalEncoder() const { return encoder.value != 0; }
     bool deferredCommandPlan() const { return commandPlan != nullptr; }

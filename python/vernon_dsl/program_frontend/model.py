@@ -38,6 +38,7 @@ class ProgramImplementation:
     kind: str
     mlir: str
     host_constants: tuple[tuple[str, int | float | bool], ...] = ()
+    graphics_stages: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,10 @@ class ParsedProgram:
             for name, value in implementation.host_constants:
                 digest.update(name.encode("utf-8"))
                 digest.update(repr(value).encode("utf-8"))
+            for role, entry, mlir in implementation.graphics_stages:
+                digest.update(role.encode("utf-8"))
+                digest.update(entry.encode("utf-8"))
+                digest.update(mlir.encode("utf-8"))
         return digest.hexdigest()
 
 

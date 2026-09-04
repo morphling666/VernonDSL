@@ -39,6 +39,8 @@ using GpuCommandCompletionCallback = VernonRhiStatus (*)(void *context);
 bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                         const std::vector<DeviceBufferCopy> &copies);
 VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies);
+VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
+                                          execution::detail::RhiCommandExecutionPlan &plan);
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                                    VernonLoadedPipeline &pipeline, std::vector<VernonPipelineArgument> &arguments,
                                    VernonLaunchSize grid);

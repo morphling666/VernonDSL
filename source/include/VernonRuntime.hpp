@@ -358,7 +358,6 @@ public:
         result.abi_version = VERNON_PIPELINE_VERSION;
         result.arguments = arguments_.empty() ? nullptr : arguments_.data();
         result.argument_count = arguments_.size();
-        result.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         result.compute_grid = {1, 1, 1};
         return result;
     }
@@ -611,6 +610,32 @@ public:
         if (!handle_ || vernonRuntimeProgramInvocationBind(handle_, &token, &argument, lease, uploadBytes,
                                                            uploadRanges) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind Program invocation");
+        return *this;
+    }
+
+    ProgramInvocation &bindRenderPass(uint32_t slot, const VernonProgramBindingToken &token,
+                                      const VernonRenderPass &renderPass,
+                                      const VernonProgramResourceLease *leases = nullptr, size_t leaseCount = 0) {
+        if (!handle_ || vernonRuntimeProgramInvocationBindRenderPass(handle_, slot, &token, &renderPass, leases,
+                                                                     leaseCount) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind Program RenderPass control");
+        return *this;
+    }
+
+    ProgramInvocation &bindDrawCommand(uint32_t slot, const VernonProgramBindingToken &token,
+                                       const VernonDrawCommand &draw,
+                                       const VernonProgramResourceLease *lease = nullptr) {
+        if (!handle_ ||
+            vernonRuntimeProgramInvocationBindDrawCommand(handle_, slot, &token, &draw, lease) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind Program DrawCommand control");
+        return *this;
+    }
+
+    ProgramInvocation &bindDynamicState(uint32_t slot, const VernonProgramBindingToken &token,
+                                        const VernonDynamicState &dynamicState) {
+        if (!handle_ ||
+            vernonRuntimeProgramInvocationBindDynamicState(handle_, slot, &token, &dynamicState) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind Program DynamicState control");
         return *this;
     }
 

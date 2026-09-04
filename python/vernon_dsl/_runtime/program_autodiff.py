@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -21,6 +21,124 @@ from .autodiff import _pipeline_derivative_groups
 from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .sampler import SamplerState
 from .texture import _TextureResource
+
+
+@dataclass
+class _ProgramDeployment:
+    directory: tempfile.TemporaryDirectory[str]
+    canonical_program: bytes
+    artifact_system: bytes
+    stage_bindings: Any
+    compiled_stages: list[tuple[str, str, Any]]
+
+    def load(self) -> Any:
+        if state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
+        return state._native_runtime.load_canonical_program(
+            self.canonical_program,
+            self.artifact_system,
+            self.directory.name,
+            self.stage_bindings,
+            self.compiled_stages,
+        )
+
+
+def _bind_program_graphics_controls(pipeline: Any, cache: _PersistentBindingTable, invocation: Any) -> list[Any]:
+    from ..render import ColorBlendState, LoadOperation, StoreOperation, lines, points, triangles
+
+    load_values = {
+        LoadOperation.CLEAR: state._native.ATTACHMENT_CLEAR,
+        LoadOperation.PRESERVE: state._native.ATTACHMENT_PRESERVE,
+        LoadOperation.DISCARD: state._native.ATTACHMENT_DISCARD,
+    }
+    store_values = {
+        StoreOperation.PRESERVE: state._native.ATTACHMENT_STORE,
+        StoreOperation.DISCARD: state._native.ATTACHMENT_DONT_CARE,
+    }
+    written: list[Any] = []
+    operations = {operation.id: operation for operation in invocation.graph.operations}
+    for node_id, controls in invocation.graphics_controls.items():
+        operation = operations[node_id]
+        render_slot, render_pass = controls["render_pass"]
+        draw_slot, draw = controls["draw"]
+        dynamic_slot, dynamic = controls["dynamic_state"]
+        builder = pipeline.invocation_builder()
+        colors = tuple(render_pass.target._color_attachments())
+        color_operations = dict(render_pass.colors)
+        for location, texture in colors:
+            attachment = color_operations[location]
+            clear_value = (
+                tuple(float(component) for component in attachment.clear_value)
+                if attachment.load is LoadOperation.CLEAR
+                else (0.0, 0.0, 0.0, 0.0)
+            )
+            builder.rhi_color_attachment(
+                location,
+                texture._resident_view(),
+                load_values[attachment.load],
+                store_values[attachment.store],
+                list(clear_value),
+            )
+            written.append(texture)
+        depth_texture = render_pass.target._depth_attachment()
+        if depth_texture is not None:
+            if render_pass.depth is None:
+                raise ValueError("depth attachment operations are required for a depth RenderTarget")
+            attachment = render_pass.depth
+            clear_depth = float(attachment.clear_value) if attachment.load is LoadOperation.CLEAR else 1.0
+            builder.rhi_depth_attachment(
+                depth_texture._resident_view(),
+                load_values[attachment.load],
+                store_values[attachment.store],
+                clear_depth,
+            )
+            written.append(depth_texture)
+        if draw is not None and draw.index_buffer is not None:
+            index_view = draw.index_buffer.view
+            builder.rhi_index_binding(
+                index_view._resident_buffer(),
+                draw.index_buffer.count,
+                index_view.layout.byte_offset,
+            )
+        topology = {
+            triangles: state._native.TOPOLOGY_TRIANGLE_LIST,
+            lines: state._native.TOPOLOGY_LINE_LIST,
+            points: state._native.TOPOLOGY_POINT_LIST,
+        }[operation.pipeline._topology]
+        builder.topology(topology)
+        builder.counts(
+            0 if draw is None or draw.vertex_count is None else draw.vertex_count,
+            1 if draw is None else draw.instance_count,
+        )
+        if render_pass.render_area is not None:
+            builder.viewport(*render_pass.render_area)
+            builder.scissor(*render_pass.render_area)
+        if dynamic is not None:
+            if dynamic.viewport is not None:
+                builder.viewport(*dynamic.viewport)
+            if dynamic.scissor is not None:
+                builder.scissor(*dynamic.scissor)
+            builder.stencil_reference(dynamic.stencil_reference)
+        configured_blends = dict(operation.pipeline._graphics_state.color_blends)
+        graphics_state = replace(
+            operation.pipeline._graphics_state,
+            color_blends=tuple(
+                (location, configured_blends.get(location, ColorBlendState())) for location, _ in colors
+            ),
+        )
+        builder.graphics_state(graphics_state)
+        render_token = (
+            "render-pass",
+            node_id,
+            repr(render_pass).encode(),
+            *(id(texture._resident_view()) for _, texture in colors),
+        )
+        draw_token = ("draw-command", node_id, repr(draw).encode())
+        dynamic_token = ("dynamic-state", node_id, repr(dynamic).encode())
+        cache.bind_render_pass_control(render_slot, render_token, builder)
+        cache.bind_draw_command_control(draw_slot, draw_token, builder)
+        cache.bind_dynamic_state_control(dynamic_slot, dynamic_token, builder)
+    return written
 
 
 def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
@@ -77,12 +195,24 @@ def _bound_program_invocation(
         for parameter, _, path, value in resolved
         if isinstance(value, (TensorStorage, TensorView, _TextureResource))
     ]
+    for controls in invocation.graphics_controls.values():
+        render_pass = controls["render_pass"][1]
+        borrows.extend(
+            (f"render_attachment_{location}", texture, "write")
+            for location, texture in render_pass.target._color_attachments()
+        )
+        depth = render_pass.target._depth_attachment()
+        if depth is not None:
+            borrows.append(("depth_attachment", depth, "write"))
+        draw = controls["draw"][1]
+        if draw is not None and draw.index_buffer is not None:
+            borrows.append(("index_buffer", draw.index_buffer.view, "read"))
     written: list[Any] = []
     lease = _DispatchBorrowLease(borrows)
     succeeded = False
     try:
         with cache.invocation(pipeline) as builder:
-            for parameter, _, path, value in resolved:
+            for parameter, slot, path, value in resolved:
                 if parameter.kind == state._native.PIPELINE_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
@@ -93,6 +223,7 @@ def _bound_program_invocation(
                         pipeline,
                         parameter,
                         value,
+                        host_value=slot.get("category") == "value",
                         annotation=invocation.input_annotations.get(path),
                     )
                 if (
@@ -101,6 +232,7 @@ def _bound_program_invocation(
                     and hasattr(value, "_mark_device_dirty")
                 ):
                     written.append(value)
+            written.extend(_bind_program_graphics_controls(pipeline, cache, invocation))
             yield builder, written, lease
         succeeded = True
     finally:
@@ -225,12 +357,24 @@ class ProgramNativePullback:
         return tuple(dict(item) for item in self._native.pass_telemetry)
 
 
-@dataclass
+@dataclass(eq=False)
 class ProgramAutodiffSpecialization:
     template: Any
+    deployment: _ProgramDeployment
     pipeline: Any
-    directory: tempfile.TemporaryDirectory[str]
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        state._runtime_children.add(self)
+
+    def _release_runtime_native(self) -> None:
+        self.binding_cache.clear()
+        self.pipeline = None
+
+    def _loaded_pipeline(self) -> Any:
+        if self.pipeline is None:
+            self.pipeline = self.deployment.load()
+        return self.pipeline
 
     @property
     def binding_telemetry(self) -> Mapping[str, int]:
@@ -243,7 +387,8 @@ class ProgramAutodiffSpecialization:
         checkpoint_memory_budget: int | None = None,
         checkpoint_policy: str = "",
     ) -> tuple[Any, ProgramNativePullback]:
-        signature = self.pipeline.program_ad_signature
+        pipeline = self._loaded_pipeline()
+        signature = pipeline.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
         if set(invocation.inputs) != expected_inputs:
             raise RuntimeError(
@@ -256,13 +401,13 @@ class ProgramAutodiffSpecialization:
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
         with _bound_program_invocation(
-            self.pipeline,
+            pipeline,
             self.binding_cache,
             invocation,
             targets,
             retain_borrows=True,
         ) as (builder, written, lease):
-            native_outputs, native_pullback = self.pipeline.program_vjp_bound(
+            native_outputs, native_pullback = pipeline.program_vjp_bound(
                 builder,
                 program_bindings,
                 checkpoint_memory_budget=checkpoint_memory_budget,
@@ -270,7 +415,7 @@ class ProgramAutodiffSpecialization:
             )
             for value in written:
                 value._mark_device_dirty()
-        derivative_groups = _pipeline_derivative_groups(self.pipeline)
+        derivative_groups = _pipeline_derivative_groups(pipeline)
         pullback = ProgramNativePullback(
             native_pullback,
             signature,
@@ -288,12 +433,24 @@ class ProgramAutodiffSpecialization:
         return invocation.outputs, pullback
 
 
-@dataclass
+@dataclass(eq=False)
 class ProgramSpecialization:
     template: Any
+    deployment: _ProgramDeployment
     pipeline: Any
-    directory: tempfile.TemporaryDirectory[str]
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        state._runtime_children.add(self)
+
+    def _release_runtime_native(self) -> None:
+        self.binding_cache.clear()
+        self.pipeline = None
+
+    def _loaded_pipeline(self) -> Any:
+        if self.pipeline is None:
+            self.pipeline = self.deployment.load()
+        return self.pipeline
 
     @property
     def binding_telemetry(self) -> Mapping[str, int]:
@@ -302,19 +459,20 @@ class ProgramSpecialization:
     def invoke(self, invocation: Any) -> Any:
         from ..program import flatten_program_outputs
 
+        pipeline = self._loaded_pipeline()
         targets = flatten_program_outputs(invocation.outputs)
-        with _bound_program_invocation(self.pipeline, self.binding_cache, invocation, targets) as (
+        with _bound_program_invocation(pipeline, self.binding_cache, invocation, targets) as (
             builder,
             written,
             _,
         ):
-            self.pipeline.program_forward_bound(builder)
+            self.binding_cache.forward()
             for value in written:
                 value._mark_device_dirty()
         return invocation.outputs
 
 
-def _compile_program(parsed: Any) -> tuple[Any, tempfile.TemporaryDirectory[str]]:
+def _compile_program(parsed: Any) -> _ProgramDeployment:
     if state._native_runtime is None:
         raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
     native = state._native
@@ -347,24 +505,23 @@ def _compile_program(parsed: Any) -> tuple[Any, tempfile.TemporaryDirectory[str]
         for stage in plan.stages
     }
     canonical_program, artifact_system, stage_bindings = _canonical_deployment(plan, descriptors)
-    pipeline = state._native_runtime.load_canonical_program(
+    return _ProgramDeployment(
+        directory,
         canonical_json(dict(canonical_program)).encode(),
         canonical_json(dict(artifact_system)).encode(),
-        directory.name,
         stage_bindings,
         [(stage.metadata["symbol"], stage.entry, result) for stage, result in retained_programs],
     )
-    return pipeline, directory
 
 
 def compile_program(parsed: Any, template: Any) -> ProgramSpecialization:
-    pipeline, directory = _compile_program(parsed)
-    return ProgramSpecialization(template, pipeline, directory)
+    deployment = _compile_program(parsed)
+    return ProgramSpecialization(template, deployment, deployment.load())
 
 
 def compile_program_autodiff(parsed: Any, template: Any) -> ProgramAutodiffSpecialization:
-    pipeline, directory = _compile_program(parsed)
-    return ProgramAutodiffSpecialization(template, pipeline, directory)
+    deployment = _compile_program(parsed)
+    return ProgramAutodiffSpecialization(template, deployment, deployment.load())
 
 
 __all__ = [

@@ -314,7 +314,7 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
 
     const uint32_t formats[]{3};
     const uint32_t strides[]{12};
-    VernonRuntimeProviderColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     VernonRuntimeCoreGraphicsCompatibility compatibility{};
     compatibility.struct_size = sizeof(compatibility);
@@ -403,7 +403,7 @@ TEST(RuntimeForeignProvider, ReleasesPartiallyPreparedGraphicsVariant) {
     VernonRuntimeCorePipeline *pipeline = nullptr;
     ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
     const uint32_t format[]{3};
-    VernonRuntimeProviderColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     VernonRuntimeCoreGraphicsCompatibility compatibility{};
     compatibility.struct_size = sizeof(compatibility);

@@ -429,7 +429,7 @@ MTLColorWriteMask colorWriteMask(uint32_t mask) {
     return result;
 }
 
-bool configureStencilFace(const VernonRuntimeProviderStencilFaceState &source,
+bool configureStencilFace(const VernonStencilFaceState &source,
                           MTLStencilDescriptor *destination) {
     MTLCompareFunction compare{};
     MTLStencilOperation stencilFail{}, depthFail{}, pass{};
@@ -1015,13 +1015,11 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     PreparedPipeline *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     PreparedBindingSet *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
     MTLPrimitiveType primitive{};
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline || !pipeline->graphics ||
+    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics ||
         !pipeline->render || (!bindings && descriptor->bindings.value) ||
         (bindings && bindings->layout != pipeline->layout) ||
         (!bindings && pipeline->layout && !pipeline->layout->entries.empty()) ||
-        !primitiveType(descriptor->topology, primitive) || descriptor->color_attachment_count == 0 ||
-        descriptor->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
-        !descriptor->color_attachments ||
+        !primitiveType(descriptor->topology, primitive) ||
         descriptor->color_attachment_count != pipeline->colorFormatCount ||
         (descriptor->depth_stencil_view.resource.value && !pipeline->depthStencil) ||
         (!descriptor->depth_stencil_view.resource.value && pipeline->depthStencil) ||

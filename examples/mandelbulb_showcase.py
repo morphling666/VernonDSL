@@ -77,7 +77,7 @@ def main() -> None:
                 max_steps=quality[0],
                 max_iterations=quality[1],
                 shadow_steps=quality[2],
-                render=vd.render(target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
+                render_pass=vd.render_pass(target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
                 **frame_values(phase),
             )
             frame += 1

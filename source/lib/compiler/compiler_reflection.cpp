@@ -691,7 +691,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
         }
 
         llvm::json::Array arguments;
-        std::set<std::string> reflectedTensorViewOwners;
+        std::map<std::string, std::string> reflectedTensorViewOwners;
         uint64_t argumentOffset = 0;
         std::map<unsigned, uint32_t> generatedUniformBindings;
         std::map<unsigned, InterfaceExtent> physicalValueLayouts;
@@ -1000,13 +1000,14 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     argument["vernon.source_shape"] = std::move(shape);
                 }
             }
-            if (mlir::isa<mlir::vernon::TensorViewType>(argumentType)) {
-                if (logicalValue && logicalValue->sourcePathExplicit)
-                    reflectedTensorViewOwners.insert(logicalValue->sourcePath);
-                else if (argumentAttrs)
+            if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(argumentType)) {
+                if (logicalValue && logicalValue->sourcePathExplicit) {
+                    reflectedTensorViewOwners.emplace(logicalValue->sourcePath, view.getAccess().str());
+                } else if (argumentAttrs) {
                     if (auto sourceName = argumentAttrs.getAs<mlir::StringAttr>("vernon.source_name");
                         sourceName && !sourceName.getValue().empty())
-                        reflectedTensorViewOwners.insert(sourceName.getValue().str());
+                        reflectedTensorViewOwners.emplace(sourceName.getValue().str(), view.getAccess().str());
+                }
             }
             if (auto generated = generatedUniformBindings.find(index); generated != generatedUniformBindings.end()) {
                 argument["vernon.set"] = int64_t{0};
@@ -1455,9 +1456,21 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 auto region = effect.getAs<mlir::StringAttr>("region");
                 if (!kind || !owner || !region)
                     continue;
-                if (reflectedTensorViewOwners.find(owner.getValue().str()) == reflectedTensorViewOwners.end()) {
+                const auto reflectedOwner = reflectedTensorViewOwners.find(owner.getValue().str());
+                if (reflectedOwner == reflectedTensorViewOwners.end()) {
                     function.emitError() << "storage effect owner '" << owner.getValue()
                                          << "' does not name a reflected TensorView argument";
+                    invalid = true;
+                    return;
+                }
+                const llvm::StringRef effectKind = kind.getValue();
+                const llvm::StringRef declaredAccess = reflectedOwner->second;
+                const bool incompatible = (declaredAccess == "read" && effectKind != "read") ||
+                                          (declaredAccess == "write" && effectKind == "read") ||
+                                          (effectKind == "atomic" && declaredAccess != "read_write");
+                if (incompatible) {
+                    function.emitError() << "storage effect '" << effectKind << "' for owner '" << owner.getValue()
+                                         << "' conflicts with declared access '" << declaredAccess << "'";
                     invalid = true;
                     return;
                 }

@@ -113,6 +113,7 @@ bool recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeP
                                 VernonRuntimeProviderResourceReference resource);
 bool retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                            VernonRuntimeProviderResourceReference resource);
+bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor);
 bool deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
                          uint64_t object, void (*cleanup)(void *, uint64_t));
 bool deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,

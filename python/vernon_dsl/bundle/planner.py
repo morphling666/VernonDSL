@@ -102,7 +102,14 @@ def build_bundle_plan(
     unique_stages = {stage.id: stage for _, stages in variants for stage in stages.values()}
     for stage in unique_stages.values():
         try:
-            validate_stage_target(stage.stage, target.target)
+            if stage.stage == "graphics":
+                graphics_stages = stage.metadata.get("graphics_compiled_stages")
+                if not isinstance(graphics_stages, tuple) or not graphics_stages:
+                    raise ValueError("graphics Program stage has no compiled shader modules")
+                for graphics_stage in graphics_stages:
+                    validate_stage_target(graphics_stage.stage, target.target)
+            else:
+                validate_stage_target(stage.stage, target.target)
         except ValueError as error:
             raise PipelineCompileError(str(error)) from None
     return BundlePlan(
@@ -149,7 +156,14 @@ def build_program_bundle_plan(
         if stage.stage != expected:
             raise PipelineCompileError(f"Program stage {name!r} requires {expected}, compiler produced {stage.stage}")
         try:
-            validate_stage_target(stage.stage, target.target)
+            if stage.stage == "graphics":
+                graphics_stages = stage.metadata.get("graphics_compiled_stages")
+                if not isinstance(graphics_stages, tuple) or not graphics_stages:
+                    raise ValueError("graphics Program stage has no compiled shader modules")
+                for graphics_stage in graphics_stages:
+                    validate_stage_target(graphics_stage.stage, target.target)
+            else:
+                validate_stage_target(stage.stage, target.target)
         except ValueError as error:
             raise PipelineCompileError(str(error)) from None
         if stage.target.spec != target.spec:

@@ -4,7 +4,7 @@
 // CHECK-NOT: spirv.AtomicCompareExchange
 // CHECK-NOT: spirv.mlir.loop
 
-module attributes {vernon.compiler_contract_version = 13 : i64, vernon.pipeline_version = 17 : i64} {
+module attributes {vernon.compiler_contract_version = 14 : i64, vernon.pipeline_version = 18 : i64} {
   gpu.module @kernels attributes {
     spirv.target_env = #spirv.target_env<
       #spirv.vce<v1.3, [Shader, AtomicFloat32AddEXT],

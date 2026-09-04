@@ -69,7 +69,6 @@ class LanguageVersionTests(unittest.TestCase):
             "ExecutionPass",
             "GraphicsEncoder",
             "PipelineInvocation",
-            "RenderPass",
             "VjpComputePass",
         )
         for name in retired:

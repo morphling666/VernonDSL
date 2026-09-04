@@ -7,14 +7,149 @@ import dataclasses
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, get_args
 
 from ._runtime.tensor import TensorStorage, TensorView
-from .operation_graph import GraphBuffer, GraphValueInput, KernelParameter, OperationGraph
+from .operation_graph import (
+    AttachmentProjection,
+    GraphAttachmentOutput,
+    GraphBuffer,
+    GraphControlInput,
+    GraphControlResource,
+    GraphResourceInput,
+    GraphValueInput,
+    KernelParameter,
+    OperationGraph,
+    ProgramControlDescriptor,
+    ProgramControlRef,
+    ProgramControlSource,
+)
+
+
+def _symbolic_program_inputs(parameter_types: Mapping[str, Any]) -> dict[str, Any]:
+    """Create the canonical symbolic boundary values used by every Program entry path."""
+
+    from .frontend.model import SemanticCategory
+
+    inputs: dict[str, Any] = {}
+    for name, parameter_type in parameter_types.items():
+        if isinstance(parameter_type, ProgramControlDescriptor):
+            inputs[name] = GraphControlInput(name, parameter_type.kind, parameter_type.prototype)
+        elif parameter_type.kind is SemanticCategory.STORAGE:
+            storage = parameter_type.storage_metadata
+            inputs[name] = GraphBuffer(
+                storage.dtype,
+                storage.shape,
+                storage.access,
+                storage.as_view,
+                parameter_type.logical,
+            )
+        elif parameter_type.kind is SemanticCategory.VALUE:
+            inputs[name] = GraphValueInput(name, parameter_type)
+        elif parameter_type.kind is SemanticCategory.RESOURCE:
+            inputs[name] = GraphResourceInput(name, parameter_type)
+        else:
+            raise TypeError(f"unknown Program parameter kind {parameter_type.kind!r}")
+    return inputs
+
+
+def _one_node_program(
+    root: Any,
+    parameter_types: Mapping[str, Any],
+    capture_operation: Any,
+    output_names: tuple[str, ...] | None = (),
+) -> tuple[ProgramTemplate, ProgramInvocation, Any]:
+    """Build a one-node Program through the same capture/parser path as Module."""
+
+    inputs = _symbolic_program_inputs(parameter_types)
+    capture = ProgramCapture(root, inputs)
+    capture_operation(capture, inputs)
+    template = ProgramTemplate.compile(capture)
+    if output_names is None:
+        if len(template.calls) != 1:
+            raise RuntimeError("one-node Program capture produced an invalid call count")
+        output_names = tuple(
+            parameter.name for parameter in template.calls[0].parameters if parameter.access in {"write", "read_write"}
+        )
+    outputs = {name: inputs[name] for name in output_names}
+    invocation = template.bind(capture, outputs)
+    from .program_frontend import parse_program
+
+    return template, invocation, parse_program(invocation)
+
+
+def _graphics_stage_frontend(pipeline: Any, stage: Any) -> Any:
+    from .compiler import Compiler, FrontendCompileRequest
+
+    function = stage.function
+    source = Path(inspect.getsourcefile(function) or "").resolve()
+    return Compiler().compile_request(FrontendCompileRequest(source, function.__name__, tuple(pipeline._features)))
+
+
+def _graphics_attachments(
+    render_pass: Any,
+    control: ProgramControlRef,
+    cache: dict[AttachmentProjection, GraphControlResource],
+) -> tuple[tuple[GraphControlResource, ...], int]:
+    from .frontend.model import ConcreteType
+
+    prototype = render_pass.prototype if isinstance(render_pass, GraphControlInput) else render_pass
+    if prototype is None:
+        raise TypeError("graphics Module export requires a concrete RenderPass argument")
+    target = prototype.target
+
+    def resource(aspect: str, location: int | None, texture: Any) -> GraphControlResource:
+        projection = AttachmentProjection(control, aspect, location)
+        existing = cache.get(projection)
+        if existing is not None:
+            return existing
+        format_name = getattr(getattr(texture, "format", None), "name", None) or "d32_float"
+        logical = ConcreteType(
+            "texture",
+            "Texture",
+            ("2d", ConcreteType("scalar", "f32"), format_name, "read_write"),
+        )
+        control_name = (
+            str(control.identifier)
+            if control.source is ProgramControlSource.ARGUMENT
+            else f"{control.source.value}.{control.identifier}"
+        )
+        result = GraphControlResource(
+            f"{control_name}.{aspect}.{location if location is not None else 0}",
+            tuple(0 for _ in texture.shape),
+            logical,
+            projection,
+        )
+        cache[projection] = result
+        return result
+
+    colors = tuple(target._color_attachments())
+    attachments = [resource("color", location, texture) for location, texture in colors]
+    depth = target._depth_attachment()
+    if depth is not None:
+        attachments.append(resource("depth", None, depth))
+    if not attachments:
+        raise ValueError("graphics Program requires at least one color or depth attachment")
+    return tuple(attachments), len(colors)
 
 
 def flatten_program_outputs(value: Any, prefix: str = "") -> dict[str, Any]:
-    if isinstance(value, (GraphBuffer, TensorStorage, TensorView)):
+    from ._runtime.texture import _TextureResource
+
+    if value is None:
+        return {}
+    if isinstance(
+        value,
+        (
+            GraphAttachmentOutput,
+            GraphBuffer,
+            GraphResourceInput,
+            TensorStorage,
+            TensorView,
+            _TextureResource,
+        ),
+    ):
         return {prefix or "output": value}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         result: dict[str, Any] = {}
@@ -54,17 +189,49 @@ class CapturedKernelCall:
     name: str
     kernel: Any
     arguments: tuple[Any, ...]
-    grid: tuple[int, int, int]
+    grid: tuple[Any, Any, Any]
     features: tuple[str, ...]
+    lowered: Any = None
+
+
+@dataclass(frozen=True)
+class CapturedGraphicsCall:
+    name: str
+    pipeline: Any
+    arguments: Mapping[str, Any]
+    render_pass: Any
+    draw: Any
+    dynamic_state: Any
+    render_pass_ref: ProgramControlRef
+    draw_ref: ProgramControlRef
+    dynamic_state_ref: ProgramControlRef
+    frontends: tuple[Any, ...] = ()
+
+
+class _ControlIdentityRegistry:
+    """Capture-local identity table for concrete invocation control objects."""
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[int, str], tuple[Any, ProgramControlRef]] = {}
+
+    def ref(self, value: Any, kind: str) -> ProgramControlRef:
+        key = (id(value), kind)
+        existing = self._entries.get(key)
+        if existing is not None and existing[0] is value:
+            return existing[1]
+        ref = ProgramControlRef(kind, ProgramControlSource.CAPTURE, len(self._entries))
+        self._entries[key] = (value, ref)
+        return ref
 
 
 class ProgramCapture:
     def __init__(self, root: Any, inputs: Mapping[str, Any]):
         self.root = root
         self.inputs = dict(inputs)
-        self.ops: list[CapturedAlloc | CapturedKernelCall] = []
+        self.ops: list[CapturedAlloc | CapturedKernelCall | CapturedGraphicsCall] = []
         self._scopes = [type(root).__name__]
         self._name_counts: dict[str, int] = {}
+        self._control_identities = _ControlIdentityRegistry()
 
     @property
     def calls(self) -> tuple[CapturedKernelCall, ...]:
@@ -73,6 +240,17 @@ class ProgramCapture:
     @property
     def allocs(self) -> tuple[CapturedAlloc, ...]:
         return tuple(op for op in self.ops if isinstance(op, CapturedAlloc))
+
+    @property
+    def graphics_calls(self) -> tuple[CapturedGraphicsCall, ...]:
+        return tuple(op for op in self.ops if isinstance(op, CapturedGraphicsCall))
+
+    def control_ref(self, value: Any, kind: str) -> ProgramControlRef:
+        if isinstance(value, GraphControlInput):
+            if value.kind != kind:
+                raise TypeError(f"expected {kind} Program control, got {value.kind}")
+            return value.ref
+        return self._control_identities.ref(value, kind)
 
     def enter_module(self, name: str) -> None:
         self._scopes.append(name)
@@ -84,19 +262,53 @@ class ProgramCapture:
         self,
         kernel: Any,
         arguments: tuple[Any, ...],
-        grid: tuple[int, int, int] | None,
+        grid: tuple[Any, Any, Any] | None,
         features: tuple[str, ...],
+        *,
+        lowered: Any = None,
     ) -> None:
         dispatch_grid = grid or (1, 1, 1)
-        if len(dispatch_grid) != 3 or any(
-            isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in dispatch_grid
-        ):
-            raise ValueError("grid must contain three positive integers")
+        if len(dispatch_grid) != 3:
+            raise ValueError("grid must contain three components")
+        for value in dispatch_grid:
+            if isinstance(value, GraphValueInput):
+                continue
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError("grid components must be positive integers or invocation Values")
         base = ".".join((*self._scopes, kernel.__name__))
         ordinal = self._name_counts.get(base, 0)
         self._name_counts[base] = ordinal + 1
         name = base if ordinal == 0 else f"{base}.{ordinal}"
-        self.ops.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features)))
+        self.ops.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features), lowered))
+
+    def capture_graphics(
+        self,
+        pipeline: Any,
+        arguments: Mapping[str, Any],
+        render_pass: Any,
+        draw: Any,
+        dynamic_state: Any,
+        *,
+        frontends: tuple[Any, ...] = (),
+    ) -> None:
+        base = ".".join((*self._scopes, "graphics"))
+        ordinal = self._name_counts.get(base, 0)
+        self._name_counts[base] = ordinal + 1
+        name = base if ordinal == 0 else f"{base}.{ordinal}"
+        self.ops.append(
+            CapturedGraphicsCall(
+                name,
+                pipeline,
+                dict(arguments),
+                render_pass,
+                draw,
+                dynamic_state,
+                self.control_ref(render_pass, "render_pass"),
+                self.control_ref(draw, "draw"),
+                self.control_ref(dynamic_state, "dynamic_state"),
+                frontends,
+            )
+        )
 
     def capture_allocation(
         self,
@@ -121,21 +333,87 @@ class KernelCallTemplate:
     kernel: Any
     parameter_names: tuple[str, ...]
     parameters: tuple[KernelParameter, ...]
-    grid: tuple[int, int, int]
+    grid: tuple[Any, Any, Any]
     features: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GraphicsCallTemplate:
+    name: str
+    pipeline: Any
+    parameter_names: tuple[str, ...]
+    parameters: tuple[KernelParameter, ...]
+    features: tuple[str, ...]
+    implementations: tuple[tuple[str, str, str], ...]
+    structs: tuple[tuple[str, tuple[Any, ...]], ...]
 
 
 class ProgramTemplate:
     """Typed, reusable structure with no invocation resource references."""
 
-    def __init__(self, calls: tuple[KernelCallTemplate, ...]):
+    def __init__(self, calls: tuple[KernelCallTemplate | GraphicsCallTemplate, ...]):
         self.calls = calls
 
     @classmethod
     def compile(cls, capture: ProgramCapture) -> ProgramTemplate:
-        calls: list[KernelCallTemplate] = []
-        for captured in capture.calls:
-            lowered = captured.kernel._lower(captured.features)
+        calls: list[KernelCallTemplate | GraphicsCallTemplate] = []
+        for captured in (op for op in capture.ops if not isinstance(op, CapturedAlloc)):
+            if isinstance(captured, CapturedGraphicsCall):
+                parameters: dict[str, KernelParameter] = {}
+                implementations: list[tuple[str, str, str]] = []
+                structs: dict[str, tuple[Any, ...]] = {}
+                for stage_index, stage in enumerate(captured.pipeline._stages):
+                    function = stage.function
+                    frontend = (
+                        captured.frontends[stage_index]
+                        if captured.frontends
+                        else _graphics_stage_frontend(captured.pipeline, stage)
+                    )
+                    implementations.append((stage.kind, function.__name__, frontend.mlir))
+                    for struct_name, struct_fields in frontend.structs:
+                        previous_fields = structs.get(struct_name)
+                        if previous_fields is not None and previous_fields != struct_fields:
+                            raise TypeError(f"graphics stages disagree on struct {struct_name!r}")
+                        structs[struct_name] = struct_fields
+                    entry = next(
+                        (typed for typed in frontend.typed_functions if typed.source.name == function.__name__),
+                        None,
+                    )
+                    if entry is None:
+                        raise RuntimeError(f"compiled graphics stage {function.__name__!r} has no typed entry")
+                    for typed in entry.parameters:
+                        interface_kinds = {item.kind for item in typed.interface}
+                        if typed.builtin is not None or "implicit" in interface_kinds:
+                            continue
+                        if stage.kind == "fragment" and "varying" in interface_kinds:
+                            continue
+                        access = str(typed.type.arguments[3]) if typed.type.kind == "texture" else typed.access.value
+                        previous = parameters.get(typed.name)
+                        parameter = KernelParameter(typed.name, access, False, False)
+                        if previous is not None and previous.access != parameter.access:
+                            raise TypeError(f"graphics stages disagree on access for parameter {typed.name!r}")
+                        parameters[typed.name] = parameter
+                parameter_names = tuple(captured.arguments)
+                if set(parameter_names) != set(parameters):
+                    missing = set(parameters) - set(parameter_names)
+                    unexpected = set(parameter_names) - set(parameters)
+                    if missing:
+                        raise TypeError(f"missing pipeline argument(s): {', '.join(sorted(missing))}")
+                    raise TypeError(f"unexpected pipeline argument(s): {', '.join(sorted(unexpected))}")
+                calls.append(
+                    GraphicsCallTemplate(
+                        captured.name,
+                        captured.pipeline,
+                        parameter_names,
+                        tuple(parameters[name] for name in parameter_names),
+                        tuple(captured.pipeline._features),
+                        tuple(implementations),
+                        tuple(sorted(structs.items())),
+                    )
+                )
+                continue
+            assert isinstance(captured, CapturedKernelCall)
+            lowered = captured.lowered or captured.kernel._lower(captured.features)
             frontend = lowered.frontend
             builtin_names = lowered.builtins
             parameter_names = tuple(
@@ -178,14 +456,26 @@ class ProgramTemplate:
         return cls(tuple(calls))
 
     def bind(self, capture: ProgramCapture, outputs: Any) -> ProgramInvocation:
-        if len(capture.calls) != len(self.calls):
+        captured_calls = sum(not isinstance(op, CapturedAlloc) for op in capture.ops)
+        if captured_calls != len(self.calls):
             raise RuntimeError("Module control flow changed for an existing Program specialization")
         graph = OperationGraph()
+        graphics_attachment_cache: dict[AttachmentProjection, GraphControlResource] = {}
+        graphics_control_slots: dict[ProgramControlRef, int] = {}
         slots: list[Any] = []
         for name, value in capture.inputs.items():
             graph.import_input(name, value)
         operation_bindings: dict[int, tuple[Any, ...]] = {}
-        kernel_index = 0
+
+        def resolve_attachment_output(value: Any) -> Any:
+            if not isinstance(value, GraphAttachmentOutput):
+                return value
+            resource = graphics_attachment_cache.get(value.projection)
+            if resource is None:
+                raise RuntimeError("attachment output must follow a graphics call using the same RenderPass")
+            return resource
+
+        call_index = 0
         for captured in capture.ops:
             if isinstance(captured, CapturedAlloc):
                 graph.append_alloc(
@@ -195,8 +485,60 @@ class ProgramTemplate:
                     values=captured.values,
                 )
                 continue
-            template = self.calls[kernel_index]
-            kernel_index += 1
+            template = self.calls[call_index]
+            call_index += 1
+            if isinstance(captured, CapturedGraphicsCall):
+                if not isinstance(template, GraphicsCallTemplate) or template.pipeline is not captured.pipeline:
+                    raise RuntimeError("Module graphics sequence changed for an existing Program specialization")
+                first_slot = len(slots)
+                arguments = tuple(
+                    resolve_attachment_output(captured.arguments[name]) for name in template.parameter_names
+                )
+                slots.extend(arguments)
+                binding_slots = {name: first_slot + index for index, name in enumerate(template.parameter_names)}
+                control_slots = {}
+                for kind, value, ref in (
+                    ("render_pass", captured.render_pass, captured.render_pass_ref),
+                    ("draw", captured.draw, captured.draw_ref),
+                    (
+                        "dynamic_state",
+                        captured.dynamic_state,
+                        captured.dynamic_state_ref,
+                    ),
+                ):
+                    slot = graphics_control_slots.get(ref)
+                    if slot is None:
+                        slot = len(slots)
+                        slots.append(value)
+                        graphics_control_slots[ref] = slot
+                    control_slots[kind] = slot
+                attachments, color_count = _graphics_attachments(
+                    captured.render_pass,
+                    captured.render_pass_ref,
+                    graphics_attachment_cache,
+                )
+                for attachment in attachments:
+                    graph.import_control_resource(attachment)
+                operation = graph.append_graphics(
+                    name=template.name,
+                    pipeline=template.pipeline,
+                    bindings=dict(zip(template.parameter_names, arguments, strict=True)),
+                    binding_slots=binding_slots,
+                    control_slots=control_slots,
+                    parameters=template.parameters,
+                    attachments=attachments,
+                    color_count=color_count,
+                    features=template.features,
+                )
+                operation_bindings[operation.id] = (
+                    *arguments,
+                    captured.render_pass,
+                    captured.draw,
+                    captured.dynamic_state,
+                )
+                continue
+            if not isinstance(template, KernelCallTemplate):
+                raise RuntimeError("Module operation sequence changed for an existing Program specialization")
             if (
                 template.kernel is not captured.kernel
                 or template.grid != captured.grid
@@ -217,7 +559,9 @@ class ProgramTemplate:
                 features=template.features,
             )
             operation_bindings[operation.id] = captured.arguments
-        graph.set_outputs(flatten_program_outputs(outputs))
+        graph.set_outputs(
+            {path: resolve_attachment_output(value) for path, value in flatten_program_outputs(outputs).items()}
+        )
         return ProgramInvocation(
             self,
             graph,
@@ -238,6 +582,26 @@ class ProgramInvocation:
     inputs: Mapping[str, Any]
     input_annotations: Mapping[str, Any]
     outputs: Any
+
+    def slot_value(self, slot: int) -> Any:
+        value = self.slots[slot]
+        if isinstance(value, GraphControlInput):
+            return self.inputs[value.name]
+        return value
+
+    @property
+    def graphics_controls(self) -> Mapping[int, Mapping[str, tuple[int, Any]]]:
+        from types import MappingProxyType
+
+        controls = {}
+        for operation in self.graph.operations:
+            control_slots = getattr(operation, "control_slots", None)
+            if control_slots is None:
+                continue
+            controls[operation.id] = MappingProxyType(
+                {kind: (slot, self.slot_value(slot)) for kind, slot in control_slots.items()}
+            )
+        return MappingProxyType(controls)
 
 
 class ModuleVjpExpression:
@@ -312,7 +676,9 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
             return getattr(base, expression.attr, None) if base is not None else None
         return None
 
-    def target_types(target: Any) -> tuple[inspect.Signature, dict[str, TypeExpr]] | None:
+    def target_types(
+        target: Any,
+    ) -> tuple[inspect.Signature, dict[str, TypeExpr]] | None:
         if isinstance(target, Module):
             return type(target)._module_definition.signature, infer(target)
         function = getattr(target, "_function", None)
@@ -376,7 +742,11 @@ def _reflect_module_parameter_types(module: Any) -> dict[str, Any]:
 
 def _module_parameter_types(module: Any) -> dict[str, Any]:
     from .frontend.model import SemanticCategory
-    from .frontend.runtime_types import RuntimeParameterDescriptor, runtime_parameter_descriptor
+    from .frontend.runtime_types import (
+        RuntimeParameterDescriptor,
+        runtime_parameter_descriptor,
+    )
+    from .operation_graph import ProgramControlDescriptor
     from .types import TypeExpr, dyn
 
     definition = type(module)._module_definition
@@ -384,9 +754,13 @@ def _module_parameter_types(module: Any) -> dict[str, Any]:
     reflected = _reflect_module_parameter_types(module)
     types: dict[str, Any] = {}
     for parameter in definition.signature.parameters.values():
+        annotation = annotations.get(parameter.name)
+        control_kind = _program_control_kind(annotation)
+        if control_kind is not None:
+            types[parameter.name] = ProgramControlDescriptor(control_kind, annotation)
+            continue
         if parameter.default is not inspect.Parameter.empty:
             continue
-        annotation = annotations.get(parameter.name)
         try:
             descriptor = runtime_parameter_descriptor(annotation)
         except TypeError:
@@ -427,7 +801,12 @@ def _parameter_types_from_values(
 ) -> dict[str, Any]:
     from ._dtypes import scalar_name
     from .frontend.model import SemanticCategory
-    from .frontend.runtime_types import RuntimeParameterDescriptor, runtime_parameter_descriptor, validate_host_value
+    from .frontend.runtime_types import (
+        RuntimeParameterDescriptor,
+        runtime_parameter_descriptor,
+        validate_host_value,
+    )
+    from .operation_graph import ProgramControlDescriptor
     from .types import TypeExpr
 
     def tensor_dtype(value: TensorStorage) -> Any:
@@ -439,7 +818,23 @@ def _parameter_types_from_values(
         types = __import__("vernon_dsl.types", fromlist=[name])
         return getattr(types, name)
 
-    def descriptor(annotation: Any, value: Any, name: str) -> RuntimeParameterDescriptor:
+    def descriptor(annotation: Any, value: Any, name: str) -> Any:
+        control_kind = _program_control_kind(annotation)
+        if control_kind is not None:
+            from .render import DrawCommand, DynamicState, RenderPass
+
+            expected = {
+                "render_pass": RenderPass,
+                "draw": DrawCommand,
+                "dynamic_state": DynamicState,
+            }[control_kind]
+            if value is not None and not isinstance(value, expected):
+                raise TypeError(
+                    f"Module.forward() control {name!r} requires {expected.__name__}, got {type(value).__name__}"
+                )
+            if control_kind == "render_pass" and value is None:
+                raise TypeError(f"Module.forward() RenderPass control {name!r} cannot be None")
+            return ProgramControlDescriptor(control_kind, annotation, value)
         as_view = isinstance(annotation, TypeExpr) and annotation.name == "TensorView"
         if isinstance(value, TensorView):
             owner = value.owner
@@ -470,6 +865,22 @@ def _parameter_types_from_values(
     return types
 
 
+def _program_control_kind(annotation: Any) -> str | None:
+    from .render import DrawCommand, DynamicState, RenderPass
+
+    members = set(get_args(annotation)) or {annotation}
+    matches = [
+        kind
+        for kind, control_type in (
+            ("render_pass", RenderPass),
+            ("draw", DrawCommand),
+            ("dynamic_state", DynamicState),
+        )
+        if control_type in members
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _parse_module_program(
     module: Any,
     arguments: tuple[Any, ...] = (),
@@ -486,6 +897,8 @@ def _parse_module_program(
         else _module_parameter_types(module)
     )
     capture, outputs = _capture_module(module, parameter_types)
+    if vjp_wrt is not None and capture.graphics_calls:
+        raise TypeError("graphics Module programs do not support autodiff")
     template = ProgramTemplate.compile(capture)
     invocation = template.bind(capture, outputs)
     from .program_frontend import parse_program
@@ -522,7 +935,7 @@ class _AllocationSpec:
 @dataclass(frozen=True)
 class _ValueRecipe:
     source: str
-    key: str | int | None = None
+    key: str | int | tuple[Any, ...] | None = None
     shape: tuple[int, ...] | None = None
     strides: tuple[int, ...] | None = None
     offset: int = 0
@@ -535,6 +948,14 @@ class _ValueRecipe:
     def resolve(self, inputs: Mapping[str, Any], allocations: tuple[TensorStorage, ...]) -> Any:
         if self.source == "constant":
             return self.constant
+        if self.source == "attachment":
+            if not isinstance(self.key, tuple) or len(self.key) != 3:
+                raise ValueError("attachment output recipe is incomplete")
+            input_name, aspect, location = self.key
+            from .render import color_output, depth_output
+
+            render_pass = inputs[input_name]
+            return color_output(render_pass, location=location) if aspect == "color" else depth_output(render_pass)
         if self.source == "input":
             if not isinstance(self.key, str):
                 raise ValueError("input tree recipe requires a parameter name")
@@ -605,15 +1026,34 @@ def _capture_recipes(
     tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...],
     _TreeRecipe,
 ]:
-    input_ids = {id(value): name for name, value in capture.inputs.items()}
-    alloc_ids = {id(alloc.result): index for index, alloc in enumerate(capture.allocs)}
+    inputs = tuple(capture.inputs.items())
+    captured_allocations = tuple(enumerate(capture.allocs))
+
+    def input_name(value: Any) -> str | None:
+        return next((name for name, candidate in inputs if candidate is value), None)
+
+    def allocation_index(value: Any) -> int | None:
+        return next(
+            (index for index, alloc in captured_allocations if alloc.result is value),
+            None,
+        )
 
     def recipe(value: Any) -> _ValueRecipe:
+        if isinstance(value, GraphAttachmentOutput):
+            render_pass_input = input_name(value.render_pass)
+            if render_pass_input is None:
+                raise TypeError("attachment output RenderPass is not a Module input")
+            return _ValueRecipe(
+                "attachment",
+                (render_pass_input, value.projection.aspect, value.projection.location),
+            )
         if isinstance(value, GraphBuffer):
-            if id(value) in input_ids:
-                source, key = "input", input_ids[id(value)]
-            elif id(value) in alloc_ids:
-                source, key = "allocation", alloc_ids[id(value)]
+            boundary_name = input_name(value)
+            allocation = allocation_index(value)
+            if boundary_name is not None:
+                source, key = "input", boundary_name
+            elif allocation is not None:
+                source, key = "allocation", allocation
             else:
                 raise TypeError(
                     "Module.forward() captured an unregistered Program buffer; "
@@ -626,7 +1066,9 @@ def _capture_recipes(
         return _ValueRecipe("constant", constant=value)
 
     def tree(value: Any) -> _TreeRecipe:
-        if isinstance(value, (GraphBuffer, TensorStorage, TensorView)):
+        if value is None:
+            return _TreeRecipe("leaf", _ValueRecipe("constant", constant=None))
+        if isinstance(value, (GraphAttachmentOutput, GraphBuffer, TensorStorage, TensorView)):
             return _TreeRecipe("leaf", recipe(value))
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return _TreeRecipe(
@@ -644,10 +1086,6 @@ def _capture_recipes(
             return _TreeRecipe("list", tuple(tree(member) for member in value))
         raise TypeError("Module output contains a value that cannot be reconstructed from Program IR")
 
-    allocations = tuple(
-        _AllocationSpec(alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values)
-        for alloc in capture.allocs
-    )
     calls = tuple(
         (
             call.kernel,
@@ -656,6 +1094,10 @@ def _capture_recipes(
             call.features,
         )
         for call in capture.calls
+    )
+    allocations = tuple(
+        _AllocationSpec(alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values)
+        for alloc in capture.allocs
     )
     return allocations, calls, tree(outputs)
 
@@ -724,7 +1166,30 @@ class _VjpSpecialization:
         )
 
 
+def _resolve_module_program_controls(
+    module: Any,
+    arguments: tuple[Any, ...],
+    keywords: Mapping[str, Any],
+) -> tuple[tuple[Any, ...], Mapping[str, Any]]:
+    definition = type(module)._module_definition
+    bound = definition.signature.bind_partial(*arguments, **keywords)
+    for parameter in definition.signature.parameters.values():
+        annotation = definition.resolved_annotations.get(parameter.name)
+        kind = _program_control_kind(annotation)
+        if kind is None:
+            continue
+        if parameter.name in bound.arguments:
+            value = bound.arguments[parameter.name]
+        elif parameter.default is not inspect.Parameter.empty:
+            value = parameter.default
+        else:
+            raise TypeError(f"Module invocation must provide {kind} control parameter {parameter.name!r}")
+        bound.arguments[parameter.name] = value
+    return bound.args, bound.kwargs
+
+
 def execute_module_primal(module: Any, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
+    arguments, keywords = _resolve_module_program_controls(module, arguments, keywords)
     key = module._program_specialization_key(arguments, keywords, variant="primal")
     specialization = module._program_cache.get(key)
     if not isinstance(specialization, _PrimalSpecialization):
@@ -758,6 +1223,8 @@ def execute_module_vjp(
             module,
             _parameter_types_from_values(module, arguments, keywords),
         )
+        if capture.graphics_calls:
+            raise TypeError("graphics Module programs do not support autodiff")
         template = ProgramTemplate.compile(capture)
         invocation = template.bind(capture, outputs)
         selected_outputs = expression.outputs or tuple(invocation.graph.outputs)

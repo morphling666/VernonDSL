@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import json
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -1284,31 +1283,15 @@ class KernelTests(unittest.TestCase):
         fill(output, 20.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
 
-    def test_direct_kernel_uses_finalized_program_controls_and_access(self) -> None:
+    def test_kernel_uses_program_control_boundaries_and_access(self) -> None:
         compiled = fill.specialize()
-        program = json.loads(compiled.canonical_program)
-        node = program["graphs"][0]["nodes"][0]
+        parameters = {parameter.name: parameter for parameter in compiled.specialization.pipeline.parameters}
         self.assertEqual(
-            node["operation"]["workgroups"],
-            [
-                {"control": {"argument": 2}},
-                {"control": {"argument": 3}},
-                {"control": {"argument": 4}},
-            ],
+            set(parameters),
+            {"output", "scale", "__grid_x", "__grid_y", "__grid_z"},
         )
-        self.assertEqual(program["storages"][0]["descriptor"]["byte_length"], 0)
-        self.assertEqual(program["values"][0]["shape"], [-1, -1])
-        self.assertEqual(program["shape_symbols"], [])
-        artifact_system = json.loads(compiled.canonical_artifact_system)
-        artifact = next(iter(artifact_system["artifacts"].values()))
-        output_endpoint = next(
-            endpoint
-            for endpoint in artifact["reflection"]["endpoints"]
-            if endpoint.get("interface") == "argument" and endpoint.get("index") == 0
-        )
-        self.assertEqual(output_endpoint["layout"]["shape"], [-1, -1])
-        self.assertEqual(compiled.native.parameters[0].access, vd._native.ACCESS_WRITE)
-        self.assertFalse(hasattr(compiled, "writable_names"))
+        self.assertEqual(parameters["output"].access, vd._native.ACCESS_WRITE)
+        self.assertEqual(tuple(parameters["output"].shape), (0, 0))
 
     def test_dynamic_kernel_reuses_one_artifact_across_shapes(self) -> None:
         small = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

@@ -840,11 +840,8 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.bind(invocation);
     const GlUint nextNameAfterPreparation = nextName;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
@@ -897,11 +894,8 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
 
     ASSERT_EQ(vernonRhiDeviceDestroyImageView(rhiRuntime(gl).device, renderTargetView.handle), VERNON_RHI_STATUS_OK);
@@ -1307,11 +1301,8 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
@@ -1491,15 +1482,12 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
-    invocation.viewport[0] = 2;
-    invocation.viewport[1] = 3;
-    invocation.viewport[2] = 7;
-    invocation.viewport[3] = 9;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.dynamic.viewport[0] = 2;
+    graphics.dynamic.viewport[1] = 3;
+    graphics.dynamic.viewport[2] = 7;
+    graphics.dynamic.viewport[3] = 9;
+    graphics.bind(invocation);
     const GlUint nextNameAfterPreparation = nextName;
     VernonRhiCommandEncoderDescriptor encoderDescriptor{};
     encoderDescriptor.struct_size = sizeof(encoderDescriptor);
@@ -1536,7 +1524,7 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     ASSERT_EQ(replacementSampler.handle.index, textureSampler.handle.index);
     ASSERT_NE(replacementSampler.handle.generation, textureSampler.handle.generation);
 
-    std::fill(std::begin(invocation.viewport), std::end(invocation.viewport), 0);
+    std::fill(std::begin(graphics.dynamic.viewport), std::end(graphics.dynamic.viewport), 0);
     ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{16.0F, 12.0F}));
     EXPECT_EQ(viewportUpload, (std::array<GlInt, 4>{0, 0, 16, 12}));
@@ -1602,11 +1590,8 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.bind(invocation);
 
     {
         invalidateCount = 0;
@@ -1689,11 +1674,8 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
     EXPECT_NE(boundSamplerName, 0u);
 
@@ -1754,12 +1736,9 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.index_binding = &indexBinding;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 3;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3, 3);
+    graphics.draw.index_binding = &indexBinding;
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     void *vertexNative = nullptr;
@@ -1841,10 +1820,8 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = &argument;
         invocation.argument_count = 1;
-        invocation.color_attachments = &attachment;
-        invocation.color_attachment_count = 1;
-        invocation.vertex_count = 3;
-        invocation.instance_count = 3;
+        vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3, 3);
+        graphics.bind(invocation);
         ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
             << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
         EXPECT_EQ(vertexAttributeType, format.nativeType);
@@ -1956,17 +1933,25 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     graphicsState.depth_stencil.stencil_write_mask = 0xa5;
     graphicsState.color_blends = &blend;
     graphicsState.color_blend_count = 1;
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = &attachment;
+    renderPass.color_attachment_count = 1;
+    renderPass.depth_attachment = &depthAttachment;
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.stencil_reference = 23;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.depth_attachment = &depthAttachment;
     invocation.graphics_state = &graphicsState;
-    invocation.stencil_reference = 23;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
+    invocation.dynamic_state = &dynamic;
     const GlUint nextNameAfterPreparation = nextName;
     ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
     attachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;

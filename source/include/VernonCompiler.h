@@ -109,18 +109,6 @@ typedef struct VernonProgramShapeFact {
     size_t rank;
 } VernonProgramShapeFact;
 
-typedef struct VernonGraphicsStageSource {
-    size_t struct_size;
-    const char *source;
-    size_t source_size;
-} VernonGraphicsStageSource;
-
-typedef struct VernonGraphicsPlanOperand {
-    size_t struct_size;
-    VernonStringView name;
-    VernonStringView type;
-} VernonGraphicsPlanOperand;
-
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
 VERNON_DSL_CAPI void vernonCompilerDestroy(VernonCompilerContext *context);
 
@@ -139,13 +127,6 @@ VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(Vernon
                                                                           const VernonCompileOptions *options);
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerPlanProgram(VernonCompilerContext *context, const char *program,
                                                                size_t program_size);
-VERNON_DSL_CAPI VernonCompileResult *vernonCompilerPlanKernel(VernonCompilerContext *context, const char *kernel,
-                                                              size_t kernel_size);
-VERNON_DSL_CAPI VernonCompileResult *
-vernonCompilerPlanGraphics(VernonCompilerContext *context, const VernonGraphicsStageSource *stages, size_t stage_count,
-                           const char *topology, size_t topology_size, const VernonStringView *features,
-                           size_t feature_count, const VernonStringView *attachment_types, size_t attachment_count,
-                           uint32_t color_count, const VernonGraphicsPlanOperand *operands, size_t operand_count);
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerFinalizeProgram(VernonCompilerContext *context, const char *plan,
                                                                    size_t plan_size,
                                                                    const VernonCompiledKernel *kernels,

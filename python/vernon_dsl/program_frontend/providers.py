@@ -36,23 +36,6 @@ class CapturedDslProvider:
         return self._implementations.get(hint) if isinstance(hint, str) else None
 
 
-class DirectKernelDslProvider:
-    """Returns the original frontend implementation for a planned direct Kernel."""
-
-    def __init__(self, mlir: str, entry: str):
-        self._implementation = ProgramImplementation(entry, entry, "compute", mlir)
-
-    def lower(
-        self,
-        request: Mapping[str, Any],
-        values: Mapping[int, Mapping[str, Any]],
-    ) -> ProgramImplementation | None:
-        del values
-        if request.get("kind") != "compute" or request.get("implementation_hint") != self._implementation.callee:
-            return None
-        return self._implementation
-
-
 class CapturedVjpDslProvider:
     def __init__(self, implementations: Sequence[ProgramImplementation], native: Any):
         self._implementations = {implementation.callee: implementation for implementation in implementations}
@@ -302,7 +285,6 @@ def _lower_builtin_copy(
 __all__ = [
     "CapturedDslProvider",
     "CapturedVjpDslProvider",
-    "DirectKernelDslProvider",
     "BuiltinDslProvider",
     "BuiltinLowerer",
     "ProgramDslProvider",

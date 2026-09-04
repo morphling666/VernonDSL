@@ -13,7 +13,6 @@ from unittest import mock
 
 import numpy as np
 from vernon_dsl._shader_assets.artifact_io import artifact_extension
-from vernon_dsl._shader_assets.cooking import _canonical_kernel_deployment
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.bundle import (
     CompiledArtifact,
@@ -59,48 +58,6 @@ def _native_available() -> bool:
 
 
 class ShaderAssetManifestTests(unittest.TestCase):
-    def test_direct_deployment_uses_cpp_program_and_contract_hash(self) -> None:
-        target = CpuTargetOptions()
-        stage = CompiledStage(
-            "interactive/kernel/direct",
-            "{}",
-            "direct",
-            "compute",
-            target,
-            {"required_features": []},
-            {"workgroup_size": [1, 1, 1]},
-            CompiledArtifact("relocatable_object", b"object", "direct.o"),
-            {
-                "symbol": "direct",
-                "target_triple": "arm64-apple-darwin",
-                "object_format": "macho",
-            },
-        )
-        canonical_program = {
-            "stages": {"forward:0": {"operation": "compute", "contract_hash": "cpp-contract-hash"}},
-            "graphs": [],
-        }
-        finalized = {
-            "canonical_program": canonical_program,
-            "stage_contracts": {
-                "forward:0": {
-                    "operation": "compute",
-                    "reflection": {"required_features": [], "endpoints": []},
-                }
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            program, artifacts, bindings, _ = _canonical_kernel_deployment(
-                stage,
-                finalized,
-                target=target,
-                request_id="forward:0",
-                output=Path(directory),
-            )
-        self.assertEqual(program, canonical_program)
-        self.assertEqual(artifacts["artifacts"][stage.id]["contract_hash"], "cpp-contract-hash")
-        self.assertEqual(bindings, {"forward:0": stage.id})
-
     def test_program_bundle_composes_logical_stages_with_kernel_artifacts(self) -> None:
         target = make_target_options("vulkan")
         stage = CompiledStage(
@@ -746,6 +703,7 @@ asset = vd.pipeline_asset(
                             "module_hash": "module",
                             "dependencies": [],
                             "target": {"kind": _target, "options": expected_options},
+                            "implementation": {"target": _target, "metadata": {}},
                             "entries": [
                                 {
                                     "name": f"{stage}_main",
@@ -769,7 +727,7 @@ asset = vd.pipeline_asset(
                                 "version": [2, 4],
                                 "minimum_os_version": [11, 0],
                             }
-                            reflection["metal_resource_slots"] = [
+                            reflection["implementation"]["metadata"]["resource_slots"] = [
                                 {
                                     "entry_point": f"{stage}_main",
                                     "stage": stage,
@@ -884,7 +842,7 @@ asset = vd.pipeline_asset(
                     descriptors = [value["artifact"] for value in document["stage_artifacts"].values()]
                     if target == "metal":
                         for stage_record in document["stage_artifacts"].values():
-                            slots = stage_record["reflection"]["metal_resource_slots"]
+                            slots = stage_record["reflection"]["implementation"]["metadata"]["resource_slots"]
                             self.assertEqual(len(slots), 1)
                             self.assertEqual(slots[0]["argument_buffer_index"], 0)
                             self.assertEqual(slots[0]["member_id"], 0)
@@ -1038,7 +996,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         host = native.RhiHost(backend)
                         runtime = host.create_runtime()
                         compiled_stages = []
-                    loaded = runtime.load_canonical_endpoint(
+                    loaded = runtime.load_canonical_program(
                         json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
                         json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
                         str(runtime_root),
@@ -1076,7 +1034,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         bad_artifacts["artifacts"][artifact_id]["contract_hash"] = contract_hash
                         bad_program["stages"][next(iter(bad_program["stages"]))]["contract_hash"] = contract_hash
                         with self.assertRaisesRegex(RuntimeError, "portable ABI slots|resource ABI slots"):
-                            runtime.load_canonical_endpoint(
+                            runtime.load_canonical_program(
                                 json.dumps(bad_program, sort_keys=True, separators=(",", ":")).encode(),
                                 json.dumps(bad_artifacts, sort_keys=True, separators=(",", ":")).encode(),
                                 str(runtime_root),
@@ -1090,7 +1048,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
                         artifact_path.write_bytes(b"broken")
                         try:
                             with self.assertRaisesRegex(RuntimeError, "PROGRAM_BLOB_AUTHENTICATION"):
-                                runtime.load_canonical_endpoint(
+                                runtime.load_canonical_program(
                                     json.dumps(canonical_program, sort_keys=True, separators=(",", ":")).encode(),
                                     json.dumps(artifact_system, sort_keys=True, separators=(",", ":")).encode(),
                                     str(runtime_root),
@@ -1323,7 +1281,7 @@ asset = vd.pipeline_asset(
                             self.assertTrue(all(not name.endswith("._m0") for name, _ in uniform_parameters))
                         for stage in document["stage_artifacts"].values():
                             if target == "metal":
-                                slots = stage["reflection"]["metal_resource_slots"]
+                                slots = stage["reflection"]["implementation"]["metadata"]["resource_slots"]
                                 self.assertTrue(slots)
                                 self.assertTrue(all(slot["entry_point"] == stage["entry"] for slot in slots))
                             artifact = stage["artifact"]

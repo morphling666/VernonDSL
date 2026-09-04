@@ -139,6 +139,33 @@ class Module:
         from ._runtime import session
 
         def signature(value: Any) -> Any:
+            from .render import DrawCommand, DynamicState, RenderPass
+
+            if isinstance(value, RenderPass):
+                target = value.target
+                colors = tuple(
+                    (
+                        location,
+                        texture.dimension,
+                        getattr(getattr(texture, "format", None), "name", None),
+                        getattr(texture, "sample_count", 1),
+                    )
+                    for location, texture in target._color_attachments()
+                )
+                depth = target._depth_attachment()
+                depth_signature = (
+                    None
+                    if depth is None
+                    else (
+                        depth.dimension,
+                        getattr(getattr(depth, "format", None), "name", None),
+                        getattr(depth, "sample_count", 1),
+                    )
+                )
+                return ("RenderPass", colors, depth_signature)
+            if isinstance(value, (DrawCommand, DynamicState)):
+                # These are managed invocation controls, not specialization inputs.
+                return type(value).__name__
             if isinstance(value, (TensorStorage, TensorView)):
                 return (
                     type(value).__name__,
@@ -176,8 +203,6 @@ class Module:
         annotations = definition.resolved_annotations
 
         def invocation_signature(name: str, value: Any) -> Any:
-            if isinstance(value, (TensorStorage, TensorView)):
-                return signature(value)
             annotation = annotations.get(name)
             if annotation is not None:
                 from .frontend.model import SemanticCategory
@@ -189,8 +214,17 @@ class Module:
                     pass
                 else:
                     category = descriptor.kind
-                    if category in {SemanticCategory.VALUE, SemanticCategory.RESOURCE}:
-                        return (category.value, descriptor.logical)
+                    if category in {
+                        SemanticCategory.STORAGE,
+                        SemanticCategory.VALUE,
+                        SemanticCategory.RESOURCE,
+                    }:
+                        return (
+                            category.value,
+                            descriptor.logical,
+                            getattr(descriptor, "access", None),
+                            getattr(descriptor, "as_view", None),
+                        )
             return signature(value)
 
         return (

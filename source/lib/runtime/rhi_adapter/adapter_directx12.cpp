@@ -562,7 +562,7 @@ VernonStatus prepareGraphicsPipelineImpl(VernonRuntimeRhiAdapter &adapter,
     native.DepthStencilState.StencilEnable = depthStencil.stencil_test;
     native.DepthStencilState.StencilReadMask = static_cast<UINT8>(depthStencil.stencil_read_mask);
     native.DepthStencilState.StencilWriteMask = static_cast<UINT8>(depthStencil.stencil_write_mask);
-    const auto stencilFace = [](const VernonRuntimeProviderStencilFaceState &source) {
+    const auto stencilFace = [](const VernonStencilFaceState &source) {
         return D3D12_DEPTH_STENCILOP_DESC{stencilOperation(source.stencil_fail), stencilOperation(source.depth_fail),
                                           stencilOperation(source.pass), compareOperation(source.compare)};
     };
@@ -971,10 +971,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline || !pipeline->graphics ||
-        !pipeline->pipeline || (descriptor->bindings.value != 0 && !bindings) ||
-        descriptor->color_attachment_count == 0 ||
-        descriptor->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS)
+    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics || !pipeline->pipeline ||
+        (descriptor->bindings.value != 0 && !bindings))
         return fail(adapter, "D3D12 adapter received an invalid draw descriptor");
     auto &device = *pipeline->device;
     ID3D12DescriptorHeap *rtvHeap = nullptr;

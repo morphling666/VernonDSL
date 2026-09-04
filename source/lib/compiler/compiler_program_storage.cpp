@@ -79,12 +79,12 @@ int64_t walkLikeSource(const llvm::json::Array &values, int64_t root, llvm::Stri
     int64_t current = root;
     while (true) {
         if (!seen.insert(current).second) {
-            error = "owned compute Storage like-source cycle";
+            error = "owned Program Storage like-source cycle";
             return -1;
         }
         const llvm::json::Object *value = findJsonObjectByIntegerId(values, current);
         if (!value) {
-            error = "owned compute Storage like-source is unknown";
+            error = "owned Program Storage like-source is unknown";
             return -1;
         }
         if (const std::optional<int64_t> like = value->getInteger("like")) {
@@ -94,7 +94,7 @@ int64_t walkLikeSource(const llvm::json::Array &values, int64_t root, llvm::Stri
         if (entryAvailable(current, allocationGraph, captureLegal, argumentSlots, captures))
             return current;
         if (!producerByValue.count(current)) {
-            error = "owned compute Storage like-source is not a ControlValueRef";
+            error = "owned Program Storage like-source is not a ControlValueRef";
             return -1;
         }
         const llvm::json::Object *allocated = findJsonObjectByIntegerId(values, programStorageRoot(parents, current));
@@ -103,7 +103,7 @@ int64_t walkLikeSource(const llvm::json::Array &values, int64_t root, llvm::Stri
                 current = *like;
                 continue;
             }
-        error = "owned compute Storage like-source has NodeResultOrigin";
+        error = "owned Program Storage like-source has NodeResultOrigin";
         return -1;
     }
 }
@@ -116,8 +116,8 @@ controlValueReference(int64_t like, llvm::StringRef allocationGraph, bool captur
         return llvm::json::Object{{"argument", argumentSlots.at(like).slot}};
     if (captureLegal && captures.count(like))
         return llvm::json::Object{{"capture", like}};
-    error = producerByValue.count(like) ? "owned compute Storage like-source has NodeResultOrigin"
-                                        : "owned compute Storage like-source is not a ControlValueRef";
+    error = producerByValue.count(like) ? "owned Program Storage like-source has NodeResultOrigin"
+                                        : "owned Program Storage like-source is not a ControlValueRef";
     return std::nullopt;
 }
 
@@ -145,13 +145,13 @@ bool isValidProgramResourceAccess(llvm::StringRef access) {
 }
 
 bool indexProgramResources(const llvm::json::Array &values, const std::vector<CanonicalProgramGraph> &selectedGraphs,
-                           const std::vector<CanonicalComputeStage> &compiledStages, ProgramResourceIndex &index,
+                           const std::vector<CanonicalProgramStage> &compiledStages, ProgramResourceIndex &index,
                            std::string &error) {
     index = {};
     std::set<std::string> indexedStages;
-    for (const CanonicalComputeStage &compiled : compiledStages)
+    for (const CanonicalProgramStage &compiled : compiledStages)
         if (compiled.requestId.empty() || !index.compiledByRequest.emplace(compiled.requestId, &compiled).second) {
-            error = "canonical compute stages have invalid or duplicate logical request ids";
+            error = "canonical Program stages have invalid or duplicate logical request ids";
             return false;
         }
     for (const CanonicalProgramGraph &view : selectedGraphs) {
@@ -159,7 +159,7 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
         for (size_t slot = 0; slot < view.arguments.size(); ++slot) {
             const int64_t id = view.arguments[slot];
             if (!index.argumentSlots.emplace(id, ProgramArgumentSlot{view.name, static_cast<int64_t>(slot)}).second) {
-                error = "canonical compute graph has invalid argument ids";
+                error = "canonical Program graph has invalid argument ids";
                 return false;
             }
         }
@@ -168,11 +168,12 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
             const llvm::json::Array *nodeResults = node ? node->getArray("results") : nullptr;
             const llvm::json::Array *rawResources = node ? node->getArray("resources") : nullptr;
             const std::optional<llvm::StringRef> kind = node ? node->getString("kind") : std::nullopt;
+            const llvm::json::Array *grid = node ? node->getArray("grid") : nullptr;
             if (!node || (kind != "compute" && kind != "render") || !requestId ||
                 !index.compiledByRequest.count(requestId->str()) || !node->getArray("operands") || !nodeResults ||
-                !node->getArray("bindings") || !rawResources || !node->getArray("grid") ||
-                node->getArray("grid")->size() != 3 || !indexedStages.insert(requestId->str()).second) {
-                error = "canonical compute node has incomplete or duplicate logical execution metadata";
+                !node->getArray("bindings") || !rawResources || (kind == "compute" && (!grid || grid->size() != 3)) ||
+                !indexedStages.insert(requestId->str()).second) {
+                error = "canonical Program node has incomplete or duplicate logical execution metadata";
                 return false;
             }
             for (const llvm::json::Value &operand : *node->getArray("operands"))
@@ -185,7 +186,7 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
                     !index.producerByValue
                          .emplace(*id, ProgramValueProducer{view.name, node->getInteger("id").value_or(-1)})
                          .second) {
-                    error = "canonical compute graph has invalid or multiply-produced result ids";
+                    error = "canonical Program graph has invalid or multiply-produced result ids";
                     return false;
                 }
             }
@@ -195,7 +196,7 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
                 const std::optional<int64_t> value = resource ? resource->getInteger("value") : std::nullopt;
                 const std::optional<llvm::StringRef> access = resource ? resource->getString("access") : std::nullopt;
                 if (!value || !access || !isValidProgramResourceAccess(*access)) {
-                    error = "canonical compute node has an invalid resource access";
+                    error = "canonical Program node has an invalid resource access";
                     return false;
                 }
                 const llvm::json::Object *logicalValue = findJsonObjectByIntegerId(values, *value);
@@ -209,13 +210,13 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
                     if (existing->second.access == "read" && logical.access == "read" && !existing->second.after &&
                         !logical.after)
                         continue;
-                    error = "canonical compute node has conflicting repeated resource accesses";
+                    error = "canonical Program node has conflicting repeated resource accesses";
                     return false;
                 }
                 const bool writable = logical.access == "write" || logical.access == "read_write";
                 if ((!writable && logical.after) ||
                     (writable && !logical.after && !index.producerByValue.count(*value))) {
-                    error = "canonical compute writable resources require exact before/after Storage SSA";
+                    error = "canonical Program writable resources require exact before/after Storage SSA";
                     return false;
                 }
                 index.storageParents.emplace(*value, *value);
@@ -244,11 +245,11 @@ bool planProgramStorageAliases(const std::map<int64_t, int64_t> &parents, Progra
         while (true) {
             const auto parent = parents.find(owner);
             if (parent == parents.end()) {
-                error = "canonical compute Storage alias chain has an unknown parent";
+                error = "canonical Program Storage alias chain has an unknown parent";
                 return false;
             }
             if (!visited.insert(owner).second) {
-                error = "canonical compute Storage alias chain contains a cycle";
+                error = "canonical Program Storage alias chain contains a cycle";
                 return false;
             }
             if (parent->second == owner)
@@ -305,6 +306,25 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
 
     std::map<int64_t, int64_t> storageByRoot;
     std::map<int64_t, bool> mutableByRoot;
+    std::set<int64_t> colorAttachmentRoots;
+    std::set<int64_t> depthAttachmentRoots;
+    for (const CanonicalProgramGraph &graph : selectedGraphs)
+        for (const llvm::json::Object *node : graph.nodes) {
+            if (node->getString("kind") != "render")
+                continue;
+            const llvm::json::Array *operands = node->getArray("operands");
+            const llvm::json::Array *results = node->getArray("results");
+            const int64_t colorCount = node->getInteger("color_count").value_or(0);
+            const bool hasDepth = results && colorCount >= 0 && results->size() == static_cast<size_t>(colorCount + 1);
+            if (!operands || colorCount < 0 || operands->size() < static_cast<size_t>(colorCount + (hasDepth ? 1 : 0)))
+                continue;
+            for (int64_t index = 0; index < colorCount; ++index)
+                if (const std::optional<int64_t> value = (*operands)[static_cast<size_t>(index)].getAsInteger())
+                    colorAttachmentRoots.insert(plan.aliases.ownerByValue.at(*value).value);
+            if (hasDepth)
+                if (const std::optional<int64_t> value = (*operands)[static_cast<size_t>(colorCount)].getAsInteger())
+                    depthAttachmentRoots.insert(plan.aliases.ownerByValue.at(*value).value);
+        }
     for (const auto &[unusedStage, resources] : index.resourcesByStage) {
         (void)unusedStage;
         for (const auto &[before, resource] : resources)
@@ -318,7 +338,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
         const llvm::json::Array *shape = value ? value->getArray("shape") : nullptr;
         const llvm::StringRef type = value ? value->getString("type").value_or("") : "";
         if (!value || !shape || type.empty()) {
-            error = "canonical compute resource has no valid static type or shape";
+            error = "canonical Program resource has no valid static type or shape";
             return false;
         }
         const int64_t storage = static_cast<int64_t>(plan.storages.size());
@@ -333,7 +353,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
         if (isProgramTextureType(type)) {
             const std::vector<std::string> fields = quotedTypeFields(type);
             if (fields.size() < 2 || shape->size() > 3) {
-                error = "canonical compute texture has no valid dimension, format, or rank";
+                error = "canonical Program texture has no valid dimension, format, or rank";
                 return false;
             }
             size_t spatialRank = shape->size();
@@ -365,10 +385,12 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                 else if (sourceAxis < dynamicExtents.size())
                     extent.emplace_back(dynamicExtents[sourceAxis]);
                 else {
-                    error = "owned compute texture requires a concrete extent";
+                    error = "owned Program texture requires a concrete extent";
                     return false;
                 }
             }
+            const bool colorAttachment = colorAttachmentRoots.count(root);
+            const bool depthAttachment = depthAttachmentRoots.count(root);
             descriptor = llvm::json::Object{{"tag", "image"},
                                             {"dimension", fields[0]},
                                             {"extent", std::move(extent)},
@@ -376,8 +398,10 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                                             {"sample_count", int64_t{1}},
                                             {"mip_levels", int64_t{1}},
                                             {"array_layers", int64_t{1}},
-                                            {"aspects", llvm::json::Array{"color"}},
-                                            {"usage", llvm::json::Array{"storage"}}};
+                                            {"aspects", llvm::json::Array{depthAttachment ? "depth" : "color"}},
+                                            {"usage", llvm::json::Array{colorAttachment   ? "color_attachment"
+                                                                        : depthAttachment ? "depth_stencil_attachment"
+                                                                                          : "storage"}}};
         } else if (isProgramSamplerType(type) || isProgramAdTapeType(type)) {
             descriptor = llvm::json::Object{
                 {"tag", "opaque"},
@@ -388,7 +412,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             const std::optional<int64_t> byteSize = layout ? layout->getInteger("byte_size") : std::nullopt;
             const bool borrowed = index.argumentSlots.count(root);
             if (!layout || !alignment || *alignment <= 0 || !byteSize || *byteSize <= 0) {
-                error = "canonical compute buffer has no valid static layout";
+                error = "canonical Program buffer has no valid static layout";
                 return false;
             }
             llvm::json::Value byteLengthValue = nullptr;
@@ -440,7 +464,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                   initialLayout->getString("layout_hash") != currentLayout->getString("layout_hash"))) ||
                 !identicalConcreteShape(initialShape, currentShape) ||
                 !identicalConcreteShape(currentShape, initialShape)) {
-                error = "canonical compute Storage SSA versions disagree on layout or concrete shape";
+                error = "canonical Program Storage SSA versions disagree on layout or concrete shape";
                 return false;
             }
             plan.storageByValue[version] = storageByRoot[root];
@@ -457,7 +481,7 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
         const llvm::json::Array *shape = value ? value->getArray("shape") : nullptr;
         const std::optional<llvm::StringRef> type = value ? value->getString("type") : std::nullopt;
         if (!value || !shape || !type) {
-            error = "canonical compute values must have contiguous ids, types, and shapes";
+            error = "canonical Program values must have contiguous ids, types, and shapes";
             return false;
         }
         llvm::json::Object origin;
@@ -473,14 +497,14 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                  found != index.allocationGraph.end())
             origin = llvm::json::Object{{"tag", "allocation"}, {"graph", found->second}};
         else {
-            error = "canonical compute value has no origin";
+            error = "canonical Program value has no origin";
             return false;
         }
         const bool resource = index.resourceVersions.count(static_cast<int64_t>(expectedId));
         const bool opaqueResource =
             isProgramTextureType(*type) || isProgramSamplerType(*type) || isProgramAdTapeType(*type);
         if (!opaqueResource && !layout) {
-            error = "canonical compute byte values must have layouts";
+            error = "canonical Program byte values must have layouts";
             return false;
         }
         llvm::json::Object row{{"id", static_cast<int64_t>(expectedId)},
@@ -542,7 +566,7 @@ bool planOwnedDynamicExtents(const llvm::json::Array &values, int64_t root, llvm
     const llvm::json::Object *likeValue = findJsonObjectByIntegerId(values, like);
     const llvm::json::Array *likeShape = likeValue ? likeValue->getArray("shape") : nullptr;
     if (!likeShape || likeShape->size() != shape.size()) {
-        error = "owned compute Storage like-source rank does not match the allocated value";
+        error = "owned Program Storage like-source rank does not match the allocated value";
         return false;
     }
     for (size_t axis = 0; axis < shape.size(); ++axis) {
@@ -552,10 +576,41 @@ bool planOwnedDynamicExtents(const llvm::json::Array &values, int64_t root, llvm
             continue;
         }
         if (!isDynamicProgramExtent((*likeShape)[axis])) {
-            error = "owned compute Storage dyn axis has a static like-source extent";
+            error = "owned Program Storage dyn axis has a static like-source extent";
             return false;
         }
         extents.emplace_back(dimensionExtent(*reference, static_cast<int64_t>(axis)));
+    }
+    return true;
+}
+
+bool applyProgramStorageUsageRequirements(llvm::json::Array &storages,
+                                          const ProgramStorageUsageRequirements &requirements, std::string &error) {
+    for (const auto &[storageId, required] : requirements) {
+        if (storageId < 0 || static_cast<size_t>(storageId) >= storages.size()) {
+            error = "Program storage usage requirement references an unknown Storage";
+            return false;
+        }
+        llvm::json::Object *storage = storages[static_cast<size_t>(storageId)].getAsObject();
+        llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
+        llvm::json::Array *usage = descriptor ? descriptor->getArray("usage") : nullptr;
+        if (!usage) {
+            error = "Program storage usage requirement has no canonical descriptor";
+            return false;
+        }
+        std::set<std::string> merged = required;
+        for (const llvm::json::Value &value : *usage) {
+            const std::optional<llvm::StringRef> name = value.getAsString();
+            if (!name || name->empty()) {
+                error = "Program Storage contains an invalid usage";
+                return false;
+            }
+            merged.insert(name->str());
+        }
+        llvm::json::Array canonical;
+        for (const std::string &name : merged)
+            canonical.emplace_back(name);
+        *usage = std::move(canonical);
     }
     return true;
 }

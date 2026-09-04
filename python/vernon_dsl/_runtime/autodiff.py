@@ -358,12 +358,7 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
         if runtime_state._architecture in {runtime_state.opengl, runtime_state.opengles}
         else {},
     )
-    key = kernel._dispatch_key(
-        arguments,
-        (),
-        options.target,
-        tuple(sorted(options.options.items())),
-    )
+    key = kernel._specialization_key((), options.target, tuple(sorted(options.options.items())))
     direct = _direct_state(kernel, expression)
     compiled = direct.compiled.get(key)
     if compiled is not None and not kernel._dependencies_current(compiled):

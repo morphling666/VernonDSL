@@ -255,9 +255,14 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
     }
     if (injectFailure(FailureBoundary::Encode))
         return fail(context, "injected GPU command DAG encoding failure", VERNON_STATUS_INTERNAL_ERROR);
+    const uint32_t requiredCapabilities =
+        std::any_of(plan.commands.nodes.begin(), plan.commands.nodes.end(),
+                    [](const auto &node) { return node.queue == execution::detail::CommandQueueClass::Graphics; })
+            ? VERNON_RHI_QUEUE_GRAPHICS
+            : VERNON_RHI_QUEUE_COMPUTE;
     execution::detail::RhiCommandDagExecutionStats stats;
     const VernonRhiStatus status =
-        execution::detail::executeRhiCommandPlanAndWait(context.rhiDevice, VERNON_RHI_QUEUE_COMPUTE, plan, &stats);
+        execution::detail::executeRhiCommandPlanAndWait(context.rhiDevice, requiredCapabilities, plan, &stats);
     if (telemetry) {
         telemetry->submissions += stats.submissions;
         telemetry->waits += stats.waits;
@@ -288,6 +293,26 @@ VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std
     if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
         return fail(context, std::move(error));
     return executeCommandPlanAndWait(context, plan);
+}
+
+VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
+                                          execution::detail::RhiCommandExecutionPlan &plan) {
+    plan = {};
+    if (uploads.empty())
+        return VERNON_STATUS_OK;
+    for (const DeviceBufferUpload &upload : uploads)
+        if (!upload.source || !upload.size)
+            return fail(context, "Program Storage upload has no source bytes");
+    appendUploadBindings(plan.bindings, uploads);
+    auto transferContext = std::make_shared<TransferCommandContext>(context, std::vector<DeviceBufferCopy>{}, uploads);
+    execution::detail::CommandNode transfer;
+    transfer.kind = execution::detail::CommandNodeKind::Transfer;
+    transfer.queue = execution::detail::CommandQueueClass::Transfer;
+    appendUploadAccesses(transfer, uploads);
+    plan.commands.nodes.push_back(std::move(transfer));
+    plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
+    plan.retainedContexts.push_back(std::move(transferContext));
+    return VERNON_STATUS_OK;
 }
 
 VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, VernonLaunchSize grid,

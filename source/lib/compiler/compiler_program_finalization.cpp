@@ -12,10 +12,10 @@
 
 namespace vernon::compiler {
 
-bool buildCanonicalComputeProgram(const llvm::json::Object &execution,
-                                  const std::vector<CanonicalComputeStage> &compiledStages, llvm::json::Object &program,
-                                  llvm::json::Object &stageContracts, llvm::json::Object &targetImplementations,
-                                  std::string &error) {
+bool finalizeCanonicalProgram(const llvm::json::Object &execution,
+                              const std::vector<CanonicalProgramStage> &compiledStages, llvm::json::Object &program,
+                              llvm::json::Object &stageContracts, llvm::json::Object &targetImplementations,
+                              std::string &error) {
     const llvm::json::Array *rawValues = execution.getArray("values");
     const llvm::json::Array *rawGraphs = execution.getArray("graphs");
     const llvm::json::Object *rawSignature = execution.getObject("signature");

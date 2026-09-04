@@ -238,9 +238,11 @@ def main() -> None:
                 position=positions,
                 offset=offsets,
                 tint=tint_bindings[binding_index],
-                indices=index_bindings[binding_index],
-                topology=vd.triangles,
-                render=vd.render(
+                draw=vd.draw(
+                    index_buffer=vd.index_buffer(index_bindings[binding_index]),
+                    instance_count=args.instances,
+                ),
+                render_pass=vd.render_pass(
                     target,
                     colors={
                         0: vd.clear((0.0, 0.0, 0.0, 0.0)),

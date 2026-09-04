@@ -297,14 +297,18 @@ def main() -> None:
     )
     rock_sampler = vd.sampler(address="repeat")
     sky_positions = vd.storage.from_numpy(create_sky_cube())
-    render_sky = vd.pipeline(sky_vertex, sky_fragment)
-    render = vd.pipeline(pbr_vertex, pbr_fragment, features={"SHADOW", "ENVIRONMENT"})
+    depth_state = vd.graphics_state(
+        depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+    )
+    render_sky = vd.pipeline(sky_vertex, sky_fragment, state=depth_state)
+    render = vd.pipeline(pbr_vertex, pbr_fragment, state=depth_state, features={"SHADOW", "ENVIRONMENT"})
     render_terrain = vd.pipeline(
         pbr_vertex,
         pbr_fragment,
+        state=depth_state,
         features={"SHADOW", "ROCK_TEXTURE"},
     )
-    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment)
+    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=depth_state)
 
     projection = perspective(
         math.radians(40.0),
@@ -329,7 +333,6 @@ def main() -> None:
     expand_grid = ((draw_count + 63) // 64, 1, 1)
     common_shadow = {
         "light_view_projection": light_view_projection,
-        "topology": vd.triangles,
     }
     common_lighting: dict[str, object] = {
         "light_view_projection": light_view_projection,
@@ -340,7 +343,6 @@ def main() -> None:
         "shadow_texel_size": np.array((1.0 / shadow_size, 1.0 / shadow_size), dtype=np.float32),
         "shadow_map": shadow_map,
         "shadow_sampler": shadow_sampler,
-        "topology": vd.triangles,
     }
     common_pbr: dict[str, object] = {
         **common_lighting,
@@ -435,16 +437,16 @@ def main() -> None:
             render_shadow(
                 position=draw_positions,
                 **common_shadow,
-                render=vd.render(
+                render_pass=vd.render_pass(
                     shadow_target,
                     color=vd.clear((1.0, 1.0, 1.0, 1.0)),
-                    depth=vd.clear(1.0),
+                    depth=vd.clear_depth(1.0),
                 ),
             )
             render_shadow(
                 position=stage_positions,
                 **common_shadow,
-                render=vd.render(shadow_target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(shadow_target, color=vd.load(), depth=vd.load()),
             )
             render_sky(
                 direction=sky_positions,
@@ -452,11 +454,10 @@ def main() -> None:
                 camera_position=camera,
                 environment_map=environment_map,
                 environment_sampler=environment_sampler,
-                topology=vd.triangles,
-                render=vd.render(
+                render_pass=vd.render_pass(
                     target,
                     color=vd.clear((0.006, 0.003, 0.002, 1.0)),
-                    depth=vd.clear(1.0),
+                    depth=vd.clear_depth(1.0),
                 ),
             )
             render_terrain(
@@ -469,7 +470,7 @@ def main() -> None:
                 view_projection=view_projection,
                 camera_position=camera,
                 **common_lighting,
-                render=vd.render(target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
             )
             render(
                 position=stage_positions,
@@ -479,7 +480,7 @@ def main() -> None:
                 view_projection=view_projection,
                 camera_position=camera,
                 **common_pbr,
-                render=vd.render(target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
             )
             frame += 1
             if not presenter.present():

@@ -21,6 +21,20 @@ const llvm::json::Object *programEndpointLayout(const llvm::json::Object &row, b
 llvm::json::Object programValueCarrier(llvm::StringRef tag, int64_t slot, const llvm::json::Object &layout);
 llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module, int64_t index);
 
+struct ProgramEndpointExpectation {
+    std::optional<llvm::StringRef> dtype;
+    const llvm::json::Array *shape{};
+    const llvm::json::Array *physicalShape{};
+    const llvm::json::Object *layout{};
+    llvm::StringRef role;
+    llvm::StringRef carrier;
+    bool vertexElement{};
+    bool canonicalValueLayout{};
+};
+
+bool verifyProgramEndpointAbi(const ProgramEndpointExpectation &expected, const llvm::json::Object &compiled,
+                              std::string &error);
+
 bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, std::map<std::string, int64_t> &boundValues,
                               std::string &error);
 

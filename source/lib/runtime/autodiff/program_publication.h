@@ -21,21 +21,14 @@ private:
 struct PendingProgramPublication {
     const program::PublicationTarget *target{};
     VernonPipelineArgument destination{};
-    std::optional<VernonPipelineArgument> initialValue;
     std::optional<VernonRhiBuffer> destinationBuffer;
-    std::optional<VernonRhiBuffer> initialBuffer;
 };
 
-bool initializeProgramPublications(std::vector<ProgramHostValue> &storage,
-                                   const std::vector<PendingProgramPublication> &publications, std::string &error);
 bool applyProgramPublicationShapes(const program::Program &program,
                                    const std::vector<PendingProgramPublication> &publications,
                                    std::vector<ProgramHostValue> &storage, std::string &error);
 bool commitProgramPublications(const std::vector<ProgramHostValue> &storage,
                                const std::vector<PendingProgramPublication> &publications, std::string &error);
-VernonStatus initializeDeviceProgramPublications(VernonRuntimeContext &context, const ProgramInvocationFrame &frame,
-                                                 const std::vector<PendingProgramPublication> &publications,
-                                                 std::string &error);
 VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, const ProgramInvocationFrame &frame,
                                              const std::vector<PendingProgramPublication> &publications,
                                              std::string &error);

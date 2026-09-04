@@ -12,6 +12,8 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <cstdint>
+#include <functional>
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -53,6 +55,11 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             continue;
         auto argumentNames = function->getAttrOfType<mlir::ArrayAttr>("vernon_program.argument_names");
         for (auto [index, argument] : llvm::enumerate(function.getArguments())) {
+            auto role = argumentNames && index < argumentNames.size()
+                            ? mlir::dyn_cast<mlir::StringAttr>(argumentNames[index])
+                            : mlir::StringAttr{};
+            if (role && role.getValue().starts_with("control."))
+                continue;
             mlir::StringAttr source = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.source_name");
             if (!source && argumentNames && index < argumentNames.size())
                 source = mlir::dyn_cast<mlir::StringAttr>(argumentNames[index]);
@@ -164,6 +171,15 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         llvm::SmallVector<llvm::StringRef> layoutDtypes(logicalDtypes.begin(), logicalDtypes.end());
         if (layoutDtypes.empty() && logicalDtype && !logicalDtype->empty())
             layoutDtypes.push_back(*logicalDtype);
+        if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(layoutType);
+            tensor && !tensor.getElementType().isIntOrFloat() && !layoutDtypes.empty()) {
+            llvm::SmallVector<llvm::StringRef> elementDtypes(layoutDtypes);
+            const int64_t elementCount =
+                std::accumulate(tensor.getShape().begin(), tensor.getShape().end(), int64_t{1}, std::multiplies<>());
+            layoutDtypes.clear();
+            for (int64_t index = 0; index < elementCount; ++index)
+                layoutDtypes.append(elementDtypes);
+        }
         mlir::FailureOr<llvm::json::Object> valueLayout = mlir::failure();
         if (derivativeOf) {
             valueLayout = reflectDerivativeLayout(derivativeOf, type, layoutDtypes);
@@ -193,6 +209,10 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         llvm::json::Array arguments;
         auto argumentNames = function->getAttrOfType<mlir::ArrayAttr>("vernon_program.argument_names");
         for (auto [index, argument] : llvm::enumerate(function.getArguments())) {
+            auto role = argumentNames && index < argumentNames.size()
+                            ? mlir::dyn_cast<mlir::StringAttr>(argumentNames[index])
+                            : mlir::StringAttr{};
+            const bool invocationControl = role && role.getValue().starts_with("control.");
             auto id = function.getArgAttrOfType<mlir::IntegerAttr>(index, "vernon_program.value_id");
             if (!id || id.getInt() < 0) {
                 function.emitError("executable Program argument has no value id");
@@ -214,9 +234,9 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     : argumentNames && index < argumentNames.size()
                         ? mlir::cast<mlir::StringAttr>(argumentNames[index]).getValue()
                         : llvm::StringRef("argument");
-                if (direction.getValue() == "forward")
+                if (direction.getValue() == "forward" && !invocationControl)
                     inputs.emplace_back(signatureBinding(valueId, path));
-                else if (direction.getValue() == "backward")
+                else if (direction.getValue() == "backward" && !invocationControl)
                     cotangents.emplace_back(signatureBinding(valueId, path));
             } else {
                 captures.emplace_back(static_cast<int64_t>(valueId));
@@ -238,8 +258,8 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             std::optional<llvm::StringRef> logicalDtype;
             if (auto dtype = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.dtype"))
                 logicalDtype = dtype.getValue();
-            reflectValue(valueId, name, argument.getType(), !capture, false, !capture, logicalDtypes, derivativeOf,
-                         logicalDtype);
+            reflectValue(valueId, name, argument.getType(), !capture && !invocationControl, false, !capture,
+                         logicalDtypes, derivativeOf, logicalDtype);
         }
         graph["arguments"] = std::move(arguments);
 
@@ -333,6 +353,23 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             if (auto graphics = mlir::dyn_cast<mlir::vernon::program::GraphicsOp>(operation)) {
                 node["topology"] = graphics.getTopology().str();
                 node["color_count"] = graphics.getColorCount();
+                if (auto controlSlots =
+                        operation.getAttrOfType<mlir::DenseI64ArrayAttr>("vernon_program.control_slots")) {
+                    llvm::json::Array slots;
+                    for (int64_t slot : controlSlots.asArrayRef())
+                        slots.emplace_back(slot);
+                    node["control_slots"] = std::move(slots);
+                }
+                if (auto state = operation.getAttrOfType<mlir::StringAttr>("vernon_program.graphics_state")) {
+                    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(state.getValue());
+                    llvm::json::Object *stateObject = parsed ? parsed->getAsObject() : nullptr;
+                    if (!stateObject) {
+                        operation.emitError("has invalid graphics pipeline state metadata");
+                        invalid = true;
+                    } else {
+                        node["graphics_state"] = std::move(*stateObject);
+                    }
+                }
             }
             llvm::json::Array operands;
             llvm::json::Array results;
@@ -361,8 +398,14 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                              operation.getOperand(index).getType(), false, false, false, abi.leaves,
                              derivativeOrigin(operandAutodiffRoles, operandAutodiffSources, index), abi.dtype);
             }
+            if (gridControlArguments && gridControlArguments.size() != 3) {
+                operation.emitError("grid control arguments must contain three axes");
+                invalid = true;
+            }
             if (gridControlArguments)
                 for (int64_t argumentIndex : gridControlArguments.asArrayRef()) {
+                    if (argumentIndex == -1)
+                        continue;
                     if (argumentIndex < 0 || static_cast<uint64_t>(argumentIndex) >= function.getNumArguments()) {
                         operation.emitError("has an invalid grid control argument");
                         invalid = true;
@@ -438,7 +481,12 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             node["resources"] = std::move(resources);
             llvm::json::Array grid;
             if (gridControlArguments) {
-                for (int64_t argumentIndex : gridControlArguments.asArrayRef()) {
+                auto compute = mlir::cast<mlir::vernon::program::ComputeOp>(operation);
+                for (auto [axis, argumentIndex] : llvm::enumerate(gridControlArguments.asArrayRef())) {
+                    if (argumentIndex == -1) {
+                        grid.emplace_back(compute.getGrid()[axis]);
+                        continue;
+                    }
                     auto valueId =
                         function.getArgAttrOfType<mlir::IntegerAttr>(argumentIndex, "vernon_program.value_id");
                     grid.emplace_back(llvm::json::Object{
@@ -482,7 +530,12 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     requestBindings.emplace_back(
                         binding(name, resultIds[index], resultAutodiffRoles, resultAutodiffSources, index));
             if (gridControlArguments) {
-                for (int64_t argumentIndex : gridControlArguments.asArrayRef()) {
+                auto compute = mlir::cast<mlir::vernon::program::ComputeOp>(operation);
+                for (auto [axis, argumentIndex] : llvm::enumerate(gridControlArguments.asArrayRef())) {
+                    if (argumentIndex == -1) {
+                        requestGrid.emplace_back(compute.getGrid()[axis]);
+                        continue;
+                    }
                     auto valueId =
                         function.getArgAttrOfType<mlir::IntegerAttr>(argumentIndex, "vernon_program.value_id");
                     requestGrid.emplace_back(llvm::json::Object{

@@ -162,11 +162,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
-    invocation.color_attachments = attachments;
-    invocation.color_attachment_count = std::size(attachments);
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(attachments, std::size(attachments), 3);
+    graphics.bind(invocation);
     const VernonStatus invokeStatus = vernon::tests::completeSubmission(pipeline, &invocation);
     expectRuntimeOk(runtime, invokeStatus);
     ASSERT_EQ(invokeStatus, VERNON_STATUS_OK);

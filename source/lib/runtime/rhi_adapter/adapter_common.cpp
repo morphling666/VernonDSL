@@ -351,6 +351,15 @@ bool retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProvid
     return kind && vernon::rhi::retainCommandResource(adapter.rhiDevice, encoder.value, *kind, resource.resource.value);
 }
 
+bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor) {
+    return descriptor && descriptor->struct_size >= sizeof(*descriptor) && descriptor->instance_count != 0 &&
+           (descriptor->vertex_count != 0 || descriptor->index_count != 0) &&
+           (descriptor->color_attachment_count != 0 || descriptor->depth_stencil_view.resource.value != 0) &&
+           descriptor->color_attachment_count <= VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS &&
+           (descriptor->color_attachment_count == 0 || descriptor->color_attachments) &&
+           ((descriptor->index_count != 0) == (descriptor->index_buffer.resource.value != 0));
+}
+
 bool deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
                          uint64_t object, void (*cleanup)(void *, uint64_t)) {
     return vernon::rhi::deferCommandCleanup(adapter.rhiDevice, encoder.value, context, object, cleanup);

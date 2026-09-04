@@ -38,7 +38,7 @@ struct ProgramResourceIndex {
     std::map<std::string, std::string> graphDirections;
     std::map<int64_t, ProgramValueProducer> producerByValue;
     std::map<int64_t, std::string> allocationGraph;
-    std::map<std::string, const CanonicalComputeStage *> compiledByRequest;
+    std::map<std::string, const CanonicalProgramStage *> compiledByRequest;
     std::map<std::string, std::map<int64_t, ProgramLogicalResource>> resourcesByStage;
     std::set<int64_t> resourceVersions;
     std::map<int64_t, int64_t> storageParents;
@@ -63,6 +63,8 @@ struct ProgramStoragePlan {
     ProgramStorageAliasPlan aliases;
 };
 
+using ProgramStorageUsageRequirements = std::map<int64_t, std::set<std::string>>;
+
 bool isProgramTextureType(llvm::StringRef type);
 bool isProgramSamplerType(llvm::StringRef type);
 bool isProgramAdTapeType(llvm::StringRef type);
@@ -70,7 +72,7 @@ bool isProgramTensorViewType(llvm::StringRef type);
 bool isValidProgramResourceAccess(llvm::StringRef access);
 
 bool indexProgramResources(const llvm::json::Array &values, const std::vector<CanonicalProgramGraph> &selectedGraphs,
-                           const std::vector<CanonicalComputeStage> &compiledStages, ProgramResourceIndex &index,
+                           const std::vector<CanonicalProgramStage> &compiledStages, ProgramResourceIndex &index,
                            std::string &error);
 
 bool planProgramStorageAliases(const std::map<int64_t, int64_t> &parents, ProgramStorageAliasPlan &plan,
@@ -80,6 +82,9 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
                                    const std::vector<CanonicalProgramGraph> &selectedGraphs,
                                    ProgramResourceIndex &index, std::set<int64_t> &capturedValues,
                                    ProgramStoragePlan &plan, std::string &error);
+
+bool applyProgramStorageUsageRequirements(llvm::json::Array &storages,
+                                          const ProgramStorageUsageRequirements &requirements, std::string &error);
 
 int64_t programStorageRoot(const std::map<int64_t, int64_t> &parents, int64_t value);
 

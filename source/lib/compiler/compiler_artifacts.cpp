@@ -204,6 +204,7 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
         }
     }
     (*root)["artifacts"] = std::move(table);
+    llvm::json::Object implementationMetadata;
     if (target == VERNON_TARGET_METAL) {
         llvm::json::Array slots;
         for (const TargetResourceSlot &slot : targetResourceSlots) {
@@ -220,8 +221,10 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
             row["count"] = static_cast<int64_t>(slot.count);
             slots.emplace_back(std::move(row));
         }
-        (*root)["metal_resource_slots"] = std::move(slots);
+        implementationMetadata["resource_slots"] = std::move(slots);
     }
+    (*root)["implementation"] =
+        llvm::json::Object{{"target", targetName(target).str()}, {"metadata", std::move(implementationMetadata)}};
 
     reflection.clear();
     llvm::raw_string_ostream stream(reflection);

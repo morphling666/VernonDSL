@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import hashlib
+import importlib
 import json
 import subprocess
 import sys
@@ -19,10 +20,13 @@ PROJECT_ROOT = Path(__file__).parents[3]
 PYTHON_TEST_ROOT = PROJECT_ROOT / "python" / "tests"
 sys.path.insert(0, str(PYTHON_TEST_ROOT))
 
-from vernon_dsl import _native as native  # noqa: E402
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION  # noqa: E402
 
-NATIVE_PATH = Path(native.__file__).resolve()
+native = importlib.import_module("vernon_dsl._native")
+native_file = native.__file__
+if not isinstance(native_file, str):
+    raise RuntimeError("vernon_dsl._native has no filesystem location")
+NATIVE_PATH = Path(native_file).resolve()
 if len(sys.argv) >= 3:
     COMPILER_LIBRARY = Path(sys.argv.pop(1)).resolve()
     COMPILE_CLI = Path(sys.argv.pop(1)).resolve()
@@ -293,7 +297,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     def __init__(self) -> None:
                         self.loads: list[tuple[bytes, bytes]] = []
 
-                    def load_canonical_endpoint(
+                    def load_canonical_program(
                         self,
                         program: bytes,
                         artifacts: bytes,
@@ -306,10 +310,10 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         return object()
 
                 capture = PipelineCapture()
-                runtime_module.Pipeline._cache.clear()
                 pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
                 position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
                 target = vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16))})
+                render_pass = vd.render_pass(target)
                 with mock.patch.multiple(
                     runtime_module,
                     _architecture=architecture,
@@ -317,14 +321,15 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     _api_version=api_version,
                     _runtime_generation=101,
                 ):
-                    compiled = pipeline._compile({"position": position}, target)
-                    repeated = pipeline._compile({"position": position}, target)
+                    compiled = pipeline._compile({"position": position}, render_pass, None, None)
+                    repeated = pipeline._compile({"position": position}, render_pass, None, None)
                 self.assertIs(compiled, repeated)
                 self.assertEqual(pipeline.compile_count, 1)
-                self.assertTrue(compiled.canonical_program)
-                self.assertTrue(compiled.canonical_artifact_system)
-                self.assertEqual(capture.loads, [(compiled.canonical_program, compiled.canonical_artifact_system)])
-                interactive_artifacts = json.loads(compiled.canonical_artifact_system)
+                deployment = compiled.specialization.deployment
+                self.assertTrue(deployment.canonical_program)
+                self.assertTrue(deployment.artifact_system)
+                self.assertEqual(capture.loads, [(deployment.canonical_program, deployment.artifact_system)])
+                interactive_artifacts = json.loads(deployment.artifact_system)
 
                 compile_calls = 0
 
@@ -389,7 +394,11 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     digest = hashlib.sha256(cooked_bytes).hexdigest()
                     self.assertEqual(digest, cooked["stage_artifacts"][stage_id]["artifact"]["sha256"])
                     cooked_digests.append(digest)
-                self.assertEqual(sorted(interactive_artifacts["blobs"]), sorted(cooked_digests))
+                interactive_modules = next(iter(interactive_artifacts["artifacts"].values()))["modules"]
+                self.assertEqual(
+                    sorted(module["sha256"] for module in interactive_modules),
+                    sorted(cooked_digests),
+                )
                 _assert_content_hash(self, cooked)
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:

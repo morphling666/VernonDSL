@@ -238,8 +238,12 @@ def main() -> None:
     if environment_enabled:
         environment_map = create_environment_cube()
         environment_sampler = vd.sampler()
-    render = vd.pipeline(pbr_vertex, pbr_fragment, features=features)
-    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment) if shadow_enabled else None
+    opaque_state = vd.graphics_state(
+        rasterization=vd.RasterizationState(cull_mode=vd.CullMode.BACK),
+        depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+    )
+    render = vd.pipeline(pbr_vertex, pbr_fragment, state=opaque_state, features=features)
+    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=opaque_state) if shadow_enabled else None
 
     projection = perspective(
         math.radians(48.0),
@@ -310,20 +314,20 @@ def main() -> None:
                 render_shadow(
                     position=positions,
                     light_view_projection=light_view_projection,
-                    render=vd.render(
+                    render_pass=vd.render_pass(
                         shadow_target,
                         color=vd.clear((1.0, 1.0, 1.0, 1.0)),
-                        depth=vd.clear(1.0),
+                        depth=vd.clear_depth(1.0),
                     ),
                 )
             render(
                 **render_arguments,
                 view_projection=np.ascontiguousarray(view_projection),
                 camera_position=np.ascontiguousarray(camera),
-                render=vd.render(
+                render_pass=vd.render_pass(
                     target,
                     color=vd.clear((0.02, 0.025, 0.04, 1.0)),
-                    depth=vd.clear(1.0),
+                    depth=vd.clear_depth(1.0),
                 ),
             )
             rgba = color.to_numpy()

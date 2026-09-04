@@ -51,6 +51,7 @@ set(PIPELINE_CANONICAL
 \"dispatch_contract\":{\"requires_unit_workgroup\":false,\"unit_grid_axes\":[]},\
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
+\"implementation\":{\"metadata\":{},\"target\":\"cpu\"},\
 \"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\"}},\
 \"target\":{\"kind\":\"cpu\",\"options\":{\"triple\":\"${TARGET_TRIPLE}\"}},\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\

@@ -12,7 +12,13 @@ import numpy as np
 from .._dtypes import scalar_name
 from ..frontend.model import ConcreteType
 from .mlir import emit_program
-from .model import MlirOperation, MlirValue, ParsedProgram, ProgramImplementation, ProgramType
+from .model import (
+    MlirOperation,
+    MlirValue,
+    ParsedProgram,
+    ProgramImplementation,
+    ProgramType,
+)
 
 
 def _quoted(value: str) -> str:
@@ -77,6 +83,12 @@ def _constant_attribute(value: Any) -> str:
     raise TypeError(f"Program constant has unsupported type {type(value).__name__}")
 
 
+def _graphics_state_attribute(value: Any) -> str:
+    from ..render import _graphics_pipeline_state_data
+
+    return _quoted(json.dumps(_graphics_pipeline_state_data(value), sort_keys=True, separators=(",", ":")))
+
+
 def _value_input_types(invocation: Any) -> dict[int, ProgramType]:
     from ..operation_graph import GraphValueInput
 
@@ -96,7 +108,7 @@ def _operation_host_constants(
     for parameter in node.parameters:
         if parameter.name in node.inputs:
             continue
-        supplied = invocation.slots[node.binding_slots[parameter.name]]
+        supplied = invocation.slot_value(node.binding_slots[parameter.name])
         if id(supplied) in value_input_ids:
             continue
         constants.append((parameter.name, _host_constant_value(supplied)))
@@ -112,7 +124,7 @@ def _lower_forward_function(
     tuple[MlirValue, ...],
     tuple[MlirOperation, ...],
 ]:
-    from ..operation_graph import AllocOp, KernelCallOp
+    from ..operation_graph import AllocOp, GraphicsCallOp, KernelCallOp
 
     graph = invocation.graph
     values: dict[str, MlirValue] = {
@@ -124,6 +136,22 @@ def _lower_forward_function(
         ssa = f"%v{value_id}"
         if all(argument.name != ssa for argument in arguments):
             arguments.append(MlirValue(ssa, values[ssa].type, f"input.{name}", value_id))
+
+    for node in graph.nodes:
+        if not isinstance(node, GraphicsCallOp):
+            continue
+        for attachment_name in node.attachment_names:
+            value_id = node.inputs[attachment_name]
+            ssa = f"%v{value_id}"
+            if all(argument.name != ssa for argument in arguments):
+                arguments.append(
+                    MlirValue(
+                        ssa,
+                        values[ssa].type,
+                        f"control.render_pass.{node.id}.{attachment_name}",
+                        value_id,
+                    )
+                )
 
     value_input_types = _value_input_types(invocation)
     value_inputs: dict[int, str] = {}
@@ -142,7 +170,7 @@ def _lower_forward_function(
     operations: list[MlirOperation] = []
     for node in graph.nodes:
         if isinstance(node, AllocOp):
-            operands = (("source", f"%v{node.like}"),) if node.like is not None else ()
+            alloc_operands = (("source", f"%v{node.like}"),) if node.like is not None else ()
             attributes: list[tuple[str, str]] = [("name", _quoted(node.name))]
             if node.values is not None:
                 attributes.append(("payload", _quoted(json.dumps(node.values))))
@@ -151,9 +179,82 @@ def _lower_forward_function(
                     node.id,
                     "vernon.intrinsic",
                     node.name,
-                    operands,
+                    alloc_operands,
                     (("result", f"%v{node.result}"),),
                     tuple(attributes),
+                )
+            )
+            continue
+        if isinstance(node, GraphicsCallOp):
+            attachment_names = set(node.attachment_names)
+            graphics_operands = [(name, f"%v{node.inputs[name]}") for name in node.attachment_names]
+            shader_operands: list[tuple[str, str]] = []
+            graphics_constant_names: list[str] = []
+            graphics_constant_values: list[str] = []
+            for parameter in node.parameters:
+                if parameter.name in node.inputs:
+                    shader_operands.append((parameter.name, f"%v{node.inputs[parameter.name]}"))
+                    continue
+                supplied = invocation.slot_value(node.binding_slots[parameter.name])
+                ssa = value_inputs.get(id(supplied))
+                if ssa is None:
+                    graphics_constant_names.append(parameter.name)
+                    graphics_constant_values.append(_constant_attribute(supplied))
+                else:
+                    shader_operands.append((parameter.name, ssa))
+            graphics_operands.extend(shader_operands)
+            ordered_results = [(name, f"%v{node.outputs[name]}") for name in node.attachment_names]
+            ordered_results.extend(
+                (name, f"%v{value}") for name, value in node.outputs.items() if name not in attachment_names
+            )
+            topology = {
+                "triangles": "triangle_list",
+                "lines": "line_list",
+                "points": "point_list",
+            }[node.pipeline._topology.name]
+            operations.append(
+                MlirOperation(
+                    node.id,
+                    "vernon_program.graphics",
+                    node.name,
+                    tuple(graphics_operands),
+                    tuple(ordered_results),
+                    (
+                        ("callee", _quoted(node.name)),
+                        ("topology", _quoted(topology)),
+                        ("features", _string_array(node.features)),
+                        (
+                            "operand_names",
+                            _string_array(tuple(name for name, _ in shader_operands)),
+                        ),
+                        (
+                            "result_names",
+                            _string_array(tuple(name for name, _ in ordered_results)),
+                        ),
+                        ("color_count", f"{node.color_count} : i32"),
+                        (
+                            "vernon_program.graphics_state",
+                            _graphics_state_attribute(node.pipeline._graphics_state),
+                        ),
+                        (
+                            "constant_names",
+                            _string_array(tuple(graphics_constant_names)),
+                        ),
+                        (
+                            "constant_values",
+                            "[" + ", ".join(graphics_constant_values) + "]",
+                        ),
+                        (
+                            "vernon_program.control_slots",
+                            _i64_array(
+                                (
+                                    node.control_slots["render_pass"],
+                                    node.control_slots["draw"],
+                                    node.control_slots["dynamic_state"],
+                                )
+                            ),
+                        ),
+                    ),
                 )
             )
             continue
@@ -168,7 +269,7 @@ def _lower_forward_function(
                 operands.append((parameter.name, f"%v{node.inputs[parameter.name]}"))
                 continue
             slot = node.binding_slots[parameter.name]
-            supplied = invocation.slots[slot]
+            supplied = invocation.slot_value(slot)
             ssa = value_inputs.get(id(supplied))
             if ssa is None:
                 constant_names.append(parameter.name)
@@ -181,6 +282,43 @@ def _lower_forward_function(
         resource_sources = []
         for result_name in result_names:
             resource_sources.append(str(operand_names.index(result_name)) if result_name in operand_names else "-1")
+        from ..operation_graph import DispatchControlKind
+
+        static_grid: list[int] = []
+        grid_controls: list[str] = []
+        for component in node.grid:
+            if component.kind is DispatchControlKind.STATIC:
+                if component.static_value is None:
+                    raise RuntimeError("static dispatch control has no value")
+                static_grid.append(component.static_value)
+                grid_controls.append("-1")
+                continue
+            if component.value is None:
+                raise RuntimeError("dynamic dispatch control has no Program Value")
+            ssa = value_inputs.get(id(component.value))
+            if ssa is None:
+                raise RuntimeError("dynamic dispatch control is not a Program input")
+            static_grid.append(1)
+            grid_controls.append(str(next(index for index, argument in enumerate(arguments) if argument.name == ssa)))
+        compute_attributes: list[tuple[str, str]] = [
+            ("callee", _quoted(node.name)),
+            ("grid", _i64_array(tuple(static_grid))),
+            ("features", _string_array(node.features)),
+            ("operand_names", _string_array(operand_names)),
+            ("result_names", _string_array(result_names)),
+            (
+                "vernon_program.operand_accesses",
+                _string_array(tuple(access_by_name.get(name, "read") for name in operand_names)),
+            ),
+            (
+                "vernon_program.result_resource_sources",
+                _i64_array(resource_sources),
+            ),
+            ("constant_names", _string_array(tuple(constant_names))),
+            ("constant_values", "[" + ", ".join(constant_values) + "]"),
+        ]
+        if any(control != "-1" for control in grid_controls):
+            compute_attributes.append(("vernon_program.grid_control_arguments", _i64_array(grid_controls)))
         operations.append(
             MlirOperation(
                 node.id,
@@ -188,23 +326,7 @@ def _lower_forward_function(
                 node.name,
                 tuple(operands),
                 results,
-                (
-                    ("callee", _quoted(node.name)),
-                    ("grid", _i64_array(node.grid)),
-                    ("features", _string_array(node.features)),
-                    ("operand_names", _string_array(operand_names)),
-                    ("result_names", _string_array(result_names)),
-                    (
-                        "vernon_program.operand_accesses",
-                        _string_array(tuple(access_by_name.get(name, "read") for name in operand_names)),
-                    ),
-                    (
-                        "vernon_program.result_resource_sources",
-                        _i64_array(resource_sources),
-                    ),
-                    ("constant_names", _string_array(tuple(constant_names))),
-                    ("constant_values", "[" + ", ".join(constant_values) + "]"),
-                ),
+                tuple(compute_attributes),
             )
         )
 
@@ -240,7 +362,30 @@ def parse_program(
     }
     structs: dict[str, tuple[tuple[str, ConcreteType], ...]] = {}
     value_input_ids = set(_value_input_types(invocation))
+    from ..operation_graph import GraphicsCallOp
+
+    graphics_templates = {
+        template.name: template for template in invocation.template.calls if hasattr(template, "implementations")
+    }
     for operation in invocation.graph.operations:
+        if isinstance(operation, GraphicsCallOp):
+            template = graphics_templates[operation.name]
+            stages = template.implementations
+            for name, fields in template.structs:
+                previous_fields = structs.get(name)
+                if previous_fields is not None and previous_fields != fields:
+                    raise ValueError(f"Program struct {name!r} has conflicting canonical declarations")
+                structs[name] = fields
+            implementation = ProgramImplementation(
+                operation.name,
+                stages[0][1],
+                "graphics",
+                stages[0][2],
+                (),
+                stages,
+            )
+            implementations[operation.name] = implementation
+            continue
         frontend = operation.kernel._lower(
             operation.features,
             autodiff_planning_policy=autodiff_planning_policy,
@@ -295,7 +440,7 @@ def parse_program(
     sources = {
         inspect.getsourcefile(function)
         for operation in invocation.graph.operations
-        if (function := getattr(operation.kernel, "_function", None)) is not None
+        if (function := getattr(getattr(operation, "kernel", None), "_function", None)) is not None
     }
     provenance = tuple(sorted(source for source in sources if source is not None))
     canonical_structs = tuple(sorted(structs.items()))

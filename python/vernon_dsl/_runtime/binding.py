@@ -220,6 +220,30 @@ class _PersistentBindingTable:
             lambda: builder.prepare_rhi_sampler(parameter.slot, resident),
         )
 
+    def bind_render_pass_control(self, slot: int, token: tuple[Any, ...], control: Any) -> None:
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("Program control update requires an active invocation transaction")
+        transaction.bind_render_pass(slot, token, control)
+
+    def bind_draw_command_control(self, slot: int, token: tuple[Any, ...], control: Any) -> None:
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("Program control update requires an active invocation transaction")
+        transaction.bind_draw_command(slot, token, control)
+
+    def bind_dynamic_state_control(self, slot: int, token: tuple[Any, ...], control: Any) -> None:
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("Program control update requires an active invocation transaction")
+        transaction.bind_dynamic_state(slot, token, control)
+
+    def forward(self) -> None:
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("Program forward requires an active invocation transaction")
+        transaction.forward()
+
 
 def _normalize_dispatch_borrows(
     borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],

@@ -132,12 +132,35 @@ typedef struct VernonDepthAttachment {
 
 typedef struct VernonGraphicsState {
     uint32_t struct_size;
+    VernonPrimitiveTopology topology;
     VernonRasterizationState rasterization;
     VernonDepthStencilState depth_stencil;
     const VernonColorBlendState *color_blends;
     size_t color_blend_count;
     uint32_t reserved[4];
 } VernonGraphicsState;
+
+typedef struct VernonRenderPass {
+    uint32_t struct_size;
+    const VernonColorAttachment *color_attachments;
+    size_t color_attachment_count;
+    const VernonDepthAttachment *depth_attachment;
+    uint32_t render_area[4];
+} VernonRenderPass;
+
+typedef struct VernonDrawCommand {
+    uint32_t struct_size;
+    const VernonIndexBinding *index_binding;
+    uint32_t vertex_count;
+    uint32_t instance_count;
+} VernonDrawCommand;
+
+typedef struct VernonDynamicState {
+    uint32_t struct_size;
+    uint32_t viewport[4];
+    uint32_t scissor[4];
+    uint32_t stencil_reference;
+} VernonDynamicState;
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiBuffer(VernonRuntimeContext *context, VernonRhiBuffer buffer,
                                                                  uint64_t offset, uint64_t size,
@@ -256,19 +279,12 @@ typedef struct VernonPipelineInvocation {
     uint32_t abi_version;
     const VernonPipelineArgument *arguments;
     size_t argument_count;
-    const VernonIndexBinding *index_binding;
-    const VernonColorAttachment *color_attachments;
-    size_t color_attachment_count;
-    const VernonDepthAttachment *depth_attachment;
-    VernonPrimitiveTopology topology;
-    uint32_t vertex_count;
-    uint32_t instance_count;
     VernonLaunchSize compute_grid;
-    uint32_t viewport[4];
-    uint32_t scissor[4];
     VernonRuntimeProviderObject command_encoder;
     const VernonGraphicsState *graphics_state;
-    uint32_t stencil_reference;
+    const VernonRenderPass *render_pass;
+    const VernonDrawCommand *draw_command;
+    const VernonDynamicState *dynamic_state;
 } VernonPipelineInvocation;
 
 typedef struct VernonProgramBindingToken {
@@ -517,6 +533,17 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBind(VernonProgra
                                                                     const VernonPipelineArgument *argument,
                                                                     const VernonProgramResourceLease *lease,
                                                                     uint64_t upload_bytes, uint64_t upload_ranges);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRenderPass(
+    VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
+    const VernonRenderPass *render_pass, const VernonProgramResourceLease *leases, size_t lease_count);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDrawCommand(VernonProgramInvocation *invocation,
+                                                                               uint32_t control_slot,
+                                                                               const VernonProgramBindingToken *token,
+                                                                               const VernonDrawCommand *draw,
+                                                                               const VernonProgramResourceLease *lease);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDynamicState(
+    VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
+    const VernonDynamicState *dynamic_state);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
                                                                        VernonPullback **output_pullback);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation);

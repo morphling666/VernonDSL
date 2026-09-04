@@ -10,17 +10,11 @@
 
 namespace vernon::runtime::program {
 
-enum class ProgramPipelineMode {
-    Managed,
-    DirectEndpoint,
-};
-
 VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
                                                  size_t programJsonSize, const char *artifactSystemJson,
                                                  size_t artifactSystemJsonSize,
                                                  const std::map<std::string, std::string> &stageBindings,
-                                                 const std::filesystem::path &bundleRoot, ProgramPipelineMode mode,
-                                                 std::string &error);
+                                                 const std::filesystem::path &bundleRoot, std::string &error);
 
 } // namespace vernon::runtime::program
 

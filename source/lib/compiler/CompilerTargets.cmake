@@ -15,11 +15,10 @@ add_library(
     compiler_dispatch.cpp
     compiler_dxc.cpp
     compiler_frontend.cpp
-    compiler_graphics_bootstrap.cpp
     compiler_internal.cpp
     compiler_json.cpp
-    compiler_kernel_bootstrap.cpp
     compiler_program_abi.cpp
+    compiler_program_aggregation.cpp
     compiler_program_assembly.cpp
     compiler_program_boundary.cpp
     compiler_program_builtin.cpp
@@ -37,6 +36,7 @@ add_library(
     compiler_program_stage.cpp
     compiler_program_storage.cpp
     compiler_program_tape.cpp
+    compiler_program_target_aggregation.cpp
     compiler_reflection.cpp
     compiler_spirv.cpp
     VernonCompiler.cpp

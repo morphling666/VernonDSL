@@ -90,13 +90,16 @@ bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContex
                 continue;
             ProgramTapeState &state = byValue[binding.value];
             state.value = binding.value;
+            if (program::executionKind(node) != program::ExecutionKind::Compute)
+                return error = "graphics Program nodes cannot carry autodiff tape dispatch metadata", false;
+            const program::ComputeOperation &compute = program::computeOperation(node);
             for (size_t axis = 0; axis < 3; ++axis)
-                if (node.compute.workgroups[axis].kind != program::ControlKind::Static ||
-                    node.compute.workgroups[axis].value > std::numeric_limits<uint32_t>::max())
+                if (compute.workgroups[axis].kind != program::ControlKind::Static ||
+                    compute.workgroups[axis].value > std::numeric_limits<uint32_t>::max())
                     return error = "Program tape dispatch requires resolved static workgroups", false;
-            state.grid = {static_cast<uint32_t>(node.compute.workgroups[0].value),
-                          static_cast<uint32_t>(node.compute.workgroups[1].value),
-                          static_cast<uint32_t>(node.compute.workgroups[2].value)};
+            state.grid = {static_cast<uint32_t>(compute.workgroups[0].value),
+                          static_cast<uint32_t>(compute.workgroups[1].value),
+                          static_cast<uint32_t>(compute.workgroups[2].value)};
             state.workgroup = stage.pipeline->workgroupSize;
             switch (*binding.target->tapeCarrier) {
             case program_plan::TapeCarrier::TapeData:

@@ -14,6 +14,7 @@ from .._versions import PIPELINE_VERSION
 from ..ad import ProgramTransformSpec, _capability_diagnostic
 from ..bundle import (
     BundlePlan,
+    CompiledArtifact,
     CompiledStage,
     OpenGLTargetOptions,
     PipelineCompileError,
@@ -211,6 +212,8 @@ def _compile_program_bundle_plan(
 
     stages: dict[str, CompiledStage] = {}
     compiled_implementations: dict[tuple[str, str], CompiledStage] = {}
+    graphics_implementations: dict[str, tuple[CompiledStage, tuple[CompiledStage, ...]]] = {}
+    finalize_rows: list[tuple[str, str, str, str]] = []
     source = Path(parsed.provenance[0]) if parsed.provenance else Path()
     reflected_values = execution.get("values")
     if not isinstance(reflected_values, list):
@@ -256,6 +259,84 @@ def _compile_program_bundle_plan(
             )
         if implementation.kind != ("compute" if kind == "compute" else "graphics"):
             raise PipelineCompileError(f"Program request {request_id!r} selected an incompatible implementation")
+        if implementation.kind == "graphics":
+            cached_graphics = graphics_implementations.get(hint)
+            if cached_graphics is None:
+                if not implementation.graphics_stages:
+                    raise PipelineCompileError(f"graphics Program implementation {hint!r} has no shader stages")
+                compiled_graphics: list[CompiledStage] = []
+                for role, entry, stage_mlir in implementation.graphics_stages:
+                    module_manifest = canonical_json(
+                        {
+                            "program": parsed.identity,
+                            "implementation_hint": hint,
+                            "entry": entry,
+                            "kind": role,
+                        }
+                    )
+                    module = ShaderModuleDescriptor(
+                        f"{pipeline_id}/{hint}/{entry}",
+                        source,
+                        source,
+                        module_manifest,
+                    )
+                    compiled_graphics.append(
+                        _compile_stage(
+                            module,
+                            ShaderStageReference(module.id, entry),
+                            role,
+                            variant,
+                            target,
+                            compiler,
+                            native_target,
+                            stage_mlir,
+                            retained_programs,
+                        )
+                    )
+                offsets: list[int] = []
+                payload = bytearray()
+                modules: list[dict[str, Any]] = []
+                for compiled_stage in compiled_graphics:
+                    offsets.append(len(payload))
+                    payload.extend(compiled_stage.artifact.data)
+                    modules.append(
+                        {
+                            "role": compiled_stage.stage,
+                            "format": compiled_stage.artifact.format,
+                            "entry_point": compiled_stage.metadata.get("symbol", compiled_stage.entry),
+                            "offset": offsets[-1],
+                            "byte_length": len(compiled_stage.artifact.data),
+                            "sha256": compiled_stage.artifact.sha256,
+                        }
+                    )
+                representative = CompiledStage(
+                    f"{pipeline_id}/{hint}",
+                    canonical_json({"program": parsed.identity, "implementation_hint": hint}),
+                    implementation.entry,
+                    "graphics",
+                    target,
+                    {},
+                    {},
+                    CompiledArtifact("graphics_stage_group", bytes(payload), "graphics-stage-group.bin"),
+                    {
+                        "graphics_modules": tuple(modules),
+                        "graphics_compiled_stages": tuple(compiled_graphics),
+                    },
+                )
+                cached_graphics = (representative, tuple(compiled_graphics))
+                graphics_implementations[hint] = cached_graphics
+            stage, compiled_graphics = cached_graphics
+            stages[request_id] = stage
+            finalize_rows.extend(
+                (
+                    request_id,
+                    stage.id,
+                    compiled_stage.entry,
+                    canonical_json(dict(compiled_stage.reflection)),
+                )
+                for compiled_stage in compiled_graphics
+            )
+            continue
         # Builtin copy/add share one hint across ranks. Rank (and dtype) live on
         # the generated entry; extents stay vd.dyn from the view descriptor.
         compile_key = (hint, implementation.entry)
@@ -288,17 +369,17 @@ def _compile_program_bundle_plan(
             )
             compiled_implementations[compile_key] = stage
         stages[request_id] = stage
-    finalized = compiler.finalize_program_result(
-        planned.reflection,
-        [
+        finalize_rows.append(
             (
                 request_id,
                 stage.id,
                 stage.entry,
                 canonical_json(dict(stage.reflection)),
             )
-            for request_id, stage in sorted(stages.items())
-        ],
+        )
+    finalized = compiler.finalize_program_result(
+        planned.reflection,
+        finalize_rows,
     )
     if not bool(finalized.ok):
         raise PipelineCompileError(str(finalized.diagnostics) or "Program finalization failed")
@@ -448,7 +529,9 @@ def _canonical_deployment(
             "sha256": digest,
             "location": {"tag": "external", "uri": path},
         }
-        requirements = runtime_requirements(plan.target.target, (stage,))
+        graphics_stages = stage.metadata.get("graphics_compiled_stages")
+        requirement_stages = tuple(graphics_stages) if isinstance(graphics_stages, tuple) else (stage,)
+        requirements = runtime_requirements(plan.target.target, requirement_stages)
         if requirements is None:
             raise PipelineCompileError(f"canonical stage {logical_stage} has no runtime requirements")
         requirements = dict(requirements)
@@ -459,12 +542,18 @@ def _canonical_deployment(
         contract_hash = hashlib.sha256(canonical_json(dict(contract)).encode("utf-8")).hexdigest()
         if canonical_stage.get("contract_hash") != contract_hash:
             raise PipelineCompileError(f"canonical stage {logical_stage} contract hash disagrees with its Program")
-        artifacts[logical_stage] = {
-            "tag": "stage",
-            "operation": "compute",
-            "contract_hash": contract_hash,
-            "runtime_requirements": requirements,
-            "modules": [
+        graphics_modules = stage.metadata.get("graphics_modules")
+        operation = "graphics" if isinstance(graphics_modules, tuple) else "compute"
+        if isinstance(graphics_modules, tuple):
+            modules = [
+                {
+                    **dict(module),
+                    "blob": digest,
+                }
+                for module in graphics_modules
+            ]
+        else:
+            modules = [
                 {
                     "role": "compute",
                     "format": stage.artifact.format,
@@ -474,7 +563,13 @@ def _canonical_deployment(
                     "byte_length": byte_length,
                     "sha256": digest,
                 }
-            ],
+            ]
+        artifacts[logical_stage] = {
+            "tag": "stage",
+            "operation": operation,
+            "contract_hash": contract_hash,
+            "runtime_requirements": requirements,
+            "modules": modules,
             "reflection": copy.deepcopy(dict(reflection)),
         }
         implementations = stage.metadata.get("program_implementations")
@@ -491,199 +586,6 @@ def _canonical_deployment(
         },
         stage_bindings,
     )
-
-
-def _direct_compiled_stage(
-    result: Any,
-    *,
-    target: TargetOptions,
-    entry: str,
-) -> CompiledStage:
-    compiled = compiled_stage_from_program(
-        result,
-        module=f"interactive/kernel/{entry}",
-        module_manifest=canonical_json({"entry": entry}),
-        entry=entry,
-        target=target,
-    )
-    if compiled.stage != "compute":
-        raise PipelineCompileError("direct Kernel canonical deployment requires a compute stage")
-    if target.target == "cpu":
-        compiled = CompiledStage(
-            compiled.module,
-            compiled.module_manifest,
-            compiled.entry,
-            compiled.stage,
-            compiled.target,
-            compiled.reflection,
-            compiled.interface,
-            compiled.artifact,
-            _cpu_stage_metadata(compiled),
-        )
-    return compiled
-
-
-def _canonical_kernel_deployment(
-    compiled: CompiledStage,
-    finalized_reflection: Mapping[str, Any],
-    *,
-    target: TargetOptions,
-    request_id: str,
-    output: Path,
-) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, str], CompiledStage]:
-    program = finalized_reflection.get("canonical_program")
-    contracts = finalized_reflection.get("stage_contracts")
-    if not isinstance(program, Mapping) or not isinstance(contracts, Mapping):
-        raise PipelineCompileError("C++ Program finalization returned no canonical deployment")
-    contract = contracts.get(request_id)
-    canonical_stages = program.get("stages")
-    canonical_stage = canonical_stages.get(request_id) if isinstance(canonical_stages, Mapping) else None
-    if not isinstance(contract, Mapping) or not isinstance(canonical_stage, Mapping):
-        raise PipelineCompileError("C++ Program finalization returned an incomplete direct stage contract")
-    contract_hash = canonical_stage.get("contract_hash")
-    if not isinstance(contract_hash, str) or not contract_hash:
-        raise PipelineCompileError("C++ Program finalization returned no direct stage contract hash")
-    descriptor = write_external_artifact(
-        output,
-        compiled.artifact.data,
-        compiled.artifact.format,
-        compiled.stage,
-        compiled.artifact.filename,
-    )
-    digest = descriptor["sha256"]
-    requirements = runtime_requirements(target.target, (compiled,))
-    if requirements is None:
-        raise PipelineCompileError("direct Kernel has no canonical runtime requirements")
-    requirements = dict(requirements)
-    requirements.pop("compute_workgroup_size", None)
-    entry_point = compiled.metadata.get("symbol", compiled.entry)
-    reflection = contract.get("reflection")
-    if not isinstance(reflection, Mapping):
-        raise PipelineCompileError("C++ Program finalization returned no portable direct stage reflection")
-    implementations = finalized_reflection.get("target_implementations")
-    implementation = implementations.get(request_id) if isinstance(implementations, Mapping) else None
-    artifact_system = {
-        "target": copy.deepcopy(target.spec),
-        "blobs": {
-            digest: {
-                "byte_length": descriptor["size"],
-                "sha256": digest,
-                "location": {"tag": "external", "uri": descriptor["path"]},
-            }
-        },
-        "artifacts": {
-            compiled.id: {
-                "tag": "stage",
-                "operation": "compute",
-                "contract_hash": contract_hash,
-                "runtime_requirements": requirements,
-                "modules": [
-                    {
-                        "role": "compute",
-                        "format": compiled.artifact.format,
-                        "entry_point": entry_point,
-                        "blob": digest,
-                        "offset": 0,
-                        "byte_length": descriptor["size"],
-                        "sha256": digest,
-                    }
-                ],
-                "reflection": copy.deepcopy(dict(reflection)),
-            }
-        },
-    }
-    if isinstance(implementation, Mapping):
-        artifact_system["artifacts"][compiled.id]["implementation"] = copy.deepcopy(dict(implementation))
-    return (
-        copy.deepcopy(dict(program)),
-        artifact_system,
-        {request_id: compiled.id},
-        compiled,
-    )
-
-
-def _canonical_graphics_deployment(
-    compiled: Sequence[CompiledStage],
-    finalized_reflection: Mapping[str, Any],
-    *,
-    target: TargetOptions,
-    request_id: str,
-    artifact_id: str,
-    output: Path,
-) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, str]]:
-    program = finalized_reflection.get("canonical_program")
-    contracts = finalized_reflection.get("stage_contracts")
-    if not isinstance(program, Mapping) or not isinstance(contracts, Mapping):
-        raise PipelineCompileError("C++ graphics finalization returned no canonical deployment")
-    contract = contracts.get(request_id)
-    canonical_stages = program.get("stages")
-    canonical_stage = canonical_stages.get(request_id) if isinstance(canonical_stages, Mapping) else None
-    if not isinstance(contract, Mapping) or not isinstance(canonical_stage, Mapping):
-        raise PipelineCompileError("C++ graphics finalization returned an incomplete StageContract")
-    contract_hash = canonical_stage.get("contract_hash")
-    reflection = contract.get("reflection")
-    if not isinstance(contract_hash, str) or not isinstance(reflection, Mapping):
-        raise PipelineCompileError("C++ graphics finalization returned invalid portable reflection")
-    implementations = finalized_reflection.get("target_implementations")
-    implementation = implementations.get(request_id) if isinstance(implementations, Mapping) else None
-    requirements = runtime_requirements(target.target, tuple(compiled))
-    if requirements is None:
-        raise PipelineCompileError("graphics Program has no canonical runtime requirements")
-    blobs: dict[str, Any] = {}
-    modules: list[dict[str, Any]] = []
-    for stage in compiled:
-        descriptor = write_external_artifact(
-            output,
-            stage.artifact.data,
-            stage.artifact.format,
-            stage.stage,
-            stage.artifact.filename,
-        )
-        digest = descriptor["sha256"]
-        blobs[digest] = {
-            "byte_length": descriptor["size"],
-            "sha256": digest,
-            "location": {"tag": "external", "uri": descriptor["path"]},
-        }
-        modules.append(
-            {
-                "role": stage.stage,
-                "format": stage.artifact.format,
-                "entry_point": stage.metadata.get("symbol", stage.entry),
-                "blob": digest,
-                "offset": 0,
-                "byte_length": descriptor["size"],
-                "sha256": digest,
-            }
-        )
-    modules.sort(key=lambda module: ("vertex", "fragment").index(module["role"]))
-    artifact_system = {
-        "target": copy.deepcopy(target.spec),
-        "blobs": blobs,
-        "artifacts": {
-            artifact_id: {
-                "tag": "stage",
-                "operation": "graphics",
-                "contract_hash": contract_hash,
-                "runtime_requirements": dict(requirements),
-                "modules": modules,
-                "reflection": copy.deepcopy(dict(reflection)),
-            }
-        },
-    }
-    implementation_row: dict[str, Any] = dict(implementation) if isinstance(implementation, Mapping) else {}
-    if target.target == "metal":
-        slots: list[Any] = []
-        for compiled_stage in compiled:
-            reflected_slots = compiled_stage.reflection.get("metal_resource_slots")
-            if isinstance(reflected_slots, list):
-                slots.extend(copy.deepcopy(slot) for slot in reflected_slots if isinstance(slot, Mapping))
-        if "endpoints" not in implementation_row:
-            implementation_row["endpoints"] = []
-        implementation_row["metal_resource_slots"] = slots
-    if implementation_row:
-        artifact_system["artifacts"][artifact_id]["implementation"] = copy.deepcopy(implementation_row)
-    return copy.deepcopy(dict(program)), artifact_system, {request_id: artifact_id}
 
 
 def _compile_module_bundle_plan(

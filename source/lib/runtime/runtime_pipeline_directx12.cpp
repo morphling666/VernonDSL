@@ -5,6 +5,7 @@
 #include "backend_directx12.h"
 #include "compute_launch_planner.h"
 #include "pipeline_metadata.h"
+#include "prepared_graphics_draw.h"
 #include "rhi/rhi_internal.h"
 #include "tensor_bridge.h"
 
@@ -520,54 +521,24 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                                        : "failed to update D3D12 RHI graphics bindings",
                     status);
     }
-    if (plan.attachments.empty() || plan.attachments.size() > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS)
-        return fail(*pipeline.context, "D3D12 RHI draw requires one to eight color attachments");
-    std::array<VernonRuntimeProviderColorAttachment, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> attachments{};
-    VernonRuntimeProviderResourceReference depthAttachment{};
     std::vector<uint32_t> formats;
     formats.reserve(plan.attachments.size());
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
-        const VernonColorAttachment &source = *plan.attachments[index];
-        attachments[index].location = source.location;
-        attachments[index].view = source.view;
-        attachments[index].load_operation = source.load_operation;
-        attachments[index].store_operation = source.store_operation;
-        std::copy(std::begin(source.clear_color), std::end(source.clear_color), attachments[index].clear_color);
         const DXGI_FORMAT format = directX12TextureFormat(plan.attachmentFormats[index]);
         if (format == DXGI_FORMAT_UNKNOWN)
             return fail(*pipeline.context, "D3D12 RHI color attachment format is unsupported");
         formats.push_back(static_cast<uint32_t>(format));
     }
-    if (plan.depthAttachment) {
-        depthAttachment = plan.depthAttachment->view;
-    }
-    std::vector<uint32_t> vertexStrides;
-    for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index)
-        if (state.rhiGraphicsLayout[index].kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-            const uint32_t binding = state.rhiGraphicsLayout[index].binding;
-            if (vertexStrides.size() <= binding)
-                vertexStrides.resize(binding + 1);
-            vertexStrides[binding] = state.rhiGraphicsValues[index].payload.buffer.stride;
-        }
     const uint32_t depthFormat = !plan.depthAttachment
                                      ? 0
                                      : static_cast<uint32_t>(plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT
                                                                  ? DXGI_FORMAT_D32_FLOAT_S8X24_UINT
                                                                  : DXGI_FORMAT_D32_FLOAT);
-    PlannedGraphicsState graphicsState;
-    const bool hasStencil = plan.depthAttachment && plan.depthFormat == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
-    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
-                           invocationDiagnostic(*pipeline.context)))
+    PreparedGraphicsDraw prepared;
+    if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsLayout,
+                             state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
-                                  formats,
-                                  depthFormat,
-                                  1,
-                                  vertexStrides,
-                                  graphicsState.rasterization,
-                                  graphicsState.depthStencil,
-                                  graphicsState.colorBlends};
-    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, variantKey, state.rhiGraphicsVariant);
+    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);
@@ -576,42 +547,8 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
                                        : "failed to prepare D3D12 RHI graphics variant",
                     status);
     }
-    const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
-    VernonRuntimeCoreDrawInvocation draw{};
-    draw.struct_size = sizeof(draw);
-    draw.command_encoder = invocation.command_encoder;
-    draw.vertex_count = plan.vertexCount;
-    draw.instance_count = plan.instanceCount;
-    draw.color_attachments = attachments.data();
-    draw.color_attachment_count = plan.attachments.size();
-    draw.depth_stencil_view = depthAttachment;
-    draw.depth_load_operation =
-        plan.depthAttachment ? plan.depthAttachment->load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
-    draw.depth_store_operation =
-        plan.depthAttachment ? plan.depthAttachment->store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
-    draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
-    draw.stencil_load_operation =
-        hasStencil ? plan.depthAttachment->stencil_load_operation : VERNON_RUNTIME_PROVIDER_LOAD_DISCARD;
-    draw.stencil_store_operation =
-        hasStencil ? plan.depthAttachment->stencil_store_operation : VERNON_RUNTIME_PROVIDER_STORE_DISCARD;
-    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
-    draw.stencil_reference = graphicsState.stencilReference;
-    draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
-    draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
-    draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
-    draw.viewport[3] = hasViewport ? invocation.viewport[3] : plan.attachmentHeight;
-    const bool hasScissor = invocation.scissor[2] && invocation.scissor[3];
-    for (size_t index = 0; index < 4; ++index)
-        draw.scissor[index] = hasScissor ? invocation.scissor[index] : draw.viewport[index];
-    draw.topology = invocation.topology;
-    if (plan.indexBinding) {
-        draw.index_buffer = plan.indexBinding->resource;
-        draw.index_buffer.offset += plan.indexBinding->offset;
-        draw.index_count = plan.indexBinding->index_count;
-        draw.index_type = plan.indexBinding->type;
-    }
     status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
-                                                                  state.rhiGraphicsBindings, &draw);
+                                                                  state.rhiGraphicsBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError =
             vernonRuntimeRhiAdapterGetLastError(directX12State(*pipeline.context).adapter);

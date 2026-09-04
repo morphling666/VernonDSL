@@ -293,7 +293,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     diagnostic = {};
     plan = {};
     plan.backend = backend;
-    plan.operation = node.operation;
+    plan.operation = executionKind(node) == ExecutionKind::Compute ? "compute" : "graphics";
     plan.topology = stage.stage.graphicsTopology;
     std::copy(std::begin(stage.stage.workgroupSize), std::end(stage.stage.workgroupSize), plan.workgroupSize);
     plan.dispatch.requiresUnitWorkgroup = stage.stage.requiresUnitWorkgroup;
@@ -308,9 +308,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     const auto cpuFrameOffset = [&](const TargetBinding &binding) -> uint64_t & {
         return binding.endpoint.interfaceKind == "result" ? cpuResultFrameOffset : cpuArgumentFrameOffset;
     };
-    uint32_t maximumSlot = 0;
     bool hasSlots = false;
-    const bool compute = node.operation != "graphics";
+    const bool compute = executionKind(node) == ExecutionKind::Compute;
     const std::string entry = stage.stage.modules.empty() ? std::string() : stage.stage.modules.front().entryPoint;
     if (entry.find("_program_copy_") != std::string::npos || entry.find("_program_add_") != std::string::npos)
         plan.dispatchMapping = DispatchMapping::FirstTensorElementCount;
@@ -486,7 +485,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 target.storageLeaves.push_back({static_cast<size_t>(elementSize),
                                                 static_cast<size_t>(layoutLeaf.byteOffset),
                                                 storageBindings[leaf]->slot});
-                maximumSlot = std::max(maximumSlot, storageBindings[leaf]->slot);
             }
             TensorViewDescriptorUse descriptor;
             descriptor.rank = endpoint.viewRank;
@@ -499,9 +497,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                   "opaque tape carrier lacks an extent or stride ABI");
                 descriptor.extentBindings.push_back(extent->slot);
                 descriptor.strideBindings.push_back(stride->slot);
-                maximumSlot = std::max({maximumSlot, extent->slot, stride->slot});
             }
-            maximumSlot = std::max(maximumSlot, offset->slot);
             hasSlots = true;
             target.tensorViewDescriptor = std::move(descriptor);
             plan.bindings.push_back(std::move(target));
@@ -524,7 +520,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                      compiled->binding, UINT32_MAX};
                 target.sampledImageBindings = compiled->sampledImageBindings;
             }
-            maximumSlot = std::max(maximumSlot, resource->slot);
             hasSlots = true;
             if (backend == VERNON_RUNTIME_CPU) {
                 if (!assignCpuPhysical(cpuFrameOffset(target), compiled, alignof(uintptr_t), sizeof(uintptr_t),
@@ -568,7 +563,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 }
                 target.transport = TargetPhysicalTransport{std::move(physical), target.native};
                 target.endpoint.portableSlot = slot->slot;
-                maximumSlot = std::max(maximumSlot, slot->slot);
                 hasSlots = true;
             } else {
                 std::vector<std::pair<uint32_t, const EndpointAbiBinding *>> indexedStorageBindings;
@@ -655,7 +649,6 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     target.storageLeaves.push_back({static_cast<size_t>(elementSize),
                                                     static_cast<size_t>(layoutLeaf.byteOffset),
                                                     storageBindings[vertexBuffer ? 0 : leaf]->slot});
-                    maximumSlot = std::max(maximumSlot, storageBindings[vertexBuffer ? 0 : leaf]->slot);
                     hasSlots = true;
                 }
                 if (endpoint.viewDescriptor) {
@@ -670,9 +663,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                           "TensorView endpoint lacks an extent or stride carrier");
                         descriptor.extentBindings.push_back(extent->slot);
                         descriptor.strideBindings.push_back(stride->slot);
-                        maximumSlot = std::max({maximumSlot, extent->slot, stride->slot});
                     }
-                    maximumSlot = std::max(maximumSlot, offset->slot);
                     hasSlots = true;
                     target.tensorViewDescriptor = std::move(descriptor);
                     if (backend == VERNON_RUNTIME_CPU) {
@@ -759,29 +750,11 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         plan.packedArgumentsSize = cpuArgumentFrameOffset;
     if (backend == VERNON_RUNTIME_CPU)
         plan.packedResultsSize = cpuResultFrameOffset;
-    if (backend == VERNON_RUNTIME_METAL && hasSlots) {
-        if (!stage.stage.nativeSlots.empty()) {
-            plan.nativeSlots = stage.stage.nativeSlots;
-            return true;
-        }
-        std::set<uint32_t> imageSlots;
-        for (const TargetBinding &binding : plan.bindings)
-            if (binding.kind == "image")
-                imageSlots.insert(binding.endpoint.portableSlot);
-        for (uint32_t slot = 0; slot <= maximumSlot; ++slot) {
-            NativeResourceSlot native;
-            native.entry = entry;
-            native.stage = "compute";
-            native.kind = imageSlots.count(slot) ? "storage_image" : "storage_buffer";
-            native.name = entry + "_arg_" + std::to_string(slot);
-            native.set = 0;
-            native.binding = slot;
-            native.argumentBufferIndex = 0;
-            native.memberId = slot;
-            native.count = 1;
-            plan.nativeSlots.push_back(std::move(native));
-        }
-    }
+    if (backend == VERNON_RUNTIME_METAL && !stage.stage.nativeSlots.empty())
+        plan.nativeSlots = stage.stage.nativeSlots;
+    else if (backend == VERNON_RUNTIME_METAL && hasSlots && compute)
+        return reject(diagnostic, "PROGRAM_TARGET_BINDING", "/stage",
+                      "Metal stage has no explicit target resource slots");
     return true;
 }
 
@@ -928,7 +901,7 @@ bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBa
             std::any_of(program.program.graphs.begin(), program.program.graphs.end(), [](const Graph &graph) {
                 return graph.direction == "backward" &&
                        std::any_of(graph.nodes.begin(), graph.nodes.end(),
-                                   [](const Node &node) { return node.operation == "graphics"; });
+                                   [](const Node &node) { return executionKind(node) == ExecutionKind::Graphics; });
             });
         if (graphicsVjp) {
             const program_capabilities::Entry &capability =

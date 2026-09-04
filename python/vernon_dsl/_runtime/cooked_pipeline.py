@@ -45,8 +45,10 @@ class CookedPipeline:
     def parameter_names(self) -> tuple[str, ...]:
         self._load()
         if self._source_parameters:
-            return self._source_parameters
-        return tuple(parameter.name for parameter in self._native.parameters)
+            return tuple(name for name in self._source_parameters if not name.startswith("__grid_"))
+        return tuple(
+            parameter.name for parameter in self._native.parameters if not parameter.name.startswith("__grid_")
+        )
 
     def __call__(
         self,
@@ -81,6 +83,13 @@ class CookedPipeline:
 
         state = _session_state()
         if self._program_bundle:
+            bindings.update(
+                {
+                    "__grid_x": grid[0],
+                    "__grid_y": grid[1],
+                    "__grid_z": grid[2],
+                }
+            )
             parameters = {parameter.slot: parameter for parameter in self._native.parameters}
             slots = tuple(
                 slot for slot in self._native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}

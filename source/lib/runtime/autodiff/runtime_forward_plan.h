@@ -6,6 +6,10 @@
 struct VernonLoadedPipeline;
 struct VernonPullback;
 
+namespace vernon::runtime {
+struct ProgramInvocationContext;
+}
+
 namespace vernon::execution::detail {
 class RhiCommandPlanSink;
 struct RhiCommandExecutionPlan;
@@ -13,7 +17,8 @@ struct RhiCommandExecutionPlan;
 
 namespace vernon::runtime::ad {
 VernonStatus forwardProgramInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
-                                      VernonPullback *&pullback);
+                                      VernonPullback *&pullback,
+                                      const ProgramInvocationContext *programContext = nullptr);
 VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
                                                const VernonPipelineInvocation &invocation,
                                                const VernonAdValueSet &inputs,

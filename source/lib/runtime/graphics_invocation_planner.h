@@ -49,6 +49,9 @@ struct PlannedGraphicsInvocation {
     uint32_t vertexCount{};
     uint32_t instanceCount{};
     const VernonIndexBinding *indexBinding{};
+    VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
+    uint32_t viewport[4]{};
+    uint32_t scissor[4]{};
 };
 
 using DescribeImageResource = VernonStatus (*)(void *userData, VernonRuntimeProviderResourceReference resource,

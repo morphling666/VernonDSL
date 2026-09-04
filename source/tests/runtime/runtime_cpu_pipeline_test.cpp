@@ -406,7 +406,6 @@ TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
     const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
     ASSERT_NE(pipeline, nullptr) << std::string(resolveError.data ? resolveError.data : "", resolveError.size);
     ASSERT_NE(pipeline->topology, nullptr);
-    EXPECT_FALSE(pipeline->topology->directDispatch);
     EXPECT_EQ(pipeline->topology->stages.size(), 2u);
 
     VernonPipelineParameterView parameter{};

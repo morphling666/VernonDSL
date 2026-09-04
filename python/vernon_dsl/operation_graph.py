@@ -14,6 +14,7 @@ from .frontend.runtime_types import RuntimeParameterDescriptor
 class OperationKind(Enum):
     ALLOC = "alloc"
     KERNEL_CALL = "kernel_call"
+    GRAPHICS_CALL = "graphics_call"
 
 
 @dataclass
@@ -57,6 +58,99 @@ class GraphResourceInput:
     @property
     def logical(self) -> ConcreteType:
         return self.descriptor.logical
+
+
+@dataclass(frozen=True, eq=False)
+class GraphControlInput:
+    """A typed Program invocation control, never a public boundary value."""
+
+    name: str
+    kind: str
+    prototype: Any = None
+
+    @property
+    def ref(self) -> ProgramControlRef:
+        return ProgramControlRef(self.kind, ProgramControlSource.ARGUMENT, self.name)
+
+
+@dataclass(frozen=True)
+class ProgramControlDescriptor:
+    kind: str
+    annotation: Any
+    prototype: Any = None
+
+
+class ProgramControlSource(Enum):
+    ARGUMENT = "argument"
+    CAPTURE = "capture"
+
+
+@dataclass(frozen=True)
+class ProgramControlRef:
+    """Stable identity of one invocation control in a captured Program."""
+
+    kind: str
+    source: ProgramControlSource
+    identifier: str | int
+
+
+@dataclass(frozen=True)
+class AttachmentProjection:
+    """One attachment projected from a RenderPass control."""
+
+    control: ProgramControlRef
+    aspect: str
+    location: int | None
+
+
+@dataclass(frozen=True)
+class GraphAttachmentOutput:
+    """Symbolic output version selected from a RenderPass control."""
+
+    render_pass: GraphControlInput
+    projection: AttachmentProjection
+
+
+class DispatchControlKind(Enum):
+    STATIC = "static"
+    VALUE = "value"
+
+
+@dataclass(frozen=True)
+class DispatchControl:
+    """One dispatch axis, either compile-time static or invocation-resolved."""
+
+    kind: DispatchControlKind
+    static_value: int | None = None
+    value: GraphValueInput | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is DispatchControlKind.STATIC:
+            if self.static_value is None or self.static_value <= 0 or self.value is not None:
+                raise ValueError("static dispatch control requires one positive integer")
+        elif self.kind is DispatchControlKind.VALUE:
+            if self.static_value is not None or not isinstance(self.value, GraphValueInput):
+                raise ValueError("dynamic dispatch control requires one Program Value")
+        else:
+            raise ValueError(f"unknown dispatch control kind {self.kind!r}")
+
+    @classmethod
+    def from_value(cls, value: int | GraphValueInput) -> DispatchControl:
+        if isinstance(value, GraphValueInput):
+            return cls(DispatchControlKind.VALUE, value=value)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("static dispatch controls must be positive integers")
+        return cls(DispatchControlKind.STATIC, static_value=value)
+
+
+@dataclass(frozen=True, eq=False)
+class GraphControlResource:
+    """An attachment resource projected from a RenderPass control."""
+
+    name: str
+    shape: tuple[int, ...]
+    logical: ConcreteType
+    projection: AttachmentProjection
 
 
 @dataclass(frozen=True)
@@ -103,17 +197,35 @@ class KernelCallOp:
     parameters: tuple[KernelParameter, ...]
     inputs: Mapping[str, int]
     outputs: Mapping[str, int]
-    grid: tuple[int, int, int]
+    grid: tuple[DispatchControl, DispatchControl, DispatchControl]
+    features: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class GraphicsCallOp:
+    id: int
+    kind: OperationKind
+    name: str
+    pipeline: Any
+    binding_slots: Mapping[str, int]
+    control_slots: Mapping[str, int]
+    parameters: tuple[KernelParameter, ...]
+    inputs: Mapping[str, int]
+    outputs: Mapping[str, int]
+    attachment_names: tuple[str, ...]
+    color_count: int
     features: tuple[str, ...]
 
 
 def _resource_owner(value: Any) -> Any | None:
-    return value if isinstance(value, (GraphBuffer, GraphResourceInput)) else None
+    return value if isinstance(value, (GraphBuffer, GraphResourceInput, GraphControlResource)) else None
 
 
 def _resource_type(value: Any) -> ResourceType:
     if isinstance(value, GraphResourceInput):
         return ResourceType((), value.logical.mlir, value.logical)
+    if isinstance(value, GraphControlResource):
+        return ResourceType(value.shape, value.logical.mlir, value.logical)
     return ResourceType(
         tuple(value.shape),
         str(getattr(value, "dtype", value)),
@@ -126,7 +238,7 @@ class OperationGraph:
 
     def __init__(self):
         self._values: list[ResourceVersion] = []
-        self._nodes: list[AllocOp | KernelCallOp] = []
+        self._nodes: list[AllocOp | KernelCallOp | GraphicsCallOp] = []
         self._current: dict[int, int] = {}
         self._owner_ids: dict[int, int] = {}
         self._owner_objects: dict[int, Any] = {}
@@ -138,12 +250,12 @@ class OperationGraph:
         return tuple(self._values)
 
     @property
-    def nodes(self) -> tuple[AllocOp | KernelCallOp, ...]:
+    def nodes(self) -> tuple[AllocOp | KernelCallOp | GraphicsCallOp, ...]:
         return tuple(self._nodes)
 
     @property
-    def operations(self) -> tuple[KernelCallOp, ...]:
-        return tuple(node for node in self._nodes if isinstance(node, KernelCallOp))
+    def operations(self) -> tuple[KernelCallOp | GraphicsCallOp, ...]:
+        return tuple(node for node in self._nodes if isinstance(node, (KernelCallOp, GraphicsCallOp)))
 
     @property
     def inputs(self) -> Mapping[str, int]:
@@ -162,6 +274,9 @@ class OperationGraph:
         if existing is not None and existing != version:
             raise ValueError(f"Module input {name!r} was imported with inconsistent resource versions")
         self._inputs[name] = version
+
+    def import_control_resource(self, value: GraphControlResource) -> int:
+        return self._define_version(value, producer=None)
 
     def append_alloc(
         self,
@@ -186,7 +301,7 @@ class OperationGraph:
         bindings: Mapping[str, Any],
         binding_slots: Mapping[str, int],
         parameters: tuple[KernelParameter, ...],
-        grid: tuple[int, int, int],
+        grid: tuple[int | GraphValueInput, int | GraphValueInput, int | GraphValueInput],
         features: tuple[str, ...],
     ) -> KernelCallOp:
         operation_id = len(self._nodes)
@@ -210,7 +325,50 @@ class OperationGraph:
             parameters,
             MappingProxyType(inputs),
             MappingProxyType(outputs),
-            grid,
+            tuple(DispatchControl.from_value(component) for component in grid),
+            features,
+        )
+        self._nodes.append(operation)
+        return operation
+
+    def append_graphics(
+        self,
+        *,
+        name: str,
+        pipeline: Any,
+        bindings: Mapping[str, Any],
+        binding_slots: Mapping[str, int],
+        control_slots: Mapping[str, int],
+        parameters: tuple[KernelParameter, ...],
+        attachments: tuple[GraphControlResource, ...],
+        color_count: int,
+        features: tuple[str, ...],
+    ) -> GraphicsCallOp:
+        operation_id = len(self._nodes)
+        inputs: dict[str, int] = {attachment.name: self._current_version(attachment) for attachment in attachments}
+        outputs: dict[str, int] = {
+            attachment.name: self._advance(attachment, operation_id) for attachment in attachments
+        }
+        for parameter in parameters:
+            value = bindings[parameter.name]
+            owner = _resource_owner(value)
+            if owner is None:
+                continue
+            inputs[parameter.name] = self._current_version(value)
+            if parameter.access in {"write", "read_write"}:
+                outputs[parameter.name] = self._advance(value, operation_id)
+        operation = GraphicsCallOp(
+            operation_id,
+            OperationKind.GRAPHICS_CALL,
+            name,
+            pipeline,
+            MappingProxyType(dict(binding_slots)),
+            MappingProxyType(dict(control_slots)),
+            parameters,
+            MappingProxyType(inputs),
+            MappingProxyType(outputs),
+            tuple(attachment.name for attachment in attachments),
+            color_count,
             features,
         )
         self._nodes.append(operation)
@@ -221,7 +379,7 @@ class OperationGraph:
         for path, value in outputs.items():
             if _resource_owner(value) is not None:
                 resolved[path] = self._current_version(value)
-        if not resolved:
+        if not resolved and not any(isinstance(node, GraphicsCallOp) for node in self._nodes):
             raise ValueError("Module.forward() must return at least one Program buffer")
         self._outputs = resolved
         self._validate()
@@ -303,8 +461,14 @@ class OperationGraph:
                     raise ValueError(f"AllocOp {node.name!r} copies an unavailable resource version")
                 produced.add(node.result)
                 continue
+            control_values = {
+                value
+                for name, value in node.inputs.items()
+                if isinstance(node, GraphicsCallOp) and name in node.attachment_names
+            }
+            produced.update(control_values)
             if any(value not in produced for value in node.inputs.values()):
-                raise ValueError(f"KernelCallOp {node.name!r} consumes an unavailable resource version")
+                raise ValueError(f"{type(node).__name__} {node.name!r} consumes an unavailable resource version")
             produced.update(node.outputs.values())
         if any(value not in produced for value in self._outputs.values()):
             raise ValueError("Module output refers to an unavailable resource version")
@@ -312,13 +476,19 @@ class OperationGraph:
 
 __all__ = [
     "AllocOp",
+    "DispatchControl",
+    "DispatchControlKind",
     "GraphBuffer",
+    "GraphControlInput",
+    "GraphControlResource",
     "GraphResourceInput",
     "GraphValueInput",
+    "GraphicsCallOp",
     "KernelCallOp",
     "KernelParameter",
     "OperationGraph",
     "OperationKind",
+    "ProgramControlDescriptor",
     "ResourceType",
     "ResourceVersion",
 ]

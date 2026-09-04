@@ -96,13 +96,15 @@ LogicalResult TextureType::verify(function_ref<InFlightDiagnostic()> emitError, 
         return emitError() << "Texture dimension must be 2d, 3d, or cube";
     if (!elementType.isF32() && !elementType.isInteger(32))
         return emitError() << "Texture shader element type must be f32, i32, or u32";
-    if (access == "sampled") {
+    if (access == "sampled" || access == "attachment") {
         if (format != "unknown")
-            return emitError() << "sampled Texture format must be unknown";
+            return emitError() << access << " Texture format must be unknown";
+        if (access == "attachment" && dimension != "2d")
+            return emitError() << "attachment Texture dimension must be 2d";
         return success();
     }
     if (access != "read" && access != "write" && access != "read_write")
-        return emitError() << "Texture access must be sampled, read, write, or read_write";
+        return emitError() << "Texture access must be sampled, attachment, read, write, or read_write";
     if (dimension == "cube")
         return emitError() << "storage Texture dimension must be 2d or 3d";
     if (!elementType.isF32())

@@ -16,6 +16,7 @@ VernonPipelineArgument hostTensor(void *data, size_t size) {
     argument.tensor.storage = VERNON_TENSOR_HOST;
     argument.tensor.host_data = data;
     argument.tensor.byte_size = size;
+    argument.tensor.element_layout.byte_size = size;
     return argument;
 }
 
@@ -236,7 +237,7 @@ TEST(ProgramTargetBinding, PreservesCompilerSelectedBufferCarrierForLargeMatrice
     EXPECT_EQ(view.parameters[0].uses[0].transport, "storage_buffer");
 }
 
-TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
+TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     const std::string f32LayoutHash = "95f54cae607cf7751c0ec4327f86b0982056823c49534e9d8dddd66fc98c5f07";
     const std::string u32LayoutHash = "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6";
     const auto layout = [](const std::string &scope, const std::string &hash, const std::string &dtype) {
@@ -472,45 +473,6 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
     ASSERT_EQ(resolved.graphs[0].predecessors.size(), 1u);
     EXPECT_TRUE(resolved.graphs[0].predecessors[0].empty());
 
-    std::vector<float> input(256);
-    for (size_t index = 0; index < input.size(); ++index)
-        input[index] = static_cast<float>(index);
-    vernon::runtime::program::Invocation invocation;
-    invocation.arguments.push_back({input.data(), input.size() * sizeof(float)});
-    invocation.parameters.push_back(4);
-    vernon::runtime::program::ExecutionResult execution;
-    const vernon::runtime::program::StageExecutor executor = [](const vernon::runtime::program::StageInvocation &stage,
-                                                                vernon::runtime::program::Diagnostic &error) {
-        if (!stage.stage || stage.resources.size() != 2 || !stage.resources[0].data || !stage.resources[1].data ||
-            stage.resources[0].byteLength != stage.resources[1].byteLength) {
-            error = {"PROGRAM_BINDING_MISMATCH", "execute", "", "invalid test stage resources"};
-            return false;
-        }
-        const auto *source = static_cast<const float *>(stage.resources[0].data);
-        auto *destination = static_cast<float *>(stage.resources[1].data);
-        const size_t count = stage.resources[0].byteLength / sizeof(float);
-        const bool bias = stage.stage->stage.modules.front().entryPoint == "bias";
-        for (size_t index = 0; index < count; ++index)
-            destination[index] = bias ? source[index] + 1.0f : source[index] * 2.0f;
-        return true;
-    };
-    ASSERT_TRUE(vernon::runtime::program::execute(resolved, invocation, executor, execution, diagnostic))
-        << diagnostic.message;
-    ASSERT_EQ(execution.outputs.size(), 1u);
-    ASSERT_EQ(execution.outputs[0].size(), 1024u);
-    const auto *output = reinterpret_cast<const float *>(execution.outputs[0].data());
-    EXPECT_EQ(output[0], 0.0f);
-    EXPECT_EQ(output[17], 34.0f);
-    EXPECT_EQ(output[255], 510.0f);
-    const vernon::runtime::program::StageExecutor failingExecutor =
-        [](const vernon::runtime::program::StageInvocation &, vernon::runtime::program::Diagnostic &error) {
-            error = {"TEST_STAGE_FAILURE", "execute", "", "intentional stage failure"};
-            return false;
-        };
-    ASSERT_FALSE(vernon::runtime::program::execute(resolved, invocation, failingExecutor, execution, diagnostic));
-    EXPECT_EQ(diagnostic.code, "TEST_STAGE_FAILURE");
-    EXPECT_TRUE(execution.outputs.empty());
-
     nlohmann::json multiManifest = manifest;
     multiManifest["stages"]["bias"] = {{"operation", "compute"}, {"contract_hash", contractHash}};
     multiManifest["storages"].push_back({{"id", 2},
@@ -563,14 +525,6 @@ TEST(ProgramExecutionManifest, ResolvesAndExecutesCanonicalComputePrograms) {
         << diagnostic.message;
     ASSERT_EQ(multiResolved.graphs[0].predecessors.size(), 2u);
     EXPECT_EQ(multiResolved.graphs[0].predecessors[1], std::vector<uint32_t>({0}));
-    execution = {};
-    ASSERT_TRUE(vernon::runtime::program::execute(multiResolved, invocation, executor, execution, diagnostic))
-        << diagnostic.message;
-    ASSERT_EQ(execution.outputs.size(), 1u);
-    output = reinterpret_cast<const float *>(execution.outputs[0].data());
-    EXPECT_EQ(output[0], 1.0f);
-    EXPECT_EQ(output[17], 35.0f);
-    EXPECT_EQ(output[255], 511.0f);
 
     nlohmann::json missingAbi = manifest;
     missingAbi.erase("abi");
@@ -652,15 +606,51 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                        nlohmann::json::array({{{"tag", "attachment"}, {"storage", 0}, {"before", 0}, {"after", 1}}})},
                       {"operation",
                        {{"tag", "graphics"},
-                        {"attachments",
-                         {{"colors",
-                           nlohmann::json::array(
-                               {{{"location", 0}, {"access", 0}, {"load", {{"tag", "discard"}}}, {"store", "store"}}})},
-                          {"depth_stencil", nullptr},
-                          {"render_area", {{"x", 0}, {"y", 0}, {"width", 32}, {"height", 32}}},
-                          {"layer_count", 1}}},
-                        {"state", nlohmann::json::object()},
-                        {"draw", {{"tag", "direct"}, {"vertex_count", 3}, {"instance_count", 1}}}}}}})}}})}};
+                        {"pipeline_state",
+                         {{"topology", "triangle_list"},
+                          {"rasterization",
+                           {{"cull_mode", "NONE"},
+                            {"front_face", "COUNTER_CLOCKWISE"},
+                            {"depth_clamp", false},
+                            {"depth_bias_constant", 0.0},
+                            {"depth_bias_slope", 0.0}}},
+                          {"depth_stencil",
+                           {{"depth_test", false},
+                            {"depth_write", false},
+                            {"depth_compare", "LESS"},
+                            {"stencil_test", false},
+                            {"front",
+                             {{"stencil_fail", "KEEP"},
+                              {"depth_fail", "KEEP"},
+                              {"pass_operation", "KEEP"},
+                              {"compare", "ALWAYS"}}},
+                            {"back",
+                             {{"stencil_fail", "KEEP"},
+                              {"depth_fail", "KEEP"},
+                              {"pass_operation", "KEEP"},
+                              {"compare", "ALWAYS"}}},
+                            {"stencil_read_mask", 255},
+                            {"stencil_write_mask", 255}}},
+                          {"color_blends", nlohmann::json::array({{0,
+                                                                   {{"enabled", false},
+                                                                    {"source_color", "ONE"},
+                                                                    {"destination_color", "ZERO"},
+                                                                    {"color_operation", "ADD"},
+                                                                    {"source_alpha", "ONE"},
+                                                                    {"destination_alpha", "ZERO"},
+                                                                    {"alpha_operation", "ADD"},
+                                                                    {"write_mask", 15}}}})}}},
+                        {"render_pass",
+                         {{"control", 0},
+                          {"colors", nlohmann::json::array({{{"location", 0},
+                                                             {"access", 0},
+                                                             {"formats", nlohmann::json::array({"rgba8_unorm"})},
+                                                             {"sample_counts", nlohmann::json::array({1})}}})},
+                          {"depth_stencil", nullptr}}},
+                        {"draw",
+                         {{"control", 1},
+                          {"default", {{"tag", "direct"}, {"vertex_count", 3}, {"instance_count", 1}}}}},
+                        {"dynamic_state", {{"control", 2}}}}}}})}}})}};
     setProgramAbi(manifest, {{"target", 0, "input", "input"}, {"target", 1, "output", "output"}});
     const std::string codeBytes = "test";
     const std::string codeHash = vernon::runtime::sha256Hex(codeBytes.data(), codeBytes.size());
@@ -700,7 +690,8 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
     ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, {{"draw", "draw-artifact"}}, resolved,
                                                   diagnostic))
         << diagnostic.message;
-    EXPECT_EQ(resolved.program.graphs.front().nodes.front().operation, "graphics");
+    EXPECT_EQ(vernon::runtime::program::executionKind(resolved.program.graphs.front().nodes.front()),
+              vernon::runtime::program::ExecutionKind::Graphics);
 }
 
 } // namespace

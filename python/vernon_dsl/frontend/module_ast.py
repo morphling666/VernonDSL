@@ -9,7 +9,14 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..module import Module
-from ..operation_graph import GraphBuffer, GraphResourceInput, GraphValueInput
+from ..operation_graph import (
+    AttachmentProjection,
+    GraphAttachmentOutput,
+    GraphBuffer,
+    GraphControlInput,
+    GraphResourceInput,
+    GraphValueInput,
+)
 from ..storage import TensorStorage, _logical_collection_shape
 from ..storage import empty as storage_empty
 from ..storage import empty_like as storage_empty_like
@@ -18,7 +25,6 @@ from ..storage import from_values as storage_from_values
 from ..storage import tangent_zeros as storage_tangent_zeros
 from ..storage import zeros as storage_zeros
 from ..storage import zeros_like as storage_zeros_like
-from .model import SemanticCategory
 from .runtime_types import RuntimeParameterDescriptor
 
 _COMPARE = {
@@ -81,25 +87,9 @@ def interpret_module_forward(
     module: Module,
     parameter_types: Mapping[str, RuntimeParameterDescriptor],
 ) -> tuple[Any, Any]:
-    from ..program import ProgramCapture
+    from ..program import ProgramCapture, _symbolic_program_inputs
 
-    inputs: dict[str, Any] = {}
-    for name, parameter_type in parameter_types.items():
-        if parameter_type.kind is SemanticCategory.STORAGE:
-            storage = parameter_type.storage_metadata
-            inputs[name] = GraphBuffer(
-                storage.dtype,
-                storage.shape,
-                storage.access,
-                storage.as_view,
-                parameter_type.logical,
-            )
-        elif parameter_type.kind is SemanticCategory.VALUE:
-            inputs[name] = GraphValueInput(name, parameter_type)
-        elif parameter_type.kind is SemanticCategory.RESOURCE:
-            inputs[name] = GraphResourceInput(name, parameter_type)
-        else:
-            raise TypeError(f"unknown Module parameter kind {parameter_type.kind!r}")
+    inputs = _symbolic_program_inputs(parameter_types)
     capture = ProgramCapture(module, inputs)
     interpreter = _ForwardInterpreter(capture, module)
     outputs = interpreter.interpret(module, dict(inputs))
@@ -111,7 +101,7 @@ def _is_graph(value: Any) -> bool:
 
 
 def _is_program_argument(value: Any) -> bool:
-    return isinstance(value, (GraphBuffer, GraphResourceInput, GraphValueInput))
+    return isinstance(value, (GraphBuffer, GraphControlInput, GraphResourceInput, GraphValueInput))
 
 
 def _require_graph(value: Any, *, what: str) -> GraphBuffer:
@@ -154,6 +144,10 @@ def _is_kernel(value: Any) -> bool:
     return kind == "compute" and hasattr(value, "_lower") and hasattr(value, "_function")
 
 
+def _is_pipeline(value: Any) -> bool:
+    return bool(getattr(value, "__vernon_pipeline__", False))
+
+
 class _ForwardInterpreter:
     def __init__(self, capture: Any, root: Module) -> None:
         self.capture = capture
@@ -166,6 +160,8 @@ class _ForwardInterpreter:
             self._body(function.body, owner, locals_, _forward_function(owner).__globals__)
         except _ForwardReturn as returned:
             return returned.value
+        if self.capture.graphics_calls:
+            return None
         raise TypeError(f"{type(owner).__name__}.forward must return a value")
 
     def _body(
@@ -187,7 +183,7 @@ class _ForwardInterpreter:
     ) -> None:
         if isinstance(statement, ast.Return):
             if statement.value is None:
-                raise TypeError(f"{type(owner).__name__}.forward must return a value")
+                raise _ForwardReturn(None)
             raise _ForwardReturn(self._expr(statement.value, owner, locals_, globals_))
         if isinstance(statement, (ast.Assign, ast.AnnAssign)):
             if isinstance(statement, ast.AnnAssign):
@@ -400,7 +396,19 @@ class _ForwardInterpreter:
             features = keywords.pop("features", ())
             if keywords:
                 raise TypeError(f"{callee.__name__} got unexpected Module.forward() keywords {sorted(keywords)}")
-            grid_value = None if grid is None else _require_comptime(grid, what="grid")
+            grid_value = None
+            if grid is not None:
+                if (
+                    not isinstance(grid, tuple)
+                    or len(grid) != 3
+                    or any(
+                        not isinstance(component, GraphValueInput)
+                        and (isinstance(component, bool) or not isinstance(component, int) or component <= 0)
+                        for component in grid
+                    )
+                ):
+                    raise TypeError("grid must contain three positive compile-time integers or scalar Program values")
+                grid_value = grid
             feature_value = _require_comptime(features, what="features")
             self.capture.capture_kernel(
                 callee,
@@ -409,6 +417,47 @@ class _ForwardInterpreter:
                 tuple(feature_value),
             )
             return None
+        if _is_pipeline(callee):
+            if args:
+                raise TypeError("Pipeline calls in Module.forward() accept keyword arguments only")
+            render_pass = keywords.pop("render_pass", None)
+            draw = keywords.pop("draw", None)
+            dynamic_state = keywords.pop("dynamic_state", None)
+            if not (isinstance(render_pass, GraphControlInput) and render_pass.kind == "render_pass"):
+                from ..render import RenderPass
+
+                if not isinstance(render_pass, RenderPass):
+                    raise TypeError("Pipeline calls in Module.forward() require render_pass=RenderPass")
+            if isinstance(draw, GraphControlInput):
+                if draw.kind != "draw":
+                    raise TypeError("draw requires a DrawCommand Program control")
+            elif draw is not None:
+                from ..render import DrawCommand
+
+                if not isinstance(draw, DrawCommand):
+                    raise TypeError("draw must be a DrawCommand or None")
+            if isinstance(dynamic_state, GraphControlInput):
+                if dynamic_state.kind != "dynamic_state":
+                    raise TypeError("dynamic_state requires a DynamicState Program control")
+            elif dynamic_state is not None:
+                from ..render import DynamicState
+
+                if not isinstance(dynamic_state, DynamicState):
+                    raise TypeError("dynamic_state must be a DynamicState or None")
+            self.capture.capture_graphics(callee, keywords, render_pass, draw, dynamic_state)
+            return None
+        attachment_aspect = getattr(callee, "__vernon_attachment_output__", None)
+        if attachment_aspect is not None:
+            if len(args) != 1 or not isinstance(args[0], GraphControlInput) or args[0].kind != "render_pass":
+                raise TypeError(f"{callee.__name__} requires a RenderPass Program control")
+            if attachment_aspect == "color":
+                location = keywords.pop("location", 0)
+                if keywords or not isinstance(location, int) or isinstance(location, bool) or location < 0:
+                    raise TypeError("color_output location must be a non-negative compile-time integer")
+                return GraphAttachmentOutput(args[0], AttachmentProjection(args[0].ref, "color", location))
+            if keywords:
+                raise TypeError("depth_output does not accept keyword arguments")
+            return GraphAttachmentOutput(args[0], AttachmentProjection(args[0].ref, "depth", None))
         if dataclasses.is_dataclass(callee) and isinstance(callee, type):
             return callee(*args, **keywords)
         if any(_contains_graph(value) for value in (*args, *keywords.values())):

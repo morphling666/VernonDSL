@@ -220,18 +220,26 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     graphicsState.depth_stencil.stencil_write_mask = 0xa5;
     graphicsState.color_blends = &blend;
     graphicsState.color_blend_count = 1;
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = &attachment;
+    renderPass.color_attachment_count = 1;
+    renderPass.depth_attachment = &depthAttachment;
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.instance_count = 1;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.stencil_reference = 17;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.depth_attachment = &depthAttachment;
     invocation.graphics_state = &graphicsState;
-    invocation.stencil_reference = 17;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.instance_count = 1;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
+    invocation.dynamic_state = &dynamic;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
@@ -248,7 +256,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_EQ(depthStencilStats.frontStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
     EXPECT_EQ(depthStencilStats.backStencilFunction, D3D12_COMPARISON_FUNC_ALWAYS);
     EXPECT_EQ(depthStencilStats.backStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
-    invocation.stencil_reference = 123;
+    dynamic.stencil_reference = 123;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
@@ -270,7 +278,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_NEAR(pixels[center + 1], color[1], 2);
     EXPECT_NEAR(pixels[center + 2], color[2], 2);
 
-    invocation.depth_attachment = nullptr;
+    renderPass.depth_attachment = nullptr;
     invocation.graphics_state = nullptr;
     const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
     {
@@ -355,12 +363,10 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.viewport[2] = 8;
-    invocation.viewport[3] = 16;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
+    graphics.dynamic.viewport[2] = 8;
+    graphics.dynamic.viewport[3] = 16;
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
@@ -379,8 +385,8 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     EXPECT_NEAR(pixels[center + 1], 128, 2);
     EXPECT_NEAR(pixels[center + 2], 0, 2);
 
-    invocation.viewport[2] = 0;
-    invocation.viewport[3] = 0;
+    graphics.dynamic.viewport[2] = 0;
+    graphics.dynamic.viewport[3] = 0;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, &download, pixels.data(), pixels.size()),

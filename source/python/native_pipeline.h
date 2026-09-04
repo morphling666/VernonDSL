@@ -198,11 +198,6 @@ CpuTargetOptionStrings parseCpuTargetOptions(const nb::dict &targetOptions);
 std::unique_ptr<CompiledProgram> compileProgramResult(Compiler &compiler, const std::string &mlir, VernonTarget target,
                                                       const nb::dict &targetOptions);
 std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std::string &program);
-std::unique_ptr<CompiledProgram> planKernelResult(Compiler &compiler, const std::string &kernel);
-std::unique_ptr<CompiledProgram>
-planGraphicsResult(Compiler &compiler, const std::vector<std::string> &stages, const std::string &topology,
-                   const std::vector<std::string> &features, const std::vector<std::string> &attachmentTypes,
-                   uint32_t colorCount, const std::vector<std::tuple<std::string, std::string>> &operands);
 std::unique_ptr<CompiledProgram>
 finalizeProgramResult(Compiler &compiler, const std::string &plan,
                       const std::vector<std::tuple<std::string, std::string, std::string, std::string>> &kernels,
@@ -501,7 +496,12 @@ struct PipelineInvocationBuilder {
     std::unique_ptr<PreparedPipelineArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
         const PipelineParameterMetadata parameter = resolveParameter(identifier);
         const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
-        const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE : VERNON_RHI_IMAGE_SAMPLED;
+        const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE
+                                       : parameter.imageBindingRole == VERNON_IMAGE_BINDING_COLOR_ATTACHMENT
+                                           ? VERNON_RHI_IMAGE_COLOR_ATTACHMENT
+                                       : parameter.imageBindingRole == VERNON_IMAGE_BINDING_DEPTH_STENCIL_ATTACHMENT
+                                           ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
+                                           : VERNON_RHI_IMAGE_SAMPLED;
         if (!view || !(view->image->usage & requiredUsage))
             throw std::invalid_argument("RHI texture usage does not match the pipeline parameter");
         if (storage && view->format != parameter.storageImageFormat)
@@ -586,6 +586,8 @@ struct PipelineInvocationBuilder {
         if (value > static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST))
             throw std::invalid_argument("invalid primitive topology");
         topology = static_cast<VernonPrimitiveTopology>(value);
+        if (hasGraphicsState)
+            graphicsState.topology = topology;
         return *this;
     }
 
@@ -616,6 +618,64 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
+    PipelineInvocationBuilder &setGraphicsState(const nb::object &state) {
+        const nb::object raster = state.attr("rasterization");
+        const nb::object depth = state.attr("depth_stencil");
+        graphicsState = {};
+        graphicsState.struct_size = sizeof(graphicsState);
+        graphicsState.topology = topology;
+        graphicsState.rasterization.cull_mode = nb::cast<uint32_t>(raster.attr("cull_mode"));
+        graphicsState.rasterization.front_face = nb::cast<uint32_t>(raster.attr("front_face"));
+        graphicsState.rasterization.depth_clamp = nb::cast<bool>(raster.attr("depth_clamp"));
+        graphicsState.rasterization.depth_bias_constant = nb::cast<float>(raster.attr("depth_bias_constant"));
+        graphicsState.rasterization.depth_bias_slope = nb::cast<float>(raster.attr("depth_bias_slope"));
+        graphicsState.rasterization.depth_bias_enabled = graphicsState.rasterization.depth_bias_constant != 0.0f ||
+                                                         graphicsState.rasterization.depth_bias_slope != 0.0f;
+        graphicsState.depth_stencil.depth_test = nb::cast<bool>(depth.attr("depth_test"));
+        graphicsState.depth_stencil.depth_write = nb::cast<bool>(depth.attr("depth_write"));
+        graphicsState.depth_stencil.depth_compare = nb::cast<uint32_t>(depth.attr("depth_compare"));
+        graphicsState.depth_stencil.stencil_test = nb::cast<bool>(depth.attr("stencil_test"));
+        const auto copyFace = [](const nb::object &source, VernonStencilFaceState &target) {
+            target.stencil_fail = nb::cast<uint32_t>(source.attr("stencil_fail"));
+            target.depth_fail = nb::cast<uint32_t>(source.attr("depth_fail"));
+            target.pass = nb::cast<uint32_t>(source.attr("pass_operation"));
+            target.compare = nb::cast<uint32_t>(source.attr("compare"));
+        };
+        copyFace(depth.attr("front"), graphicsState.depth_stencil.front);
+        copyFace(depth.attr("back"), graphicsState.depth_stencil.back);
+        graphicsState.depth_stencil.stencil_read_mask = nb::cast<uint32_t>(depth.attr("stencil_read_mask"));
+        graphicsState.depth_stencil.stencil_write_mask = nb::cast<uint32_t>(depth.attr("stencil_write_mask"));
+        colorBlends.clear();
+        for (nb::handle item : state.attr("color_blends")) {
+            const nb::tuple pair = nb::cast<nb::tuple>(item);
+            const uint32_t location = nb::cast<uint32_t>(pair[0]);
+            if (location != colorBlends.size())
+                throw std::invalid_argument("graphics color blend locations must be contiguous from zero");
+            const nb::object source = nb::borrow<nb::object>(pair[1]);
+            VernonColorBlendState blend{};
+            blend.blend_enabled = nb::cast<bool>(source.attr("enabled"));
+            blend.source_color_factor = nb::cast<uint32_t>(source.attr("source_color"));
+            blend.destination_color_factor = nb::cast<uint32_t>(source.attr("destination_color"));
+            blend.color_operation = nb::cast<uint32_t>(source.attr("color_operation"));
+            blend.source_alpha_factor = nb::cast<uint32_t>(source.attr("source_alpha"));
+            blend.destination_alpha_factor = nb::cast<uint32_t>(source.attr("destination_alpha"));
+            blend.alpha_operation = nb::cast<uint32_t>(source.attr("alpha_operation"));
+            blend.write_mask = nb::cast<uint32_t>(source.attr("write_mask"));
+            colorBlends.push_back(blend);
+        }
+        graphicsState.color_blends = colorBlends.empty() ? nullptr : colorBlends.data();
+        graphicsState.color_blend_count = colorBlends.size();
+        hasGraphicsState = true;
+        return *this;
+    }
+
+    PipelineInvocationBuilder &setStencilReference(uint32_t value) {
+        if (value > 0xff)
+            throw std::invalid_argument("stencil reference must be in [0, 255]");
+        stencilReference = value;
+        return *this;
+    }
+
     VernonPipelineInvocation invocation(std::vector<VernonPipelineArgument> &values) const {
         values.clear();
         values.reserve(arguments.size());
@@ -626,16 +686,28 @@ struct PipelineInvocationBuilder {
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
         invocation.argument_count = values.size();
-        invocation.index_binding = hasIndex ? &index : nullptr;
-        invocation.color_attachments = attachments.empty() ? nullptr : attachments.data();
-        invocation.color_attachment_count = attachments.size();
-        invocation.depth_attachment = hasDepthAttachment ? &depthAttachment : nullptr;
-        invocation.topology = topology;
-        invocation.vertex_count = vertexCount;
-        invocation.instance_count = instanceCount;
         invocation.compute_grid = computeGrid;
-        std::memcpy(invocation.viewport, viewport, sizeof(viewport));
-        std::memcpy(invocation.scissor, scissor, sizeof(scissor));
+        invocation.graphics_state = hasGraphicsState ? &graphicsState : nullptr;
+        if (hasGraphicsState) {
+            renderPass = {};
+            renderPass.struct_size = sizeof(renderPass);
+            renderPass.color_attachments = attachments.empty() ? nullptr : attachments.data();
+            renderPass.color_attachment_count = attachments.size();
+            renderPass.depth_attachment = hasDepthAttachment ? &depthAttachment : nullptr;
+            drawCommand = {};
+            drawCommand.struct_size = sizeof(drawCommand);
+            drawCommand.index_binding = hasIndex ? &index : nullptr;
+            drawCommand.vertex_count = vertexCount;
+            drawCommand.instance_count = instanceCount;
+            dynamicState = {};
+            dynamicState.struct_size = sizeof(dynamicState);
+            std::memcpy(dynamicState.viewport, viewport, sizeof(viewport));
+            std::memcpy(dynamicState.scissor, scissor, sizeof(scissor));
+            dynamicState.stencil_reference = stencilReference;
+            invocation.render_pass = &renderPass;
+            invocation.draw_command = &drawCommand;
+            invocation.dynamic_state = &dynamicState;
+        }
         return invocation;
     }
 
@@ -681,6 +753,13 @@ struct PipelineInvocationBuilder {
     VernonLaunchSize computeGrid{};
     uint32_t viewport[4]{};
     uint32_t scissor[4]{};
+    VernonGraphicsState graphicsState{};
+    std::vector<VernonColorBlendState> colorBlends;
+    bool hasGraphicsState{};
+    uint32_t stencilReference{};
+    mutable VernonRenderPass renderPass{};
+    mutable VernonDrawCommand drawCommand{};
+    mutable VernonDynamicState dynamicState{};
 };
 
 inline void appendBindingTokenField(std::string &result, char tag, const char *data, size_t size) {
@@ -746,11 +825,17 @@ struct PythonPreparedBindingLease {
 // runtime ProgramInstance referenced by this adapter.
 struct PythonProgramInvocationAdapter {
     PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline,
-                                   vernon::runtime::program::ProgramInstance &instance)
+                                   vernon::runtime::program::ProgramInstance &instance,
+                                   VernonProgramInstance *nativeInstance)
         : builder(std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline)),
-          transaction(instance.beginInvocation()) {}
+          transaction(instance.beginInvocation()),
+          nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
+        if (!nativeInvocation)
+            throw std::runtime_error("failed to begin native Program invocation");
+    }
     PythonProgramInvocationAdapter(const PythonProgramInvocationAdapter &) = delete;
     PythonProgramInvocationAdapter &operator=(const PythonProgramInvocationAdapter &) = delete;
+    ~PythonProgramInvocationAdapter() { vernonRuntimeProgramInvocationDestroy(nativeInvocation); }
 
     PipelineInvocationBuilder &builderView() const { return *builder; }
 
@@ -761,7 +846,12 @@ struct PythonProgramInvocationAdapter {
             transaction->observeUploads(uploadBytes, uploadRanges);
         if (const std::shared_ptr<void> *payload = transaction->find(slot, key)) {
             auto lease = std::static_pointer_cast<PythonPreparedBindingLease>(*payload);
-            builder->preparedArgument(*nb::cast<PreparedPipelineArgument *>(lease->prepared));
+            auto *argument = nb::cast<PreparedPipelineArgument *>(lease->prepared);
+            builder->preparedArgument(*argument);
+            VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+            if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, nullptr,
+                                                   uploadBytes, uploadRanges) != VERNON_STATUS_OK)
+                throw std::runtime_error("failed to bind native Program argument");
             return;
         }
         nb::object prepared = prepare();
@@ -772,24 +862,80 @@ struct PythonProgramInvocationAdapter {
         if (!eagerUpload)
             transaction->observeUploads(uploadBytes, uploadRanges);
         transaction->stage(slot, key, std::make_shared<PythonPreparedBindingLease>(std::move(prepared)), 0, 0);
+        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, nullptr, uploadBytes,
+                                               uploadRanges) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind native Program argument");
+    }
+
+    void bindRenderPass(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
+        std::vector<VernonPipelineArgument> values;
+        VernonPipelineInvocation frame = control.invocation(values);
+        if (!frame.render_pass)
+            throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
+        const std::string key = canonicalBindingToken(token);
+        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        if (vernonRuntimeProgramInvocationBindRenderPass(nativeInvocation, slot, &bindingToken, frame.render_pass,
+                                                         nullptr, 0) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind native Program RenderPass control");
+    }
+
+    void bindDrawCommand(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
+        std::vector<VernonPipelineArgument> values;
+        VernonPipelineInvocation frame = control.invocation(values);
+        if (!frame.draw_command)
+            throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
+        const std::string key = canonicalBindingToken(token);
+        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        if (vernonRuntimeProgramInvocationBindDrawCommand(nativeInvocation, slot, &bindingToken, frame.draw_command,
+                                                          nullptr) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind native Program DrawCommand control");
+    }
+
+    void bindDynamicState(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
+        std::vector<VernonPipelineArgument> values;
+        VernonPipelineInvocation frame = control.invocation(values);
+        if (!frame.dynamic_state)
+            throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
+        const std::string key = canonicalBindingToken(token);
+        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        if (vernonRuntimeProgramInvocationBindDynamicState(nativeInvocation, slot, &bindingToken,
+                                                           frame.dynamic_state) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to bind native Program DynamicState control");
+    }
+
+    void forward() {
+        if (vernonRuntimeProgramInvocationForward(nativeInvocation, nullptr) != VERNON_STATUS_OK)
+            throw std::runtime_error("native Program invocation failed: " +
+                                     nativeStringView(vernonRuntimeGetLastError(builder->runtime)));
     }
 
     void commit() { snapshot = transaction->commit(); }
-    void rollback() { transaction->rollback(); }
+    void rollback() {
+        transaction->rollback();
+        vernonRuntimeProgramInvocationRollback(nativeInvocation);
+    }
 
     std::unique_ptr<PipelineInvocationBuilder> builder;
     std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
+    VernonProgramInvocation *nativeInvocation{};
 };
 
 struct PythonProgramInstanceAdapter {
     PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline)
-        : owner(owner), runtime(runtime), pipeline(pipeline), nativeInstance(pipeline) {}
+        : owner(owner), runtime(runtime), pipeline(pipeline), nativeInstance(pipeline),
+          nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(pipeline)) {
+        if (!nativeInvocationInstance)
+            throw std::runtime_error("failed to create native Program instance");
+    }
     PythonProgramInstanceAdapter(const PythonProgramInstanceAdapter &) = delete;
     PythonProgramInstanceAdapter &operator=(const PythonProgramInstanceAdapter &) = delete;
+    ~PythonProgramInstanceAdapter() { vernonRuntimeProgramInstanceDestroy(nativeInvocationInstance); }
 
     std::unique_ptr<PythonProgramInvocationAdapter> beginInvocation() {
-        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, pipeline, nativeInstance);
+        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, pipeline, nativeInstance,
+                                                                nativeInvocationInstance);
     }
 
     nb::dict telemetryView() const {
@@ -807,6 +953,7 @@ struct PythonProgramInstanceAdapter {
     VernonRuntimeContext *runtime{};
     VernonLoadedPipeline *pipeline{};
     vernon::runtime::program::ProgramInstance nativeInstance;
+    VernonProgramInstance *nativeInvocationInstance{};
 };
 
 const char *numpyDtypeName(VernonDataType dtype);

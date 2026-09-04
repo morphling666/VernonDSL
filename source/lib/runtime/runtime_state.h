@@ -159,7 +159,6 @@ struct VernonPipelineTopology {
     // category, access, shape and ownership remain exclusively in ProgramABI.
     std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
     std::vector<uint32_t> residualValues;
-    bool directDispatch{};
     std::vector<VernonResolvedProgramStage> stages;
     std::unordered_map<std::string, size_t> stageIndices;
     std::optional<uint64_t> programCheckpointMemoryBudget;

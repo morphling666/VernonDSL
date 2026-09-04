@@ -113,9 +113,14 @@ def main() -> None:
             render(
                 position=positions,
                 offset=offsets,
-                indices=indices,
-                topology=vd.triangles,
-                target=target,
+                draw=vd.draw(index_buffer=vd.index_buffer(indices), instance_count=args.instances),
+                render_pass=vd.render_pass(
+                    target,
+                    colors={
+                        0: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                        1: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                    },
+                ),
             )
             color_rgba = color.to_numpy()
             id_rgba = object_id.to_numpy()

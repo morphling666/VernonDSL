@@ -4,6 +4,7 @@
 #include "runtime/runtime_dispatch.h"
 
 #include <algorithm>
+#include <set>
 
 namespace vernon::runtime::ad {
 
@@ -28,6 +29,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
     }
     ProgramOwnerBindings ownerBindings;
     std::map<std::pair<program::ProgramOwnerKind, uint32_t>, size_t> stagedOwners;
+    std::set<std::pair<program::ProgramOwnerKind, uint32_t>> borrowedOutputOwners;
     if (request.publications) {
         for (const auto &[slot, value] : request.valueBySlot) {
             (void)value;
@@ -40,7 +42,19 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage ||
                 supplied->second->kind != VERNON_PIPELINE_TENSOR)
                 continue;
-            PendingProgramPublication publication{target, *supplied->second, std::nullopt};
+            const auto storage =
+                std::find_if(execution.storages.begin(), execution.storages.end(),
+                             [&](const program::Storage &candidate) { return candidate.id == boundary.aliasOwner.id; });
+            if (storage == execution.storages.end()) {
+                error = "Program output boundary references an unknown Storage";
+                return false;
+            }
+            const auto key = std::make_pair(boundary.aliasOwner.kind, boundary.aliasOwner.id);
+            if (storage->ownership == program::StorageOwnership::Borrowed) {
+                borrowedOutputOwners.insert(key);
+                continue;
+            }
+            PendingProgramPublication publication{target, *supplied->second};
             if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 VernonRhiBuffer destination{};
                 if (!resolveBackendRhiBufferReference(context, supplied->second->tensor.resource, destination)) {
@@ -49,7 +63,6 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 }
                 publication.destinationBuffer = destination;
             }
-            const auto key = std::make_pair(boundary.aliasOwner.kind, boundary.aliasOwner.id);
             stagedOwners.emplace(key, request.publications->size());
             request.publications->push_back(std::move(publication));
         }
@@ -64,23 +77,26 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
         const program::ProgramOwnerId &owner = execution.abi.boundarySlots[slot].aliasOwner;
         if (!ownerBindings.bind(owner, *supplied->second, error))
             return false;
-        const auto staged = stagedOwners.find(std::make_pair(owner.kind, owner.id));
-        if (staged != stagedOwners.end()) {
-            PendingProgramPublication &publication = (*request.publications)[staged->second];
-            if (execution.abi.boundarySlots[slot].role == program::BoundaryRole::Input) {
-                publication.initialValue = *supplied->second;
-                if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                    VernonRhiBuffer initial{};
-                    if (!resolveBackendRhiBufferReference(context, supplied->second->tensor.resource, initial)) {
-                        error = "PublicationPlan device input is not backed by a referenced Vernon RHI buffer";
-                        return false;
-                    }
-                    publication.initialBuffer = initial;
-                }
+        const auto ownerKey = std::make_pair(owner.kind, owner.id);
+        if (borrowedOutputOwners.count(ownerKey)) {
+            if (owner.kind != program::ProgramOwnerKind::Storage || supplied->second->kind != VERNON_PIPELINE_TENSOR) {
+                error = "borrowed Program output owner is not Tensor Storage";
+                return false;
             }
             ProgramStorageBacking &backing = backings[owner.id];
-            backing.bytes = std::max(backing.bytes, supplied->second->tensor.byte_size);
+            backing.external = *supplied->second;
+            backing.bytes = supplied->second->tensor.byte_size;
             backing.sized = backing.bytes != 0;
+            externalValues.emplace(value, *supplied->second);
+            live[value] = 1;
+            continue;
+        }
+        const auto staged = stagedOwners.find(ownerKey);
+        if (staged != stagedOwners.end()) {
+            if (execution.abi.boundarySlots[slot].role == program::BoundaryRole::Input) {
+                error = "owned Program Storage cannot be bound as a public input";
+                return false;
+            }
             live[value] = 1;
             continue;
         }

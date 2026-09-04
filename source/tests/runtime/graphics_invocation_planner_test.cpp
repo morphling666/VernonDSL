@@ -1,4 +1,5 @@
 #include "runtime/graphics_invocation_planner.h"
+#include "runtime/graphics_scope_planner.h"
 #include "runtime/pipeline_metadata.h"
 
 #include <gtest/gtest.h>
@@ -81,15 +82,25 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
 
     VernonColorAttachment attachment{};
     attachment.view = {1, {3}, 0, 1024};
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = &attachment;
+    renderPass.color_attachment_count = 1;
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = divisor ? 3 : 0;
+    draw.instance_count = instanceCount;
+    VernonGraphicsState state{};
+    state.struct_size = sizeof(state);
+    state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.vertex_count = divisor ? 3 : 0;
-    invocation.instance_count = instanceCount;
+    invocation.graphics_state = &state;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
     return planForTest(variant, invocation, plan, error);
 }
 
@@ -155,16 +166,30 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     attachments[1].location = 0;
     attachments[1].view = firstTarget;
     VernonIndexBinding index{VERNON_INDEX_U32, 0, 6, indexBuffer};
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = attachments;
+    renderPass.color_attachment_count = std::size(attachments);
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.index_binding = &index;
+    draw.instance_count = 1;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.viewport[2] = 20;
+    dynamic.viewport[3] = 10;
+    VernonGraphicsState state{};
+    state.struct_size = sizeof(state);
+    state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.index_binding = &index;
-    invocation.color_attachments = attachments;
-    invocation.color_attachment_count = std::size(attachments);
-    invocation.viewport[2] = 20;
-    invocation.viewport[3] = 10;
+    invocation.graphics_state = &state;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
+    invocation.dynamic_state = &dynamic;
 
     PlannedGraphicsInvocation plan;
     std::string error;
@@ -261,7 +286,7 @@ TEST(GraphicsInvocationPlanner, AppliesInstanceDivisorsToInferredAndExplicitCoun
 }
 
 TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
-    VernonRhiColorBlendState blends[2]{};
+    VernonColorBlendState blends[2]{};
     blends[0].blend_enabled = 1;
     blends[0].source_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
     blends[0].destination_color_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
@@ -288,7 +313,10 @@ TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
     source.color_blend_count = std::size(blends);
     VernonPipelineInvocation invocation{};
     invocation.graphics_state = &source;
-    invocation.stencil_reference = 3;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.stencil_reference = 3;
+    invocation.dynamic_state = &dynamic;
 
     PlannedGraphicsState planned;
     std::string error;
@@ -301,11 +329,11 @@ TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
 
     source.color_blend_count = 1;
     EXPECT_FALSE(planGraphicsState(invocation, std::size(blends), true, true, planned, error));
-    EXPECT_EQ(error, "graphics state does not match the render-target layout");
+    EXPECT_EQ(error, "graphics state color blend count does not match the color attachment count");
 }
 
 TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
-    VernonRhiColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.source_color_factor = VERNON_RHI_BLEND_DESTINATION_COLOR;
     blend.destination_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
@@ -349,7 +377,10 @@ TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
     source.depth_stencil.stencil_read_mask = 0x100;
     EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
     source.depth_stencil.stencil_read_mask = 0;
-    invocation.stencil_reference = 0x100;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.stencil_reference = 0x100;
+    invocation.dynamic_state = &dynamic;
     EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
 }
 
@@ -365,6 +396,96 @@ TEST(GraphicsInvocationPlanner, VariantKeyUsesOnlyCanonicalStaticFields) {
     EXPECT_EQ(graphicsVariantKeyHash(first), graphicsVariantKeyHash(same));
     same.colorBlends[0].write_mask = VERNON_RHI_COLOR_WRITE_RED;
     EXPECT_FALSE(graphicsVariantKeysEqual(first, same));
+}
+
+TEST(GraphicsScopePlanner, MergesOnlyPreservedCompatibleAttachments) {
+    VernonColorAttachment previous{};
+    previous.location = 0;
+    previous.view = {7, {11}, 0, 0};
+    previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    VernonColorAttachment following = previous;
+    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    PlannedGraphicsInvocation first;
+    first.attachments = {&previous};
+    first.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
+    first.attachmentWidth = 16;
+    first.attachmentHeight = 16;
+    PlannedGraphicsInvocation second = first;
+    second.attachments = {&following};
+
+    GraphicsScopePlanner planner;
+    EXPECT_FALSE(planner.canAppend(first));
+    planner.append(first);
+    EXPECT_TRUE(planner.canAppend(second));
+    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    EXPECT_FALSE(planner.canAppend(second));
+    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    following.view.identity = 8;
+    EXPECT_FALSE(planner.canAppend(second));
+}
+
+TEST(GraphicsScopePlanner, SamplingPreviousDepthAttachmentEndsScope) {
+    VernonDepthAttachment previous{};
+    previous.view = {17, {29}, 0, 0};
+    previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    previous.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+    VernonDepthAttachment following = previous;
+    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    following.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+
+    PlannedGraphicsInvocation shadow;
+    shadow.depthAttachment = &previous;
+    shadow.depthFormat = VERNON_TEXTURE_D32_FLOAT;
+    shadow.attachmentWidth = 16;
+    shadow.attachmentHeight = 16;
+    PlannedGraphicsInvocation pbr = shadow;
+    pbr.depthAttachment = &following;
+    pbr.sampledResources[{0, 0}].imageView = previous.view;
+
+    GraphicsScopePlanner planner;
+    planner.append(shadow);
+    EXPECT_FALSE(planner.canAppend(pbr));
+}
+
+TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
+    Variant variant;
+    variant.vertex = "vertex";
+    variant.fragment = "fragment";
+    VernonColorAttachment attachment{};
+    attachment.view = {4, {14}, 0, 0};
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = &attachment;
+    renderPass.color_attachment_count = 1;
+    renderPass.render_area[2] = 10;
+    renderPass.render_area[3] = 11;
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 2;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.viewport[2] = 12;
+    dynamic.viewport[3] = 13;
+    VernonGraphicsState state{};
+    state.struct_size = sizeof(state);
+    state.topology = VERNON_TOPOLOGY_LINE_LIST;
+
+    VernonPipelineInvocation invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
+    invocation.dynamic_state = &dynamic;
+    invocation.graphics_state = &state;
+    PlannedGraphicsInvocation planned;
+    std::string error;
+    ASSERT_TRUE(planForTest(variant, invocation, planned, error)) << error;
+    EXPECT_EQ(planned.vertexCount, 3u);
+    EXPECT_EQ(planned.instanceCount, 2u);
+    EXPECT_EQ(planned.topology, VERNON_TOPOLOGY_LINE_LIST);
+    EXPECT_EQ(planned.resolution[0], 12.0f);
+    EXPECT_EQ(planned.resolution[1], 13.0f);
 }
 
 } // namespace

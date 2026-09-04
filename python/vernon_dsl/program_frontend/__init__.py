@@ -10,7 +10,6 @@ from .providers import (
     BuiltinDslProvider,
     CapturedDslProvider,
     CapturedVjpDslProvider,
-    DirectKernelDslProvider,
     ProviderChain,
 )
 
@@ -20,7 +19,6 @@ __all__ = [
     "BuiltinDslProvider",
     "CapturedDslProvider",
     "CapturedVjpDslProvider",
-    "DirectKernelDslProvider",
     "ParsedProgram",
     "ProgramImplementation",
     "ProgramType",

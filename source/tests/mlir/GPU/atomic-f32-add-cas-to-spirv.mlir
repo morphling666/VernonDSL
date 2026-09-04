@@ -8,7 +8,7 @@
 // CHECK-NOT: AtomicFloat32AddEXT
 // CHECK-NOT: !spirv.ptr<f32, Workgroup>
 
-module attributes {vernon.compiler_contract_version = 13 : i64, vernon.pipeline_version = 17 : i64} {
+module attributes {vernon.compiler_contract_version = 14 : i64, vernon.pipeline_version = 18 : i64} {
   gpu.module @kernels {
     gpu.func @add(%storage: memref<1xf32, #spirv.storage_class<Workgroup>>) kernel
         attributes {spirv.entry_point_abi = #spirv.entry_point_abi<workgroup_size = [1, 1, 1]>} {

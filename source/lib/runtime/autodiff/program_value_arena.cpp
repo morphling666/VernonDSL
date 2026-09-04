@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 
@@ -70,6 +71,7 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
         error = "Program invocation frame requirement set does not match its values";
         return false;
     }
+    deviceUploads_.clear();
     struct HostBacking {
         const void *data{};
         size_t bytes{};
@@ -94,10 +96,11 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
     for (auto &[identity, backing] : backings) {
         (void)identity;
         backing.device = std::make_shared<gpu::DeviceBuffer>(context, backing.bytes);
-        if (!backing.device->valid() || !backing.device->upload(backing.data, backing.bytes)) {
-            error = "Program invocation frame could not allocate or upload a Storage backing";
+        if (!backing.device->valid()) {
+            error = "Program invocation frame could not allocate a Storage backing";
             return false;
         }
+        deviceUploads_.push_back({backing.device->handle(), backing.data, backing.bytes});
     }
     for (size_t value = 0; value < logicalArguments_.size(); ++value) {
         if (!required[value])
@@ -158,6 +161,15 @@ bool ProgramInvocationFrame::adoptRetainedValue(uint32_t value, const ProgramInv
     const bool externalResource = retainedArgument.kind != VERNON_PIPELINE_TENSOR ||
                                   retainedArgument.tensor.storage == VERNON_TENSOR_RHI_RESOURCE;
     if (retained.logicalBuffers_[value] || externalResource) {
+        if (logicalBuffers_[value]) {
+            const VernonRhiBuffer replaced = logicalBuffers_[value]->handle();
+            deviceUploads_.erase(std::remove_if(deviceUploads_.begin(), deviceUploads_.end(),
+                                                [&](const ProgramDeviceUpload &upload) {
+                                                    return upload.destination.index == replaced.index &&
+                                                           upload.destination.generation == replaced.generation;
+                                                }),
+                                 deviceUploads_.end());
+        }
         logicalBuffers_[value] = retained.logicalBuffers_[value];
         logicalArguments_[value] = retainedArgument;
     }
@@ -268,6 +280,66 @@ bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &requ
     return true;
 }
 
+bool ProgramInvocationFrame::resolveControl(const program::Program &program, const program::ControlComponent &control,
+                                            uint64_t &value, std::string &error) const {
+    if (control.kind == program::ControlKind::Static) {
+        value = control.value;
+        return true;
+    }
+    uint32_t valueId = UINT32_MAX;
+    if (control.kind == program::ControlKind::Parameter) {
+        if (control.reference < program.parameters.size())
+            valueId = program.parameters[control.reference].value;
+    } else {
+        const auto argument =
+            std::find_if(program.values.begin(), program.values.end(), [&](const program::Value &row) {
+                return row.origin.kind == program::OriginKind::Argument && row.origin.slot == control.reference;
+            });
+        if (argument != program.values.end())
+            valueId = argument->id;
+    }
+    if (valueId >= hostValues_.size())
+        return error = "Program dispatch control references an unavailable value", false;
+    const VernonPipelineArgument &argument = hostValues_[valueId].argument;
+    if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
+        !argument.tensor.host_data || argument.tensor.byte_offset > argument.tensor.byte_size)
+        return error = "Program dispatch control is not a host scalar value", false;
+    const uint8_t *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
+    const std::string &dtype = program.values[valueId].canonicalType.dtype;
+    if (dtype == "u32" || dtype == "ui32") {
+        uint32_t scalar{};
+        std::memcpy(&scalar, data, sizeof(scalar));
+        value = scalar;
+    } else if (dtype == "i32" || dtype == "si32") {
+        int32_t scalar{};
+        std::memcpy(&scalar, data, sizeof(scalar));
+        if (scalar < 0)
+            return error = "Program dispatch control must be non-negative", false;
+        value = static_cast<uint64_t>(scalar);
+    } else if (dtype == "u64" || dtype == "ui64" || dtype == "index") {
+        std::memcpy(&value, data, sizeof(value));
+    } else if (dtype == "i64" || dtype == "si64") {
+        int64_t scalar{};
+        std::memcpy(&scalar, data, sizeof(scalar));
+        if (scalar < 0)
+            return error = "Program dispatch control must be non-negative", false;
+        value = static_cast<uint64_t>(scalar);
+    } else {
+        return error = "Program dispatch control must be an integer scalar", false;
+    }
+    return true;
+}
+
+bool ProgramInvocationFrame::bindControlImageStorage(const program::Program &program, uint32_t storage,
+                                                     VernonRuntimeProviderResourceReference view, std::string &error) {
+    if (!view.identity || !view.resource.value)
+        return error = "Program attachment Storage has no runtime image view", false;
+    if (storage >= program.storages.size())
+        return error = "Program attachment access references an unknown Storage", false;
+    return controlImages_.emplace(storage, view).second || controlImages_.at(storage).identity == view.identity ||
+           (error = "Program Storage is projected from multiple runtime image views", false);
+}
+
 bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &program, const program::Node &node,
                                                       const VernonResolvedProgramStage &stage,
                                                       MaterializedProgramArguments &output, std::string &error) const {
@@ -280,17 +352,17 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
     output.shapes.reserve(stage.bindings.size());
     output.strides.reserve(stage.bindings.size());
     uint64_t dispatchInvocations = 1;
-    for (const program::ControlComponent &control : node.compute.workgroups) {
-        if (control.kind != program::ControlKind::Static) {
-            error = "Program dispatch requires a resolved static invocation shape";
-            return false;
-        }
-        const uint64_t extent = control.value;
-        if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent) {
-            error = "Program dispatch invocation count overflows";
-            return false;
-        } else {
-            dispatchInvocations *= extent;
+    if (program::executionKind(node) == program::ExecutionKind::Compute) {
+        for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
+            uint64_t extent{};
+            if (!resolveControl(program, control, extent, error))
+                return false;
+            if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent) {
+                error = "Program dispatch invocation count overflows";
+                return false;
+            } else {
+                dispatchInvocations *= extent;
+            }
         }
     }
     for (uint32_t extent :
@@ -308,7 +380,18 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             error = "resolved Program stage binding exceeds the invocation frame";
             return false;
         }
-        const VernonPipelineArgument *source = argument(binding.value, binding.target ? &*binding.target : nullptr);
+        VernonPipelineArgument controlImage{};
+        const VernonPipelineArgument *source = nullptr;
+        const program::Value &programValue = program.values[binding.value];
+        const auto image = programValue.storage ? controlImages_.find(*programValue.storage) : controlImages_.end();
+        if (image != controlImages_.end()) {
+            controlImage.slot = binding.value;
+            controlImage.kind = VERNON_PIPELINE_IMAGE;
+            controlImage.image.view = image->second;
+            source = &controlImage;
+        } else {
+            source = argument(binding.value, binding.target ? &*binding.target : nullptr);
+        }
         if (!source) {
             error = "resolved Program stage binding has no physical carrier";
             return false;

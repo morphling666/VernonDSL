@@ -669,7 +669,7 @@ VernonStatus preparePipelineImpl(void *data, const VernonRuntimeProviderPipeline
             (!hasDepth && (depthState.depth_test || depthState.depth_write)) ||
             (!hasStencil && depthState.stencil_test))
             return fail(adapter, "Vulkan graphics pipeline contains an invalid depth/stencil state");
-        const auto stencilFace = [](const VernonRuntimeProviderStencilFaceState &face) {
+        const auto stencilFace = [](const VernonStencilFaceState &face) {
             return VkStencilOpState{static_cast<VkStencilOp>(face.stencil_fail),
                                     static_cast<VkStencilOp>(face.pass),
                                     static_cast<VkStencilOp>(face.depth_fail),
@@ -1279,9 +1279,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!descriptor || !pipeline || !pipeline->graphics || !pipeline->pipeline ||
-        descriptor->color_attachment_count == 0 ||
-        descriptor->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS)
+    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics || !pipeline->pipeline)
         return fail(adapter, "Vulkan adapter received an invalid draw");
     const VkCommandBuffer command = reinterpret_cast<VkCommandBuffer>(nativeCommandEncoder(adapter, commandEncoder));
     const int renderingClaim =

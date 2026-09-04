@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace vernon::tests {
 
@@ -33,6 +34,40 @@ struct RhiImageView {
 struct RhiSampler {
     VernonRhiSampler handle{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference reference{};
+};
+
+struct GraphicsInvocationControls {
+    VernonGraphicsState state{};
+    VernonRenderPass renderPass{};
+    VernonDrawCommand draw{};
+    VernonDynamicState dynamic{};
+    std::vector<VernonColorBlendState> blends;
+
+    GraphicsInvocationControls(const VernonColorAttachment *colors, size_t colorCount, uint32_t vertexCount = 0,
+                               uint32_t instanceCount = 1,
+                               VernonPrimitiveTopology topology = VERNON_TOPOLOGY_TRIANGLE_LIST) {
+        state.struct_size = sizeof(state);
+        state.topology = topology;
+        blends.resize(colorCount);
+        for (VernonColorBlendState &blend : blends)
+            blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
+        state.color_blends = blends.data();
+        state.color_blend_count = blends.size();
+        renderPass.struct_size = sizeof(renderPass);
+        renderPass.color_attachments = colors;
+        renderPass.color_attachment_count = colorCount;
+        draw.struct_size = sizeof(draw);
+        draw.vertex_count = vertexCount;
+        draw.instance_count = instanceCount;
+        dynamic.struct_size = sizeof(dynamic);
+    }
+
+    void bind(VernonPipelineInvocation &invocation) {
+        invocation.graphics_state = &state;
+        invocation.render_pass = &renderPass;
+        invocation.draw_command = &draw;
+        invocation.dynamic_state = &dynamic;
+    }
 };
 
 inline VernonStatus completeSubmission(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {

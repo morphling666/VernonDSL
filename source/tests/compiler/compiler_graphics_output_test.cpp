@@ -284,8 +284,7 @@ TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
         if (target == VERNON_TARGET_METAL) {
             const VernonStringView reflection = vernonCompileResultGetReflection(result);
             const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
-            ASSERT_TRUE(reflected.contains("metal_resource_slots"));
-            const auto &slots = reflected["metal_resource_slots"];
+            const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
             auto hasSlot = [&](std::string_view entry, std::string_view kind, uint32_t set, uint32_t binding,
                                uint32_t argumentBuffer, uint32_t memberId) {
                 return std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
@@ -387,7 +386,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     EXPECT_NE(output.find("[[buffer(1)]]"), std::string::npos);
     const VernonStringView reflection = vernonCompileResultGetReflection(result);
     const auto reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
-    const auto &slots = reflected.at("metal_resource_slots");
+    const auto &slots = reflected.at("implementation").at("metadata").at("resource_slots");
     for (uint32_t set = 0; set < 2; ++set) {
         EXPECT_TRUE(std::any_of(slots.begin(), slots.end(), [&](const nlohmann::json &slot) {
             return slot.value("entry_point", "") == "multi_set_compute" && slot.value("kind", "") == "storage_buffer" &&

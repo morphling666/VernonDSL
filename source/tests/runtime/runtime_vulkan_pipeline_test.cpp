@@ -209,7 +209,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     depthAttachment.stencil_load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
     depthAttachment.stencil_store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
     depthAttachment.clear_stencil = 7;
-    VernonRhiColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.source_color_factor = VERNON_RHI_BLEND_ONE;
     blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
     blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
@@ -231,20 +231,28 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     graphicsState.depth_stencil.back = graphicsState.depth_stencil.front;
     graphicsState.color_blends = &blend;
     graphicsState.color_blend_count = 1;
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    renderPass.color_attachments = &attachment;
+    renderPass.color_attachment_count = 1;
+    renderPass.depth_attachment = &depthAttachment;
+    VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, std::size(indices), indexBuffer.reference};
+    VernonDrawCommand draw{};
+    draw.struct_size = sizeof(draw);
+    draw.index_binding = &indexBinding;
+    draw.instance_count = 1;
+    VernonDynamicState dynamic{};
+    dynamic.struct_size = sizeof(dynamic);
+    dynamic.stencil_reference = 3;
     VernonPipelineInvocation invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.depth_attachment = &depthAttachment;
     invocation.graphics_state = &graphicsState;
-    invocation.stencil_reference = 3;
-    VernonIndexBinding indexBinding{VERNON_INDEX_U32, 0, std::size(indices), indexBuffer.reference};
-    invocation.index_binding = &indexBinding;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.instance_count = 1;
+    invocation.render_pass = &renderPass;
+    invocation.draw_command = &draw;
+    invocation.dynamic_state = &dynamic;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats firstStats =
@@ -266,10 +274,10 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_EQ(vernonRhiDeviceUploadImage(context.device, sampled.handle, &upload, 1), VERNON_RHI_STATUS_OK);
     attachment.view = secondTargetView.reference;
     depthAttachment.view = secondDepthView.reference;
-    invocation.viewport[0] = 4;
-    invocation.viewport[1] = 3;
-    invocation.viewport[2] = 24;
-    invocation.viewport[3] = 12;
+    dynamic.viewport[0] = 4;
+    dynamic.viewport[1] = 3;
+    dynamic.viewport[2] = 24;
+    dynamic.viewport[3] = 12;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats secondStats =
@@ -284,7 +292,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     EXPECT_EQ(secondStats.stagingBufferAllocations, firstStats.stagingBufferAllocations);
     EXPECT_EQ(secondStats.renderPassCreations, firstStats.renderPassCreations);
 
-    invocation.stencil_reference = 9;
+    dynamic.stencil_reference = 9;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     const vernon::runtime::VulkanGraphicsCacheStats warmStats =
@@ -348,7 +356,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
 
     attachment.view = firstTargetView.reference;
     depthAttachment.view = firstDepthView.reference;
-    std::fill(std::begin(invocation.viewport), std::end(invocation.viewport), 0);
+    std::fill(std::begin(dynamic.viewport), std::end(dynamic.viewport), 0);
     const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
     {
         vernon::execution::ExecutionGraph graph(context.device);

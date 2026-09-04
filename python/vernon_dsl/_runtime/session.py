@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import weakref
 from dataclasses import dataclass
 from typing import Any
@@ -50,14 +51,15 @@ class RuntimeUnavailableError(RuntimeError):
 
 def _release_runtime() -> None:
     global _native_runtime, _rhi_host, _owned_opengl_context
-    Kernel.invalidate_loaded()
-    invalidate_loaded_vjps()
-    for compiled in Pipeline._cache.values():
-        compiled.native = None
+    # Collect dead module/program cycles while their native runtime is still
+    # valid. Otherwise their native wrappers can be finalized during a later
+    # compiler call, after the runtime they borrowed from has been replaced.
+    gc.collect()
     for submission in list(_runtime_submissions):
         submission._release_runtime_native()
     for child in list(_runtime_children):
         child._release_runtime_native()
+    invalidate_loaded_vjps()
     _native_runtime = None
     _rhi_host = None
     _owned_opengl_context = None

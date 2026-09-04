@@ -27,6 +27,19 @@ bool compatibleAbiShape(const llvm::json::Array *logical, const llvm::json::Arra
     return true;
 }
 
+bool compatibleAbiShapeSuffix(const llvm::json::Array *logical, const llvm::json::Array *physical) {
+    if (!logical || !physical || logical->size() < physical->size())
+        return false;
+    const size_t offset = logical->size() - physical->size();
+    for (size_t index = 0; index < physical->size(); ++index) {
+        const std::optional<int64_t> concrete = (*logical)[offset + index].getAsInteger();
+        const std::optional<int64_t> declared = (*physical)[index].getAsInteger();
+        if (!concrete || !declared || (*concrete > 0 && *declared > 0 && *concrete != *declared))
+            return false;
+    }
+    return true;
+}
+
 const llvm::json::Object *selectedTransportPlan(const llvm::json::Object &row) {
     const llvm::json::Object *layouts = row.getObject("physical_layouts");
     if (!layouts)
@@ -168,6 +181,35 @@ bool compatibleProgramBindingShape(llvm::StringRef role, llvm::StringRef carrier
         const std::optional<int64_t> actual = (*physical)[index + 1].getAsInteger();
         if (!expected || !actual || (*expected > 0 && *actual > 0 && *expected != *actual))
             return false;
+    }
+    return true;
+}
+
+bool verifyProgramEndpointAbi(const ProgramEndpointExpectation &expected, const llvm::json::Object &compiled,
+                              std::string &error) {
+    const llvm::StringRef kind = compiled.getString("kind").value_or("");
+    if (kind == "image" || kind == "sampler")
+        return true;
+    const std::optional<llvm::StringRef> actualDtype =
+        compiled.getString("dtype") ? compiled.getString("dtype") : compiled.getString("vernon.dtype");
+    const llvm::json::Array *actualShape =
+        expected.physicalShape
+            ? expected.physicalShape
+            : (compiled.getArray("shape") ? compiled.getArray("shape") : compiled.getArray("source_shape"));
+    const llvm::json::Object *actualLayout = compiled.getObject("value_layout");
+    const std::optional<llvm::StringRef> expectedLayoutHash =
+        expected.layout ? expected.layout->getString("layout_hash") : std::nullopt;
+    const std::optional<llvm::StringRef> actualLayoutHash =
+        actualLayout ? actualLayout->getString("layout_hash") : std::nullopt;
+    if (expected.canonicalValueLayout && expectedLayoutHash && actualLayoutHash &&
+        *expectedLayoutHash == *actualLayoutHash)
+        return true;
+    const bool shapeMatches = expected.vertexElement ? compatibleAbiShapeSuffix(expected.shape, actualShape)
+                                                     : compatibleProgramBindingShape(expected.role, expected.carrier,
+                                                                                     expected.shape, actualShape);
+    if ((expected.dtype && actualDtype && *expected.dtype != *actualDtype) || !shapeMatches) {
+        error = "compiled endpoint dtype, shape, or value layout does not match its Program Value";
+        return false;
     }
     return true;
 }

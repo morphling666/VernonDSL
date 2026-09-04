@@ -17,11 +17,28 @@ bool assembleCanonicalProgram(const llvm::json::Object &rawSignature,
                               const std::map<int64_t, int64_t> &storageByValue, const std::set<int64_t> &capturedValues,
                               llvm::json::Object &program, std::string &error) {
     llvm::json::Array canonicalGraphs;
+    std::set<int64_t> publicArgumentValues;
+    for (llvm::StringRef field : {"inputs", "cotangents"})
+        if (const llvm::json::Array *rows = rawSignature.getArray(field))
+            for (const llvm::json::Value &rowValue : *rows)
+                if (const llvm::json::Object *row = rowValue.getAsObject())
+                    if (std::optional<int64_t> value = row->getInteger("value"))
+                        publicArgumentValues.insert(*value);
     for (const CanonicalProgramGraph &view : selectedGraphs) {
         llvm::json::Array graphInputs;
-        for (size_t slot = 0; slot < view.arguments.size(); ++slot)
-            graphInputs.emplace_back(llvm::json::Object{
-                {"tag", "user_input"}, {"value", view.arguments[slot]}, {"slot", static_cast<int64_t>(slot)}});
+        size_t userSlot = 0;
+        for (int64_t valueId : view.arguments) {
+            if (publicArgumentValues.count(valueId)) {
+                for (llvm::json::Value &value : values)
+                    if (llvm::json::Object *row = value.getAsObject(); row && row->getInteger("id") == valueId)
+                        if (llvm::json::Object *origin = row->getObject("origin");
+                            origin && origin->getString("tag") == "argument" && origin->getString("graph") == view.name)
+                            (*origin)["slot"] = static_cast<int64_t>(userSlot);
+                graphInputs.emplace_back(llvm::json::Object{
+                    {"tag", "user_input"}, {"value", valueId}, {"slot", static_cast<int64_t>(userSlot++)}});
+            } else
+                graphInputs.emplace_back(llvm::json::Object{{"tag", "invocation_control"}, {"value", valueId}});
+        }
         for (const llvm::json::Value &rowValue : values) {
             const llvm::json::Object *row = rowValue.getAsObject();
             const llvm::json::Object *origin = row ? row->getObject("origin") : nullptr;

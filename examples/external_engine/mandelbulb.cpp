@@ -24,9 +24,9 @@ std::string runtimeError(VernonRuntimeContext *runtime) {
     return error.data ? std::string(error.data, error.size) : "unknown Runtime error";
 }
 
-bool findParameter(VernonLoadedPipeline *pipeline, const char *name, size_t size,
+bool findParameter(VernonProgramExecutable *pipeline, const char *name, size_t size,
                    VernonPipelineParameterView &parameter) {
-    return vernonRuntimeLoadedPipelineFindParameter(pipeline, {name, size}, &parameter) == VERNON_STATUS_OK;
+    return vernonRuntimeProgramExecutableFindParameter(pipeline, {name, size}, &parameter) == VERNON_STATUS_OK;
 }
 
 VernonPipelineArgument hostArgument(const VernonPipelineParameterView &parameter, const void *data, size_t size,
@@ -50,7 +50,7 @@ VernonPipelineArgument hostArgument(const VernonPipelineParameterView &parameter
 class MandelbulbRenderPass final : public vernon::execution::RenderPass {
 public:
     MandelbulbRenderPass(vernon::execution::GraphImage target, VernonRuntimeContext *runtime,
-                         VernonLoadedPipeline *pipeline, VernonPipelineInvocation *invocation)
+                         VernonProgramExecutable *pipeline, VernonPipelineInvocation *invocation)
         : RenderPass("mandelbulb-raymarch"), target_(target), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -78,7 +78,7 @@ public:
 private:
     vernon::execution::GraphImage target_;
     VernonRuntimeContext *runtime_{};
-    VernonLoadedPipeline *pipeline_{};
+    VernonProgramExecutable *pipeline_{};
     VernonPipelineInvocation *invocation_{};
 };
 
@@ -194,9 +194,9 @@ public:
         image_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         vertexBuffer_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         if (pipeline_)
-            vernonRuntimeLoadedPipelineDestroy(pipeline_);
+            vernonRuntimeProgramExecutableDestroy(pipeline_);
         if (bundle_)
-            vernonRuntimePipelineBundleDestroy(bundle_);
+            vernonRuntimeProgramBundleDestroy(bundle_);
         if (runtime_)
             vernonRuntimeDestroy(runtime_);
         pipeline_ = nullptr;
@@ -259,8 +259,8 @@ private:
 
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
-    VernonPipelineBundle *bundle_{};
-    VernonLoadedPipeline *pipeline_{};
+    VernonProgramBundle *bundle_{};
+    VernonProgramExecutable *pipeline_{};
     VernonRhiBuffer vertexBuffer_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference vertexReference_{};
     VernonRhiImage image_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};

@@ -3,15 +3,36 @@
 
 #include "llvm/Support/JSON.h"
 
+#include <map>
+#include <optional>
 #include <string>
 
 namespace vernon::compiler {
 
-struct CanonicalComputeStage {
+enum class ProgramStageOperation {
+    Compute,
+    Graphics,
+};
+
+struct CompiledProgramModule {
+    std::string entryName;
+    llvm::json::Object entry;
+};
+
+struct ProgramTargetImplementation {
+    std::string target;
+    llvm::json::Object metadata;
+};
+
+struct CanonicalProgramStage {
     std::string requestId;
     std::string implementationStageId;
-    llvm::json::Object compiledReflection;
-    llvm::json::Object compiledEntry;
+    ProgramStageOperation operation{ProgramStageOperation::Compute};
+    std::map<std::string, CompiledProgramModule> modules;
+    llvm::json::Object portableReflection;
+    ProgramTargetImplementation targetImplementation;
+    std::string targetIdentity;
+    std::optional<int64_t> pipelineVersion;
 };
 
 } // namespace vernon::compiler

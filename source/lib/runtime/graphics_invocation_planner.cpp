@@ -52,15 +52,18 @@ bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorC
     state.depthStencil.depth_compare = VERNON_RHI_COMPARE_LESS;
     state.depthStencil.stencil_read_mask = 0xff;
     state.depthStencil.stencil_write_mask = 0xff;
-    state.stencilReference = invocation.stencil_reference;
+    if (invocation.dynamic_state && invocation.dynamic_state->struct_size < sizeof(VernonDynamicState))
+        return fail(error, "DynamicState control metadata is incomplete");
+    state.stencilReference = invocation.dynamic_state ? invocation.dynamic_state->stencil_reference : 0;
     state.colorBlends.resize(colorCount);
     for (auto &blend : state.colorBlends)
         blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     if (invocation.graphics_state) {
         const VernonGraphicsState &source = *invocation.graphics_state;
-        if (source.struct_size < sizeof(source) || source.color_blend_count != colorCount ||
-            (colorCount && !source.color_blends))
-            return fail(error, "graphics state does not match the render-target layout");
+        if (source.struct_size < sizeof(source))
+            return fail(error, "graphics state metadata is incomplete");
+        if (source.color_blend_count != colorCount || (colorCount && !source.color_blends))
+            return fail(error, "graphics state color blend count does not match the color attachment count");
         state.rasterization = source.rasterization;
         state.depthStencil = source.depth_stencil;
         for (size_t index = 0; index < colorCount; ++index) {
@@ -72,6 +75,10 @@ bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorC
                face.depth_fail <= VERNON_RHI_STENCIL_DECREMENT_WRAP && face.pass <= VERNON_RHI_STENCIL_DECREMENT_WRAP &&
                face.compare <= VERNON_RHI_COMPARE_ALWAYS;
     };
+    if (!hasDepth && (state.depthStencil.depth_test || state.depthStencil.depth_write))
+        return fail(error, "graphics depth test/write requires a depth attachment");
+    if (!hasStencil && state.depthStencil.stencil_test)
+        return fail(error, "graphics stencil test requires a stencil attachment");
     if (state.rasterization.cull_mode > VERNON_RHI_CULL_BACK ||
         state.rasterization.front_face > VERNON_RHI_FRONT_FACE_CLOCKWISE || state.rasterization.depth_clamp > 1 ||
         state.rasterization.depth_bias_enabled > 1 || !std::isfinite(state.rasterization.depth_bias_constant) ||
@@ -79,9 +86,7 @@ bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorC
         state.depthStencil.depth_write > 1 || state.depthStencil.depth_compare > VERNON_RHI_COMPARE_ALWAYS ||
         state.depthStencil.stencil_test > 1 || !validFace(state.depthStencil.front) ||
         !validFace(state.depthStencil.back) || state.depthStencil.stencil_read_mask > 0xff ||
-        state.depthStencil.stencil_write_mask > 0xff || state.stencilReference > 0xff ||
-        (!hasDepth && (state.depthStencil.depth_test || state.depthStencil.depth_write)) ||
-        (!hasStencil && state.depthStencil.stencil_test))
+        state.depthStencil.stencil_write_mask > 0xff || state.stencilReference > 0xff)
         return fail(error, "graphics state contains an invalid or unsupported value");
     for (const auto &blend : state.colorBlends)
         if (blend.blend_enabled > 1 || blend.source_color_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
@@ -151,20 +156,28 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
     prepared = {};
 }
 
-bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &source,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
     plan = {};
-    for (size_t index = 0; index < invocation.argument_count; ++index)
-        if (!plan.arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
+    for (size_t index = 0; index < source.argument_count; ++index)
+        if (!plan.arguments.emplace(source.arguments[index].slot, &source.arguments[index]).second)
             return fail(error, "duplicate pipeline argument slot");
     if (plan.arguments.size() != variant.parameters.size())
         return fail(error, "pipeline argument count does not match layout");
 
     for (const Parameter &parameter : variant.parameters) {
         const auto found = plan.arguments.find(parameter.slot);
-        if (found == plan.arguments.end() || !kindMatches(parameter, *found->second))
-            return fail(error, "pipeline argument kind does not match layout");
+        if (found == plan.arguments.end()) {
+            error = "graphics pipeline argument '" + parameter.name + "' is missing at slot " +
+                    std::to_string(parameter.slot);
+            return false;
+        }
+        if (!kindMatches(parameter, *found->second)) {
+            error = "graphics pipeline argument '" + parameter.name + "' expects " + parameter.kind +
+                    " but received kind " + std::to_string(found->second->kind);
+            return false;
+        }
         const VernonPipelineArgument &argument = *found->second;
         if (argument.kind == VERNON_PIPELINE_TENSOR) {
             const ValueLayout &expectedLayout = !parameter.elementLayout.leaves.empty() ? parameter.elementLayout
@@ -199,12 +212,27 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
     if (variant.vertex.empty())
         return true;
 
-    if (!invocation.color_attachment_count || !invocation.color_attachments)
-        return fail(error, "graphics pipeline requires color attachments");
+    if (!source.graphics_state || source.graphics_state->struct_size < sizeof(VernonGraphicsState))
+        return fail(error, "graphics pipeline state is missing or incomplete");
+    if (!source.render_pass || source.render_pass->struct_size < sizeof(VernonRenderPass))
+        return fail(error, "RenderPass control is missing or incomplete");
+    if (!source.draw_command || source.draw_command->struct_size < sizeof(VernonDrawCommand))
+        return fail(error, "DrawCommand control is missing or incomplete");
+    if (source.dynamic_state && source.dynamic_state->struct_size < sizeof(VernonDynamicState))
+        return fail(error, "DynamicState control metadata is incomplete");
+    const VernonGraphicsState &graphicsState = *source.graphics_state;
+    const VernonRenderPass &renderPass = *source.render_pass;
+    const VernonDrawCommand &draw = *source.draw_command;
+    if (graphicsState.topology > VERNON_TOPOLOGY_POINT_LIST)
+        return fail(error, "graphics pipeline topology is invalid");
+    plan.topology = graphicsState.topology;
+    if ((renderPass.color_attachment_count && !renderPass.color_attachments) ||
+        (!renderPass.color_attachment_count && !renderPass.depth_attachment))
+        return fail(error, "graphics pipeline requires a color or depth attachment");
     if (!describeImage)
         return fail(error, "graphics image descriptor resolver is missing");
-    for (size_t index = 0; index < invocation.color_attachment_count; ++index) {
-        const VernonColorAttachment &attachment = invocation.color_attachments[index];
+    for (size_t index = 0; index < renderPass.color_attachment_count; ++index) {
+        const VernonColorAttachment &attachment = renderPass.color_attachments[index];
         if (!attachment.view.identity || !attachment.view.resource.value)
             return fail(error, "render target is invalid");
         if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
@@ -247,8 +275,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         }
         plan.attachmentFormats.push_back(description.view.format);
     }
-    if (invocation.depth_attachment) {
-        const VernonDepthAttachment &attachment = *invocation.depth_attachment;
+    if (renderPass.depth_attachment) {
+        const VernonDepthAttachment &attachment = *renderPass.depth_attachment;
         if (!attachment.view.identity || !attachment.view.resource.value)
             return fail(error, "depth attachment is invalid");
         VernonRuntimeProviderImageDescription description{};
@@ -262,11 +290,16 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             std::max(description.image.extent.width >> description.view.subresources.base_mip_level, 1u);
         const uint32_t height =
             std::max(description.image.extent.height >> description.view.subresources.base_mip_level, 1u);
+        const bool firstAttachment = !plan.attachmentWidth;
         if (description.view.dimension != VERNON_TEXTURE_2D ||
             !(description.image.usage & VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT) || !width || !height ||
-            width != plan.attachmentWidth || height != plan.attachmentHeight ||
+            (!firstAttachment && (width != plan.attachmentWidth || height != plan.attachmentHeight)) ||
             (format != VERNON_TEXTURE_D32_FLOAT && format != VERNON_TEXTURE_D32_FLOAT_S8_UINT))
             return fail(error, "depth attachment must be D32 or D32S8 with the render-target extent");
+        if (firstAttachment) {
+            plan.attachmentWidth = width;
+            plan.attachmentHeight = height;
+        }
         if (attachment.load_operation > VERNON_RUNTIME_PROVIDER_LOAD_DISCARD ||
             attachment.store_operation > VERNON_RUNTIME_PROVIDER_STORE_DISCARD ||
             !std::isfinite(attachment.clear_depth) || attachment.clear_depth < 0.0f || attachment.clear_depth > 1.0f ||
@@ -277,11 +310,20 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         plan.depthAttachment = &attachment;
         plan.depthFormat = format;
     }
-    const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
-    plan.resolution = {static_cast<float>(hasViewport ? invocation.viewport[2] : plan.attachmentWidth),
-                       static_cast<float>(hasViewport ? invocation.viewport[3] : plan.attachmentHeight)};
-    plan.vertexCount = invocation.vertex_count;
-    plan.instanceCount = invocation.instance_count;
+    const uint32_t *dynamicViewport = source.dynamic_state ? source.dynamic_state->viewport : nullptr;
+    const uint32_t *dynamicScissor = source.dynamic_state ? source.dynamic_state->scissor : nullptr;
+    const bool hasViewport = dynamicViewport && dynamicViewport[2] && dynamicViewport[3];
+    const uint32_t *viewport = hasViewport ? dynamicViewport : renderPass.render_area;
+    plan.viewport[0] = viewport[0];
+    plan.viewport[1] = viewport[1];
+    plan.viewport[2] = viewport[2] ? viewport[2] : plan.attachmentWidth;
+    plan.viewport[3] = viewport[3] ? viewport[3] : plan.attachmentHeight;
+    const bool hasScissor = dynamicScissor && dynamicScissor[2] && dynamicScissor[3];
+    for (size_t index = 0; index < 4; ++index)
+        plan.scissor[index] = hasScissor ? dynamicScissor[index] : plan.viewport[index];
+    plan.resolution = {static_cast<float>(plan.viewport[2]), static_cast<float>(plan.viewport[3])};
+    plan.vertexCount = draw.vertex_count;
+    plan.instanceCount = draw.instance_count;
 
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampled;
     for (const Parameter &parameter : variant.parameters) {
@@ -386,8 +428,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
         plan.instanceCount = 1;
     if (!plan.vertexCount)
         return fail(error, "graphics draw counts cannot be inferred");
-    if (invocation.index_binding) {
-        const VernonIndexBinding &index = *invocation.index_binding;
+    if (draw.index_binding) {
+        const VernonIndexBinding &index = *draw.index_binding;
         if (!index.resource.identity || !index.resource.resource.value || index.type != VERNON_INDEX_U32 ||
             !index.index_count)
             return fail(error, "index binding is invalid");

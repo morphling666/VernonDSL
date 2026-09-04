@@ -305,7 +305,7 @@ VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
 }
 
 VernonStatus forwardProgramInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
-                                      VernonPullback *&pullback) {
+                                      VernonPullback *&pullback, const ProgramInvocationContext *programContext) {
     pullback = nullptr;
     const auto *differentiated = differentiatedPipeline(&pipeline);
     auto *executable = differentiated ? differentiated->executable.get() : nullptr;
@@ -317,7 +317,7 @@ VernonStatus forwardProgramInvocation(VernonLoadedPipeline &pipeline, const Vern
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     std::unique_ptr<PullbackExecution> execution;
-    const ForwardExecutionTarget target{{}, &invocation, nullptr};
+    const ForwardExecutionTarget target{{}, &invocation, nullptr, programContext};
     const VernonStatus status = executable->forward(target, {1, 1, 1}, inputs, &outputs, execution);
     if (status != VERNON_STATUS_OK)
         return status;

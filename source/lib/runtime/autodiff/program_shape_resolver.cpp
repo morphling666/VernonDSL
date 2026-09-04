@@ -17,7 +17,9 @@ public:
             const shape::DeclaredShape declared = shape::decodeRuntimeContractShape(value.shape);
             if (value.id < values_.size() && values_[value.id].concreteShape &&
                 !shape::matches(declared, *values_[value.id].concreteShape))
-                return error = "bound shape conflicts with the declared Program shape", false;
+                return error = "bound shape for Program value " + std::to_string(value.id) +
+                               " conflicts with the declared Program shape",
+                       false;
             if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared);
                 concrete && !bind(value.id, *concrete, "Program declaration", error))
                 return false;
@@ -31,7 +33,9 @@ private:
     bool seedCompiledStages(std::string &error) {
         if (!topology_)
             return true;
-        for (const VernonResolvedProgramStage &stage : topology_->stages)
+        for (const VernonResolvedProgramStage &stage : topology_->stages) {
+            if (stage.pipeline && !stage.pipeline->variant.vertex.empty())
+                continue;
             for (size_t index = 0;
                  stage.pipeline && index < stage.bindings.size() && index < stage.pipeline->variant.parameters.size();
                  ++index) {
@@ -52,6 +56,7 @@ private:
                 if (!bind(value, *concrete, "compiled stage binding", error))
                     return false;
             }
+        }
         return true;
     }
 

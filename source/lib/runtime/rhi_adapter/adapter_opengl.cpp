@@ -139,9 +139,9 @@ struct PreparedPipeline {
     std::atomic<uint32_t> references{1};
     VernonRuntimeRhiAdapter *adapter{};
     std::shared_ptr<NativeGraphicsBundle> native;
-    VernonRuntimeProviderRasterizationState rasterization{};
-    VernonRuntimeProviderDepthStencilState depthStencil{};
-    std::vector<VernonRuntimeProviderColorBlendState> colorBlends;
+    VernonRasterizationState rasterization{};
+    VernonDepthStencilState depthStencil{};
+    std::vector<VernonColorBlendState> colorBlends;
     uint32_t depthStencilFormat{};
     PreparedLayout *layout{};
     bool compute{};
@@ -259,7 +259,7 @@ VernonStatus configureGraphicsState(VernonRuntimeRhiAdapter &adapter,
           !openGLState(adapter).device->driver.blendEquationSeparatei ||
           !openGLState(adapter).device->driver.colorMaski)))
         return fail(adapter, "OpenGL graphics pipeline contains unsupported graphics state");
-    const auto validFace = [](const VernonRuntimeProviderStencilFaceState &face) {
+    const auto validFace = [](const VernonStencilFaceState &face) {
         return face.stencil_fail <= VERNON_RHI_STENCIL_DECREMENT_WRAP &&
                face.depth_fail <= VERNON_RHI_STENCIL_DECREMENT_WRAP && face.pass <= VERNON_RHI_STENCIL_DECREMENT_WRAP &&
                face.compare <= VERNON_RHI_COMPARE_ALWAYS;
@@ -814,14 +814,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline || pipeline->compute ||
-        descriptor->vertex_count == 0 || descriptor->instance_count == 0 ||
+    if (!validCommonDrawDescriptor(descriptor) || !pipeline || pipeline->compute ||
         (!bindings && descriptor->bindings.value != 0) ||
         (pipeline->native->bindings.empty() ? bindings != nullptr : bindings == nullptr) ||
-        descriptor->color_attachment_count == 0 ||
-        descriptor->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
-        !descriptor->color_attachments ||
-        ((descriptor->index_count != 0) != (descriptor->index_buffer.resource.value != 0)) ||
         (descriptor->index_count != 0 && descriptor->index_type != 0))
         return fail(adapter, "OpenGL adapter received an invalid draw");
     std::unique_lock<std::mutex> bindingGuard;
@@ -906,7 +901,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     driver.depthMask(pipeline->depthStencil.depth_write != 0);
     if (pipeline->depthStencil.stencil_test) {
         driver.enable(rhi::opengl::kStencilTest);
-        const auto applyStencilFace = [&](uint32_t face, const VernonRuntimeProviderStencilFaceState &state) {
+        const auto applyStencilFace = [&](uint32_t face, const VernonStencilFaceState &state) {
             driver.stencilFuncSeparate(face, 0x0200 + state.compare,
                                        static_cast<rhi::opengl::Int>(descriptor->stencil_reference),
                                        pipeline->depthStencil.stencil_read_mask);

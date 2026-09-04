@@ -36,8 +36,12 @@ bool fillHostTensor(ProgramHostValue &value, const program::Value &slot, const V
         if (!value.concreteShape)
             return error = "Program autodiff tensor shape was not resolved before allocation", false;
     }
-    if (!shape::rowMajorByteStrides(*value.concreteShape, layout.byteSize, value.strides))
-        return error = "Program autodiff tensor layout overflows", false;
+    if (value.strides.empty()) {
+        if (!shape::rowMajorByteStrides(*value.concreteShape, layout.byteSize, value.strides))
+            return error = "Program autodiff tensor layout overflows", false;
+    } else if (value.strides.size() != value.concreteShape->size()) {
+        return error = "Program autodiff tensor shape and strides have different ranks", false;
+    }
     value.argument.kind = VERNON_PIPELINE_TENSOR;
     value.argument.tensor.struct_size = sizeof(VernonTensorView);
     value.argument.tensor.storage = VERNON_TENSOR_HOST;
@@ -121,11 +125,14 @@ bool tapeLaneCount(const program::Program &execution, const VernonPipelineTopolo
                 }
             }
             size_t volume = 1;
+            if (program::executionKind(node) != program::ExecutionKind::Compute)
+                continue;
+            const program::ComputeOperation &compute = program::computeOperation(node);
             for (int axis = 0; axis < 3; ++axis) {
-                if (node.compute.workgroups[axis].kind != program::ControlKind::Static)
+                if (compute.workgroups[axis].kind != program::ControlKind::Static)
                     return error = "Program autodiff tape dispatch volume requires resolved static workgroups", false;
                 const size_t groups =
-                    node.compute.workgroups[axis].value ? static_cast<size_t>(node.compute.workgroups[axis].value) : 1;
+                    compute.workgroups[axis].value ? static_cast<size_t>(compute.workgroups[axis].value) : 1;
                 const size_t wg = workgroup[axis] ? workgroup[axis] : 1;
                 if (groups > std::numeric_limits<size_t>::max() / wg ||
                     volume > std::numeric_limits<size_t>::max() / (groups * wg))

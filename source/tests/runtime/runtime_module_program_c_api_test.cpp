@@ -86,12 +86,32 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     VernonPipelineArgument outputArgument = tensorArgument(outputParameter, output);
     const VernonProgramBindingToken sourceToken = bindingToken("source-v1");
     const VernonProgramBindingToken outputToken = bindingToken("output-v1");
+    const VernonProgramBindingToken renderPassToken = bindingToken("render-pass-v1");
+    const VernonProgramBindingToken dynamicStateToken = bindingToken("dynamic-state-v1");
+    int controlLeaseCount = 0;
+    VernonProgramResourceLease controlLease{
+        sizeof(VernonProgramResourceLease),
+        &controlLeaseCount,
+        [](void *value) { ++*static_cast<int *>(value); },
+        [](void *value) { --*static_cast<int *>(value); },
+    };
+    VernonRenderPass renderPass{};
+    renderPass.struct_size = sizeof(renderPass);
+    VernonDynamicState dynamicState{};
+    dynamicState.struct_size = sizeof(dynamicState);
+    dynamicState.viewport[2] = 1;
+    dynamicState.viewport[3] = 1;
 
     VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
     ASSERT_NE(invocation, nullptr);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
               VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeProgramInvocationBindRenderPass(invocation, 0, &renderPassToken, &renderPass, &controlLease, 1),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindDynamicState(invocation, 0, &dynamicStateToken, &dynamicState),
               VERNON_STATUS_OK);
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK) << lastError(context);
@@ -132,6 +152,17 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     vernonRuntimeProgramInvocationDestroy(invocation);
     EXPECT_FLOAT_EQ(output, 9.0f);
 
+    const VernonProgramBindingToken changedRenderPassToken = bindingToken("render-pass-v2");
+    invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindRenderPass(invocation, 0, &changedRenderPassToken, &renderPass,
+                                                           &controlLease, 1),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(controlLeaseCount, 2);
+    vernonRuntimeProgramInvocationRollback(invocation);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    EXPECT_EQ(controlLeaseCount, 1);
+
     VernonProgramBindingTelemetry telemetry{};
     telemetry.struct_size = sizeof(telemetry);
     ASSERT_EQ(vernonRuntimeProgramInstanceGetTelemetry(instance, &telemetry), VERNON_STATUS_OK);
@@ -139,8 +170,10 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     EXPECT_EQ(telemetry.reuse_count, 2u);
     EXPECT_EQ(telemetry.upload_bytes, sizeof(source));
     EXPECT_EQ(telemetry.upload_ranges, 1u);
+    EXPECT_EQ(controlLeaseCount, 1);
 
     vernonRuntimeProgramInstanceDestroy(instance);
+    EXPECT_EQ(controlLeaseCount, 0);
     vernonRuntimeLoadedPipelineDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

@@ -211,6 +211,9 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/dirty_index_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_planner.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/target_implementation_metadata.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/prepared_graphics_draw.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
@@ -268,6 +271,7 @@ function(vernon_add_runtime)
         VernonRuntime
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_graphics_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_boundary_binder.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_invocation_frame_builder.cpp

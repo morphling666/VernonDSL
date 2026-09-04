@@ -5,6 +5,8 @@
 
 #include "llvm/ADT/Twine.h"
 
+#include <algorithm>
+#include <map>
 #include <optional>
 #include <set>
 #include <vector>
@@ -56,6 +58,7 @@ std::string programGraphicsVertexFormat(llvm::StringRef dtype, int64_t component
 } // namespace
 
 bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflection, const llvm::json::Array &rawValues,
+                                      const llvm::json::Array &storages,
                                       const std::map<std::string, int64_t> &boundValues,
                                       std::map<int64_t, ProgramLogicalResource> &resources,
                                       ProgramGraphicsInterfacePlan &plan, std::string &error) {
@@ -169,6 +172,24 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                 }
                 const llvm::StringRef kind = row->getString("kind").value_or("");
                 const bool vertexAttribute = role == "vertex" && row->getArray("attribute_leaves");
+                const llvm::StringRef logicalType = logicalValue->getString("type").value_or("");
+                if ((kind == "image" && !isProgramTextureType(logicalType)) ||
+                    (kind == "sampler" && !isProgramSamplerType(logicalType))) {
+                    error = "compiled graphics resource kind does not match its Program Value";
+                    return false;
+                }
+                const ProgramEndpointExpectation expectation{
+                    logicalValue->getString("dtype"),
+                    logicalValue->getArray("shape"),
+                    nullptr,
+                    logicalValue->getObject("value_layout"),
+                    {},
+                    {},
+                    vertexAttribute,
+                    kind == "tensor_value",
+                };
+                if (!verifyProgramEndpointAbi(expectation, *row, error))
+                    return false;
                 const bool resourceEndpoint =
                     vertexAttribute || kind == "image" || kind == "sampler" || resources.count(valueId);
                 llvm::json::Array abiBindings;
@@ -184,16 +205,40 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         return false;
                     }
                     llvm::json::Object resourceLayout;
-                    if (kind == "image")
+                    if (kind == "image") {
+                        const ProgramLogicalResource &resource = resources.at(valueId);
+                        const llvm::json::Object *storage =
+                            resource.storage >= 0 && static_cast<size_t>(resource.storage) < storages.size()
+                                ? storages[static_cast<size_t>(resource.storage)].getAsObject()
+                                : nullptr;
+                        const llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
+                        const llvm::json::Array *aspects = descriptor ? descriptor->getArray("aspects") : nullptr;
+                        if (!descriptor || descriptor->getString("tag") != "image" || !descriptor->getArray("usage") ||
+                            !aspects) {
+                            error = "compiled graphics image endpoint has no canonical image Storage";
+                            return false;
+                        }
+                        plan.storageUsageRequirements[resource.storage].insert("sampled");
                         resourceLayout =
                             llvm::json::Object{{"tag", "image"},
-                                               {"dimension", row->getString("dimension").value_or("").str()},
-                                               {"format", row->getString("exact_storage_format").value_or("any").str()},
-                                               {"sample_count", int64_t{0}},
-                                               {"aspects", llvm::json::Array{"color"}}};
-                    else if (kind == "sampler")
+                                               {"dimension", descriptor->getString("dimension").value_or("").str()},
+                                               {"format", descriptor->getString("format").value_or("any").str()},
+                                               {"sample_count", descriptor->getInteger("sample_count").value_or(0)},
+                                               {"aspects", copyJsonArray(*aspects)}};
+                    } else if (kind == "sampler")
                         resourceLayout = llvm::json::Object{{"tag", "sampler"}};
                     else if (vertexAttribute) {
+                        const ProgramLogicalResource &resource = resources.at(valueId);
+                        const llvm::json::Object *storage =
+                            resource.storage >= 0 && static_cast<size_t>(resource.storage) < storages.size()
+                                ? storages[static_cast<size_t>(resource.storage)].getAsObject()
+                                : nullptr;
+                        const llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
+                        if (!descriptor || descriptor->getString("tag") != "buffer" || !descriptor->getArray("usage")) {
+                            error = "compiled vertex attribute has no canonical buffer Storage";
+                            return false;
+                        }
+                        plan.storageUsageRequirements[resource.storage].insert("vertex");
                         llvm::json::Array cellShape = programGraphicsAttributeCellShape(*row);
                         const int64_t viewRank = static_cast<int64_t>(cellShape.size());
                         resourceLayout = llvm::json::Object{
@@ -235,6 +280,8 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                                                                           {"access", *accessIndex}});
                     plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(*row, role, endpointIndex));
                     if (vertexAttribute) {
+                        if (!plan.vertexCountValue)
+                            plan.vertexCountValue = valueId;
                         const int64_t divisor = row->getInteger("vernon.instance_divisor").value_or(0);
                         if (divisor < 0) {
                             error = "compiled graphics vertex input has a negative instance divisor";
@@ -293,17 +340,21 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
     return true;
 }
 
-bool buildCanonicalGraphicsOperation(
-    const llvm::json::Object &node, const llvm::json::Array &rawValues, const llvm::json::Array &storages,
-    const std::map<std::string, int64_t> &boundValues, std::map<int64_t, ProgramLogicalResource> &resources,
-    const llvm::json::Array &fragmentOutputs, std::map<int64_t, int64_t> &accessByValue, llvm::json::Array &accesses,
-    llvm::json::Array &attachmentConstraints, llvm::json::Object &operation, std::string &error) {
+bool buildCanonicalGraphicsOperation(const llvm::json::Object &node, const llvm::json::Array &rawValues,
+                                     const llvm::json::Array &storages,
+                                     const std::map<std::string, int64_t> &boundValues,
+                                     std::map<int64_t, ProgramLogicalResource> &resources,
+                                     const llvm::json::Array &fragmentOutputs, std::optional<int64_t> vertexCountValue,
+                                     std::map<int64_t, int64_t> &accessByValue, llvm::json::Array &accesses,
+                                     llvm::json::Array &attachmentConstraints, llvm::json::Object &operation,
+                                     std::string &error) {
     const llvm::json::Array *nodeOperands = node.getArray("operands");
     const llvm::json::Array *nodeResults = node.getArray("results");
     const int64_t colorCount = node.getInteger("color_count").value_or(1);
-    if (!nodeOperands || colorCount < 1 || static_cast<uint64_t>(colorCount) > nodeOperands->size() ||
-        nodeOperands->size() < static_cast<uint64_t>(colorCount) ||
-        (nodeResults && nodeResults->size() < static_cast<uint64_t>(colorCount))) {
+    if (!nodeOperands || !nodeResults || colorCount < 0 || static_cast<uint64_t>(colorCount) > nodeOperands->size() ||
+        (nodeResults->size() != static_cast<uint64_t>(colorCount) &&
+         nodeResults->size() != static_cast<uint64_t>(colorCount + 1)) ||
+        nodeResults->empty()) {
         error = "canonical graphics node has an invalid color attachment count";
         return false;
     }
@@ -352,8 +403,11 @@ bool buildCanonicalGraphicsOperation(
         if (!depthImage)
             return false;
     }
-    const llvm::json::Array *extent = colorImages.front().descriptor->getArray("extent");
     attachmentConstraints.clear();
+    if (fragmentOutputs.size() != colorImages.size()) {
+        error = "compiled fragment outputs must exactly match the color attachments";
+        return false;
+    }
     for (const llvm::json::Value &outputValue : fragmentOutputs) {
         const llvm::json::Object *output = outputValue.getAsObject();
         if (!output)
@@ -377,52 +431,120 @@ bool buildCanonicalGraphicsOperation(
             {"sample_counts", llvm::json::Array{depthImage->descriptor->getInteger("sample_count").value_or(1)}},
             {"aspects", llvm::json::Array{"depth"}}});
     const int64_t vertexCount = [&]() {
-        for (const auto &[name, valueId] : boundValues) {
-            (void)name;
-            if (resources.count(valueId))
-                if (const llvm::json::Object *value = findJsonObjectByIntegerId(rawValues, valueId))
-                    if (const llvm::json::Array *shape = value->getArray("shape"); shape && !shape->empty())
-                        return (*shape)[0].getAsInteger().value_or(1);
-        }
+        if (vertexCountValue)
+            if (const llvm::json::Object *value = findJsonObjectByIntegerId(rawValues, *vertexCountValue))
+                if (const llvm::json::Array *shape = value->getArray("shape"); shape && !shape->empty()) {
+                    const int64_t extent = (*shape)[0].getAsInteger().value_or(0);
+                    return std::max(int64_t{0}, extent);
+                }
         return int64_t{1};
     }();
+    const llvm::json::Array *slots = node.getArray("control_slots");
+    const llvm::json::Object *sourceState = node.getObject("graphics_state");
+    if (!slots || slots->size() != 3 || !(*slots)[0].getAsInteger() || !(*slots)[1].getAsInteger() ||
+        !(*slots)[2].getAsInteger() || !sourceState) {
+        error = "canonical graphics node requires typed pipeline state and three Program control slots";
+        return false;
+    }
+    llvm::json::Object pipelineState = copyJsonObject(*sourceState);
+    pipelineState["topology"] = node.getString("topology").value_or("triangle_list").str();
+    const llvm::json::Array *configuredBlends = sourceState->getArray("color_blends");
+    if (!configuredBlends) {
+        error = "graphics pipeline state has no color_blends array";
+        return false;
+    }
+    std::map<int64_t, const llvm::json::Object *> blendByLocation;
+    for (const llvm::json::Value &entryValue : *configuredBlends) {
+        const llvm::json::Array *entry = entryValue.getAsArray();
+        const std::optional<int64_t> location = entry && entry->size() == 2 ? (*entry)[0].getAsInteger() : std::nullopt;
+        const llvm::json::Object *blend = entry && entry->size() == 2 ? (*entry)[1].getAsObject() : nullptr;
+        if (!location || *location < 0 || static_cast<size_t>(*location) >= colorImages.size() || !blend ||
+            !blendByLocation.emplace(*location, blend).second) {
+            error = "graphics pipeline state has an invalid color blend location";
+            return false;
+        }
+    }
+    llvm::json::Array canonicalBlends;
+    for (size_t location = 0; location < colorImages.size(); ++location) {
+        const auto configured = blendByLocation.find(static_cast<int64_t>(location));
+        llvm::json::Object blend =
+            configured != blendByLocation.end()
+                ? copyJsonObject(*configured->second)
+                : llvm::json::Object{
+                      {"enabled", false},         {"source_color", "ONE"},    {"destination_color", "ZERO"},
+                      {"color_operation", "ADD"}, {"source_alpha", "ONE"},    {"destination_alpha", "ZERO"},
+                      {"alpha_operation", "ADD"}, {"write_mask", int64_t{15}}};
+        canonicalBlends.emplace_back(
+            llvm::json::Array{static_cast<int64_t>(location), llvm::json::Value(std::move(blend))});
+    }
+    pipelineState["color_blends"] = std::move(canonicalBlends);
     llvm::json::Array colors;
     for (size_t index = 0; index < colorImages.size(); ++index)
-        colors.emplace_back(llvm::json::Object{{"location", static_cast<int64_t>(index)},
-                                               {"access", colorImages[index].access},
-                                               {"load", llvm::json::Object{{"tag", "discard"}}},
-                                               {"store", "store"}});
+        colors.emplace_back(llvm::json::Object{
+            {"location", static_cast<int64_t>(index)},
+            {"access", colorImages[index].access},
+            {"formats", llvm::json::Array{colorImages[index].format}},
+            {"sample_counts",
+             llvm::json::Array{colorImages[index].descriptor->getInteger("sample_count").value_or(1)}}});
     llvm::json::Value depthStencil = nullptr;
     if (depthImage)
-        depthStencil = llvm::json::Object{{"access", depthImage->access},
-                                          {"load", llvm::json::Object{{"tag", "discard"}}},
-                                          {"store", "store"},
-                                          {"depth", true},
-                                          {"stencil", false}};
+        depthStencil = llvm::json::Object{
+            {"access", depthImage->access},
+            {"formats", llvm::json::Array{depthImage->format}},
+            {"sample_counts", llvm::json::Array{depthImage->descriptor->getInteger("sample_count").value_or(1)}},
+            {"aspects", llvm::json::Array{"depth"}}};
     operation = llvm::json::Object{
         {"tag", "graphics"},
-        {"attachments",
-         llvm::json::Object{{"colors", std::move(colors)},
-                            {"depth_stencil", std::move(depthStencil)},
-                            {"render_area", llvm::json::Object{{"x", int64_t{0}},
-                                                               {"y", int64_t{0}},
-                                                               {"width", (*extent)[0].getAsInteger().value_or(1)},
-                                                               {"height", (*extent)[1].getAsInteger().value_or(1)}}},
-                            {"layer_count", int64_t{1}}}},
-        {"state",
-         llvm::json::Object{
-             {"raster",
-              llvm::json::Object{{"front_face", "counter_clockwise"}, {"cull_mode", "none"}, {"fill_mode", "fill"}}},
-             {"depth_stencil", llvm::json::Object{{"depth_test", hasDepth},
-                                                  {"depth_write", hasDepth},
-                                                  {"depth_compare", hasDepth ? "less" : "always"},
-                                                  {"stencil_test", false}}},
-             {"multisample", llvm::json::Object{{"sample_mask", int64_t{4294967295ULL}}, {"alpha_to_coverage", false}}},
-             {"blend", llvm::json::Array()},
-             {"viewport", nullptr},
-             {"scissor", nullptr}}},
-        {"draw", llvm::json::Object{{"tag", "direct"}, {"vertex_count", vertexCount}, {"instance_count", int64_t{1}}}},
+        {"pipeline_state", std::move(pipelineState)},
+        {"render_pass", llvm::json::Object{{"control", *(*slots)[0].getAsInteger()},
+                                           {"colors", std::move(colors)},
+                                           {"depth_stencil", std::move(depthStencil)}}},
+        {"draw", llvm::json::Object{{"control", *(*slots)[1].getAsInteger()},
+                                    {"default", llvm::json::Object{{"tag", "direct"},
+                                                                   {"vertex_count", vertexCount},
+                                                                   {"instance_count", int64_t{1}}}}}},
+        {"dynamic_state", llvm::json::Object{{"control", *(*slots)[2].getAsInteger()}}},
     };
+    return true;
+}
+
+bool buildCanonicalGraphicsStageContract(const llvm::json::Object &node, llvm::json::Array requiredFeatures,
+                                         ProgramGraphicsInterfacePlan &plan, llvm::json::Array attachmentConstraints,
+                                         llvm::json::Object &stageContract, std::string &error) {
+    std::vector<int64_t> slots;
+    for (const llvm::json::Value &endpointValue : plan.endpoints.json()) {
+        const llvm::json::Object *endpoint = endpointValue.getAsObject();
+        const llvm::json::Object *abi = endpoint ? endpoint->getObject("abi") : nullptr;
+        const llvm::json::Array *bindings = abi ? abi->getArray("bindings") : nullptr;
+        if (!bindings)
+            return error = "compiled graphics endpoint has no portable ABI bindings", false;
+        for (const llvm::json::Value &bindingValue : *bindings) {
+            const llvm::json::Object *binding = bindingValue.getAsObject();
+            const llvm::json::Object *carrier = binding ? binding->getObject("carrier") : nullptr;
+            const std::optional<int64_t> slot = carrier ? carrier->getInteger("slot") : std::nullopt;
+            if (slot)
+                slots.push_back(*slot);
+        }
+    }
+    std::sort(slots.begin(), slots.end());
+    for (size_t index = 0; index < slots.size(); ++index)
+        if (slots[index] != static_cast<int64_t>(index))
+            return error = "compiled graphics portable ABI slots must be contiguous and unique", false;
+
+    llvm::json::Object graphics{
+        {"topology", node.getString("topology").value_or("triangle_list").str()},
+        {"vertex_inputs", plan.vertexInputs.take()},
+        {"fragment_outputs", copyJsonArray(plan.fragmentOutputs.json())},
+        {"linkage", llvm::json::Object{{"vertex_outputs", plan.vertexOutputs.take()},
+                                       {"fragment_inputs", plan.fragmentInputs.take()}}},
+        {"attachment_constraints", std::move(attachmentConstraints)},
+        {"index_formats", llvm::json::Array{"u16", "u32"}},
+        {"capabilities", llvm::json::Array{"direct_draw"}},
+    };
+    llvm::json::Object reflection{{"required_features", std::move(requiredFeatures)},
+                                  {"endpoints", plan.endpoints.take()},
+                                  {"graphics", std::move(graphics)}};
+    stageContract = llvm::json::Object{{"operation", "graphics"}, {"reflection", std::move(reflection)}};
     return true;
 }
 

@@ -37,7 +37,7 @@ class DependencyBoundaryTests(unittest.TestCase):
         self.assertEqual(vd.Tensor.__module__, "vernon_dsl.types")
         self.assertEqual(vd.Kernel.__module__, "vernon_dsl._runtime.kernel")
         self.assertEqual(vd.Pipeline.__module__, "vernon_dsl._runtime.pipeline")
-        self.assertEqual(vd.PrimitiveTopology.__module__, "vernon_dsl._runtime.pipeline")
+        self.assertEqual(vd.PrimitiveTopology.__module__, "vernon_dsl.render")
 
     def test_runtime_resource_modules_follow_dependency_boundaries(self) -> None:
         runtime = ROOT / "_runtime"

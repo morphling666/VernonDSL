@@ -347,7 +347,9 @@ class TypedFunctionInstance:
     storage_activity: StorageActivitySummary | None = None
 
     @property
-    def specialization_key(self) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
+    def specialization_key(
+        self,
+    ) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
         return self.qualified_name, self.argument_types, self.enabled_features
 
 

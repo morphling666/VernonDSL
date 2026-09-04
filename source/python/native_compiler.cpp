@@ -109,9 +109,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def(nb::init<>())
         .def("analyze_program_result", &analyzeProgramResult, nb::arg("mlir"))
         .def("plan_program_result", &planProgramResult, nb::arg("program"))
-        .def("plan_kernel_result", &planKernelResult, nb::arg("kernel"))
-        .def("plan_graphics_result", &planGraphicsResult, nb::arg("stages"), nb::arg("topology"), nb::arg("features"),
-             nb::arg("attachment_types"), nb::arg("color_count"), nb::arg("operands"))
         // shape_facts fill graphics image/attachment extents only. Compute TensorView dyn
         // extents are not compile inputs; C++ bind reads them from the bound buffer.
         .def("finalize_program_result", &finalizeProgramResult, nb::arg("plan"), nb::arg("kernels"),
@@ -196,8 +193,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_cooked_asset", &Runtime::loadCookedAsset, nb::keep_alive<0, 1>())
         .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("program"), nb::arg("artifact_system"),
-             nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>())
-        .def("load_canonical_endpoint", &Runtime::loadCanonicalEndpoint, nb::arg("program"), nb::arg("artifact_system"),
              nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
     nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
         .def_ro("slot", &PipelineParameterMetadata::slot)
@@ -284,6 +279,10 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("height"), nb::rv_policy::reference_internal)
         .def("scissor", &PipelineInvocationBuilder::setScissor, nb::arg("x"), nb::arg("y"), nb::arg("width"),
              nb::arg("height"), nb::rv_policy::reference_internal)
+        .def("graphics_state", &PipelineInvocationBuilder::setGraphicsState, nb::arg("state"),
+             nb::rv_policy::reference_internal)
+        .def("stencil_reference", &PipelineInvocationBuilder::setStencilReference, nb::arg("value"),
+             nb::rv_policy::reference_internal)
         .def("encode", [](PipelineInvocationBuilder &builder,
                           const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
         .def("encode", [](PipelineInvocationBuilder &builder,
@@ -293,6 +292,13 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("builder", &PythonProgramInvocationAdapter::builderView, nb::rv_policy::reference_internal)
         .def("bind", &PythonProgramInvocationAdapter::bind, nb::arg("slot"), nb::arg("token"), nb::arg("prepare"),
              nb::arg("upload_bytes") = 0, nb::arg("upload_ranges") = 0, nb::arg("eager_upload") = false)
+        .def("bind_render_pass", &PythonProgramInvocationAdapter::bindRenderPass, nb::arg("slot"), nb::arg("token"),
+             nb::arg("control"))
+        .def("bind_draw_command", &PythonProgramInvocationAdapter::bindDrawCommand, nb::arg("slot"), nb::arg("token"),
+             nb::arg("control"))
+        .def("bind_dynamic_state", &PythonProgramInvocationAdapter::bindDynamicState, nb::arg("slot"), nb::arg("token"),
+             nb::arg("control"))
+        .def("forward", &PythonProgramInvocationAdapter::forward, nb::call_guard<nb::gil_scoped_release>())
         .def("commit", &PythonProgramInvocationAdapter::commit)
         .def("rollback", &PythonProgramInvocationAdapter::rollback);
     nb::class_<PythonProgramInstanceAdapter>(module, "ProgramInstance")

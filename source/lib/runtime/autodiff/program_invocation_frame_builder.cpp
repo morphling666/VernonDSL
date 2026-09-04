@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <map>
 #include <optional>
+#include <set>
 
 namespace vernon::runtime::ad {
 namespace {
@@ -88,6 +89,15 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
            std::vector<ProgramHostValue> &storage, const FrameRequest &request,
            std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     storage.assign(execution.values.size(), {});
+    std::vector<char> invocationControls(execution.values.size());
+    std::set<uint32_t> invocationControlStorages;
+    for (const program::Graph &graph : execution.graphs)
+        for (const program::GraphInput &input : graph.inputs)
+            if (input.kind == program::GraphInputKind::InvocationControl && input.value < execution.values.size()) {
+                invocationControls[input.value] = 1;
+                if (execution.values[input.value].storage)
+                    invocationControlStorages.insert(*execution.values[input.value].storage);
+            }
     std::vector<char> live = request.required;
     live.resize(execution.values.size());
     const auto markBindings = [&](const ProgramLeafFrameSource &source) {
@@ -104,9 +114,13 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
     if (request.tapeCaptures)
         for (size_t value = 0; value < request.tapeCaptures->size() && value < live.size(); ++value)
             live[value] |= static_cast<bool>((*request.tapeCaptures)[value]);
+    for (const program::Value &slot : execution.values)
+        if (slot.storage && invocationControlStorages.count(*slot.storage))
+            live[slot.id] = 0;
     std::vector<char> liveStorage(execution.storages.size());
     for (const program::Value &slot : execution.values)
-        if (live[slot.id] && slot.storage && *slot.storage < liveStorage.size())
+        if (live[slot.id] && slot.storage && *slot.storage < liveStorage.size() &&
+            !invocationControlStorages.count(*slot.storage))
             liveStorage[*slot.storage] = 1;
 
     std::map<uint32_t, ProgramStorageBacking> backings;
@@ -124,7 +138,8 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
 
     std::vector<std::optional<ValueLayout>> layouts(execution.values.size());
     for (const program::Value &slot : execution.values) {
-        if (program::isTapeValueType(slot.type))
+        if (program::isTapeValueType(slot.type) || invocationControls[slot.id] ||
+            (slot.storage && invocationControlStorages.count(*slot.storage)))
             continue;
         layouts[slot.id] = resolvedProgramValueLayout(slot);
         const auto external = externalValues.find(slot.id);
@@ -143,13 +158,13 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
                    false;
         if (argument) {
             const VernonTensorView &tensor = argument->tensor;
-            if (tensor.rank && (!tensor.shape || !tensor.byte_strides))
+            if (tensor.rank < slot.shape.size() || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
                 return error = "Program invocation Tensor binding has incomplete shape metadata", false;
             storage[slot.id].concreteShape = shape::ConcreteShape();
             storage[slot.id].strides.clear();
-            if (tensor.rank) {
-                storage[slot.id].concreteShape->assign(tensor.shape, tensor.shape + tensor.rank);
-                storage[slot.id].strides.assign(tensor.byte_strides, tensor.byte_strides + tensor.rank);
+            if (!slot.shape.empty()) {
+                storage[slot.id].concreteShape->assign(tensor.shape, tensor.shape + slot.shape.size());
+                storage[slot.id].strides.assign(tensor.byte_strides, tensor.byte_strides + slot.shape.size());
             }
         }
         if (!slot.storage)
@@ -170,7 +185,7 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
         !materializeProgramValues(execution, topology, storage, live, layouts, backings, externalValues,
                                   request.tapeCaptures, tapePolicy, error))
         return false;
-    return !request.canonical || initializeProgramPublications(storage, request.canonical->publications, error);
+    return true;
 }
 
 } // namespace

@@ -405,9 +405,9 @@ typedef struct VernonRhiGraphicsPipelineDescriptor {
     size_t color_format_count;
     VernonRhiFormat depth_stencil_format;
     uint32_t sample_count;
-    VernonRhiRasterizationState rasterization;
-    VernonRhiDepthStencilState depth_stencil;
-    const VernonRhiColorBlendState *color_blends;
+    VernonRasterizationState rasterization;
+    VernonDepthStencilState depth_stencil;
+    const VernonColorBlendState *color_blends;
     size_t color_blend_count;
     uint32_t reserved[4];
 } VernonRhiGraphicsPipelineDescriptor;

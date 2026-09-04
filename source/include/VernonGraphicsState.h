@@ -107,16 +107,6 @@ typedef struct VernonColorBlendState {
     uint32_t write_mask;
 } VernonColorBlendState;
 
-/* Source-compatible names for the RHI and provider surfaces. */
-typedef VernonRasterizationState VernonRhiRasterizationState;
-typedef VernonStencilFaceState VernonRhiStencilFaceState;
-typedef VernonDepthStencilState VernonRhiDepthStencilState;
-typedef VernonColorBlendState VernonRhiColorBlendState;
-typedef VernonRasterizationState VernonRuntimeProviderRasterizationState;
-typedef VernonStencilFaceState VernonRuntimeProviderStencilFaceState;
-typedef VernonDepthStencilState VernonRuntimeProviderDepthStencilState;
-typedef VernonColorBlendState VernonRuntimeProviderColorBlendState;
-
 #ifdef __cplusplus
 }
 #endif

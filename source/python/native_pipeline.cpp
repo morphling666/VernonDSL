@@ -232,39 +232,6 @@ std::unique_ptr<CompiledProgram> planProgramResult(Compiler &compiler, const std
         vernonCompilerPlanProgram(compiler.context, program.data(), program.size()), VERNON_TARGET_CPU);
 }
 
-std::unique_ptr<CompiledProgram> planKernelResult(Compiler &compiler, const std::string &kernel) {
-    return std::make_unique<CompiledProgram>(vernonCompilerPlanKernel(compiler.context, kernel.data(), kernel.size()),
-                                             VERNON_TARGET_CPU);
-}
-
-std::unique_ptr<CompiledProgram>
-planGraphicsResult(Compiler &compiler, const std::vector<std::string> &stages, const std::string &topology,
-                   const std::vector<std::string> &features, const std::vector<std::string> &attachmentTypes,
-                   uint32_t colorCount, const std::vector<std::tuple<std::string, std::string>> &operands) {
-    std::vector<VernonGraphicsStageSource> stageSources;
-    stageSources.reserve(stages.size());
-    for (const std::string &stage : stages)
-        stageSources.push_back({sizeof(VernonGraphicsStageSource), stage.data(), stage.size()});
-    std::vector<VernonStringView> featureViews;
-    featureViews.reserve(features.size());
-    for (const std::string &feature : features)
-        featureViews.push_back({feature.data(), feature.size()});
-    std::vector<VernonStringView> attachmentViews;
-    attachmentViews.reserve(attachmentTypes.size());
-    for (const std::string &type : attachmentTypes)
-        attachmentViews.push_back({type.data(), type.size()});
-    std::vector<VernonGraphicsPlanOperand> operandViews;
-    operandViews.reserve(operands.size());
-    for (const auto &[name, type] : operands)
-        operandViews.push_back(
-            {sizeof(VernonGraphicsPlanOperand), {name.data(), name.size()}, {type.data(), type.size()}});
-    return std::make_unique<CompiledProgram>(
-        vernonCompilerPlanGraphics(compiler.context, stageSources.data(), stageSources.size(), topology.data(),
-                                   topology.size(), featureViews.data(), featureViews.size(), attachmentViews.data(),
-                                   attachmentViews.size(), colorCount, operandViews.data(), operandViews.size()),
-        VERNON_TARGET_CPU);
-}
-
 std::unique_ptr<CompiledProgram>
 finalizeProgramResult(Compiler &compiler, const std::string &plan,
                       const std::vector<std::tuple<std::string, std::string, std::string, std::string>> &inputs,

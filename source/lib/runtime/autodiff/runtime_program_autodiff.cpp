@@ -436,6 +436,7 @@ public:
              !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, false, error)))
             return fail(*context_, error);
         ProgramInvocationFrame arena(std::move(hostStorage));
+        arena.setInvocationContext(target.programContext);
         VernonLoadedPipeline proxy;
         proxy.context = context_;
         proxy.variant = variant_;
@@ -443,10 +444,6 @@ public:
         if (context_->backend != VERNON_RUNTIME_CPU) {
             if (!arena.materializeDevice(*context_, required, error))
                 return fail(*context_, error);
-            if (const VernonStatus publicationStatus =
-                    initializeDeviceProgramPublications(*context_, arena, publications, error);
-                publicationStatus != VERNON_STATUS_OK)
-                return error.empty() ? publicationStatus : fail(*context_, error);
             std::vector<ProgramTapeState> tapeStates;
             if (!prepareProgramTapeStates(arena, *context_, *execution, *topology, *forward, tapeStates, error))
                 return fail(*context_, error);

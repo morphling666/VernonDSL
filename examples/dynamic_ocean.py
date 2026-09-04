@@ -181,10 +181,13 @@ def main() -> None:
     normal_map = load_rgba_texture(Path(__file__).resolve().parent / "assets" / "water" / "Foam003_1K_NormalGL.jpg")
     normal_sampler = vd.sampler(address="repeat")
     sky_positions = vd.storage.from_numpy(create_sky_cube())
-    render_sky = vd.pipeline(sky_vertex, sky_fragment)
-    render_ocean = vd.pipeline(ocean_vertex, ocean_fragment)
-    render = vd.pipeline(pbr_vertex, pbr_fragment, features={"SHADOW", "ENVIRONMENT"})
-    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment)
+    depth_state = vd.graphics_state(
+        depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+    )
+    render_sky = vd.pipeline(sky_vertex, sky_fragment, state=depth_state)
+    render_ocean = vd.pipeline(ocean_vertex, ocean_fragment, state=depth_state)
+    render = vd.pipeline(pbr_vertex, pbr_fragment, state=depth_state, features={"SHADOW", "ENVIRONMENT"})
+    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=depth_state)
 
     projection = perspective(
         math.radians(44.0),
@@ -211,7 +214,6 @@ def main() -> None:
     expand_grid = ((draw_count + 63) // 64, 1, 1)
     common_shadow = {
         "light_view_projection": light_view_projection,
-        "topology": vd.triangles,
     }
     common_pbr: dict[str, object] = {
         "light_view_projection": light_view_projection,
@@ -224,7 +226,6 @@ def main() -> None:
         "shadow_sampler": shadow_sampler,
         "environment_map": environment_map,
         "environment_sampler": environment_sampler,
-        "topology": vd.triangles,
     }
     presenter = FramePresenter(
         output,
@@ -292,16 +293,16 @@ def main() -> None:
             render_shadow(
                 position=draw_positions,
                 **common_shadow,
-                render=vd.render(
+                render_pass=vd.render_pass(
                     shadow_target,
                     color=vd.clear((1.0, 1.0, 1.0, 1.0)),
-                    depth=vd.clear(1.0),
+                    depth=vd.clear_depth(1.0),
                 ),
             )
             render_shadow(
                 position=seabed_positions,
                 **common_shadow,
-                render=vd.render(shadow_target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(shadow_target, color=vd.load(), depth=vd.load()),
             )
             render_sky(
                 direction=sky_positions,
@@ -309,11 +310,10 @@ def main() -> None:
                 camera_position=camera,
                 environment_map=environment_map,
                 environment_sampler=environment_sampler,
-                topology=vd.triangles,
-                render=vd.render(
+                render_pass=vd.render_pass(
                     target,
                     color=vd.clear((0.001, 0.004, 0.013, 1.0)),
-                    depth=vd.clear(1.0),
+                    depth=vd.clear_depth(1.0),
                 ),
             )
             render_ocean(
@@ -328,8 +328,7 @@ def main() -> None:
                 normal_map=normal_map,
                 normal_sampler=normal_sampler,
                 phase=phase,
-                topology=vd.triangles,
-                render=vd.render(target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
             )
             render(
                 position=seabed_positions,
@@ -339,7 +338,7 @@ def main() -> None:
                 view_projection=view_projection,
                 camera_position=camera,
                 **common_pbr,
-                render=vd.render(target, color=vd.load(), depth=vd.load()),
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
             )
             frame += 1
             if not presenter.present():

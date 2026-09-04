@@ -8,7 +8,7 @@ from unittest import mock
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl._runtime.session import RuntimeUnavailableError
-from vernon_dsl.program_frontend import BuiltinDslProvider, DirectKernelDslProvider
+from vernon_dsl.program_frontend import BuiltinDslProvider
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))
@@ -118,6 +118,13 @@ class ScaleByHostConstant(vd.Module):
         return output
 
 
+class MixedGrid(vd.Module):
+    def forward(self, source: vd.TensorStorage, groups_x: vd.u32) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        module_square(source, output, grid=(groups_x, 2, 1))
+        return output
+
+
 def _builtin_program_value(value_id: int, dtype: str, shape: list[int]) -> dict[str, object]:
     rank_shape = ", ".join("-1" for _ in shape)
     return {
@@ -144,18 +151,6 @@ def _builtin_program_value(value_id: int, dtype: str, shape: list[int]) -> dict[
 
 
 class ModuleTests(unittest.TestCase):
-    def test_direct_provider_returns_original_frontend_implementation(self) -> None:
-        provider = DirectKernelDslProvider("module { func.func @direct() }", "direct")
-        implementation = provider.lower(
-            {"kind": "compute", "implementation_hint": "direct"},
-            {},
-        )
-        self.assertIsNotNone(implementation)
-        assert implementation is not None
-        self.assertEqual(implementation.entry, "direct")
-        self.assertEqual(implementation.mlir, "module { func.func @direct() }")
-        self.assertIsNone(provider.lower({"kind": "render", "implementation_hint": "direct"}, {}))
-
     def test_fusion_dsl_provider_lowers_builtin_add_request(self) -> None:
         values = {index: _builtin_program_value(index, "f32", [4]) for index in range(3)}
         request = {
@@ -479,6 +474,13 @@ class ModuleTests(unittest.TestCase):
             (("factor", 3),),
         )
         self.assertIn('constant_names = ["factor"]', parsed.mlir)
+
+    def test_grid_axes_mix_static_and_program_value_controls(self) -> None:
+        from vernon_dsl.program import _parse_module_program
+
+        parsed = _parse_module_program(MixedGrid())
+        self.assertIn("grid = array<i64: 1, 2, 1>", parsed.mlir)
+        self.assertIn("vernon_program.grid_control_arguments = array<i64: 1, -1, -1>", parsed.mlir)
 
     def test_module_frontend_reuses_canonical_aggregate_logical_types(self) -> None:
         from vernon_dsl.program import _parse_module_program

@@ -22,12 +22,12 @@ def pipeline_asset_reference(value: str | Path) -> tuple[Path, str]:
     marker = spelling.rfind(".py:")
     if marker < 0:
         raise PipelineCompileError(
-            "pipeline asset input must be a Python descriptor reference in source.py:descriptor_name form"
+            "Program Asset input must be a Python descriptor reference in source.py:descriptor_name form"
         )
     source = Path(spelling[: marker + 3]).resolve()
     descriptor_name = spelling[marker + 4 :]
     if not descriptor_name or not descriptor_name.isidentifier() or keyword.iskeyword(descriptor_name):
-        raise PipelineCompileError("pipeline asset reference requires a valid Python descriptor name after source.py:")
+        raise PipelineCompileError("Program Asset reference requires a valid Python descriptor name after source.py:")
     return source, descriptor_name
 
 
@@ -45,10 +45,10 @@ def _feature_bindings(tree: ast.Module) -> dict[str, str]:
             or not isinstance(value.args[0], ast.Constant)
             or not isinstance(value.args[0].value, str)
         ):
-            raise PipelineCompileError("feature declarations used by pipeline assets require one string literal")
+            raise PipelineCompileError("feature declarations used by Program Assets require one string literal")
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
         if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-            raise PipelineCompileError("feature declarations used by pipeline assets require a simple name")
+            raise PipelineCompileError("feature declarations used by Program Assets require a simple name")
         bindings[targets[0].id] = value.args[0].value
     return bindings
 
@@ -121,11 +121,11 @@ def _literal_keyword(keywords: dict[str, ast.expr], name: str) -> Any:
 def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> ShaderPipelineDescriptor:
     source_path = Path(source).resolve()
     if not source_path.is_file():
-        raise PipelineCompileError(f"pipeline asset source does not exist: {source_path}")
+        raise PipelineCompileError(f"Program Asset source does not exist: {source_path}")
     try:
         tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
     except (OSError, SyntaxError) as error:
-        raise PipelineCompileError(f"cannot parse pipeline asset source {source_path}: {error}") from None
+        raise PipelineCompileError(f"cannot parse Program Asset source {source_path}: {error}") from None
 
     declarations = []
     for statement in tree.body:
@@ -146,9 +146,9 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         ):
             declarations.append(value)
     if not declarations:
-        raise PipelineCompileError(f"pipeline asset declaration '{descriptor_name}' was not found in {source_path}")
+        raise PipelineCompileError(f"Program Asset declaration '{descriptor_name}' was not found in {source_path}")
     if len(declarations) != 1:
-        raise PipelineCompileError(f"duplicate pipeline asset declaration: {descriptor_name}")
+        raise PipelineCompileError(f"duplicate Program Asset declaration: {descriptor_name}")
     declaration = declarations[0]
     if declaration.args:
         raise PipelineCompileError("pipeline_asset accepts keyword arguments only")
@@ -161,7 +161,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
 
     pipeline_id = _literal_keyword(keywords, "id")
     if not isinstance(pipeline_id, str) or not pipeline_id:
-        raise PipelineCompileError("pipeline asset id must be a non-empty string")
+        raise PipelineCompileError("Program Asset id must be a non-empty string")
 
     def entry_stage(entry: ast.expr) -> tuple[str, str]:
         if not isinstance(entry, ast.Name):
@@ -307,7 +307,7 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
             raise PipelineCompileError(message) from None
     else:
         raise PipelineCompileError(
-            "pipeline_asset program must be one compute Kernel, one Module, or a tuple of graphics entry functions"
+            "Program Asset program must be a compute Kernel, Pipeline, Module, or VJP expression"
         )
     if transform is not None:
         graphics = program_kind == "stages" and set(stage_functions) != {"compute"}
@@ -331,14 +331,14 @@ def parse_python_pipeline_asset(source: str | Path, descriptor_name: str) -> Sha
         parsed: list[tuple[str, ...]] = []
         for row in variants_node.elts:
             if not isinstance(row, (ast.Tuple, ast.List)):
-                raise PipelineCompileError("each pipeline asset variant must be a tuple or list")
+                raise PipelineCompileError("each Program Asset variant must be a tuple or list")
             if any(not isinstance(item, ast.Name) or item.id not in features for item in row.elts):
-                raise PipelineCompileError("pipeline asset variants must reference locally declared features")
+                raise PipelineCompileError("Program Asset variants must reference locally declared features")
             key = tuple(features[item.id] for item in row.elts if isinstance(item, ast.Name))
             if list(key) != sorted(key) or len(set(key)) != len(key):
-                raise PipelineCompileError(f"pipeline asset variant is not canonical: {list(key)}")
+                raise PipelineCompileError(f"Program Asset variant is not canonical: {list(key)}")
             if key in parsed:
-                raise PipelineCompileError(f"duplicate pipeline asset variant: {list(key)}")
+                raise PipelineCompileError(f"duplicate Program Asset variant: {list(key)}")
             parsed.append(key)
         variants = tuple(parsed)
     if not variants:

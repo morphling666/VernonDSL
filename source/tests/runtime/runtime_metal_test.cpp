@@ -1090,7 +1090,7 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     pipelineDescriptor.depth_stencil.stencil_read_mask = 0xff;
     pipelineDescriptor.depth_stencil.stencil_write_mask = 0xff;
     pipelineDescriptor.depth_stencil.back = pipelineDescriptor.depth_stencil.front;
-    VernonRuntimeProviderColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.source_color_factor = VERNON_RHI_BLEND_ONE;
     blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
     blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
@@ -1493,10 +1493,8 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &position;
     invocation.argument_count = 1;
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
+    graphics.bind(invocation);
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::vector<uint8_t> pixels(32 * 32 * 4);
@@ -1672,16 +1670,14 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
-    invocation.color_attachments = &attachment;
-    invocation.color_attachment_count = 1;
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.instance_count = 1;
+    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
+    graphics.bind(invocation);
     VernonIndexBinding invalidIndex{static_cast<VernonIndexType>(1), 0, indices.size(), indexReference};
-    invocation.index_binding = &invalidIndex;
+    graphics.draw.index_binding = &invalidIndex;
     EXPECT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     const VernonStringView indexError = vernonRuntimeGetLastError(runtime);
     EXPECT_NE(std::string(indexError.data, indexError.size).find("index binding is invalid"), std::string::npos);
-    invocation.index_binding = nullptr;
+    graphics.draw.index_binding = nullptr;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 

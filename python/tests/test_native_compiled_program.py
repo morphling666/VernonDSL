@@ -190,20 +190,27 @@ module {
 }
 """
 
-DIRECT_KERNEL_MODULE = r"""
+MIXED_GRID_PROGRAM = r"""
 module {
-  func.func @increment(
-      %values: !vernon.tensor_view<f32, [16], "read_write", "device"> {
-        vernon.interface = "resource",
-        vernon.source_name = "values",
-        vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
-      }) attributes {
-        vernon.entry,
-        vernon.stage = "compute",
-        vernon.workgroup_size = array<i32: 8, 1, 1>
+  func.func @forward(
+      %source: f32 {vernon.source_name = "source"},
+      %groups_x: i32 {vernon.source_name = "groups_x", vernon.dtype = "u32"},
+      %groups_z: i32 {vernon.source_name = "groups_z", vernon.dtype = "u32"})
+      -> (f32 {vernon.source_name = "output"})
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.source", "input.groups_x", "input.groups_z"],
+        vernon_program.result_names = ["output.result"]
       } {
-    return
+    %result = "vernon_program.compute"(%source) {
+      callee = "Module.square",
+      grid = array<i64: 1, 7, 1>,
+      vernon_program.grid_control_arguments = array<i64: 1, -1, 2>,
+      features = [],
+      operand_names = ["source"],
+      result_names = ["output"]
+    } : (f32) -> f32
+    func.return %result : f32
   }
 }
 """
@@ -222,24 +229,20 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertIn("vernon_program.compute", request["region_mlir"])
         self.assertEqual(reflection["program_plan"]["graphs"][0]["nodes"][0]["stage"], "forward:0")
 
-    def test_kernel_planner_bootstraps_explicit_dispatch_controls(self) -> None:
-        plan = native.Compiler().plan_kernel_result(DIRECT_KERNEL_MODULE)
+    def test_program_grid_axes_can_mix_static_and_runtime_controls(self) -> None:
+        plan = native.Compiler().plan_program_result(MIXED_GRID_PROGRAM)
         self.assertTrue(plan.ok, plan.diagnostics)
         reflection = json.loads(plan.reflection)
-        request = reflection["kernel_compile_requests"][0]
         node = reflection["program_plan"]["graphs"][0]["nodes"][0]
         self.assertEqual(
             node["grid"],
             [
                 {"control": {"argument": 1}},
+                7,
                 {"control": {"argument": 2}},
-                {"control": {"argument": 3}},
             ],
         )
-        self.assertEqual(request["grid"], node["grid"])
-        self.assertEqual(request["bindings"], [{"parameter": "values", "value": 0}])
-        self.assertEqual(node["resources"], [{"value": 0, "access": "read_write", "after": 4}])
-        self.assertIn("func.func @increment", request["region_mlir"])
+        self.assertEqual(reflection["kernel_compile_requests"][0]["grid"], node["grid"])
 
     def test_target_available_reports_compiler_capabilities(self) -> None:
         self.assertTrue(native.target_available(native.Target.CPU))

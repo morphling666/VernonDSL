@@ -1,9 +1,8 @@
 #include "VernonCompiler.h"
 #include "compiler_dispatch.h"
 #include "compiler_frontend.h"
-#include "compiler_graphics_bootstrap.h"
 #include "compiler_internal.h"
-#include "compiler_kernel_bootstrap.h"
+#include "compiler_program_aggregation.h"
 #include "compiler_program_finalization.h"
 #include "compiler_program_implementation.h"
 #include "compiler_program_stage.h"
@@ -135,69 +134,6 @@ VernonCompileResult *vernonCompilerPlanProgram(VernonCompilerContext *context, c
     return validate(context, program, programSize).release();
 }
 
-VernonCompileResult *vernonCompilerPlanKernel(VernonCompilerContext *context, const char *kernel, size_t kernelSize) {
-    auto result = std::make_unique<VernonCompileResult>();
-    if (!context || (!kernel && kernelSize != 0)) {
-        result->status = VERNON_STATUS_INVALID_ARGUMENT;
-        result->diagnostics = "context and kernel source must be valid";
-        return result.release();
-    }
-    result->status = vernon::compiler::planComputeKernel(*context->frontend, kernel, kernelSize, result->artifacts,
-                                                         result->reflection, result->diagnostics);
-    return result.release();
-}
-
-VernonCompileResult *vernonCompilerPlanGraphics(VernonCompilerContext *context, const VernonGraphicsStageSource *stages,
-                                                size_t stageCount, const char *topology, size_t topologySize,
-                                                const VernonStringView *features, size_t featureCount,
-                                                const VernonStringView *attachmentTypes, size_t attachmentCount,
-                                                uint32_t colorCount, const VernonGraphicsPlanOperand *operands,
-                                                size_t operandCount) {
-    auto result = std::make_unique<VernonCompileResult>();
-    if (!context || (!stages && stageCount != 0) || (!features && featureCount != 0) ||
-        (!operands && operandCount != 0) || (!topology && topologySize != 0) ||
-        (!attachmentTypes && attachmentCount != 0) || colorCount == 0 || colorCount > attachmentCount ||
-        attachmentCount - colorCount > 1) {
-        result->status = VERNON_STATUS_INVALID_ARGUMENT;
-        result->diagnostics = "graphics plan sources, topology, and attachments must be valid";
-        return result.release();
-    }
-    std::vector<vernon::compiler::GraphicsStageSource> parsedStages;
-    parsedStages.reserve(stageCount);
-    for (size_t index = 0; index < stageCount; ++index) {
-        const VernonGraphicsStageSource &stage = stages[index];
-        if (stage.struct_size != sizeof(VernonGraphicsStageSource) || (!stage.source && stage.source_size != 0)) {
-            result->status = VERNON_STATUS_INVALID_ARGUMENT;
-            result->diagnostics = "graphics stage source is incomplete";
-            return result.release();
-        }
-        parsedStages.push_back({stage.source, stage.source_size});
-    }
-    std::vector<std::string> parsedFeatures;
-    parsedFeatures.reserve(featureCount);
-    for (size_t index = 0; index < featureCount; ++index)
-        parsedFeatures.push_back(stringOf(features[index]));
-    std::vector<vernon::compiler::GraphicsPlanOperand> parsedOperands;
-    parsedOperands.reserve(operandCount);
-    for (size_t index = 0; index < operandCount; ++index) {
-        const VernonGraphicsPlanOperand &operand = operands[index];
-        if (operand.struct_size != sizeof(VernonGraphicsPlanOperand)) {
-            result->status = VERNON_STATUS_INVALID_ARGUMENT;
-            result->diagnostics = "graphics operand descriptor is incomplete";
-            return result.release();
-        }
-        parsedOperands.push_back({stringOf(operand.name), stringOf(operand.type)});
-    }
-    std::vector<std::string> parsedAttachments;
-    parsedAttachments.reserve(attachmentCount);
-    for (size_t index = 0; index < attachmentCount; ++index)
-        parsedAttachments.push_back(stringOf(attachmentTypes[index]));
-    result->status = vernon::compiler::planGraphicsProgram(
-        *context->frontend, parsedStages, std::string(topology ? topology : "", topologySize), parsedFeatures,
-        parsedAttachments, colorCount, parsedOperands, result->artifacts, result->reflection, result->diagnostics);
-    return result.release();
-}
-
 VernonCompileResult *vernonCompilerFinalizeProgram(VernonCompilerContext *context, const char *plan, size_t planSize,
                                                    const VernonCompiledKernel *kernels, size_t kernelCount) {
     return vernonCompilerFinalizeProgramWithShapes(context, plan, planSize, kernels, kernelCount, nullptr, 0);
@@ -242,42 +178,9 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     return object;
         return nullptr;
     };
-    const auto sameShape = [](const llvm::json::Array *left, const llvm::json::Array *right) {
-        const size_t leftSize = left ? left->size() : 0;
-        const size_t rightSize = right ? right->size() : 0;
-        if (leftSize != rightSize)
-            return false;
-        for (size_t index = 0; index < leftSize; ++index) {
-            const std::optional<int64_t> expected = (*left)[index].getAsInteger();
-            const std::optional<int64_t> actual = (*right)[index].getAsInteger();
-            if (!expected || !actual)
-                return false;
-            // Dynamic extents are wildcards. A concrete Program value may
-            // specialize a dynamic compiled ABI, and a concrete compiled ABI
-            // may specialize a dynamic Program value.
-            if (*expected > 0 && *actual > 0 && *expected != *actual)
-                return false;
-        }
-        return true;
-    };
-    const auto suffixShape = [](const llvm::json::Array *logical, const llvm::json::Array *element) {
-        if (!logical || !element || logical->size() < element->size())
-            return false;
-        const size_t offset = logical->size() - element->size();
-        for (size_t index = 0; index < element->size(); ++index) {
-            const std::optional<int64_t> expected = (*element)[index].getAsInteger();
-            const std::optional<int64_t> actual = (*logical)[index + offset].getAsInteger();
-            if (!expected || !actual || *expected <= 0 || (*actual > 0 && *expected != *actual))
-                return false;
-        }
-        return true;
-    };
-
-    std::map<std::string, std::string> program;
-    llvm::json::Array compiledRows;
     llvm::json::Object canonicalProgram;
     llvm::json::Object stageContracts;
-    std::vector<vernon::compiler::CanonicalComputeStage> canonicalStages;
+    std::vector<vernon::compiler::CanonicalProgramStage> canonicalStages;
     std::map<std::string, size_t> canonicalStageByRequest;
     for (size_t index = 0; index < kernelCount; ++index) {
         const VernonCompiledKernel &kernel = kernels[index];
@@ -430,191 +333,150 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             result->diagnostics = "Program request has no ABI bindings";
             return result.release();
         }
-        for (llvm::json::Value &bindingValue : *bindings) {
-            if (expectedStage == "graphics")
-                break;
-            llvm::json::Object *binding = bindingValue.getAsObject();
-            std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
-            std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
-            llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
-            const std::optional<llvm::StringRef> role = binding ? binding->getString("autodiff_role") : std::nullopt;
-            const std::optional<llvm::StringRef> autodiffSource =
-                binding ? binding->getString("autodiff_source") : std::nullopt;
-            const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
-            if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
-                continue;
-            auto parameterIt = parameter ? interface.find(parameter->str()) : interface.end();
-            if (!parameter || !valueId || parameterIt == interface.end() || !value) {
-                result->status = VERNON_STATUS_VERIFICATION_ERROR;
-                result->diagnostics =
-                    "compiled kernel ABI does not bind Program parameter for request '" + requestId + "'";
-                return result.release();
-            }
-            llvm::json::Object *parameterRow = parameterIt->second;
-            std::optional<llvm::StringRef> expectedDtype = value->getString("dtype");
-            llvm::json::Array *expectedShape = value->getArray("shape");
-            llvm::json::Array aggregateExpectedShape;
-            if (expectedStage == "compute" && (!expectedShape || expectedShape->empty()) &&
-                !value->getInteger("storage"))
-                if (llvm::json::Object *layout = value->getObject("value_layout"))
-                    if (llvm::json::Array *leaves = layout->getArray("leaves"); leaves && leaves->size() == 1)
-                        if (llvm::json::Object *leaf = (*leaves)[0].getAsObject())
-                            if (llvm::json::Array *leafShape = leaf->getArray("shape")) {
-                                expectedShape = leafShape;
-                                expectedDtype = leaf->getString("dtype");
-                            }
-            std::optional<size_t> projectedLeafIndex;
-            if (expectedStage == "compute") {
-                llvm::json::Object *layout = value->getObject("value_layout");
-                llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
-                const std::optional<int64_t> explicitLeaf = binding->getInteger("leaf");
-                if (explicitLeaf) {
-                    if (*explicitLeaf < 0)
-                        projectedLeafIndex = std::numeric_limits<size_t>::max();
-                    else
-                        projectedLeafIndex = static_cast<size_t>(*explicitLeaf);
-                } else if (layout && autodiffSource && (role == "gradient" || role == "cotangent")) {
-                    projectedLeafIndex =
-                        vernon::compiler::resolveProgramValueLeafIndex(*layout, *autodiffSource, *parameter);
-                }
-                if (projectedLeafIndex && (!leaves || *projectedLeafIndex >= leaves->size())) {
+        if (expectedStage == "compute")
+            for (llvm::json::Value &bindingValue : *bindings) {
+                llvm::json::Object *binding = bindingValue.getAsObject();
+                std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
+                std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
+                llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
+                const std::optional<llvm::StringRef> role =
+                    binding ? binding->getString("autodiff_role") : std::nullopt;
+                const std::optional<llvm::StringRef> autodiffSource =
+                    binding ? binding->getString("autodiff_source") : std::nullopt;
+                const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
+                if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
+                    continue;
+                auto parameterIt = parameter ? interface.find(parameter->str()) : interface.end();
+                if (!parameter || !valueId || parameterIt == interface.end() || !value) {
                     result->status = VERNON_STATUS_VERIFICATION_ERROR;
                     result->diagnostics =
-                        "Program leaf projection does not match its canonical Value ABI for request '" + requestId +
-                        "'";
+                        "compiled kernel ABI does not bind Program parameter for request '" + requestId + "'";
                     return result.release();
                 }
-                if (projectedLeafIndex) {
-                    llvm::json::Object *leaf = (*leaves)[*projectedLeafIndex].getAsObject();
-                    expectedDtype = leaf ? leaf->getString("dtype") : std::nullopt;
-                    if (llvm::json::Array *ownerShape = value->getArray("shape"))
-                        for (const llvm::json::Value &extent : *ownerShape)
-                            aggregateExpectedShape.emplace_back(extent);
-                    if (llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr)
-                        for (const llvm::json::Value &extent : *leafShape)
-                            aggregateExpectedShape.emplace_back(extent);
-                    expectedShape = &aggregateExpectedShape;
-                }
-            }
-            std::optional<llvm::StringRef> actualDtype = parameterRow->getString("dtype");
-            if (!actualDtype)
-                actualDtype = parameterRow->getString("vernon.dtype");
-            llvm::json::Array *actualShape = parameterRow->getArray("shape");
-            if (!actualShape)
-                actualShape = parameterRow->getArray("source_shape");
-            llvm::json::Array derivativeActualShape;
-            if (actualShape && projectedLeafIndex) {
-                llvm::json::Object *layout = parameterRow->getObject("value_layout");
-                if (!layout)
-                    layout = parameterRow->getObject("element_layout");
-                llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
-                llvm::json::Object *leaf = leaves && leaves->size() == 1 ? (*leaves)[0].getAsObject() : nullptr;
-                llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr;
-                if (leafShape) {
-                    for (const llvm::json::Value &extent : *actualShape)
-                        derivativeActualShape.emplace_back(extent);
-                    for (const llvm::json::Value &extent : *leafShape)
-                        derivativeActualShape.emplace_back(extent);
-                    actualShape = &derivativeActualShape;
-                }
-            }
-            const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
-            const bool opaqueResource = parameterKind == "image" || parameterKind == "sampler";
-            const bool compatibleBindingShape =
-                expectedStage == "compute"
-                    ? vernon::compiler::compatibleProgramBindingShape(
-                          role.value_or(""), parameterRow->getString("vernon.autodiff_carrier").value_or(""),
-                          expectedShape, actualShape)
-                    : sameShape(expectedShape, actualShape);
-            const bool graphicsVertexElement = expectedStage == "graphics" &&
-                                               parameterRow->getArray("attribute_leaves") &&
-                                               suffixShape(expectedShape, actualShape);
-            llvm::json::Object *expectedLayout = value->getObject("value_layout");
-            llvm::json::Object *actualLayout = parameterRow->getObject("value_layout");
-            const std::optional<llvm::StringRef> expectedLayoutHash =
-                expectedLayout ? expectedLayout->getString("layout_hash") : std::nullopt;
-            const std::optional<llvm::StringRef> actualLayoutHash =
-                actualLayout ? actualLayout->getString("layout_hash") : std::nullopt;
-            const bool canonicalValueLayoutMatches = expectedStage == "compute" && parameterKind == "tensor_value" &&
-                                                     !projectedLeafIndex && expectedLayoutHash && actualLayoutHash &&
-                                                     *expectedLayoutHash == *actualLayoutHash;
-            if (!opaqueResource && !canonicalValueLayoutMatches &&
-                ((expectedDtype && actualDtype && *expectedDtype != *actualDtype) ||
-                 (!compatibleBindingShape && !graphicsVertexElement))) {
-                auto shapeText = [](const llvm::json::Array *shape) {
-                    if (!shape)
-                        return std::string("[]");
-                    std::string text = "[";
-                    for (size_t index = 0; index < shape->size(); ++index) {
-                        if (index)
-                            text += ", ";
-                        if (std::optional<int64_t> extent = (*shape)[index].getAsInteger())
-                            text += std::to_string(*extent);
+                llvm::json::Object *parameterRow = parameterIt->second;
+                std::optional<llvm::StringRef> expectedDtype = value->getString("dtype");
+                llvm::json::Array *expectedShape = value->getArray("shape");
+                llvm::json::Array aggregateExpectedShape;
+                if (expectedStage == "compute" && (!expectedShape || expectedShape->empty()) &&
+                    !value->getInteger("storage"))
+                    if (llvm::json::Object *layout = value->getObject("value_layout"))
+                        if (llvm::json::Array *leaves = layout->getArray("leaves"); leaves && leaves->size() == 1)
+                            if (llvm::json::Object *leaf = (*leaves)[0].getAsObject())
+                                if (llvm::json::Array *leafShape = leaf->getArray("shape")) {
+                                    expectedShape = leafShape;
+                                    expectedDtype = leaf->getString("dtype");
+                                }
+                std::optional<size_t> projectedLeafIndex;
+                if (expectedStage == "compute") {
+                    llvm::json::Object *layout = value->getObject("value_layout");
+                    llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
+                    const std::optional<int64_t> explicitLeaf = binding->getInteger("leaf");
+                    if (explicitLeaf) {
+                        if (*explicitLeaf < 0)
+                            projectedLeafIndex = std::numeric_limits<size_t>::max();
+                        else
+                            projectedLeafIndex = static_cast<size_t>(*explicitLeaf);
+                    } else if (layout && autodiffSource && (role == "gradient" || role == "cotangent")) {
+                        projectedLeafIndex =
+                            vernon::compiler::resolveProgramValueLeafIndex(*layout, *autodiffSource, *parameter);
                     }
-                    text += "]";
-                    return text;
+                    if (projectedLeafIndex && (!leaves || *projectedLeafIndex >= leaves->size())) {
+                        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+                        result->diagnostics =
+                            "Program leaf projection does not match its canonical Value ABI for request '" + requestId +
+                            "'";
+                        return result.release();
+                    }
+                    if (projectedLeafIndex) {
+                        llvm::json::Object *leaf = (*leaves)[*projectedLeafIndex].getAsObject();
+                        expectedDtype = leaf ? leaf->getString("dtype") : std::nullopt;
+                        if (llvm::json::Array *ownerShape = value->getArray("shape"))
+                            for (const llvm::json::Value &extent : *ownerShape)
+                                aggregateExpectedShape.emplace_back(extent);
+                        if (llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr)
+                            for (const llvm::json::Value &extent : *leafShape)
+                                aggregateExpectedShape.emplace_back(extent);
+                        expectedShape = &aggregateExpectedShape;
+                    }
+                }
+                llvm::json::Array *actualShape = parameterRow->getArray("shape");
+                if (!actualShape)
+                    actualShape = parameterRow->getArray("source_shape");
+                llvm::json::Array derivativeActualShape;
+                if (actualShape && projectedLeafIndex) {
+                    llvm::json::Object *layout = parameterRow->getObject("value_layout");
+                    if (!layout)
+                        layout = parameterRow->getObject("element_layout");
+                    llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
+                    llvm::json::Object *leaf = leaves && leaves->size() == 1 ? (*leaves)[0].getAsObject() : nullptr;
+                    llvm::json::Array *leafShape = leaf ? leaf->getArray("shape") : nullptr;
+                    if (leafShape) {
+                        for (const llvm::json::Value &extent : *actualShape)
+                            derivativeActualShape.emplace_back(extent);
+                        for (const llvm::json::Value &extent : *leafShape)
+                            derivativeActualShape.emplace_back(extent);
+                        actualShape = &derivativeActualShape;
+                    }
+                }
+                const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
+                llvm::json::Object *expectedLayout = value->getObject("value_layout");
+                const vernon::compiler::ProgramEndpointExpectation expectation{
+                    expectedDtype,
+                    expectedShape,
+                    actualShape,
+                    expectedLayout,
+                    role.value_or(""),
+                    parameterRow->getString("vernon.autodiff_carrier").value_or(""),
+                    false,
+                    parameterKind == "tensor_value" && !projectedLeafIndex,
                 };
-                result->status = VERNON_STATUS_VERIFICATION_ERROR;
-                result->diagnostics = "compiled kernel ABI type does not match Program value for request '" +
-                                      requestId + "' parameter '" + parameter->str() +
-                                      "' expected dtype=" + (expectedDtype ? expectedDtype->str() : "<none>") +
-                                      " shape=" + shapeText(expectedShape) +
-                                      " actual dtype=" + (actualDtype ? actualDtype->str() : "<none>") +
-                                      " shape=" + shapeText(actualShape);
-                return result.release();
+                std::string abiError;
+                if (!vernon::compiler::verifyProgramEndpointAbi(expectation, *parameterRow, abiError)) {
+                    result->status = VERNON_STATUS_VERIFICATION_ERROR;
+                    result->diagnostics = "compiled kernel ABI type does not match Program value for request '" +
+                                          requestId + "' parameter '" + parameter->str() + "': " + abiError;
+                    return result.release();
+                }
             }
-        }
         auto grouped = canonicalStageByRequest.find(requestId);
         if (grouped == canonicalStageByRequest.end()) {
             canonicalStageByRequest[requestId] = canonicalStages.size();
-            canonicalStages.push_back(vernon::compiler::CanonicalComputeStage{requestId, stageId, *kernelRoot, *entry});
-            program.emplace(requestId, stageId);
-        } else {
-            vernon::compiler::CanonicalComputeStage &stage = canonicalStages[grouped->second];
-            if (stage.implementationStageId != stageId) {
-                result->status = VERNON_STATUS_INVALID_ARGUMENT;
-                result->diagnostics = "graphics modules for one Program request disagree on stage identity";
-                return result.release();
-            }
-            llvm::json::Array *mergedEntries = stage.compiledReflection.getArray("entries");
-            if (!mergedEntries) {
+            canonicalStages.emplace_back();
+            if (!vernon::compiler::appendCompiledProgramModule(canonicalStages.back(), requestId, stageId,
+                                                               expectedStage == "compute"
+                                                                   ? vernon::compiler::ProgramStageOperation::Compute
+                                                                   : vernon::compiler::ProgramStageOperation::Graphics,
+                                                               *kernelRoot, *entry, result->diagnostics)) {
                 result->status = VERNON_STATUS_VERIFICATION_ERROR;
-                result->diagnostics = "compiled graphics reflection has no entries";
                 return result.release();
             }
-            for (const llvm::json::Value &moduleEntry : *entries)
-                mergedEntries->emplace_back(moduleEntry);
-            llvm::json::Array *mergedFeatures = stage.compiledReflection.getArray("required_features");
-            if (!mergedFeatures)
-                stage.compiledReflection["required_features"] = llvm::json::Array();
-            mergedFeatures = stage.compiledReflection.getArray("required_features");
-            if (const llvm::json::Array *features = kernelRoot->getArray("required_features"))
-                for (const llvm::json::Value &feature : *features)
-                    mergedFeatures->emplace_back(feature);
+        } else {
+            if (!vernon::compiler::appendCompiledProgramModule(canonicalStages[grouped->second], requestId, stageId,
+                                                               expectedStage == "compute"
+                                                                   ? vernon::compiler::ProgramStageOperation::Compute
+                                                                   : vernon::compiler::ProgramStageOperation::Graphics,
+                                                               *kernelRoot, *entry, result->diagnostics)) {
+                result->status = VERNON_STATUS_VERIFICATION_ERROR;
+                return result.release();
+            }
         }
-        llvm::json::Object row;
-        row["request_id"] = requestId;
-        row["stage_id"] = stageId;
-        row["entry"] = entryName;
-        row["reflection"] = std::move(*kernelRoot);
-        compiledRows.emplace_back(std::move(row));
     }
     if (canonicalStageByRequest.size() != requestById.size()) {
         result->status = VERNON_STATUS_INVALID_ARGUMENT;
         result->diagnostics = "compiled kernels do not exactly cover Program kernel requests";
         return result.release();
     }
+    for (const vernon::compiler::CanonicalProgramStage &stage : canonicalStages)
+        if (!vernon::compiler::finalizeProgramStageAggregation(stage, result->diagnostics)) {
+            result->status = VERNON_STATUS_VERIFICATION_ERROR;
+            return result.release();
+        }
     llvm::json::Object targetImplementations;
-    if (!vernon::compiler::buildCanonicalComputeProgram(*execution, canonicalStages, canonicalProgram, stageContracts,
-                                                        targetImplementations, result->diagnostics)) {
+    if (!vernon::compiler::finalizeCanonicalProgram(*execution, canonicalStages, canonicalProgram, stageContracts,
+                                                    targetImplementations, result->diagnostics)) {
         result->status = VERNON_STATUS_VERIFICATION_ERROR;
         return result.release();
     }
-    llvm::json::Object programObject;
-    for (const auto &[requestId, stageId] : program)
-        programObject[requestId] = stageId;
-    (*root)["program"] = std::move(programObject);
-    (*root)["compiled_kernels"] = std::move(compiledRows);
     (*root)["canonical_program"] = std::move(canonicalProgram);
     (*root)["stage_contracts"] = std::move(stageContracts);
     if (!targetImplementations.empty())

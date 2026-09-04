@@ -7,12 +7,17 @@
 #include "runtime/target_binding_plan.h"
 
 #include <array>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 struct VernonRuntimeContext;
 struct VernonResolvedProgramStage;
+
+namespace vernon::runtime {
+struct ProgramInvocationContext;
+}
 
 namespace vernon::runtime::ad {
 
@@ -39,6 +44,12 @@ struct ProgramHostValue {
     ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};
 };
 
+struct ProgramDeviceUpload {
+    VernonRhiBuffer destination{};
+    const void *source{};
+    size_t size{};
+};
+
 class ProgramInvocationFrame {
 public:
     ProgramInvocationFrame() = default;
@@ -59,6 +70,10 @@ public:
     bool materializeNodeArguments(const program::Program &program, const program::Node &node,
                                   const VernonResolvedProgramStage &stage, MaterializedProgramArguments &output,
                                   std::string &error) const;
+    bool bindControlImageStorage(const program::Program &program, uint32_t storage,
+                                 VernonRuntimeProviderResourceReference view, std::string &error);
+    bool resolveControl(const program::Program &program, const program::ControlComponent &control, uint64_t &value,
+                        std::string &error) const;
 
     const VernonPipelineArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr) const;
     VernonPipelineArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr);
@@ -66,7 +81,10 @@ public:
 
     const std::vector<VernonPipelineArgument> &logicalArguments() const { return logicalArguments_; }
     std::vector<VernonPipelineArgument> &logicalArguments() { return logicalArguments_; }
+    const std::vector<ProgramDeviceUpload> &deviceUploads() const { return deviceUploads_; }
     bool deviceResident() const { return deviceResident_; }
+    void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
+    const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
     const std::vector<ProgramHostValue> &hostValues() const { return hostValues_; }
     std::vector<ProgramHostValue> &hostValues() { return hostValues_; }
 
@@ -86,7 +104,10 @@ private:
     std::vector<ProgramHostValue> hostValues_;
     std::vector<VernonPipelineArgument> logicalArguments_;
     std::vector<std::shared_ptr<gpu::DeviceBuffer>> logicalBuffers_;
+    std::vector<ProgramDeviceUpload> deviceUploads_;
     std::vector<std::array<Carrier, 4>> carriers_;
+    std::map<uint32_t, VernonRuntimeProviderResourceReference> controlImages_;
+    const ProgramInvocationContext *invocationContext_{};
     bool deviceResident_{};
 };
 

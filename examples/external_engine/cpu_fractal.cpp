@@ -36,7 +36,7 @@ std::string runtimeError(VernonRuntimeContext *runtime) {
 class FractalComputePass final : public vernon::execution::ComputePass {
 public:
     FractalComputePass(vernon::execution::GraphBuffer pixels, VernonRuntimeContext *runtime,
-                       VernonLoadedPipeline *pipeline, VernonPipelineInvocation *invocation)
+                       VernonProgramExecutable *pipeline, VernonPipelineInvocation *invocation)
         : ComputePass("fractal-compute"), pixels_(pixels), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -58,7 +58,7 @@ public:
 private:
     vernon::execution::GraphBuffer pixels_;
     VernonRuntimeContext *runtime_{};
-    VernonLoadedPipeline *pipeline_{};
+    VernonProgramExecutable *pipeline_{};
     VernonPipelineInvocation *invocation_{};
 };
 
@@ -124,12 +124,12 @@ public:
         if (!runtime_)
             return false;
 #if defined(__EMSCRIPTEN__)
-        const VernonPipelineBundleLoadOptions *loadOptions = nullptr;
+        const VernonProgramBundleLoadOptions *loadOptions = nullptr;
 #else
-        VernonPipelineBundleLoadOptions desktopOptions{};
+        VernonProgramBundleLoadOptions desktopOptions{};
         desktopOptions.struct_size = sizeof(desktopOptions);
         desktopOptions.bundle_directory = vernon_external_engine::cpu_bundle::kCookedDirectory;
-        const VernonPipelineBundleLoadOptions *loadOptions = &desktopOptions;
+        const VernonProgramBundleLoadOptions *loadOptions = &desktopOptions;
 #endif
         bundle_ =
             vernonRuntimeLoadPipelineBundleWithOptions(runtime_, vernon_external_engine::cpu_bundle::kManifest,
@@ -142,8 +142,9 @@ public:
 
         VernonPipelineParameterView pixelsParameter{};
         VernonPipelineParameterView timeParameter{};
-        if (vernonRuntimeLoadedPipelineFindParameter(pipeline_, {"pixels", 6}, &pixelsParameter) != VERNON_STATUS_OK ||
-            vernonRuntimeLoadedPipelineFindParameter(pipeline_, {"time", 4}, &timeParameter) != VERNON_STATUS_OK)
+        if (vernonRuntimeProgramExecutableFindParameter(pipeline_, {"pixels", 6}, &pixelsParameter) !=
+                VERNON_STATUS_OK ||
+            vernonRuntimeProgramExecutableFindParameter(pipeline_, {"time", 4}, &timeParameter) != VERNON_STATUS_OK)
             return false;
         pixels_.resize(static_cast<size_t>(kWidth) * kHeight);
         rgba_.resize(pixels_.size() * 4);
@@ -222,9 +223,9 @@ public:
             vernonRhiDeviceDestroyImage(graphics_->device(), presentImage_);
         presentImage_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         if (pipeline_)
-            vernonRuntimeLoadedPipelineDestroy(pipeline_);
+            vernonRuntimeProgramExecutableDestroy(pipeline_);
         if (bundle_)
-            vernonRuntimePipelineBundleDestroy(bundle_);
+            vernonRuntimeProgramBundleDestroy(bundle_);
         if (runtime_)
             vernonRuntimeDestroy(runtime_);
         pipeline_ = nullptr;
@@ -236,8 +237,8 @@ private:
     bool headless_{};
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
-    VernonPipelineBundle *bundle_{};
-    VernonLoadedPipeline *pipeline_{};
+    VernonProgramBundle *bundle_{};
+    VernonProgramExecutable *pipeline_{};
     VernonRhiImage presentImage_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     std::vector<float> pixels_;
     std::vector<uint8_t> rgba_;
