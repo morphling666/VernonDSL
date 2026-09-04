@@ -47,7 +47,7 @@ build = [
 
 [project.scripts]
 vernon-compile-python = "vernon_dsl.cli:main"
-vernon-cook-pipeline = "vernon_dsl.pipeline_asset_cli:main"
+vernon-cook-program = "vernon_dsl.program_asset_cli:main"
 
 [tool.uv]
 package = false
@@ -73,6 +73,9 @@ regex = 'RELEASE_VERSION = "(?P<value>[^"]+)"'
 [tool.ruff]
 line-length = 120
 fix = true
+# Vendored third-party checkout. It is not gitignored, and `fix = true` means an
+# unscoped `ruff check` would rewrite thousands of upstream files in place.
+extend-exclude = ["llvm-project"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
@@ -86,7 +89,7 @@ select = ["E", "F", "I", "B"]
 "examples/shader_lib/shadow.py" = ["F403", "F405"]
 "examples/shadowed_material.py" = ["F403", "F405"]
 "python/tests/cube_map_shader.py" = ["F821"]
-"python/tests/pipeline_asset_fixture.py" = ["F722"]
+"python/tests/program_asset_fixture.py" = ["F722"]
 "python/tests/smoke_shader.py" = ["F403", "F405", "F841"]
 
 [tool.basedpyright]
