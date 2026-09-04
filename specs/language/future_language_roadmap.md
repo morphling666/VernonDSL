@@ -29,7 +29,7 @@ The normative design is [`../autodiff.md`](../autodiff.md).
 - Add one public reverse-mode transform, `vd.ad.vjp`, for a Kernel, graphics
   stage tuple, or existing ExecutionGraph. Keep authored entry signatures
   unchanged.
-- Extend `pipeline_asset(program=...)` with a declarative VJP
+- Extend `program_asset(program=...)` with a declarative VJP
   `ProgramExpression`; cook independent primal, forward-with-tape, and
   backward profiles under one asset ID.
 - Derive adjoint Values recursively for floating Scalar, Tensor, Tuple, and

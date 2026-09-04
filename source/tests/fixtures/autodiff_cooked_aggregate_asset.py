@@ -36,7 +36,7 @@ def objective(
     output[1] = result[1]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="runtime/cooked-autodiff",
     program=vd.ad.vjp(
         objective,

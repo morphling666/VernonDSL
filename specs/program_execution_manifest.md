@@ -221,7 +221,7 @@ Its persistent file layout is:
 
 ```text
 bundle/
-  program.pipeline.json
+  program.program.json
   artifacts/
     <blob-sha256>.o
     <blob-sha256>.obj
@@ -236,7 +236,7 @@ bundle/
 Only applicable files required by emitted variants are present; the suffix
 list above is illustrative rather than a requirement to emit every format.
 Blob external URIs point
-from `program.pipeline.json` into this `artifacts/` directory and remain
+from `program.program.json` into this `artifacts/` directory and remain
 normalized relative paths beneath the bundle root.
 
 The object above shows container structure only, not a valid bundle: version

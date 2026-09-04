@@ -202,7 +202,7 @@ def mandelbulb_fragment(
     return vd.Vector([gamma, 1.0])
 
 
-mandelbulb_asset = vd.pipeline_asset(
+mandelbulb_asset = vd.program_asset(
     id="examples/external_engine/mandelbulb",
     program=(fullscreen_vertex, mandelbulb_fragment),
     variants=((),),

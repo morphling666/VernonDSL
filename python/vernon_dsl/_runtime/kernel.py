@@ -12,7 +12,7 @@ from typing import Any, ClassVar, Protocol
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from ..bundle import PipelineCompileError, canonical_json, make_target_options
+from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
@@ -466,7 +466,7 @@ class Kernel:
 
         try:
             specialization = compile_program(parsed, template)
-        except PipelineCompileError as error:
+        except ProgramCompileError as error:
             raise RuntimeError(str(error)) from error
         cached = _CompiledKernel(
             frontend,

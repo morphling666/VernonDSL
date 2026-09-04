@@ -15,7 +15,7 @@ from .texture import _TextureResource
 
 
 @dataclass
-class CookedPipeline:
+class CookedProgram:
     """Callable compute pipeline loaded through the native asset loader."""
 
     _bundle: bytes
@@ -151,16 +151,16 @@ class CookedPipeline:
                     value._mark_device_dirty()
 
 
-def load_pipeline(
+def load_program(
     manifest: str | Path,
     *,
     features: tuple[str, ...] = (),
-) -> CookedPipeline:
+) -> CookedProgram:
     manifest_path = Path(manifest).resolve()
     if any(not isinstance(feature, str) or not feature for feature in features):
         raise ValueError("pipeline asset features must be non-empty strings")
     bundle = manifest_path.read_bytes()
-    pipeline = CookedPipeline(
+    pipeline = CookedProgram(
         bundle,
         str(manifest_path.parent),
         tuple(sorted(set(features))),
@@ -206,4 +206,4 @@ def _source_parameter_order(bundle: bytes) -> tuple[str, ...]:
     return ()
 
 
-__all__ = ["CookedPipeline", "load_pipeline"]
+__all__ = ["CookedProgram", "load_program"]

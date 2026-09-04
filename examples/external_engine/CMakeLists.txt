@@ -28,7 +28,7 @@ function(vernon_find_single_manifest directory output)
         GLOB
         manifests
         CONFIGURE_DEPENDS
-        "${directory}/*.pipeline.json")
+        "${directory}/*.program.json")
     list(LENGTH manifests manifest_count)
     if(NOT
        manifest_count
@@ -159,7 +159,7 @@ find_package(
     Python3
     COMPONENTS Interpreter
     REQUIRED)
-set(_vernon_embedded_graphics_manifest "${CMAKE_CURRENT_BINARY_DIR}/generated/graphics.pipeline.json")
+set(_vernon_embedded_graphics_manifest "${CMAKE_CURRENT_BINARY_DIR}/generated/graphics.program.json")
 execute_process(
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/embed_text_artifacts.py" "${_vernon_graphics_manifest}"
             "${_vernon_embedded_graphics_manifest}"

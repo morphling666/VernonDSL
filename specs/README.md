@@ -78,7 +78,7 @@ current `PIPELINE_VERSION` contract.
 
 ## Pipeline boundary
 
-`PipelineAsset` accepts a compute Kernel, graphics pipeline, initialized Module
+`ProgramAsset` accepts a compute Kernel, graphics pipeline, initialized Module
 or explicit Program transform. The coordinated breaking target has exactly one
 canonical deployment path:
 

@@ -439,7 +439,7 @@ class ModuleTests(unittest.TestCase):
 
     def test_pipeline_asset_retains_initialized_module(self) -> None:
         module = AnnotatedSquare()
-        asset = vd.pipeline_asset(id="modules/annotated-square", program=module)
+        asset = vd.program_asset(id="modules/annotated-square", program=module)
         self.assertIs(asset.program, module)
 
     def test_module_frontend_reflects_nested_kernel_parameter_types(self) -> None:

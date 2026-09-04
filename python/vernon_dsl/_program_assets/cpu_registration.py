@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Sequence
 
-from ..bundle import PipelineCompileError
+from ..bundle import ProgramCompileError
 
 _C_SYMBOL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -13,7 +13,7 @@ _C_SYMBOL = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 def write_cpu_static_registration(output: Path, symbols: Sequence[str]) -> dict[str, Any]:
     ordered = tuple(sorted(set(symbols)))
     if not ordered or any(_C_SYMBOL.fullmatch(symbol) is None for symbol in ordered):
-        raise PipelineCompileError("CPU artifacts contain an invalid static entry symbol")
+        raise ProgramCompileError("CPU artifacts contain an invalid static entry symbol")
 
     identity = hashlib.sha256("\n".join(ordered).encode("utf-8")).hexdigest()
     stem = f"vernon_cpu_registration_{identity[:16]}"

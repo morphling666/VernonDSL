@@ -15,7 +15,7 @@ def static_objective(
     output[gid[0]] = total * difference / y
 
 
-static_asset = vd.pipeline_asset(
+static_asset = vd.program_asset(
     id="compute/gpu_static_tape_vjp",
     program=vd.ad.vjp(
         static_objective,
@@ -41,7 +41,7 @@ def dynamic_objective(
     output[gid[0]] = total
 
 
-dynamic_asset = vd.pipeline_asset(
+dynamic_asset = vd.program_asset(
     id="compute/gpu_dynamic_tape_vjp",
     program=vd.ad.vjp(
         dynamic_objective,

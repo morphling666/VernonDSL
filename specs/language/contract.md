@@ -373,7 +373,7 @@ a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
 Value even if a backend uses a buffer physically. Direct shader addressing,
 stores, and atomics require `TensorView[..., resource()]`.
 
-A persistent `PipelineAsset` wraps exactly one executable pipeline. Its
+A persistent `ProgramAsset` wraps exactly one executable pipeline. Its
 `program=` is either one `@kernel` entry or a non-empty tuple containing only
 graphics entries. Kernel programs are compute-only; graphics stage tuples form
 graphics-only Pipelines. Compute and graphics entries cannot be mixed in one
@@ -382,13 +382,13 @@ pipeline.
 Each graphics entry carries an explicit stage kind. A target-independent stage
 registry validates tuple topology and ordering. The registered graphics
 topology is `vertex -> fragment`. Future stage additions can extend topology
-validation without changing `PipelineAsset` syntax; such changes are covered by
+validation without changing `ProgramAsset` syntax; such changes are covered by
 `COMPILER_CONTRACT_VERSION`.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
 same closed stage/direction/type registry. `vd.feature` is the single
-compile-time specialization mechanism for program code. `PipelineAsset`
+compile-time specialization mechanism for program code. `ProgramAsset`
 explicitly enumerates accepted canonical feature combinations through
 `variants=`; there is no independent public shader-variant selector. Feature
 values and `When` branches are compile-time specialization inputs, not runtime
@@ -473,7 +473,7 @@ reduced.
 
 Authored Kernel and graphics entry signatures do not change. The language has
 no `grad_or_not`, `requires_grad`, implicit `.grad`, global gradient clearing,
-or context that silently executes backward work. `pipeline_asset()` remains the
+or context that silently executes backward work. `program_asset()` remains the
 only cookable declaration; a VJP is represented by a declarative
 `ProgramExpression` in its `program=` operand.
 

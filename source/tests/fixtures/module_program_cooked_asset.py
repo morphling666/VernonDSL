@@ -19,7 +19,7 @@ class Square(vd.Module):
         return output
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="runtime/module-program-cooked",
     program=vd.ad.vjp(Square(), wrt=("source",), outputs=("output",)),
 )

@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Any, Mapping
 
-from .types import PIPELINE_VERSION, BundlePlan, CompiledArtifact, PipelineCompileError
+from .types import PIPELINE_VERSION, BundlePlan, CompiledArtifact, ProgramCompileError
 
 
 def canonical_json(value: Any) -> str:
@@ -33,7 +33,7 @@ def inline_artifact_descriptor(artifact: CompiledArtifact) -> dict[str, Any]:
             base64.b64encode(artifact.data).decode("ascii") if encoding == "base64" else artifact.data.decode("utf-8")
         )
     except UnicodeDecodeError:
-        raise PipelineCompileError(f"{artifact.format} runtime artifact is not UTF-8") from None
+        raise ProgramCompileError(f"{artifact.format} runtime artifact is not UTF-8") from None
     return {
         "format": artifact.format,
         "storage": "inline",
@@ -52,7 +52,7 @@ def materialize_bundle(
         variant.canonical_program is not None and isinstance(variant.canonical_program.get("stages"), Mapping)
         for variant in plan.variants
     ):
-        from .._shader_assets.cooking import _canonical_deployment
+        from .._program_assets.cooking import _canonical_deployment
 
         variants = []
         for variant in plan.variants:
@@ -81,16 +81,16 @@ def materialize_bundle(
     document = plan.logical_dict()
     records = document["stage_artifacts"]
     if set(records) != set(artifact_descriptors):
-        raise PipelineCompileError("artifact descriptors do not match planned stages")
+        raise ProgramCompileError("artifact descriptors do not match planned stages")
     for stage_id, descriptor in artifact_descriptors.items():
         stage = next(stage for stage in plan.stages if stage.id == stage_id)
         if descriptor.get("sha256") != stage.artifact.sha256:
-            raise PipelineCompileError(f"artifact descriptor digest does not match stage {stage_id}")
+            raise ProgramCompileError(f"artifact descriptor digest does not match stage {stage_id}")
         records[stage_id]["artifact"] = dict(descriptor)
         if stage.target.target == "cpu":
             symbol = stage.metadata.get("symbol")
             if not isinstance(symbol, str) or not symbol:
-                raise PipelineCompileError(f"CPU stage {stage_id} has no exported symbol")
+                raise ProgramCompileError(f"CPU stage {stage_id} has no exported symbol")
             records[stage_id]["symbol"] = symbol
     return with_content_hash(document)
 

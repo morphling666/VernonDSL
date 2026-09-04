@@ -68,7 +68,7 @@ def native_numeric_objective(
     )
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="runtime/cooked-native-autodiff-numeric-cpu",
     program=vd.ad.vjp(
         native_numeric_objective,

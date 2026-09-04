@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast, get_args, get_origin
 
-from ..bundle import PipelineCompileError, canonical_json, make_target_options
+from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest
 from ..frontend.runtime_types import (
     RuntimeParameterDescriptor,
@@ -252,7 +252,7 @@ class Pipeline:
 
         try:
             specialization = compile_program(parsed, template)
-        except PipelineCompileError as error:
+        except ProgramCompileError as error:
             raise RuntimeError(str(error)) from None
         compiled = _CompiledPipeline(identity, invocation, specialization)
         self._specializations[identity] = compiled

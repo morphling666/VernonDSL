@@ -41,9 +41,9 @@ else:
     )
 
 import vernon_dsl as vd  # noqa: E402
+import vernon_dsl._program_assets.cooking as shader_assets_module  # noqa: E402
 import vernon_dsl._runtime.session as runtime_module  # noqa: E402
-import vernon_dsl._shader_assets.cooking as shader_assets_module  # noqa: E402
-from pipeline_asset_fixture import (  # noqa: E402
+from program_asset_fixture import (  # noqa: E402
     OFFSET,
     scale,
     solid_fragment,
@@ -51,10 +51,10 @@ from pipeline_asset_fixture import (  # noqa: E402
 )
 from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
-from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
-from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
+from vernon_dsl.program_asset_cli import main as pipeline_asset_main  # noqa: E402
+from vernon_dsl.program_assets import cook_program_asset  # noqa: E402
 
-FIXTURE = PYTHON_TEST_ROOT / "pipeline_asset_fixture.py"
+FIXTURE = PYTHON_TEST_ROOT / "program_asset_fixture.py"
 GOLDEN = json.loads(
     (PROJECT_ROOT / "source" / "tests" / "fixtures" / "compile_parity_golden.json").read_text(encoding="utf-8")
 )
@@ -363,8 +363,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     mock.patch.object(shader_assets_module, "_native_module", return_value=proxy),
                     mock.patch("subprocess.run", side_effect=AssertionError("offline cooking spawned a subprocess")),
                 ):
-                    manifest_path = cook_pipeline_asset(
-                        pipeline_asset=f"{FIXTURE}:triangle_asset",
+                    manifest_path = cook_program_asset(
+                        program_asset=f"{FIXTURE}:triangle_asset",
                         output=cooked_dir,
                         target=(OpenGLTargetOptions(version=330) if target_name == "opengl" else VulkanTargetOptions()),
                     )
@@ -374,7 +374,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 # fragment artifact is deduplicated after compilation.
                 self.assertEqual(compile_calls, 8)
                 cooked = json.loads(manifest_path.read_text(encoding="utf-8"))
-                cli_cooked = json.loads((cli_dir / "cli.pipeline.json").read_text(encoding="utf-8"))
+                cli_cooked = json.loads((cli_dir / "cli.program.json").read_text(encoding="utf-8"))
                 self.assertEqual(cooked, cli_cooked)
                 self.assertEqual(cooked["target"], {"kind": target_name, "options": target_options})
                 self.assertNotIn("targets", cooked)

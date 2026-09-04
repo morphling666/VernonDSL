@@ -20,7 +20,7 @@ class ShaderStageReference:
 
 
 @dataclass(frozen=True)
-class ShaderPipelineDescriptor:
+class ShaderProgramDescriptor:
     id: str
     stages: dict[str, ShaderStageReference]
     variants: tuple[tuple[str, ...], ...]

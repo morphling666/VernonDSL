@@ -175,12 +175,12 @@ Storage versions.
 
 ## 4. Source and asset declaration
 
-`pipeline_asset()` remains the only cookable declaration. For supported
+`program_asset()` remains the only cookable declaration. For supported
 autodiff cooking, its `program=` operand is a VJP `ProgramExpression`. A CPU
 Kernel operand normalizes to a one-node Program before VJP construction.
 
 ```python
-loss_asset = vd.pipeline_asset(
+loss_asset = vd.program_asset(
     id="pipeline/loss",
     program=vd.ad.vjp(
         loss_kernel,
@@ -203,10 +203,10 @@ topology.
 The cooker CLI and descriptor reference remain unchanged:
 
 ```text
-vernon-cook-pipeline model.py:loss_asset --target cpu -o build/loss
+vernon-cook-program model.py:loss_asset --target cpu -o build/loss
 ```
 
-There is no `ad_pipeline_asset()` and no `autodiff=True` Boolean.
+There is no `ad_program_asset()` and no `autodiff=True` Boolean.
 
 ## 5. Python execution
 

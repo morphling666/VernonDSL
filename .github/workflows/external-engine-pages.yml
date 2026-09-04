@@ -109,12 +109,12 @@ jobs:
         env:
           PYTHONPATH: python:${{ github.workspace }}
         run: |
-          uv run --frozen --no-sync python -m vernon_dsl.pipeline_asset_cli \
+          uv run --frozen --no-sync python -m vernon_dsl.program_asset_cli \
             examples/external_engine/fractal_pipeline.py:asset \
             --target cpu \
             --cpu-triple wasm32-unknown-emscripten \
             -o pages-fractal-cooked
-          uv run --frozen --no-sync python -m vernon_dsl.pipeline_asset_cli \
+          uv run --frozen --no-sync python -m vernon_dsl.program_asset_cli \
             examples/shader_lib/mandelbulb.py:mandelbulb_asset \
             --target opengles \
             --opengl-version 300 \

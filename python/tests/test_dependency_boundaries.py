@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import vernon_dsl as vd
-from vernon_dsl.pipeline_assets import cook_pipeline_asset, encode_runtime_stage, parse_python_pipeline_asset
+from vernon_dsl.program_assets import cook_program_asset, encode_runtime_stage, parse_python_program_asset
 
 ROOT = Path(__file__).parents[1] / "vernon_dsl"
 
@@ -67,15 +67,15 @@ class DependencyBoundaryTests(unittest.TestCase):
     def test_shader_artifact_io_lives_in_its_implementation_module(self) -> None:
         self.assertEqual(
             encode_runtime_stage.__module__,
-            "vernon_dsl._shader_assets.artifact_io",
+            "vernon_dsl._program_assets.artifact_io",
         )
         self.assertEqual(
-            parse_python_pipeline_asset.__module__,
-            "vernon_dsl._shader_assets.parsing",
+            parse_python_program_asset.__module__,
+            "vernon_dsl._program_assets.parsing",
         )
         self.assertEqual(
-            cook_pipeline_asset.__module__,
-            "vernon_dsl._shader_assets.cooking",
+            cook_program_asset.__module__,
+            "vernon_dsl._program_assets.cooking",
         )
 
     def test_frontend_does_not_import_runtime(self) -> None:

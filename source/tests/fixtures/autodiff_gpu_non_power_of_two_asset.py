@@ -18,7 +18,7 @@ def objective(
     shared_loss[gid[0]] = scale * values[gid[0]] * values[gid[0]]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/gpu_non_power_of_two_vjp",
     program=vd.ad.vjp(
         objective,

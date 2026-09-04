@@ -8,7 +8,7 @@ compiler, offline cooker, and Program-based Runtime/RHI APIs.
 - Tensor-first Python frontend with shared graphics and compute semantics.
 - CPU, CUDA, Vulkan, OpenGL, OpenGL ES, and DirectX compilation paths.
 - Direct CPU compute dispatch and GPU-optional runtime execution.
-- Offscreen graphics pipelines, host readback, PipelineAsset cooking, and
+- Offscreen graphics pipelines, host readback, ProgramAsset cooking, and
   bundled VernonRuntime CMake sources.
 - Pipeline 17 makes canonical Program plus ArtifactSystem the only execution
   package. Runtime topology, bindings, and autodiff signatures are resolved
@@ -56,7 +56,7 @@ compiler, offline cooker, and Program-based Runtime/RHI APIs.
 Source checkouts use a dependency-only uv environment. Set `PYTHONPATH` to the
 repository's `python` directory and run commands with
 `uv run --frozen --no-sync`. Built wheels install the package and the
-`vernon-compile-python` and `vernon-cook-pipeline` console scripts normally.
+`vernon-compile-python` and `vernon-cook-program` console scripts normally.
 
 ## Compatibility and lifecycle
 

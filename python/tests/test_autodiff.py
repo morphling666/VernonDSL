@@ -7,7 +7,7 @@ from pathlib import Path
 
 import vernon_dsl as vd
 from vernon_dsl.bundle import BundlePlan, CpuTargetOptions
-from vernon_dsl.pipeline_assets import PipelineCompileError, parse_python_pipeline_asset
+from vernon_dsl.program_assets import ProgramCompileError, parse_python_program_asset
 
 
 class AutodiffDeclarationTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class AutodiffDeclarationTests(unittest.TestCase):
             vd.ad.vjp((vertex, fragment), wrt=("value",), outputs=("loss",), rules=rules)
 
     def test_bundle_schema_rejects_partial_differentiated_profiles(self) -> None:
-        with self.assertRaisesRegex(PipelineCompileError, "require both"):
+        with self.assertRaisesRegex(ProgramCompileError, "require both"):
             BundlePlan(
                 "partial",
                 CpuTargetOptions(),
@@ -105,14 +105,14 @@ def compute(
 ) -> None:
     loss[0] = value[0] * value[0]
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/vjp",
     program=vd.ad.vjp(compute, wrt=("value",), outputs=("loss",)),
 )
 """,
                 encoding="utf-8",
             )
-            descriptor = parse_python_pipeline_asset(source, "asset")
+            descriptor = parse_python_program_asset(source, "asset")
             self.assertIsNotNone(descriptor.transform)
             assert descriptor.transform is not None
             self.assertEqual(descriptor.transform["wrt"], ["value"])
@@ -135,16 +135,16 @@ def compute(
     loss[0] = value[0] * value[0]
 
 compute_vjp = vd.ad.vjp(compute, wrt=("value",), outputs=("loss",))
-named = vd.pipeline_asset(id="compute/vjp", program=compute_vjp)
-inline = vd.pipeline_asset(
+named = vd.program_asset(id="compute/vjp", program=compute_vjp)
+inline = vd.program_asset(
     id="compute/vjp",
     program=vd.ad.vjp(compute, wrt=("value",), outputs=("loss",)),
 )
 """,
                 encoding="utf-8",
             )
-            named = parse_python_pipeline_asset(source, "named")
-            inline = parse_python_pipeline_asset(source, "inline")
+            named = parse_python_program_asset(source, "named")
+            inline = parse_python_program_asset(source, "inline")
             self.assertEqual(named.transform, inline.transform)
             self.assertEqual(named.stages["compute"].entry, inline.stages["compute"].entry)
             self.assertEqual(named.variants, inline.variants)
@@ -160,12 +160,12 @@ import vernon_dsl as vd
 def compute(value: vd.f32) -> None:
     pass
 
-asset = vd.pipeline_asset(id="compute/vjp", program=vd.ad.vjp(compute, wrt=("value",)))
+asset = vd.program_asset(id="compute/vjp", program=vd.ad.vjp(compute, wrt=("value",)))
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "requires non-empty writable Storage outputs"):
-                parse_python_pipeline_asset(source, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "requires non-empty writable Storage outputs"):
+                parse_python_program_asset(source, "asset")
 
 
 if __name__ == "__main__":

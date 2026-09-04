@@ -145,10 +145,10 @@ invalidation remain session state; resources never cache a copied global
 runtime handle.
 
 Shader artifact encoding, extension selection, and content-addressed file writes
-live in `_shader_assets.artifact_io`. Cooking consumes that implementation
+live in `_program_assets.artifact_io`. Cooking consumes that implementation
 through the public facade, preserving canonical pipeline bytes while keeping filesystem
 artifact policy independent of descriptor parsing and native compilation.
-Python pipeline descriptor parsing lives in `_shader_assets.parsing`; it reads
+Python pipeline descriptor parsing lives in `_program_assets.parsing`; it reads
 source AST and project feature declarations without importing or executing the
 descriptor module. Cooking receives only the validated immutable descriptor,
 so parser diagnostics and variant canonicalization remain testable without a
@@ -157,7 +157,7 @@ native compiler.
 Compute source compilation and invocation behavior lives in `_runtime.kernel`.
 The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
 native entries are `LoadedPipeline` objects and invoke the same compute pipeline
-ABI as PipelineAssets. Reinitializing a session invalidates loaded pipelines
+ABI as ProgramAssets. Reinitializing a session invalidates loaded pipelines
 without discarding deterministic frontend and compiler results.
 Graphics Pipeline bundle compilation, binding, and invocation live in
 `_runtime.pipeline`; session now contains only backend/context lifecycle and
@@ -178,7 +178,7 @@ effect/alias-safe reverse traversal, and explicit custom graphics primitives.
 The initial public surface rejects JVP, full Jacobian materialization, nested
 transforms, Hessians, and HVPs.
 Native stage compilation, compile-result normalization, variant deduplication,
-and manifest materialization live in `_shader_assets.cooking`. Tests inject
+and manifest materialization live in `_program_assets.cooking`. Tests inject
 compiler and project capabilities at that implementation boundary rather than
 patching the public facade.
 
@@ -257,7 +257,7 @@ effects from operation-name fallbacks.
 There is one Python AST-to-MLIR frontend (`FrontendCompileRequest`) and one
 native compiler implementation behind the stable C API. Interactive
 `Kernel`/`Pipeline`, the owning `_native.CompiledProgram`, `vernon-compile`,
-and the target `vernon-cook-pipeline` tool must pass the same specialized MLIR
+and the target `vernon-cook-program` tool must pass the same specialized MLIR
 and target options to that C API; none may carry an independent lowering or
 reflection path.
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
@@ -276,19 +276,19 @@ that result. Relocatable objects remain the persistent CPU format.
 
 Stage cache identity is derived from the semantic module ID, entry, stage,
 target options, reflected dependencies and interface, and exact artifact
-digest. PipelineAsset serialization is deliberately excluded: changing
+digest. ProgramAsset serialization is deliberately excluded: changing
 asset packaging without changing the specialized program must not create a
 different stage. Frontend specialization caches include source dependency
 hashes, enabled features, captured constants, runtime tensor shapes, and
 workgroup size. Cache hits must preserve byte-identical artifacts and canonical
 reflection; content changes must invalidate the corresponding key.
 
-## Pipeline asset declarations
+## Program Asset declarations
 
 A persistent executable is declared by one module-level
-`pipeline_asset(...)` assignment beside its entry functions. The cooker parses
+`program_asset(...)` assignment beside its entry functions. The cooker parses
 the assignment from the source AST and must not import or execute the module.
-`PipelineAsset` applies equally to compute and graphics pipelines.
+`ProgramAsset` applies equally to compute and graphics pipelines.
 
 `program=` accepts one of these executable source forms:
 
@@ -305,20 +305,20 @@ graphics pipeline is a one-node Program; a Module differs only in node count.
 FAST_PATH = vd.feature("FAST_PATH")
 SKIN = vd.feature("SKIN")
 
-compute_asset = vd.pipeline_asset(
+compute_asset = vd.program_asset(
     id="pipeline/simulate",
     program=simulate_kernel,
     variants=((), (FAST_PATH,)),
 )
 
-graphics_asset = vd.pipeline_asset(
+graphics_asset = vd.program_asset(
     id="pipeline/mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (SKIN,)),
 )
 ```
 
-Kernel is compute-only and Pipeline is graphics-only. A PipelineAsset cannot
+Kernel is compute-only and Pipeline is graphics-only. A ProgramAsset cannot
 mix a Kernel entry with graphics entries. The previous
 compute-plus-vertex-plus-fragment Pipeline form is invalid.
 
@@ -326,7 +326,7 @@ Every graphics tuple member carries its stage kind through its decorator.
 Tuple position does not infer stage kind. A target-independent stage registry
 and topology rules validate the set and ordering. The current registry accepts
 `vertex -> fragment`; future tessellation, task, mesh, or other graphics stages
-can use the same mechanism without changing `PipelineAsset` syntax or Program
+can use the same mechanism without changing `ProgramAsset` syntax or Program
 structure. Unknown stages, duplicate singleton stages, invalid ordering, and
 incompatible stage families are program-validation errors. Stage topology is
 part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
@@ -340,18 +340,18 @@ the list contains no duplicate key. `()` is the empty feature key, not an
 implicit fallback. Stage compilation remains cached per entry and feature key,
 so unchanged artifacts are content-addressed and shared across variants. The
 manifest-level `features` list is exactly the union of names present in those
-keys. Features declared by source modules but omitted from every PipelineAsset
+keys. Features declared by source modules but omitted from every ProgramAsset
 variant are not part of its contract.
 
-Target architecture and target options are cooker inputs, not PipelineAsset
-source fields. A compute PipelineAsset accepts a compute target; a graphics
-PipelineAsset accepts a graphics target. The same backend-independent
-PipelineAsset may be cooked separately for multiple targets. Target and options
+Target architecture and target options are cooker inputs, not ProgramAsset
+source fields. A compute ProgramAsset accepts a compute target; a graphics
+ProgramAsset accepts a graphics target. The same backend-independent
+ProgramAsset may be cooked separately for multiple targets. Target and options
 participate in artifact and cache identity and are recorded in the resulting
 manifest, but do not alter backend-independent program semantic identity.
 
 The legacy stage-specific
-`pipeline_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
+`program_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
 is rejected.
 
 ## Host orchestration boundary
@@ -530,7 +530,7 @@ Every compile surface uses the same target-discriminated vocabulary:
 
 The C API represents these as `VernonCompileOptions.target` plus the matching
 `as.*` union member. Python exposes one frozen dataclass per target. Reflection
-and PipelineAssets serialize the same model as
+and ProgramAssets serialize the same model as
 `{"kind": <target>, "options": {...}}`; emitted language and minimum-OS
 metadata are output facts, not compile options.
 
@@ -538,7 +538,7 @@ HLSL Shader Model is likewise a compile option and is valid only for DirectX.
 The C API DirectX union member and cooker encode it as major times ten plus minor (`60` for
 Shader Model 6.0), defaulting to `60` and rejecting older models. It
 participates in artifact identity and is recorded in compiler reflection and
-the PipelineAsset target spec. Builds use a pinned, hash-verified official DXC
+the ProgramAsset target spec. Builds use a pinned, hash-verified official DXC
 redistributable so developer and CI artifacts share the same compiler.
 `VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
 toolchains. The cooker strips debug/reflection data for deterministic runtime
@@ -550,7 +550,7 @@ Every DSL function has exactly one explicit kind. The currently implemented
 entry decorators are `@kernel`, `@vertex`, and `@fragment`; `@func` declares a
 private, stage-polymorphic helper. Future graphics entry decorators register a
 stage kind and topology constraints under `COMPILER_CONTRACT_VERSION` rather
-than changing PipelineAsset syntax. The module graph preserves helper
+than changing ProgramAsset syntax. The module graph preserves helper
 dependency hashes, rejects recursion and calls to entries, and the normal
 per-stage compiler validation checks an inlined helper's operations against
 each reachable stage. Requiring `@func` avoids silently treating unrelated
@@ -713,7 +713,7 @@ remain exclusively in semantic analysis.
 
 ## Persistent Program asset contract
 
-The target `vernon-cook-pipeline` command emits exactly one Program object and
+The target `vernon-cook-program` command emits exactly one Program object and
 content-addressed external StageArtifacts, exactly one per selected stage ID;
 nodes may share a stage ID, and a graphics StageArtifact contains both shader
 modules. The Program directly contains

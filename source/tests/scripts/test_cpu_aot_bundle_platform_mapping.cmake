@@ -26,7 +26,7 @@ function(
         )
     endif()
 
-    file(READ "${output_directory}/cpu_fill.pipeline.json" manifest)
+    file(READ "${output_directory}/cpu_fill.program.json" manifest)
     string(
         JSON
         actual_triple

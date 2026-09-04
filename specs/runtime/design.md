@@ -2,7 +2,7 @@
 
 ## CPU cooked pipelines
 
-CPU cooking emits the canonical `*.pipeline.json` manifest, a target
+CPU cooking emits the canonical `*.program.json` manifest, a target
 relocatable `.o`/`.obj` with stable module-hashed C entry wrappers, and
 generated registration `.c`/`.h` sources. The manifest records
 `PIPELINE_VERSION`, the target triple, object format, exported symbol, artifact
@@ -101,7 +101,7 @@ destroyed. Runtime-only builds never discover GLFW.
 The OpenGL function table, external-context callbacks, buffers, images,
 samplers, shader compilation, programs, vertex arrays, and attachment
 framebuffer objects are owned by VernonRHI. Runtime retains format and
-invocation policy while PipelineAsset and direct compute-artifact loaders both
+invocation policy while ProgramAsset and direct compute-artifact loaders both
 produce `VernonLoadedPipeline` and execute through RuntimeCore and the RHI
 provider adapter.
 `VernonOpenGLContextCallbacks` is the single context contract for Python and
@@ -161,7 +161,7 @@ Execution is split across RuntimeCore and backend-specific providers:
 
 - `VernonRHI` is the hardware layer. Capability facets separate Compute,
   Graphics, and NativeInterop; CUDA implements Compute only.
-- `VernonRuntimeCore` owns PipelineAsset parsing, reflection, binding plans, and
+- `VernonRuntimeCore` owns ProgramAsset parsing, reflection, binding plans, and
   prepared-pipeline caches. It calls an opaque `RuntimeDeviceProvider` SPI and
   does not depend on VernonRHI types.
 - `VernonRuntimeRHIAdapter` implements that SPI with VernonRHI. A foreign
@@ -430,7 +430,7 @@ non-default stream, and synchronous compatibility transfers reuse a
 size-matched pinned staging pool around asynchronous Driver API copies. Compute
 pipeline preparation fixes the argument pointer layout once; dispatch only
 updates preallocated descriptors and enqueues on the persistent stream. Both
-direct artifact pipelines and PipelineAsset compute pipelines use this path,
+direct artifact pipelines and ProgramAsset compute pipelines use this path,
 avoiding module, stream, staging, and argument-vector allocation on the hot
 path.
 
@@ -490,7 +490,7 @@ normal device creation skips software adapters.
 
 ### Pipeline runtime requirements
 
-PipelineAssets may contain a hash-covered `runtime_requirements`
+ProgramAssets may contain a hash-covered `runtime_requirements`
 object. Its target-discriminated values are derived from the emitted artifact:
 CPU target triple/object format, GLSL profile and API version,
 SPIR-V version plus Vulkan 1.1 and compute workgroup limits, or PTX version,
@@ -561,13 +561,13 @@ removes these artifact shapes and handles rather than normalizing them.
 
 `VernonLoadedPipeline` is the only Runtime program handle. It represents either
 one compute stage or a validated tuple of graphics stages; compute and graphics
-entries are never combined in one pipeline. A persistent PipelineAsset resolves
+entries are never combined in one pipeline. A persistent ProgramAsset resolves
 to the same handle. Direct CPU entries and raw GPU artifacts synthesize a
 compute-only variant and return `VernonLoadedPipeline` as well.
 
-PipelineAsset target architecture and options are selected by the cooker. A
-compute PipelineAsset resolves only against a compute backend, while a graphics
-PipelineAsset resolves only against a graphics backend. The target profile is
+ProgramAsset target architecture and options are selected by the cooker. A
+compute ProgramAsset resolves only against a compute backend, while a graphics
+ProgramAsset resolves only against a graphics backend. The target profile is
 part of artifact identity and the cooked manifest, not the source declaration.
 
 The graphics stage tuple is extensible through the language's versioned stage

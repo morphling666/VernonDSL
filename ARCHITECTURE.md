@@ -481,16 +481,16 @@ Artifact data 内联在 bundle 中：SPIR-V/DXIL 使用 base64，文本 artifact
 UTF-8。交互路径仍使用正式 `PIPELINE_VERSION` schema，不存在另一套私有 runtime
 格式。
 
-## 9. PipelineAsset 与 Cook
+## 9. ProgramAsset 与 Cook
 
 ### 9.1 声明
 
-持久化 executable 通过模块级 `pipeline_asset(...)` 声明：
+持久化 executable 通过模块级 `program_asset(...)` 声明：
 
 ```python
 FAST = vd.feature("FAST")
 
-mesh_asset = vd.pipeline_asset(
+mesh_asset = vd.program_asset(
     id="pipeline/mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (FAST,)),
@@ -525,7 +525,7 @@ flowchart TD
 Cook 的具体步骤：
 
 1. 解析 `source.py:asset_name`；
-2. 从 AST 提取 PipelineAsset 和 feature declaration；
+2. 从 AST 提取 ProgramAsset 和 feature declaration；
 3. 验证 stage topology、target compatibility 和 variant canonical form；
 4. 为每个 variant/entry 生成 specialized MLIR；
 5. 按 module、entry、MLIR digest、canonical target spec 缓存重复 stage compilation；
@@ -534,10 +534,10 @@ Cook 的具体步骤：
 8. 验证 vertex/fragment interface 和 fragment outputs；
 9. 以 artifact digest 去重 stage records；
 10. 写 `artifacts/{sha256}{extension}` 并生成
-    `{output-directory-name}.pipeline.json`。
+    `{output-directory-name}.program.json`。
 
 Target 是 cooker 输入而不是 source declaration。一个 backend-independent
-PipelineAsset 可以分别 Cook 为 Vulkan、OpenGL、DirectX、CUDA 或 CPU 部署物，
+ProgramAsset 可以分别 Cook 为 Vulkan、OpenGL、DirectX、CUDA 或 CPU 部署物，
 也可以生成由 Vernon Metal Runtime 或外部 Metal 工具链使用的 MSL source
 artifact，只要其 stage 和 feature 被该 target 支持。
 
@@ -572,7 +572,7 @@ Artifact descriptor 与 stage digest 必须一致。Runtime 在把 bytes 交给 
 
 ### 9.4 CPU 部署差异
 
-CPU Cook 产出 canonical `*.pipeline.json`、relocatable `.o`/`.obj` 和生成的
+CPU Cook 产出 canonical `*.program.json`、relocatable `.o`/`.obj` 和生成的
 static-registration `.c`/`.h`，而不是可由 Runtime 随意 `dlopen` 的 LLVM
 中间格式。部署应用将 object 与 registration source 链入自身，调用生成的
 registration function，并通过 module-hashed wrapper symbol 注册 entry。
@@ -675,7 +675,7 @@ Canonical Program or direct endpoint
 - `source/lib/compiler/`：PreparedModule、reflection 和 target pipelines；
 - `python/vernon_dsl/bundle/`：纯 bundle model、parameter planning 和
   serialization；
-- `python/vernon_dsl/_shader_assets/`：PipelineAsset AST parsing、Cook 和
+- `python/vernon_dsl/_program_assets/`：ProgramAsset AST parsing、Cook 和
   artifact IO；
 - `source/lib/runtime/`：RuntimeCore、backend pipeline implementations 和
   RHI Adapter；

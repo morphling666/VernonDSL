@@ -31,7 +31,7 @@ def objective(
     )
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/structured_scalar_vjp",
     program=vd.ad.vjp(objective, wrt=("x", "y", "z"), outputs=("output",)),
 )
@@ -62,7 +62,7 @@ def balanced_objective(
     )
 
 
-balanced_asset = vd.pipeline_asset(
+balanced_asset = vd.program_asset(
     id="compute/structured_scalar_balanced_vjp",
     program=vd.ad.vjp(
         balanced_objective,
@@ -95,7 +95,7 @@ def dynamic_objective(x: vd.f32, count: vd.i32, output: vd.TensorView[vd.f32, (1
 
 
 dynamic_program = vd.ad.vjp(dynamic_objective, wrt=("x",), outputs=("output",))
-dynamic_asset = vd.pipeline_asset(
+dynamic_asset = vd.program_asset(
     id="compute/structured_dynamic_vjp",
     program=vd.ad.vjp(dynamic_objective, wrt=("x",), outputs=("output",)),
 )
@@ -106,7 +106,7 @@ def double_objective(x: vd.f64, output: vd.TensorView[vd.f64, (1,), vd.write]) -
     output[0] = x * x + x
 
 
-double_asset = vd.pipeline_asset(
+double_asset = vd.program_asset(
     id="compute/structured_f64_vjp",
     program=vd.ad.vjp(double_objective, wrt=("x",), outputs=("output",)),
 )

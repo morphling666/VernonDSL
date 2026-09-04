@@ -9,18 +9,18 @@ from ..types import Feature
 
 
 @dataclass(frozen=True)
-class PipelineAssetDeclaration:
+class ProgramAssetDeclaration:
     id: str
     program: Any
     variants: tuple[tuple[Feature, ...], ...]
 
 
-def pipeline_asset(
+def program_asset(
     *,
     id: str,
     program: Any,
     variants: Iterable[Iterable[Feature]] = ((),),
-) -> PipelineAssetDeclaration:
+) -> ProgramAssetDeclaration:
     """Declare one cookable compute or graphics pipeline."""
 
     from .._runtime.pipeline import Pipeline
@@ -29,7 +29,7 @@ def pipeline_asset(
 
     primal = program.program if isinstance(program, ProgramExpression) else program
     if isinstance(primal, (Module, Pipeline)) or isinstance(program, ModuleVjpExpression):
-        return PipelineAssetDeclaration(
+        return ProgramAssetDeclaration(
             id=id,
             program=program,
             variants=tuple(tuple(key) for key in variants),
@@ -46,7 +46,7 @@ def pipeline_asset(
             raise ValueError(str(error).replace("graphics pipeline", "graphics pipeline program")) from None
     elif getattr(primal, "__vernon_dsl__", (None,))[0] != "compute":
         raise TypeError("single-entry pipeline program must be a compute Kernel")
-    return PipelineAssetDeclaration(
+    return ProgramAssetDeclaration(
         id=id,
         program=program,
         variants=tuple(tuple(key) for key in variants),

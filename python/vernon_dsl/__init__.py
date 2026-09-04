@@ -49,11 +49,11 @@ from .intrinsics import (
     workgroup_storage,
 )
 from .module import Module
-from .pipeline_assets import (
-    PipelineAssetDeclaration,
+from .program_assets import (
+    ProgramAssetDeclaration,
     load_cooked_vjp_asset,
-    load_pipeline,
-    pipeline_asset,
+    load_program,
+    program_asset,
 )
 from .render import (
     AttachmentOperation,
@@ -184,7 +184,7 @@ __all__ = [
     "Matrix",
     "Module",
     "Pipeline",
-    "PipelineAssetDeclaration",
+    "ProgramAssetDeclaration",
     "PrimitiveTopology",
     "RasterizationState",
     "RenderPass",
@@ -250,7 +250,7 @@ __all__ = [
     "lines",
     "load_cooked_vjp_asset",
     "load",
-    "load_pipeline",
+    "load_program",
     "log",
     "kernel",
     "matmul",
@@ -263,7 +263,7 @@ __all__ = [
     "pow",
     "preserve",
     "pipeline",
-    "pipeline_asset",
+    "program_asset",
     "points",
     "r11g11b10_float",
     "r16_float",

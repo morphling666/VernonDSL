@@ -137,7 +137,7 @@ Verify the installation:
 ```powershell
 py -c "from importlib.metadata import version; print(version('vernon-lang'))"
 vernon-compile-python --help
-vernon-cook-pipeline --help
+vernon-cook-program --help
 ```
 
 The wheel contains the Vernon compiler, CPU Runtime, and the native backend
@@ -210,7 +210,7 @@ locations and Vulkan initialization error when runtime discovery fails.
 Declare a persistent asset beside its shader stages:
 
 ```python
-mesh_asset = vd.pipeline_asset(
+mesh_asset = vd.program_asset(
     id="pipeline/mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
@@ -221,7 +221,7 @@ Cook it for a deployment target without importing or executing the source
 module:
 
 ```powershell
-vernon-cook-pipeline examples/variant_mesh.py:mesh_asset `
+vernon-cook-program examples/variant_mesh.py:mesh_asset `
   --target vulkan `
   -o build/variant_mesh
 ```
@@ -229,12 +229,12 @@ vernon-cook-pipeline examples/variant_mesh.py:mesh_asset `
 For a CPU compute asset:
 
 ```powershell
-vernon-cook-pipeline python/tests/pipeline_asset_fixture.py:scale_asset `
+vernon-cook-program python/tests/program_asset_fixture.py:scale_asset `
   --target cpu `
   -o build/cpu_scale
 ```
 
-The output contains the canonical pipeline-16 `*.pipeline.json` manifest and
+The output contains the canonical pipeline-16 `*.program.json` manifest and
 content-addressed files under `artifacts/`. Depending on the target, artifacts
 are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, LLVM IR, or relocatable CPU
 objects. A differentiated asset adds the optional root `autodiff` object to the
@@ -253,7 +253,7 @@ cooker as a module:
 
 ```powershell
 $env:PYTHONPATH = "$PWD/python"
-uv run --frozen --no-sync python -m vernon_dsl.pipeline_asset_cli `
+uv run --frozen --no-sync python -m vernon_dsl.program_asset_cli `
   examples/variant_mesh.py:mesh_asset --target vulkan -o build/variant_mesh
 ```
 

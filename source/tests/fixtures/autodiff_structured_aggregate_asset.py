@@ -23,7 +23,7 @@ def objective(
     output[1] = scaled[1]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/structured_aggregate_vjp",
     program=vd.ad.vjp(
         objective,

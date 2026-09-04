@@ -26,7 +26,7 @@ bytes cannot be re-hashed as a standalone object at Runtime load time.
 Build LLVM with the WebAssembly target enabled. A host build of the compiler performs cooking:
 
 ```sh
-python -m vernon_dsl.pipeline_asset_cli \
+python -m vernon_dsl.program_asset_cli \
   path/to/pipelines.py:asset \
   --target cpu \
   --cpu-triple wasm32-unknown-emscripten \

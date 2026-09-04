@@ -4,7 +4,7 @@ VernonDSL 0.1.2 treats the following installed interfaces as public:
 
 - names exported by `vernon_dsl.__all__`;
 - `vernon_dsl.runtime_source` helpers for locating the bundled Runtime source;
-- the `vernon-compile-python` and `vernon-cook-pipeline` command-line tools;
+- the `vernon-compile-python` and `vernon-cook-program` command-line tools;
 - application-facing C declarations in `VernonCommon.h`,
   `VernonGraphicsState.h`, `VernonOpenGLContext.h`, `VernonRHI.h`,
   `VernonRuntime.h`, `VernonVersions.h`,

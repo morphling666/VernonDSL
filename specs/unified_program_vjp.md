@@ -457,7 +457,7 @@ Already present:
 - Python parser residual forward results and backward arguments;
 - Program reflection and `KernelCompileRequest[]`;
 - C++ request finalization and ABI checks;
-- Program bundle planning;
+- Program Asset planning;
 - manifest parsing and validation;
 - CPU forward Program materialization into native `ExecutionGraph`;
 - multi-node dependency and internal tensor materialization.

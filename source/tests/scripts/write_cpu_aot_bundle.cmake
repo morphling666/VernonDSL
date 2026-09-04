@@ -71,4 +71,4 @@ string(
               1
               -1
               PIPELINE_BODY)
-file(WRITE "${OUTPUT}/cpu_fill.pipeline.json" "{\"content_hash\":\"${PIPELINE_HASH}\",${PIPELINE_BODY}\n")
+file(WRITE "${OUTPUT}/cpu_fill.program.json" "{\"content_hash\":\"${PIPELINE_HASH}\",${PIPELINE_BODY}\n")

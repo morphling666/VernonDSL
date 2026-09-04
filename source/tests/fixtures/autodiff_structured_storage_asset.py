@@ -17,7 +17,7 @@ def mutate(
     loss[gid[0], gid[1], gid[2]] = values[gid[0], gid[1], gid[2], 0] + values[gid[0], gid[1], gid[2], index]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/structured_storage_vjp",
     program=vd.ad.vjp(mutate, wrt=("values", "source", "scale"), outputs=("loss",)),
 )
@@ -43,7 +43,7 @@ def aggregate_objective(
     )
 
 
-aggregate_asset = vd.pipeline_asset(
+aggregate_asset = vd.program_asset(
     id="compute/structured_storage_aggregate_vjp",
     program=vd.ad.vjp(
         aggregate_objective,

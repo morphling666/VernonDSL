@@ -15,7 +15,7 @@ def objective(
     loss[gid[1], gid[0]] = values[gid[1], gid[0]] * values[gid[1], gid[0]]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/gpu_no_tape_vjp",
     program=vd.ad.vjp(
         objective,

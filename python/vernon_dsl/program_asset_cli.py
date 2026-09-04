@@ -4,16 +4,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from .bundle import PipelineCompileError, make_target_options
+from .bundle import ProgramCompileError, make_target_options
 from .diagnostics import CompileError
-from .pipeline_assets import cook_pipeline_asset
+from .program_assets import cook_program_asset
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="vernon-cook-pipeline",
+        prog="vernon-cook-program",
         description=(
-            "Cook a Python pipeline_asset descriptor for one compiler target. "
+            "Cook a Python program_asset descriptor for one compiler target. "
             "The CPU target emits AOT host object code; it is not restricted to x86."
         ),
         epilog=(
@@ -28,7 +28,7 @@ def _parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "pipeline_asset",
+        "program_asset",
         type=str,
         help="Python descriptor reference in source.py:descriptor_name form",
     )
@@ -125,13 +125,13 @@ def main(argv: list[str] | None = None) -> int:
         }
         invalid_groups = [name for name, supplied in supplied_groups.items() if supplied and name != target]
         if invalid_groups and not (target == "opengles" and invalid_groups == ["opengl"]):
-            raise PipelineCompileError(f"{invalid_groups[0]} options do not apply to target '{target}'")
-        cook_pipeline_asset(
-            pipeline_asset=arguments.pipeline_asset,
+            raise ProgramCompileError(f"{invalid_groups[0]} options do not apply to target '{target}'")
+        cook_program_asset(
+            program_asset=arguments.program_asset,
             output=arguments.output,
             target=make_target_options(target, selected_options),
         )
-    except (CompileError, PipelineCompileError, OSError) as error:
+    except (CompileError, ProgramCompileError, OSError) as error:
         print(error, file=sys.stderr)
         return 1
     return 0

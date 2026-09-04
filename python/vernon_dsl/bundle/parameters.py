@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Mapping, Sequence
 
 from .._mlir import ranked_tensor_parts
-from .types import PipelineCompileError
+from .types import ProgramCompileError
 
 
 def dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
@@ -16,7 +16,7 @@ def dtype_and_shape(type_name: object) -> tuple[str | None, list[int]]:
     try:
         extents = [0 if dimension == "?" else int(dimension) for dimension in shape]
     except ValueError:
-        raise PipelineCompileError(f"invalid reflected tensor type {type_name!r}") from None
+        raise ProgramCompileError(f"invalid reflected tensor type {type_name!r}") from None
     return dtype, extents
 
 
@@ -35,7 +35,7 @@ def _physical_value_profile(target: object, transport: object) -> tuple[str, str
     if target == "metal":
         return "metal_constant_buffer", transport if isinstance(transport, str) else "constant_buffer"
     if not isinstance(transport, str):
-        raise PipelineCompileError("packed value argument is missing its reflected transport")
+        raise ProgramCompileError("packed value argument is missing its reflected transport")
     if transport == "storage_buffer":
         return "vulkan_std430_storage_buffer", transport
     if target == "vulkan":
@@ -50,22 +50,22 @@ def _physical_value_profile(target: object, transport: object) -> tuple[str, str
             return "opengl_native_uniform", "native_uniform"
     if target == "directx" and transport in {"uniform_buffer", "push_constant"}:
         return "directx_constant_buffer", transport
-    raise PipelineCompileError(f"unsupported physical value transport {transport!r} for target {target!r}")
+    raise ProgramCompileError(f"unsupported physical value transport {transport!r} for target {target!r}")
 
 
 def _internal_parameter_source(row: Mapping[str, Any]) -> str | None:
     legacy_markers = ("vernon.compiler_generated", "vernon.implicit_sampler", "vernon.system_value")
     if any(marker in row for marker in legacy_markers):
-        raise PipelineCompileError("legacy compiler-generated parameter metadata is unsupported")
+        raise ProgramCompileError("legacy compiler-generated parameter metadata is unsupported")
     implicit = row.get("vernon.implicit")
     if implicit == "resolution":
         return "system_value"
     if implicit == "sampler":
         if row.get("kind") != "sampler":
-            raise PipelineCompileError("implicit sampler metadata must annotate a sampler argument")
+            raise ProgramCompileError("implicit sampler metadata must annotate a sampler argument")
         return "implicit_sampler"
     if implicit is not None:
-        raise PipelineCompileError(f"unsupported compiler-generated parameter {implicit!r}")
+        raise ProgramCompileError(f"unsupported compiler-generated parameter {implicit!r}")
     return None
 
 
@@ -78,10 +78,10 @@ def reflected_parameters(
         stage_kind = record.get("stage", stage)
         interface = record.get("interface", {})
         if not isinstance(interface, Mapping):
-            raise PipelineCompileError(f"{stage} stage interface must be an object")
+            raise ProgramCompileError(f"{stage} stage interface must be an object")
         for row in interface.get("arguments", []):
             if not isinstance(row, Mapping):
-                raise PipelineCompileError(f"{stage} interface argument must be an object")
+                raise ProgramCompileError(f"{stage} interface argument must be an object")
             if "vernon.builtin" in row or row.get("vernon.varying", False):
                 continue
             internal_source = _internal_parameter_source(row)
@@ -95,7 +95,7 @@ def reflected_parameters(
                 or not isinstance(interface_name, str)
                 or row.get("kind") not in {"scalar", "tensor_value", "tensor", "image", "sampler"}
             ):
-                raise PipelineCompileError(f"{stage} external argument is missing source or kind metadata")
+                raise ProgramCompileError(f"{stage} external argument is missing source or kind metadata")
             inferred_dtype, inferred_shape = dtype_and_shape(row.get("type"))
             reflected_shape = row.get("shape")
             if row.get("kind") == "tensor" and isinstance(row.get("source_shape"), list):
@@ -163,12 +163,12 @@ def reflected_parameters(
             elif isinstance(element_layout, Mapping):
                 use["value_layout"] = dict(element_layout)
             elif row.get("kind") not in {"image", "sampler"}:
-                raise PipelineCompileError(f"{stage} value argument is missing canonical value_layout")
+                raise ProgramCompileError(f"{stage} value argument is missing canonical value_layout")
             if packed_value:
                 profile, transport = _physical_value_profile(record.get("target"), row.get("value_transport"))
                 selected_layout = physical_layouts.get(profile) if isinstance(physical_layouts, Mapping) else None
                 if not isinstance(selected_layout, Mapping):
-                    raise PipelineCompileError(f"{stage} packed value argument is missing profile {profile!r}")
+                    raise ProgramCompileError(f"{stage} packed value argument is missing profile {profile!r}")
                 use["interface_plan"] = dict(selected_layout)
                 use["transport"] = transport
             if internal_source is not None:
@@ -192,9 +192,9 @@ def reflected_parameters(
                 or (interface_name == "uniform" and use.get("transport") in {"uniform_buffer", "storage_buffer"})
             )
             if descriptor_required and ("vernon.set" not in use or "vernon.binding" not in use):
-                raise PipelineCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
+                raise ProgramCompileError(f"{stage} descriptor-backed argument is missing reflected set/binding")
             if row.get("kind") == "sampler" and not use.get("sampled_image_bindings"):
-                raise PipelineCompileError(f"{stage} sampler argument has no reflected sampled image binding")
+                raise ProgramCompileError(f"{stage} sampler argument has no reflected sampled image binding")
             backend_name = _backend_name(name)
             if interface_name == "uniform":
                 if record.get("target") in {"opengl", "opengles", "metal", "directx"} and "vernon.binding" not in row:
@@ -225,12 +225,12 @@ def classify_parameter_use(use: Mapping[str, Any]) -> str:
 
 def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     if not uses:
-        raise PipelineCompileError(f"pipeline parameter {name!r} has no uses")
+        raise ProgramCompileError(f"pipeline parameter {name!r} has no uses")
     normalized = [dict(use) for use in uses]
     first = normalized[0]
     kind = classify_parameter_use(first)
     if any(not isinstance(use.get("type"), str) or not use["type"] for use in normalized):
-        raise PipelineCompileError(f"pipeline parameter {name!r} is missing its logical type")
+        raise ProgramCompileError(f"pipeline parameter {name!r} is missing its logical type")
     for use in normalized[1:]:
         incompatible_layout = kind != "tensor" and (
             use.get("type") != first.get("type") or use.get("shape", []) != first.get("shape", [])
@@ -245,7 +245,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
             or incompatible_layout
             or incompatible_tensor_layout
         ):
-            raise PipelineCompileError(f"incompatible pipeline parameter {name!r}")
+            raise ProgramCompileError(f"incompatible pipeline parameter {name!r}")
     representative = (
         next((use for use in normalized if use.get("stage") != "compute"), first) if kind == "tensor" else first
     )
@@ -257,7 +257,7 @@ def merge_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) -> dict[s
     )
     address_spaces = {use.get("address_space") for use in normalized}
     if tensor_view and address_spaces != {"device"}:
-        raise PipelineCompileError(f"pipeline TensorView parameter {name!r} must use device address space")
+        raise ProgramCompileError(f"pipeline TensorView parameter {name!r} must use device address space")
     access = (
         "read_write"
         if "read_write" in access_values or access_values == {"read", "write"}
@@ -310,13 +310,13 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
     parameter = merge_parameter_uses(name, uses)
     sources = {use.get("internal_source") for use in uses}
     if len(sources) != 1 or None in sources:
-        raise PipelineCompileError(f"inconsistent internal pipeline parameter {name!r}")
+        raise ProgramCompileError(f"inconsistent internal pipeline parameter {name!r}")
     source = next(iter(sources))
     parameter["source"] = source
     if source == "system_value":
         values = {use.get("system_value") for use in uses}
         if values != {"resolution"}:
-            raise PipelineCompileError(f"inconsistent resolution system value {name!r}")
+            raise ProgramCompileError(f"inconsistent resolution system value {name!r}")
         parameter["system_value"] = "resolution"
         leaves = parameter.get("value_layout", {}).get("leaves", [])
         if (
@@ -326,12 +326,12 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
             or leaves[0].get("scalar_count") != 2
             or leaves[0].get("shape") != [2]
         ):
-            raise PipelineCompileError("resolution system value must have reflected type tensor<2xf32>")
+            raise ProgramCompileError("resolution system value must have reflected type tensor<2xf32>")
         if any(use.get("sampled_image_bindings") for use in uses):
-            raise PipelineCompileError("resolution system value cannot pair sampled images")
+            raise ProgramCompileError("resolution system value cannot pair sampled images")
     else:
         if parameter.get("kind") != "sampler":
-            raise PipelineCompileError("implicit sampler metadata must annotate a sampler argument")
+            raise ProgramCompileError("implicit sampler metadata must annotate a sampler argument")
         for use in uses:
             bindings = use.get("sampled_image_bindings")
             if (
@@ -348,7 +348,7 @@ def merge_internal_parameter_uses(name: str, uses: Sequence[Mapping[str, Any]]) 
                     for binding in bindings
                 )
             ):
-                raise PipelineCompileError("implicit sampler requires reflected sampled image bindings")
+                raise ProgramCompileError("implicit sampler requires reflected sampled image bindings")
     return parameter
 
 
@@ -381,7 +381,7 @@ def validate_graphics_interfaces(
     inputs = interface_by_location(consumer_interface.get("arguments", []), "input")
     for location, value_type in inputs.items():
         if outputs.get(location) != value_type:
-            raise PipelineCompileError(f"{producer_stage}/{consumer_stage} interface mismatch at location {location}")
+            raise ProgramCompileError(f"{producer_stage}/{consumer_stage} interface mismatch at location {location}")
 
 
 def fragment_outputs(records: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:

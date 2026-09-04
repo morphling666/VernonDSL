@@ -8,8 +8,8 @@ from typing import Any, Iterator, Mapping
 
 import numpy as np
 
-from .._shader_assets.artifact_io import write_external_artifact
-from .._shader_assets.cooking import (
+from .._program_assets.artifact_io import write_external_artifact
+from .._program_assets.cooking import (
     _canonical_deployment,
     _compile_program_bundle_plan,
     _native_target,

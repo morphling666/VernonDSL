@@ -16,10 +16,10 @@ from typing import Any, Callable
 import numpy as np  # type: ignore[import-not-found]
 import vernon_dsl as vd  # type: ignore[import-not-found]
 from vernon_dsl.compiler import compile_file  # type: ignore[import-not-found]
-from vernon_dsl.pipeline_assets import cook_pipeline_asset  # type: ignore[import-not-found]
+from vernon_dsl.program_assets import cook_program_asset  # type: ignore[import-not-found]
 
 ROOT = Path(__file__).resolve().parents[1]
-FRONTEND_FIXTURE = ROOT / "python" / "tests" / "pipeline_asset_fixture.py"
+FRONTEND_FIXTURE = ROOT / "python" / "tests" / "program_asset_fixture.py"
 NATIVE_FIXTURE = ROOT / "python" / "tests" / "advanced_pipeline_shader.py"
 
 
@@ -115,8 +115,8 @@ def benchmark_cook(iterations: int, target: str) -> dict[str, object]:
             output = root / str(iteration)
             samples.append(
                 _milliseconds(
-                    lambda output=output: cook_pipeline_asset(
-                        pipeline_asset=f"{FRONTEND_FIXTURE}:scale_asset",
+                    lambda output=output: cook_program_asset(
+                        program_asset=f"{FRONTEND_FIXTURE}:scale_asset",
                         output=output,
                         target=target,
                     )

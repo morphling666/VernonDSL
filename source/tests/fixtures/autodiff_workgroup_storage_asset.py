@@ -25,7 +25,7 @@ def workgroup_objective(
     output[gid[2], gid[1], gid[0]] = second[lane]
 
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="compute/structured_storage_workgroup_vjp",
     program=vd.ad.vjp(
         workgroup_objective,

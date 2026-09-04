@@ -4,13 +4,13 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from ..bundle import CompiledArtifact, PipelineCompileError, inline_artifact_descriptor
+from ..bundle import CompiledArtifact, ProgramCompileError, inline_artifact_descriptor
 
 
 def encode_runtime_stage(record: dict[str, Any], artifact: bytes) -> dict[str, Any]:
     artifact_format = record.get("format")
     if not isinstance(artifact_format, str) or not artifact_format:
-        raise PipelineCompileError("runtime stage artifact format is missing")
+        raise ProgramCompileError("runtime stage artifact format is missing")
     return {
         **record,
         "artifact": inline_artifact_descriptor(CompiledArtifact(artifact_format, artifact)),
@@ -71,7 +71,7 @@ def write_external_artifact(
     artifact_path.parent.mkdir(parents=True, exist_ok=True)
     if artifact_path.exists():
         if artifact_path.read_bytes() != artifact:
-            raise PipelineCompileError(f"content-addressed artifact collision: {relative_path}")
+            raise ProgramCompileError(f"content-addressed artifact collision: {relative_path}")
     else:
         artifact_path.write_bytes(artifact)
     return {

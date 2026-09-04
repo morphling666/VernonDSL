@@ -41,7 +41,7 @@ function(
     output_stem
     output_variable)
     set(_vernon_bundle_directory "${VERNON_TEST_BINARY_ROOT}/${output_stem}")
-    set(_vernon_bundle_manifest "${_vernon_bundle_directory}/${output_stem}.pipeline.json")
+    set(_vernon_bundle_manifest "${_vernon_bundle_directory}/${output_stem}.program.json")
     string(
         REGEX
         REPLACE ":[^:]+$"
@@ -53,7 +53,7 @@ function(
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_bundle_directory}"
         COMMAND
             ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
-            vernon_dsl.pipeline_asset_cli "${asset_reference}" --target "${architecture}" --output
+            vernon_dsl.program_asset_cli "${asset_reference}" --target "${architecture}" --output
             "${_vernon_bundle_directory}"
         DEPENDS vernon-dsl-native "${_vernon_asset_source}" ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
         VERBATIM)
@@ -130,8 +130,8 @@ function(
         set(_vernon_cook_command ${Python_EXECUTABLE} "${FIXTURE_COOK_SCRIPT}" "${asset_reference}"
                                  "${_vernon_directory}")
     else()
-        set(_vernon_cook_command ${Python_EXECUTABLE} -m vernon_dsl.pipeline_asset_cli "${asset_reference}" --target
-                                 cpu --output "${_vernon_directory}")
+        set(_vernon_cook_command ${Python_EXECUTABLE} -m vernon_dsl.program_asset_cli "${asset_reference}" --target cpu
+                                 --output "${_vernon_directory}")
     endif()
     add_custom_command(
         OUTPUT "${_vernon_manifest}"
@@ -227,14 +227,14 @@ if(TARGET VernonRuntime)
     target_include_directories(vernon-cpu-aot-fixture PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
     set(cpu_bundle "${VERNON_TEST_BINARY_ROOT}/cpu_aot_bundle")
     add_custom_command(
-        OUTPUT "${cpu_bundle}/cpu_fill.pipeline.json"
+        OUTPUT "${cpu_bundle}/cpu_fill.program.json"
         COMMAND
             ${CMAKE_COMMAND} "-DARTIFACT=$<TARGET_FILE:vernon-cpu-aot-fixture>" "-DOUTPUT=${cpu_bundle}"
             "-DOPERATING_SYSTEM=${runtime_test_os}" "-DARCHITECTURE=${runtime_test_arch}" -P
             "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
         DEPENDS vernon-cpu-aot-fixture "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
         VERBATIM)
-    add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/cpu_fill.pipeline.json")
+    add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/cpu_fill.program.json")
     add_test(
         NAME vernon-cpu-aot-bundle-platform-mapping
         COMMAND
@@ -460,7 +460,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             cooked-autodiff
             autodiff_cooked_fixture
-            autodiff_cooked_fixture.pipeline.json
+            autodiff_cooked_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_cooked_aggregate_asset.py:asset"
             vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
@@ -468,7 +468,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             module-program-cooked
             module_program_cooked_fixture
-            module_program_cooked_fixture.pipeline.json
+            module_program_cooked_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
             vernonRegisterModuleProgramFixture
             module_program_cooked_manifest
@@ -476,7 +476,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
-            autodiff_native_f16_fixture.pipeline.json
+            autodiff_native_f16_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_native_f16_asset.py:asset"
             vernonRegisterNativeAutodiffF16Fixture
             native_autodiff_f16_manifest
@@ -484,7 +484,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             native-autodiff-numeric-cpu
             autodiff_native_numeric_cpu_fixture
-            autodiff_native_numeric_cpu_fixture.pipeline.json
+            autodiff_native_numeric_cpu_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_native_numeric_asset.py:asset"
             vernonRegisterNativeAutodiffNumericCpuFixture
             native_autodiff_numeric_cpu_manifest
@@ -492,7 +492,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-scalar-autodiff
             autodiff_structured_scalar_fixture
-            autodiff_structured_scalar_fixture.pipeline.json
+            autodiff_structured_scalar_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:asset"
             vernonRegisterStructuredScalarAutodiffFixture
             structured_scalar_autodiff_manifest
@@ -500,7 +500,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-scalar-balanced-autodiff
             autodiff_structured_scalar_balanced_fixture
-            autodiff_structured_scalar_balanced_fixture.pipeline.json
+            autodiff_structured_scalar_balanced_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:balanced_asset"
             vernonRegisterStructuredScalarBalancedAutodiffFixture
             structured_scalar_balanced_autodiff_manifest
@@ -508,7 +508,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-dynamic-autodiff
             autodiff_structured_dynamic_fixture
-            autodiff_structured_dynamic_fixture.pipeline.json
+            autodiff_structured_dynamic_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:dynamic_asset"
             vernonRegisterStructuredDynamicAutodiffFixture
             structured_dynamic_autodiff_manifest
@@ -516,7 +516,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-f64-autodiff
             autodiff_structured_f64_fixture
-            autodiff_structured_f64_fixture.pipeline.json
+            autodiff_structured_f64_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_scalar_asset.py:double_asset"
             vernonRegisterStructuredF64AutodiffFixture
             structured_f64_autodiff_manifest
@@ -524,7 +524,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-aggregate-autodiff
             autodiff_structured_aggregate_fixture
-            autodiff_structured_aggregate_fixture.pipeline.json
+            autodiff_structured_aggregate_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_aggregate_asset.py:asset"
             vernonRegisterStructuredAggregateAutodiffFixture
             structured_aggregate_autodiff_manifest
@@ -532,7 +532,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-storage-autodiff
             autodiff_structured_storage_fixture
-            autodiff_structured_storage_fixture.pipeline.json
+            autodiff_structured_storage_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:asset"
             vernonRegisterStructuredStorageAutodiffFixture
             structured_storage_autodiff_manifest
@@ -540,7 +540,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-storage-aggregate-autodiff
             autodiff_structured_storage_aggregate_fixture
-            autodiff_structured_storage_aggregate_fixture.pipeline.json
+            autodiff_structured_storage_aggregate_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_structured_storage_asset.py:aggregate_asset"
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             structured_storage_aggregate_autodiff_manifest
@@ -548,7 +548,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             structured-storage-workgroup-autodiff
             autodiff_structured_storage_workgroup_fixture
-            autodiff_structured_storage_workgroup_fixture.pipeline.json
+            autodiff_structured_storage_workgroup_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_workgroup_storage_asset.py:asset"
             vernonRegisterStructuredStorageWorkgroupAutodiffFixture
             structured_storage_workgroup_autodiff_manifest
@@ -556,7 +556,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-signed-stride
             autodiff_dynamic_v2_signed_stride_fixture
-            autodiff_dynamic_v2_signed_stride_fixture.pipeline.json
+            autodiff_dynamic_v2_signed_stride_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:signed_stride_asset"
             vernonRegisterDynamicV2SignedStrideFixture
             dynamic_v2_signed_stride_manifest
@@ -564,7 +564,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-field-path
             autodiff_dynamic_v2_field_path_fixture
-            autodiff_dynamic_v2_field_path_fixture.pipeline.json
+            autodiff_dynamic_v2_field_path_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:field_path_asset"
             vernonRegisterDynamicV2FieldPathFixture
             dynamic_v2_field_path_manifest
@@ -572,7 +572,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-strided-scatter
             autodiff_dynamic_v2_strided_scatter_fixture
-            autodiff_dynamic_v2_strided_scatter_fixture.pipeline.json
+            autodiff_dynamic_v2_strided_scatter_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:strided_scatter_asset"
             vernonRegisterDynamicV2StridedScatterFixture
             dynamic_v2_strided_scatter_manifest
@@ -580,7 +580,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-gather
             autodiff_dynamic_v2_gather_fixture
-            autodiff_dynamic_v2_gather_fixture.pipeline.json
+            autodiff_dynamic_v2_gather_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:gather_asset"
             vernonRegisterDynamicV2GatherFixture
             dynamic_v2_gather_manifest
@@ -588,7 +588,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-multi-output
             autodiff_dynamic_v2_multi_output_fixture
-            autodiff_dynamic_v2_multi_output_fixture.pipeline.json
+            autodiff_dynamic_v2_multi_output_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:multi_output_asset"
             vernonRegisterDynamicV2MultiOutputFixture
             dynamic_v2_multi_output_manifest
@@ -596,7 +596,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-partially-dynamic
             autodiff_dynamic_v2_partially_dynamic_fixture
-            autodiff_dynamic_v2_partially_dynamic_fixture.pipeline.json
+            autodiff_dynamic_v2_partially_dynamic_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:partially_dynamic_asset"
             vernonRegisterDynamicV2PartiallyDynamicFixture
             dynamic_v2_partially_dynamic_manifest
@@ -604,7 +604,7 @@ if(TARGET VernonRuntime)
         vernon_add_cpu_autodiff_fixture(
             dynamic-v2-mixed-alias
             autodiff_dynamic_v2_mixed_alias_fixture
-            autodiff_dynamic_v2_mixed_alias_fixture.pipeline.json
+            autodiff_dynamic_v2_mixed_alias_fixture.program.json
             "${VERNON_TEST_ROOT}/fixtures/autodiff_dynamic_v2_parity_asset.py:mixed_alias_asset"
             vernonRegisterDynamicV2MixedAliasFixture
             dynamic_v2_mixed_alias_manifest
@@ -895,19 +895,19 @@ if(TARGET VernonRuntime)
             vernon_add_pipeline_test_bundle(
                 metal-compute-pipeline
                 metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
                 metal_compute_pipeline_bundle
                 metal_compute_pipeline_test_manifest)
             vernon_add_pipeline_test_bundle(
                 metal-graphics-pipeline
                 metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
                 metal_graphics_pipeline_bundle
                 metal_graphics_pipeline_test_manifest)
             vernon_add_pipeline_test_bundle(
                 metal-resolution-pipeline
                 metal
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
                 metal_resolution_pipeline_bundle
                 metal_resolution_pipeline_test_manifest)
             target_compile_definitions(
@@ -971,19 +971,19 @@ if(TARGET VernonRuntime)
             vernon_add_pipeline_test_bundle(
                 directx-pipeline
                 directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
                 directx_pipeline_bundle
                 directx_pipeline_test_manifest)
             vernon_add_pipeline_test_bundle(
                 directx-compute-pipeline
                 directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
                 directx_compute_pipeline_bundle
                 directx_compute_pipeline_test_manifest)
             vernon_add_pipeline_test_bundle(
                 directx-resolution-pipeline
                 directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:resolution_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
                 directx_resolution_pipeline_bundle
                 directx_resolution_pipeline_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
@@ -1007,13 +1007,13 @@ if(TARGET VernonRuntime)
         vernon_add_pipeline_test_bundle(
             vulkan-pipeline
             vulkan
-            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:sampled_asset"
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
             vulkan_pipeline_bundle
             vulkan_pipeline_test_manifest)
         vernon_add_pipeline_test_bundle(
             vulkan-compute-pipeline
             vulkan
-            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:scale_asset"
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
             vulkan_compute_pipeline_bundle
             vulkan_compute_pipeline_test_manifest)
         vernon_add_pipeline_test_bundle(
@@ -1040,7 +1040,7 @@ if(TARGET VernonRuntime)
         vernon_add_pipeline_test_bundle(
             opengl-runtime-acceptance
             opengl
-            "${VERNON_REPOSITORY_ROOT}/python/tests/pipeline_asset_fixture.py:opengl_runtime_acceptance_asset"
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:opengl_runtime_acceptance_asset"
             opengl_runtime_acceptance_bundle
             opengl_runtime_acceptance_manifest)
         target_compile_definitions(

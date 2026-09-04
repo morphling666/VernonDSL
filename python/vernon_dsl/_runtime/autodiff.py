@@ -106,7 +106,7 @@ class _StructuredPullback:
 
 
 @dataclass
-class CookedVjpPipeline:
+class CookedVjpProgram:
     _bundle: bytes
     _directory: str
     _features: tuple[str, ...]
@@ -282,12 +282,12 @@ def load_cooked_vjp_asset(
     manifest: str | Path,
     *,
     features: tuple[str, ...] = (),
-) -> CookedVjpPipeline:
+) -> CookedVjpProgram:
     manifest_path = Path(manifest).resolve()
     if any(not isinstance(feature, str) or not feature for feature in features):
         raise ValueError("pipeline asset features must be non-empty strings")
     selected_features = tuple(sorted(set(features)))
-    pipeline = CookedVjpPipeline(
+    pipeline = CookedVjpProgram(
         manifest_path.read_bytes(),
         str(manifest_path.parent),
         selected_features,
@@ -446,7 +446,7 @@ def execute_direct_vjp(
 
 
 __all__ = [
-    "CookedVjpPipeline",
+    "CookedVjpProgram",
     "clear_vjp_cache",
     "execute_direct_vjp",
     "invalidate_loaded_vjps",

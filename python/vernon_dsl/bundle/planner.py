@@ -33,7 +33,7 @@ from .serialize import (
     serialize_bundle,
     with_content_hash,
 )
-from .types import BundlePlan, CompiledArtifact, CompiledStage, PipelineCompileError, TargetOptions, VariantPlan
+from .types import BundlePlan, CompiledArtifact, CompiledStage, ProgramCompileError, TargetOptions, VariantPlan
 
 
 def plan_variant(
@@ -48,12 +48,12 @@ def plan_variant(
         )
     )
     if ("compute" in records) == bool(graphics):
-        raise PipelineCompileError("pipeline variant must contain either one compute program or one graphics program")
+        raise ProgramCompileError("pipeline variant must contain either one compute program or one graphics program")
     if graphics:
         try:
             validate_graphics_topology(graphics)
         except ValueError as error:
-            raise PipelineCompileError(str(error)) from None
+            raise ProgramCompileError(str(error)) from None
         for producer, consumer in zip(graphics, graphics[1:], strict=False):
             validate_graphics_interfaces(producer, records[producer], consumer, records[consumer])
     external = external_parameters(records)
@@ -111,7 +111,7 @@ def build_bundle_plan(
             else:
                 validate_stage_target(stage.stage, target.target)
         except ValueError as error:
-            raise PipelineCompileError(str(error)) from None
+            raise ProgramCompileError(str(error)) from None
     return BundlePlan(
         pipeline_id,
         target,
@@ -134,7 +134,7 @@ def build_program_bundle_plan(
 
     canonical_stages = canonical_program.get("stages")
     if not isinstance(canonical_stages, Mapping):
-        raise PipelineCompileError("canonical Program has no stage contracts")
+        raise ProgramCompileError("canonical Program has no stage contracts")
     if set(canonical_stages) != set(stages):
         missing = sorted(set(canonical_stages) - set(stages))
         unused = sorted(set(stages) - set(canonical_stages))
@@ -143,7 +143,7 @@ def build_program_bundle_plan(
             detail.append("missing " + ", ".join(repr(value) for value in missing))
         if unused:
             detail.append("unused " + ", ".join(repr(value) for value in unused))
-        raise PipelineCompileError("Program implementation stages do not match its contracts: " + "; ".join(detail))
+        raise ProgramCompileError("Program implementation stages do not match its contracts: " + "; ".join(detail))
 
     stage_bindings: dict[str, str] = {}
     unique_stages: dict[str, CompiledStage] = {}
@@ -152,9 +152,9 @@ def build_program_bundle_plan(
         operation = contract.get("operation") if isinstance(contract, Mapping) else None
         expected = "compute" if operation == "compute" else "graphics" if operation == "graphics" else None
         if expected is None:
-            raise PipelineCompileError(f"canonical Program stage {name!r} has an invalid operation")
+            raise ProgramCompileError(f"canonical Program stage {name!r} has an invalid operation")
         if stage.stage != expected:
-            raise PipelineCompileError(f"Program stage {name!r} requires {expected}, compiler produced {stage.stage}")
+            raise ProgramCompileError(f"Program stage {name!r} requires {expected}, compiler produced {stage.stage}")
         try:
             if stage.stage == "graphics":
                 graphics_stages = stage.metadata.get("graphics_compiled_stages")
@@ -165,9 +165,9 @@ def build_program_bundle_plan(
             else:
                 validate_stage_target(stage.stage, target.target)
         except ValueError as error:
-            raise PipelineCompileError(str(error)) from None
+            raise ProgramCompileError(str(error)) from None
         if stage.target.spec != target.spec:
-            raise PipelineCompileError(f"Program stage {name!r} target does not match the bundle target")
+            raise ProgramCompileError(f"Program stage {name!r} target does not match the bundle target")
         stage_bindings[name] = stage.id
         unique_stages[stage.id] = stage
 
@@ -192,7 +192,7 @@ __all__ = [
     "BundlePlan",
     "CompiledArtifact",
     "CompiledStage",
-    "PipelineCompileError",
+    "ProgramCompileError",
     "TargetOptions",
     "VariantPlan",
     "build_bundle_plan",

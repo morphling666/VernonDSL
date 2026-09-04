@@ -28,7 +28,7 @@ def mesh_fragment(
     return tint
 
 
-mesh_asset = vd.pipeline_asset(
+mesh_asset = vd.program_asset(
     id="shaders/variant_mesh",
     program=(mesh_vertex, mesh_fragment),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),

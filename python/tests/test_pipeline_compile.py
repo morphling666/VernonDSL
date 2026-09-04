@@ -12,7 +12,7 @@ from vernon_dsl.bundle import (
     CompiledStage,
     MetalTargetOptions,
     OpenGLTargetOptions,
-    PipelineCompileError,
+    ProgramCompileError,
     build_bundle_plan,
     canonical_json,
     compiled_stage_from_program,
@@ -264,7 +264,7 @@ class PipelineCompileTests(unittest.TestCase):
             metadata={},
             interface={},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "incomplete PTX header"):
+        with self.assertRaisesRegex(ProgramCompileError, "incomplete PTX header"):
             runtime_requirements("cuda", [stage])
 
         metal_stage = SimpleNamespace(
@@ -275,7 +275,7 @@ class PipelineCompileTests(unittest.TestCase):
             metadata={},
             interface={},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "no valid msl_version"):
+        with self.assertRaisesRegex(ProgramCompileError, "no valid msl_version"):
             runtime_requirements("metal", [metal_stage])
         metal_stage.target.options = {}
         metal_stage.reflection = {
@@ -285,7 +285,7 @@ class PipelineCompileTests(unittest.TestCase):
                 "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [11, 0]},
             }
         }
-        with self.assertRaisesRegex(PipelineCompileError, "requires apple_platform"):
+        with self.assertRaisesRegex(ProgramCompileError, "requires apple_platform"):
             runtime_requirements("metal", [metal_stage])
 
     def test_compiled_stage_uses_reflected_target_options(self) -> None:
@@ -399,11 +399,11 @@ class PipelineCompileTests(unittest.TestCase):
                 ],
             },
         )
-        with self.assertRaisesRegex(PipelineCompileError, "duplicate variant keys"):
+        with self.assertRaisesRegex(ProgramCompileError, "duplicate variant keys"):
             duplicate_profiles.logical_dict()
 
         duplicate_variants = replace(plan, variants=(plan.variants[0], plan.variants[0]))
-        with self.assertRaisesRegex(PipelineCompileError, "duplicate canonical keys"):
+        with self.assertRaisesRegex(ProgramCompileError, "duplicate canonical keys"):
             duplicate_variants.logical_dict()
         self.assertEqual(
             set(logical["stage_artifacts"][stage.id]),
@@ -427,13 +427,13 @@ class PipelineCompileTests(unittest.TestCase):
             MetalTargetOptions(platform="ios").native_options,
             {"options": {"platform": "ios"}},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "invalid vulkan target options"):
+        with self.assertRaisesRegex(ProgramCompileError, "invalid vulkan target options"):
             make_target_options("vulkan", {"processor": "generic"})
-        with self.assertRaisesRegex(PipelineCompileError, "invalid metal target options"):
+        with self.assertRaisesRegex(ProgramCompileError, "invalid metal target options"):
             make_target_options("metal", {"shader_model": 60})
-        with self.assertRaisesRegex(PipelineCompileError, "shader model must be 6.0 or newer"):
+        with self.assertRaisesRegex(ProgramCompileError, "shader model must be 6.0 or newer"):
             make_target_options("directx", {"shader_model": 55})
-        with self.assertRaisesRegex(PipelineCompileError, "macos.*ios"):
+        with self.assertRaisesRegex(ProgramCompileError, "macos.*ios"):
             MetalTargetOptions(platform="tvos")
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
@@ -521,7 +521,7 @@ class PipelineCompileTests(unittest.TestCase):
         unpaired = json.loads(json.dumps(records))
         del unpaired["fragment"]["interface"]["arguments"][1]["sampled_image_bindings"]
         unpaired_fragment = _stage("fragment", b"fragment", unpaired["fragment"]["interface"])
-        with self.assertRaisesRegex(PipelineCompileError, "no reflected sampled image binding"):
+        with self.assertRaisesRegex(ProgramCompileError, "no reflected sampled image binding"):
             build_bundle_plan(
                 "pipeline",
                 fragment.target,
@@ -541,7 +541,7 @@ class PipelineCompileTests(unittest.TestCase):
         sampler = legacy["fragment"]["interface"]["arguments"][1]
         del sampler["vernon.implicit"]
         sampler["vernon.compiler_generated"] = True
-        with self.assertRaisesRegex(PipelineCompileError, "legacy compiler-generated"):
+        with self.assertRaisesRegex(ProgramCompileError, "legacy compiler-generated"):
             external_parameters(legacy)
 
     def test_explicit_sampler_remains_external(self) -> None:
@@ -711,7 +711,7 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertNotIn("interface_plan", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
-        with self.assertRaisesRegex(PipelineCompileError, "missing reflected set/binding"):
+        with self.assertRaisesRegex(ProgramCompileError, "missing reflected set/binding"):
             external_parameters(records)
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
@@ -768,7 +768,7 @@ class PipelineCompileTests(unittest.TestCase):
             "interface": "storage",
             "access": "read",
         }
-        with self.assertRaisesRegex(PipelineCompileError, "must use device address space"):
+        with self.assertRaisesRegex(ProgramCompileError, "must use device address space"):
             merge_parameter_uses("missing_address_space", [tensor_view_use])
         tensor_view_use["address_space"] = "device"
         self.assertEqual(
@@ -1007,9 +1007,9 @@ class PipelineCompileTests(unittest.TestCase):
         )
         self.assertEqual(select_entry(reflection, "main")["stage"], "compute")
         self.assertEqual(select_artifact(reflection, "main", "compute")["filename"], "main.ptx")
-        with self.assertRaisesRegex(PipelineCompileError, "exactly one"):
+        with self.assertRaisesRegex(ProgramCompileError, "exactly one"):
             select_entry({"entries": []}, "missing")
-        with self.assertRaisesRegex(PipelineCompileError, "incompatible"):
+        with self.assertRaisesRegex(ProgramCompileError, "incompatible"):
             merge_parameter_uses(
                 "value",
                 [
@@ -1033,7 +1033,7 @@ class PipelineCompileTests(unittest.TestCase):
                     },
                 ],
             )
-        with self.assertRaisesRegex(PipelineCompileError, "mismatch"):
+        with self.assertRaisesRegex(ProgramCompileError, "mismatch"):
             validate_graphics_interfaces(
                 "vertex",
                 {
@@ -1069,7 +1069,7 @@ class PipelineCompileTests(unittest.TestCase):
             },
         )
         plan = build_bundle_plan("pipeline", stage.target, (), [((), {"compute": stage})])
-        with self.assertRaisesRegex(PipelineCompileError, "do not match planned"):
+        with self.assertRaisesRegex(ProgramCompileError, "do not match planned"):
             materialize_bundle(plan, {})
 
 

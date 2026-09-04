@@ -10,7 +10,7 @@ VernonDSL uses one Program model for:
 - transforms such as VJP.
 
 All paths produce the same typed Program IR and use the same compiler, pipeline artifact, loader, and native runtime.
-The existing public asset name remains `pipeline_asset`; do not add `program_asset` or a second contract.
+The existing public asset name remains `program_asset`; do not add `program_asset` or a second contract.
 
 Standalone kernels and graphics pipelines are normalized to one-node Programs
 at the asset/compiler boundary. Node count must not select a different
@@ -102,12 +102,12 @@ outputs, pullback = vd.ad.vjp(module, wrt=("mesh",))(mesh, camera, target)
 gradients = pullback(cotangents)
 ```
 
-### 2.2 Pipeline assets
+### 2.2 Program Assets
 
 An initialized Module can be used directly:
 
 ```python
-pbr_asset = vd.pipeline_asset(
+pbr_asset = vd.program_asset(
     id="pipelines/pbr",
     program=Pbr(shadows=True),
     variants=((),),
@@ -117,17 +117,17 @@ pbr_asset = vd.pipeline_asset(
 Cooking keeps the existing facade:
 
 ```python
-vd.cook_pipeline_asset(
+vd.cook_program_asset(
     "scene.py:pbr_asset",
     target="metal",
     output="build/pipelines",
 )
 
-pbr = vd.load_pipeline("build/pipelines/cooked.pipeline.json")
+pbr = vd.load_program("build/pipelines/cooked.program.json")
 pbr(mesh, camera, target)
 ```
 
-`pipeline_asset` accepts kernels, graphics pipelines, initialized Modules, and supported transforms. There is no public
+`program_asset` accepts kernels, graphics pipelines, initialized Modules, and supported transforms. There is no public
 `vd.export` step or `ExportedProgram` type. The initialized Program is retained by the asset declaration until cooking;
 the cooker and an interactive cache miss both enter the same internal compiler frontend.
 
@@ -366,7 +366,7 @@ The native checkpoint planner receives the complete primal/reverse DAG, includin
 liveness, replay cost, replay legality, and deterministic-reduction constraints. Python must not replay Module prefixes,
 choose retain/rematerialize heuristics, synthesize telemetry, or execute reverse fragments.
 
-## 8. Pipeline assets and runtime
+## 8. Program Assets and runtime
 
 For `scene.py:pbr_asset`, cooking imports the descriptor in a clean worker, obtains the initialized Program, enters the
 same compiler frontend used by an interactive cache miss, and writes the existing pipeline artifact format.
@@ -417,7 +417,7 @@ pair and rejects every older cooked artifact rather than normalizing it.
 4. Materialize the authoritative MLIR Program dialect and compiler reflection, including Program-node to selected
    implementation mappings.
 5. Apply logical VJP transforms, implementation selection, and optional fusion in MLIR.
-6. Extend `pipeline_asset` and its cooker to compile initialized Programs in a clean worker.
+6. Extend `program_asset` and its cooker to compile initialized Programs in a clean worker.
 7. Lower primal and VJP Program IR to native compute, render, barrier, lifetime, and reverse commands.
 8. Move checkpoint planning/execution fully into the native DAG.
 9. Remove public pass/encoder/graph APIs and transitional Python execution.
@@ -425,7 +425,7 @@ pair and rejects every older cooked artifact rather than normalizing it.
 
 ## 11. Acceptance criteria
 
-- `pipeline_asset(program=Module(...))` cooks without user-provided example arguments.
+- `program_asset(program=Module(...))` cooks without user-provided example arguments.
 - Module parameter types are inferred from annotations, leaf reflection, and Program constraints; ambiguity is diagnosed.
 - `Module.__init__` is normal Python and the artifact contains no Python object or constructor configuration tree.
 - A primal Module call creates no VJP executable or reverse state.

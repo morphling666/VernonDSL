@@ -17,12 +17,12 @@ perform no filesystem or dynamic-library access.
 cmake -S . -B host-build
 cmake --build host-build --target vernon-dsl-native
 
-PYTHONPATH=python .venv/bin/python -m vernon_dsl.pipeline_asset_cli \
+PYTHONPATH=python .venv/bin/python -m vernon_dsl.program_asset_cli \
   examples/external_engine/fractal_pipeline.py:asset \
   --target cpu \
   -o fractal-desktop-cooked
 
-PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.pipeline_asset_cli \
+PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.program_asset_cli \
   examples/shader_lib/mandelbulb.py:mandelbulb_asset \
   --target opengl --opengl-version 330 \
   -o mandelbulb-desktop-cooked
@@ -37,13 +37,13 @@ cmake --build split-desktop-build
 ## WebAssembly split screen
 
 ```sh
-PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.pipeline_asset_cli \
+PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.program_asset_cli \
   examples/external_engine/fractal_pipeline.py:asset \
   --target cpu \
   --cpu-triple wasm32-unknown-emscripten \
   -o fractal-wasm-cooked
 
-PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.pipeline_asset_cli \
+PYTHONPATH="python:$PWD" .venv/bin/python -m vernon_dsl.program_asset_cli \
   examples/shader_lib/mandelbulb.py:mandelbulb_asset \
   --target opengles --opengl-version 300 \
   -o mandelbulb-wasm-cooked

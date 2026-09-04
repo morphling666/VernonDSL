@@ -78,7 +78,7 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
 TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
-    const std::string bundle = readFile(directory / "cpu_fill.pipeline.json");
+    const std::string bundle = readFile(directory / "cpu_fill.program.json");
     ASSERT_FALSE(bundle.empty());
 
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -141,7 +141,7 @@ TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
 TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
-    const std::string bundle = readFile(directory / "cpu_fill.pipeline.json");
+    const std::string bundle = readFile(directory / "cpu_fill.program.json");
     ASSERT_TRUE(!bundle.empty());
 
     VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;
@@ -340,7 +340,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
 TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
-    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.pipeline.json"));
+    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.program.json"));
     nlohmann::json &variant = bundle["variants"][0];
     variant["program"] = {{"forward:0", "fill"}, {"forward:1", "fill"}};
     nlohmann::json internal = variant["parameters"][0];
@@ -444,7 +444,7 @@ TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
 TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
     const std::string directoryUtf8 = directory.u8string();
-    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.pipeline.json"));
+    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.program.json"));
     nlohmann::json &variant = bundle["variants"][0];
     nlohmann::json gradient = variant["parameters"][0];
     gradient["slot"] = 1;
@@ -547,7 +547,7 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem) {
     const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string fixture = readFile(directory / "cpu_fill.pipeline.json");
+    const std::string fixture = readFile(directory / "cpu_fill.program.json");
     ASSERT_FALSE(fixture.empty());
 
     auto wasmManifest = [&](const char *id, const char *symbol) {

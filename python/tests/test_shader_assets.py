@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
-from vernon_dsl._shader_assets.artifact_io import artifact_extension
+from vernon_dsl._program_assets.artifact_io import artifact_extension
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.bundle import (
     CompiledArtifact,
@@ -23,11 +23,11 @@ from vernon_dsl.bundle import (
     make_target_options,
 )
 from vernon_dsl.module_graph import load_project, resolve_project_entry
-from vernon_dsl.pipeline_assets import (
-    PipelineCompileError,
-    cook_pipeline_asset,
+from vernon_dsl.program_assets import (
+    ProgramCompileError,
+    cook_program_asset,
     encode_runtime_stage,
-    parse_python_pipeline_asset,
+    parse_python_program_asset,
 )
 
 
@@ -49,11 +49,11 @@ def _fake_native(compile_program_result: object) -> SimpleNamespace:
 
 def _native_available() -> bool:
     try:
-        from vernon_dsl._shader_assets.cooking import _native_module
+        from vernon_dsl._program_assets.cooking import _native_module
 
         _native_module()
         return True
-    except PipelineCompileError:
+    except ProgramCompileError:
         return False
 
 
@@ -163,7 +163,7 @@ from .fullscreen import vertex as fullscreen_vertex
 def fragment_main() -> vd.Vector[vd.f32, 4]:
     return vd.Vector([1.0, 0.0, 0.0, 1.0])
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/imported",
     program=(fullscreen_vertex, fragment_main),
 )
@@ -171,7 +171,7 @@ asset = vd.pipeline_asset(
                 encoding="utf-8",
             )
 
-            descriptor = parse_python_pipeline_asset(source, "asset")
+            descriptor = parse_python_program_asset(source, "asset")
             self.assertEqual(descriptor.stages["vertex"].entry, "fullscreen_vertex")
             resolution = resolve_project_entry(source, "fullscreen_vertex")
             self.assertIsNotNone(resolution)
@@ -207,15 +207,15 @@ import fullscreen
 def fragment_main() -> vd.Vector[vd.f32, 4]:
     return vd.Vector([1.0, 0.0, 0.0, 1.0])
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/qualified",
     program=(fullscreen.fullscreen_vertex, fragment_main),
 )
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "simple imported or local function names"):
-                parse_python_pipeline_asset(qualified, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "simple imported or local function names"):
+                parse_python_program_asset(qualified, "asset")
 
             (root / "exports.py").write_text(
                 "from fullscreen import fullscreen_vertex\n",
@@ -231,15 +231,15 @@ from exports import fullscreen_vertex
 def fragment_main() -> vd.Vector[vd.f32, 4]:
     return vd.Vector([1.0, 0.0, 0.0, 1.0])
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/reexported",
     program=(fullscreen_vertex, fragment_main),
 )
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "has no symbol 'fullscreen_vertex'"):
-                parse_python_pipeline_asset(reexported, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "has no symbol 'fullscreen_vertex'"):
+                parse_python_program_asset(reexported, "asset")
 
     def test_python_pipeline_asset_is_parsed_without_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -258,7 +258,7 @@ def vertex_main(value: vd.f32) -> vd.f32:
 def fragment_main(value: vd.f32) -> vd.f32:
     return value
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/static",
     program=(vertex_main, fragment_main),
     variants=((), (FEATURE,)),
@@ -266,7 +266,7 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            descriptor = parse_python_pipeline_asset(source, "asset")
+            descriptor = parse_python_program_asset(source, "asset")
             self.assertEqual(descriptor.id, "pipelines/static")
             self.assertEqual(descriptor.variants, ((), ("FEATURE",)))
             self.assertEqual(set(descriptor.stages), {"vertex", "fragment"})
@@ -283,7 +283,7 @@ import vernon_dsl as vd
 def compute_main() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/legacy",
     compute=compute_main,
     variants=((),),
@@ -292,8 +292,8 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "unknown pipeline_asset argument"):
-                parse_python_pipeline_asset(source, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "unknown program_asset argument"):
+                parse_python_program_asset(source, "asset")
 
     def test_python_pipeline_asset_rejects_graphics_stage_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -310,7 +310,7 @@ def vertex_main() -> None:
 def fragment_main() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/reversed",
     program=(fragment_main, vertex_main),
     variants=((),),
@@ -318,8 +318,8 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "topology order"):
-                parse_python_pipeline_asset(source, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "topology order"):
+                parse_python_program_asset(source, "asset")
 
     def test_python_pipeline_asset_rejects_noncanonical_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -334,7 +334,7 @@ ALPHA = vd.feature("ALPHA")
 def compute_main() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/bad",
     program=compute_main,
     variants=((ZED, ALPHA),),
@@ -342,8 +342,8 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "not canonical"):
-                parse_python_pipeline_asset(source, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "not canonical"):
+                parse_python_program_asset(source, "asset")
 
     def test_python_pipeline_asset_enforces_variant_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -359,7 +359,7 @@ import vernon_dsl as vd
 def compute_main() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/too_many",
     program=compute_main,
     variants=({variants},),
@@ -367,12 +367,12 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "variant cap 16"):
-                parse_python_pipeline_asset(source, "asset")
+            with self.assertRaisesRegex(ProgramCompileError, "variant cap 16"):
+                parse_python_program_asset(source, "asset")
 
     def test_example_pipeline_asset_has_canonical_variants(self) -> None:
         root = Path(__file__).parents[2]
-        pipeline = parse_python_pipeline_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
+        pipeline = parse_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
         self.assertEqual(pipeline.id, "shaders/variant_mesh")
         self.assertEqual(
             pipeline.variants,
@@ -390,14 +390,14 @@ class ShaderAssetCookTests(unittest.TestCase):
     def test_cooker_rejects_non_python_pipeline_asset_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with self.assertRaisesRegex(PipelineCompileError, "source.py:descriptor_name"):
-                cook_pipeline_asset(
-                    pipeline_asset=root / "asset.json",
+            with self.assertRaisesRegex(ProgramCompileError, "source.py:descriptor_name"):
+                cook_program_asset(
+                    program_asset=root / "asset.json",
                     output=root / "output",
                 )
-            with self.assertRaisesRegex(PipelineCompileError, "valid Python descriptor name"):
-                cook_pipeline_asset(
-                    pipeline_asset=f"{root / 'asset.py'}:",
+            with self.assertRaisesRegex(ProgramCompileError, "valid Python descriptor name"):
+                cook_program_asset(
+                    program_asset=f"{root / 'asset.py'}:",
                     output=root / "output",
                 )
 
@@ -519,7 +519,7 @@ UNUSED = vd.feature("UNUSED")
 def scale() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/cpu",
     program=scale,
     variants=((),),
@@ -529,19 +529,19 @@ asset = vd.pipeline_asset(
             )
             output = root / "cooked"
             with (
-                mock.patch("vernon_dsl._shader_assets.cooking.compile_file", return_value="module {}"),
+                mock.patch("vernon_dsl._program_assets.cooking.compile_file", return_value="module {}"),
                 mock.patch(
-                    "vernon_dsl._shader_assets.cooking.load_project", return_value=SimpleNamespace(features={"UNUSED"})
+                    "vernon_dsl._program_assets.cooking.load_project", return_value=SimpleNamespace(features={"UNUSED"})
                 ),
                 mock.patch(
-                    "vernon_dsl._shader_assets.cooking._native_module",
+                    "vernon_dsl._program_assets.cooking._native_module",
                     return_value=_fake_native(compile_program_result),
                 ),
                 mock.patch("subprocess.run", side_effect=AssertionError("cooker invoked subprocess")),
-                mock.patch("vernon_dsl._shader_assets.cooking.build_bundle_plan", side_effect=capture_plan),
+                mock.patch("vernon_dsl._program_assets.cooking.build_bundle_plan", side_effect=capture_plan),
             ):
-                manifest_path = cook_pipeline_asset(
-                    pipeline_asset=f"{source}:asset",
+                manifest_path = cook_program_asset(
+                    program_asset=f"{source}:asset",
                     output=output,
                     target=CpuTargetOptions(processor="generic", features=("+sse2",)),
                 )
@@ -607,7 +607,7 @@ asset = vd.pipeline_asset(
             self.assertIn("vernonRuntimeRegisterStaticCpuEntry", registration_source)
             self.assertIn("&__vernon_cpu_module_scale", registration_source)
             self.assertTrue(registration_sources[0].with_suffix(".h").is_file())
-            self.assertEqual(manifest_path.name, "cooked.pipeline.json")
+            self.assertEqual(manifest_path.name, "cooked.program.json")
             self.assertFalse((output / "pipeline.bundle").exists())
 
     def test_mocked_gpu_targets_emit_external_deduplicated_artifacts(self) -> None:
@@ -643,7 +643,7 @@ FEATURE = vd.feature("FEATURE")
 
 {stage_definitions}
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="pipelines/{target}",
     program={program_expression},
     variants=((), (FEATURE,)),
@@ -750,29 +750,29 @@ asset = vd.pipeline_asset(
 
                     output = case_root / f"{target}_asset"
                     with (
-                        mock.patch("vernon_dsl._shader_assets.cooking.compile_file", return_value="module {}"),
+                        mock.patch("vernon_dsl._program_assets.cooking.compile_file", return_value="module {}"),
                         mock.patch(
-                            "vernon_dsl._shader_assets.cooking.load_project",
+                            "vernon_dsl._program_assets.cooking.load_project",
                             return_value=SimpleNamespace(features={"FEATURE"}),
                         ),
                         mock.patch(
-                            "vernon_dsl._shader_assets.cooking._native_module",
+                            "vernon_dsl._program_assets.cooking._native_module",
                             return_value=_fake_native(compile_program_result),
                         ),
                     ):
-                        manifest_path = cook_pipeline_asset(
-                            pipeline_asset=f"{source}:asset",
+                        manifest_path = cook_program_asset(
+                            program_asset=f"{source}:asset",
                             output=output,
                             target=target,
                         )
                         first_manifest = manifest_path.read_bytes()
-                        repeated_path = cook_pipeline_asset(
-                            pipeline_asset=f"{source}:asset",
+                        repeated_path = cook_program_asset(
+                            program_asset=f"{source}:asset",
                             output=output,
                             target=target,
                         )
 
-                    self.assertEqual(manifest_path.name, f"{target}_asset.pipeline.json")
+                    self.assertEqual(manifest_path.name, f"{target}_asset.program.json")
                     self.assertEqual(repeated_path, manifest_path)
                     self.assertEqual(manifest_path.read_bytes(), first_manifest)
                     document = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -902,13 +902,13 @@ class Square(vd.Module):
         square(source, output)
         return output
 
-asset = vd.pipeline_asset(id="module/square", program=Square())
+asset = vd.program_asset(id="module/square", program=Square())
 """,
                 encoding="utf-8",
             )
 
-            manifest = cook_pipeline_asset(
-                pipeline_asset=f"{source}:asset",
+            manifest = cook_program_asset(
+                program_asset=f"{source}:asset",
                 output=root / "cooked",
                 target="cpu",
             )
@@ -940,8 +940,8 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
             )
             self.assertEqual([storage["ownership"] for storage in program["storages"]], ["borrowed", "owned"])
 
-            from vernon_dsl._shader_assets.artifact_io import write_external_artifact
-            from vernon_dsl._shader_assets.cooking import (
+            from vernon_dsl._program_assets.artifact_io import write_external_artifact
+            from vernon_dsl._program_assets.cooking import (
                 _canonical_deployment,
                 _compile_module_bundle_plan,
                 _load_pipeline_asset_declaration,
@@ -950,7 +950,7 @@ asset = vd.pipeline_asset(id="module/square", program=Square())
             )
 
             native = _native_module()
-            pipeline = parse_python_pipeline_asset(source, "asset")
+            pipeline = parse_python_program_asset(source, "asset")
             declaration = _load_pipeline_asset_declaration(source, "asset")
             for target_name in ("cpu", "metal", "vulkan"):
                 with self.subTest(target=target_name):
@@ -1074,7 +1074,7 @@ def vertex_main() -> None:
 def fragment_main() -> None:
     pass
 
-asset = vd.pipeline_asset(
+asset = vd.program_asset(
     id="graphics",
     program=(vertex_main, fragment_main),
     variants=((),),
@@ -1082,9 +1082,9 @@ asset = vd.pipeline_asset(
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(PipelineCompileError, "CPU pipeline bundles support"):
-                cook_pipeline_asset(
-                    pipeline_asset=f"{source}:asset",
+            with self.assertRaisesRegex(ProgramCompileError, "CPU pipeline bundles support"):
+                cook_program_asset(
+                    program_asset=f"{source}:asset",
                     output=root / "output",
                     target="cpu",
                 )
@@ -1094,8 +1094,8 @@ asset = vd.pipeline_asset(
             self.skipTest("native Vernon extension is not built")
         source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_no_tape_asset.py"
         with tempfile.TemporaryDirectory() as directory:
-            manifest = cook_pipeline_asset(
-                pipeline_asset=f"{source}:asset",
+            manifest = cook_program_asset(
+                program_asset=f"{source}:asset",
                 output=directory,
                 target="vulkan",
             )
@@ -1107,7 +1107,7 @@ asset = vd.pipeline_asset(
     def test_gpu_captured_tape_vjp_cooks_static_and_dynamic_profiles(self) -> None:
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
-        from vernon_dsl._shader_assets.cooking import _native_module
+        from vernon_dsl._program_assets.cooking import _native_module
 
         native = _native_module()
         source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_tape_asset.py"
@@ -1129,8 +1129,8 @@ asset = vd.pipeline_asset(
                 ):
                     if not native.target_available(native_target):
                         continue
-                    manifest = cook_pipeline_asset(
-                        pipeline_asset=f"{source}:{descriptor}",
+                    manifest = cook_program_asset(
+                        program_asset=f"{source}:{descriptor}",
                         output=directory,
                         target=target,
                     )
@@ -1146,8 +1146,8 @@ asset = vd.pipeline_asset(
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
-            manifest = cook_pipeline_asset(
-                pipeline_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
+            manifest = cook_program_asset(
+                program_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
                 output=directory,
             )
             bundle = json.loads(manifest.read_text(encoding="utf-8"))
@@ -1187,7 +1187,7 @@ asset = vd.pipeline_asset(
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
-        source = root / "python" / "tests" / "pipeline_asset_fixture.py"
+        source = root / "python" / "tests" / "program_asset_fixture.py"
         cases = {
             "opengl": ("triangle_asset", "pipelines/triangle", {"vertex", "fragment"}),
             "cuda": ("scale_asset", "pipelines/scale", {"compute"}),
@@ -1196,8 +1196,8 @@ asset = vd.pipeline_asset(
         with tempfile.TemporaryDirectory() as directory:
             for target, (name, asset_id, stages) in cases.items():
                 output = Path(directory) / target
-                manifest = cook_pipeline_asset(
-                    pipeline_asset=f"{source}:{name}",
+                manifest = cook_program_asset(
+                    program_asset=f"{source}:{name}",
                     output=output,
                     target=target,
                 )
@@ -1219,8 +1219,8 @@ asset = vd.pipeline_asset(
                     self.assertEqual(len({variant["program"]["vertex"] for variant in document["variants"]}), 2)
                     self.assertEqual(len({variant["program"]["fragment"] for variant in document["variants"]}), 1)
                     repeated = Path(directory) / "opengl_repeated"
-                    repeated_manifest = cook_pipeline_asset(
-                        pipeline_asset=f"{source}:{name}",
+                    repeated_manifest = cook_program_asset(
+                        program_asset=f"{source}:{name}",
                         output=repeated,
                         target=target,
                     )
@@ -1237,12 +1237,12 @@ asset = vd.pipeline_asset(
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
-        from vernon_dsl._shader_assets.cooking import _native_module
+        from vernon_dsl._program_assets.cooking import _native_module
 
         native = _native_module()
         assets = (
             (root / "python" / "tests" / "cube_map_shader.py", "cube_map_asset", {"vertex", "fragment"}),
-            (root / "python" / "tests" / "pipeline_asset_fixture.py", "scale_asset", {"compute"}),
+            (root / "python" / "tests" / "program_asset_fixture.py", "scale_asset", {"compute"}),
         )
         targets = {
             "metal": ("msl", ".metal", {"platform": "macos"}),
@@ -1255,8 +1255,8 @@ asset = vd.pipeline_asset(
                         if target == "directx" and not native.target_available(native.Target.DIRECTX):
                             continue
                         output = Path(directory) / f"{name}_{target}"
-                        manifest = cook_pipeline_asset(
-                            pipeline_asset=f"{source}:{name}",
+                        manifest = cook_program_asset(
+                            program_asset=f"{source}:{name}",
                             output=output,
                             target=make_target_options(target, target_options),
                         )
@@ -1299,8 +1299,8 @@ asset = vd.pipeline_asset(
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
         with tempfile.TemporaryDirectory() as directory:
-            manifest = cook_pipeline_asset(
-                pipeline_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
+            manifest = cook_program_asset(
+                program_asset=f"{root / 'examples' / 'variant_mesh.py'}:mesh_asset",
                 output=directory,
                 target="vulkan",
             )

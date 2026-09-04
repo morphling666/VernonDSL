@@ -300,7 +300,7 @@ class _DepthTarget:
 class ModuleGraphicsControlTests(unittest.TestCase):
     @staticmethod
     def _cook(parsed: Any, pipeline_id: str) -> dict[str, Any]:
-        from vernon_dsl._shader_assets.cooking import _compile_program_bundle_plan, _native_target
+        from vernon_dsl._program_assets.cooking import _compile_program_bundle_plan, _native_target
         from vernon_dsl.bundle import make_target_options
 
         native = import_module("vernon_dsl._native")
@@ -501,7 +501,7 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         self.assertEqual(set(vertex_storage["descriptor"]["usage"]), {"storage", "vertex"})
 
     def test_managed_graphics_cooking_packages_both_shader_stages(self) -> None:
-        from vernon_dsl._shader_assets.cooking import _compile_program_bundle_plan, _native_target
+        from vernon_dsl._program_assets.cooking import _compile_program_bundle_plan, _native_target
         from vernon_dsl.bundle import make_target_options
         from vernon_dsl.program import _parse_module_program
 

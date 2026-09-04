@@ -51,31 +51,31 @@ def scale(
     values[index] = values[index] * factor
 
 
-triangle_asset = vd.pipeline_asset(
+triangle_asset = vd.program_asset(
     id="pipelines/triangle",
     program=(triangle_vertex, solid_fragment),
     variants=((), (OFFSET,)),
 )
 
-sampled_asset = vd.pipeline_asset(
+sampled_asset = vd.program_asset(
     id="pipelines/sampled_triangle",
     program=(triangle_vertex, sampled_fragment),
     variants=((),),
 )
 
-resolution_asset = vd.pipeline_asset(
+resolution_asset = vd.program_asset(
     id="pipelines/resolution_triangle",
     program=(triangle_vertex, resolution_fragment),
     variants=((),),
 )
 
-opengl_runtime_acceptance_asset = vd.pipeline_asset(
+opengl_runtime_acceptance_asset = vd.program_asset(
     id="pipelines/opengl_runtime_acceptance",
     program=(triangle_vertex, opengl_runtime_acceptance_fragment),
     variants=((),),
 )
 
-scale_asset = vd.pipeline_asset(
+scale_asset = vd.program_asset(
     id="pipelines/scale",
     program=scale,
     variants=((),),

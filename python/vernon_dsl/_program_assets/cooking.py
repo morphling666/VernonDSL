@@ -17,7 +17,7 @@ from ..bundle import (
     CompiledArtifact,
     CompiledStage,
     OpenGLTargetOptions,
-    PipelineCompileError,
+    ProgramCompileError,
     TargetOptions,
     build_bundle_plan,
     build_program_bundle_plan,
@@ -46,14 +46,14 @@ from ..program_frontend import (
 from .artifact_io import write_external_artifact
 from .cpu_registration import write_cpu_static_registration
 from .descriptors import ShaderModuleDescriptor, ShaderStageReference
-from .parsing import parse_python_pipeline_asset, pipeline_asset_reference
+from .parsing import parse_python_program_asset, program_asset_reference
 
 
 def _native_module() -> Any:
     try:
         from .. import _native as native
     except (ImportError, OSError):
-        raise PipelineCompileError(
+        raise ProgramCompileError(
             "shader cooking requires vernon_dsl._native; build the native extension or install a wheel containing it"
         ) from None
     return native
@@ -71,11 +71,11 @@ def _native_target(native: Any, target: str) -> Any:
             "opengles": "OPENGL_ES",
         }[target]
     except KeyError:
-        raise PipelineCompileError(f"target '{target}' is not available through the native compiler") from None
+        raise ProgramCompileError(f"target '{target}' is not available through the native compiler") from None
     try:
         return getattr(native.Target, name)
     except AttributeError:
-        raise PipelineCompileError(f"target '{target}' is not available through the native compiler") from None
+        raise ProgramCompileError(f"target '{target}' is not available through the native compiler") from None
 
 
 def _cpu_object_format(filename: str, target_triple: str) -> str:
@@ -94,12 +94,12 @@ def _cpu_stage_metadata(stage: CompiledStage) -> dict[str, Any]:
     reflected_target = stage.reflection.get("target")
     reflected_options = reflected_target.get("options") if isinstance(reflected_target, Mapping) else None
     if not isinstance(symbol, str) or not symbol:
-        raise PipelineCompileError(f"CPU compiler reflection has no exported symbol for {stage.entry}")
+        raise ProgramCompileError(f"CPU compiler reflection has no exported symbol for {stage.entry}")
     if not isinstance(reflected_options, Mapping):
-        raise PipelineCompileError("CPU compiler reflection has no target options")
+        raise ProgramCompileError("CPU compiler reflection has no target options")
     target_triple = reflected_options.get("triple")
     if not isinstance(target_triple, str) or not target_triple:
-        raise PipelineCompileError("CPU compiler reflection has no normalized target triple")
+        raise ProgramCompileError("CPU compiler reflection has no normalized target triple")
     metadata: dict[str, Any] = {
         "symbol": symbol,
         "pipeline_version": PIPELINE_VERSION,
@@ -139,7 +139,7 @@ def _compile_stage(
         target=target,
     )
     if compiled.stage != stage:
-        raise PipelineCompileError(f"compiler reflected {reference.entry} as {compiled.stage}, expected {stage}")
+        raise ProgramCompileError(f"compiler reflected {reference.entry} as {compiled.stage}, expected {stage}")
     if target.target == "cpu":
         compiled = CompiledStage(
             compiled.module,
@@ -153,7 +153,7 @@ def _compile_stage(
             _cpu_stage_metadata(compiled),
         )
         if compiled.artifact.format != "relocatable_object":
-            raise PipelineCompileError("CPU cooking requires the compiler relocatable object artifact")
+            raise ProgramCompileError("CPU cooking requires the compiler relocatable object artifact")
     if retained_programs is not None:
         retained_programs.append((compiled, result))
     return compiled
@@ -173,7 +173,7 @@ def _specialize_program_implementations(
         try:
             mlir = native._specialize_kernel_constants(implementation.mlir, implementation.entry, names, values)
         except ValueError as error:
-            raise PipelineCompileError(
+            raise ProgramCompileError(
                 f"cannot specialize Program callee {implementation.callee!r} host constants: {error}"
             ) from None
         specialized.append(
@@ -201,14 +201,14 @@ def _compile_program_bundle_plan(
 ) -> BundlePlan:
     planned = compiler.plan_program_result(parsed.mlir)
     if not bool(planned.ok):
-        raise PipelineCompileError(str(planned.diagnostics) or "Program planning failed")
+        raise ProgramCompileError(str(planned.diagnostics) or "Program planning failed")
     reflection = parse_reflection_json(planned.reflection)
     execution = reflection.get("program_plan")
     if not isinstance(execution, Mapping):
-        raise PipelineCompileError("Program compiler reflection has no typed Program plan")
+        raise ProgramCompileError("Program compiler reflection has no typed Program plan")
     requests = reflection.get("kernel_compile_requests")
     if not isinstance(requests, list):
-        raise PipelineCompileError("Program compiler reflection has no kernel compile requests")
+        raise ProgramCompileError("Program compiler reflection has no kernel compile requests")
 
     stages: dict[str, CompiledStage] = {}
     compiled_implementations: dict[tuple[str, str], CompiledStage] = {}
@@ -217,7 +217,7 @@ def _compile_program_bundle_plan(
     source = Path(parsed.provenance[0]) if parsed.provenance else Path()
     reflected_values = execution.get("values")
     if not isinstance(reflected_values, list):
-        raise PipelineCompileError("Program compiler reflection has no reflected values")
+        raise ProgramCompileError("Program compiler reflection has no reflected values")
     values = {
         value["id"]: value
         for value in reflected_values
@@ -235,7 +235,7 @@ def _compile_program_bundle_plan(
     other_requests: list[Mapping[str, Any]] = []
     for request in requests:
         if not isinstance(request, Mapping):
-            raise PipelineCompileError("Program planner returned an invalid kernel compile request")
+            raise ProgramCompileError("Program planner returned an invalid kernel compile request")
         hint = request.get("implementation_hint")
         if isinstance(hint, str) and hint.endswith(".vjp"):
             vjp_requests.append(request)
@@ -246,24 +246,24 @@ def _compile_program_bundle_plan(
         hint = request.get("implementation_hint")
         kind = request.get("kind")
         if not isinstance(request_id, str) or not isinstance(hint, str) or kind not in {"compute", "render"}:
-            raise PipelineCompileError("Program planner returned incomplete kernel compile request metadata")
+            raise ProgramCompileError("Program planner returned incomplete kernel compile request metadata")
         try:
             implementation = providers.lower(request, values)
         except ImplementationUnavailable as error:
-            raise PipelineCompileError(
+            raise ProgramCompileError(
                 f"Python DSL provider cannot lower Program request {request_id!r}: {error}"
             ) from None
         if implementation is None:
-            raise PipelineCompileError(
+            raise ProgramCompileError(
                 f"no Python DSL implementation provider can lower Program request {request_id!r} ({hint!r})"
             )
         if implementation.kind != ("compute" if kind == "compute" else "graphics"):
-            raise PipelineCompileError(f"Program request {request_id!r} selected an incompatible implementation")
+            raise ProgramCompileError(f"Program request {request_id!r} selected an incompatible implementation")
         if implementation.kind == "graphics":
             cached_graphics = graphics_implementations.get(hint)
             if cached_graphics is None:
                 if not implementation.graphics_stages:
-                    raise PipelineCompileError(f"graphics Program implementation {hint!r} has no shader stages")
+                    raise ProgramCompileError(f"graphics Program implementation {hint!r} has no shader stages")
                 compiled_graphics: list[CompiledStage] = []
                 for role, entry, stage_mlir in implementation.graphics_stages:
                     module_manifest = canonical_json(
@@ -382,15 +382,15 @@ def _compile_program_bundle_plan(
         finalize_rows,
     )
     if not bool(finalized.ok):
-        raise PipelineCompileError(str(finalized.diagnostics) or "Program finalization failed")
+        raise ProgramCompileError(str(finalized.diagnostics) or "Program finalization failed")
     finalized_reflection = parse_reflection_json(finalized.reflection)
     reflected_targets = {stage.target for stage in stages.values()}
     if len(reflected_targets) != 1:
-        raise PipelineCompileError("Program stages disagree on their reflected target")
+        raise ProgramCompileError("Program stages disagree on their reflected target")
     canonical_program = finalized_reflection.get("canonical_program")
     contracts = finalized_reflection.get("stage_contracts")
     if not isinstance(canonical_program, Mapping) or not isinstance(contracts, Mapping):
-        raise PipelineCompileError("C++ Program finalization returned no canonical deployment")
+        raise ProgramCompileError("C++ Program finalization returned no canonical deployment")
     plan = build_program_bundle_plan(
         pipeline_id,
         reflected_targets.pop(),
@@ -399,7 +399,7 @@ def _compile_program_bundle_plan(
         canonical_program,
     )
     if set(contracts) != set(stages) or any(not isinstance(contract, Mapping) for contract in contracts.values()):
-        raise PipelineCompileError("canonical stage contracts do not exactly cover logical compute requests")
+        raise ProgramCompileError("canonical stage contracts do not exactly cover logical compute requests")
     contracts_by_implementation: dict[str, dict[str, Mapping[str, Any]]] = {}
     implementations_by_stage: dict[str, dict[str, Mapping[str, Any]]] = {}
     implementations = finalized_reflection.get("target_implementations")
@@ -439,7 +439,7 @@ def _load_pipeline_asset_declaration(source: Path, descriptor_name: str) -> Any:
     module_name = f"_vernon_pipeline_asset_{hashlib.sha256(str(source).encode()).hexdigest()[:20]}"
     specification = importlib.util.spec_from_file_location(module_name, source)
     if specification is None or specification.loader is None:
-        raise PipelineCompileError(f"cannot load pipeline asset source {source}")
+        raise ProgramCompileError(f"cannot load pipeline asset source {source}")
     module = importlib.util.module_from_spec(specification)
     inserted_path = str(source.parent)
     sys.modules[module_name] = module
@@ -447,15 +447,15 @@ def _load_pipeline_asset_declaration(source: Path, descriptor_name: str) -> Any:
     try:
         specification.loader.exec_module(module)
     except Exception as error:
-        raise PipelineCompileError(f"cannot evaluate pipeline asset source {source}: {error}") from error
+        raise ProgramCompileError(f"cannot evaluate pipeline asset source {source}: {error}") from error
     finally:
         sys.path.pop(0)
         sys.modules.pop(module_name, None)
     declaration = getattr(module, descriptor_name, None)
-    from .declaration import PipelineAssetDeclaration
+    from .declaration import ProgramAssetDeclaration
 
-    if not isinstance(declaration, PipelineAssetDeclaration):
-        raise PipelineCompileError(f"pipeline asset declaration '{descriptor_name}' did not evaluate canonically")
+    if not isinstance(declaration, ProgramAssetDeclaration):
+        raise ProgramCompileError(f"pipeline asset declaration '{descriptor_name}' did not evaluate canonically")
     return declaration
 
 
@@ -477,7 +477,7 @@ def _materialize_plan(plan: BundlePlan, output_path: Path, target_name: str) -> 
             output_path,
             [str(stage.metadata.get("symbol", "")) for stage in plan.stages],
         )
-    manifest = output_path / f"{output_path.name}.pipeline.json"
+    manifest = output_path / f"{output_path.name}.program.json"
     manifest.write_text(
         json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -491,14 +491,14 @@ def _canonical_deployment(
     artifact_descriptors: Mapping[str, Mapping[str, Any]],
 ) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, str]]:
     if len(plan.variants) != 1:
-        raise PipelineCompileError("canonical deployment currently requires exactly one variant")
+        raise ProgramCompileError("canonical deployment currently requires exactly one variant")
     variant = plan.variants[0]
     if variant.canonical_program is None:
-        raise PipelineCompileError("canonical deployment has no Program")
+        raise ProgramCompileError("canonical deployment has no Program")
     stages = {stage.id: stage for stage in plan.stages}
     canonical_stage_rows = variant.canonical_program.get("stages")
     if not isinstance(canonical_stage_rows, Mapping):
-        raise PipelineCompileError("canonical deployment has no logical stages")
+        raise ProgramCompileError("canonical deployment has no logical stages")
     blobs: dict[str, Any] = {}
     artifacts: dict[str, Any] = {}
     stage_bindings: dict[str, str] = {}
@@ -509,9 +509,9 @@ def _canonical_deployment(
         contract = contracts.get(logical_stage) if isinstance(contracts, Mapping) else None
         canonical_stage = canonical_stage_rows.get(logical_stage)
         if not isinstance(descriptor, Mapping) or not isinstance(contract, Mapping):
-            raise PipelineCompileError(f"canonical stage {logical_stage} is incomplete")
+            raise ProgramCompileError(f"canonical stage {logical_stage} is incomplete")
         if not isinstance(canonical_stage, Mapping):
-            raise PipelineCompileError(f"canonical Program has no logical stage {logical_stage!r}")
+            raise ProgramCompileError(f"canonical Program has no logical stage {logical_stage!r}")
         path = descriptor.get("path")
         digest = descriptor.get("sha256")
         byte_length = descriptor.get("size")
@@ -523,7 +523,7 @@ def _canonical_deployment(
             or not isinstance(byte_length, int)
             or not isinstance(entry_point, str)
         ):
-            raise PipelineCompileError(f"canonical stage {logical_stage} has invalid artifact metadata")
+            raise ProgramCompileError(f"canonical stage {logical_stage} has invalid artifact metadata")
         blobs[digest] = {
             "byte_length": byte_length,
             "sha256": digest,
@@ -533,15 +533,15 @@ def _canonical_deployment(
         requirement_stages = tuple(graphics_stages) if isinstance(graphics_stages, tuple) else (stage,)
         requirements = runtime_requirements(plan.target.target, requirement_stages)
         if requirements is None:
-            raise PipelineCompileError(f"canonical stage {logical_stage} has no runtime requirements")
+            raise ProgramCompileError(f"canonical stage {logical_stage} has no runtime requirements")
         requirements = dict(requirements)
         requirements.pop("compute_workgroup_size", None)
         reflection = contract.get("reflection")
         if not isinstance(reflection, Mapping):
-            raise PipelineCompileError(f"canonical stage {logical_stage} has no portable reflection")
+            raise ProgramCompileError(f"canonical stage {logical_stage} has no portable reflection")
         contract_hash = hashlib.sha256(canonical_json(dict(contract)).encode("utf-8")).hexdigest()
         if canonical_stage.get("contract_hash") != contract_hash:
-            raise PipelineCompileError(f"canonical stage {logical_stage} contract hash disagrees with its Program")
+            raise ProgramCompileError(f"canonical stage {logical_stage} contract hash disagrees with its Program")
         graphics_modules = stage.metadata.get("graphics_modules")
         operation = "graphics" if isinstance(graphics_modules, tuple) else "compute"
         if isinstance(graphics_modules, tuple):
@@ -602,7 +602,7 @@ def _compile_module_bundle_plan(
     expression = declaration.program
     module = expression.module if isinstance(expression, ModuleVjpExpression) else expression
     if not isinstance(module, Module):
-        raise PipelineCompileError("pipeline asset declared a host Program that is not a Vernon Module")
+        raise ProgramCompileError("pipeline asset declared a host Program that is not a Vernon Module")
     parsed = _parse_module_program(
         module,
         vjp_wrt=expression.wrt if isinstance(expression, ModuleVjpExpression) else None,
@@ -627,7 +627,7 @@ def _compile_module_bundle_plan(
     ]
     targets = {canonical_json(plan.target.spec): plan.target for plan in variant_plans}
     if len(targets) != 1:
-        raise PipelineCompileError("compiler returned inconsistent target options across Program variants")
+        raise ProgramCompileError("compiler returned inconsistent target options across Program variants")
     stages = {stage.id: stage for plan in variant_plans for stage in plan.stages}
     return BundlePlan(
         pipeline.id,
@@ -638,28 +638,28 @@ def _compile_module_bundle_plan(
     )
 
 
-def cook_pipeline_asset(
+def cook_program_asset(
     *,
-    pipeline_asset: str | Path,
+    program_asset: str | Path,
     output: str | Path,
     target: TargetOptions | str | None = None,
 ) -> Path:
-    source, descriptor_name = pipeline_asset_reference(pipeline_asset)
-    pipeline = parse_python_pipeline_asset(source, descriptor_name)
+    source, descriptor_name = program_asset_reference(program_asset)
+    pipeline = parse_python_program_asset(source, descriptor_name)
     if target is None:
         target = OpenGLTargetOptions()
     elif isinstance(target, str):
         target = make_target_options(target)
     target_name = target.target
     if pipeline.transform is not None and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
-        raise PipelineCompileError(_capability_diagnostic("graphics_vjp"))
+        raise ProgramCompileError(_capability_diagnostic("graphics_vjp"))
     if target_name == "cpu" and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
-        raise PipelineCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
+        raise ProgramCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
     for stage in pipeline.stages:
         try:
             validate_stage_target(stage, target_name)
         except ValueError as error:
-            raise PipelineCompileError(str(error)) from None
+            raise ProgramCompileError(str(error)) from None
     resolved_target = target
     native = _native_module()
     native_target = _native_target(native, target_name)
@@ -668,13 +668,13 @@ def cook_pipeline_asset(
     for stage, reference in pipeline.stages.items():
         module = pipeline.modules.get(reference.module)
         if module is None:
-            raise PipelineCompileError(f"pipeline {stage} stage references unknown module '{reference.module}'")
+            raise ProgramCompileError(f"pipeline {stage} stage references unknown module '{reference.module}'")
         selected_modules[stage] = module
         declared_features.update(load_project(module.source).features)
     for variant in pipeline.variants:
         unknown = set(variant) - declared_features
         if unknown:
-            raise PipelineCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(unknown)))
+            raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(unknown)))
 
     output_path = Path(output).resolve()
     planned_variants: list[tuple[tuple[str, ...], dict[str, CompiledStage]]] = []
@@ -748,18 +748,18 @@ def cook_pipeline_asset(
                 )
             )
             if not is_structured_vjp_abi_eligible(frontend, transform):
-                raise PipelineCompileError("autodiff requires a structured VJP with explicit writable Storage outputs")
+                raise ProgramCompileError("autodiff requires a structured VJP with explicit writable Storage outputs")
             try:
                 structured = build_structured_vjp(native, frontend, transform)
             except ValueError as error:
-                raise PipelineCompileError(str(error)) from None
+                raise ProgramCompileError(str(error)) from None
             variant_transform = structured.transform
             profile_plan = structured.plan
             profile_modules = structured.profiles
             if resolved_transform is None:
                 resolved_transform = variant_transform
             elif resolved_transform.output_cotangents != variant_transform.output_cotangents:
-                raise PipelineCompileError("VJP variants must expose the same canonical output cotangent paths")
+                raise ProgramCompileError("VJP variants must expose the same canonical output cotangent paths")
             profile_programs: dict[str, dict[str, Any]] = {}
             module = selected_modules["compute"]
             for profile_name, profile_mlir in profile_modules.items():
@@ -819,7 +819,7 @@ def cook_pipeline_asset(
         canonical_json(stage.target.spec): stage.target for _, stages in planned_variants for stage in stages.values()
     }
     if len(compiled_targets) != 1:
-        raise PipelineCompileError("compiler returned inconsistent target options across pipeline stages")
+        raise ProgramCompileError("compiler returned inconsistent target options across pipeline stages")
     manifest_target = next(iter(compiled_targets.values()))
     plan = build_bundle_plan(
         pipeline.id,
@@ -845,4 +845,4 @@ def cook_pipeline_asset(
     return _materialize_plan(plan, output_path, target_name)
 
 
-__all__ = ["cook_pipeline_asset"]
+__all__ = ["cook_program_asset"]

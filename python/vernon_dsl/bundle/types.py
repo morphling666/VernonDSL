@@ -8,7 +8,7 @@ from typing import Any, ClassVar, Mapping, TypeAlias
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 
 
-class PipelineCompileError(ValueError):
+class ProgramCompileError(ValueError):
     pass
 
 
@@ -41,11 +41,11 @@ class CpuTargetOptions(_TargetOptionsBase):
 
     def __post_init__(self) -> None:
         if not isinstance(self.triple, str) or not isinstance(self.processor, str):
-            raise PipelineCompileError("CPU triple and processor must be strings")
+            raise ProgramCompileError("CPU triple and processor must be strings")
         if not isinstance(self.features, (list, tuple)) or any(
             not isinstance(value, str) or not value for value in self.features
         ):
-            raise PipelineCompileError("CPU features must be a sequence of non-empty strings")
+            raise ProgramCompileError("CPU features must be a sequence of non-empty strings")
         object.__setattr__(self, "features", tuple(self.features))
 
     @property
@@ -79,7 +79,7 @@ class OpenGLTargetOptions(_TargetOptionsBase):
         if self.version is not None and (
             not isinstance(self.version, int) or isinstance(self.version, bool) or not 100 <= self.version <= 999
         ):
-            raise PipelineCompileError("OpenGL version must be a three-digit GLSL version number")
+            raise ProgramCompileError("OpenGL version must be a three-digit GLSL version number")
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -107,7 +107,7 @@ class MetalTargetOptions(_TargetOptionsBase):
 
     def __post_init__(self) -> None:
         if self.platform not in {"macos", "ios"}:
-            raise PipelineCompileError("Metal platform must be 'macos' or 'ios'")
+            raise ProgramCompileError("Metal platform must be 'macos' or 'ios'")
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -121,7 +121,7 @@ class DirectXTargetOptions(_TargetOptionsBase):
 
     def __post_init__(self) -> None:
         if not isinstance(self.shader_model, int) or isinstance(self.shader_model, bool) or self.shader_model < 60:
-            raise PipelineCompileError("DirectX shader model must be 6.0 or newer")
+            raise ProgramCompileError("DirectX shader model must be 6.0 or newer")
 
     @property
     def options(self) -> Mapping[str, Any]:
@@ -163,11 +163,11 @@ def make_target_options(target: str, options: Mapping[str, Any] | None = None) -
     try:
         constructor = constructors[target]
     except KeyError:
-        raise PipelineCompileError(f"unknown compiler target '{target}'") from None
+        raise ProgramCompileError(f"unknown compiler target '{target}'") from None
     try:
         return constructor(**values)
     except TypeError as error:
-        raise PipelineCompileError(f"invalid {target} target options: {error}") from None
+        raise ProgramCompileError(f"invalid {target} target options: {error}") from None
 
 
 @dataclass(frozen=True)
@@ -178,7 +178,7 @@ class CompiledArtifact:
 
     def __post_init__(self) -> None:
         if not self.format:
-            raise PipelineCompileError("compiled artifact format is missing")
+            raise ProgramCompileError("compiled artifact format is missing")
         object.__setattr__(self, "data", bytes(self.data))
 
     @property
@@ -200,7 +200,7 @@ class CompiledStage:
 
     def __post_init__(self) -> None:
         if not self.entry or not self.stage:
-            raise PipelineCompileError("compiled stage requires entry and stage")
+            raise ProgramCompileError("compiled stage requires entry and stage")
         object.__setattr__(self, "reflection", frozen_mapping(self.reflection))
         object.__setattr__(self, "interface", frozen_mapping(self.interface))
         object.__setattr__(self, "metadata", frozen_mapping(self.metadata))
@@ -245,7 +245,7 @@ class VariantPlan:
 
     def __post_init__(self) -> None:
         if any(not feature for feature in self.key) or tuple(sorted(set(self.key))) != self.key:
-            raise PipelineCompileError("pipeline variant key must contain unique non-empty features in sorted order")
+            raise ProgramCompileError("pipeline variant key must contain unique non-empty features in sorted order")
         object.__setattr__(self, "program", frozen_mapping(self.program))
         if self.canonical_program is not None:
             object.__setattr__(self, "canonical_program", frozen_mapping(self.canonical_program))
@@ -277,7 +277,7 @@ class BundlePlan:
 
     def __post_init__(self) -> None:
         if (self.transform is None) != (self.autodiff_profiles is None):
-            raise PipelineCompileError("differentiated bundles require both program_transform and autodiff_profiles")
+            raise ProgramCompileError("differentiated bundles require both program_transform and autodiff_profiles")
         if self.transform is not None:
             object.__setattr__(self, "transform", frozen_mapping(self.transform))
         if self.autodiff_profiles is not None:
@@ -289,20 +289,20 @@ class BundlePlan:
         variant_records = [variant.to_dict() for variant in self.variants]
         variant_keys = [variant.key for variant in self.variants]
         if len(set(variant_keys)) != len(variant_keys):
-            raise PipelineCompileError("pipeline variants contain duplicate canonical keys")
+            raise ProgramCompileError("pipeline variants contain duplicate canonical keys")
         if self.transform is not None:
             profile_rows = (self.autodiff_profiles or {})["variants"]
             profile_keys = [tuple(profile["key"]) for profile in profile_rows]
             if any(any(not feature for feature in key) or tuple(sorted(set(key))) != key for key in profile_keys):
-                raise PipelineCompileError("autodiff profile variant keys are not canonical")
+                raise ProgramCompileError("autodiff profile variant keys are not canonical")
             if len(set(profile_keys)) != len(profile_keys):
-                raise PipelineCompileError("autodiff profiles contain duplicate variant keys")
+                raise ProgramCompileError("autodiff profiles contain duplicate variant keys")
             profiles = {
                 tuple(profile["key"]): {name: value for name, value in profile.items() if name != "key"}
                 for profile in profile_rows
             }
             if set(profiles) != {variant.key for variant in self.variants}:
-                raise PipelineCompileError("autodiff profiles do not exactly cover pipeline variants")
+                raise ProgramCompileError("autodiff profiles do not exactly cover pipeline variants")
         result = {
             "pipeline_version": PIPELINE_VERSION,
             "type": "pipeline",
@@ -343,7 +343,7 @@ __all__ = [
     "MetalTargetOptions",
     "OpenGLESTargetOptions",
     "OpenGLTargetOptions",
-    "PipelineCompileError",
+    "ProgramCompileError",
     "TargetOptions",
     "VulkanTargetOptions",
     "VariantPlan",
