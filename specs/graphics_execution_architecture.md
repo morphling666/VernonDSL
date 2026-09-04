@@ -179,7 +179,7 @@ Delete:
 
 ## 5. Pipeline invocation ABI
 
-`VernonPipelineInvocation` keeps typed pointers:
+`VernonProgramSubmitDescriptor` keeps typed pointers:
 
 ```c
 const VernonGraphicsState *graphics_state;

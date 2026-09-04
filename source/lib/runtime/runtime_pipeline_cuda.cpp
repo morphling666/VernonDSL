@@ -27,7 +27,7 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 } // namespace
 #endif
 
-bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveCudaPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     auto state = std::make_unique<CudaPipelineState>();
     const Stage &stage = bundle.stages.at(variant.compute);
@@ -154,7 +154,7 @@ bool resolveCudaPipeline(VernonPipelineBundle &bundle, const Variant &variant, V
 #endif
 }
 
-void destroyCudaPipeline(VernonLoadedPipeline &pipeline) {
+void destroyCudaPipeline(VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.bindings);
@@ -164,7 +164,7 @@ void destroyCudaPipeline(VernonLoadedPipeline &pipeline) {
 #endif
 }
 
-VernonStatus invokeCudaComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeCudaComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_CUDA_RUNTIME)
     CudaPipelineState &state = runtimeBackendState<CudaPipelineState>(pipeline);
     for (size_t index = 0; index < state.layout.size(); ++index) {

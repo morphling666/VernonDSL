@@ -28,7 +28,7 @@ namespace {
 
 using HostProgramValue = ProgramHostValue;
 
-bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonPipelineArgument> &values,
+bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonProgramArgument> &values,
                            std::string &error) {
     if (values.size() < storage.size())
         return error = "Program autodiff tape value arena is incomplete", false;
@@ -96,7 +96,7 @@ VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
 
 class ProgramPullback final : public PullbackExecution {
 public:
-    ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<VernonPipelineTopology> topology, Variant variant,
+    ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<VernonProgramTopology> topology, Variant variant,
                     Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
                     std::vector<ProgramLeafBinding> gradientBindings, ProgramResidualPlan plan,
                     std::vector<std::vector<uint8_t>> residuals, std::vector<std::vector<uint64_t>> residualShapes,
@@ -153,7 +153,7 @@ public:
             for (uint32_t value : program::residualCaptures(execution))
                 if (!derivatives.adoptRetainedValue(value, *deviceState_, error))
                     return fail(*context_, error);
-            VernonLoadedPipeline proxy;
+            VernonProgramExecutable proxy;
             proxy.context = context_;
             proxy.variant = variant_;
             proxy.topology = topology_;
@@ -223,7 +223,7 @@ public:
                         residuals_[value].size());
         }
         ProgramInvocationFrame arena(std::move(storage));
-        VernonLoadedPipeline proxy;
+        VernonProgramExecutable proxy;
         proxy.context = context_;
         proxy.variant = variant_;
         proxy.topology = topology_;
@@ -309,7 +309,7 @@ public:
 
 private:
     VernonRuntimeContext *context_;
-    std::shared_ptr<VernonPipelineTopology> topology_;
+    std::shared_ptr<VernonProgramTopology> topology_;
     Variant variant_;
     Signature signature_;
     std::vector<ProgramLeafBinding> cotangentBindings_;
@@ -325,10 +325,10 @@ private:
 
 class ProgramExecutable final : public Executable {
 public:
-    ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<VernonPipelineTopology> topology, Variant variant)
+    ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<VernonProgramTopology> topology, Variant variant)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)) {
         rebuildVariantLayoutViews(variant_);
-        const std::shared_ptr<VernonPipelineTopology> locked = topology_.lock();
+        const std::shared_ptr<VernonProgramTopology> locked = topology_.lock();
         if (!locked || !locked->resolvedProgram) {
             signatureError_ = "Program executable has no resolved canonical owner";
             return;
@@ -403,7 +403,7 @@ public:
 
     VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize, const VernonAdValueSet &inputs,
                          VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) override {
-        const std::shared_ptr<VernonPipelineTopology> topology = topology_.lock();
+        const std::shared_ptr<VernonProgramTopology> topology = topology_.lock();
         const program::Program *execution =
             topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
         const program::Graph *forward = execution ? program::findGraph(*execution, "forward") : nullptr;
@@ -437,7 +437,7 @@ public:
             return fail(*context_, error);
         ProgramInvocationFrame arena(std::move(hostStorage));
         arena.setInvocationContext(target.programContext);
-        VernonLoadedPipeline proxy;
+        VernonProgramExecutable proxy;
         proxy.context = context_;
         proxy.variant = variant_;
         proxy.topology = topology;
@@ -550,7 +550,7 @@ public:
 
 private:
     VernonRuntimeContext *context_;
-    std::weak_ptr<VernonPipelineTopology> topology_;
+    std::weak_ptr<VernonProgramTopology> topology_;
     Variant variant_;
     Signature signature_;
     std::vector<ProgramLeafBinding> inputBindings_;
@@ -563,7 +563,7 @@ private:
 
 } // namespace
 
-bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
+bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups) {
     if (!pipeline.context || !pipeline.topology || !pipeline.topology->resolvedProgram)
         return false;
@@ -648,7 +648,7 @@ bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
             invocationDiagnostic(*pipeline.context) = "Program autodiff derivative groups do not match its signature";
         return false;
     }
-    pipeline.differentiated = VernonDifferentiatedPipeline{std::move(executable), std::move(groups)};
+    pipeline.differentiated = VernonDifferentiatedProgram{std::move(executable), std::move(groups)};
     return true;
 }
 

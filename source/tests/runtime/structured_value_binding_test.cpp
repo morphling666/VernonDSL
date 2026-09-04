@@ -13,8 +13,8 @@ namespace {
 
 using namespace vernon::runtime;
 
-VernonLoadedPipeline structuredPipeline(std::vector<uint64_t> outerShape = {}) {
-    VernonLoadedPipeline pipeline;
+VernonProgramExecutable structuredPipeline(std::vector<uint64_t> outerShape = {}) {
+    VernonProgramExecutable pipeline;
     Parameter parameter;
     parameter.slot = 3;
     parameter.name = "value";
@@ -52,13 +52,13 @@ template <typename T> T load(const uint8_t *data, size_t offset) {
 }
 
 TEST(StructuredValueBinding, PacksFieldTreeUsingReflectedOffsetsAndShape) {
-    VernonLoadedPipeline pipeline = structuredPipeline();
+    VernonProgramExecutable pipeline = structuredPipeline();
     const std::array<float, 4> matrix{1.0f, 2.0f, 3.0f, 4.0f};
-    PipelineInvocationBuilder builder(&pipeline);
+    ProgramInvocationBuilder builder(&pipeline);
     builder.bindValue("value",
                       fields(field("id", int32_t{7}), field("weight", 2.5), field("matrix", shaped({2, 2}, matrix))));
 
-    const VernonPipelineInvocation invocation = builder.invocation();
+    const VernonProgramSubmitDescriptor invocation = builder.invocation();
     ASSERT_EQ(invocation.argument_count, 1u);
     const VernonTensorView &tensor = invocation.arguments[0].tensor;
     ASSERT_EQ(tensor.byte_size, 32u);
@@ -71,7 +71,7 @@ TEST(StructuredValueBinding, PacksFieldTreeUsingReflectedOffsetsAndShape) {
 }
 
 TEST(StructuredValueBinding, PacksNestedFieldAndTupleElementPaths) {
-    VernonLoadedPipeline pipeline = structuredPipeline();
+    VernonProgramExecutable pipeline = structuredPipeline();
     auto &layout = pipeline.variant.parameters[0].elementLayout;
     layout.byteSize = 8;
     layout.alignment = 4;
@@ -83,27 +83,27 @@ TEST(StructuredValueBinding, PacksNestedFieldAndTupleElementPaths) {
     layout.abiLeaves = {{VERNON_DATA_I32, 1, 0}, {VERNON_DATA_F32, 1, 4}};
     rebuildValueLayoutPathViews(layout);
 
-    PipelineInvocationBuilder builder(&pipeline);
+    ProgramInvocationBuilder builder(&pipeline);
     builder.bindValue("value", fields(field("meta", elements(int32_t{9}, 1.25f))));
-    const VernonPipelineInvocation invocation = builder.invocation();
+    const VernonProgramSubmitDescriptor invocation = builder.invocation();
     const auto *bytes = static_cast<const uint8_t *>(invocation.arguments[0].tensor.host_data);
     EXPECT_EQ(load<int32_t>(bytes, 0), 9);
     EXPECT_EQ(load<float>(bytes, 4), 1.25f);
 }
 
 TEST(StructuredValueBinding, PacksTensorFromStructureOfArrays) {
-    VernonLoadedPipeline pipeline = structuredPipeline({2, 2});
+    VernonProgramExecutable pipeline = structuredPipeline({2, 2});
     const std::array<int32_t, 4> ids{1, 2, 3, 4};
     const std::array<double, 4> weights{0.5, 1.5, 2.5, 3.5};
     const std::array<float, 16> matrices{
         0, 1, 2, 3, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33,
     };
-    PipelineInvocationBuilder builder(&pipeline);
+    ProgramInvocationBuilder builder(&pipeline);
     builder.bindTensor(
         "value", {2, 2},
         fields(field("id", ids), field("weight", weights), field("matrix", shaped({2, 2, 2, 2}, matrices))));
 
-    const VernonPipelineInvocation invocation = builder.invocation();
+    const VernonProgramSubmitDescriptor invocation = builder.invocation();
     const VernonTensorView &tensor = invocation.arguments[0].tensor;
     ASSERT_EQ(tensor.byte_size, 128u);
     EXPECT_EQ(tensor.byte_strides[0], 64);
@@ -115,10 +115,10 @@ TEST(StructuredValueBinding, PacksTensorFromStructureOfArrays) {
 }
 
 TEST(StructuredValueBinding, PacksTensorFromLogicalElementCallback) {
-    VernonLoadedPipeline pipeline = structuredPipeline({2, 2});
-    PipelineInvocationBuilder builder(&pipeline);
+    VernonProgramExecutable pipeline = structuredPipeline({2, 2});
+    ProgramInvocationBuilder builder(&pipeline);
     builder.bindTensor(
-        "value", {2, 2}, [](PipelineInvocationBuilder::ElementWriter &element, const std::vector<uint64_t> &index) {
+        "value", {2, 2}, [](ProgramInvocationBuilder::ElementWriter &element, const std::vector<uint64_t> &index) {
             const int32_t linear = static_cast<int32_t>(index[0] * 2 + index[1]);
             const std::array<float, 4> matrix{static_cast<float>(linear), static_cast<float>(linear + 1),
                                               static_cast<float>(linear + 2), static_cast<float>(linear + 3)};
@@ -127,7 +127,7 @@ TEST(StructuredValueBinding, PacksTensorFromLogicalElementCallback) {
                 .field("matrix", shaped({2, 2}, matrix));
         });
 
-    const VernonPipelineInvocation invocation = builder.invocation();
+    const VernonProgramSubmitDescriptor invocation = builder.invocation();
     const auto *bytes = static_cast<const uint8_t *>(invocation.arguments[0].tensor.host_data);
     EXPECT_EQ(load<int32_t>(bytes, 3 * 32), 3);
     EXPECT_EQ(load<double>(bytes, 3 * 32 + 8), 3.25);
@@ -135,28 +135,28 @@ TEST(StructuredValueBinding, PacksTensorFromLogicalElementCallback) {
 }
 
 TEST(StructuredValueBinding, DiagnosesFieldDtypeShapeCompletenessAndDuplicateBinding) {
-    VernonLoadedPipeline pipeline = structuredPipeline({2, 2});
+    VernonProgramExecutable pipeline = structuredPipeline({2, 2});
     const std::array<int32_t, 4> ids{};
     const std::array<double, 4> weights{};
     const std::array<float, 16> matrices{};
 
-    PipelineInvocationBuilder missing(&pipeline);
+    ProgramInvocationBuilder missing(&pipeline);
     EXPECT_THROW(missing.bindTensor("value", {2, 2}, fields(field("id", ids), field("weight", weights))),
                  std::invalid_argument);
 
-    PipelineInvocationBuilder dtype(&pipeline);
+    ProgramInvocationBuilder dtype(&pipeline);
     EXPECT_THROW(dtype.bindTensor("value", {2, 2},
                                   fields(field("id", weights), field("weight", weights),
                                          field("matrix", shaped({2, 2, 2, 2}, matrices)))),
                  std::invalid_argument);
 
-    PipelineInvocationBuilder shape(&pipeline);
+    ProgramInvocationBuilder shape(&pipeline);
     EXPECT_THROW(
         shape.bindTensor("value", {2, 2},
                          fields(field("id", ids), field("weight", weights), field("matrix", shaped({4, 4}, matrices)))),
         std::invalid_argument);
 
-    PipelineInvocationBuilder duplicate(&pipeline);
+    ProgramInvocationBuilder duplicate(&pipeline);
     const StructuredValue valid =
         fields(field("id", ids), field("weight", weights), field("matrix", shaped({2, 2, 2, 2}, matrices)));
     duplicate.bindTensor("value", {2, 2}, valid);

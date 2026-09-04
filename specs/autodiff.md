@@ -242,8 +242,8 @@ neither has a second signature, grouping, or execution model.
 The public C Runtime exposes indexed reflection rather than a scalar-output
 special case:
 
-- `vernonRuntimeLoadedPipelineGetAdOutputCount` and
-  `vernonRuntimeLoadedPipelineGetAdOutputByIndex`;
+- `vernonRuntimeProgramExecutableGetAdOutputCount` and
+  `vernonRuntimeProgramExecutableGetAdOutputByIndex`;
 - the equivalent cotangent and gradient count/index pairs;
 - derivative-group count/index queries and indexed leaf-path queries.
 

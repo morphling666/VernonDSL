@@ -1,5 +1,5 @@
-#ifndef VERNON_PYTHON_NATIVE_PIPELINE_H
-#define VERNON_PYTHON_NATIVE_PIPELINE_H
+#ifndef VERNON_PYTHON_NATIVE_PROGRAM_H
+#define VERNON_PYTHON_NATIVE_PROGRAM_H
 
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
@@ -134,8 +134,8 @@ std::string specializeKernelHostConstants(const std::string &moduleText, const s
 struct Runtime;
 RhiHostState *runtimeRhiHost(const Runtime *runtime);
 struct CompiledProgram;
-struct LoadedPipeline;
-struct PipelineInvocationBuilder;
+struct PythonProgramExecutable;
+struct ProgramInvocationBuilder;
 
 using SharedCompileResult = std::shared_ptr<VernonCompileResult>;
 
@@ -207,10 +207,10 @@ std::unique_ptr<CompiledProgram> analyzeProgramResult(Compiler &compiler, const 
 std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,
                                                                        const nb::dict &targetOptions);
 
-struct PipelineParameterMetadata {
+struct ProgramParameterMetadata {
     uint32_t slot{};
     std::string name;
-    VernonPipelineArgumentKind kind{};
+    VernonProgramArgumentKind kind{};
     uint32_t elementByteSize{};
     uint32_t elementAlignment{};
     std::string layoutHash;
@@ -221,18 +221,18 @@ struct PipelineParameterMetadata {
     std::vector<uint64_t> shape;
 };
 
-struct PipelineOutputMetadata {
+struct ProgramOutputMetadata {
     std::string name;
-    VernonPipelineArgumentKind kind{};
+    VernonProgramArgumentKind kind{};
     VernonDataType dtype{};
     VernonValueAccess access{};
     std::vector<uint64_t> shape;
     uint32_t location{};
 };
 
-PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &view);
+ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &view);
 
-PipelineOutputMetadata outputMetadata(const VernonPipelineOutputView &view);
+ProgramOutputMetadata outputMetadata(const VernonProgramOutputView &view);
 
 struct PythonRuntimeSubmission {
     explicit PythonRuntimeSubmission(VernonSubmission *value) : handle(value) {}
@@ -255,17 +255,17 @@ struct PythonRuntimeSubmission {
     VernonSubmission *handle{};
 };
 
-struct PreparedPipelineArgument {
-    PreparedPipelineArgument() = default;
-    PreparedPipelineArgument(const PreparedPipelineArgument &other)
+struct PreparedProgramArgument {
+    PreparedProgramArgument() = default;
+    PreparedProgramArgument(const PreparedProgramArgument &other)
         : value(other.value), shape(other.shape), strides(other.strides), layoutHash(other.layoutHash),
           elementLeaves(other.elementLeaves), owner(other.owner) {
         refreshViews();
     }
-    PreparedPipelineArgument &operator=(const PreparedPipelineArgument &) = delete;
+    PreparedProgramArgument &operator=(const PreparedProgramArgument &) = delete;
 
     void refreshViews() {
-        if (value.kind != VERNON_PIPELINE_TENSOR)
+        if (value.kind != VERNON_PROGRAM_TENSOR)
             return;
         value.tensor.shape = shape.empty() ? nullptr : shape.data();
         value.tensor.byte_strides = strides.empty() ? nullptr : strides.data();
@@ -273,7 +273,7 @@ struct PreparedPipelineArgument {
         value.tensor.element_layout.leaves = elementLeaves.empty() ? nullptr : elementLeaves.data();
     }
 
-    VernonPipelineArgument value{};
+    VernonProgramArgument value{};
     std::vector<uint64_t> shape;
     std::vector<int64_t> strides;
     std::string layoutHash;
@@ -281,25 +281,25 @@ struct PreparedPipelineArgument {
     nb::object owner;
 };
 
-struct PipelineInvocationBuilder {
-    PipelineInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline)
+struct ProgramInvocationBuilder {
+    ProgramInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline)
         : owner(owner), runtime(runtime), pipeline(pipeline) {}
-    PipelineInvocationBuilder(const PipelineInvocationBuilder &) = delete;
-    PipelineInvocationBuilder &operator=(const PipelineInvocationBuilder &) = delete;
+    ProgramInvocationBuilder(const ProgramInvocationBuilder &) = delete;
+    ProgramInvocationBuilder &operator=(const ProgramInvocationBuilder &) = delete;
 
-    PipelineParameterMetadata resolveParameter(const nb::object &identifier) {
-        VernonPipelineParameterView view{};
+    ProgramParameterMetadata resolveParameter(const nb::object &identifier) {
+        VernonProgramParameterView view{};
         if (nb::isinstance<nb::str>(identifier)) {
             const std::string name = nb::cast<std::string>(identifier);
-            if (vernonRuntimeLoadedPipelineFindParameter(pipeline, {name.data(), name.size()}, &view) !=
+            if (vernonRuntimeProgramExecutableFindParameter(pipeline, {name.data(), name.size()}, &view) !=
                 VERNON_STATUS_OK)
                 throw std::invalid_argument("unknown pipeline parameter '" + name + "'");
-            PipelineParameterMetadata metadata = parameterMetadata(view);
-            if (view.kind == VERNON_PIPELINE_IMAGE) {
-                VernonPipelineImageConstraintView constraint{};
+            ProgramParameterMetadata metadata = parameterMetadata(view);
+            if (view.kind == VERNON_PROGRAM_IMAGE) {
+                VernonProgramImageConstraintView constraint{};
                 constraint.struct_size = sizeof(constraint);
-                if (vernonRuntimeLoadedPipelineFindImageConstraint(pipeline, {name.data(), name.size()}, &constraint) !=
-                    VERNON_STATUS_OK)
+                if (vernonRuntimeProgramExecutableFindImageConstraint(pipeline, {name.data(), name.size()},
+                                                                      &constraint) != VERNON_STATUS_OK)
                     throw std::runtime_error("cannot query pipeline image constraint");
                 metadata.imageBindingRole = constraint.binding_role;
                 metadata.storageImageFormat = constraint.storage_format;
@@ -309,16 +309,16 @@ struct PipelineInvocationBuilder {
         if (!nb::isinstance<nb::int_>(identifier))
             throw std::invalid_argument("pipeline parameter must be a name or slot");
         const uint32_t slot = nb::cast<uint32_t>(identifier);
-        const size_t count = vernonRuntimeLoadedPipelineGetParameterCount(pipeline);
+        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
         for (size_t index = 0; index < count; ++index) {
-            if (vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
+            if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
                 view.slot == slot) {
-                PipelineParameterMetadata metadata = parameterMetadata(view);
-                if (view.kind == VERNON_PIPELINE_IMAGE) {
-                    VernonPipelineImageConstraintView constraint{};
+                ProgramParameterMetadata metadata = parameterMetadata(view);
+                if (view.kind == VERNON_PROGRAM_IMAGE) {
+                    VernonProgramImageConstraintView constraint{};
                     constraint.struct_size = sizeof(constraint);
-                    if (vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(pipeline, index, &constraint) !=
-                        VERNON_STATUS_OK)
+                    if (vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
+                            pipeline, index, &constraint) != VERNON_STATUS_OK)
                         throw std::runtime_error("cannot query pipeline image constraint");
                     metadata.imageBindingRole = constraint.binding_role;
                     metadata.storageImageFormat = constraint.storage_format;
@@ -329,15 +329,15 @@ struct PipelineInvocationBuilder {
         throw std::invalid_argument("unknown pipeline parameter slot " + std::to_string(slot));
     }
 
-    std::unique_ptr<PreparedPipelineArgument> createArgument(const PipelineParameterMetadata &parameter,
-                                                             VernonPipelineArgumentKind kind) {
+    std::unique_ptr<PreparedProgramArgument> createArgument(const ProgramParameterMetadata &parameter,
+                                                            VernonProgramArgumentKind kind) {
         if (parameter.kind != kind)
             throw std::invalid_argument("pipeline parameter '" + parameter.name + "' has a different reflected kind");
-        auto prepared = std::make_unique<PreparedPipelineArgument>();
-        PreparedPipelineArgument &result = *prepared;
+        auto prepared = std::make_unique<PreparedProgramArgument>();
+        PreparedProgramArgument &result = *prepared;
         result.value.slot = parameter.slot;
         result.value.kind = kind;
-        if (kind == VERNON_PIPELINE_TENSOR) {
+        if (kind == VERNON_PROGRAM_TENSOR) {
             result.layoutHash = parameter.layoutHash;
             result.elementLeaves = parameter.elementLeaves;
             result.value.tensor.element_layout = {
@@ -349,15 +349,15 @@ struct PipelineInvocationBuilder {
         return prepared;
     }
 
-    PipelineInvocationBuilder &preparedArgument(PreparedPipelineArgument &prepared) {
+    ProgramInvocationBuilder &preparedArgument(PreparedProgramArgument &prepared) {
         if (!slots.insert(prepared.value.slot).second)
             throw std::invalid_argument("pipeline parameter was already bound");
         arguments.push_back(&prepared);
         return *this;
     }
 
-    PipelineInvocationBuilder &ownedArgument(std::unique_ptr<PreparedPipelineArgument> prepared) {
-        PreparedPipelineArgument &value = *prepared;
+    ProgramInvocationBuilder &ownedArgument(std::unique_ptr<PreparedProgramArgument> prepared) {
+        PreparedProgramArgument &value = *prepared;
         ownedArguments.push_back(std::move(prepared));
         return preparedArgument(value);
     }
@@ -381,12 +381,12 @@ struct PipelineInvocationBuilder {
         throw std::invalid_argument("unsupported NumPy pipeline dtype '" + name + "'");
     }
 
-    std::unique_ptr<PreparedPipelineArgument> prepareHostTensor(const nb::object &identifier, const nb::object &array) {
+    std::unique_ptr<PreparedProgramArgument> prepareHostTensor(const nb::object &identifier, const nb::object &array) {
         if (!nb::isinstance(array, nb::module_::import_("numpy").attr("ndarray")))
             throw std::invalid_argument("host tensor must be a NumPy ndarray");
-        const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        auto prepared = createArgument(parameter, VERNON_PIPELINE_TENSOR);
-        PreparedPipelineArgument &argument = *prepared;
+        const ProgramParameterMetadata parameter = resolveParameter(identifier);
+        auto prepared = createArgument(parameter, VERNON_PROGRAM_TENSOR);
+        PreparedProgramArgument &argument = *prepared;
         const std::vector<uint64_t> arrayShape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
         const std::vector<int64_t> arrayStrides = nb::cast<std::vector<int64_t>>(array.attr("strides"));
         if (arrayStrides.size() != arrayShape.size())
@@ -455,18 +455,18 @@ struct PipelineInvocationBuilder {
         return prepared;
     }
 
-    PipelineInvocationBuilder &hostTensor(const nb::object &identifier, const nb::object &array) {
+    ProgramInvocationBuilder &hostTensor(const nb::object &identifier, const nb::object &array) {
         return ownedArgument(prepareHostTensor(identifier, array));
     }
 
-    std::unique_ptr<PreparedPipelineArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
-                                                               uint32_t access, const std::vector<uint64_t> &shape,
-                                                               const std::vector<int64_t> &strides, size_t offset) {
+    std::unique_ptr<PreparedProgramArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
+                                                              uint32_t access, const std::vector<uint64_t> &shape,
+                                                              const std::vector<int64_t> &strides, size_t offset) {
         if (!buffer || shape.size() != strides.size())
             throw std::invalid_argument("RHI Tensor shape and strides must have equal rank");
-        const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        auto prepared = createArgument(parameter, VERNON_PIPELINE_TENSOR);
-        PreparedPipelineArgument &argument = *prepared;
+        const ProgramParameterMetadata parameter = resolveParameter(identifier);
+        auto prepared = createArgument(parameter, VERNON_PROGRAM_TENSOR);
+        PreparedProgramArgument &argument = *prepared;
         argument.owner = nb::cast(buffer, nb::rv_policy::reference);
         argument.shape = shape;
         argument.strides = strides;
@@ -487,14 +487,14 @@ struct PipelineInvocationBuilder {
         return prepared;
     }
 
-    PipelineInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
-                                         const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
-                                         size_t offset) {
+    ProgramInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
+                                        const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
+                                        size_t offset) {
         return ownedArgument(prepareRhiTensor(identifier, buffer, access, shape, strides, offset));
     }
 
-    std::unique_ptr<PreparedPipelineArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
-        const PipelineParameterMetadata parameter = resolveParameter(identifier);
+    std::unique_ptr<PreparedProgramArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
+        const ProgramParameterMetadata parameter = resolveParameter(identifier);
         const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
         const uint32_t requiredUsage = storage ? VERNON_RHI_IMAGE_STORAGE
                                        : parameter.imageBindingRole == VERNON_IMAGE_BINDING_COLOR_ATTACHMENT
@@ -506,36 +506,36 @@ struct PipelineInvocationBuilder {
             throw std::invalid_argument("RHI texture usage does not match the pipeline parameter");
         if (storage && view->format != parameter.storageImageFormat)
             throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
-        auto prepared = createArgument(parameter, VERNON_PIPELINE_IMAGE);
-        PreparedPipelineArgument &argument = *prepared;
+        auto prepared = createArgument(parameter, VERNON_PROGRAM_IMAGE);
+        PreparedProgramArgument &argument = *prepared;
         argument.owner = nb::cast(view, nb::rv_policy::reference);
         if (vernonRuntimeReferenceRhiImageView(runtime, view->handle, &argument.value.image.view) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI image view belongs to another Runtime device");
         return prepared;
     }
 
-    PipelineInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
+    ProgramInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
         return ownedArgument(prepareRhiTexture(identifier, view));
     }
 
-    std::unique_ptr<PreparedPipelineArgument> prepareRhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+    std::unique_ptr<PreparedProgramArgument> prepareRhiSampler(const nb::object &identifier, RhiSampler *sampler) {
         if (!sampler)
             throw std::invalid_argument("RHI sampler is null");
-        const PipelineParameterMetadata parameter = resolveParameter(identifier);
-        auto prepared = createArgument(parameter, VERNON_PIPELINE_SAMPLER);
-        PreparedPipelineArgument &argument = *prepared;
+        const ProgramParameterMetadata parameter = resolveParameter(identifier);
+        auto prepared = createArgument(parameter, VERNON_PROGRAM_SAMPLER);
+        PreparedProgramArgument &argument = *prepared;
         argument.owner = nb::cast(sampler, nb::rv_policy::reference);
         if (vernonRuntimeReferenceRhiSampler(runtime, sampler->handle, &argument.value.resource) != VERNON_STATUS_OK)
             throw std::invalid_argument("RHI sampler belongs to another Runtime device");
         return prepared;
     }
 
-    PipelineInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
+    ProgramInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
         return ownedArgument(prepareRhiSampler(identifier, sampler));
     }
 
-    PipelineInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImageView *view, uint32_t loadOperation,
-                                                  uint32_t storeOperation, const std::array<float, 4> &clearColor) {
+    ProgramInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImageView *view, uint32_t loadOperation,
+                                                 uint32_t storeOperation, const std::array<float, 4> &clearColor) {
         if (!view || !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
             (view->format == VERNON_TEXTURE_D32_FLOAT || view->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
@@ -551,8 +551,8 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiDepthAttachment(RhiImageView *view, uint32_t loadOperation, uint32_t storeOperation,
-                                                  float clearDepth) {
+    ProgramInvocationBuilder &rhiDepthAttachment(RhiImageView *view, uint32_t loadOperation, uint32_t storeOperation,
+                                                 float clearDepth) {
         if (!view || !(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
             (view->format != VERNON_TEXTURE_D32_FLOAT && view->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
@@ -568,7 +568,7 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &rhiIndexBinding(RhiBuffer *buffer, uint32_t count, size_t offset) {
+    ProgramInvocationBuilder &rhiIndexBinding(RhiBuffer *buffer, uint32_t count, size_t offset) {
         if (!buffer || offset > buffer->size)
             throw std::invalid_argument("RHI index buffer is null");
         index = {};
@@ -582,7 +582,7 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &setTopology(uint32_t value) {
+    ProgramInvocationBuilder &setTopology(uint32_t value) {
         if (value > static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST))
             throw std::invalid_argument("invalid primitive topology");
         topology = static_cast<VernonPrimitiveTopology>(value);
@@ -591,18 +591,18 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &counts(uint32_t vertices, uint32_t instances) {
+    ProgramInvocationBuilder &counts(uint32_t vertices, uint32_t instances) {
         vertexCount = vertices;
         instanceCount = instances;
         return *this;
     }
 
-    PipelineInvocationBuilder &grid(uint32_t x, uint32_t y, uint32_t z) {
+    ProgramInvocationBuilder &grid(uint32_t x, uint32_t y, uint32_t z) {
         computeGrid = {x, y, z};
         return *this;
     }
 
-    PipelineInvocationBuilder &setViewport(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    ProgramInvocationBuilder &setViewport(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
         viewport[0] = x;
         viewport[1] = y;
         viewport[2] = width;
@@ -610,7 +610,7 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &setScissor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    ProgramInvocationBuilder &setScissor(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
         scissor[0] = x;
         scissor[1] = y;
         scissor[2] = width;
@@ -618,7 +618,7 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &setGraphicsState(const nb::object &state) {
+    ProgramInvocationBuilder &setGraphicsState(const nb::object &state) {
         const nb::object raster = state.attr("rasterization");
         const nb::object depth = state.attr("depth_stencil");
         graphicsState = {};
@@ -669,19 +669,19 @@ struct PipelineInvocationBuilder {
         return *this;
     }
 
-    PipelineInvocationBuilder &setStencilReference(uint32_t value) {
+    ProgramInvocationBuilder &setStencilReference(uint32_t value) {
         if (value > 0xff)
             throw std::invalid_argument("stencil reference must be in [0, 255]");
         stencilReference = value;
         return *this;
     }
 
-    VernonPipelineInvocation invocation(std::vector<VernonPipelineArgument> &values) const {
+    VernonProgramSubmitDescriptor invocation(std::vector<VernonProgramArgument> &values) const {
         values.clear();
         values.reserve(arguments.size());
-        for (const PreparedPipelineArgument *argument : arguments)
+        for (const PreparedProgramArgument *argument : arguments)
             values.push_back(argument->value);
-        VernonPipelineInvocation invocation{};
+        VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
@@ -712,16 +712,16 @@ struct PipelineInvocationBuilder {
     }
 
     std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {
-        std::vector<VernonPipelineArgument> values;
-        VernonPipelineInvocation invocation = this->invocation(values);
+        std::vector<VernonProgramArgument> values;
+        VernonProgramSubmitDescriptor invocation = this->invocation(values);
         if (encoder) {
-            if (vernonRuntimePipelineEncode(*encoder, pipeline, &invocation) != VERNON_STATUS_OK)
+            if (vernonRuntimeProgramEncode(*encoder, pipeline, &invocation) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline encoding failed: " +
                                          nativeStringView(vernonRuntimeGetLastError(runtime)));
             return {};
         }
         VernonSubmission *submission{};
-        if (vernonRuntimePipelineSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
+        if (vernonRuntimeProgramSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
             throw std::runtime_error("pipeline submission failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
         return std::make_unique<PythonRuntimeSubmission>(submission);
@@ -738,9 +738,9 @@ struct PipelineInvocationBuilder {
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
-    VernonLoadedPipeline *pipeline{};
-    std::vector<PreparedPipelineArgument *> arguments;
-    std::vector<std::unique_ptr<PreparedPipelineArgument>> ownedArguments;
+    VernonProgramExecutable *pipeline{};
+    std::vector<PreparedProgramArgument *> arguments;
+    std::vector<std::unique_ptr<PreparedProgramArgument>> ownedArguments;
     std::unordered_set<uint32_t> slots;
     std::vector<VernonColorAttachment> attachments;
     VernonDepthAttachment depthAttachment{};
@@ -824,10 +824,10 @@ struct PythonPreparedBindingLease {
 // token comparison, snapshots, telemetry, and payload leases live in the
 // runtime ProgramInstance referenced by this adapter.
 struct PythonProgramInvocationAdapter {
-    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline,
+    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline,
                                    vernon::runtime::program::ProgramInstance &instance,
                                    VernonProgramInstance *nativeInstance)
-        : builder(std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline)),
+        : builder(std::make_unique<ProgramInvocationBuilder>(owner, runtime, pipeline)),
           transaction(instance.beginInvocation()),
           nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
         if (!nativeInvocation)
@@ -837,7 +837,7 @@ struct PythonProgramInvocationAdapter {
     PythonProgramInvocationAdapter &operator=(const PythonProgramInvocationAdapter &) = delete;
     ~PythonProgramInvocationAdapter() { vernonRuntimeProgramInvocationDestroy(nativeInvocation); }
 
-    PipelineInvocationBuilder &builderView() const { return *builder; }
+    ProgramInvocationBuilder &builderView() const { return *builder; }
 
     void bind(uint32_t slot, const nb::object &token, const nb::callable &prepare, uint64_t uploadBytes = 0,
               uint64_t uploadRanges = 0, bool eagerUpload = false) {
@@ -846,7 +846,7 @@ struct PythonProgramInvocationAdapter {
             transaction->observeUploads(uploadBytes, uploadRanges);
         if (const std::shared_ptr<void> *payload = transaction->find(slot, key)) {
             auto lease = std::static_pointer_cast<PythonPreparedBindingLease>(*payload);
-            auto *argument = nb::cast<PreparedPipelineArgument *>(lease->prepared);
+            auto *argument = nb::cast<PreparedProgramArgument *>(lease->prepared);
             builder->preparedArgument(*argument);
             VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
             if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, nullptr,
@@ -855,7 +855,7 @@ struct PythonProgramInvocationAdapter {
             return;
         }
         nb::object prepared = prepare();
-        auto *argument = nb::cast<PreparedPipelineArgument *>(prepared);
+        auto *argument = nb::cast<PreparedProgramArgument *>(prepared);
         if (!argument)
             throw std::invalid_argument("binding prepare callback did not return a prepared argument");
         builder->preparedArgument(*argument);
@@ -868,9 +868,9 @@ struct PythonProgramInvocationAdapter {
             throw std::runtime_error("failed to bind native Program argument");
     }
 
-    void bindRenderPass(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
-        std::vector<VernonPipelineArgument> values;
-        VernonPipelineInvocation frame = control.invocation(values);
+    void bindRenderPass(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
+        std::vector<VernonProgramArgument> values;
+        VernonProgramSubmitDescriptor frame = control.invocation(values);
         if (!frame.render_pass)
             throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
@@ -880,9 +880,9 @@ struct PythonProgramInvocationAdapter {
             throw std::runtime_error("failed to bind native Program RenderPass control");
     }
 
-    void bindDrawCommand(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
-        std::vector<VernonPipelineArgument> values;
-        VernonPipelineInvocation frame = control.invocation(values);
+    void bindDrawCommand(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
+        std::vector<VernonProgramArgument> values;
+        VernonProgramSubmitDescriptor frame = control.invocation(values);
         if (!frame.draw_command)
             throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
@@ -892,9 +892,9 @@ struct PythonProgramInvocationAdapter {
             throw std::runtime_error("failed to bind native Program DrawCommand control");
     }
 
-    void bindDynamicState(uint32_t slot, const nb::object &token, PipelineInvocationBuilder &control) {
-        std::vector<VernonPipelineArgument> values;
-        VernonPipelineInvocation frame = control.invocation(values);
+    void bindDynamicState(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
+        std::vector<VernonProgramArgument> values;
+        VernonProgramSubmitDescriptor frame = control.invocation(values);
         if (!frame.dynamic_state)
             throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
@@ -916,14 +916,14 @@ struct PythonProgramInvocationAdapter {
         vernonRuntimeProgramInvocationRollback(nativeInvocation);
     }
 
-    std::unique_ptr<PipelineInvocationBuilder> builder;
+    std::unique_ptr<ProgramInvocationBuilder> builder;
     std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
     VernonProgramInvocation *nativeInvocation{};
 };
 
 struct PythonProgramInstanceAdapter {
-    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonLoadedPipeline *pipeline)
+    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline)
         : owner(owner), runtime(runtime), pipeline(pipeline), nativeInstance(pipeline),
           nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(pipeline)) {
         if (!nativeInvocationInstance)
@@ -951,7 +951,7 @@ struct PythonProgramInstanceAdapter {
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
-    VernonLoadedPipeline *pipeline{};
+    VernonProgramExecutable *pipeline{};
     vernon::runtime::program::ProgramInstance nativeInstance;
     VernonProgramInstance *nativeInvocationInstance{};
 };

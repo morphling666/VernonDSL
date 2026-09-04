@@ -17,7 +17,7 @@ struct ProgramBoundaryView {
     std::string category;
 };
 
-std::vector<ProgramBoundaryView> programBoundaryViews(const VernonLoadedPipeline &pipeline);
+std::vector<ProgramBoundaryView> programBoundaryViews(const VernonProgramExecutable &pipeline);
 
 } // namespace vernon::runtime
 

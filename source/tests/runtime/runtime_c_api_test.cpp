@@ -31,7 +31,7 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
 
 TEST(RuntimeCApi, AutodiffOpaqueHandleRejectsInvalidCalls) {
     VernonPullback *pullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdPipelineForward(nullptr, {1, 1, 1}, nullptr, nullptr, &pullback), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonAdProgramForward(nullptr, {1, 1, 1}, nullptr, nullptr, &pullback), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(pullback, nullptr);
     EXPECT_EQ(vernonPullbackApply(nullptr, nullptr, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
     vernonPullbackDestroy(nullptr);
@@ -72,15 +72,15 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     static const char bad_reflection[] = "{\"compiler_contract_version\":" VERNON_COMPILER_CONTRACT_VERSION_STRING
                                          ",\"pipeline_version\":0,\"entries\":[]}";
     ASSERT_TRUE(!vernonRuntimeLoadCpuEntry(runtime, fill_grid, bad_reflection, sizeof(bad_reflection) - 1, "fill", 4));
-    VernonLoadedPipeline *pipeline =
+    VernonProgramExecutable *pipeline =
         vernonRuntimeLoadCpuEntry(runtime, fill_grid, reflection, sizeof(reflection) - 1, "fill", 4);
     ASSERT_TRUE(pipeline);
     uint64_t shape[] = {16};
     int64_t strides[] = {4};
     float values[16] = {0};
-    VernonPipelineArgument argument = {};
+    VernonProgramArgument argument = {};
     argument.slot = 0;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_HOST;
     argument.tensor.host_data = values;
@@ -91,14 +91,14 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = 16 * sizeof(float);
     VernonLaunchSize grid = {2, 1, 2};
-    VernonPipelineInvocation invocation = {};
+    VernonProgramSubmitDescriptor invocation = {};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = grid;
     VernonSubmission *submission{};
-    ASSERT_EQ(vernonRuntimePipelineSubmit(pipeline, &invocation, &submission), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramSubmit(pipeline, &invocation, &submission), VERNON_STATUS_OK);
     ASSERT_NE(submission, nullptr);
     VernonSubmissionState submissionState{};
     ASSERT_EQ(vernonSubmissionGetState(submission, &submissionState), VERNON_STATUS_OK);
@@ -113,28 +113,28 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     constrainedJson["entries"][0]["dispatch_contract"] = {{"unit_grid_axes", {1, 2}},
                                                           {"requires_unit_workgroup", false}};
     const std::string constrainedReflection = constrainedJson.dump();
-    VernonLoadedPipeline *constrainedPipeline = vernonRuntimeLoadCpuEntry(
+    VernonProgramExecutable *constrainedPipeline = vernonRuntimeLoadCpuEntry(
         runtime, fill_grid, constrainedReflection.data(), constrainedReflection.size(), "fill", 4);
     ASSERT_NE(constrainedPipeline, nullptr);
     EXPECT_EQ(vernon::tests::completeSubmission(constrainedPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     invocation.compute_grid = {2, 1, 1};
     EXPECT_EQ(vernon::tests::completeSubmission(constrainedPipeline, &invocation), VERNON_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(constrainedPipeline);
+    vernonRuntimeProgramExecutableDestroy(constrainedPipeline);
 
     constrainedJson["entries"][0]["workgroup_size"] = {1, 1, 1};
     constrainedJson["entries"][0]["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}},
                                                           {"requires_unit_workgroup", true}};
     const std::string singleInvocationReflection = constrainedJson.dump();
-    VernonLoadedPipeline *singleInvocationPipeline = vernonRuntimeLoadCpuEntry(
+    VernonProgramExecutable *singleInvocationPipeline = vernonRuntimeLoadCpuEntry(
         runtime, fill_grid, singleInvocationReflection.data(), singleInvocationReflection.size(), "fill", 4);
     ASSERT_NE(singleInvocationPipeline, nullptr);
     EXPECT_EQ(vernon::tests::completeSubmission(singleInvocationPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     invocation.compute_grid = {1, 1, 1};
     EXPECT_EQ(vernon::tests::completeSubmission(singleInvocationPipeline, &invocation), VERNON_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(singleInvocationPipeline);
+    vernonRuntimeProgramExecutableDestroy(singleInvocationPipeline);
 
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_INVALID_ARGUMENT);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
 
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
 }

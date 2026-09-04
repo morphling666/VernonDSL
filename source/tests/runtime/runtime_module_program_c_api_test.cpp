@@ -17,18 +17,19 @@ std::string lastError(VernonRuntimeContext *context) {
     return std::string(error.data ? error.data : "", error.size);
 }
 
-VernonPipelineParameterView parameter(VernonLoadedPipeline *pipeline, const char *name) {
-    VernonPipelineParameterView result{};
-    EXPECT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {name, std::strlen(name)}, &result), VERNON_STATUS_OK);
+VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
+    VernonProgramParameterView result{};
+    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {name, std::strlen(name)}, &result),
+              VERNON_STATUS_OK);
     return result;
 }
 
-VernonPipelineArgument tensorArgument(const VernonPipelineParameterView &parameter, float &value) {
+VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter, float &value) {
     static const uint64_t shape[]{1};
     static const int64_t strides[]{sizeof(float)};
-    VernonPipelineArgument result{};
+    VernonProgramArgument result{};
     result.slot = parameter.slot;
-    result.kind = VERNON_PIPELINE_TENSOR;
+    result.kind = VERNON_PROGRAM_TENSOR;
     result.tensor.struct_size = sizeof(VernonTensorView);
     result.tensor.storage = VERNON_TENSOR_HOST;
     result.tensor.host_data = &value;
@@ -60,20 +61,20 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonLoadedPipeline *pipeline =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), {nullptr, 0}, nullptr);
+    VernonProgramExecutable *pipeline = vernonRuntimeLoadManagedProgramBundleWithOptions(
+        context, manifest.data(), manifest.size(), {nullptr, 0}, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 2u);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline), 1u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
 
-    const VernonPipelineParameterView sourceParameter = parameter(pipeline, "source");
-    const VernonPipelineParameterView outputParameter = parameter(pipeline, "output");
-    ASSERT_EQ(sourceParameter.kind, VERNON_PIPELINE_TENSOR);
-    ASSERT_EQ(outputParameter.kind, VERNON_PIPELINE_TENSOR);
+    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
+    const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
+    ASSERT_EQ(sourceParameter.kind, VERNON_PROGRAM_TENSOR);
+    ASSERT_EQ(outputParameter.kind, VERNON_PROGRAM_TENSOR);
 
     VernonAdValueSet emptyValues{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *legacyPullback = nullptr;
-    EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &emptyValues, &emptyValues, &legacyPullback),
+    EXPECT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &emptyValues, &emptyValues, &legacyPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(legacyPullback, nullptr);
     EXPECT_NE(lastError(context).find("vernonRuntimeProgramForward"), std::string::npos);
@@ -82,8 +83,8 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     ASSERT_NE(instance, nullptr);
     float source = 3.0f;
     float output = 0.0f;
-    VernonPipelineArgument sourceArgument = tensorArgument(sourceParameter, source);
-    VernonPipelineArgument outputArgument = tensorArgument(outputParameter, output);
+    VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
+    VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
     const VernonProgramBindingToken sourceToken = bindingToken("source-v1");
     const VernonProgramBindingToken outputToken = bindingToken("output-v1");
     const VernonProgramBindingToken renderPassToken = bindingToken("render-pass-v1");
@@ -174,7 +175,7 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
 
     vernonRuntimeProgramInstanceDestroy(instance);
     EXPECT_EQ(controlLeaseCount, 0);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -188,15 +189,15 @@ TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
     ASSERT_NE(context, nullptr);
     {
         auto executable = vernon::runtime::ProgramExecutable::load(context, manifest.data(), manifest.size());
-        const VernonPipelineParameterView sourceParameter = parameter(executable.get(), "source");
-        const VernonPipelineParameterView outputParameter = parameter(executable.get(), "output");
+        const VernonProgramParameterView sourceParameter = parameter(executable.get(), "source");
+        const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
         vernon::runtime::ProgramInstance instance(executable);
         executable = {};
 
         float source = 4.0f;
         float output = 0.0f;
-        const VernonPipelineArgument sourceArgument = tensorArgument(sourceParameter, source);
-        const VernonPipelineArgument outputArgument = tensorArgument(outputParameter, output);
+        const VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
+        const VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
         const VernonProgramBindingToken sourceToken = bindingToken("cpp-source-v1");
         const VernonProgramBindingToken outputToken = bindingToken("cpp-output-v1");
         auto invocation = instance.begin();

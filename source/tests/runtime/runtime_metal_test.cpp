@@ -1319,20 +1319,20 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     EXPECT_TRUE(capabilities.supports_graphics);
 
     const std::string directory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = directory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
-    VernonPipelineParameterView valuesParameter{};
-    VernonPipelineParameterView factorParameter{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"values", 6}, &valuesParameter), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
+    VernonProgramParameterView valuesParameter{};
+    VernonProgramParameterView factorParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"values", 6}, &valuesParameter), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
 
     constexpr std::array<float, 4> source{1, 2, 3, 4};
     VernonRhiBufferDescriptor bufferDescriptor{};
@@ -1352,9 +1352,9 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     constexpr uint64_t scalarShape[]{1};
     constexpr int64_t strides[]{sizeof(float)};
     constexpr float factor = 3.0f;
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = valuesParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = bufferReference;
@@ -1365,7 +1365,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     arguments[0].tensor.byte_strides = strides;
     arguments[0].tensor.byte_size = sizeof(source);
     arguments[1].slot = factorParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
@@ -1375,7 +1375,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     arguments[1].tensor.shape = scalarShape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -1402,8 +1402,8 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
         EXPECT_EQ(output[index], source[index] * factor * factor);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }
@@ -1420,17 +1420,17 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = directory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_NE(loaded, nullptr);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
-    VernonPipelineParameterView positionParameter{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"position", 8}, &positionParameter),
+    VernonProgramParameterView positionParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
               VERNON_STATUS_OK);
 
     constexpr float positions[]{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
@@ -1475,9 +1475,9 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
 
     constexpr uint64_t shape[]{3, 2};
     constexpr int64_t strides[]{2 * sizeof(float), sizeof(float)};
-    VernonPipelineArgument position{};
+    VernonProgramArgument position{};
     position.slot = positionParameter.slot;
-    position.kind = VERNON_PIPELINE_TENSOR;
+    position.kind = VERNON_PROGRAM_TENSOR;
     position.tensor.struct_size = sizeof(VernonTensorView);
     position.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     position.tensor.resource = vertexReference;
@@ -1488,7 +1488,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     position.tensor.byte_strides = strides;
     position.tensor.byte_size = sizeof(positions);
     VernonColorAttachment attachment{0, targetReference};
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &position;
@@ -1514,8 +1514,8 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, targetView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, target), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, vertices), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }
@@ -1537,22 +1537,23 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = directory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_NE(loaded, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                               vernonRuntimeGetLastError(runtime).size);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
-    VernonPipelineParameterView imageParameter{};
-    VernonPipelineParameterView samplerParameter{};
-    VernonPipelineParameterView positionParameter{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"image", 5}, &imageParameter), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"sampler", 7}, &samplerParameter), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"position", 8}, &positionParameter),
+    VernonProgramParameterView imageParameter{};
+    VernonProgramParameterView samplerParameter{};
+    VernonProgramParameterView positionParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"image", 5}, &imageParameter), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"sampler", 7}, &samplerParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
               VERNON_STATUS_OK);
 
     constexpr float positions[]{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
@@ -1635,15 +1636,15 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
 
     constexpr uint64_t shape[]{3, 2};
     constexpr int64_t strides[]{2 * sizeof(float), sizeof(float)};
-    VernonPipelineArgument arguments[3]{};
+    VernonProgramArgument arguments[3]{};
     arguments[0].slot = imageParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_IMAGE;
+    arguments[0].kind = VERNON_PROGRAM_IMAGE;
     arguments[0].image = {sampledReference};
     arguments[1].slot = samplerParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_SAMPLER;
+    arguments[1].kind = VERNON_PROGRAM_SAMPLER;
     arguments[1].resource = samplerReference;
     arguments[2].slot = positionParameter.slot;
-    arguments[2].kind = VERNON_PIPELINE_TENSOR;
+    arguments[2].kind = VERNON_PROGRAM_TENSOR;
     arguments[2].tensor.struct_size = sizeof(VernonTensorView);
     arguments[2].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[2].tensor.resource = vertexReference;
@@ -1665,7 +1666,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     ASSERT_EQ(vernonRuntimeReferenceRhiBuffer(runtime, indexBuffer, 0, sizeof(indices), &indexReference),
               VERNON_STATUS_OK);
     VernonColorAttachment attachment{0, targetReference};
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -1814,8 +1815,8 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, sampled), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, indexBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, vertices), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }

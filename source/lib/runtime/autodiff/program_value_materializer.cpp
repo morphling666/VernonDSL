@@ -42,7 +42,7 @@ bool fillHostTensor(ProgramHostValue &value, const program::Value &slot, const V
     } else if (value.strides.size() != value.concreteShape->size()) {
         return error = "Program autodiff tensor shape and strides have different ranks", false;
     }
-    value.argument.kind = VERNON_PIPELINE_TENSOR;
+    value.argument.kind = VERNON_PROGRAM_TENSOR;
     value.argument.tensor.struct_size = sizeof(VernonTensorView);
     value.argument.tensor.storage = VERNON_TENSOR_HOST;
     value.argument.tensor.host_data = hostData;
@@ -103,7 +103,7 @@ bool tapePayloadStride(const std::string &type, size_t &stride, std::string &err
     return true;
 }
 
-bool tapeLaneCount(const program::Program &execution, const VernonPipelineTopology *topology, uint32_t tapeValue,
+bool tapeLaneCount(const program::Program &execution, const VernonProgramTopology *topology, uint32_t tapeValue,
                    size_t &lanes, std::string &error) {
     lanes = 1;
     for (const program::Graph &graph : execution.graphs) {
@@ -116,7 +116,7 @@ bool tapeLaneCount(const program::Program &execution, const VernonPipelineTopolo
             if (topology) {
                 const auto found = topology->stageIndices.find(node.stage);
                 if (found != topology->stageIndices.end() && found->second < topology->stages.size()) {
-                    const VernonLoadedPipeline *pipeline = topology->stages[found->second].pipeline.get();
+                    const VernonProgramExecutable *pipeline = topology->stages[found->second].pipeline.get();
                     if (pipeline) {
                         workgroup[0] = pipeline->workgroupSize.x ? pipeline->workgroupSize.x : 1;
                         workgroup[1] = pipeline->workgroupSize.y ? pipeline->workgroupSize.y : 1;
@@ -145,7 +145,7 @@ bool tapeLaneCount(const program::Program &execution, const VernonPipelineTopolo
     return true;
 }
 
-bool attachTape(const program::Program &execution, const VernonPipelineTopology *topology, const program::Value &slot,
+bool attachTape(const program::Program &execution, const VernonProgramTopology *topology, const program::Value &slot,
                 const std::vector<std::shared_ptr<HostStaticTapeBatch>> *captures,
                 const std::shared_ptr<AutodiffMemoryPolicy> &policy, ProgramHostValue &value, std::string &error) {
     std::shared_ptr<HostStaticTapeBatch> batch;
@@ -206,7 +206,7 @@ bool fillProgramTapeHostValue(ProgramHostValue &value, std::shared_ptr<HostStati
     std::memcpy(value.owned.data(), &descriptor, descriptorBytes);
     std::memcpy(value.owned.data() + descriptorBytes, &root, sizeof(root));
     value.argument = {};
-    value.argument.kind = VERNON_PIPELINE_TENSOR;
+    value.argument.kind = VERNON_PROGRAM_TENSOR;
     value.argument.tensor.struct_size = sizeof(VernonTensorView);
     value.argument.tensor.storage = VERNON_TENSOR_HOST;
     value.argument.tensor.host_data = value.owned.data();
@@ -215,7 +215,7 @@ bool fillProgramTapeHostValue(ProgramHostValue &value, std::shared_ptr<HostStati
     return true;
 }
 
-bool materializeProgramOwnedStorages(const program::Program &execution, const VernonPipelineTopology *topology,
+bool materializeProgramOwnedStorages(const program::Program &execution, const VernonProgramTopology *topology,
                                      std::vector<ProgramHostValue> &storage, const std::vector<char> &liveStorage,
                                      const std::vector<std::optional<ValueLayout>> &layouts,
                                      std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
@@ -324,11 +324,11 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const Ve
     return true;
 }
 
-bool materializeProgramValues(const program::Program &execution, const VernonPipelineTopology *topology,
+bool materializeProgramValues(const program::Program &execution, const VernonProgramTopology *topology,
                               std::vector<ProgramHostValue> &storage, const std::vector<char> &live,
                               const std::vector<std::optional<ValueLayout>> &layouts,
                               const std::map<uint32_t, ProgramStorageBacking> &backings,
-                              const std::map<uint32_t, VernonPipelineArgument> &externalValues,
+                              const std::map<uint32_t, VernonProgramArgument> &externalValues,
                               const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures,
                               const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, std::string &error) {
     for (const program::Value &slot : execution.values) {
@@ -346,7 +346,7 @@ bool materializeProgramValues(const program::Program &execution, const VernonPip
             const ProgramStorageBacking &backing = backings.at(*slot.storage);
             if (backing.external) {
                 value.argument = *backing.external;
-                if (value.argument.kind == VERNON_PIPELINE_TENSOR) {
+                if (value.argument.kind == VERNON_PROGRAM_TENSOR) {
                     value.argument.tensor.element_layout = programValueLayoutView(*layouts[slot.id]);
                     if (value.concreteShape) {
                         value.argument.tensor.rank = static_cast<uint32_t>(value.concreteShape->size());
@@ -364,10 +364,10 @@ bool materializeProgramValues(const program::Program &execution, const VernonPip
         } else if (const auto external = externalValues.find(slot.id); external != externalValues.end()) {
             value.argument = external->second;
             value.ownership =
-                value.argument.kind == VERNON_PIPELINE_TENSOR && value.argument.tensor.storage == VERNON_TENSOR_HOST
+                value.argument.kind == VERNON_PROGRAM_TENSOR && value.argument.tensor.storage == VERNON_TENSOR_HOST
                     ? ProgramValueOwnership::BorrowedHost
                     : ProgramValueOwnership::BorrowedDevice;
-            if (value.argument.kind == VERNON_PIPELINE_TENSOR)
+            if (value.argument.kind == VERNON_PROGRAM_TENSOR)
                 value.argument.tensor.element_layout = programValueLayoutView(*layouts[slot.id]);
             continue;
         } else if (!programValueHasDynamicShape(slot)) {

@@ -24,7 +24,7 @@ size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &p
 namespace vernon::runtime::program {
 struct ResolvedProgram;
 } // namespace vernon::runtime::program
-struct VernonPipelineTopology;
+struct VernonProgramTopology;
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
@@ -106,7 +106,7 @@ template <typename Handle> void destroyRuntimeBackendState(Handle &handle) {
     handle.destroyBackendState = nullptr;
 }
 
-struct VernonPipelineBundle {
+struct VernonProgramBundle {
     VernonRuntimeContext *context{};
     std::string id;
     std::unordered_map<std::string, vernon::runtime::Stage> stages;
@@ -114,18 +114,18 @@ struct VernonPipelineBundle {
     std::optional<vernon::runtime::AutodiffManifest> autodiff;
 };
 
-struct VernonDifferentiatedPipeline {
+struct VernonDifferentiatedProgram {
     std::shared_ptr<vernon::runtime::ad::Executable> executable;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
 };
 
-struct VernonLoadedPipeline {
-    VernonLoadedPipeline() = default;
-    VernonLoadedPipeline(const VernonLoadedPipeline &) = delete;
-    VernonLoadedPipeline &operator=(const VernonLoadedPipeline &) = delete;
-    VernonLoadedPipeline(VernonLoadedPipeline &&) noexcept;
-    VernonLoadedPipeline &operator=(VernonLoadedPipeline &&) noexcept;
-    ~VernonLoadedPipeline();
+struct VernonProgramExecutable {
+    VernonProgramExecutable() = default;
+    VernonProgramExecutable(const VernonProgramExecutable &) = delete;
+    VernonProgramExecutable &operator=(const VernonProgramExecutable &) = delete;
+    VernonProgramExecutable(VernonProgramExecutable &&) noexcept;
+    VernonProgramExecutable &operator=(VernonProgramExecutable &&) noexcept;
+    ~VernonProgramExecutable();
 
     VernonRuntimeContext *context{};
     vernon::runtime::Variant variant;
@@ -133,8 +133,8 @@ struct VernonLoadedPipeline {
     vernon::runtime::DispatchContract dispatchContract;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
     std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
-    std::shared_ptr<VernonPipelineTopology> topology;
-    std::optional<VernonDifferentiatedPipeline> differentiated;
+    std::shared_ptr<VernonProgramTopology> topology;
+    std::optional<VernonDifferentiatedProgram> differentiated;
     void *backendState{};
     void (*destroyBackendState)(void *){};
 };
@@ -146,13 +146,13 @@ struct VernonProgramStageBinding {
 };
 
 struct VernonResolvedProgramStage {
-    std::unique_ptr<VernonLoadedPipeline> pipeline;
+    std::unique_ptr<VernonProgramExecutable> pipeline;
     std::vector<VernonProgramStageBinding> bindings;
     vernon::runtime::program::DispatchMapping dispatchMapping{vernon::runtime::program::DispatchMapping::StaticGrid};
 };
 
-struct VernonPipelineTopology {
-    ~VernonPipelineTopology();
+struct VernonProgramTopology {
+    ~VernonProgramTopology();
 
     std::shared_ptr<const vernon::runtime::program::ResolvedProgram> resolvedProgram;
     // Stable leaf/path backing for C-ABI reflection. Slot identity, role,
@@ -165,8 +165,8 @@ struct VernonPipelineTopology {
     std::string programCheckpointPolicy;
 };
 
-inline VernonLoadedPipeline::VernonLoadedPipeline(VernonLoadedPipeline &&) noexcept = default;
-inline VernonLoadedPipeline &VernonLoadedPipeline::operator=(VernonLoadedPipeline &&) noexcept = default;
-inline VernonLoadedPipeline::~VernonLoadedPipeline() = default;
+inline VernonProgramExecutable::VernonProgramExecutable(VernonProgramExecutable &&) noexcept = default;
+inline VernonProgramExecutable &VernonProgramExecutable::operator=(VernonProgramExecutable &&) noexcept = default;
+inline VernonProgramExecutable::~VernonProgramExecutable() = default;
 
 #endif

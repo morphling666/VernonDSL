@@ -30,7 +30,7 @@
 
 namespace vernon::runtime {
 
-bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveBackendPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
     if (bundle.context->backend == VERNON_RUNTIME_CPU)
         return resolveCpuPipeline(bundle, variant, pipeline);
     if (bundle.context->backend == VERNON_RUNTIME_CUDA)
@@ -47,7 +47,7 @@ bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant
     return false;
 }
 
-void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
+void destroyBackendPipeline(VernonProgramExecutable &pipeline) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU) {
         destroyCpuPipeline(pipeline);
     } else if (pipeline.context->backend == VERNON_RUNTIME_CUDA) {
@@ -64,7 +64,7 @@ void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
     destroyRuntimeBackendState(pipeline);
 }
 
-VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeBackendPipeline(VernonProgramExecutable &pipeline, const VernonProgramSubmitDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA)
         return VERNON_STATUS_OK;
@@ -77,7 +77,7 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
     return invokeOpenGLGraphicsPipeline(pipeline, invocation, plan);
 }
 
-VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan) {
+VernonStatus invokeBackendComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &plan) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU)
         return invokeCpuComputePipeline(pipeline, plan);
     if (pipeline.context->backend == VERNON_RUNTIME_CUDA)
@@ -95,7 +95,7 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
 
 #if defined(VERNON_RUNTIME_TESTING)
 VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
-                                                     const VernonLoadedPipeline *pipeline) {
+                                                     const VernonProgramExecutable *pipeline) {
     VulkanGraphicsCacheStats result;
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (!context || !pipeline || pipeline->context != context || context->backend != VERNON_RUNTIME_VULKAN)
@@ -122,7 +122,7 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     return result;
 }
 
-size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline) {
+size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
         return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;
@@ -132,7 +132,7 @@ size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pip
     return 0;
 }
 
-size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline) {
+size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
         return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;

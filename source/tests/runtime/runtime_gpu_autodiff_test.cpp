@@ -254,13 +254,13 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr uint64_t shape[]{2, 2};
@@ -279,19 +279,19 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(owned.device(), &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderObject providerEncoder{};
     ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(context, encoder, &providerEncoder), VERNON_STATUS_OK);
-    VernonPipelineInvocation invalidInvocation{};
+    VernonProgramSubmitDescriptor invalidInvocation{};
     invalidInvocation.struct_size = sizeof(invalidInvocation);
     invalidInvocation.abi_version = VERNON_PIPELINE_VERSION;
     invalidInvocation.argument_count = 1;
     invalidInvocation.compute_grid = {1, 1, 1};
     VernonPullback *invalidPullback = nullptr;
-    EXPECT_EQ(vernonAdPipelineEncodeForward(providerEncoder, pipeline, &invalidInvocation, &inputs, &invalidPullback),
+    EXPECT_EQ(vernonAdProgramEncodeForward(providerEncoder, pipeline, &invalidInvocation, &inputs, &invalidPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(invalidPullback, nullptr);
     EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(owned.device(), encoder), VERNON_RHI_STATUS_OK);
 
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_EQ(loss, (std::array<float, 4>{4.0f, 9.0f, 25.0f, 49.0f}));
@@ -419,8 +419,8 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceCotangent), VERNON_RHI_STATUS_OK);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
 void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
@@ -434,13 +434,13 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr uint64_t shape[]{2, 2};
@@ -463,7 +463,7 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
         loss.fill(-91.0f);
         VernonPullback *failedPullback = nullptr;
         setFailureInjectionForTesting(boundary);
-        EXPECT_NE(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &failedPullback), VERNON_STATUS_OK)
+        EXPECT_NE(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &failedPullback), VERNON_STATUS_OK)
             << static_cast<int>(boundary);
         clearFailureInjectionForTesting();
         EXPECT_EQ(failedPullback, nullptr);
@@ -474,7 +474,7 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     values = original;
     loss.fill(0.0f);
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
 
@@ -499,8 +499,8 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
 void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath, bool dynamic) {
@@ -513,13 +513,13 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr size_t laneCount = 8;
@@ -542,7 +542,7 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     for (size_t lane = 0; lane < laneCount; ++lane)
@@ -693,8 +693,8 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), deviceSeed), VERNON_RHI_STATUS_OK);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
 void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
@@ -707,13 +707,13 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr size_t laneCount = 192;
@@ -739,7 +739,7 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     for (size_t lane = 0; lane < laneCount; ++lane) {
@@ -781,8 +781,8 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     EXPECT_NEAR(gradient, expected, 0.5f);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
 }
 
 #if defined(VERNON_GPU_AUTODIFF_VULKAN_MANIFEST)

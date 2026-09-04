@@ -82,15 +82,15 @@ public:
     OwnedPipeline &operator=(const OwnedPipeline &) = delete;
     ~OwnedPipeline();
 
-    VernonLoadedPipeline *get() const { return value_; }
-    VernonLoadedPipeline &operator*() const { return *value_; }
-    VernonLoadedPipeline *operator->() const { return value_; }
+    VernonProgramExecutable *get() const { return value_; }
+    VernonProgramExecutable &operator*() const { return *value_; }
+    VernonProgramExecutable *operator->() const { return value_; }
     bool create(VernonRuntimeContext &context, const Stage &stage);
 
 private:
     void reset();
 
-    VernonLoadedPipeline *value_{};
+    VernonProgramExecutable *value_{};
 };
 
 using DeviceValues = std::unordered_map<std::string, DeviceValue>;

@@ -177,7 +177,7 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
 
 } // namespace
 
-bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveCpuPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
     auto state = std::make_unique<CpuPipelineState>();
     CpuKernelState kernel;
     ReflectedEntry reflection;
@@ -189,13 +189,13 @@ bool resolveCpuPipeline(VernonPipelineBundle &bundle, const Variant &variant, Ve
     return true;
 }
 
-void destroyCpuPipeline(VernonLoadedPipeline &pipeline) {
+void destroyCpuPipeline(VernonProgramExecutable &pipeline) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.bindings);
     vernonRuntimeCorePipelineDestroy(state.pipeline);
 }
 
-VernonStatus invokeCpuComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeCpuComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     for (size_t index = 0; index < state.layout.size(); ++index) {
         const auto &layout = state.layout[index];

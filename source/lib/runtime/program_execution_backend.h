@@ -10,11 +10,11 @@
 
 namespace vernon::runtime::program {
 
-VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                 size_t programJsonSize, const char *artifactSystemJson,
-                                                 size_t artifactSystemJsonSize,
-                                                 const std::map<std::string, std::string> &stageBindings,
-                                                 const std::filesystem::path &bundleRoot, std::string &error);
+VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
+                                                    size_t programJsonSize, const char *artifactSystemJson,
+                                                    size_t artifactSystemJsonSize,
+                                                    const std::map<std::string, std::string> &stageBindings,
+                                                    const std::filesystem::path &bundleRoot, std::string &error);
 
 } // namespace vernon::runtime::program
 

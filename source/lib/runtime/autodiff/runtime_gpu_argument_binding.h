@@ -15,8 +15,8 @@ bool materializeInternalBufferView(const shape::DeclaredShape &declaredShape, co
                                    size_t logicalBytes, InternalBufferView &view);
 bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter &parameter, const DeviceBuffer &buffer,
                                   size_t logicalBytes, InternalBufferView &view,
-                                  std::vector<VernonPipelineArgument> &arguments);
-bool appendBindingArgument(const Binding &binding, std::vector<VernonPipelineArgument> &arguments);
+                                  std::vector<VernonProgramArgument> &arguments);
+bool appendBindingArgument(const Binding &binding, std::vector<VernonProgramArgument> &arguments);
 
 } // namespace vernon::runtime::ad::gpu
 

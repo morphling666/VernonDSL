@@ -25,16 +25,16 @@ std::string runtimeError(VernonRuntimeContext *runtime) {
 }
 
 bool findParameter(VernonProgramExecutable *pipeline, const char *name, size_t size,
-                   VernonPipelineParameterView &parameter) {
+                   VernonProgramParameterView &parameter) {
     return vernonRuntimeProgramExecutableFindParameter(pipeline, {name, size}, &parameter) == VERNON_STATUS_OK;
 }
 
-VernonPipelineArgument hostArgument(const VernonPipelineParameterView &parameter, const void *data, size_t size,
-                                    uint32_t rank = 0, const uint64_t *shape = nullptr,
-                                    const int64_t *strides = nullptr) {
-    VernonPipelineArgument argument{};
+VernonProgramArgument hostArgument(const VernonProgramParameterView &parameter, const void *data, size_t size,
+                                   uint32_t rank = 0, const uint64_t *shape = nullptr,
+                                   const int64_t *strides = nullptr) {
+    VernonProgramArgument argument{};
     argument.slot = parameter.slot;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_HOST;
     argument.tensor.host_data = data;
@@ -50,7 +50,7 @@ VernonPipelineArgument hostArgument(const VernonPipelineParameterView &parameter
 class MandelbulbRenderPass final : public vernon::execution::RenderPass {
 public:
     MandelbulbRenderPass(vernon::execution::GraphImage target, VernonRuntimeContext *runtime,
-                         VernonProgramExecutable *pipeline, VernonPipelineInvocation *invocation)
+                         VernonProgramExecutable *pipeline, VernonProgramSubmitDescriptor *invocation)
         : RenderPass("mandelbulb-raymarch"), target_(target), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -69,7 +69,7 @@ public:
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        if (vernonRuntimePipelineEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK)
+        if (vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_OK;
         std::cerr << "Mandelbulb encode failed: " << runtimeError(runtime_) << '\n';
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -79,7 +79,7 @@ private:
     vernon::execution::GraphImage target_;
     VernonRuntimeContext *runtime_{};
     VernonProgramExecutable *pipeline_{};
-    VernonPipelineInvocation *invocation_{};
+    VernonProgramSubmitDescriptor *invocation_{};
 };
 
 class MandelbulbPanel final : public ExternalEnginePanel {
@@ -102,9 +102,9 @@ public:
         if (!runtime_)
             return false;
         bundle_ =
-            vernonRuntimeLoadPipelineBundleWithOptions(runtime_, vernon_external_engine::graphics_bundle::kManifest,
-                                                       vernon_external_engine::graphics_bundle::kManifestSize, nullptr);
-        pipeline_ = bundle_ ? vernonRuntimeResolvePipeline(bundle_, {nullptr, 0}) : nullptr;
+            vernonRuntimeLoadProgramBundleWithOptions(runtime_, vernon_external_engine::graphics_bundle::kManifest,
+                                                      vernon_external_engine::graphics_bundle::kManifestSize, nullptr);
+        pipeline_ = bundle_ ? vernonRuntimeResolveProgram(bundle_, {nullptr, 0}) : nullptr;
         if (!pipeline_) {
             std::cerr << "failed to load the Mandelbulb pipeline: " << runtimeError(runtime_) << '\n';
             return false;
@@ -127,7 +127,7 @@ public:
 
         const char *names[] = {"position", "camera_position", "camera_target", "time",
                                "power",    "max_iterations",  "max_steps",     "shadow_steps"};
-        std::array<VernonPipelineParameterView, 8> parameters{};
+        std::array<VernonProgramParameterView, 8> parameters{};
         for (size_t index = 0; index < parameters.size(); ++index)
             if (!findParameter(pipeline_, names[index], std::char_traits<char>::length(names[index]),
                                parameters[index]))
@@ -273,9 +273,9 @@ private:
     int32_t maxIterations_{18};
     int32_t maxSteps_{112};
     int32_t shadowSteps_{32};
-    std::array<VernonPipelineArgument, 8> arguments_{};
+    std::array<VernonProgramArgument, 8> arguments_{};
     VernonColorAttachment attachment_{};
-    VernonPipelineInvocation invocation_{};
+    VernonProgramSubmitDescriptor invocation_{};
     std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
     uint32_t renderWidth_{};
     uint32_t renderHeight_{};

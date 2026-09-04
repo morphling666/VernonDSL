@@ -172,7 +172,7 @@ private:
         if (!materializeBindingPlan((*backward_)->variant, *bindingSpecs_, retainedDevices_, retainedHosts_, working,
                                     derivatives.devices, bindings, bindingError))
             return fail(context_, std::move(bindingError), VERNON_STATUS_INTERNAL_ERROR);
-        std::vector<VernonPipelineArgument> arguments;
+        std::vector<VernonProgramArgument> arguments;
         arguments.reserve(bindings.size());
         const uint32_t launchData[3]{grid_.x, grid_.y, grid_.z};
         DeviceBuffer launchBuffer(context_, sizeof(launchData));
@@ -445,7 +445,7 @@ private:
                     {replayStatus.handle(), 0, &emptySummary, sizeof(emptySummary)}};
                 if (firstBatch)
                     uploads.push_back({launch.handle(), 0, launchData, sizeof(launchData)});
-                std::vector<VernonPipelineArgument> arguments;
+                std::vector<VernonProgramArgument> arguments;
                 ReplayArgumentViews views;
                 if (!appendReplayArguments(context_, forwardBindings, tape, tapeBytes, segment, segmentBytes,
                                            replayStatus, statusBufferBytes, launch, sizeof(launchData), views,
@@ -525,7 +525,7 @@ private:
                     {segment.handle(), 0, metadata.data(), metadata.size() * sizeof(Segment)},
                     {replayStatus.handle(), 0, &emptySummary, sizeof(emptySummary)},
                     {launch.handle(), 0, launchData, sizeof(launchData)}};
-                std::vector<VernonPipelineArgument> arguments;
+                std::vector<VernonProgramArgument> arguments;
                 ReplayArgumentViews forwardViews;
                 if (!appendReplayArguments(context_, forwardBindings, tape, tapeBytes, segment, segmentBytes,
                                            replayStatus, statusBufferBytes, launch, sizeof(launchData), forwardViews,
@@ -610,7 +610,7 @@ private:
                     return fail(context_, "cannot roll back GPU replay after Tape retry", VERNON_STATUS_INTERNAL_ERROR);
             }
 
-            std::vector<VernonPipelineArgument> arguments;
+            std::vector<VernonProgramArgument> arguments;
             ReplayArgumentViews backwardViews;
             if (!appendReplayArguments(context_, backwardBindings, tape, tapeBytes, segment, segmentBytes, replayStatus,
                                        statusBufferBytes, launch, sizeof(launchData), backwardViews, arguments,

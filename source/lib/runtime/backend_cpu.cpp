@@ -410,7 +410,7 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     return false;
 }
 
-void setCpuProgramTape(VernonLoadedPipeline &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root) {
+void setCpuProgramTape(VernonProgramExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     state.tapeAllocator = allocator;
     state.tapeRoot = root;

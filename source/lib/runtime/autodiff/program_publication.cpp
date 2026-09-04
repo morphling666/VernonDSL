@@ -16,20 +16,20 @@ bool sameResourceReference(const VernonRuntimeProviderResourceReference &lhs,
            lhs.size == rhs.size;
 }
 
-bool sameBoundaryBinding(const VernonPipelineArgument &lhs, const VernonPipelineArgument &rhs) {
+bool sameBoundaryBinding(const VernonProgramArgument &lhs, const VernonProgramArgument &rhs) {
     if (lhs.kind != rhs.kind)
         return false;
     switch (lhs.kind) {
-    case VERNON_PIPELINE_TENSOR:
+    case VERNON_PROGRAM_TENSOR:
         if (lhs.tensor.storage != rhs.tensor.storage || lhs.tensor.byte_offset != rhs.tensor.byte_offset ||
             lhs.tensor.byte_size != rhs.tensor.byte_size)
             return false;
         return lhs.tensor.storage == VERNON_TENSOR_HOST
                    ? lhs.tensor.host_data == rhs.tensor.host_data
                    : sameResourceReference(lhs.tensor.resource, rhs.tensor.resource);
-    case VERNON_PIPELINE_IMAGE:
+    case VERNON_PROGRAM_IMAGE:
         return sameResourceReference(lhs.image.view, rhs.image.view);
-    case VERNON_PIPELINE_SAMPLER:
+    case VERNON_PROGRAM_SAMPLER:
         return sameResourceReference(lhs.resource, rhs.resource);
     }
     return false;
@@ -126,7 +126,7 @@ bool planTensorCopy(const VernonTensorView &source, const VernonTensorView &dest
 
 } // namespace
 
-bool ProgramOwnerBindings::bind(program::ProgramOwnerId owner, const VernonPipelineArgument &argument,
+bool ProgramOwnerBindings::bind(program::ProgramOwnerId owner, const VernonProgramArgument &argument,
                                 std::string &error) {
     const auto [binding, inserted] = bindings_.emplace(std::make_pair(owner.kind, owner.id), argument);
     if (!inserted && !sameBoundaryBinding(binding->second, argument)) {
@@ -173,9 +173,9 @@ bool commitProgramPublications(const std::vector<ProgramHostValue> &storage,
             error = "PublicationPlan target exceeds its invocation frame";
             return false;
         }
-        const VernonPipelineArgument &staged = storage[publication.target->value].argument;
+        const VernonProgramArgument &staged = storage[publication.target->value].argument;
         const VernonTensorView &destination = publication.destination.tensor;
-        if (staged.kind != VERNON_PIPELINE_TENSOR || staged.tensor.storage != VERNON_TENSOR_HOST ||
+        if (staged.kind != VERNON_PROGRAM_TENSOR || staged.tensor.storage != VERNON_TENSOR_HOST ||
             !staged.tensor.host_data || destination.storage != VERNON_TENSOR_HOST || !destination.host_data ||
             staged.tensor.rank != destination.rank) {
             error = "PublicationPlan cannot commit its staged host Storage";
@@ -207,14 +207,14 @@ bool devicePublicationCopies(const ProgramInvocationFrame &frame,
             error = "PublicationPlan device target is missing";
             return false;
         }
-        const VernonPipelineArgument *stagedArgument = frame.argument(publication.target->value);
+        const VernonProgramArgument *stagedArgument = frame.argument(publication.target->value);
         const VernonRhiBuffer staged = frame.buffer(publication.target->value);
         if (staged.index == VERNON_RHI_INVALID_HANDLE_INDEX) {
             error = "PublicationPlan device target has no staged buffer";
             return false;
         }
         const VernonTensorView &destination = publication.destination.tensor;
-        if (!stagedArgument || stagedArgument->kind != VERNON_PIPELINE_TENSOR) {
+        if (!stagedArgument || stagedArgument->kind != VERNON_PROGRAM_TENSOR) {
             error = "PublicationPlan device target has no Tensor view";
             return false;
         }

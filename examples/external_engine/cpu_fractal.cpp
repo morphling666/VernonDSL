@@ -36,7 +36,7 @@ std::string runtimeError(VernonRuntimeContext *runtime) {
 class FractalComputePass final : public vernon::execution::ComputePass {
 public:
     FractalComputePass(vernon::execution::GraphBuffer pixels, VernonRuntimeContext *runtime,
-                       VernonProgramExecutable *pipeline, VernonPipelineInvocation *invocation)
+                       VernonProgramExecutable *pipeline, VernonProgramSubmitDescriptor *invocation)
         : ComputePass("fractal-compute"), pixels_(pixels), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -45,7 +45,7 @@ public:
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
                             const vernon::execution::ExecutionResources &) override {
         VernonSubmission *submission{};
-        if (vernonRuntimePipelineSubmit(pipeline_, invocation_, &submission) == VERNON_STATUS_OK &&
+        if (vernonRuntimeProgramSubmit(pipeline_, invocation_, &submission) == VERNON_STATUS_OK &&
             vernonSubmissionWait(submission) == VERNON_STATUS_OK) {
             vernonSubmissionDestroy(submission);
             return VERNON_RHI_STATUS_OK;
@@ -59,7 +59,7 @@ private:
     vernon::execution::GraphBuffer pixels_;
     VernonRuntimeContext *runtime_{};
     VernonProgramExecutable *pipeline_{};
-    VernonPipelineInvocation *invocation_{};
+    VernonProgramSubmitDescriptor *invocation_{};
 };
 
 class FractalPresentPass final : public vernon::execution::ComputePass {
@@ -132,16 +132,16 @@ public:
         const VernonProgramBundleLoadOptions *loadOptions = &desktopOptions;
 #endif
         bundle_ =
-            vernonRuntimeLoadPipelineBundleWithOptions(runtime_, vernon_external_engine::cpu_bundle::kManifest,
-                                                       vernon_external_engine::cpu_bundle::kManifestSize, loadOptions);
-        pipeline_ = bundle_ ? vernonRuntimeResolvePipeline(bundle_, {nullptr, 0}) : nullptr;
+            vernonRuntimeLoadProgramBundleWithOptions(runtime_, vernon_external_engine::cpu_bundle::kManifest,
+                                                      vernon_external_engine::cpu_bundle::kManifestSize, loadOptions);
+        pipeline_ = bundle_ ? vernonRuntimeResolveProgram(bundle_, {nullptr, 0}) : nullptr;
         if (!pipeline_) {
             std::cerr << "failed to load the fractal pipeline: " << runtimeError(runtime_) << '\n';
             return false;
         }
 
-        VernonPipelineParameterView pixelsParameter{};
-        VernonPipelineParameterView timeParameter{};
+        VernonProgramParameterView pixelsParameter{};
+        VernonProgramParameterView timeParameter{};
         if (vernonRuntimeProgramExecutableFindParameter(pipeline_, {"pixels", 6}, &pixelsParameter) !=
                 VERNON_STATUS_OK ||
             vernonRuntimeProgramExecutableFindParameter(pipeline_, {"time", 4}, &timeParameter) != VERNON_STATUS_OK)
@@ -150,7 +150,7 @@ public:
         rgba_.resize(pixels_.size() * 4);
 
         arguments_[0].slot = pixelsParameter.slot;
-        arguments_[0].kind = VERNON_PIPELINE_TENSOR;
+        arguments_[0].kind = VERNON_PROGRAM_TENSOR;
         arguments_[0].tensor.struct_size = sizeof(VernonTensorView);
         arguments_[0].tensor.storage = VERNON_TENSOR_HOST;
         arguments_[0].tensor.host_data = pixels_.data();
@@ -161,7 +161,7 @@ public:
         arguments_[0].tensor.byte_strides = kPixelStrides;
         arguments_[0].tensor.byte_size = pixels_.size() * sizeof(float);
         arguments_[1].slot = timeParameter.slot;
-        arguments_[1].kind = VERNON_PIPELINE_TENSOR;
+        arguments_[1].kind = VERNON_PROGRAM_TENSOR;
         arguments_[1].tensor.struct_size = sizeof(VernonTensorView);
         arguments_[1].tensor.storage = VERNON_TENSOR_HOST;
         arguments_[1].tensor.host_data = &time_;
@@ -243,8 +243,8 @@ private:
     std::vector<float> pixels_;
     std::vector<uint8_t> rgba_;
     float time_{};
-    std::array<VernonPipelineArgument, 2> arguments_{};
-    VernonPipelineInvocation invocation_{};
+    std::array<VernonProgramArgument, 2> arguments_{};
+    VernonProgramSubmitDescriptor invocation_{};
     std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
 };
 

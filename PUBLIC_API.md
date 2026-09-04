@@ -51,7 +51,7 @@ are stable once published in a 0.1 release. Unreleased API drafts may be
 replaced without compatibility wrappers before their first release.
 
 Execution is submission-based. Runtime pipelines use
-`vernonRuntimePipelineSubmit`, and RHI command encoders are consumed by
+`vernonRuntimeProgramSubmit`, and RHI command encoders are consumed by
 `vernonRhiDeviceSubmit`. A submission may already be
 complete; callers use its state query or `wait()` method. C callers explicitly
 destroy submission/completion handles, while C++ and Python submissions use

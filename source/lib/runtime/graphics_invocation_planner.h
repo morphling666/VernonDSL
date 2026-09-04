@@ -17,7 +17,7 @@
 
 namespace vernon::runtime {
 
-using PipelineArgumentMap = std::unordered_map<uint32_t, const VernonPipelineArgument *>;
+using PipelineArgumentMap = std::unordered_map<uint32_t, const VernonProgramArgument *>;
 
 enum PlannedShaderStage : uint32_t { PLANNED_STAGE_VERTEX = 1u << 0, PLANNED_STAGE_FRAGMENT = 1u << 1 };
 
@@ -69,11 +69,11 @@ struct PreparedGraphicsVariant {
     VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
-bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+bool planGraphicsInvocation(const Variant &variant, const VernonProgramSubmitDescriptor &invocation,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error);
-bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorCount, bool hasDepth, bool hasStencil,
-                       PlannedGraphicsState &state, std::string &error);
+bool planGraphicsState(const VernonProgramSubmitDescriptor &invocation, size_t colorCount, bool hasDepth,
+                       bool hasStencil, PlannedGraphicsState &state, std::string &error);
 VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
                                    PreparedGraphicsVariant &prepared);
 void destroyGraphicsVariant(PreparedGraphicsVariant &prepared);

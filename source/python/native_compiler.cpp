@@ -194,30 +194,30 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_cooked_asset", &Runtime::loadCookedAsset, nb::keep_alive<0, 1>())
         .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("program"), nb::arg("artifact_system"),
              nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
-    nb::class_<PipelineParameterMetadata>(module, "PipelineParameter")
-        .def_ro("slot", &PipelineParameterMetadata::slot)
-        .def_ro("name", &PipelineParameterMetadata::name)
-        .def_prop_ro("kind", [](const PipelineParameterMetadata &value) { return static_cast<uint32_t>(value.kind); })
-        .def_ro("element_byte_size", &PipelineParameterMetadata::elementByteSize)
-        .def_ro("element_alignment", &PipelineParameterMetadata::elementAlignment)
-        .def_ro("layout_hash", &PipelineParameterMetadata::layoutHash)
+    nb::class_<ProgramParameterMetadata>(module, "ProgramParameter")
+        .def_ro("slot", &ProgramParameterMetadata::slot)
+        .def_ro("name", &ProgramParameterMetadata::name)
+        .def_prop_ro("kind", [](const ProgramParameterMetadata &value) { return static_cast<uint32_t>(value.kind); })
+        .def_ro("element_byte_size", &ProgramParameterMetadata::elementByteSize)
+        .def_ro("element_alignment", &ProgramParameterMetadata::elementAlignment)
+        .def_ro("layout_hash", &ProgramParameterMetadata::layoutHash)
         .def_prop_ro("element_leaves",
-                     [](const PipelineParameterMetadata &value) {
+                     [](const ProgramParameterMetadata &value) {
                          nb::list leaves;
                          for (const VernonValueLeafView &leaf : value.elementLeaves)
                              leaves.append(nb::make_tuple(leaf.dtype, leaf.scalar_count, leaf.byte_offset));
                          return leaves;
                      })
         .def_prop_ro("access",
-                     [](const PipelineParameterMetadata &value) { return static_cast<uint32_t>(value.access); })
-        .def_ro("shape", &PipelineParameterMetadata::shape);
-    nb::class_<PipelineOutputMetadata>(module, "PipelineOutput")
-        .def_ro("name", &PipelineOutputMetadata::name)
-        .def_prop_ro("kind", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.kind); })
-        .def_prop_ro("dtype", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.dtype); })
-        .def_prop_ro("access", [](const PipelineOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
-        .def_ro("shape", &PipelineOutputMetadata::shape)
-        .def_ro("location", &PipelineOutputMetadata::location);
+                     [](const ProgramParameterMetadata &value) { return static_cast<uint32_t>(value.access); })
+        .def_ro("shape", &ProgramParameterMetadata::shape);
+    nb::class_<ProgramOutputMetadata>(module, "ProgramOutput")
+        .def_ro("name", &ProgramOutputMetadata::name)
+        .def_prop_ro("kind", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.kind); })
+        .def_prop_ro("dtype", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.dtype); })
+        .def_prop_ro("access", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
+        .def_ro("shape", &ProgramOutputMetadata::shape)
+        .def_ro("location", &ProgramOutputMetadata::location);
     nb::class_<PythonRuntimeSubmission>(module, "Submission")
         .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("state", &PythonRuntimeSubmission::state);
@@ -240,54 +240,53 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("mark_all", &vernon::runtime::DirtyIndexSet::markAll)
         .def("clear", &vernon::runtime::DirtyIndexSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
-    nb::class_<PreparedPipelineArgument>(module, "_PreparedPipelineArgument");
-    nb::class_<PipelineInvocationBuilder>(module, "PipelineInvocationBuilder")
-        .def("prepare_host_tensor", &PipelineInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
+    nb::class_<PreparedProgramArgument>(module, "_PreparedPipelineArgument");
+    nb::class_<ProgramInvocationBuilder>(module, "ProgramInvocationBuilder")
+        .def("prepare_host_tensor", &ProgramInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
-        .def("prepare_rhi_tensor", &PipelineInvocationBuilder::prepareRhiTensor, nb::arg("parameter"),
-             nb::arg("buffer"), nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0)
-        .def("prepare_rhi_texture", &PipelineInvocationBuilder::prepareRhiTexture, nb::arg("parameter"),
+        .def("prepare_rhi_tensor", &ProgramInvocationBuilder::prepareRhiTensor, nb::arg("parameter"), nb::arg("buffer"),
+             nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0)
+        .def("prepare_rhi_texture", &ProgramInvocationBuilder::prepareRhiTexture, nb::arg("parameter"),
              nb::arg("texture"))
-        .def("prepare_rhi_sampler", &PipelineInvocationBuilder::prepareRhiSampler, nb::arg("parameter"),
+        .def("prepare_rhi_sampler", &ProgramInvocationBuilder::prepareRhiSampler, nb::arg("parameter"),
              nb::arg("sampler"))
-        .def("prepared_argument", &PipelineInvocationBuilder::preparedArgument, nb::arg("argument"),
+        .def("prepared_argument", &ProgramInvocationBuilder::preparedArgument, nb::arg("argument"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
-        .def("host_tensor", &PipelineInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
+        .def("host_tensor", &ProgramInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
-        .def("rhi_tensor", &PipelineInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
+        .def("rhi_tensor", &ProgramInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
              nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_texture", &PipelineInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
+        .def("rhi_texture", &ProgramInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_sampler", &PipelineInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
+        .def("rhi_sampler", &ProgramInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_color_attachment", &PipelineInvocationBuilder::rhiColorAttachment, nb::arg("location"),
+        .def("rhi_color_attachment", &ProgramInvocationBuilder::rhiColorAttachment, nb::arg("location"),
              nb::arg("texture"), nb::arg("load_operation"), nb::arg("store_operation"), nb::arg("clear_color"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_depth_attachment", &PipelineInvocationBuilder::rhiDepthAttachment, nb::arg("texture"),
+        .def("rhi_depth_attachment", &ProgramInvocationBuilder::rhiDepthAttachment, nb::arg("texture"),
              nb::arg("load_operation"), nb::arg("store_operation"), nb::arg("clear_depth"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
-        .def("rhi_index_binding", &PipelineInvocationBuilder::rhiIndexBinding, nb::arg("buffer"), nb::arg("count"),
+        .def("rhi_index_binding", &ProgramInvocationBuilder::rhiIndexBinding, nb::arg("buffer"), nb::arg("count"),
              nb::arg("offset") = 0, nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
-        .def("topology", &PipelineInvocationBuilder::setTopology, nb::arg("topology"),
+        .def("topology", &ProgramInvocationBuilder::setTopology, nb::arg("topology"), nb::rv_policy::reference_internal)
+        .def("counts", &ProgramInvocationBuilder::counts, nb::arg("vertex_count") = 0, nb::arg("instance_count") = 0,
              nb::rv_policy::reference_internal)
-        .def("counts", &PipelineInvocationBuilder::counts, nb::arg("vertex_count") = 0, nb::arg("instance_count") = 0,
+        .def("grid", &ProgramInvocationBuilder::grid, nb::arg("x"), nb::arg("y"), nb::arg("z"),
              nb::rv_policy::reference_internal)
-        .def("grid", &PipelineInvocationBuilder::grid, nb::arg("x"), nb::arg("y"), nb::arg("z"),
-             nb::rv_policy::reference_internal)
-        .def("viewport", &PipelineInvocationBuilder::setViewport, nb::arg("x"), nb::arg("y"), nb::arg("width"),
+        .def("viewport", &ProgramInvocationBuilder::setViewport, nb::arg("x"), nb::arg("y"), nb::arg("width"),
              nb::arg("height"), nb::rv_policy::reference_internal)
-        .def("scissor", &PipelineInvocationBuilder::setScissor, nb::arg("x"), nb::arg("y"), nb::arg("width"),
+        .def("scissor", &ProgramInvocationBuilder::setScissor, nb::arg("x"), nb::arg("y"), nb::arg("width"),
              nb::arg("height"), nb::rv_policy::reference_internal)
-        .def("graphics_state", &PipelineInvocationBuilder::setGraphicsState, nb::arg("state"),
+        .def("graphics_state", &ProgramInvocationBuilder::setGraphicsState, nb::arg("state"),
              nb::rv_policy::reference_internal)
-        .def("stencil_reference", &PipelineInvocationBuilder::setStencilReference, nb::arg("value"),
+        .def("stencil_reference", &ProgramInvocationBuilder::setStencilReference, nb::arg("value"),
              nb::rv_policy::reference_internal)
-        .def("encode", [](PipelineInvocationBuilder &builder,
+        .def("encode", [](ProgramInvocationBuilder &builder,
                           const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
-        .def("encode", [](PipelineInvocationBuilder &builder,
+        .def("encode", [](ProgramInvocationBuilder &builder,
                           const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
-        .def("submit", [](PipelineInvocationBuilder &builder) { return builder.submit(); });
+        .def("submit", [](ProgramInvocationBuilder &builder) { return builder.submit(); });
     nb::class_<PythonProgramInvocationAdapter>(module, "_ProgramInvocation")
         .def_prop_ro("builder", &PythonProgramInvocationAdapter::builderView, nb::rv_policy::reference_internal)
         .def("bind", &PythonProgramInvocationAdapter::bind, nb::arg("slot"), nb::arg("token"), nb::arg("prepare"),
@@ -327,24 +326,24 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("atomic_publication_count", &PythonPullback::atomicPublicationCount)
         .def_prop_ro("temporary_allocation_traffic_bytes", &PythonPullback::temporaryAllocationTrafficBytes)
         .def_prop_ro("device_wait_nanoseconds", &PythonPullback::deviceWaitNanoseconds);
-    nb::class_<LoadedPipeline>(module, "LoadedPipeline")
-        .def("invocation_builder", &LoadedPipeline::invocationBuilder, nb::keep_alive<0, 1>())
+    nb::class_<PythonProgramExecutable>(module, "ProgramExecutable")
+        .def("invocation_builder", &PythonProgramExecutable::invocationBuilder, nb::keep_alive<0, 1>())
         .def(
             "program_instance",
-            [](LoadedPipeline &pipeline) {
+            [](PythonProgramExecutable &pipeline) {
                 return std::make_unique<PythonProgramInstanceAdapter>(pipeline.owner, pipeline.runtime,
                                                                       pipeline.pipeline);
             },
             nb::keep_alive<0, 1>())
         .def(
             "submit",
-            [](LoadedPipeline &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
+            [](PythonProgramExecutable &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
                 return pipeline.submitCompute(x, y, z, values);
             },
             nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("values"))
         .def(
             "submit",
-            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder) {
+            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder) {
                 if (builder.pipeline != pipeline.pipeline)
                     throw std::invalid_argument("invocation builder belongs to another pipeline");
                 return builder.submit();
@@ -352,7 +351,7 @@ void bindNativeCompiler(nb::module_ &module) {
             nb::arg("builder"))
         .def(
             "vjp",
-            [](LoadedPipeline &pipeline, const nb::dict &bindings, const nb::tuple &grid) {
+            [](PythonProgramExecutable &pipeline, const nb::dict &bindings, const nb::tuple &grid) {
                 if (grid.size() != 3)
                     throw std::invalid_argument("autodiff grid must contain three dimensions");
                 const auto dimension = [&](size_t index) {
@@ -371,8 +370,8 @@ void bindNativeCompiler(nb::module_ &module) {
             nb::arg("bindings"), nb::arg("grid"))
         .def(
             "vjp_encode",
-            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder, vernon::execution::ComputeEncoder &encoder,
-               const nb::dict &bindings, const nb::tuple &grid) {
+            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder,
+               vernon::execution::ComputeEncoder &encoder, const nb::dict &bindings, const nb::tuple &grid) {
                 if (grid.size() != 3)
                     throw std::invalid_argument("autodiff grid must contain three dimensions");
                 const auto dimension = [&](size_t index) {
@@ -390,7 +389,7 @@ void bindNativeCompiler(nb::module_ &module) {
             nb::arg("builder"), nb::arg("encoder"), nb::arg("bindings"), nb::arg("grid"))
         .def(
             "vjp_plan",
-            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder,
+            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder,
                vernon::execution::detail::RhiCommandExecutionPlan &plan, const nb::dict &bindings,
                const nb::tuple &grid) {
                 if (grid.size() != 3)
@@ -407,26 +406,26 @@ void bindNativeCompiler(nb::module_ &module) {
                                     nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
             },
             nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
-        .def("program_forward_bound", &LoadedPipeline::programForwardBound, nb::arg("builder"),
+        .def("program_forward_bound", &PythonProgramExecutable::programForwardBound, nb::arg("builder"),
              nb::call_guard<nb::gil_scoped_release>())
         .def(
             "program_vjp_bound",
-            [](LoadedPipeline &pipeline, PipelineInvocationBuilder &builder, const nb::dict &bindings,
+            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder, const nb::dict &bindings,
                nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
                 return pipeline.programVjpBound(builder, bindings, nb::cast(&pipeline, nb::rv_policy::reference),
                                                 checkpoint_memory_budget, checkpoint_policy);
             },
             nb::arg("builder"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
             nb::arg("checkpoint_policy") = std::string())
-        .def_prop_ro("derivative_groups", &LoadedPipeline::derivativeGroups)
-        .def_prop_ro("program_ad_signature", &LoadedPipeline::programAdSignature)
-        .def_prop_ro("program_abi", &LoadedPipeline::programAbi)
-        .def_prop_ro("is_managed_program", &LoadedPipeline::isManagedProgram)
-        .def_prop_ro("workgroup_size", &LoadedPipeline::workgroupSize)
-        .def_prop_ro("read_footprints", &LoadedPipeline::readFootprints)
-        .def_prop_ro("write_footprints", &LoadedPipeline::writeFootprints)
-        .def_prop_ro("parameters", &LoadedPipeline::parameters)
-        .def_prop_ro("outputs", &LoadedPipeline::outputs);
+        .def_prop_ro("derivative_groups", &PythonProgramExecutable::derivativeGroups)
+        .def_prop_ro("program_ad_signature", &PythonProgramExecutable::programAdSignature)
+        .def_prop_ro("program_abi", &PythonProgramExecutable::programAbi)
+        .def_prop_ro("is_managed_program", &PythonProgramExecutable::isManagedProgram)
+        .def_prop_ro("workgroup_size", &PythonProgramExecutable::workgroupSize)
+        .def_prop_ro("read_footprints", &PythonProgramExecutable::readFootprints)
+        .def_prop_ro("write_footprints", &PythonProgramExecutable::writeFootprints)
+        .def_prop_ro("parameters", &PythonProgramExecutable::parameters)
+        .def_prop_ro("outputs", &PythonProgramExecutable::outputs);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);
     module.attr("DATA_I32") = static_cast<uint32_t>(VERNON_DATA_I32);
     module.attr("DATA_U32") = static_cast<uint32_t>(VERNON_DATA_U32);
@@ -436,9 +435,9 @@ void bindNativeCompiler(nb::module_ &module) {
     module.attr("ACCESS_READ") = static_cast<uint32_t>(VERNON_ACCESS_READ);
     module.attr("ACCESS_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_WRITE);
     module.attr("ACCESS_READ_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_READ_WRITE);
-    module.attr("PIPELINE_TENSOR") = static_cast<uint32_t>(VERNON_PIPELINE_TENSOR);
-    module.attr("PIPELINE_IMAGE") = static_cast<uint32_t>(VERNON_PIPELINE_IMAGE);
-    module.attr("PIPELINE_SAMPLER") = static_cast<uint32_t>(VERNON_PIPELINE_SAMPLER);
+    module.attr("PIPELINE_TENSOR") = static_cast<uint32_t>(VERNON_PROGRAM_TENSOR);
+    module.attr("PIPELINE_IMAGE") = static_cast<uint32_t>(VERNON_PROGRAM_IMAGE);
+    module.attr("PIPELINE_SAMPLER") = static_cast<uint32_t>(VERNON_PROGRAM_SAMPLER);
     module.attr("TOPOLOGY_TRIANGLE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST);
     module.attr("ATTACHMENT_CLEAR") = static_cast<uint32_t>(VERNON_RHI_LOAD_CLEAR);
     module.attr("ATTACHMENT_PRESERVE") = static_cast<uint32_t>(VERNON_RHI_LOAD_PRESERVE);

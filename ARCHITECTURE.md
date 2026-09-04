@@ -588,7 +588,7 @@ manifest + artifacts
   -> select canonical feature variant
   -> resolve stage artifacts
   -> prepare backend layouts/pipelines
-  -> cache VernonLoadedPipeline
+  -> cache VernonProgramExecutable
   -> bind by stable slots
   -> encode through direct endpoint or internal Command DAG
 ```

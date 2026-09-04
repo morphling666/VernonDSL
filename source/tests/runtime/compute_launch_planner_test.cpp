@@ -74,9 +74,9 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> contiguousStride{sizeof(float)};
     const std::array<int64_t, 1> stridedStride{2 * sizeof(float)};
-    VernonPipelineArgument supplied[2]{};
+    VernonProgramArgument supplied[2]{};
     supplied[0].slot = 0;
-    supplied[0].kind = VERNON_PIPELINE_TENSOR;
+    supplied[0].kind = VERNON_PROGRAM_TENSOR;
     supplied[0].tensor = {sizeof(VernonTensorView),
                           VERNON_TENSOR_HOST,
                           {contiguousValues.data()},
@@ -88,7 +88,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
                           0,
                           sizeof(contiguousValues)};
     supplied[1].slot = 1;
-    supplied[1].kind = VERNON_PIPELINE_TENSOR;
+    supplied[1].kind = VERNON_PROGRAM_TENSOR;
     supplied[1].tensor = {sizeof(VernonTensorView),
                           VERNON_TENSOR_HOST,
                           {stridedValues.data()},
@@ -99,7 +99,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
                           stridedStride.data(),
                           0,
                           sizeof(stridedValues)};
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.arguments = supplied;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
@@ -135,9 +135,9 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     const std::array<uint64_t, 2> shape{2, 3};
     const std::array<int64_t, 2> strides{6 * sizeof(float), -static_cast<int64_t>(sizeof(float))};
     const VernonRuntimeProviderResourceReference resource{1, {2}, 0, 12 * sizeof(float)};
-    VernonPipelineArgument supplied{};
+    VernonProgramArgument supplied{};
     supplied.slot = 0;
-    supplied.kind = VERNON_PIPELINE_TENSOR;
+    supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
     supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     supplied.tensor.resource = resource;
@@ -148,7 +148,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 12 * sizeof(float);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
     PlannedComputeLaunch plan;
@@ -193,9 +193,9 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
     parameter.uses.front().tensorViewDescriptor = TensorViewDescriptorUse{0, 1, {}, {}};
     variant.parameters = {parameter};
 
-    VernonPipelineArgument supplied{};
+    VernonProgramArgument supplied{};
     supplied.slot = 0;
-    supplied.kind = VERNON_PIPELINE_TENSOR;
+    supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
     supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     supplied.tensor.resource = {1, {2}, 0, sizeof(float)};
@@ -203,7 +203,7 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
     supplied.tensor.access = VERNON_ACCESS_READ_WRITE;
     supplied.tensor.rank = 0;
     supplied.tensor.byte_size = sizeof(float);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};
@@ -232,9 +232,9 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
 
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> strides{sizeof(float)};
-    VernonPipelineArgument supplied{};
+    VernonProgramArgument supplied{};
     supplied.slot = 0;
-    supplied.kind = VERNON_PIPELINE_TENSOR;
+    supplied.kind = VERNON_PROGRAM_TENSOR;
     supplied.tensor.struct_size = sizeof(VernonTensorView);
     supplied.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     supplied.tensor.resource = {1, {2}, 0, 2 * sizeof(float)};
@@ -244,7 +244,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_size = 2 * sizeof(float);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
 
@@ -261,9 +261,9 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
     const std::array<float, 8> values{};
     const std::array<uint64_t, 1> shape{2};
     const std::array<int64_t, 1> zeroStride{0};
-    VernonPipelineArgument supplied[2]{};
+    VernonProgramArgument supplied[2]{};
     supplied[0].slot = 0;
-    supplied[0].kind = VERNON_PIPELINE_TENSOR;
+    supplied[0].kind = VERNON_PROGRAM_TENSOR;
     supplied[0].tensor = {sizeof(VernonTensorView),
                           VERNON_TENSOR_HOST,
                           {values.data()},
@@ -274,7 +274,7 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
                           zeroStride.data(),
                           0,
                           sizeof(values)};
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.arguments = supplied;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};

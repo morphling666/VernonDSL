@@ -19,7 +19,7 @@ struct PreparedGraphicsDraw {
     VernonRuntimeCoreDrawInvocation invocation{};
 };
 
-bool prepareGraphicsDraw(const VernonPipelineInvocation &invocation, const PlannedGraphicsInvocation &plan,
+bool prepareGraphicsDraw(const VernonProgramSubmitDescriptor &invocation, const PlannedGraphicsInvocation &plan,
                          std::vector<uint32_t> attachmentFormats, uint32_t depthFormat,
                          const std::vector<VernonRuntimeProviderBindingLayoutEntry> &layout,
                          const std::vector<VernonRuntimeProviderBindingValue> &values, PreparedGraphicsDraw &prepared,

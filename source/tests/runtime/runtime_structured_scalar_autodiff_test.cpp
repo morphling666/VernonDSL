@@ -41,13 +41,13 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     EXPECT_EQ(pipeline->topology, nullptr);
     EXPECT_TRUE(pipeline->differentiated.has_value());
@@ -80,7 +80,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
         VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
-        ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
             << lastError(context);
         ASSERT_NE(pullback, nullptr);
         for (float outputValue : outputValues)
@@ -195,7 +195,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {0, 0, 0, 0}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {0, 0, 0, 0}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     for (float outputValue : outputValues)
@@ -220,8 +220,8 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         EXPECT_NEAR(gradientStorage[index], 78.0 * finiteDifference(x, y, z, index), 3e-3);
     vernonPullbackDestroy(pullback);
 
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -241,11 +241,11 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     ASSERT_TRUE(bundle->autodiff.has_value());
     ASSERT_EQ(bundle->autodiff->profiles.size(), 1u);
@@ -270,7 +270,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
         return (objective(positive[0], positive[1], positive[2]) - objective(negative[0], negative[1], negative[2])) /
                (2.0 * epsilon);
     };
-    auto run = [&](VernonLoadedPipeline *pipeline, VernonLaunchSize grid, auto &&verifyAfterForward,
+    auto run = [&](VernonProgramExecutable *pipeline, VernonLaunchSize grid, auto &&verifyAfterForward,
                    auto &&verifyAfterBackward) {
         float x = 1.2f;
         float y = 0.7f;
@@ -294,7 +294,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
         VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
         VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
-        ASSERT_EQ(vernonAdPipelineForward(pipeline, grid, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        ASSERT_EQ(vernonAdProgramForward(pipeline, grid, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
             << lastError(context);
         ASSERT_NE(pullback, nullptr);
         for (float value : output)
@@ -333,7 +333,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
 
     size_t segmentBytes = 0;
     ASSERT_TRUE(vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(6, variant.staticTapeBytesHint, segmentBytes));
-    VernonLoadedPipeline *pipeline = nullptr;
+    VernonProgramExecutable *pipeline = nullptr;
     for (VernonLaunchSize grid : {VernonLaunchSize{512, 1, 1}, VernonLaunchSize{1024, 1, 1}}) {
         size_t wholeDispatchBytes = 0;
         ASSERT_TRUE(vernon::runtime::ad::hostStaticTapeBatchPureStaticBytes(
@@ -341,7 +341,7 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
         auto retainedPolicy =
             std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(segmentBytes, wholeDispatchBytes);
         vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, retainedPolicy);
-        pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+        pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
         ASSERT_NE(pipeline, nullptr) << lastError(context);
         vernon::runtime::AutodiffPullbackMemoryUsage retainedUsage{};
         run(
@@ -374,12 +374,12 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
             {"peak_temporary_tape_bytes", retainedUsage.peakTemporaryBytes},
         };
         EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*retainedPolicy), 0u);
-        vernonRuntimeLoadedPipelineDestroy(pipeline);
+        vernonRuntimeProgramExecutableDestroy(pipeline);
     }
 
     auto boundedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(segmentBytes, segmentBytes);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
-    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     for (VernonLaunchSize grid :
          {VernonLaunchSize{3, 2, 2}, VernonLaunchSize{512, 1, 1}, VernonLaunchSize{1024, 1, 1}}) {
@@ -434,8 +434,8 @@ TEST(RuntimeStructuredScalarAutodiff, BalancedRetainsOnlyExactlyAdmittedWholeDis
     ASSERT_TRUE(evidenceInput);
     EXPECT_EQ(nlohmann::json::parse(evidenceInput), measuredEvidence)
         << "regenerate specs/autodiff_balanced_frontend_evidence.json from measured runtime evidence";
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -455,13 +455,13 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
         *context,
         std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
             vernon::runtime::ad::kDefaultHostTapeInvocationLimit, vernon::runtime::ad::kDefaultHostTapeContextLimit));
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     auto measure = [&](int32_t count) {
@@ -476,7 +476,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
         VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
         VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
-        EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+        EXPECT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
             << lastError(context);
         EXPECT_NE(pullback, nullptr);
         if (!pullback)
@@ -509,8 +509,8 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
     EXPECT_LE(longLoop.regionLookups,
               longLoop.leafReads + 2u * longLoop.childReads + longLoop.executedCountReads + longLoop.exitKindReads);
 
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -527,13 +527,13 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     auto calibrationPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
         std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, calibrationPolicy);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     float x = 1.25f;
@@ -548,7 +548,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *calibrationPullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &calibrationPullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(calibrationPullback, nullptr);
     float calibrationGradient = 0.0f;
@@ -561,17 +561,17 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     ASSERT_GT(oneInvocationBytes, 0u);
     vernonPullbackDestroy(calibrationPullback);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
 
     auto boundedPolicy =
         std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(oneInvocationBytes, oneInvocationBytes);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
-    pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     count = 1500;
     output = -31.0f;
     VernonPullback *rejectedPullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(rejectedPullback, nullptr);
     EXPECT_FLOAT_EQ(output, (1.0f + 2.0f * count) * x);
@@ -588,8 +588,8 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*boundedPolicy), 0u);
     vernonPullbackDestroy(rejectedPullback);
 
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 #endif
@@ -603,21 +603,21 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
     const std::string bundleDirectory = manifestPath.parent_path().string();
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
     VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
     VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
     EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F64);
     EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F64);
     EXPECT_EQ(gradientMetadata.dtype, VERNON_DATA_F64);
@@ -632,7 +632,7 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_DOUBLE_EQ(output, 3.75);
@@ -649,8 +649,8 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
     EXPECT_DOUBLE_EQ(gradient, 8.0);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 

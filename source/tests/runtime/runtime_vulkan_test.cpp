@@ -255,8 +255,8 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     ASSERT_TRUE(runtime);
     VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
     VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    VernonLoadedPipeline *pipeline = vernonRuntimeLoadArtifact(runtime, artifact.data, artifact.size, reflection.data,
-                                                               reflection.size, "increment", std::strlen("increment"));
+    VernonProgramExecutable *pipeline = vernonRuntimeLoadArtifact(
+        runtime, artifact.data, artifact.size, reflection.data, reflection.size, "increment", std::strlen("increment"));
     ASSERT_TRUE(pipeline);
 
     float input[8] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -265,9 +265,9 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[]{8};
     const int64_t strides[]{sizeof(float)};
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     argument.slot = 0;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     argument.tensor.resource = buffer.reference;
@@ -277,7 +277,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(input);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
@@ -292,7 +292,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         ASSERT_TRUE(output[index] == input[index] + 1.0f);
 
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);

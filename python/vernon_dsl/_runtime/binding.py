@@ -19,26 +19,26 @@ class _PersistentBindingTable:
     """Owns native transactional persistent bindings for one executable."""
 
     def __init__(self) -> None:
-        self._native_pipeline: Any | None = None
+        self._native_program: Any | None = None
         self._instance: Any | None = None
         self._transactions = threading.local()
         self._lock = threading.RLock()
 
-    def _native_instance(self, native_pipeline: Any) -> Any:
+    def _native_instance(self, native_program: Any) -> Any:
         with self._lock:
-            if self._instance is None or self._native_pipeline is not native_pipeline:
-                self._native_pipeline = native_pipeline
-                self._instance = native_pipeline.program_instance()
+            if self._instance is None or self._native_program is not native_program:
+                self._native_program = native_program
+                self._instance = native_program.program_instance()
             return self._instance
 
     def clear(self) -> None:
         with self._lock:
-            self._native_pipeline = None
+            self._native_program = None
             self._instance = None
 
     @contextmanager
-    def invocation(self, native_pipeline: Any) -> Iterator[Any]:
-        transaction = self._native_instance(native_pipeline).begin_invocation()
+    def invocation(self, native_program: Any) -> Iterator[Any]:
+        transaction = self._native_instance(native_program).begin_invocation()
         if getattr(self._transactions, "current", None) is not None:
             raise RuntimeError("persistent binding invocations cannot be nested on one thread")
         self._transactions.current = transaction
@@ -76,7 +76,7 @@ class _PersistentBindingTable:
     def bind_argument(
         self,
         builder: Any,
-        native_pipeline: Any,
+        native_program: Any,
         parameter: Any,
         value: Any,
         *,
@@ -211,7 +211,7 @@ class _PersistentBindingTable:
             upload_ranges=1,
         )
 
-    def bind_sampler(self, builder: Any, native_pipeline: Any, parameter: Any, sampler: SamplerState) -> None:
+    def bind_sampler(self, builder: Any, native_program: Any, parameter: Any, sampler: SamplerState) -> None:
         resident = sampler._resident_sampler()
         self._bind(
             builder,

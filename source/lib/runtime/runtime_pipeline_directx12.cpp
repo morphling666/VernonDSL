@@ -63,7 +63,7 @@ DXGI_FORMAT directX12TextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveDirectX12Pipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     auto *pipelineState = new DirectX12PipelineState();
     if (!variant.compute.empty()) {
@@ -419,7 +419,7 @@ bool resolveDirectX12Pipeline(VernonPipelineBundle &bundle, const Variant &varia
 #endif
 }
 
-void destroyDirectX12Pipeline(VernonLoadedPipeline &pipeline) {
+void destroyDirectX12Pipeline(VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -432,7 +432,8 @@ void destroyDirectX12Pipeline(VernonLoadedPipeline &pipeline) {
 #endif
 }
 
-VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeDirectX12GraphicsPipeline(VernonProgramExecutable &pipeline,
+                                             const VernonProgramSubmitDescriptor &invocation,
                                              const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
@@ -448,7 +449,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
         value.kind = layout.kind;
         if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_UNIFORM) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "D3D12 RHI uniform argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
             const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
@@ -459,7 +460,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             value.payload.inline_value.size = prepared.storage.size();
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
                 found->second->tensor.byte_strides[0] <= 0)
@@ -470,7 +471,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI storage argument is missing");
@@ -479,13 +480,13 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
             value.payload.buffer.resource.offset += tensor.byte_offset;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_IMAGE ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
                 !found->second->image.view.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI image argument is missing");
             value.payload.image.view = found->second->image.view;
         } else if (prepared.source == DirectX12PipelineState::GraphicsBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 RHI sampler argument is missing");
             value.payload.sampler.resource = found->second->resource;
@@ -566,7 +567,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonLoadedPipeline &pipeline, con
 #endif
 }
 
-VernonStatus invokeDirectX12ComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeDirectX12ComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *directX12State(*pipeline.context).adapter;

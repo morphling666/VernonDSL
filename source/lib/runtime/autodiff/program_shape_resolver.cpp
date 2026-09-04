@@ -8,7 +8,7 @@ namespace {
 
 class Resolver {
 public:
-    Resolver(const program::Program &program, const VernonPipelineTopology *topology,
+    Resolver(const program::Program &program, const VernonProgramTopology *topology,
              std::vector<ProgramHostValue> &values)
         : program_(program), topology_(topology), values_(values) {}
 
@@ -107,13 +107,13 @@ private:
     }
 
     const program::Program &program_;
-    const VernonPipelineTopology *topology_;
+    const VernonProgramTopology *topology_;
     std::vector<ProgramHostValue> &values_;
 };
 
 } // namespace
 
-bool resolveProgramShapes(const program::Program &program, const VernonPipelineTopology *topology,
+bool resolveProgramShapes(const program::Program &program, const VernonProgramTopology *topology,
                           std::vector<ProgramHostValue> &values, std::string &error) {
     return Resolver(program, topology, values).resolve(error);
 }

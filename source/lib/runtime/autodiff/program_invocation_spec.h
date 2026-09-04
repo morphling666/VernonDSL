@@ -30,7 +30,7 @@ struct ProgramLeafFrameSource {
 };
 
 struct CanonicalForwardBindings {
-    const VernonPipelineInvocation &invocation;
+    const VernonProgramSubmitDescriptor &invocation;
     const std::vector<std::pair<uint32_t, uint32_t>> &valueBySlot;
     std::vector<PendingProgramPublication> &publications;
 };

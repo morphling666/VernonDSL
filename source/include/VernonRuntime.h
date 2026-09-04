@@ -22,8 +22,8 @@ extern "C" {
 #endif
 
 typedef struct VernonRuntimeContext VernonRuntimeContext;
-typedef struct VernonPipelineBundle VernonPipelineBundle;
-typedef struct VernonLoadedPipeline VernonLoadedPipeline;
+typedef struct VernonProgramBundle VernonProgramBundle;
+typedef struct VernonProgramExecutable VernonProgramExecutable;
 typedef struct VernonPullback VernonPullback;
 typedef struct VernonSubmission VernonSubmission;
 typedef struct VernonProgramInstance VernonProgramInstance;
@@ -78,14 +78,14 @@ VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(Vernon
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
 
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
-                                                                    size_t artifact_size, const char *reflection,
-                                                                    size_t reflection_size, const char *entry,
-                                                                    size_t entry_size);
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
-                                                                    VernonCpuEntryPoint entry_point,
-                                                                    const char *reflection, size_t reflection_size,
-                                                                    const char *entry, size_t entry_size);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeLoadArtifact(VernonRuntimeContext *context,
+                                                                       const void *artifact, size_t artifact_size,
+                                                                       const char *reflection, size_t reflection_size,
+                                                                       const char *entry, size_t entry_size);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
+                                                                       VernonCpuEntryPoint entry_point,
+                                                                       const char *reflection, size_t reflection_size,
+                                                                       const char *entry, size_t entry_size);
 /*
  * Registers an AOT entry that was statically linked into the application.
  * Re-registering the same symbol and pointer is idempotent.
@@ -215,17 +215,17 @@ typedef struct VernonValuePathComponentView {
     uint64_t index;
 } VernonValuePathComponentView;
 
-typedef struct VernonPipelineValueLeafView {
+typedef struct VernonProgramValueLeafView {
     uint32_t struct_size;
     VernonValueLeafView value;
     /* Struct field path of this payload leaf. Empty for a scalar Tensor cell. */
     const VernonValuePathComponentView *path;
     size_t path_count;
     /* Leaf-internal packed extents. Empty for a scalar cell. Outer Tensor rank
-     * lives on VernonPipelineParameterView.rank / static_shape, not here. */
+     * lives on VernonProgramParameterView.rank / static_shape, not here. */
     const uint64_t *static_shape;
     uint32_t static_rank;
-} VernonPipelineValueLeafView;
+} VernonProgramValueLeafView;
 
 typedef struct VernonValueLayoutView {
     uint32_t struct_size;
@@ -258,26 +258,26 @@ typedef struct VernonImageArgument {
     VernonRuntimeProviderResourceReference view;
 } VernonImageArgument;
 
-typedef enum VernonPipelineArgumentKind {
-    VERNON_PIPELINE_TENSOR = 0,
-    VERNON_PIPELINE_IMAGE = 1,
-    VERNON_PIPELINE_SAMPLER = 2
-} VernonPipelineArgumentKind;
+typedef enum VernonProgramArgumentKind {
+    VERNON_PROGRAM_TENSOR = 0,
+    VERNON_PROGRAM_IMAGE = 1,
+    VERNON_PROGRAM_SAMPLER = 2
+} VernonProgramArgumentKind;
 
-typedef struct VernonPipelineArgument {
+typedef struct VernonProgramArgument {
     uint32_t slot;
-    VernonPipelineArgumentKind kind;
+    VernonProgramArgumentKind kind;
     union {
         VernonTensorView tensor;
         VernonImageArgument image;
         VernonRuntimeProviderResourceReference resource;
     };
-} VernonPipelineArgument;
+} VernonProgramArgument;
 
-typedef struct VernonPipelineInvocation {
+typedef struct VernonProgramSubmitDescriptor {
     uint32_t struct_size;
     uint32_t abi_version;
-    const VernonPipelineArgument *arguments;
+    const VernonProgramArgument *arguments;
     size_t argument_count;
     VernonLaunchSize compute_grid;
     VernonRuntimeProviderObject command_encoder;
@@ -285,7 +285,7 @@ typedef struct VernonPipelineInvocation {
     const VernonRenderPass *render_pass;
     const VernonDrawCommand *draw_command;
     const VernonDynamicState *dynamic_state;
-} VernonPipelineInvocation;
+} VernonProgramSubmitDescriptor;
 
 typedef struct VernonProgramBindingToken {
     uint32_t struct_size;
@@ -309,10 +309,10 @@ typedef struct VernonProgramBindingTelemetry {
     uint64_t upload_ranges;
 } VernonProgramBindingTelemetry;
 
-typedef struct VernonPipelineParameterView {
+typedef struct VernonProgramParameterView {
     uint32_t slot;
     VernonStringView name;
-    VernonPipelineArgumentKind kind;
+    VernonProgramArgumentKind kind;
     /* Packed host-binding ABI of the whole argument (call-frame / copy plan).
      * Named element_layout for historical reasons; for a shaped Tensor this
      * is the packed value, not one cell. Cells/fields: GetParameterValueLeaf. */
@@ -321,9 +321,9 @@ typedef struct VernonPipelineParameterView {
     /* Outer Tensor extents. Empty for a scalar or struct parameter. */
     uint32_t rank;
     const uint64_t *static_shape;
-} VernonPipelineParameterView;
+} VernonProgramParameterView;
 
-typedef struct VernonPipelineImageConstraintView {
+typedef struct VernonProgramImageConstraintView {
     uint32_t struct_size;
     VernonTextureDimension dimension;
     VernonImageBindingRole binding_role;
@@ -331,17 +331,17 @@ typedef struct VernonPipelineImageConstraintView {
     VernonTextureFormat storage_format;
     /* Reserved for future constraints; initialize all elements to zero. */
     uint32_t reserved[4];
-} VernonPipelineImageConstraintView;
+} VernonProgramImageConstraintView;
 
-typedef struct VernonPipelineOutputView {
+typedef struct VernonProgramOutputView {
     VernonStringView name;
-    VernonPipelineArgumentKind kind;
+    VernonProgramArgumentKind kind;
     VernonDataType dtype;
     VernonValueAccess access;
     uint32_t rank;
     const uint64_t *static_shape;
     uint32_t location;
-} VernonPipelineOutputView;
+} VernonProgramOutputView;
 
 typedef struct VernonAdValue {
     uint32_t struct_size;
@@ -437,7 +437,7 @@ typedef struct VernonPullbackApplyOptions {
     uint32_t reserved[4];
 } VernonPullbackApplyOptions;
 
-typedef struct VernonPipelineBundleLoadOptions {
+typedef struct VernonProgramBundleLoadOptions {
     uint32_t struct_size;
     /*
      * UTF-8 directory containing the manifest. Required by external artifact
@@ -446,7 +446,7 @@ typedef struct VernonPipelineBundleLoadOptions {
     const char *bundle_directory;
     /* Reserved for future use; initialize all elements to zero. */
     uint32_t reserved[4];
-} VernonPipelineBundleLoadOptions;
+} VernonProgramBundleLoadOptions;
 
 typedef enum VernonExecutableBundleKind {
     VERNON_EXECUTABLE_BUNDLE_PIPELINE = 0,
@@ -455,27 +455,26 @@ typedef enum VernonExecutableBundleKind {
 
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeExecutableBundleInspectKind(const void *bundle, size_t bundle_size,
                                                                           VernonExecutableBundleKind *kind);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundle, size_t bundle_size,
-                                                                          VernonRuntimeBackend *target);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramBundleInspectTarget(const void *bundle, size_t bundle_size,
+                                                                         VernonRuntimeBackend *target);
 /* Loads a cooked single-kernel pipeline or Module Program bundle. CPU
  * relocatable objects must already be linked and registered by the host. */
-VERNON_RUNTIME_CAPI VernonPipelineBundle *
-vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
-                                           const VernonPipelineBundleLoadOptions *options);
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *
+VERNON_RUNTIME_CAPI VernonProgramBundle *
 vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
-                                          VernonFeatureSetView features,
-                                          const VernonPipelineBundleLoadOptions *options);
-VERNON_RUNTIME_CAPI VernonStringView vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle);
-VERNON_RUNTIME_CAPI void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle);
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
-                                                                       VernonFeatureSetView features);
-VERNON_RUNTIME_CAPI void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI uint8_t vernonRuntimeLoadedPipelineIsManagedProgram(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetParameterCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(const VernonLoadedPipeline *pipeline,
-                                                                                size_t index,
-                                                                                VernonPipelineParameterView *parameter);
+                                          const VernonProgramBundleLoadOptions *options);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *
+vernonRuntimeLoadManagedProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
+                                                 VernonFeatureSetView features,
+                                                 const VernonProgramBundleLoadOptions *options);
+VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramBundleGetId(const VernonProgramBundle *bundle);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramBundleDestroy(VernonProgramBundle *bundle);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
+                                                                         VernonFeatureSetView features);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI uint8_t vernonRuntimeProgramExecutableIsManagedProgram(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonProgramParameterView *parameter);
 /*
  * Parameter identity and host binding: name, access, outer Tensor shape
  * (rank / static_shape), and packed host_value ABI in element_layout.
@@ -484,9 +483,9 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(
  * rank=1, static_shape=[2], and element_layout of the whole packed value
  * (scalar_count=2). Walk payload cells/fields with GetParameterValueLeaf.
  */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline *pipeline,
-                                                                          VernonStringView name,
-                                                                          VernonPipelineParameterView *parameter);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindParameter(const VernonProgramExecutable *pipeline,
+                                                                             VernonStringView name,
+                                                                             VernonProgramParameterView *parameter);
 /*
  * Logical payload leaf of one tensor parameter: one cell of a shaped Tensor,
  * or one field of a struct. Query this for AD packing / reflection dtype
@@ -497,40 +496,39 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindParameter(const 
  * host_value ABI (the whole tensor as one layout) is FindParameter().
  * element_layout, not this API.
  */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoadedPipeline *pipeline,
-                                                                                  VernonStringView parameter_name,
-                                                                                  size_t leaf_index,
-                                                                                  VernonPipelineValueLeafView *leaf);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(
-    const VernonLoadedPipeline *pipeline, size_t parameter_index, VernonPipelineImageConstraintView *constraint);
-VERNON_RUNTIME_CAPI VernonStatus
-vernonRuntimeLoadedPipelineFindImageConstraint(const VernonLoadedPipeline *pipeline, VernonStringView parameter_name,
-                                               VernonPipelineImageConstraintView *constraint);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetOutputCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(const VernonLoadedPipeline *pipeline,
-                                                                             size_t index,
-                                                                             VernonPipelineOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *pipeline,
-                                                                       VernonStringView name,
-                                                                       VernonPipelineOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline,
-                                                             const VernonPipelineInvocation *invocation,
-                                                             VernonSubmission **output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder,
-                                                             VernonLoadedPipeline *pipeline,
-                                                             const VernonPipelineInvocation *invocation);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetParameterValueLeaf(
+    const VernonProgramExecutable *pipeline, VernonStringView parameter_name, size_t leaf_index,
+    VernonProgramValueLeafView *leaf);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
+    const VernonProgramExecutable *pipeline, size_t parameter_index, VernonProgramImageConstraintView *constraint);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(
+    const VernonProgramExecutable *pipeline, VernonStringView parameter_name,
+    VernonProgramImageConstraintView *constraint);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetOutputCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetOutputByIndex(const VernonProgramExecutable *pipeline,
+                                                                                size_t index,
+                                                                                VernonProgramOutputView *output);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindOutput(const VernonProgramExecutable *pipeline,
+                                                                          VernonStringView name,
+                                                                          VernonProgramOutputView *output);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramSubmit(VernonProgramExecutable *pipeline,
+                                                            const VernonProgramSubmitDescriptor *invocation,
+                                                            VernonSubmission **output);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramEncode(VernonRuntimeProviderObject encoder,
+                                                            VernonProgramExecutable *pipeline,
+                                                            const VernonProgramSubmitDescriptor *invocation);
 /* Executes a compiler-emitted managed Program using its ProgramABI boundary slots.
  * output_pullback may be null when the caller does not retain autodiff state. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramForward(VernonLoadedPipeline *pipeline,
-                                                             const VernonPipelineInvocation *invocation,
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramForward(VernonProgramExecutable *pipeline,
+                                                             const VernonProgramSubmitDescriptor *invocation,
                                                              VernonPullback **output_pullback);
-VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
 VERNON_RUNTIME_CAPI VernonProgramInvocation *
 vernonRuntimeProgramInstanceBeginInvocation(VernonProgramInstance *instance);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocation,
                                                                     const VernonProgramBindingToken *token,
-                                                                    const VernonPipelineArgument *argument,
+                                                                    const VernonProgramArgument *argument,
                                                                     const VernonProgramResourceLease *lease,
                                                                     uint64_t upload_bytes, uint64_t upload_ranges);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRenderPass(
@@ -554,41 +552,38 @@ VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetState(const VernonSubmission
                                                           VernonSubmissionState *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
-VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineForward(VernonLoadedPipeline *pipeline, VernonLaunchSize compute_grid,
-                                                         const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
-                                                         VernonPullback **pullback);
-VERNON_RUNTIME_CAPI VernonStatus vernonAdPipelineEncodeForward(VernonRuntimeProviderObject encoder,
-                                                               VernonLoadedPipeline *pipeline,
-                                                               const VernonPipelineInvocation *invocation,
-                                                               const VernonAdValueSet *inputs,
-                                                               VernonPullback **pullback);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdInputCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdInputByIndex(const VernonLoadedPipeline *pipeline,
-                                                                              size_t index,
-                                                                              VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdOutputCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdOutputByIndex(const VernonLoadedPipeline *pipeline,
-                                                                               size_t index,
-                                                                               VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdCotangentCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdCotangentByIndex(const VernonLoadedPipeline *pipeline,
-                                                                                  size_t index,
-                                                                                  VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdGradientCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdGradientByIndex(const VernonLoadedPipeline *pipeline,
-                                                                                 size_t index,
-                                                                                 VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI uint8_t vernonRuntimeLoadedPipelineHasProgramAutodiff(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetProgramAdValueCount(const VernonLoadedPipeline *pipeline,
-                                                                             VernonProgramAdBoundary boundary);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(
-    const VernonLoadedPipeline *pipeline, VernonProgramAdBoundary boundary, size_t index,
+VERNON_RUNTIME_CAPI VernonStatus vernonAdProgramForward(VernonProgramExecutable *pipeline,
+                                                        VernonLaunchSize compute_grid, const VernonAdValueSet *inputs,
+                                                        VernonAdValueSet *outputs, VernonPullback **pullback);
+VERNON_RUNTIME_CAPI VernonStatus vernonAdProgramEncodeForward(VernonRuntimeProviderObject encoder,
+                                                              VernonProgramExecutable *pipeline,
+                                                              const VernonProgramSubmitDescriptor *invocation,
+                                                              const VernonAdValueSet *inputs,
+                                                              VernonPullback **pullback);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdInputCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdInputByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdOutputCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdOutputByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdCotangentCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdCotangentByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdGradientCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdGradientByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
+VERNON_RUNTIME_CAPI uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetProgramAdValueCount(const VernonProgramExecutable *pipeline,
+                                                                                VernonProgramAdBoundary boundary);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetProgramAdValueByIndex(
+    const VernonProgramExecutable *pipeline, VernonProgramAdBoundary boundary, size_t index,
     VernonProgramAdValueView *value);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(
-    const VernonLoadedPipeline *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(
-    const VernonLoadedPipeline *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
+VERNON_RUNTIME_CAPI size_t
+vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(
+    const VernonProgramExecutable *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(
+    const VernonProgramExecutable *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
 VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback,
                                                                 const VernonAdValueSet *cotangents,
                                                                 VernonAdValueSet *gradients,

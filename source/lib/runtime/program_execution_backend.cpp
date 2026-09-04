@@ -100,10 +100,10 @@ bool loadModuleBytes(const ArtifactSystem &artifacts, const std::string &artifac
     return loadCodeModuleBytes(artifacts, artifactId, bundleRoot, stage->second.modules.front(), bytes, diagnostic);
 }
 
-VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
-                                                  const ArtifactSystem &artifacts,
-                                                  const std::filesystem::path &bundleRoot, const Node &node,
-                                                  const ResolvedStage &resolvedStage, Diagnostic &diagnostic) {
+VernonProgramExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
+                                                     const ArtifactSystem &artifacts,
+                                                     const std::filesystem::path &bundleRoot, const Node &node,
+                                                     const ResolvedStage &resolvedStage, Diagnostic &diagnostic) {
     const StageArtifact &artifact = resolvedStage.stage;
     if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA)
         return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs/0/nodes/0/operation",
@@ -117,7 +117,7 @@ VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context,
     if (!buildExecutableBindingView(bindingPlan, variant, reflection, diagnostic))
         return nullptr;
 
-    VernonPipelineBundle bundle;
+    VernonProgramBundle bundle;
     bundle.context = &context;
     for (const CodeModule &module : artifact.modules) {
         std::vector<uint8_t> bytes;
@@ -141,7 +141,7 @@ VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context,
         else if (module.role == "fragment")
             variant.fragment = key;
     }
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
     rebuildVariantLayoutViews(pipeline->variant);
@@ -153,9 +153,9 @@ VernonLoadedPipeline *loadGraphicsProgramPipeline(VernonRuntimeContext &context,
     return pipeline.release();
 }
 
-VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
-                                              const std::filesystem::path &bundleRoot,
-                                              const ResolvedExecutableNode &node, Diagnostic &diagnostic) {
+VernonProgramExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
+                                                 const std::filesystem::path &bundleRoot,
+                                                 const ResolvedExecutableNode &node, Diagnostic &diagnostic) {
     const ResolvedStage &stage = *node.stage;
     if (stage.stage.modules.size() != 1)
         return reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
@@ -183,7 +183,7 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
             return nullptr;
         }
     }
-    VernonLoadedPipeline *pipeline = loadBackendTypedComputePipeline(
+    VernonProgramExecutable *pipeline = loadBackendTypedComputePipeline(
         context, std::move(variant), std::move(reflection), moduleBytes.empty() ? nullptr : moduleBytes.data(),
         moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
     if (!pipeline)
@@ -194,23 +194,23 @@ VernonLoadedPipeline *loadComputeNodePipeline(VernonRuntimeContext &context, con
 
 } // namespace
 
-VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
-                                                 std::shared_ptr<const ResolvedProgram> program,
-                                                 const ArtifactSystem &artifacts,
-                                                 const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
+VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context,
+                                                    std::shared_ptr<const ResolvedProgram> program,
+                                                    const ArtifactSystem &artifacts,
+                                                    const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
     diagnostic = {};
     ResolvedExecutablePlan executable;
     if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
         return nullptr;
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
-    auto topology = std::make_shared<VernonPipelineTopology>();
+    auto topology = std::make_shared<VernonProgramTopology>();
     topology->resolvedProgram = std::move(program);
     topology->residualValues = residualCaptures(topology->resolvedProgram->program);
     for (const ResolvedExecutableNode &node : executable.nodes) {
         if (topology->stageIndices.find(node.node->stage) != topology->stageIndices.end())
             continue;
-        std::unique_ptr<VernonLoadedPipeline> child(
+        std::unique_ptr<VernonProgramExecutable> child(
             executionKind(*node.node) == ExecutionKind::Graphics
                 ? loadGraphicsProgramPipeline(context, *topology->resolvedProgram, artifacts, bundleRoot, *node.node,
                                               *node.stage, diagnostic)
@@ -241,15 +241,15 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context,
     return pipeline.release();
 }
 
-VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                 size_t programJsonSize, const char *artifactSystemJson,
-                                                 size_t artifactSystemJsonSize,
-                                                 const std::map<std::string, std::string> &stageBindings,
-                                                 const std::filesystem::path &bundleRoot, std::string &error) {
+VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
+                                                    size_t programJsonSize, const char *artifactSystemJson,
+                                                    size_t artifactSystemJsonSize,
+                                                    const std::map<std::string, std::string> &stageBindings,
+                                                    const std::filesystem::path &bundleRoot, std::string &error) {
     Diagnostic diagnostic;
     Program program;
     ArtifactSystem artifacts;
-    const auto failed = [&]() -> VernonLoadedPipeline * {
+    const auto failed = [&]() -> VernonProgramExecutable * {
         error =
             diagnostic.code + (diagnostic.path.empty() ? ": " : " at " + diagnostic.path + ": ") + diagnostic.message;
         return nullptr;
@@ -278,7 +278,7 @@ VernonLoadedPipeline *loadBackendProgramPipeline(VernonRuntimeContext &context, 
         return failed();
     }
     auto owner = std::make_shared<ResolvedProgram>(std::move(resolved));
-    if (VernonLoadedPipeline *loaded =
+    if (VernonProgramExecutable *loaded =
             loadBackendProgramPipeline(context, std::move(owner), artifacts, bundleRoot, diagnostic))
         return loaded;
     return failed();

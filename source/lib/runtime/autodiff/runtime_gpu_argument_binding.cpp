@@ -88,7 +88,7 @@ bool materializeInternalBufferView(const shape::DeclaredShape &declaredShape, co
 
 bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter &parameter, const DeviceBuffer &buffer,
                                   size_t logicalBytes, InternalBufferView &view,
-                                  std::vector<VernonPipelineArgument> &arguments) {
+                                  std::vector<VernonProgramArgument> &arguments) {
     (void)context;
     const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
     if (!layout ||
@@ -97,9 +97,9 @@ bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter
     VernonRuntimeProviderResourceReference resource{};
     if (!buffer.reference(resource))
         return false;
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     argument.slot = parameter.slot;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(argument.tensor);
     argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     argument.tensor.resource = resource;
@@ -116,13 +116,13 @@ bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter
     return true;
 }
 
-bool appendBindingArgument(const Binding &binding, std::vector<VernonPipelineArgument> &arguments) {
+bool appendBindingArgument(const Binding &binding, std::vector<VernonProgramArgument> &arguments) {
     const Parameter &parameter = *binding.parameter;
     const std::vector<uint64_t> &shape = binding.shape();
     const std::vector<int64_t> &strides = binding.strides();
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     argument.slot = parameter.slot;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     if (binding.source == BindingSource::Device) {
         if (!binding.device || !fillDeviceTensor(parameter, *binding.device, shape, strides, argument.tensor))
             return false;

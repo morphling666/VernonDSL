@@ -37,7 +37,7 @@ const char *categoryName(program::BoundaryCategory category) {
 
 } // namespace
 
-std::vector<ProgramBoundaryView> programBoundaryViews(const VernonLoadedPipeline &pipeline) {
+std::vector<ProgramBoundaryView> programBoundaryViews(const VernonProgramExecutable &pipeline) {
     if (!pipeline.topology || !pipeline.topology->resolvedProgram)
         throw std::runtime_error("pipeline has no compiler-emitted ProgramABI");
     std::vector<ProgramBoundaryView> result;

@@ -13,7 +13,7 @@ The browser path keeps the compiler, pipeline, and CPU entry contracts unchanged
    `vernon_cpu_registration_<hash>.c`.
 3. Link the object, registration source, and `VernonRuntime` into the Emscripten application.
 4. Load the cooked manifest from application memory with
-   `vernonRuntimeLoadPipelineBundleWithOptions(..., nullptr)`.
+   `vernonRuntimeLoadProgramBundleWithOptions(..., nullptr)`.
 5. Resolve the stage through the static CPU entry registry. The web profile never opens the
    artifact path or calls a dynamic-library API.
 

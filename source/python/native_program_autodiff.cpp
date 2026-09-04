@@ -1,4 +1,4 @@
-#include "native_pipeline_autodiff.h"
+#include "native_program_autodiff.h"
 
 #include <algorithm>
 #include <cctype>
@@ -283,12 +283,13 @@ bool PythonPullback::applyGroupedDeviceWithOptions(const nb::object &cotangent, 
     return true;
 }
 
-PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
-                                     size_t leafIndex, VernonPipelineValueLeafView *reflected) {
-    VernonPipelineValueLeafView leaf{};
+PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *pipeline, const ProgramParameterMetadata &parameter,
+                                     size_t leafIndex, VernonProgramValueLeafView *reflected) {
+    VernonProgramValueLeafView leaf{};
     leaf.struct_size = sizeof(leaf);
     const VernonStringView parameterName{parameter.name.data(), parameter.name.size()};
-    if (vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, parameterName, leafIndex, &leaf) != VERNON_STATUS_OK)
+    if (vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, parameterName, leafIndex, &leaf) !=
+        VERNON_STATUS_OK)
         throw std::runtime_error("cannot read autodiff input leaf metadata");
     PythonAdMetadata result{parameter.name, parameter.name, static_cast<VernonDataType>(leaf.value.dtype), {}};
     for (size_t index = 0; index < leaf.path_count; ++index) {
@@ -301,7 +302,7 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
         else
             throw std::runtime_error("autodiff input leaf has an invalid path");
     }
-    if (parameter.kind == VERNON_PIPELINE_TENSOR) {
+    if (parameter.kind == VERNON_PROGRAM_TENSOR) {
         result.shape = parameter.shape;
         if (leaf.static_rank)
             result.shape.insert(result.shape.end(), leaf.static_shape, leaf.static_shape + leaf.static_rank);
@@ -313,8 +314,8 @@ PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const Pipel
     return result;
 }
 
-nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterMetadata &parameter,
-                              const VernonPipelineValueLeafView &leaf) {
+nb::object resolveAdInputLeaf(const nb::dict &bindings, const ProgramParameterMetadata &parameter,
+                              const VernonProgramValueLeafView &leaf) {
     nb::str root(parameter.name.c_str());
     if (!bindings.contains(root))
         throw std::invalid_argument("missing autodiff binding '" + parameter.name + "'");

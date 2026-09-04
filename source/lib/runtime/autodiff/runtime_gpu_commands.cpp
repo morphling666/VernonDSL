@@ -74,9 +74,9 @@ bool decodeBuffer(uint64_t key, VernonRhiBuffer &buffer) {
 
 bool appendPipelineResources(execution::detail::CommandNode &node,
                              std::vector<execution::detail::RhiCommandResourceBinding> &bindings,
-                             const std::vector<VernonPipelineArgument> &arguments) {
-    for (const VernonPipelineArgument &argument : arguments) {
-        if (argument.kind != VERNON_PIPELINE_TENSOR)
+                             const std::vector<VernonProgramArgument> &arguments) {
+    for (const VernonProgramArgument &argument : arguments) {
+        if (argument.kind != VERNON_PROGRAM_TENSOR)
             continue;
         const VernonTensorView &tensor = argument.tensor;
         if (tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
@@ -116,14 +116,14 @@ struct TransferCommandContext {
 };
 
 struct PipelineCommandContext {
-    PipelineCommandContext(VernonRuntimeContext &runtimeValue, VernonLoadedPipeline &pipelineValue,
-                           const std::vector<VernonPipelineArgument> &argumentValues, VernonLaunchSize gridValue)
+    PipelineCommandContext(VernonRuntimeContext &runtimeValue, VernonProgramExecutable &pipelineValue,
+                           const std::vector<VernonProgramArgument> &argumentValues, VernonLaunchSize gridValue)
         : runtime(runtimeValue), pipeline(pipelineValue), arguments(argumentValues), grid(gridValue) {
         shapes.resize(arguments.size());
         strides.resize(arguments.size());
         for (size_t index = 0; index < arguments.size(); ++index) {
-            VernonPipelineArgument &argument = arguments[index];
-            if (argument.kind != VERNON_PIPELINE_TENSOR || !argument.tensor.rank)
+            VernonProgramArgument &argument = arguments[index];
+            if (argument.kind != VERNON_PROGRAM_TENSOR || !argument.tensor.rank)
                 continue;
             shapes[index].assign(argument.tensor.shape, argument.tensor.shape + argument.tensor.rank);
             strides[index].assign(argument.tensor.byte_strides, argument.tensor.byte_strides + argument.tensor.rank);
@@ -133,8 +133,8 @@ struct PipelineCommandContext {
     }
 
     VernonRuntimeContext &runtime;
-    VernonLoadedPipeline &pipeline;
-    std::vector<VernonPipelineArgument> arguments;
+    VernonProgramExecutable &pipeline;
+    std::vector<VernonProgramArgument> arguments;
     VernonLaunchSize grid;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<int64_t>> strides;
@@ -218,18 +218,18 @@ VernonRhiStatus encodeWithFailureBoundary(void *opaque, VernonRhiCommandEncoder 
 } // namespace
 
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
-                                   VernonLoadedPipeline &pipeline, std::vector<VernonPipelineArgument> &arguments,
+                                   VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                    VernonLaunchSize grid) {
     VernonRuntimeProviderObject provider{};
     if (referenceBackendCommandEncoder(context, encoder, provider) != VERNON_STATUS_OK)
         return fail(context, "cannot reference GPU autodiff command encoder", VERNON_STATUS_INTERNAL_ERROR);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return vernonRuntimePipelineEncode(provider, &pipeline, &invocation);
+    return vernonRuntimeProgramEncode(provider, &pipeline, &invocation);
 }
 
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
@@ -315,8 +315,8 @@ VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const s
     return VERNON_STATUS_OK;
 }
 
-VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, VernonLaunchSize grid,
-                                              std::vector<VernonPipelineArgument> &arguments,
+VernonStatus executePipelineCommandDagAndWait(VernonProgramExecutable &pipeline, VernonLaunchSize grid,
+                                              std::vector<VernonProgramArgument> &arguments,
                                               const std::vector<DeviceBufferUpload> &uploadsBefore,
                                               execution::detail::CommandNodeKind kind,
                                               PullbackControlPlaneUsage *telemetry,
@@ -327,8 +327,8 @@ VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, Ve
 
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                      VernonLoadedPipeline &pipeline,
-                                      const std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize grid,
+                                      VernonProgramExecutable &pipeline,
+                                      const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
                                       const std::vector<DeviceBufferCopy> &copiesAfter,
                                       execution::detail::CommandNodeKind kind,
                                       execution::detail::RhiCommandExecutionPlan &plan) {
@@ -336,8 +336,8 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
     for (const DeviceBufferUpload &upload : uploadsBefore)
         if (!upload.source || !upload.size)
             return fail(context, "GPU autodiff upload has no source bytes");
-    for (const VernonPipelineArgument &argument : arguments)
-        if (argument.kind == VERNON_PIPELINE_TENSOR && argument.tensor.rank &&
+    for (const VernonProgramArgument &argument : arguments)
+        if (argument.kind == VERNON_PROGRAM_TENSOR && argument.tensor.rank &&
             (!argument.tensor.shape || !argument.tensor.byte_strides))
             return fail(context, "GPU autodiff Tensor argument has incomplete layout metadata");
     appendCopyBindings(plan.bindings, copiesBefore);
@@ -394,9 +394,9 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
 
 VernonStatus
 executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                 const std::vector<DeviceBufferUpload> &uploadsBefore, VernonLoadedPipeline &pipeline,
-                                 std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize grid,
-                                 const std::vector<DeviceBufferCopy> &copiesAfter,
+                                 const std::vector<DeviceBufferUpload> &uploadsBefore,
+                                 VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
+                                 VernonLaunchSize grid, const std::vector<DeviceBufferCopy> &copiesAfter,
                                  execution::detail::CommandNodeKind kind, PullbackControlPlaneUsage *telemetry,
                                  execution::detail::RhiCommandPlanSink *sink) {
     if (injectFailure(FailureBoundary::Submit))
@@ -411,7 +411,7 @@ executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vecto
 
 VernonStatus
 executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                       VernonLoadedPipeline &pipeline, std::vector<VernonPipelineArgument> &arguments,
+                                       VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                        VernonLaunchSize grid, const std::vector<DeviceBufferUpload> &uploadsBefore,
                                        VernonRhiBuffer statusBuffer, size_t statusOffset, size_t statusSize,
                                        GpuCommandCompletionCallback complete, void *completionContext,

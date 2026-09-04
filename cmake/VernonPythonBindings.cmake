@@ -57,8 +57,8 @@ function(vernon_add_python_bindings package_directory source_directory)
         "${source_directory}/python/native_command_retention.cpp"
         "${source_directory}/python/native_compiler.cpp"
         "${source_directory}/python/native_module.cpp"
-        "${source_directory}/python/native_pipeline.cpp"
-        "${source_directory}/python/native_pipeline_autodiff.cpp"
+        "${source_directory}/python/native_program.cpp"
+        "${source_directory}/python/native_program_autodiff.cpp"
         "${source_directory}/python/native_rhi.cpp"
         "${source_directory}/python/native_runtime.cpp")
     _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")

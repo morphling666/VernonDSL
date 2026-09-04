@@ -103,7 +103,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
         ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, texture.handle), VERNON_RHI_STATUS_OK);
     }
     const std::string bundleDirectory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
     ASSERT_TRUE(document.contains("runtime_requirements"));
@@ -114,23 +114,23 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     unsupportedDocument["content_hash"] =
         vernon::runtime::sha256Hex(unsupportedCanonical.data(), unsupportedCanonical.size());
     const std::string unsupportedBundle = unsupportedDocument.dump(-1, ' ', false);
-    ASSERT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(runtime, unsupportedBundle.data(), unsupportedBundle.size(),
-                                                            &options));
+    ASSERT_FALSE(vernonRuntimeLoadProgramBundleWithOptions(runtime, unsupportedBundle.data(), unsupportedBundle.size(),
+                                                           &options));
     const VernonStringView unsupportedError = vernonRuntimeGetLastError(runtime);
     ASSERT_NE(std::string(unsupportedError.data, unsupportedError.size).find("pipeline requires Vulkan 99.0"),
               std::string::npos);
 
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     if (!loaded) {
         const VernonStringView error = vernonRuntimeGetLastError(runtime);
         std::fwrite(error.data, 1, error.size, stderr);
         std::fputc('\n', stderr);
     }
     ASSERT_TRUE(loaded);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterCount(pipeline), 2u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
 
     constexpr float positions[] = {-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
     auto vertices =
@@ -185,12 +185,12 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_NE(textureSampler.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     const uint64_t shape[] = {3, 2};
     const int64_t strides[] = {2 * sizeof(float), sizeof(float)};
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = 0; // Slots are stable and sorted by source name.
-    arguments[0].kind = VERNON_PIPELINE_IMAGE;
+    arguments[0].kind = VERNON_PROGRAM_IMAGE;
     arguments[0].image = {sampledView.reference};
     arguments[1].slot = 1;
-    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[1].tensor.resource = vertices.reference;
@@ -244,7 +244,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonDynamicState dynamic{};
     dynamic.struct_size = sizeof(dynamic);
     dynamic.stencil_reference = 3;
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -389,9 +389,9 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, firstTarget.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, indexBuffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
     EXPECT_EQ(vernon::runtime::getRhiAdapterLivePreparedPipelineCount(runtime), 0u);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }
@@ -407,19 +407,19 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_NE(runtime, nullptr);
     const std::string directory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = directory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_NE(loaded, nullptr);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
-    VernonPipelineParameterView valuesParameter{};
-    VernonPipelineParameterView factorParameter{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"values", 6}, &valuesParameter), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
+    VernonProgramParameterView valuesParameter{};
+    VernonProgramParameterView factorParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"values", 6}, &valuesParameter), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"factor", 6}, &factorParameter), VERNON_STATUS_OK);
 
     constexpr std::array<float, 4> source{0, 1, 2, 3};
     auto buffer =
@@ -433,9 +433,9 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     constexpr int64_t strides[]{sizeof(float)};
     constexpr float factor = 3.0f;
     constexpr float secondFactor = 5.0f;
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = valuesParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = buffer.reference;
@@ -446,7 +446,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[0].tensor.byte_strides = strides;
     arguments[0].tensor.byte_size = sizeof(source);
     arguments[1].slot = factorParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
@@ -456,7 +456,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[1].tensor.shape = scalarShape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -469,9 +469,9 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(context.device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderObject providerEncoder{};
     ASSERT_EQ(vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder, &providerEncoder), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRuntimeProgramEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
     arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
-    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << "RHI: " << vernon::test::text(vernonRhiDeviceGetLastError(context.device))
         << "; runtime: " << vernon::test::text(vernonRuntimeGetLastError(runtime));
     constexpr uint64_t secondShape[]{2};
@@ -482,7 +482,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     arguments[0].tensor.byte_offset = sizeof(float);
     arguments[1].tensor.host_data = &secondFactor;
     invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernonRuntimePipelineEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramEncode(providerEncoder, pipeline, &invocation), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, encoder), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernon::tests::completeSubmission(context.device, encoder), VERNON_RHI_STATUS_OK);
@@ -499,8 +499,8 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     EXPECT_EQ(output[3], source[3] * secondFactor);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, secondBuffer.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }

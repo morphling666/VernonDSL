@@ -1,7 +1,7 @@
 #ifndef VERNON_PYTHON_NATIVE_RUNTIME_H
 #define VERNON_PYTHON_NATIVE_RUNTIME_H
 
-#include "native_pipeline_autodiff.h"
+#include "native_program_autodiff.h"
 #include "runtime/program_execution_backend.h"
 
 #include <nanobind/stl/map.h>
@@ -76,18 +76,18 @@ struct Runtime {
         }
     }
 
-    std::unique_ptr<LoadedPipeline> load(const nb::bytes &artifact, const std::string &reflection,
-                                         const std::string &entry) {
-        VernonLoadedPipeline *pipeline =
+    std::unique_ptr<PythonProgramExecutable> load(const nb::bytes &artifact, const std::string &reflection,
+                                                  const std::string &entry) {
+        VernonProgramExecutable *pipeline =
             vernonRuntimeLoadArtifact(handle, artifact.c_str(), artifact.size(), reflection.data(), reflection.size(),
                                       entry.data(), entry.size());
         if (!pipeline)
             throw std::runtime_error("cannot load compute pipeline: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
+        return std::make_unique<PythonProgramExecutable>(this, handle, nullptr, pipeline);
     }
 
-    std::unique_ptr<LoadedPipeline> loadCpuEntry(const CompiledProgram &program, const std::string &entry) {
+    std::unique_ptr<PythonProgramExecutable> loadCpuEntry(const CompiledProgram &program, const std::string &entry) {
         program.requireSuccess();
         if (program.target != VERNON_TARGET_CPU)
             throw std::runtime_error("CPU entries can be loaded only from CPU compiled programs");
@@ -98,20 +98,19 @@ struct Runtime {
         if (!entryPoint)
             throw std::runtime_error("CPU entry '" + entry + "' was not found in compiled program");
         const std::string reflection = program.reflection();
-        VernonLoadedPipeline *pipeline = vernonRuntimeLoadCpuEntry(handle, entryPoint, reflection.data(),
-                                                                   reflection.size(), entry.data(), entry.size());
+        VernonProgramExecutable *pipeline = vernonRuntimeLoadCpuEntry(handle, entryPoint, reflection.data(),
+                                                                      reflection.size(), entry.data(), entry.size());
         if (!pipeline)
             throw std::runtime_error("cannot load CPU entry: " + nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline,
-                                                std::vector<SharedCompileResult>{program.result});
+        return std::make_unique<PythonProgramExecutable>(this, handle, nullptr, pipeline,
+                                                         std::vector<SharedCompileResult>{program.result});
     }
 
-    std::unique_ptr<LoadedPipeline> loadAutodiff(const CompiledProgram &primal, const std::string &primalName,
-                                                 const CompiledProgram &forward, const std::string &forwardName,
-                                                 const CompiledProgram &backward, const std::string &backwardName,
-                                                 uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                                                 const std::string &selectedPolicy,
-                                                 bool wholeDispatchRetentionPermitted, const nb::list &groupMetadata) {
+    std::unique_ptr<PythonProgramExecutable>
+    loadAutodiff(const CompiledProgram &primal, const std::string &primalName, const CompiledProgram &forward,
+                 const std::string &forwardName, const CompiledProgram &backward, const std::string &backwardName,
+                 uint64_t staticTapeBytesHint, const std::string &residualStorage, const std::string &selectedPolicy,
+                 bool wholeDispatchRetentionPermitted, const nb::list &groupMetadata) {
         const CompiledProgram *programs[] = {&primal, &forward, &backward};
         const std::string *names[] = {&primalName, &forwardName, &backwardName};
         VernonCpuEntryPoint entries[3]{};
@@ -159,7 +158,7 @@ struct Runtime {
                 leaves.push_back(view(leaf));
             derivativeGroupViews.push_back({group.role, view(group.declaredPath), leaves.data(), leaves.size()});
         }
-        VernonLoadedPipeline *pipeline = nullptr;
+        VernonProgramExecutable *pipeline = nullptr;
         if (primal.target == VERNON_TARGET_CPU) {
             pipeline = vernon::runtime::loadBackendCpuAutodiffPipeline(
                 *handle, entries[0], view(reflections[0]), view(primalName), entries[1], view(reflections[1]),
@@ -187,53 +186,54 @@ struct Runtime {
         if (!pipeline)
             throw std::runtime_error("cannot load direct autodiff profiles: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(
+        return std::make_unique<PythonProgramExecutable>(
             this, handle, nullptr, pipeline,
             std::vector<SharedCompileResult>{primal.result, forward.result, backward.result});
     }
 
-    std::unique_ptr<LoadedPipeline> loadPipeline(const nb::bytes &data, const std::vector<std::string> &features) {
-        VernonPipelineBundle *bundle =
-            vernonRuntimeLoadPipelineBundleWithOptions(handle, data.c_str(), data.size(), nullptr);
+    std::unique_ptr<PythonProgramExecutable> loadPipeline(const nb::bytes &data,
+                                                          const std::vector<std::string> &features) {
+        VernonProgramBundle *bundle =
+            vernonRuntimeLoadProgramBundleWithOptions(handle, data.c_str(), data.size(), nullptr);
         if (!bundle)
             throw std::runtime_error("cannot load pipeline bundle: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
         std::vector<const char *> names;
         for (const std::string &feature : features)
             names.push_back(feature.c_str());
-        VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
+        VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {names.data(), names.size()});
         if (!pipeline) {
             const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
-            vernonRuntimePipelineBundleDestroy(bundle);
+            vernonRuntimeProgramBundleDestroy(bundle);
             throw std::runtime_error("cannot resolve pipeline bundle: " + error);
         }
-        return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
+        return std::make_unique<PythonProgramExecutable>(this, handle, bundle, pipeline);
     }
 
-    std::unique_ptr<LoadedPipeline> loadPipelineAsset(const nb::bytes &data, const std::string &directory,
-                                                      const std::vector<std::string> &features) {
-        VernonPipelineBundleLoadOptions options{};
+    std::unique_ptr<PythonProgramExecutable> loadPipelineAsset(const nb::bytes &data, const std::string &directory,
+                                                               const std::vector<std::string> &features) {
+        VernonProgramBundleLoadOptions options{};
         options.struct_size = sizeof(options);
         options.bundle_directory = directory.c_str();
-        VernonPipelineBundle *bundle =
-            vernonRuntimeLoadPipelineBundleWithOptions(handle, data.c_str(), data.size(), &options);
+        VernonProgramBundle *bundle =
+            vernonRuntimeLoadProgramBundleWithOptions(handle, data.c_str(), data.size(), &options);
         if (!bundle)
             throw std::runtime_error("cannot load pipeline bundle: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
         std::vector<const char *> names;
         for (const std::string &feature : features)
             names.push_back(feature.c_str());
-        VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {names.data(), names.size()});
+        VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {names.data(), names.size()});
         if (!pipeline) {
             const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
-            vernonRuntimePipelineBundleDestroy(bundle);
+            vernonRuntimeProgramBundleDestroy(bundle);
             throw std::runtime_error("cannot resolve pipeline bundle: " + error);
         }
-        return std::make_unique<LoadedPipeline>(this, handle, bundle, pipeline);
+        return std::make_unique<PythonProgramExecutable>(this, handle, bundle, pipeline);
     }
 
-    std::unique_ptr<LoadedPipeline> loadCookedAsset(const nb::bytes &data, const std::string &directory,
-                                                    const std::vector<std::string> &features) {
+    std::unique_ptr<PythonProgramExecutable> loadCookedAsset(const nb::bytes &data, const std::string &directory,
+                                                             const std::vector<std::string> &features) {
         VernonExecutableBundleKind kind{};
         if (vernonRuntimeExecutableBundleInspectKind(data.c_str(), data.size(), &kind) != VERNON_STATUS_OK)
             throw std::runtime_error("cooked asset is neither a Pipeline nor Program bundle");
@@ -241,35 +241,33 @@ struct Runtime {
                                                         : loadPipelineAsset(data, directory, features);
     }
 
-    std::unique_ptr<LoadedPipeline> loadProgramAsset(const nb::bytes &data, const std::string &directory,
-                                                     const std::vector<std::string> &features) {
-        VernonPipelineBundleLoadOptions options{};
+    std::unique_ptr<PythonProgramExecutable> loadProgramAsset(const nb::bytes &data, const std::string &directory,
+                                                              const std::vector<std::string> &features) {
+        VernonProgramBundleLoadOptions options{};
         options.struct_size = sizeof(options);
         options.bundle_directory = directory.c_str();
         std::vector<const char *> names;
         for (const std::string &feature : features)
             names.push_back(feature.c_str());
-        VernonLoadedPipeline *pipeline = vernonRuntimeLoadProgramBundleWithOptions(
+        VernonProgramExecutable *pipeline = vernonRuntimeLoadManagedProgramBundleWithOptions(
             handle, data.c_str(), data.size(), {names.data(), names.size()}, &options);
         if (!pipeline)
             throw std::runtime_error("cannot load Program bundle: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<LoadedPipeline>(this, handle, nullptr, pipeline);
+        return std::make_unique<PythonProgramExecutable>(this, handle, nullptr, pipeline);
     }
 
-    std::unique_ptr<LoadedPipeline> loadCanonicalProgram(const nb::bytes &programData,
-                                                         const nb::bytes &artifactSystemData,
-                                                         const std::string &directory,
-                                                         const std::map<std::string, std::string> &stageBindings,
-                                                         const nb::list &compiledStages) {
+    std::unique_ptr<PythonProgramExecutable>
+    loadCanonicalProgram(const nb::bytes &programData, const nb::bytes &artifactSystemData,
+                         const std::string &directory, const std::map<std::string, std::string> &stageBindings,
+                         const nb::list &compiledStages) {
         return loadCanonicalProgramImpl(programData, artifactSystemData, directory, stageBindings, compiledStages);
     }
 
-    std::unique_ptr<LoadedPipeline> loadCanonicalProgramImpl(const nb::bytes &programData,
-                                                             const nb::bytes &artifactSystemData,
-                                                             const std::string &directory,
-                                                             const std::map<std::string, std::string> &stageBindings,
-                                                             const nb::list &compiledStages) {
+    std::unique_ptr<PythonProgramExecutable>
+    loadCanonicalProgramImpl(const nb::bytes &programData, const nb::bytes &artifactSystemData,
+                             const std::string &directory, const std::map<std::string, std::string> &stageBindings,
+                             const nb::list &compiledStages) {
         namespace program = vernon::runtime::program;
         std::string error;
         std::vector<SharedCompileResult> retained;
@@ -283,12 +281,13 @@ struct Runtime {
             registerInternedCpuStages(compiledStages, "compiled canonical Program stage metadata is invalid",
                                       "compiled canonical Program CPU entry ",
                                       "cannot register canonical Program CPU entry ", retained, registered, interned);
-            VernonLoadedPipeline *loaded = program::loadBackendProgramPipeline(
+            VernonProgramExecutable *loaded = program::loadBackendProgramPipeline(
                 *handle, programData.c_str(), programData.size(), artifactSystemData.c_str(), artifactSystemData.size(),
                 stageBindings, directory, error);
             if (!loaded)
                 throw std::runtime_error(error);
-            auto pipeline = std::make_unique<LoadedPipeline>(this, handle, nullptr, loaded, std::move(retained));
+            auto pipeline =
+                std::make_unique<PythonProgramExecutable>(this, handle, nullptr, loaded, std::move(retained));
             pipeline->internedCpuJits = std::move(interned);
             pipeline->registeredCpuEntries = std::move(registered);
             return pipeline;

@@ -48,7 +48,7 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 
 } // namespace
 
-bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveOpenGLPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
     auto *state = new OpenGLPipelineState();
     struct OpenGLBindingCandidate {
         VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -499,14 +499,15 @@ bool resolveOpenGLPipeline(VernonPipelineBundle &bundle, const Variant &variant,
     return false;
 }
 
-void destroyOpenGLPipeline(VernonLoadedPipeline &pipeline) {
+void destroyOpenGLPipeline(VernonProgramExecutable &pipeline) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCoreBindingsDestroy(state.rhiBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiPipeline);
 }
 
-VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeOpenGLGraphicsPipeline(VernonProgramExecutable &pipeline,
+                                          const VernonProgramSubmitDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
@@ -520,7 +521,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         value.kind = layout.kind;
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI vertex argument is missing");
@@ -535,7 +536,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI storage argument is missing");
@@ -546,7 +547,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_IMAGE ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
                 !found->second->image.view.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI image argument is missing");
             value.payload.image.view = found->second->image.view;
@@ -554,7 +555,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         }
         if (prepared.source == OpenGLPipelineState::InlineBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "OpenGL RHI sampler argument is missing");
             value.payload.sampler.resource = found->second->resource;
@@ -578,7 +579,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             continue;
         }
         const auto found = plan.arguments.find(prepared.externalSlot);
-        if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+        if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
             return fail(*pipeline.context, "OpenGL RHI uniform argument is missing");
         const VernonTensorView &tensor = found->second->tensor;
         const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
@@ -635,7 +636,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
     return VERNON_STATUS_OK;
 }
 
-VernonStatus invokeOpenGLComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeOpenGLComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
         return fail(*pipeline.context, "OpenGL provider compute pipeline is not loaded");

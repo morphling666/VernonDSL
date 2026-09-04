@@ -83,7 +83,7 @@ bool resolveStageReflection(const Stage &stage, VernonRuntimeBackend backend, Re
 
 const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::string &transport);
 
-std::optional<VernonPipelineArgumentKind> pipelineArgumentKind(const std::string &kind);
+std::optional<VernonProgramArgumentKind> pipelineArgumentKind(const std::string &kind);
 
 std::optional<VernonDataType> pipelineDataType(const std::string &dtype);
 

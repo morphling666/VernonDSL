@@ -250,14 +250,14 @@ VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEnt
     return registerStaticCpuEntry(symbol, entryPoint);
 }
 
-VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
-                                                  const char *reflectionData, size_t reflectionSize,
-                                                  const char *entryData, size_t entrySize) {
+VernonProgramExecutable *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
+                                                     const char *reflectionData, size_t reflectionSize,
+                                                     const char *entryData, size_t entrySize) {
     const nlohmann::json parsed =
         nlohmann::json::parse(reflectionData, reflectionData + reflectionSize, nullptr, false);
     if (parsed.is_discarded())
         return nullptr;
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
     ReflectedEntry reflection;
     const std::string entry(entryData, entrySize);
@@ -281,23 +281,23 @@ VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context,
     return pipeline.release();
 }
 
-VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
-                                                  size_t artifactSize, const char *reflectionData,
-                                                  size_t reflectionSize, const char *entryData, size_t entrySize) {
+VernonProgramExecutable *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
+                                                     size_t artifactSize, const char *reflectionData,
+                                                     size_t reflectionSize, const char *entryData, size_t entrySize) {
     Stage stage;
     Variant variant;
     ReflectedEntry reflection;
     if (!buildDirectComputeStage(context, artifact, artifactSize, reflectionData, reflectionSize, entryData, entrySize,
                                  stage, variant, reflection))
         return nullptr;
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
     pipeline->dispatchContract = reflection.dispatchContract;
     pipeline->readFootprints = reflection.readFootprints;
     pipeline->writeFootprints = reflection.writeFootprints;
-    VernonPipelineBundle bundle;
+    VernonProgramBundle bundle;
     bundle.context = &context;
     bundle.stages.emplace(stage.entry, std::move(stage));
     if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
@@ -306,12 +306,12 @@ VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context,
     return pipeline.release();
 }
 
-VernonLoadedPipeline *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
-                                                      ReflectedEntry reflection, const void *artifact,
-                                                      size_t artifactSize, const std::string &entry,
-                                                      VernonCpuEntryPoint cpuEntry,
-                                                      const std::vector<NativeResourceSlot> &nativeSlots) {
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+VernonProgramExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
+                                                         ReflectedEntry reflection, const void *artifact,
+                                                         size_t artifactSize, const std::string &entry,
+                                                         VernonCpuEntryPoint cpuEntry,
+                                                         const std::vector<NativeResourceSlot> &nativeSlots) {
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
     pipeline->variant = std::move(variant);
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
@@ -347,7 +347,7 @@ VernonLoadedPipeline *loadBackendTypedComputePipeline(VernonRuntimeContext &cont
     else
         stage.binary.assign(static_cast<const uint8_t *>(artifact),
                             static_cast<const uint8_t *>(artifact) + artifactSize);
-    VernonPipelineBundle bundle;
+    VernonProgramBundle bundle;
     bundle.context = &context;
     bundle.stages.emplace(stage.entry, std::move(stage));
     if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))

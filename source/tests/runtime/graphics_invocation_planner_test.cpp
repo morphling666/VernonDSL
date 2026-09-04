@@ -31,8 +31,8 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
     return VERNON_STATUS_OK;
 }
 
-bool planForTest(const Variant &variant, const VernonPipelineInvocation &invocation, PlannedGraphicsInvocation &plan,
-                 std::string &error) {
+bool planForTest(const Variant &variant, const VernonProgramSubmitDescriptor &invocation,
+                 PlannedGraphicsInvocation &plan, std::string &error) {
     return planGraphicsInvocation(variant, invocation, describeTestImage, nullptr, plan, error);
 }
 
@@ -68,8 +68,8 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     parameter.uses.push_back(std::move(use));
     variant.parameters.push_back(std::move(parameter));
 
-    VernonPipelineArgument argument{};
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    VernonProgramArgument argument{};
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     argument.tensor.resource = {1, {2}, 0, 4096};
@@ -93,7 +93,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     VernonGraphicsState state{};
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = &argument;
@@ -145,9 +145,9 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
 
     const std::array<uint64_t, 2> vertexShape{4, 3};
     std::array<int64_t, 2> vertexStrides{12, 4};
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = 0;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = vertexBuffer;
@@ -158,7 +158,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     arguments[0].tensor.byte_strides = vertexStrides.data();
     arguments[0].tensor.byte_size = 48;
     arguments[1].slot = 1;
-    arguments[1].kind = VERNON_PIPELINE_IMAGE;
+    arguments[1].kind = VERNON_PROGRAM_IMAGE;
     arguments[1].image = {sampledTexture};
     VernonColorAttachment attachments[2]{};
     attachments[0].location = 1;
@@ -181,7 +181,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     VernonGraphicsState state{};
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -311,7 +311,7 @@ TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
     source.depth_stencil.back = source.depth_stencil.front;
     source.color_blends = blends;
     source.color_blend_count = std::size(blends);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.graphics_state = &source;
     VernonDynamicState dynamic{};
     dynamic.struct_size = sizeof(dynamic);
@@ -347,7 +347,7 @@ TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
     source.depth_stencil.stencil_write_mask = 0xff;
     source.color_blends = &blend;
     source.color_blend_count = 1;
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
@@ -368,7 +368,7 @@ TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
     VernonGraphicsState source{};
     source.struct_size = sizeof(source);
     source.rasterization.depth_bias_constant = std::numeric_limits<float>::infinity();
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
@@ -471,7 +471,7 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_LINE_LIST;
 
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.render_pass = &renderPass;

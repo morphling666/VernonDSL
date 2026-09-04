@@ -53,7 +53,7 @@ std::optional<shape::DeclaredShape> logicalProjectionShape(const Parameter &para
 
 } // namespace
 
-ProgramInvocationFrame::ProgramInvocationFrame(const std::vector<VernonPipelineArgument> &hostArguments)
+ProgramInvocationFrame::ProgramInvocationFrame(const std::vector<VernonProgramArgument> &hostArguments)
     : logicalArguments_(hostArguments), logicalBuffers_(hostArguments.size()), carriers_(hostArguments.size()) {}
 
 ProgramInvocationFrame::ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues)
@@ -81,11 +81,11 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
     for (size_t value = 0; value < logicalArguments_.size(); ++value) {
         if (!required[value])
             continue;
-        const VernonPipelineArgument &argument = logicalArguments_[value];
+        const VernonProgramArgument &argument = logicalArguments_[value];
         if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
                                            hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
             continue;
-        if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
+        if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
         const uintptr_t identity = reinterpret_cast<uintptr_t>(argument.tensor.host_data);
@@ -105,11 +105,11 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
     for (size_t value = 0; value < logicalArguments_.size(); ++value) {
         if (!required[value])
             continue;
-        VernonPipelineArgument &argument = logicalArguments_[value];
+        VernonProgramArgument &argument = logicalArguments_[value];
         if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
                                            hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
             continue;
-        if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
+        if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
         const auto found = backings.find(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
@@ -157,9 +157,9 @@ bool ProgramInvocationFrame::adoptRetainedValue(uint32_t value, const ProgramInv
         error = "Program retained Value exceeds its invocation frame";
         return false;
     }
-    const VernonPipelineArgument &retainedArgument = retained.logicalArguments_[value];
-    const bool externalResource = retainedArgument.kind != VERNON_PIPELINE_TENSOR ||
-                                  retainedArgument.tensor.storage == VERNON_TENSOR_RHI_RESOURCE;
+    const VernonProgramArgument &retainedArgument = retained.logicalArguments_[value];
+    const bool externalResource =
+        retainedArgument.kind != VERNON_PROGRAM_TENSOR || retainedArgument.tensor.storage == VERNON_TENSOR_RHI_RESOURCE;
     if (retained.logicalBuffers_[value] || externalResource) {
         if (logicalBuffers_[value]) {
             const VernonRhiBuffer replaced = logicalBuffers_[value]->handle();
@@ -188,7 +188,7 @@ void ProgramInvocationFrame::rebindLogicalDescriptor(uint32_t value) {
     if (value >= hostValues_.size() || value >= logicalArguments_.size())
         return;
     ProgramHostValue &host = hostValues_[value];
-    if (host.argument.kind != VERNON_PIPELINE_TENSOR || logicalArguments_[value].kind != VERNON_PIPELINE_TENSOR)
+    if (host.argument.kind != VERNON_PROGRAM_TENSOR || logicalArguments_[value].kind != VERNON_PROGRAM_TENSOR)
         return;
     if (host.concreteShape) {
         host.argument.tensor.rank = static_cast<uint32_t>(host.concreteShape->size());
@@ -223,7 +223,7 @@ bool ProgramInvocationFrame::allocateCarrier(VernonRuntimeContext &context, uint
     slot->shape = std::move(shape);
     slot->strides = std::move(strides);
     slot->argument = {};
-    slot->argument.kind = VERNON_PIPELINE_TENSOR;
+    slot->argument.kind = VERNON_PROGRAM_TENSOR;
     slot->argument.tensor.struct_size = sizeof(VernonTensorView);
     slot->argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     if (!slot->buffer->reference(slot->argument.tensor.resource)) {
@@ -269,7 +269,7 @@ bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &requ
         if (!required[value] || !logicalBuffers_[value])
             continue;
         const ProgramHostValue &host = hostValues_[value];
-        if (host.argument.kind != VERNON_PIPELINE_TENSOR || !host.argument.tensor.host_data ||
+        if (host.argument.kind != VERNON_PROGRAM_TENSOR || !host.argument.tensor.host_data ||
             !logicalBuffers_[value]->download(host.argument.tensor.byte_offset,
                                               const_cast<void *>(host.argument.tensor.host_data),
                                               host.argument.tensor.byte_size)) {
@@ -300,8 +300,8 @@ bool ProgramInvocationFrame::resolveControl(const program::Program &program, con
     }
     if (valueId >= hostValues_.size())
         return error = "Program dispatch control references an unavailable value", false;
-    const VernonPipelineArgument &argument = hostValues_[valueId].argument;
-    if (argument.kind != VERNON_PIPELINE_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
+    const VernonProgramArgument &argument = hostValues_[valueId].argument;
+    if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
         !argument.tensor.host_data || argument.tensor.byte_offset > argument.tensor.byte_size)
         return error = "Program dispatch control is not a host scalar value", false;
     const uint8_t *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
@@ -380,13 +380,13 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             error = "resolved Program stage binding exceeds the invocation frame";
             return false;
         }
-        VernonPipelineArgument controlImage{};
-        const VernonPipelineArgument *source = nullptr;
+        VernonProgramArgument controlImage{};
+        const VernonProgramArgument *source = nullptr;
         const program::Value &programValue = program.values[binding.value];
         const auto image = programValue.storage ? controlImages_.find(*programValue.storage) : controlImages_.end();
         if (image != controlImages_.end()) {
             controlImage.slot = binding.value;
-            controlImage.kind = VERNON_PIPELINE_IMAGE;
+            controlImage.kind = VERNON_PROGRAM_IMAGE;
             controlImage.image.view = image->second;
             source = &controlImage;
         } else {
@@ -396,15 +396,15 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             error = "resolved Program stage binding has no physical carrier";
             return false;
         }
-        VernonPipelineArgument materialized = *source;
+        VernonProgramArgument materialized = *source;
         materialized.slot = parameter.slot;
-        if (binding.target && materialized.kind == VERNON_PIPELINE_TENSOR) {
+        if (binding.target && materialized.kind == VERNON_PROGRAM_TENSOR) {
             materialized.tensor.access = valueAccess(binding.target->access);
             materialized.tensor.element_layout = pipelineValueLayout(binding.target->elementLayout);
         }
         output.shapes.emplace_back();
         output.strides.emplace_back();
-        if (materialized.kind == VERNON_PIPELINE_TENSOR && materialized.tensor.rank) {
+        if (materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.rank) {
             const shape::DeclaredShape declared =
                 shape::decodeRuntimeContractShape(program.values[binding.value].shape);
             if (binding.value < hostValues_.size() && hostValues_[binding.value].concreteShape) {
@@ -444,7 +444,7 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
                 materialized.tensor.byte_size = bytes;
             }
             gpu::InternalBufferView view;
-            if (materialized.kind != VERNON_PIPELINE_TENSOR ||
+            if (materialized.kind != VERNON_PROGRAM_TENSOR ||
                 !gpu::materializeInternalBufferView(binding.target->shape, binding.target->elementLayout,
                                                     materialized.tensor.byte_size, view)) {
                 error = "resolved Program carrier '" + binding.target->name + "' (role " + binding.target->role +
@@ -460,7 +460,7 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
         }
         if (binding.leaf) {
             const program::Value &slot = program.values[binding.value];
-            if (materialized.kind != VERNON_PIPELINE_TENSOR || !slot.layout ||
+            if (materialized.kind != VERNON_PROGRAM_TENSOR || !slot.layout ||
                 *binding.leaf >= slot.layout->leaves.size()) {
                 error = "resolved Program stage leaf exceeds the canonical Value ABI";
                 return false;
@@ -491,7 +491,7 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
         }
         if (binding.target && binding.target->viewTransform) {
-            if (materialized.kind != VERNON_PIPELINE_TENSOR || !materialized.tensor.shape ||
+            if (materialized.kind != VERNON_PROGRAM_TENSOR || !materialized.tensor.shape ||
                 !materialized.tensor.byte_strides ||
                 parameter.shape.size() != binding.target->viewTransform->axes.size()) {
                 error = "Program view transform has an incompatible logical view";
@@ -549,8 +549,8 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
     return true;
 }
 
-const VernonPipelineArgument *ProgramInvocationFrame::argument(uint32_t value,
-                                                               const program::TargetBinding *binding) const {
+const VernonProgramArgument *ProgramInvocationFrame::argument(uint32_t value,
+                                                              const program::TargetBinding *binding) const {
     if (value >= logicalArguments_.size())
         return nullptr;
     if (binding) {
@@ -561,8 +561,8 @@ const VernonPipelineArgument *ProgramInvocationFrame::argument(uint32_t value,
     return &logicalArguments_[value];
 }
 
-VernonPipelineArgument *ProgramInvocationFrame::argument(uint32_t value, const program::TargetBinding *binding) {
-    return const_cast<VernonPipelineArgument *>(
+VernonProgramArgument *ProgramInvocationFrame::argument(uint32_t value, const program::TargetBinding *binding) {
+    return const_cast<VernonProgramArgument *>(
         static_cast<const ProgramInvocationFrame &>(*this).argument(value, binding));
 }
 

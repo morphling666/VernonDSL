@@ -102,7 +102,7 @@ The OpenGL function table, external-context callbacks, buffers, images,
 samplers, shader compilation, programs, vertex arrays, and attachment
 framebuffer objects are owned by VernonRHI. Runtime retains format and
 invocation policy while ProgramAsset and direct compute-artifact loaders both
-produce `VernonLoadedPipeline` and execute through RuntimeCore and the RHI
+produce `VernonProgramExecutable` and execute through RuntimeCore and the RHI
 provider adapter.
 `VernonOpenGLContextCallbacks` is the single context contract for Python and
 Engine owners; backend behavior never branches on context origin.
@@ -189,7 +189,7 @@ RenderTarget-owned proxy. Immutable `SamplerState` objects bind shader
 
 ## Reflection-driven structured Value binding
 
-The public C++ `PipelineInvocationBuilder` packs field trees, Tensor
+The public C++ `ProgramInvocationBuilder` packs field trees, Tensor
 structure-of-arrays views, and per-element callbacks into runtime-owned
 canonical bytes. It resolves every leaf through the reflected field/index path
 under one source parameter name and validates dtype, static leaf shape, outer
@@ -559,11 +559,11 @@ The following paragraphs record the shipped pre-breaking implementation only;
 they are not an alternate target architecture. The coordinated Program release
 removes these artifact shapes and handles rather than normalizing them.
 
-`VernonLoadedPipeline` is the only Runtime program handle. It represents either
+`VernonProgramExecutable` is the only Runtime program handle. It represents either
 one compute stage or a validated tuple of graphics stages; compute and graphics
 entries are never combined in one pipeline. A persistent ProgramAsset resolves
 to the same handle. Direct CPU entries and raw GPU artifacts synthesize a
-compute-only variant and return `VernonLoadedPipeline` as well.
+compute-only variant and return `VernonProgramExecutable` as well.
 
 ProgramAsset target architecture and options are selected by the cooker. A
 compute ProgramAsset resolves only against a compute backend, while a graphics

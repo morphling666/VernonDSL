@@ -23,10 +23,10 @@ vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint
                                       VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
 }
 
-VernonPipelineParameterView parameter(VernonLoadedPipeline *pipeline, const char *name) {
-    VernonPipelineParameterView result{};
+VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
+    VernonProgramParameterView result{};
     const VernonStringView view{name, std::char_traits<char>::length(name)};
-    EXPECT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, view, &result), VERNON_STATUS_OK) << name;
+    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, view, &result), VERNON_STATUS_OK) << name;
     return result;
 }
 
@@ -55,13 +55,13 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
     const std::string bundleDirectory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_TRUE(loaded);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
     ASSERT_TRUE(pipeline) << (resolveError.data ? std::string(resolveError.data, resolveError.size) : std::string{});
 
@@ -116,15 +116,15 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     constexpr std::array<float, 16> identity = {
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
     };
-    const VernonPipelineParameterView positionParameter = parameter(pipeline, "aPos");
-    const VernonPipelineParameterView cubeParameter = parameter(pipeline, "cubeMap");
-    const VernonPipelineParameterView modelParameter = parameter(pipeline, "model");
-    const VernonPipelineParameterView projectionParameter = parameter(pipeline, "projection");
-    const VernonPipelineParameterView viewParameter = parameter(pipeline, "view");
+    const VernonProgramParameterView positionParameter = parameter(pipeline, "aPos");
+    const VernonProgramParameterView cubeParameter = parameter(pipeline, "cubeMap");
+    const VernonProgramParameterView modelParameter = parameter(pipeline, "model");
+    const VernonProgramParameterView projectionParameter = parameter(pipeline, "projection");
+    const VernonProgramParameterView viewParameter = parameter(pipeline, "view");
 
-    std::array<VernonPipelineArgument, 5> arguments{};
+    std::array<VernonProgramArgument, 5> arguments{};
     arguments[0].slot = positionParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = vertices.reference;
@@ -135,10 +135,10 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     arguments[0].tensor.byte_strides = vertexStrides;
     arguments[0].tensor.byte_size = sizeof(positions);
     arguments[1].slot = cubeParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_IMAGE;
+    arguments[1].kind = VERNON_PROGRAM_IMAGE;
     arguments[1].image = {cubeView.reference};
     for (size_t index = 2; index < arguments.size(); ++index) {
-        arguments[index].kind = VERNON_PIPELINE_TENSOR;
+        arguments[index].kind = VERNON_PROGRAM_TENSOR;
         arguments[index].tensor.struct_size = sizeof(VernonTensorView);
         arguments[index].tensor.storage = VERNON_TENSOR_HOST;
         arguments[index].tensor.host_data = identity.data();
@@ -157,7 +157,7 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         {0, colorView.reference},
         {1, bloomView.reference},
     };
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments.data();
@@ -201,8 +201,8 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, cube.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     ASSERT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }

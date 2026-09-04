@@ -62,7 +62,7 @@ struct GraphicsInvocationControls {
         dynamic.struct_size = sizeof(dynamic);
     }
 
-    void bind(VernonPipelineInvocation &invocation) {
+    void bind(VernonProgramSubmitDescriptor &invocation) {
         invocation.graphics_state = &state;
         invocation.render_pass = &renderPass;
         invocation.draw_command = &draw;
@@ -70,9 +70,10 @@ struct GraphicsInvocationControls {
     }
 };
 
-inline VernonStatus completeSubmission(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation) {
+inline VernonStatus completeSubmission(VernonProgramExecutable *pipeline,
+                                       const VernonProgramSubmitDescriptor *invocation) {
     VernonSubmission *submission{};
-    const VernonStatus submitStatus = vernonRuntimePipelineSubmit(pipeline, invocation, &submission);
+    const VernonStatus submitStatus = vernonRuntimeProgramSubmit(pipeline, invocation, &submission);
     if (submitStatus != VERNON_STATUS_OK)
         return submitStatus;
     const VernonStatus completionStatus = vernonSubmissionWait(submission);
@@ -96,7 +97,7 @@ inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiComma
 class RuntimeGraphRenderPass final : public execution::RenderPass {
 public:
     RuntimeGraphRenderPass(std::string name, execution::GraphImage target, VernonRuntimeContext *runtime,
-                           VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation,
+                           VernonProgramExecutable *pipeline, const VernonProgramSubmitDescriptor *invocation,
                            VernonRhiLoadOperation load = VERNON_RHI_LOAD_CLEAR,
                            VernonRhiStoreOperation store = VERNON_RHI_STORE_PRESERVE)
         : RenderPass(std::move(name)), target_(target), runtime_(runtime), pipeline_(pipeline), invocation_(invocation),
@@ -115,7 +116,7 @@ public:
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimePipelineEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+        return vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
                    ? VERNON_RHI_STATUS_OK
                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -123,8 +124,8 @@ public:
 private:
     execution::GraphImage target_;
     VernonRuntimeContext *runtime_{};
-    VernonLoadedPipeline *pipeline_{};
-    const VernonPipelineInvocation *invocation_{};
+    VernonProgramExecutable *pipeline_{};
+    const VernonProgramSubmitDescriptor *invocation_{};
     VernonRhiLoadOperation load_{};
     VernonRhiStoreOperation store_{};
 };
@@ -132,7 +133,7 @@ private:
 class RuntimeGraphComputePass final : public execution::ComputePass {
 public:
     RuntimeGraphComputePass(std::string name, execution::GraphBuffer buffer, VernonRuntimeContext *runtime,
-                            VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation)
+                            VernonProgramExecutable *pipeline, const VernonProgramSubmitDescriptor *invocation)
         : ComputePass(std::move(name)), buffer_(buffer), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -142,7 +143,7 @@ public:
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimePipelineEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+        return vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
                    ? VERNON_RHI_STATUS_OK
                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -150,8 +151,8 @@ public:
 private:
     execution::GraphBuffer buffer_;
     VernonRuntimeContext *runtime_{};
-    VernonLoadedPipeline *pipeline_{};
-    const VernonPipelineInvocation *invocation_{};
+    VernonProgramExecutable *pipeline_{};
+    const VernonProgramSubmitDescriptor *invocation_{};
 };
 
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {

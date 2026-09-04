@@ -30,13 +30,13 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{1, 1, 1, 3};
@@ -57,13 +57,13 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     inputValues[1].data = values;
     VernonPullback *rejectedPullback = nullptr;
-    EXPECT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback),
+    EXPECT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &rejectedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPullback, nullptr);
     inputValues[1].data = source;
 
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(loss, 26.0f);
@@ -103,8 +103,8 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     EXPECT_FLOAT_EQ(valuesGradient[2], 0.0f);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -118,13 +118,13 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{1, 1, 1, 3};
@@ -144,7 +144,7 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     ASSERT_FLOAT_EQ(loss, 26.0f);
@@ -182,8 +182,8 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
     EXPECT_FLOAT_EQ(source[1], -20.0f);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -200,13 +200,13 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
     ASSERT_NE(context, nullptr);
     auto tapePolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(0, 0);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, tapePolicy);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{2, 1, 1, 3};
@@ -226,7 +226,7 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
@@ -241,8 +241,8 @@ TEST(RuntimeStructuredStorageAutodiff, NoTapeProfileDoesNotReserveHostTape) {
 
     vernonPullbackDestroy(pullback);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*tapePolicy), 0u);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 #endif

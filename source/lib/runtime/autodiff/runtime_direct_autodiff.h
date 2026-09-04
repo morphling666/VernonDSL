@@ -48,7 +48,7 @@ struct AutodiffGpuStageView {
     VernonStringView entry;
 };
 
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
+VERNON_RUNTIME_CAPI VernonProgramExecutable *loadBackendCpuAutodiffPipeline(
     VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry, VernonStringView primalReflection,
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
@@ -56,17 +56,18 @@ VERNON_RUNTIME_CAPI VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     uint64_t staticTapeBytesHint, VernonStringView residualStorage, VernonStringView selectedPolicy,
     bool wholeDispatchRetentionPermitted);
 
-VERNON_RUNTIME_CAPI VernonLoadedPipeline *
+VERNON_RUNTIME_CAPI VernonProgramExecutable *
 loadBackendGpuAutodiffPipeline(VernonRuntimeContext &context, const AutodiffGpuStageView &primal,
                                const AutodiffGpuStageView &forward, const AutodiffGpuStageView &backward,
                                const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount,
                                uint64_t staticTapeBytesHint, VernonStringView residualStorage,
                                VernonStringView selectedPolicy);
 
-VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffReadFootprints(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffWriteFootprints(const VernonLoadedPipeline *pipeline);
+VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffReadFootprints(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint>
+autodiffWriteFootprints(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);
@@ -107,7 +108,7 @@ struct AutodiffPullbackPassTelemetry {
 AutodiffPullbackCheckpointPlan autodiffPullbackCheckpointPlan(const VernonPullback *pullback);
 std::vector<AutodiffPullbackPassTelemetry> autodiffPullbackPassTelemetry(const VernonPullback *pullback);
 uint64_t autodiffPullbackPeakRuntimeManagedBytes(const VernonPullback *pullback);
-void autodiffSetProgramCheckpointPlan(VernonLoadedPipeline *pipeline, const uint64_t *memoryBudget,
+void autodiffSetProgramCheckpointPlan(VernonProgramExecutable *pipeline, const uint64_t *memoryBudget,
                                       std::string_view policy);
 
 } // namespace vernon::runtime

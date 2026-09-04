@@ -1,8 +1,8 @@
-#ifndef VERNON_PYTHON_NATIVE_PIPELINE_AUTODIFF_H
-#define VERNON_PYTHON_NATIVE_PIPELINE_AUTODIFF_H
+#ifndef VERNON_PYTHON_NATIVE_PROGRAM_AUTODIFF_H
+#define VERNON_PYTHON_NATIVE_PROGRAM_AUTODIFF_H
 
 #include "native_command_retention.h"
-#include "native_pipeline.h"
+#include "native_program.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/program_boundary_view.h"
@@ -146,11 +146,11 @@ inline void instantiatePythonAdMetadata(PythonAdMetadata &leaf, const std::deque
     }
 }
 
-PythonAdMetadata adInputLeafMetadata(VernonLoadedPipeline *pipeline, const PipelineParameterMetadata &parameter,
-                                     size_t leafIndex, VernonPipelineValueLeafView *reflected = nullptr);
+PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *pipeline, const ProgramParameterMetadata &parameter,
+                                     size_t leafIndex, VernonProgramValueLeafView *reflected = nullptr);
 
-nb::object resolveAdInputLeaf(const nb::dict &bindings, const PipelineParameterMetadata &parameter,
-                              const VernonPipelineValueLeafView &leaf);
+nb::object resolveAdInputLeaf(const nb::dict &bindings, const ProgramParameterMetadata &parameter,
+                              const VernonProgramValueLeafView &leaf);
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
 struct PythonPullback {
@@ -497,21 +497,21 @@ private:
     nb::dict bindings;
 };
 
-struct LoadedPipeline {
-    LoadedPipeline(Runtime *owner, VernonRuntimeContext *runtime, VernonPipelineBundle *bundle,
-                   VernonLoadedPipeline *pipeline, std::vector<SharedCompileResult> retainedResults = {},
-                   std::vector<std::pair<std::string, VernonCpuEntryPoint>> registeredCpuEntries = {})
+struct PythonProgramExecutable {
+    PythonProgramExecutable(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramBundle *bundle,
+                            VernonProgramExecutable *pipeline, std::vector<SharedCompileResult> retainedResults = {},
+                            std::vector<std::pair<std::string, VernonCpuEntryPoint>> registeredCpuEntries = {})
         : owner(owner), runtime(runtime), bundle(bundle), pipeline(pipeline),
           retainedResults(std::move(retainedResults)), registeredCpuEntries(std::move(registeredCpuEntries)) {}
-    ~LoadedPipeline() {
-        vernonRuntimeLoadedPipelineDestroy(pipeline);
+    ~PythonProgramExecutable() {
+        vernonRuntimeProgramExecutableDestroy(pipeline);
         for (const auto &[symbol, entry] : registeredCpuEntries)
             vernonRuntimeUnregisterCpuEntry(runtime, {symbol.data(), symbol.size()}, entry);
-        vernonRuntimePipelineBundleDestroy(bundle);
+        vernonRuntimeProgramBundleDestroy(bundle);
     }
 
-    std::unique_ptr<PipelineInvocationBuilder> invocationBuilder() {
-        return std::make_unique<PipelineInvocationBuilder>(owner, runtime, pipeline);
+    std::unique_ptr<ProgramInvocationBuilder> invocationBuilder() {
+        return std::make_unique<ProgramInvocationBuilder>(owner, runtime, pipeline);
     }
 
     std::array<uint32_t, 3> workgroupSize() const {
@@ -519,10 +519,10 @@ struct LoadedPipeline {
         return {size.x, size.y, size.z};
     }
 
-    bool isManagedProgram() const { return vernonRuntimeLoadedPipelineIsManagedProgram(pipeline) != 0; }
+    bool isManagedProgram() const { return vernonRuntimeProgramExecutableIsManagedProgram(pipeline) != 0; }
 
     nb::dict programAdSignature() const {
-        if (!vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline))
+        if (!vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline))
             throw std::runtime_error("pipeline has no Program autodiff signature");
         nb::dict signature;
         const std::pair<const char *, VernonProgramAdBoundary> boundaries[] = {
@@ -532,11 +532,11 @@ struct LoadedPipeline {
         };
         for (const auto &[name, boundary] : boundaries) {
             nb::list rows;
-            const size_t count = vernonRuntimeLoadedPipelineGetProgramAdValueCount(pipeline, boundary);
+            const size_t count = vernonRuntimeProgramExecutableGetProgramAdValueCount(pipeline, boundary);
             for (size_t index = 0; index < count; ++index) {
                 VernonProgramAdValueView value{};
                 value.struct_size = sizeof(value);
-                if (vernonRuntimeLoadedPipelineGetProgramAdValueByIndex(pipeline, boundary, index, &value) !=
+                if (vernonRuntimeProgramExecutableGetProgramAdValueByIndex(pipeline, boundary, index, &value) !=
                     VERNON_STATUS_OK)
                     throw std::runtime_error("cannot read Program autodiff signature");
                 nb::dict row;
@@ -567,11 +567,11 @@ struct LoadedPipeline {
         return result;
     }
 
-    void programForwardBound(PipelineInvocationBuilder &builder) {
+    void programForwardBound(ProgramInvocationBuilder &builder) {
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("Program invocation builder belongs to another pipeline");
-        std::vector<VernonPipelineArgument> arguments;
-        VernonPipelineInvocation invocation = builder.invocation(arguments);
+        std::vector<VernonProgramArgument> arguments;
+        VernonProgramSubmitDescriptor invocation = builder.invocation(arguments);
         VernonPullback *pullback = nullptr;
         const VernonStatus status = vernonRuntimeProgramForward(pipeline, &invocation, &pullback);
         if (pullback)
@@ -580,10 +580,10 @@ struct LoadedPipeline {
             throw std::runtime_error("Program forward failed: " + nativeStringView(vernonRuntimeGetLastError(runtime)));
     }
 
-    nb::tuple programVjpBound(PipelineInvocationBuilder &builder, const nb::dict &programBindings,
+    nb::tuple programVjpBound(ProgramInvocationBuilder &builder, const nb::dict &programBindings,
                               nb::object pipelineOwner, const nb::object &checkpointMemoryBudget,
                               const std::string &checkpointPolicy) {
-        if (!vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline))
+        if (!vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline))
             throw std::runtime_error("pipeline has no Program autodiff signature");
         if (checkpointMemoryBudget.is_none())
             vernon::runtime::autodiffSetProgramCheckpointPlan(pipeline, nullptr, checkpointPolicy);
@@ -596,13 +596,13 @@ struct LoadedPipeline {
             value.struct_size = sizeof(value);
             VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
             if (std::string_view(kind) == "input")
-                status = vernonRuntimeLoadedPipelineGetAdInputByIndex(pipeline, index, &value);
+                status = vernonRuntimeProgramExecutableGetAdInputByIndex(pipeline, index, &value);
             else if (std::string_view(kind) == "output")
-                status = vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, index, &value);
+                status = vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, index, &value);
             else if (std::string_view(kind) == "cotangent")
-                status = vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, index, &value);
+                status = vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, index, &value);
             else if (std::string_view(kind) == "gradient")
-                status = vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, index, &value);
+                status = vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, index, &value);
             if (status != VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read Program autodiff leaf metadata");
             PythonAdMetadata result;
@@ -614,18 +614,18 @@ struct LoadedPipeline {
             return result;
         };
         const auto declaredDerivativePath = [&](VernonAdDerivativeRole role, const std::string &leafPath) {
-            const size_t count = vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(pipeline);
+            const size_t count = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline);
             for (size_t groupIndex = 0; groupIndex < count; ++groupIndex) {
                 VernonAdDerivativeGroupView group{};
                 group.struct_size = sizeof(group);
-                if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
+                if (vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
                         VERNON_STATUS_OK ||
                     group.role != role)
                     continue;
                 for (size_t leafIndex = 0; leafIndex < group.leaf_count; ++leafIndex) {
                     VernonStringView leaf{};
-                    if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(pipeline, groupIndex, leafIndex, &leaf) ==
-                            VERNON_STATUS_OK &&
+                    if (vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(pipeline, groupIndex, leafIndex,
+                                                                               &leaf) == VERNON_STATUS_OK &&
                         nativeStringView(leaf) == leafPath)
                         return nativeStringView(group.declared_path);
                 }
@@ -635,8 +635,8 @@ struct LoadedPipeline {
         nb::dict outputs;
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("Program invocation builder belongs to another pipeline");
-        std::vector<VernonPipelineArgument> arguments;
-        VernonPipelineInvocation invocation = builder.invocation(arguments);
+        std::vector<VernonProgramArgument> arguments;
+        VernonProgramSubmitDescriptor invocation = builder.invocation(arguments);
         VernonPullback *pullback = nullptr;
         const VernonStatus status = vernonRuntimeProgramForward(pipeline, &invocation, &pullback);
         if (status != VERNON_STATUS_OK) {
@@ -656,7 +656,7 @@ struct LoadedPipeline {
             nb::object array = nb::module_::import_("numpy").attr("asarray")(value);
             leaf.shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
         };
-        const size_t cotangentCount = vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline);
+        const size_t cotangentCount = vernonRuntimeProgramExecutableGetAdCotangentCount(pipeline);
         for (size_t index = 0; index < cotangentCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("cotangent", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path);
@@ -664,7 +664,7 @@ struct LoadedPipeline {
             cotangents.push_back(std::move(leaf));
         }
         std::vector<PythonAdMetadata> gradients;
-        const size_t gradientCount = vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline);
+        const size_t gradientCount = vernonRuntimeProgramExecutableGetAdGradientCount(pipeline);
         for (size_t index = 0; index < gradientCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("gradient", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path);
@@ -694,20 +694,20 @@ struct LoadedPipeline {
     }
 
     nb::tuple vjp(uint32_t gridX, uint32_t gridY, uint32_t gridZ, const nb::dict &bindings, nb::object pipelineOwner,
-                  PipelineInvocationBuilder *encodedBuilder = nullptr,
+                  ProgramInvocationBuilder *encodedBuilder = nullptr,
                   const VernonRhiCommandEncoder *nativeEncoder = nullptr,
                   vernon::execution::detail::RhiCommandExecutionPlan *commandPlan = nullptr) {
         if (!gridX || !gridY || !gridZ)
             throw std::invalid_argument("autodiff grid dimensions must be positive");
-        const std::vector<PipelineParameterMetadata> metadata = parameters();
+        const std::vector<ProgramParameterMetadata> metadata = parameters();
         if (bindings.size() != metadata.size())
             throw std::invalid_argument("autodiff bindings do not match pipeline parameters");
         std::deque<PythonAdValue> inputValues;
         std::vector<VernonAdValue> inputViews;
         std::vector<PythonAdMetadata> inputLeafMetadata;
-        for (const PipelineParameterMetadata &parameter : metadata) {
+        for (const ProgramParameterMetadata &parameter : metadata) {
             for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
-                VernonPipelineValueLeafView reflected{};
+                VernonProgramValueLeafView reflected{};
                 PythonAdMetadata leaf = adInputLeafMetadata(pipeline, parameter, leafIndex, &reflected);
                 nb::object value = resolveAdInputLeaf(bindings, parameter, reflected);
                 const std::vector<uint64_t> actualShape = nb::cast<std::vector<uint64_t>>(value.attr("shape"));
@@ -739,8 +739,8 @@ struct LoadedPipeline {
         if (extentX > SIZE_MAX / extentY || static_cast<size_t>(extentX) * extentY > SIZE_MAX / extentZ)
             throw std::invalid_argument("autodiff grid size overflows");
         const size_t carrierCount = static_cast<size_t>(extentX) * extentY * extentZ;
-        const size_t outputCount = vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline);
-        const size_t cotangentCount = vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline);
+        const size_t outputCount = vernonRuntimeProgramExecutableGetAdOutputCount(pipeline);
+        const size_t cotangentCount = vernonRuntimeProgramExecutableGetAdCotangentCount(pipeline);
         if (!outputCount || !cotangentCount)
             throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
         auto prependCarrierDimensions = [&](std::vector<uint64_t> &shape) {
@@ -766,7 +766,7 @@ struct LoadedPipeline {
         for (size_t index = 0; index < outputCount; ++index) {
             VernonAdValueMetadataView outputValue{};
             outputValue.struct_size = sizeof(outputValue);
-            if (vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, index, &outputValue) != VERNON_STATUS_OK)
+            if (vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, index, &outputValue) != VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             outputMetadata.push_back(materializeMetadata(outputValue));
             const PythonAdMetadata &metadata = outputMetadata.back();
@@ -781,7 +781,8 @@ struct LoadedPipeline {
         for (size_t index = 0; index < cotangentCount; ++index) {
             VernonAdValueMetadataView cotangentValue{};
             cotangentValue.struct_size = sizeof(cotangentValue);
-            if (vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, index, &cotangentValue) != VERNON_STATUS_OK)
+            if (vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, index, &cotangentValue) !=
+                VERNON_STATUS_OK)
                 throw std::runtime_error("pipeline has no consistent autodiff output/cotangent signature");
             PythonAdMetadata cotangent = materializeMetadata(cotangentValue);
             const auto input =
@@ -806,8 +807,8 @@ struct LoadedPipeline {
             if (!encodedBuilder || (nativeEncoder == nullptr) == (commandPlan == nullptr) ||
                 encodedBuilder->pipeline != pipeline)
                 throw std::invalid_argument("encoded autodiff invocation belongs to another pipeline");
-            std::vector<VernonPipelineArgument> values;
-            VernonPipelineInvocation invocation = encodedBuilder->invocation(values);
+            std::vector<VernonProgramArgument> values;
+            VernonProgramSubmitDescriptor invocation = encodedBuilder->invocation(values);
             if (invocation.compute_grid.x != gridX || invocation.compute_grid.y != gridY ||
                 invocation.compute_grid.z != gridZ)
                 throw std::invalid_argument("encoded autodiff invocation grid does not match the VJP grid");
@@ -818,10 +819,10 @@ struct LoadedPipeline {
                 VernonRuntimeProviderObject encoder{};
                 if (vernonRuntimeReferenceRhiCommandEncoder(runtime, *nativeEncoder, &encoder) != VERNON_STATUS_OK)
                     throw std::invalid_argument("command encoder belongs to another Runtime device");
-                forwardStatus = vernonAdPipelineEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
+                forwardStatus = vernonAdProgramEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
             }
         } else {
-            forwardStatus = vernonAdPipelineForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
+            forwardStatus = vernonAdProgramForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
         }
         if (forwardStatus != VERNON_STATUS_OK)
             throw std::runtime_error("autodiff forward invocation failed: " +
@@ -831,12 +832,12 @@ struct LoadedPipeline {
                 input.commit();
 
         std::vector<PythonAdMetadata> gradients;
-        const size_t gradientCount = vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline);
+        const size_t gradientCount = vernonRuntimeProgramExecutableGetAdGradientCount(pipeline);
         gradients.reserve(gradientCount);
         for (size_t index = 0; index < gradientCount; ++index) {
             VernonAdValueMetadataView gradient{};
             gradient.struct_size = sizeof(gradient);
-            if (vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, index, &gradient) != VERNON_STATUS_OK) {
+            if (vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, index, &gradient) != VERNON_STATUS_OK) {
                 vernonPullbackDestroy(pullback);
                 throw std::runtime_error("cannot read autodiff gradient reflection");
             }
@@ -882,17 +883,17 @@ struct LoadedPipeline {
     }
 
     std::unique_ptr<PythonRuntimeSubmission> submitCompute(uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
-        const std::vector<PipelineParameterMetadata> metadata = parameters();
+        const std::vector<ProgramParameterMetadata> metadata = parameters();
         if (values.size() != metadata.size())
             throw std::invalid_argument("compute pipeline value count does not match reflection");
         std::deque<std::string> scalarStorage;
         std::deque<std::vector<uint64_t>> shapes;
         std::deque<std::vector<int64_t>> strides;
-        std::vector<VernonPipelineArgument> arguments;
+        std::vector<VernonProgramArgument> arguments;
         arguments.reserve(metadata.size());
         for (size_t index = 0; index < metadata.size(); ++index) {
-            const PipelineParameterMetadata &parameter = metadata[index];
-            if (parameter.kind != VERNON_PIPELINE_TENSOR)
+            const ProgramParameterMetadata &parameter = metadata[index];
+            if (parameter.kind != VERNON_PROGRAM_TENSOR)
                 throw std::invalid_argument("direct compute pipelines accept only Tensor/value parameters");
             shapes.push_back(parameter.shape);
             strides.emplace_back(parameter.shape.size());
@@ -901,9 +902,9 @@ struct LoadedPipeline {
                 strides.back()[dimension] = static_cast<int64_t>(stride);
                 stride *= static_cast<size_t>(parameter.shape[dimension]);
             }
-            VernonPipelineArgument argument{};
+            VernonProgramArgument argument{};
             argument.slot = parameter.slot;
-            argument.kind = VERNON_PIPELINE_TENSOR;
+            argument.kind = VERNON_PROGRAM_TENSOR;
             argument.tensor.struct_size = sizeof(VernonTensorView);
             argument.tensor.element_layout = {
                 sizeof(VernonValueLayoutView),  parameter.elementByteSize,
@@ -935,14 +936,14 @@ struct LoadedPipeline {
             }
             arguments.push_back(argument);
         }
-        VernonPipelineInvocation invocation{};
+        VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = arguments.data();
         invocation.argument_count = arguments.size();
         invocation.compute_grid = {x, y, z};
         VernonSubmission *submission{};
-        if (vernonRuntimePipelineSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
+        if (vernonRuntimeProgramSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
             throw std::runtime_error("compute pipeline submission failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
         return std::make_unique<PythonRuntimeSubmission>(submission);
@@ -950,18 +951,18 @@ struct LoadedPipeline {
 
     nb::list derivativeGroups() const {
         nb::list result;
-        const size_t groupCount = vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(pipeline);
+        const size_t groupCount = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline);
         for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
             VernonAdDerivativeGroupView group{};
             group.struct_size = sizeof(group);
-            if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
+            if (vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
                 VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read autodiff derivative group metadata");
             nb::list leaves;
             for (size_t leafIndex = 0; leafIndex < group.leaf_count; ++leafIndex) {
                 VernonStringView leafPath{};
-                if (vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(pipeline, groupIndex, leafIndex, &leafPath) !=
-                    VERNON_STATUS_OK)
+                if (vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(pipeline, groupIndex, leafIndex,
+                                                                           &leafPath) != VERNON_STATUS_OK)
                     throw std::runtime_error("cannot read autodiff derivative group leaf");
                 leaves.append(nativeStringView(leafPath));
             }
@@ -971,26 +972,26 @@ struct LoadedPipeline {
         return result;
     }
 
-    std::vector<PipelineParameterMetadata> parameters() const {
-        std::vector<PipelineParameterMetadata> result;
-        const size_t count = vernonRuntimeLoadedPipelineGetParameterCount(pipeline);
+    std::vector<ProgramParameterMetadata> parameters() const {
+        std::vector<ProgramParameterMetadata> result;
+        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
         result.reserve(count);
         for (size_t index = 0; index < count; ++index) {
-            VernonPipelineParameterView view{};
-            if (vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
+            VernonProgramParameterView view{};
+            if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read loaded pipeline parameter");
             result.push_back(parameterMetadata(view));
         }
         return result;
     }
 
-    std::vector<PipelineOutputMetadata> outputs() const {
-        std::vector<PipelineOutputMetadata> result;
-        const size_t count = vernonRuntimeLoadedPipelineGetOutputCount(pipeline);
+    std::vector<ProgramOutputMetadata> outputs() const {
+        std::vector<ProgramOutputMetadata> result;
+        const size_t count = vernonRuntimeProgramExecutableGetOutputCount(pipeline);
         result.reserve(count);
         for (size_t index = 0; index < count; ++index) {
-            VernonPipelineOutputView view{};
-            if (vernonRuntimeLoadedPipelineGetOutputByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
+            VernonProgramOutputView view{};
+            if (vernonRuntimeProgramExecutableGetOutputByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read loaded pipeline output");
             result.push_back(outputMetadata(view));
         }
@@ -999,8 +1000,8 @@ struct LoadedPipeline {
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
-    VernonPipelineBundle *bundle{};
-    VernonLoadedPipeline *pipeline{};
+    VernonProgramBundle *bundle{};
+    VernonProgramExecutable *pipeline{};
     // ORC entry pointers are valid only while an interned compile result owns the JIT.
     std::vector<std::shared_ptr<InternedCpuJit>> internedCpuJits;
     std::vector<SharedCompileResult> retainedResults;

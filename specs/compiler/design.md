@@ -156,7 +156,7 @@ native compiler.
 
 Compute source compilation and invocation behavior lives in `_runtime.kernel`.
 The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
-native entries are `LoadedPipeline` objects and invoke the same compute pipeline
+native entries are `PythonProgramExecutable` objects and invoke the same compute pipeline
 ABI as ProgramAssets. Reinitializing a session invalidates loaded pipelines
 without discarding deterministic frontend and compiler results.
 Graphics Pipeline bundle compilation, binding, and invocation live in
@@ -366,7 +366,7 @@ nodes are excluded; structured control flow inside a compute implementation
 remains Kernel IR.
 
 Texture parameter constraints are queried through a separate `struct_size`-
-versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
+versioned runtime view so `VernonProgramParameterView` remains ABI-stable.
 Pipeline 17 records the required texture dimension; format remains
 unconstrained.
 

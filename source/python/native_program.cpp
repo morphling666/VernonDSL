@@ -1,4 +1,4 @@
-#include "native_pipeline.h"
+#include "native_program.h"
 
 #include <future>
 
@@ -291,8 +291,8 @@ std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std
     return results;
 }
 
-PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &view) {
-    PipelineParameterMetadata result;
+ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &view) {
+    ProgramParameterMetadata result;
     result.slot = view.slot;
     result.name = nativeStringView(view.name);
     result.kind = view.kind;
@@ -308,8 +308,8 @@ PipelineParameterMetadata parameterMetadata(const VernonPipelineParameterView &v
     return result;
 }
 
-PipelineOutputMetadata outputMetadata(const VernonPipelineOutputView &view) {
-    PipelineOutputMetadata result;
+ProgramOutputMetadata outputMetadata(const VernonProgramOutputView &view) {
+    ProgramOutputMetadata result;
     result.name = nativeStringView(view.name);
     result.kind = view.kind;
     result.dtype = view.dtype;

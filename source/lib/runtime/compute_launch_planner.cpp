@@ -14,7 +14,7 @@ namespace vernon::runtime {
 
 namespace {
 
-using ComputeArgumentMap = std::unordered_map<uint32_t, const VernonPipelineArgument *>;
+using ComputeArgumentMap = std::unordered_map<uint32_t, const VernonProgramArgument *>;
 
 bool fail(std::string &error, const char *message) {
     error = message;
@@ -45,7 +45,8 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
 }
 
 bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments, VernonLaunchSize workgroup,
-                          const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
+                          const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                          std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
     size_t computeArgumentSpan = 0;
     size_t computeArgumentCount = 0;
@@ -68,7 +69,7 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
         const auto suppliedIt = arguments.find(parameter.slot);
         if (suppliedIt == arguments.end())
             return fail(error, "compute argument is missing");
-        const VernonPipelineArgument &supplied = *suppliedIt->second;
+        const VernonProgramArgument &supplied = *suppliedIt->second;
         for (const ParameterUse &use : parameter.uses) {
             if (use.stage != "compute" && use.stage != variant.compute)
                 continue;
@@ -76,14 +77,14 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
                 return fail(error, "compute argument index is duplicated");
 
             ComputeLaunchArgument &argument = plan.arguments[use.index];
-            if (supplied.kind == VERNON_PIPELINE_IMAGE) {
+            if (supplied.kind == VERNON_PROGRAM_IMAGE) {
                 if (parameter.kind != "image" || !supplied.image.view.identity || !supplied.image.view.resource.value)
                     return fail(error, "compute image argument is invalid");
                 argument = ComputeImageArgument{supplied.image.view};
                 assigned[use.index] = 1;
                 continue;
             }
-            if (supplied.kind != VERNON_PIPELINE_TENSOR)
+            if (supplied.kind != VERNON_PROGRAM_TENSOR)
                 return fail(error, "compute argument kind is unsupported");
             if (supplied.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 if (!supplied.tensor.resource.identity || !supplied.tensor.resource.resource.value ||
@@ -150,8 +151,8 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
             const auto argumentIt = arguments.find(parameter.slot);
             if (argumentIt == arguments.end())
                 continue;
-            const VernonPipelineArgument &argument = *argumentIt->second;
-            if (argument.kind != VERNON_PIPELINE_TENSOR ||
+            const VernonProgramArgument &argument = *argumentIt->second;
+            if (argument.kind != VERNON_PROGRAM_TENSOR ||
                 (argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE &&
                  argument.tensor.storage != VERNON_TENSOR_HOST) ||
                 (argument.tensor.rank && !argument.tensor.shape))
@@ -219,7 +220,8 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
 }
 
 bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
-                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error) {
+                           const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                           std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (!arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
@@ -234,11 +236,11 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
         if (found == arguments.end())
             return fail(error, "pipeline argument kind does not match layout");
         if (parameter.kind == "image") {
-            if (found->second->kind != VERNON_PIPELINE_IMAGE)
+            if (found->second->kind != VERNON_PROGRAM_IMAGE)
                 return fail(error, "pipeline argument kind does not match layout");
             continue;
         }
-        if (parameter.kind != "tensor" || found->second->kind != VERNON_PIPELINE_TENSOR)
+        if (parameter.kind != "tensor" || found->second->kind != VERNON_PROGRAM_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
         const ValueLayout &expectedLayout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;

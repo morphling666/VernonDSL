@@ -608,7 +608,7 @@ TEST(RuntimeAutodiff, ReplacesStaleInvocationDiagnosticAtPublicBoundary) {
     context.backend = VERNON_RUNTIME_CPU;
     vernon::runtime::invocationDiagnostic(context) = "stale autodiff diagnostic";
     constexpr char invalidBundle[] = "{";
-    EXPECT_EQ(vernonRuntimeLoadPipelineBundleWithOptions(&context, invalidBundle, sizeof(invalidBundle) - 1, nullptr),
+    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(&context, invalidBundle, sizeof(invalidBundle) - 1, nullptr),
               nullptr);
     const VernonStringView error = vernonRuntimeGetLastError(&context);
     const std::string message(error.data, error.size);

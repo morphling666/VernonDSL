@@ -259,13 +259,13 @@ bool isAutodiffInternal(const Parameter &parameter) {
 }
 
 bool appendDeviceArgument(const Parameter &parameter, DeviceValue &device,
-                          std::vector<VernonPipelineArgument> &arguments) {
+                          std::vector<VernonProgramArgument> &arguments) {
     VernonRuntimeProviderResourceReference resource{};
     if (!device.buffer.reference(resource))
         return false;
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     argument.slot = parameter.slot;
-    argument.kind = VERNON_PIPELINE_TENSOR;
+    argument.kind = VERNON_PROGRAM_TENSOR;
     if (!fillTensorView(parameter, device, argument.tensor, resource))
         return false;
     arguments.push_back(argument);
@@ -274,7 +274,7 @@ bool appendDeviceArgument(const Parameter &parameter, DeviceValue &device,
 
 bool buildForwardArguments(VernonRuntimeContext &context, const Variant &variant, const VernonAdValueSet &inputs,
                            DeviceValues &working, DeviceValues &retainedDevices, HostValues &retainedHosts,
-                           std::vector<VernonPipelineArgument> &arguments, std::vector<DeviceBufferUpload> &uploads,
+                           std::vector<VernonProgramArgument> &arguments, std::vector<DeviceBufferUpload> &uploads,
                            bool retainStorageHostCopy) {
     arguments.reserve(variant.parameters.size());
     for (const Parameter &parameter : variant.parameters) {
@@ -287,9 +287,9 @@ bool buildForwardArguments(VernonRuntimeContext &context, const Variant &variant
             auto [host, inserted] = retainedHosts.emplace(parameter.name, HostValue(*value));
             if (!inserted)
                 return false;
-            VernonPipelineArgument argument{};
+            VernonProgramArgument argument{};
             argument.slot = parameter.slot;
-            argument.kind = VERNON_PIPELINE_TENSOR;
+            argument.kind = VERNON_PROGRAM_TENSOR;
             if (!fillHostTensorView(parameter, host->second, argument.tensor))
                 return false;
             arguments.push_back(argument);
@@ -320,7 +320,7 @@ template <typename Handle> bool decodeResourceHandle(uint64_t key, Handle &handl
     return true;
 }
 
-const VernonPipelineArgument *findInvocationArgument(const VernonPipelineInvocation &invocation, uint32_t slot) {
+const VernonProgramArgument *findInvocationArgument(const VernonProgramSubmitDescriptor &invocation, uint32_t slot) {
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (invocation.arguments[index].slot == slot)
             return &invocation.arguments[index];
@@ -414,7 +414,7 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     prepared.signature = std::make_shared<Signature>();
     if (!materializeRuntimeSignature(*signature, inputs, *prepared.signature))
         return fail(context, "GPU autodiff values cannot be materialized from reflection");
-    std::vector<VernonPipelineArgument> arguments;
+    std::vector<VernonProgramArgument> arguments;
     std::vector<DeviceBufferUpload> uploads;
     std::vector<DeviceBufferCopy> copies;
     VernonRhiCommandEncoder nativeEncoder{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
@@ -426,7 +426,7 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     } else {
         if (!target.invocation)
             return fail(context, "encoded GPU autodiff forward has no invocation");
-        const VernonPipelineInvocation &invocation = *target.invocation;
+        const VernonProgramSubmitDescriptor &invocation = *target.invocation;
         if (target.externalEncoder() &&
             (!decodeResourceHandle(target.encoder.value, nativeEncoder) ||
              vernon::rhi::commandEncoderKey(context.rhiDevice, nativeEncoder) != target.encoder.value))
@@ -438,8 +438,8 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
             if (isAutodiffInternal(parameter))
                 continue;
             const VernonAdValue *value = findParameterValues(inputs, parameter);
-            const VernonPipelineArgument *argument = findInvocationArgument(invocation, parameter.slot);
-            if (!value || !argument || argument->kind != VERNON_PIPELINE_TENSOR)
+            const VernonProgramArgument *argument = findInvocationArgument(invocation, parameter.slot);
+            if (!value || !argument || argument->kind != VERNON_PROGRAM_TENSOR)
                 return fail(context, std::string("cannot prepare encoded GPU autodiff ") + resourceName + " resources",
                             VERNON_STATUS_INTERNAL_ERROR);
             if (std::find(retainedNames.begin(), retainedNames.end(), parameter.name) == retainedNames.end())
@@ -558,11 +558,11 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     if (!target.externalEncoder())
         return executePipelineCommandDagAndWait(*pipeline, computeGrid, arguments, uploads,
                                                 execution::detail::CommandNodeKind::Derivative);
-    VernonPipelineInvocation encoded = *target.invocation;
+    VernonProgramSubmitDescriptor encoded = *target.invocation;
     encoded.arguments = arguments.empty() ? nullptr : arguments.data();
     encoded.argument_count = arguments.size();
     encoded.command_encoder = {};
-    return vernonRuntimePipelineEncode(target.encoder, pipeline.get(), &encoded);
+    return vernonRuntimeProgramEncode(target.encoder, pipeline.get(), &encoded);
 }
 
 bool stageForwardResults(const Signature &signature, const OwnedPipeline &pipeline, DeviceValues &working,

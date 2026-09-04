@@ -116,7 +116,7 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
     return telemetry;
 }
 
-bool planProgramResiduals(const program::Program &execution, const VernonPipelineTopology *topology,
+bool planProgramResiduals(const program::Program &execution, const VernonProgramTopology *topology,
                           const Variant &variant, const std::vector<ProgramHostValue> &materialized,
                           uint64_t memoryBudget, const std::string &policy, bool rematerializeTapes,
                           ProgramResidualPlan &result, std::string &error) {

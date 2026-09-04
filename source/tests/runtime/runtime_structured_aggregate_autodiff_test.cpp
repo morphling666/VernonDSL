@@ -28,50 +28,50 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *bundle =
-        vernonRuntimeLoadPipelineBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputCount(pipeline), 1u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputCount(pipeline), 1u);
     VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
     EXPECT_EQ(std::string_view(outputMetadata.path.data, outputMetadata.path.size), "output");
     EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F32);
     ASSERT_EQ(outputMetadata.rank, 1u);
     EXPECT_EQ(outputMetadata.shape[0], 2u);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentCount(pipeline), 1u);
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetAdCotangentCount(pipeline), 1u);
     VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
     EXPECT_EQ(std::string_view(cotangentMetadata.path.data, cotangentMetadata.path.size), "output");
     EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F32);
-    EXPECT_EQ(vernonRuntimeLoadedPipelineGetAdGradientCount(pipeline), 3u);
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetAdGradientCount(pipeline), 3u);
     VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
     EXPECT_FALSE(std::string_view(gradientMetadata.path.data, gradientMetadata.path.size).empty());
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupCount(pipeline), 4u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline), 4u);
     VernonAdDerivativeGroupView group{sizeof(VernonAdDerivativeGroupView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupByIndex(pipeline, 0, &group), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, 0, &group), VERNON_STATUS_OK);
     EXPECT_EQ(group.role, VERNON_AD_DERIVATIVE_GRADIENT);
     EXPECT_GE(group.leaf_count, 1u);
     VernonStringView groupLeaf{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetAdDerivativeGroupLeaf(pipeline, 0, 0, &groupLeaf), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(pipeline, 0, 0, &groupLeaf), VERNON_STATUS_OK);
     EXPECT_FALSE(std::string_view(groupLeaf.data, groupLeaf.size).empty());
 
     auto expectField = [](const VernonValuePathComponentView &component, std::string_view name) {
         EXPECT_EQ(component.kind, VERNON_VALUE_PATH_FIELD);
         EXPECT_EQ(std::string_view(component.field.data, component.field.size), name);
     };
-    VernonPipelineParameterView valueParameter{};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"value", 5}, &valueParameter), VERNON_STATUS_OK);
+    VernonProgramParameterView valueParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"value", 5}, &valueParameter), VERNON_STATUS_OK);
     ASSERT_EQ(valueParameter.rank, 1u);
     EXPECT_EQ(valueParameter.static_shape[0], 2u);
-    VernonPipelineValueLeafView valueLeaf{sizeof(VernonPipelineValueLeafView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, {"value", 5}, 0, &valueLeaf),
+    VernonProgramValueLeafView valueLeaf{sizeof(VernonProgramValueLeafView)};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, {"value", 5}, 0, &valueLeaf),
               VERNON_STATUS_OK);
     EXPECT_EQ(valueLeaf.value.dtype, VERNON_DATA_F32);
     EXPECT_EQ(valueLeaf.value.scalar_count, 1u);
@@ -79,8 +79,8 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     EXPECT_EQ(valueLeaf.static_rank, 0u);
     EXPECT_EQ(valueLeaf.path_count, 0u);
 
-    VernonPipelineValueLeafView scaleLeaf{sizeof(VernonPipelineValueLeafView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, {"parameters", 10}, 0, &scaleLeaf),
+    VernonProgramValueLeafView scaleLeaf{sizeof(VernonProgramValueLeafView)};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, {"parameters", 10}, 0, &scaleLeaf),
               VERNON_STATUS_OK);
     EXPECT_EQ(scaleLeaf.value.dtype, VERNON_DATA_F32);
     EXPECT_EQ(scaleLeaf.value.scalar_count, 1u);
@@ -90,8 +90,8 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     expectField(scaleLeaf.path[0], "inner");
     expectField(scaleLeaf.path[1], "scale");
 
-    VernonPipelineValueLeafView biasLeaf{sizeof(VernonPipelineValueLeafView)};
-    ASSERT_EQ(vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline, {"parameters", 10}, 1, &biasLeaf),
+    VernonProgramValueLeafView biasLeaf{sizeof(VernonProgramValueLeafView)};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, {"parameters", 10}, 1, &biasLeaf),
               VERNON_STATUS_OK);
     EXPECT_EQ(biasLeaf.value.dtype, VERNON_DATA_F32);
     EXPECT_EQ(biasLeaf.value.scalar_count, 1u);
@@ -115,7 +115,7 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdPipelineForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
+    EXPECT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPullback, nullptr);
     EXPECT_NE(lastError(context).find("dispatch grid axis 0 must equal 1"), std::string::npos);
@@ -123,7 +123,7 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     EXPECT_FLOAT_EQ(outputValues[1], 0.0f);
 
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdPipelineForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(outputValues[0], 9.0f);
@@ -159,8 +159,8 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     EXPECT_FLOAT_EQ(valueGradient[1], 28.0f);
 
     vernonPullbackDestroy(pullback);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 

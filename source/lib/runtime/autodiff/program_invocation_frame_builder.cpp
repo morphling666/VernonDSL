@@ -85,7 +85,7 @@ bool attachResiduals(const FrameRequest &request, const program::Program &execut
     return true;
 }
 
-bool build(VernonRuntimeContext &context, const program::Program &execution, const VernonPipelineTopology *topology,
+bool build(VernonRuntimeContext &context, const program::Program &execution, const VernonProgramTopology *topology,
            std::vector<ProgramHostValue> &storage, const FrameRequest &request,
            std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     storage.assign(execution.values.size(), {});
@@ -127,7 +127,7 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
     for (const program::Storage &slot : execution.storages)
         backings.emplace(slot.id, ProgramStorageBacking{slot.initialValue, static_cast<size_t>(slot.buffer.byteLength),
                                                         slot.buffer.byteLength > 0, std::nullopt});
-    std::map<uint32_t, VernonPipelineArgument> externalValues;
+    std::map<uint32_t, VernonProgramArgument> externalValues;
     if (request.canonical) {
         ProgramBoundaryBindingRequest binding{request.canonical->invocation, request.canonical->valueBySlot,
                                               &request.canonical->publications};
@@ -143,11 +143,11 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             continue;
         layouts[slot.id] = resolvedProgramValueLayout(slot);
         const auto external = externalValues.find(slot.id);
-        const VernonPipelineArgument *argument = external != externalValues.end() ? &external->second
-                                                 : slot.storage && backings[*slot.storage].external
-                                                     ? &*backings[*slot.storage].external
-                                                     : nullptr;
-        if (argument && argument->kind != VERNON_PIPELINE_TENSOR) {
+        const VernonProgramArgument *argument = external != externalValues.end() ? &external->second
+                                                : slot.storage && backings[*slot.storage].external
+                                                    ? &*backings[*slot.storage].external
+                                                    : nullptr;
+        if (argument && argument->kind != VERNON_PROGRAM_TENSOR) {
             storage[slot.id].argument = *argument;
             continue;
         }
@@ -205,7 +205,7 @@ bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi) {
 }
 
 bool buildProgramInvocationFrame(VernonRuntimeContext &context, const program::Program &execution,
-                                 const VernonPipelineTopology *topology, std::vector<ProgramHostValue> &storage,
+                                 const VernonProgramTopology *topology, std::vector<ProgramHostValue> &storage,
                                  const ForwardInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
                                  std::string &error) {
     if (const auto *canonical = std::get_if<CanonicalForwardBindings>(&spec.bindings))
@@ -217,7 +217,7 @@ bool buildProgramInvocationFrame(VernonRuntimeContext &context, const program::P
 }
 
 bool buildProgramInvocationFrame(VernonRuntimeContext &context, const program::Program &execution,
-                                 const VernonPipelineTopology *topology, std::vector<ProgramHostValue> &storage,
+                                 const VernonProgramTopology *topology, std::vector<ProgramHostValue> &storage,
                                  const PullbackInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
                                  std::string &error) {
     return build(context, execution, topology, storage,

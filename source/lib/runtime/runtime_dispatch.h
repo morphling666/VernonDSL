@@ -9,8 +9,8 @@
 #include <string>
 #include <vector>
 
-struct VernonLoadedPipeline;
-struct VernonPipelineBundle;
+struct VernonProgramExecutable;
+struct VernonProgramBundle;
 struct VernonRuntimeContext;
 
 namespace vernon::runtime::ad {
@@ -28,17 +28,17 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
 bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
 
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint);
-VernonLoadedPipeline *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
-                                                  const char *reflection, size_t reflectionSize, const char *entry,
-                                                  size_t entrySize);
-VernonLoadedPipeline *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
-                                                  size_t artifactSize, const char *reflection, size_t reflectionSize,
-                                                  const char *entry, size_t entrySize);
-VernonLoadedPipeline *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
-                                                      ReflectedEntry reflection, const void *artifact,
-                                                      size_t artifactSize, const std::string &entry,
-                                                      VernonCpuEntryPoint cpuEntry,
-                                                      const std::vector<NativeResourceSlot> &nativeSlots);
+VernonProgramExecutable *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
+                                                     const char *reflection, size_t reflectionSize, const char *entry,
+                                                     size_t entrySize);
+VernonProgramExecutable *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
+                                                     size_t artifactSize, const char *reflection, size_t reflectionSize,
+                                                     const char *entry, size_t entrySize);
+VernonProgramExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
+                                                         ReflectedEntry reflection, const void *artifact,
+                                                         size_t artifactSize, const std::string &entry,
+                                                         VernonCpuEntryPoint cpuEntry,
+                                                         const std::vector<NativeResourceSlot> &nativeSlots);
 bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
                              const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
                              Stage &stage, Variant &variant, ReflectedEntry &reflectedEntry);
@@ -46,12 +46,12 @@ bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backe
                                   std::string &error);
 bool isDirectPipelineTopology(const Variant &variant);
 
-bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline);
-void destroyBackendPipeline(VernonLoadedPipeline &pipeline);
-VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+bool resolveBackendPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline);
+void destroyBackendPipeline(VernonProgramExecutable &pipeline);
+VernonStatus invokeBackendPipeline(VernonProgramExecutable &pipeline, const VernonProgramSubmitDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan);
-VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan);
-VernonStatus executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
+VernonStatus invokeBackendComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &plan);
+VernonStatus executePipelineProgramGraph(VernonProgramExecutable &pipeline, const program::Graph &graph,
                                          ad::ProgramInvocationFrame &frame);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,

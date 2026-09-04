@@ -51,7 +51,7 @@ from program_asset_fixture import (  # noqa: E402
 )
 from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
-from vernon_dsl.program_asset_cli import main as pipeline_asset_main  # noqa: E402
+from vernon_dsl.program_asset_cli import main as program_asset_main  # noqa: E402
 from vernon_dsl.program_assets import cook_program_asset  # noqa: E402
 
 FIXTURE = PYTHON_TEST_ROOT / "program_asset_fixture.py"
@@ -368,7 +368,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         output=cooked_dir,
                         target=(OpenGLTargetOptions(version=330) if target_name == "opengl" else VulkanTargetOptions()),
                     )
-                    cli_status = pipeline_asset_main(cli_arguments)
+                    cli_status = program_asset_main(cli_arguments)
                 self.assertEqual(cli_status, 0)
                 # Two stage/feature specializations per cook. The unchanged
                 # fragment artifact is deduplicated after compilation.

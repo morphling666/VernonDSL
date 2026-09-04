@@ -129,7 +129,7 @@ bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t text
 #endif
 }
 
-bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveMetalPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     if (variant.compute.empty()) {
         const Stage &vertex = bundle.stages.at(variant.vertex);
@@ -523,7 +523,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
 #endif
 }
 
-void destroyMetalPipeline(VernonLoadedPipeline &pipeline) {
+void destroyMetalPipeline(VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -536,7 +536,8 @@ void destroyMetalPipeline(VernonLoadedPipeline &pipeline) {
 #endif
 }
 
-VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeMetalGraphicsPipeline(VernonProgramExecutable &pipeline,
+                                         const VernonProgramSubmitDescriptor &invocation,
                                          const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
@@ -552,7 +553,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
         value.kind = layout.kind;
         if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
                 found->second->tensor.byte_strides[0] <= 0)
@@ -562,7 +563,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
             value.payload.buffer.stride = static_cast<uint32_t>(found->second->tensor.byte_strides[0]);
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "Metal RHI storage argument is missing");
@@ -570,13 +571,13 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
             value.payload.buffer.resource.offset += found->second->tensor.byte_offset;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_IMAGE ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
                 !found->second->image.view.resource.value)
                 return fail(*pipeline.context, "Metal RHI image argument is missing");
             value.payload.image.view = found->second->image.view;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "Metal RHI sampler argument is missing");
             value.payload.sampler.resource = found->second->resource;
@@ -595,7 +596,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
             value.payload.inline_value.size = prepared.storage.size();
         } else {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "Metal RHI uniform argument is missing");
             const std::optional<std::vector<uint8_t>> packed = packTensor(found->second->tensor, prepared.packing);
             if (!packed || packed->size() != prepared.storage.size())
@@ -662,7 +663,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeMetalComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;

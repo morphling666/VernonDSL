@@ -422,13 +422,13 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
     return false;
 }
 
-std::optional<VernonPipelineArgumentKind> pipelineArgumentKind(const std::string &kind) {
+std::optional<VernonProgramArgumentKind> pipelineArgumentKind(const std::string &kind) {
     if (kind == "tensor")
-        return VERNON_PIPELINE_TENSOR;
+        return VERNON_PROGRAM_TENSOR;
     if (kind == "image")
-        return VERNON_PIPELINE_IMAGE;
+        return VERNON_PROGRAM_IMAGE;
     if (kind == "sampler")
-        return VERNON_PIPELINE_SAMPLER;
+        return VERNON_PROGRAM_SAMPLER;
     return std::nullopt;
 }
 

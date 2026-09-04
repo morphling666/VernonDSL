@@ -40,7 +40,7 @@
 #include <vector>
 
 struct RuntimeProgramBinding {
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     std::vector<uint64_t> shape;
     std::vector<int64_t> strides;
     std::string layoutHash;
@@ -48,7 +48,7 @@ struct RuntimeProgramBinding {
     std::shared_ptr<void> lease;
 
     void refresh() {
-        if (argument.kind != VERNON_PIPELINE_TENSOR)
+        if (argument.kind != VERNON_PROGRAM_TENSOR)
             return;
         argument.tensor.shape = shape.empty() ? nullptr : shape.data();
         argument.tensor.byte_strides = strides.empty() ? nullptr : strides.data();
@@ -77,15 +77,15 @@ struct RuntimeProgramControl {
 };
 
 struct RuntimeProgramInstanceState {
-    explicit RuntimeProgramInstanceState(VernonLoadedPipeline &value)
+    explicit RuntimeProgramInstanceState(VernonProgramExecutable &value)
         : pipeline(&value), bindings(&value), controls(&value) {}
-    VernonLoadedPipeline *pipeline;
+    VernonProgramExecutable *pipeline;
     vernon::runtime::program::ProgramInstance bindings;
     vernon::runtime::program::ProgramInstance controls;
 };
 
 struct VernonProgramInstance {
-    explicit VernonProgramInstance(VernonLoadedPipeline &value)
+    explicit VernonProgramInstance(VernonProgramExecutable &value)
         : state(std::make_shared<RuntimeProgramInstanceState>(value)) {}
     std::shared_ptr<RuntimeProgramInstanceState> state;
 };
@@ -237,7 +237,7 @@ const ValueLayout &parameterLogicalLeafLayout(const Parameter &parameter) {
     return parameter.elementLayout;
 }
 
-const program::Program *managedProgram(const VernonLoadedPipeline &pipeline) {
+const program::Program *managedProgram(const VernonProgramExecutable &pipeline) {
     return pipeline.topology && pipeline.topology->resolvedProgram ? &pipeline.topology->resolvedProgram->program
                                                                    : nullptr;
 }
@@ -267,7 +267,7 @@ const program::BoundarySlot *findPublicBoundary(const program::Program &program,
     return found == program.abi.boundarySlots.end() ? nullptr : &*found;
 }
 
-const ValueLayout *boundaryLayoutView(const VernonLoadedPipeline &pipeline, const program::BoundarySlot &slot) {
+const ValueLayout *boundaryLayoutView(const VernonProgramExecutable &pipeline, const program::BoundarySlot &slot) {
     const program::Program *program = managedProgram(pipeline);
     if (!program)
         return nullptr;
@@ -382,9 +382,9 @@ VernonRuntimeCapabilities vernonRuntimeGetContextCapabilities(const VernonRuntim
     return result;
 }
 
-VernonLoadedPipeline *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context, VernonCpuEntryPoint entryPoint,
-                                                const char *reflection, size_t reflectionSize, const char *entry,
-                                                size_t entrySize) {
+VernonProgramExecutable *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context, VernonCpuEntryPoint entryPoint,
+                                                   const char *reflection, size_t reflectionSize, const char *entry,
+                                                   size_t entrySize) {
     RuntimeDiagnosticScope diagnostic(context);
     if (!context || context->backend != VERNON_RUNTIME_CPU || !entryPoint || !reflection || !reflectionSize || !entry ||
         !entrySize)
@@ -426,9 +426,9 @@ VernonStatus vernonRuntimeUnregisterCpuEntry(VernonRuntimeContext *context, Vern
     return VERNON_STATUS_OK;
 }
 
-VernonLoadedPipeline *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
-                                                size_t artifactSize, const char *reflection, size_t reflectionSize,
-                                                const char *entry, size_t entrySize) {
+VernonProgramExecutable *vernonRuntimeLoadArtifact(VernonRuntimeContext *context, const void *artifact,
+                                                   size_t artifactSize, const char *reflection, size_t reflectionSize,
+                                                   const char *entry, size_t entrySize) {
     RuntimeDiagnosticScope diagnostic(context);
     if (!context || !artifact || !artifactSize || !reflection || !reflectionSize || !entry || !entrySize)
         return nullptr;
@@ -464,8 +464,8 @@ VernonStatus vernonRuntimeExecutableBundleInspectKind(const void *bundleData, si
     }
 }
 
-VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, size_t bundleSize,
-                                                      VernonRuntimeBackend *target) {
+VernonStatus vernonRuntimeProgramBundleInspectTarget(const void *bundleData, size_t bundleSize,
+                                                     VernonRuntimeBackend *target) {
     if (!bundleData || !bundleSize || !target)
         return VERNON_STATUS_INVALID_ARGUMENT;
     try {
@@ -504,9 +504,9 @@ VernonStatus vernonRuntimePipelineBundleInspectTarget(const void *bundleData, si
     }
 }
 
-VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
-                                                                 size_t bundleSize,
-                                                                 const VernonPipelineBundleLoadOptions *options) {
+VernonProgramBundle *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
+                                                               size_t bundleSize,
+                                                               const VernonProgramBundleLoadOptions *options) {
     if (!context)
         return nullptr;
     RuntimeDiagnosticScope diagnostic(context);
@@ -514,7 +514,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
          context->backend != VERNON_RUNTIME_OPENGL_ES && context->backend != VERNON_RUNTIME_VULKAN &&
          context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12 &&
          context->backend != VERNON_RUNTIME_METAL) ||
-        !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions))) {
+        !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonProgramBundleLoadOptions))) {
         invocationDiagnostic(*context) = "invalid pipeline bundle load invocation";
         return nullptr;
     }
@@ -545,7 +545,7 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
         if (!parseRuntimeRequirements(root, expectedTarget, requirements, invocationDiagnostic(*context)) ||
             !validateRuntimeRequirements(*context, requirements))
             return nullptr;
-        auto bundle = std::make_unique<VernonPipelineBundle>();
+        auto bundle = std::make_unique<VernonProgramBundle>();
         bundle->context = context;
         bundle->id = root.value("id", "");
         AutodiffManifest autodiff;
@@ -772,14 +772,15 @@ VernonPipelineBundle *vernonRuntimeLoadPipelineBundleWithOptions(VernonRuntimeCo
     }
 }
 
-VernonLoadedPipeline *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
-                                                                size_t bundleSize, VernonFeatureSetView features,
-                                                                const VernonPipelineBundleLoadOptions *options) {
+VernonProgramExecutable *
+vernonRuntimeLoadManagedProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundleData,
+                                                 size_t bundleSize, VernonFeatureSetView features,
+                                                 const VernonProgramBundleLoadOptions *options) {
     if (!context)
         return nullptr;
     RuntimeDiagnosticScope diagnostic(context);
     if (!bundleData || !bundleSize || (features.count && !features.names) ||
-        (options && options->struct_size < sizeof(VernonPipelineBundleLoadOptions))) {
+        (options && options->struct_size < sizeof(VernonProgramBundleLoadOptions))) {
         fail(context, "invalid Program bundle load invocation");
         return nullptr;
     }
@@ -846,7 +847,7 @@ VernonLoadedPipeline *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeCon
         const std::string programJson = (*selected)["program"].dump();
         const std::string artifactSystemJson = (*selected)["artifact_system"].dump();
         std::string error;
-        VernonLoadedPipeline *pipeline = program::loadBackendProgramPipeline(
+        VernonProgramExecutable *pipeline = program::loadBackendProgramPipeline(
             *context, programJson.data(), programJson.size(), artifactSystemJson.data(), artifactSystemJson.size(),
             stageBindings, bundleRoot, error);
         if (!pipeline)
@@ -858,7 +859,7 @@ VernonLoadedPipeline *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeCon
     }
 }
 
-VernonStringView vernonRuntimePipelineBundleGetId(const VernonPipelineBundle *bundle) {
+VernonStringView vernonRuntimeProgramBundleGetId(const VernonProgramBundle *bundle) {
     RuntimeDiagnosticScope diagnostic(bundle ? bundle->context : nullptr);
     return bundle ? VernonStringView{bundle->id.data(), bundle->id.size()} : VernonStringView{nullptr, 0};
 }
@@ -874,7 +875,7 @@ VernonValueLayoutView valueLayoutView(const ValueLayout &layout) {
             layout.abiLeaves.size()};
 }
 
-bool fillParameterView(const Parameter &source, VernonPipelineParameterView &destination) {
+bool fillParameterView(const Parameter &source, VernonProgramParameterView &destination) {
     const auto kind = pipelineArgumentKind(source.kind);
     const auto access = pipelineValueAccess(source.access);
     if (!kind || !access)
@@ -891,13 +892,13 @@ bool fillParameterView(const Parameter &source, VernonPipelineParameterView &des
     return true;
 }
 
-bool fillBoundaryParameterView(const VernonLoadedPipeline &pipeline, const program::BoundarySlot &source,
-                               VernonPipelineParameterView &destination) {
-    VernonPipelineArgumentKind kind = VERNON_PIPELINE_TENSOR;
+bool fillBoundaryParameterView(const VernonProgramExecutable &pipeline, const program::BoundarySlot &source,
+                               VernonProgramParameterView &destination) {
+    VernonProgramArgumentKind kind = VERNON_PROGRAM_TENSOR;
     if (source.category == program::BoundaryCategory::Texture)
-        kind = VERNON_PIPELINE_IMAGE;
+        kind = VERNON_PROGRAM_IMAGE;
     else if (source.category == program::BoundaryCategory::Sampler)
-        kind = VERNON_PIPELINE_SAMPLER;
+        kind = VERNON_PROGRAM_SAMPLER;
     VernonValueAccess access = VERNON_ACCESS_READ;
     if (source.access == program::BoundaryAccess::Write)
         access = VERNON_ACCESS_WRITE;
@@ -918,7 +919,7 @@ bool fillBoundaryParameterView(const VernonLoadedPipeline &pipeline, const progr
     return true;
 }
 
-VernonStatus fillImageConstraintView(const Parameter &source, VernonPipelineImageConstraintView &destination) {
+VernonStatus fillImageConstraintView(const Parameter &source, VernonProgramImageConstraintView &destination) {
     if (source.kind != "image")
         return VERNON_STATUS_INVALID_ARGUMENT;
     const auto dimension = pipelineTextureDimension(source.dimension);
@@ -941,7 +942,7 @@ VernonStatus fillImageConstraintView(const Parameter &source, VernonPipelineImag
 }
 
 VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source,
-                                             VernonPipelineImageConstraintView &destination) {
+                                             VernonProgramImageConstraintView &destination) {
     if (source.category != program::BoundaryCategory::Texture || !source.storage ||
         source.storage->descriptorKind != program::StorageDescriptorKind::Image)
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -970,7 +971,7 @@ VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source
     return VERNON_STATUS_OK;
 }
 
-bool fillOutputView(const Output &source, VernonPipelineOutputView &destination) {
+bool fillOutputView(const Output &source, VernonProgramOutputView &destination) {
     const auto kind = pipelineArgumentKind(source.kind);
     const auto dtype = pipelineDataType(source.dtype);
     const auto access = pipelineValueAccess(source.access);
@@ -990,7 +991,7 @@ bool stringViewEquals(VernonStringView view, const std::string &value) {
     return view.size == value.size() && (!view.size || std::memcmp(view.data, value.data(), view.size) == 0);
 }
 
-void destroyPipelineImplementations(VernonLoadedPipeline &pipeline) {
+void destroyPipelineImplementations(VernonProgramExecutable &pipeline) {
     pipeline.topology.reset();
     if (pipeline.backendState)
         destroyBackendPipeline(pipeline);
@@ -998,7 +999,7 @@ void destroyPipelineImplementations(VernonLoadedPipeline &pipeline) {
 
 } // namespace
 
-void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
+void vernonRuntimeProgramBundleDestroy(VernonProgramBundle *bundle) {
     if (!bundle)
         return;
     RuntimeDiagnosticScope diagnostic(bundle->context);
@@ -1006,7 +1007,7 @@ void vernonRuntimePipelineBundleDestroy(VernonPipelineBundle *bundle) {
     delete bundle;
 }
 
-VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle, VernonFeatureSetView features) {
+VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle, VernonFeatureSetView features) {
     if (!bundle)
         return nullptr;
     try {
@@ -1030,7 +1031,7 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
             fail(bundle->context, "pipeline bundle has no exact feature variant");
             return nullptr;
         }
-        auto pipeline = std::make_unique<VernonLoadedPipeline>();
+        auto pipeline = std::make_unique<VernonProgramExecutable>();
         pipeline->context = bundle->context;
         pipeline->variant = *found;
         if (!found->compute.empty()) {
@@ -1083,7 +1084,7 @@ VernonLoadedPipeline *vernonRuntimeResolvePipeline(VernonPipelineBundle *bundle,
     return nullptr;
 }
 
-size_t vernonRuntimeLoadedPipelineGetParameterCount(const VernonLoadedPipeline *pipeline) {
+size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline)
         return 0;
@@ -1092,8 +1093,8 @@ size_t vernonRuntimeLoadedPipelineGetParameterCount(const VernonLoadedPipeline *
     return pipeline->variant.parameters.size();
 }
 
-VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(const VernonLoadedPipeline *pipeline, size_t index,
-                                                            VernonPipelineParameterView *parameter) {
+VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(const VernonProgramExecutable *pipeline, size_t index,
+                                                               VernonProgramParameterView *parameter) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !parameter)
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -1109,8 +1110,8 @@ VernonStatus vernonRuntimeLoadedPipelineGetParameterByIndex(const VernonLoadedPi
                                                                               : VERNON_STATUS_PARSE_ERROR;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline *pipeline, VernonStringView name,
-                                                      VernonPipelineParameterView *parameter) {
+VernonStatus vernonRuntimeProgramExecutableFindParameter(const VernonProgramExecutable *pipeline, VernonStringView name,
+                                                         VernonProgramParameterView *parameter) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !parameter || (name.size && !name.data))
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -1127,11 +1128,11 @@ VernonStatus vernonRuntimeLoadedPipelineFindParameter(const VernonLoadedPipeline
     return fillParameterView(*found, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoadedPipeline *pipeline,
-                                                              VernonStringView parameterName, size_t leafIndex,
-                                                              VernonPipelineValueLeafView *leaf) {
+VernonStatus vernonRuntimeProgramExecutableGetParameterValueLeaf(const VernonProgramExecutable *pipeline,
+                                                                 VernonStringView parameterName, size_t leafIndex,
+                                                                 VernonProgramValueLeafView *leaf) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !leaf || leaf->struct_size < sizeof(VernonPipelineValueLeafView) ||
+    if (!pipeline || !leaf || leaf->struct_size < sizeof(VernonProgramValueLeafView) ||
         (parameterName.size && !parameterName.data))
         return VERNON_STATUS_INVALID_ARGUMENT;
     if (const program::Program *program = managedProgram(*pipeline)) {
@@ -1167,10 +1168,10 @@ VernonStatus vernonRuntimeLoadedPipelineGetParameterValueLeaf(const VernonLoaded
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(
-    const VernonLoadedPipeline *pipeline, size_t parameterIndex, VernonPipelineImageConstraintView *constraint) {
+VernonStatus vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
+    const VernonProgramExecutable *pipeline, size_t parameterIndex, VernonProgramImageConstraintView *constraint) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineImageConstraintView))
+    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonProgramImageConstraintView))
         return VERNON_STATUS_INVALID_ARGUMENT;
     if (const program::Program *program = managedProgram(*pipeline)) {
         const program::BoundarySlot *slot = publicBoundaryAt(*program, parameterIndex);
@@ -1181,11 +1182,11 @@ VernonStatus vernonRuntimeLoadedPipelineGetImageConstraintByParameterIndex(
     return fillImageConstraintView(pipeline->variant.parameters[parameterIndex], *constraint);
 }
 
-VernonStatus vernonRuntimeLoadedPipelineFindImageConstraint(const VernonLoadedPipeline *pipeline,
-                                                            VernonStringView parameterName,
-                                                            VernonPipelineImageConstraintView *constraint) {
+VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(const VernonProgramExecutable *pipeline,
+                                                               VernonStringView parameterName,
+                                                               VernonProgramImageConstraintView *constraint) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonPipelineImageConstraintView) ||
+    if (!pipeline || !constraint || constraint->struct_size < sizeof(VernonProgramImageConstraintView) ||
         (parameterName.size && !parameterName.data))
         return VERNON_STATUS_INVALID_ARGUMENT;
     if (const program::Program *program = managedProgram(*pipeline)) {
@@ -1200,21 +1201,21 @@ VernonStatus vernonRuntimeLoadedPipelineFindImageConstraint(const VernonLoadedPi
     return fillImageConstraintView(*found, *constraint);
 }
 
-size_t vernonRuntimeLoadedPipelineGetOutputCount(const VernonLoadedPipeline *pipeline) {
+size_t vernonRuntimeProgramExecutableGetOutputCount(const VernonProgramExecutable *pipeline) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     return pipeline ? pipeline->variant.outputs.size() : 0;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineGetOutputByIndex(const VernonLoadedPipeline *pipeline, size_t index,
-                                                         VernonPipelineOutputView *output) {
+VernonStatus vernonRuntimeProgramExecutableGetOutputByIndex(const VernonProgramExecutable *pipeline, size_t index,
+                                                            VernonProgramOutputView *output) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !output || index >= pipeline->variant.outputs.size())
         return VERNON_STATUS_INVALID_ARGUMENT;
     return fillOutputView(pipeline->variant.outputs[index], *output) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
 }
 
-VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *pipeline, VernonStringView name,
-                                                   VernonPipelineOutputView *output) {
+VernonStatus vernonRuntimeProgramExecutableFindOutput(const VernonProgramExecutable *pipeline, VernonStringView name,
+                                                      VernonProgramOutputView *output) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !output || (name.size && !name.data))
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -1225,7 +1226,7 @@ VernonStatus vernonRuntimeLoadedPipelineFindOutput(const VernonLoadedPipeline *p
     return fillOutputView(*found, *output) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
 }
 
-void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
+void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline) {
     if (!pipeline)
         return;
     RuntimeDiagnosticScope diagnostic(pipeline->context);
@@ -1234,7 +1235,7 @@ void vernonRuntimeLoadedPipelineDestroy(VernonLoadedPipeline *pipeline) {
     delete pipeline;
 }
 
-uint8_t vernonRuntimeLoadedPipelineIsManagedProgram(const VernonLoadedPipeline *pipeline) {
+uint8_t vernonRuntimeProgramExecutableIsManagedProgram(const VernonProgramExecutable *pipeline) {
     return pipeline && pipeline->topology && pipeline->topology->resolvedProgram;
 }
 
@@ -1280,14 +1281,14 @@ extern "C++" PipelineComputePassDescription describeProgramNode(const program::N
 }
 
 bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const uint64_t staticGrid[3],
-                        const std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize &grid,
+                        const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize &grid,
                         std::string &error) {
     grid = {static_cast<uint32_t>(staticGrid[0]), static_cast<uint32_t>(staticGrid[1]),
             static_cast<uint32_t>(staticGrid[2])};
     if (mapping == vernon::runtime::program::DispatchMapping::StaticGrid)
         return true;
-    for (const VernonPipelineArgument &argument : arguments) {
-        if (argument.kind != VERNON_PIPELINE_TENSOR || (argument.tensor.rank && !argument.tensor.shape))
+    for (const VernonProgramArgument &argument : arguments) {
+        if (argument.kind != VERNON_PROGRAM_TENSOR || (argument.tensor.rank && !argument.tensor.shape))
             continue;
         uint64_t count = 1;
         for (uint32_t dimension = 0; dimension < argument.tensor.rank; ++dimension) {
@@ -1307,12 +1308,11 @@ bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const
 
 class PipelineComputePass final : public vernon::execution::ComputePass {
 public:
-    PipelineComputePass(const program::Node &node, VernonLoadedPipeline &pipeline,
-                        std::vector<VernonPipelineArgument> arguments,
-                        std::vector<std::vector<uint64_t>> argumentShapes,
+    PipelineComputePass(const program::Node &node, VernonProgramExecutable &pipeline,
+                        std::vector<VernonProgramArgument> arguments, std::vector<std::vector<uint64_t>> argumentShapes,
                         std::vector<std::vector<int64_t>> argumentStrides,
                         const std::vector<vernon::execution::GraphBuffer> &resources,
-                        const std::vector<VernonPipelineArgument> *arena, const program::Program *program,
+                        const std::vector<VernonProgramArgument> *arena, const program::Program *program,
                         VernonLaunchSize grid)
         : ComputePass(programNodeName(node)), description_(describeProgramNode(node)), pipeline_(pipeline),
           arguments_(std::move(arguments)), argumentShapes_(std::move(argumentShapes)),
@@ -1333,7 +1333,7 @@ public:
 
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
                             const vernon::execution::ExecutionResources &) override {
-        VernonPipelineInvocation invocation{};
+        VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PIPELINE_VERSION;
         invocation.arguments = arguments_.data();
@@ -1349,10 +1349,10 @@ public:
                 if (!arena_ || !program_ || valueId >= arena_->size() || valueId >= program_->values.size() ||
                     !program::isTapeValueType(program_->values[valueId].type))
                     return;
-                const VernonPipelineArgument &argument = (*arena_)[valueId];
+                const VernonProgramArgument &argument = (*arena_)[valueId];
                 constexpr size_t allocatorDescriptorBytes = sizeof(VernonAdTapeAllocator *);
                 constexpr size_t rootDescriptorBytes = sizeof(VernonAdRegionHandle);
-                if (argument.kind != VERNON_PIPELINE_TENSOR || !argument.tensor.host_data ||
+                if (argument.kind != VERNON_PROGRAM_TENSOR || !argument.tensor.host_data ||
                     argument.tensor.byte_size < allocatorDescriptorBytes + rootDescriptorBytes)
                     return;
                 const auto *bytes = static_cast<const uint8_t *>(argument.tensor.host_data);
@@ -1391,23 +1391,23 @@ public:
 
 private:
     PipelineComputePassDescription description_;
-    VernonLoadedPipeline &pipeline_;
-    std::vector<VernonPipelineArgument> arguments_;
+    VernonProgramExecutable &pipeline_;
+    std::vector<VernonProgramArgument> arguments_;
     std::vector<std::vector<uint64_t>> argumentShapes_;
     std::vector<std::vector<int64_t>> argumentStrides_;
     const std::vector<vernon::execution::GraphBuffer> &resources_;
-    const std::vector<VernonPipelineArgument> *arena_{};
+    const std::vector<VernonProgramArgument> *arena_{};
     const program::Program *program_{};
     VernonLaunchSize grid_{};
 };
 
 struct ManagedGraphicsCommandContext {
-    VernonLoadedPipeline &pipeline;
+    VernonProgramExecutable &pipeline;
     vernon::runtime::ad::MaterializedProgramArguments materialized;
     std::shared_ptr<RuntimeProgramControl> renderPass;
     std::shared_ptr<RuntimeProgramControl> draw;
     std::shared_ptr<RuntimeProgramControl> dynamic;
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     PlannedGraphicsInvocation plan;
     VernonGraphicsState graphicsState{};
     std::vector<VernonColorBlendState> colorBlends;
@@ -1457,13 +1457,13 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
     return status == VERNON_RHI_STATUS_OK ? ended : status;
 }
 
-VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, const program::Graph &graph,
+VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, const program::Graph &graph,
                                              vernon::runtime::ad::ProgramInvocationFrame &arena) {
     if (!pipeline.topology || !pipeline.topology->resolvedProgram)
         return fail(pipeline.context, "Program graph has no resolved canonical owner");
     const program::ResolvedProgram &resolved = *pipeline.topology->resolvedProgram;
     const program::Program &canonicalProgram = resolved.program;
-    const std::vector<VernonPipelineArgument> &valueArguments = arena.logicalArguments();
+    const std::vector<VernonProgramArgument> &valueArguments = arena.logicalArguments();
     if (valueArguments.size() != canonicalProgram.values.size())
         return fail(pipeline.context, "Program graph value set does not match its execution topology");
     const auto canonicalGraph =
@@ -1556,7 +1556,7 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
                     ManagedGraphicsCommandContext{*resolvedStage.pipeline, std::move(materializedNodes.back()),
                                                   std::move(renderPass), std::move(draw), std::move(dynamic)});
                 prepareGraphicsPipelineState(graphics, *graphicsContext);
-                VernonPipelineInvocation &invocation = graphicsContext->invocation;
+                VernonProgramSubmitDescriptor &invocation = graphicsContext->invocation;
                 invocation.struct_size = sizeof(invocation);
                 invocation.abi_version = VERNON_PIPELINE_VERSION;
                 invocation.arguments = graphicsContext->materialized.arguments.data();
@@ -1641,8 +1641,8 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
             resources.push_back({});
             continue;
         }
-        const VernonPipelineArgument &argument = valueArguments[index];
-        if (argument.kind != VERNON_PIPELINE_TENSOR)
+        const VernonProgramArgument &argument = valueArguments[index];
+        if (argument.kind != VERNON_PROGRAM_TENSOR)
             return fail(pipeline.context, "Program graph requires materialized tensor values");
         if (argument.tensor.storage == VERNON_TENSOR_HOST && argument.tensor.host_data) {
             const uint64_t identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
@@ -1666,7 +1666,7 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
         if (stageIndex == pipeline.topology->stageIndices.end())
             return fail(pipeline.context, "pipeline node has no resolved kernel stage");
         VernonResolvedProgramStage &resolvedStage = pipeline.topology->stages[stageIndex->second];
-        VernonLoadedPipeline &stage = *resolvedStage.pipeline;
+        VernonProgramExecutable &stage = *resolvedStage.pipeline;
         vernon::runtime::ad::MaterializedProgramArguments materialized;
         std::string materializationError;
         if (!arena.materializeNodeArguments(canonicalProgram, node, resolvedStage, materialized, materializationError))
@@ -1705,7 +1705,7 @@ VernonStatus executePipelineProgramGraphImpl(VernonLoadedPipeline &pipeline, con
     return VERNON_STATUS_OK;
 }
 
-VernonStatus executeManagedProgram(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation) {
+VernonStatus executeManagedProgram(VernonProgramExecutable &pipeline, const VernonProgramSubmitDescriptor &invocation) {
     VernonPullback *pullback = nullptr;
     const VernonStatus status = vernon::runtime::ad::forwardProgramInvocation(pipeline, invocation, pullback);
     if (pullback)
@@ -1713,7 +1713,8 @@ VernonStatus executeManagedProgram(VernonLoadedPipeline &pipeline, const VernonP
     return status;
 }
 
-VernonStatus encodePipelineInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation) {
+VernonStatus encodePipelineInvocation(VernonProgramExecutable &pipeline,
+                                      const VernonProgramSubmitDescriptor &invocation) {
     if (pipeline.topology)
         return executeManagedProgram(pipeline, invocation);
     if (!pipeline.variant.compute.empty()) {
@@ -1744,12 +1745,12 @@ VernonStatus encodePipelineInvocation(VernonLoadedPipeline &pipeline, const Vern
 
 } // namespace
 
-VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline, const VernonPipelineInvocation *invocation,
-                                         VernonSubmission **output) {
+VernonStatus vernonRuntimeProgramSubmit(VernonProgramExecutable *pipeline,
+                                        const VernonProgramSubmitDescriptor *invocation, VernonSubmission **output) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (output)
         *output = nullptr;
-    if (!pipeline || !invocation || !output || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+    if (!pipeline || !invocation || !output || invocation->struct_size < sizeof(VernonProgramSubmitDescriptor) ||
         invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments) ||
         invocation->command_encoder.value != 0)
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline submission");
@@ -1777,7 +1778,7 @@ VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline, const V
     VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     if (vernonRhiDeviceCreateCommandEncoder(pipeline->context->rhiDevice, &descriptor, &native) != VERNON_RHI_STATUS_OK)
         return fail(pipeline->context, "failed to create the immediate command encoder");
-    VernonPipelineInvocation encoded = *invocation;
+    VernonProgramSubmitDescriptor encoded = *invocation;
     VernonStatus status = referenceBackendCommandEncoder(*pipeline->context, native, encoded.command_encoder);
     bool rendering = false;
     if (status == VERNON_STATUS_OK && graphics) {
@@ -1820,18 +1821,18 @@ VernonStatus vernonRuntimePipelineSubmit(VernonLoadedPipeline *pipeline, const V
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimePipelineEncode(VernonRuntimeProviderObject encoder, VernonLoadedPipeline *pipeline,
-                                         const VernonPipelineInvocation *invocation) {
+VernonStatus vernonRuntimeProgramEncode(VernonRuntimeProviderObject encoder, VernonProgramExecutable *pipeline,
+                                        const VernonProgramSubmitDescriptor *invocation) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonPipelineInvocation) ||
+    if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonProgramSubmitDescriptor) ||
         invocation->abi_version != VERNON_PIPELINE_VERSION || (invocation->argument_count && !invocation->arguments))
         return fail(pipeline ? pipeline->context : nullptr, "invalid pipeline invocation");
-    VernonPipelineInvocation encoded = *invocation;
+    VernonProgramSubmitDescriptor encoded = *invocation;
     encoded.command_encoder = encoder;
     return encodePipelineInvocation(*pipeline, encoded);
 }
 
-VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonLoadedPipeline *pipeline) {
+VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline) {
     try {
         RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
         if (!pipeline || !pipeline->context || !pipeline->topology || !pipeline->topology->resolvedProgram)
@@ -1856,7 +1857,7 @@ VernonProgramInvocation *vernonRuntimeProgramInstanceBeginInvocation(VernonProgr
 
 VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocation,
                                                 const VernonProgramBindingToken *token,
-                                                const VernonPipelineArgument *argument,
+                                                const VernonProgramArgument *argument,
                                                 const VernonProgramResourceLease *lease, uint64_t uploadBytes,
                                                 uint64_t uploadRanges) {
     VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
@@ -1865,8 +1866,8 @@ VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocat
     try {
         RuntimeDiagnosticScope diagnostic(context);
         if (!invocation || invocation->finished || !token || token->struct_size < sizeof(*token) || !token->size ||
-            !token->data || !argument || argument->kind < VERNON_PIPELINE_TENSOR ||
-            argument->kind > VERNON_PIPELINE_SAMPLER)
+            !token->data || !argument || argument->kind < VERNON_PROGRAM_TENSOR ||
+            argument->kind > VERNON_PROGRAM_SAMPLER)
             return fail(context, "invalid persistent Program binding update");
         const std::string key(static_cast<const char *>(token->data), token->size);
         if (invocation->transaction->find(argument->slot, key)) {
@@ -1875,7 +1876,7 @@ VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocat
         }
         auto binding = std::make_shared<RuntimeProgramBinding>();
         binding->argument = *argument;
-        if (argument->kind == VERNON_PIPELINE_TENSOR) {
+        if (argument->kind == VERNON_PROGRAM_TENSOR) {
             const VernonTensorView &tensor = argument->tensor;
             if (tensor.struct_size < sizeof(tensor) ||
                 tensor.element_layout.struct_size < sizeof(VernonValueLayoutView) ||
@@ -2027,7 +2028,7 @@ VernonStatus vernonRuntimeProgramInvocationBindDynamicState(VernonProgramInvocat
 
 VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
                                                    VernonPullback **outputPullback) {
-    VernonLoadedPipeline *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
+    VernonProgramExecutable *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
     try {
         RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
         if (outputPullback)
@@ -2036,12 +2037,12 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
             return fail(pipeline ? pipeline->context : nullptr, "invalid persistent Program invocation");
         invocation->snapshot = invocation->transaction->snapshot();
         invocation->controlSnapshot = invocation->controlTransaction->snapshot();
-        std::vector<VernonPipelineArgument> arguments;
-        const size_t count = vernonRuntimeLoadedPipelineGetParameterCount(pipeline);
+        std::vector<VernonProgramArgument> arguments;
+        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
         arguments.reserve(count);
         for (size_t index = 0; index < count; ++index) {
-            VernonPipelineParameterView parameter{};
-            if (vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, index, &parameter) != VERNON_STATUS_OK)
+            VernonProgramParameterView parameter{};
+            if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &parameter) != VERNON_STATUS_OK)
                 return fail(pipeline->context, "cannot reflect persistent Program boundary slot");
             const std::shared_ptr<void> *payload = invocation->snapshot->find(parameter.slot);
             if (!payload)
@@ -2050,7 +2051,7 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
             binding->refresh();
             arguments.push_back(binding->argument);
         }
-        VernonPipelineInvocation frame{};
+        VernonProgramSubmitDescriptor frame{};
         frame.struct_size = sizeof(frame);
         frame.abi_version = VERNON_PIPELINE_VERSION;
         frame.arguments = arguments.data();
@@ -2183,14 +2184,15 @@ VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *conte
 
 } // extern "C"
 
-VernonStatus vernon::runtime::executePipelineProgramGraph(VernonLoadedPipeline &pipeline, const program::Graph &graph,
+VernonStatus vernon::runtime::executePipelineProgramGraph(VernonProgramExecutable &pipeline,
+                                                          const program::Graph &graph,
                                                           vernon::runtime::ad::ProgramInvocationFrame &arena) {
     if (!pipeline.topology)
         return fail(pipeline.context, "resolved pipeline has no execution topology");
     return executePipelineProgramGraphImpl(pipeline, graph, arena);
 }
 
-VernonPipelineTopology::~VernonPipelineTopology() {
+VernonProgramTopology::~VernonProgramTopology() {
     for (const auto &stage : stages)
         if (stage.pipeline && stage.pipeline->backendState)
             vernon::runtime::destroyBackendPipeline(*stage.pipeline);

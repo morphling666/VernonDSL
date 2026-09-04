@@ -197,7 +197,7 @@ OwnedPipeline::~OwnedPipeline() { reset(); }
 
 bool OwnedPipeline::create(VernonRuntimeContext &context, const Stage &stage) {
     reset();
-    auto pipeline = std::make_unique<VernonLoadedPipeline>();
+    auto pipeline = std::make_unique<VernonProgramExecutable>();
     pipeline->context = &context;
     if (!buildReflectedComputeVariant(stage, context.backend, pipeline->variant, invocationDiagnostic(context)))
         return false;
@@ -205,7 +205,7 @@ bool OwnedPipeline::create(VernonRuntimeContext &context, const Stage &stage) {
     pipeline->dispatchContract = stage.dispatchContract;
     pipeline->readFootprints = stage.readFootprints;
     pipeline->writeFootprints = stage.writeFootprints;
-    VernonPipelineBundle bundle;
+    VernonProgramBundle bundle;
     bundle.context = &context;
     bundle.stages.emplace(stage.entry, stage);
     if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))

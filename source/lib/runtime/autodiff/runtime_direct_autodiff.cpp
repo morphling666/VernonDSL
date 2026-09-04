@@ -48,7 +48,7 @@ bool validStageView(const AutodiffGpuStageView &view) {
 
 } // namespace
 
-VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
+VernonProgramExecutable *loadBackendCpuAutodiffPipeline(
     VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry, VernonStringView primalReflection,
     VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
     VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
@@ -65,10 +65,10 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
             return nullptr;
         const std::vector<std::string> paths =
             autodiffDerivativeLeafPaths(derivativeGroups, AutodiffDerivativeRole::Gradient);
-        using PipelinePtr = std::unique_ptr<VernonLoadedPipeline, void (*)(VernonLoadedPipeline *)>;
+        using PipelinePtr = std::unique_ptr<VernonProgramExecutable, void (*)(VernonProgramExecutable *)>;
         PipelinePtr pipeline(loadBackendCpuEntryPipeline(context, primalEntry, primalReflection.data,
                                                          primalReflection.size, primalName.data, primalName.size),
-                             vernonRuntimeLoadedPipelineDestroy);
+                             vernonRuntimeProgramExecutableDestroy);
         if (!pipeline)
             return nullptr;
         std::shared_ptr<ad::Executable> executable;
@@ -84,7 +84,7 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
         }
         if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
             return nullptr;
-        pipeline->differentiated = VernonDifferentiatedPipeline{std::move(executable), derivativeGroups};
+        pipeline->differentiated = VernonDifferentiatedProgram{std::move(executable), derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {
@@ -95,7 +95,7 @@ VernonLoadedPipeline *loadBackendCpuAutodiffPipeline(
     }
 }
 
-VernonLoadedPipeline *loadBackendGpuAutodiffPipeline(
+VernonProgramExecutable *loadBackendGpuAutodiffPipeline(
     VernonRuntimeContext &context, const AutodiffGpuStageView &primal, const AutodiffGpuStageView &forward,
     const AutodiffGpuStageView &backward, const AutodiffDerivativeGroupView *groupViews, size_t derivativeGroupCount,
     uint64_t staticTapeBytesHint, VernonStringView residualStorage, VernonStringView selectedPolicy) {
@@ -125,11 +125,11 @@ VernonLoadedPipeline *loadBackendGpuAutodiffPipeline(
             !materializeStage(backward, backwardStage))
             return nullptr;
 
-        using PipelinePtr = std::unique_ptr<VernonLoadedPipeline, void (*)(VernonLoadedPipeline *)>;
+        using PipelinePtr = std::unique_ptr<VernonProgramExecutable, void (*)(VernonProgramExecutable *)>;
         PipelinePtr pipeline(loadBackendArtifactPipeline(context, primal.artifact, primal.artifactSize,
                                                          primal.reflection.data, primal.reflection.size,
                                                          primal.entry.data, primal.entry.size),
-                             vernonRuntimeLoadedPipelineDestroy);
+                             vernonRuntimeProgramExecutableDestroy);
         if (!pipeline)
             return nullptr;
         std::shared_ptr<ad::Executable> executable;
@@ -143,7 +143,7 @@ VernonLoadedPipeline *loadBackendGpuAutodiffPipeline(
         }
         if (!ad::validateDerivativeGroupsAgainstSignature(context, derivativeGroups, executable->signature()))
             return nullptr;
-        pipeline->differentiated = VernonDifferentiatedPipeline{std::move(executable), derivativeGroups};
+        pipeline->differentiated = VernonDifferentiatedProgram{std::move(executable), derivativeGroups};
         return pipeline.release();
     } catch (...) {
         try {

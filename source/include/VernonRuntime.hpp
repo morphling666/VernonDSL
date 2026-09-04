@@ -174,7 +174,7 @@ private:
         children_.push_back({std::move(component), std::make_shared<StructuredValue>(std::move(value))});
     }
 
-    friend class PipelineInvocationBuilder;
+    friend class ProgramInvocationBuilder;
 };
 
 struct NamedField {
@@ -228,14 +228,14 @@ template <typename T> StructuredValue shaped(std::vector<uint64_t> shape, T &&in
     return shaped(std::move(shape), value(std::forward<T>(input)));
 }
 
-class PipelineInvocationBuilder {
+class ProgramInvocationBuilder {
 public:
-    explicit PipelineInvocationBuilder(VernonLoadedPipeline *pipeline) : pipeline_(pipeline) {
+    explicit ProgramInvocationBuilder(VernonProgramExecutable *pipeline) : pipeline_(pipeline) {
         if (!pipeline_)
             throw std::invalid_argument("pipeline invocation builder requires a loaded pipeline");
     }
 
-    PipelineInvocationBuilder &bindValue(std::string_view parameterName, const StructuredValue &source) {
+    ProgramInvocationBuilder &bindValue(std::string_view parameterName, const StructuredValue &source) {
         Parameter parameter = reflect(parameterName);
         if (!parameter.shape.empty())
             throw std::invalid_argument("pipeline parameter '" + parameter.name + "' is a Tensor, not a Value");
@@ -246,12 +246,12 @@ public:
     }
 
     template <typename T, std::enable_if_t<!std::is_same_v<std::decay_t<T>, StructuredValue>, int> = 0>
-    PipelineInvocationBuilder &bindValue(std::string_view parameterName, T &&source) {
+    ProgramInvocationBuilder &bindValue(std::string_view parameterName, T &&source) {
         return bindValue(parameterName, value(std::forward<T>(source)));
     }
 
-    PipelineInvocationBuilder &bindTensor(std::string_view parameterName, std::vector<uint64_t> shape,
-                                          const StructuredValue &source) {
+    ProgramInvocationBuilder &bindTensor(std::string_view parameterName, std::vector<uint64_t> shape,
+                                         const StructuredValue &source) {
         Parameter parameter = reflect(parameterName);
         validateOuterShape(parameter, shape);
         const size_t count = detail::checkedElementCount(shape);
@@ -261,8 +261,8 @@ public:
         return *this;
     }
 
-    PipelineInvocationBuilder &bindTensor(std::string_view parameterName, std::initializer_list<uint64_t> shape,
-                                          const StructuredValue &source) {
+    ProgramInvocationBuilder &bindTensor(std::string_view parameterName, std::initializer_list<uint64_t> shape,
+                                         const StructuredValue &source) {
         return bindTensor(parameterName, std::vector<uint64_t>(shape), source);
     }
 
@@ -282,12 +282,12 @@ public:
 
     private:
         StructuredValue root_ = StructuredValue::product();
-        friend class PipelineInvocationBuilder;
+        friend class ProgramInvocationBuilder;
     };
 
     template <typename Callback>
-    PipelineInvocationBuilder &bindTensor(std::string_view parameterName, std::vector<uint64_t> shape,
-                                          Callback callback) {
+    ProgramInvocationBuilder &bindTensor(std::string_view parameterName, std::vector<uint64_t> shape,
+                                         Callback callback) {
         Parameter parameter = reflect(parameterName);
         validateOuterShape(parameter, shape);
         const size_t count = detail::checkedElementCount(shape);
@@ -318,12 +318,12 @@ public:
     }
 
     template <typename Callback>
-    PipelineInvocationBuilder &bindTensor(std::string_view parameterName, std::initializer_list<uint64_t> shape,
-                                          Callback callback) {
+    ProgramInvocationBuilder &bindTensor(std::string_view parameterName, std::initializer_list<uint64_t> shape,
+                                         Callback callback) {
         return bindTensor(parameterName, std::vector<uint64_t>(shape), std::move(callback));
     }
 
-    VernonPipelineInvocation invocation() {
+    VernonProgramSubmitDescriptor invocation() {
         arguments_.clear();
         arguments_.reserve(owned_.size());
         for (OwnedArgument &source : owned_) {
@@ -347,14 +347,14 @@ public:
             tensor.shape = source.shape.empty() ? nullptr : source.shape.data();
             tensor.byte_strides = source.strides.empty() ? nullptr : source.strides.data();
             tensor.byte_size = source.data.size();
-            VernonPipelineArgument argument{};
+            VernonProgramArgument argument{};
             argument.slot = source.parameter.slot;
-            argument.kind = VERNON_PIPELINE_TENSOR;
+            argument.kind = VERNON_PROGRAM_TENSOR;
             argument.tensor = tensor;
             arguments_.push_back(argument);
         }
-        VernonPipelineInvocation result{};
-        result.struct_size = sizeof(VernonPipelineInvocation);
+        VernonProgramSubmitDescriptor result{};
+        result.struct_size = sizeof(VernonProgramSubmitDescriptor);
         result.abi_version = VERNON_PIPELINE_VERSION;
         result.arguments = arguments_.empty() ? nullptr : arguments_.data();
         result.argument_count = arguments_.size();
@@ -461,11 +461,11 @@ private:
     }
 
     Parameter reflect(std::string_view name) const {
-        VernonPipelineParameterView view{};
+        VernonProgramParameterView view{};
         const VernonStringView nameView{name.data(), name.size()};
-        if (vernonRuntimeLoadedPipelineFindParameter(pipeline_, nameView, &view) != VERNON_STATUS_OK)
+        if (vernonRuntimeProgramExecutableFindParameter(pipeline_, nameView, &view) != VERNON_STATUS_OK)
             throw std::invalid_argument("unknown pipeline parameter '" + std::string(name) + "'");
-        if (view.kind != VERNON_PIPELINE_TENSOR)
+        if (view.kind != VERNON_PROGRAM_TENSOR)
             throw std::invalid_argument("pipeline parameter '" + std::string(name) + "' is not a Value or Tensor");
         Parameter result;
         result.slot = view.slot;
@@ -476,9 +476,10 @@ private:
             result.shape.assign(view.static_shape, view.static_shape + view.rank);
         result.leaves.reserve(view.element_layout.leaf_count);
         for (size_t index = 0; index < view.element_layout.leaf_count; ++index) {
-            VernonPipelineValueLeafView leaf{};
-            leaf.struct_size = sizeof(VernonPipelineValueLeafView);
-            if (vernonRuntimeLoadedPipelineGetParameterValueLeaf(pipeline_, nameView, index, &leaf) != VERNON_STATUS_OK)
+            VernonProgramValueLeafView leaf{};
+            leaf.struct_size = sizeof(VernonProgramValueLeafView);
+            if (vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline_, nameView, index, &leaf) !=
+                VERNON_STATUS_OK)
                 throw std::invalid_argument("pipeline parameter has invalid structured Value reflection");
             ReflectedLeaf reflected;
             reflected.value = leaf.value;
@@ -515,9 +516,9 @@ private:
         return owned_.back();
     }
 
-    VernonLoadedPipeline *pipeline_{};
+    VernonProgramExecutable *pipeline_{};
     std::vector<OwnedArgument> owned_;
-    std::vector<VernonPipelineArgument> arguments_;
+    std::vector<VernonProgramArgument> arguments_;
 };
 
 class Pullback {
@@ -570,21 +571,22 @@ public:
 
     static ProgramExecutable load(VernonRuntimeContext *context, const void *bundle, size_t bundleSize,
                                   VernonFeatureSetView features = {nullptr, 0},
-                                  const VernonPipelineBundleLoadOptions *options = nullptr) {
-        VernonLoadedPipeline *handle =
-            vernonRuntimeLoadProgramBundleWithOptions(context, bundle, bundleSize, features, options);
+                                  const VernonProgramBundleLoadOptions *options = nullptr) {
+        VernonProgramExecutable *handle =
+            vernonRuntimeLoadManagedProgramBundleWithOptions(context, bundle, bundleSize, features, options);
         if (!handle)
             throw std::runtime_error("failed to load Program bundle");
         return ProgramExecutable(handle);
     }
 
     explicit operator bool() const noexcept { return static_cast<bool>(handle_); }
-    VernonLoadedPipeline *get() const noexcept { return handle_.get(); }
+    VernonProgramExecutable *get() const noexcept { return handle_.get(); }
 
 private:
-    explicit ProgramExecutable(VernonLoadedPipeline *handle) : handle_(handle, vernonRuntimeLoadedPipelineDestroy) {}
+    explicit ProgramExecutable(VernonProgramExecutable *handle)
+        : handle_(handle, vernonRuntimeProgramExecutableDestroy) {}
 
-    std::shared_ptr<VernonLoadedPipeline> handle_;
+    std::shared_ptr<VernonProgramExecutable> handle_;
     friend class ProgramInstance;
 };
 
@@ -604,7 +606,7 @@ public:
     }
     ~ProgramInvocation() { vernonRuntimeProgramInvocationDestroy(handle_); }
 
-    ProgramInvocation &bind(const VernonProgramBindingToken &token, const VernonPipelineArgument &argument,
+    ProgramInvocation &bind(const VernonProgramBindingToken &token, const VernonProgramArgument &argument,
                             const VernonProgramResourceLease *lease = nullptr, uint64_t uploadBytes = 0,
                             uint64_t uploadRanges = 0) {
         if (!handle_ || vernonRuntimeProgramInvocationBind(handle_, &token, &argument, lease, uploadBytes,
@@ -698,14 +700,14 @@ public:
     VernonProgramInstance *get() const noexcept { return handle_; }
 
 private:
-    std::shared_ptr<VernonLoadedPipeline> executable_;
+    std::shared_ptr<VernonProgramExecutable> executable_;
     VernonProgramInstance *handle_{};
 };
 
-inline Pullback vjp(VernonLoadedPipeline *pipeline, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
+inline Pullback vjp(VernonProgramExecutable *pipeline, const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
                     VernonLaunchSize computeGrid) {
     VernonPullback *pullback = nullptr;
-    if (vernonAdPipelineForward(pipeline, computeGrid, &inputs, &outputs, &pullback) != VERNON_STATUS_OK)
+    if (vernonAdProgramForward(pipeline, computeGrid, &inputs, &outputs, &pullback) != VERNON_STATUS_OK)
         throw std::runtime_error("autodiff forward invocation failed");
     return Pullback(pullback);
 }

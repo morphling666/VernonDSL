@@ -23,18 +23,18 @@ struct ProgramStorageBacking {
     uint32_t owner{UINT32_MAX};
     size_t bytes{};
     bool sized{};
-    std::optional<VernonPipelineArgument> external;
+    std::optional<VernonProgramArgument> external;
 };
 
 struct ProgramBoundaryBindingRequest {
-    const VernonPipelineInvocation &invocation;
+    const VernonProgramSubmitDescriptor &invocation;
     const std::vector<std::pair<uint32_t, uint32_t>> &valueBySlot;
     std::vector<PendingProgramPublication> *publications{};
 };
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
                            const ProgramBoundaryBindingRequest &request,
-                           std::map<uint32_t, VernonPipelineArgument> &externalValues,
+                           std::map<uint32_t, VernonProgramArgument> &externalValues,
                            std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
                            std::string &error);
 

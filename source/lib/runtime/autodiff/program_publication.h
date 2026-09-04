@@ -12,15 +12,15 @@ namespace vernon::runtime::ad {
 
 class ProgramOwnerBindings {
 public:
-    bool bind(program::ProgramOwnerId owner, const VernonPipelineArgument &argument, std::string &error);
+    bool bind(program::ProgramOwnerId owner, const VernonProgramArgument &argument, std::string &error);
 
 private:
-    std::map<std::pair<program::ProgramOwnerKind, uint32_t>, VernonPipelineArgument> bindings_;
+    std::map<std::pair<program::ProgramOwnerKind, uint32_t>, VernonProgramArgument> bindings_;
 };
 
 struct PendingProgramPublication {
     const program::PublicationTarget *target{};
-    VernonPipelineArgument destination{};
+    VernonProgramArgument destination{};
     std::optional<VernonRhiBuffer> destinationBuffer;
 };
 

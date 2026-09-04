@@ -64,7 +64,8 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
                                                      const ComputeBindingSource &source);
 
 bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
-                           const VernonPipelineInvocation &invocation, PlannedComputeLaunch &plan, std::string &error);
+                           const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                           std::string &error);
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime

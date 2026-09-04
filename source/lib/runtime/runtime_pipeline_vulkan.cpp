@@ -62,7 +62,7 @@ VkFormat vulkanTextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveVulkanPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     auto *state = new VulkanPipelineState();
     if (!variant.compute.empty()) {
@@ -393,7 +393,7 @@ bool resolveVulkanPipeline(VernonPipelineBundle &bundle, const Variant &variant,
 #endif
 }
 
-void destroyVulkanPipeline(VernonLoadedPipeline &pipeline) {
+void destroyVulkanPipeline(VernonProgramExecutable &pipeline) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -406,7 +406,8 @@ void destroyVulkanPipeline(VernonLoadedPipeline &pipeline) {
 #endif
 }
 
-VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeVulkanGraphicsPipeline(VernonProgramExecutable &pipeline,
+                                          const VernonProgramSubmitDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
@@ -422,7 +423,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
         value.kind = layout.kind;
         if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
                 found->second->tensor.byte_strides[0] <= 0)
@@ -433,7 +434,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             value.payload.buffer.stride = static_cast<uint32_t>(tensor.byte_strides[0]);
         } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "Vulkan RHI storage argument is missing");
@@ -442,13 +443,13 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             value.payload.buffer.resource.offset += tensor.byte_offset;
         } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_IMAGE ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
                 !found->second->image.view.resource.value)
                 return fail(*pipeline.context, "Vulkan RHI image argument is missing");
             value.payload.image.view = found->second->image.view;
         } else if (prepared.source == VulkanPipelineState::Binding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "Vulkan RHI sampler argument is missing");
             value.payload.sampler.resource = found->second->resource;
@@ -468,7 +469,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
             value.payload.inline_value.size = prepared.storage.size();
         } else {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "Vulkan RHI uniform argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
             const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
@@ -539,7 +540,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonLoadedPipeline &pipeline, const 
 #endif
 }
 
-VernonStatus invokeVulkanComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeVulkanComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
     for (size_t index = 0; index < state.rhiComputeLayout.size(); ++index) {

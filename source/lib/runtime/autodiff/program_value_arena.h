@@ -22,7 +22,7 @@ struct ProgramInvocationContext;
 namespace vernon::runtime::ad {
 
 struct MaterializedProgramArguments {
-    std::vector<VernonPipelineArgument> arguments;
+    std::vector<VernonProgramArgument> arguments;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<int64_t>> strides;
 };
@@ -39,7 +39,7 @@ struct ProgramHostValue {
     std::vector<uint8_t> owned;
     std::vector<int64_t> strides;
     std::optional<shape::ConcreteShape> concreteShape;
-    VernonPipelineArgument argument{};
+    VernonProgramArgument argument{};
     std::shared_ptr<HostStaticTapeBatch> tapeBatch;
     ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};
 };
@@ -53,7 +53,7 @@ struct ProgramDeviceUpload {
 class ProgramInvocationFrame {
 public:
     ProgramInvocationFrame() = default;
-    explicit ProgramInvocationFrame(const std::vector<VernonPipelineArgument> &hostArguments);
+    explicit ProgramInvocationFrame(const std::vector<VernonProgramArgument> &hostArguments);
     explicit ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues);
 
     bool materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required, std::string &error);
@@ -75,12 +75,12 @@ public:
     bool resolveControl(const program::Program &program, const program::ControlComponent &control, uint64_t &value,
                         std::string &error) const;
 
-    const VernonPipelineArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr) const;
-    VernonPipelineArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr);
+    const VernonProgramArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr) const;
+    VernonProgramArgument *argument(uint32_t value, const program::TargetBinding *binding = nullptr);
     VernonRhiBuffer buffer(uint32_t value, const program::TargetBinding *binding = nullptr) const;
 
-    const std::vector<VernonPipelineArgument> &logicalArguments() const { return logicalArguments_; }
-    std::vector<VernonPipelineArgument> &logicalArguments() { return logicalArguments_; }
+    const std::vector<VernonProgramArgument> &logicalArguments() const { return logicalArguments_; }
+    std::vector<VernonProgramArgument> &logicalArguments() { return logicalArguments_; }
     const std::vector<ProgramDeviceUpload> &deviceUploads() const { return deviceUploads_; }
     bool deviceResident() const { return deviceResident_; }
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
@@ -91,7 +91,7 @@ public:
 private:
     struct Carrier {
         std::shared_ptr<gpu::DeviceBuffer> buffer;
-        VernonPipelineArgument argument{};
+        VernonProgramArgument argument{};
         std::vector<uint64_t> shape;
         std::vector<int64_t> strides;
     };
@@ -102,7 +102,7 @@ private:
     void rebindLogicalDescriptor(uint32_t value);
 
     std::vector<ProgramHostValue> hostValues_;
-    std::vector<VernonPipelineArgument> logicalArguments_;
+    std::vector<VernonProgramArgument> logicalArguments_;
     std::vector<std::shared_ptr<gpu::DeviceBuffer>> logicalBuffers_;
     std::vector<ProgramDeviceUpload> deviceUploads_;
     std::vector<std::array<Carrier, 4>> carriers_;

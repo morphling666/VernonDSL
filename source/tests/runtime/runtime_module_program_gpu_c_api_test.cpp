@@ -62,21 +62,22 @@ std::string lastError(VernonRuntimeContext *context) {
     return std::string(error.data ? error.data : "", error.size);
 }
 
-VernonPipelineParameterView parameter(VernonLoadedPipeline *pipeline, const char *name) {
-    VernonPipelineParameterView result{};
-    EXPECT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, {name, std::strlen(name)}, &result), VERNON_STATUS_OK);
+VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
+    VernonProgramParameterView result{};
+    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {name, std::strlen(name)}, &result),
+              VERNON_STATUS_OK);
     return result;
 }
 
-VernonPipelineArgument tensorArgument(VernonRuntimeContext *context, VernonRhiBuffer buffer,
-                                      const VernonPipelineParameterView &parameter) {
+VernonProgramArgument tensorArgument(VernonRuntimeContext *context, VernonRhiBuffer buffer,
+                                     const VernonProgramParameterView &parameter) {
     static const uint64_t shape[]{1};
     static const int64_t strides[]{sizeof(float)};
     VernonRuntimeProviderResourceReference resource{};
     EXPECT_EQ(vernonRuntimeReferenceRhiBuffer(context, buffer, 0, sizeof(float), &resource), VERNON_STATUS_OK);
-    VernonPipelineArgument result{};
+    VernonProgramArgument result{};
     result.slot = parameter.slot;
-    result.kind = VERNON_PIPELINE_TENSOR;
+    result.kind = VERNON_PROGRAM_TENSOR;
     result.tensor.struct_size = sizeof(VernonTensorView);
     result.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     result.tensor.resource = resource;
@@ -103,13 +104,13 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     const std::string bundleDirectory = manifestPath.parent_path().string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonLoadedPipeline *pipeline =
-        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), {nullptr, 0}, &options);
+    VernonProgramExecutable *pipeline = vernonRuntimeLoadManagedProgramBundleWithOptions(
+        context, manifest.data(), manifest.size(), {nullptr, 0}, &options);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
-    ASSERT_EQ(vernonRuntimeLoadedPipelineHasProgramAutodiff(pipeline), 1u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
 
     VernonRhiBufferDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
@@ -128,10 +129,10 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
               VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), outputBuffer, 0, &zero, sizeof(zero)), VERNON_RHI_STATUS_OK);
 
-    const VernonPipelineParameterView sourceParameter = parameter(pipeline, "source");
-    const VernonPipelineParameterView outputParameter = parameter(pipeline, "output");
-    VernonPipelineArgument sourceArgument = tensorArgument(context, sourceBuffer, sourceParameter);
-    VernonPipelineArgument outputArgument = tensorArgument(context, outputBuffer, outputParameter);
+    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
+    const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
+    VernonProgramArgument sourceArgument = tensorArgument(context, sourceBuffer, sourceParameter);
+    VernonProgramArgument outputArgument = tensorArgument(context, outputBuffer, outputParameter);
     const VernonProgramBindingToken sourceToken = bindingToken("gpu-source-v1");
     const VernonProgramBindingToken outputToken = bindingToken("gpu-output-v1");
 
@@ -193,7 +194,7 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
 
     vernonPullbackDestroy(pullback);
     vernonRuntimeProgramInstanceDestroy(instance);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
 }

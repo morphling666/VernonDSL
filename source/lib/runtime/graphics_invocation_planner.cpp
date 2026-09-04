@@ -11,10 +11,10 @@
 namespace vernon::runtime {
 namespace {
 
-bool kindMatches(const Parameter &parameter, const VernonPipelineArgument &argument) {
-    return (parameter.kind == "tensor" && argument.kind == VERNON_PIPELINE_TENSOR) ||
-           (parameter.kind == "image" && argument.kind == VERNON_PIPELINE_IMAGE) ||
-           (parameter.kind == "sampler" && argument.kind == VERNON_PIPELINE_SAMPLER);
+bool kindMatches(const Parameter &parameter, const VernonProgramArgument &argument) {
+    return (parameter.kind == "tensor" && argument.kind == VERNON_PROGRAM_TENSOR) ||
+           (parameter.kind == "image" && argument.kind == VERNON_PROGRAM_IMAGE) ||
+           (parameter.kind == "sampler" && argument.kind == VERNON_PROGRAM_SAMPLER);
 }
 
 bool validTensor(const VernonTensorView &tensor) {
@@ -44,8 +44,8 @@ bool fail(std::string &error, const char *message) {
 
 } // namespace
 
-bool planGraphicsState(const VernonPipelineInvocation &invocation, size_t colorCount, bool hasDepth, bool hasStencil,
-                       PlannedGraphicsState &state, std::string &error) {
+bool planGraphicsState(const VernonProgramSubmitDescriptor &invocation, size_t colorCount, bool hasDepth,
+                       bool hasStencil, PlannedGraphicsState &state, std::string &error) {
     state = {};
     state.depthStencil.depth_test = hasDepth;
     state.depthStencil.depth_write = hasDepth;
@@ -156,7 +156,7 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
     prepared = {};
 }
 
-bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocation &source,
+bool planGraphicsInvocation(const Variant &variant, const VernonProgramSubmitDescriptor &source,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
     plan = {};
@@ -178,8 +178,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                     " but received kind " + std::to_string(found->second->kind);
             return false;
         }
-        const VernonPipelineArgument &argument = *found->second;
-        if (argument.kind == VERNON_PIPELINE_TENSOR) {
+        const VernonProgramArgument &argument = *found->second;
+        if (argument.kind == VERNON_PROGRAM_TENSOR) {
             const ValueLayout &expectedLayout = !parameter.elementLayout.leaves.empty() ? parameter.elementLayout
                                                 : parameter.valueLayout                 ? *parameter.valueLayout
                                                                                         : parameter.elementLayout;
@@ -201,7 +201,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                         parameter.shape[dimension] != argument.tensor.shape[dimension + offset])
                         return fail(error, "pipeline Tensor shape does not match layout");
             }
-        } else if (argument.kind == VERNON_PIPELINE_IMAGE) {
+        } else if (argument.kind == VERNON_PROGRAM_IMAGE) {
             if (!argument.image.view.identity || !argument.image.view.resource.value)
                 return fail(error, "pipeline image argument does not match layout");
         } else if (!argument.resource.identity || !argument.resource.resource.value) {
@@ -327,12 +327,12 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
 
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampled;
     for (const Parameter &parameter : variant.parameters) {
-        const VernonPipelineArgument &argument = *plan.arguments.at(parameter.slot);
+        const VernonProgramArgument &argument = *plan.arguments.at(parameter.slot);
         for (const ParameterUse &use : parameter.uses) {
             const uint32_t stage = shaderStage(use);
             if (!stage)
                 continue;
-            if (argument.kind == VERNON_PIPELINE_IMAGE) {
+            if (argument.kind == VERNON_PROGRAM_IMAGE) {
                 if (use.binding == UINT32_MAX)
                     return fail(error, "sampled image is missing set/binding");
                 PlannedSampledResource &resource = sampled[{use.descriptorSet, use.binding}];
@@ -343,7 +343,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
                 resource.stages |= stage;
                 continue;
             }
-            if (argument.kind == VERNON_PIPELINE_SAMPLER) {
+            if (argument.kind == VERNON_PROGRAM_SAMPLER) {
                 if (use.sampledImageBindings.empty())
                     return fail(error, "sampler reflection has no paired sampled image "
                                        "binding");
@@ -361,7 +361,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonPipelineInvocati
             if (use.interfaceKind != "input")
                 continue;
             const VernonTensorView &tensor = argument.tensor;
-            if (argument.kind != VERNON_PIPELINE_TENSOR || tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
+            if (argument.kind != VERNON_PROGRAM_TENSOR || tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !tensor.resource.resource.value || !tensor.rank || !tensor.shape || !tensor.byte_strides ||
                 use.location == UINT32_MAX || use.attributeLeaves.empty())
                 return fail(error, "graphics Tensor view is invalid");

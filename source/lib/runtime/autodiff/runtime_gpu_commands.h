@@ -42,7 +42,7 @@ VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std
 VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
                                           execution::detail::RhiCommandExecutionPlan &plan);
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
-                                   VernonLoadedPipeline &pipeline, std::vector<VernonPipelineArgument> &arguments,
+                                   VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                    VernonLaunchSize grid);
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
                                        const execution::detail::RhiCommandExecutionPlan &plan,
@@ -50,27 +50,27 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
                                        execution::detail::RhiCommandPlanSink *sink = nullptr, bool flush = false);
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                      VernonLoadedPipeline &pipeline,
-                                      const std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize grid,
+                                      VernonProgramExecutable &pipeline,
+                                      const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
                                       const std::vector<DeviceBufferCopy> &copiesAfter,
                                       execution::detail::CommandNodeKind kind,
                                       execution::detail::RhiCommandExecutionPlan &plan);
 
-VernonStatus executePipelineCommandDagAndWait(VernonLoadedPipeline &pipeline, VernonLaunchSize grid,
-                                              std::vector<VernonPipelineArgument> &arguments,
+VernonStatus executePipelineCommandDagAndWait(VernonProgramExecutable &pipeline, VernonLaunchSize grid,
+                                              std::vector<VernonProgramArgument> &arguments,
                                               const std::vector<DeviceBufferUpload> &uploadsBefore,
                                               execution::detail::CommandNodeKind kind,
                                               PullbackControlPlaneUsage *telemetry = nullptr,
                                               execution::detail::RhiCommandPlanSink *sink = nullptr);
 VernonStatus executePipelineCommandDagAndWait(
     VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-    const std::vector<DeviceBufferUpload> &uploadsBefore, VernonLoadedPipeline &pipeline,
-    std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize grid,
+    const std::vector<DeviceBufferUpload> &uploadsBefore, VernonProgramExecutable &pipeline,
+    std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
     const std::vector<DeviceBufferCopy> &copiesAfter, execution::detail::CommandNodeKind kind,
     PullbackControlPlaneUsage *telemetry = nullptr, execution::detail::RhiCommandPlanSink *sink = nullptr);
 VernonStatus executePipelineStatusCommandDagAndWait(
-    VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore, VernonLoadedPipeline &pipeline,
-    std::vector<VernonPipelineArgument> &arguments, VernonLaunchSize grid,
+    VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore, VernonProgramExecutable &pipeline,
+    std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
     const std::vector<DeviceBufferUpload> &uploadsBefore, VernonRhiBuffer statusBuffer, size_t statusOffset,
     size_t statusSize, GpuCommandCompletionCallback complete, void *completionContext,
     execution::detail::CommandNodeKind kind, PullbackControlPlaneUsage *telemetry = nullptr,

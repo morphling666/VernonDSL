@@ -20,7 +20,7 @@ struct ProgramTapeState {
 bool allocateProgramTapeState(ProgramInvocationFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
                               std::string &error);
 bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContext &context,
-                              const program::Program &execution, const VernonPipelineTopology &topology,
+                              const program::Program &execution, const VernonProgramTopology &topology,
                               const program::Graph &forward, std::vector<ProgramTapeState> &states, std::string &error);
 bool validateProgramTapeStates(ProgramInvocationFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error);

@@ -5,7 +5,7 @@
 void vernon_runtime_public_c_header_compile_check(void) {
     VernonRuntimeCreateOptions options = {0};
     VernonOpenGLContextCallbacks callbacks = {0};
-    VernonPipelineBundleLoadOptions bundle_options = {0};
+    VernonProgramBundleLoadOptions bundle_options = {0};
     VernonCpuInvocation invocation = {0};
     VernonAdValue ad_value = {0};
     VernonAdValueSet ad_values = {0};

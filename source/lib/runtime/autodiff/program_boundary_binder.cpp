@@ -10,18 +10,18 @@ namespace vernon::runtime::ad {
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
                            const ProgramBoundaryBindingRequest &request,
-                           std::map<uint32_t, VernonPipelineArgument> &externalValues,
+                           std::map<uint32_t, VernonProgramArgument> &externalValues,
                            std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
                            std::string &error) {
-    const VernonPipelineInvocation &invocation = request.invocation;
+    const VernonProgramSubmitDescriptor &invocation = request.invocation;
     if (invocation.argument_count != request.valueBySlot.size() ||
         (invocation.argument_count && !invocation.arguments)) {
         error = "Program invocation does not match its canonical boundary slots";
         return false;
     }
-    std::map<uint32_t, const VernonPipelineArgument *> bySlot;
+    std::map<uint32_t, const VernonProgramArgument *> bySlot;
     for (size_t index = 0; index < invocation.argument_count; ++index) {
-        const VernonPipelineArgument &argument = invocation.arguments[index];
+        const VernonProgramArgument &argument = invocation.arguments[index];
         if (!bySlot.emplace(argument.slot, &argument).second) {
             error = "Program invocation binds one canonical slot more than once";
             return false;
@@ -40,7 +40,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             const auto supplied = bySlot.find(slot);
             if (!target || target->role != program::BoundaryRole::Output || supplied == bySlot.end() ||
                 boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage ||
-                supplied->second->kind != VERNON_PIPELINE_TENSOR)
+                supplied->second->kind != VERNON_PROGRAM_TENSOR)
                 continue;
             const auto storage =
                 std::find_if(execution.storages.begin(), execution.storages.end(),
@@ -79,7 +79,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             return false;
         const auto ownerKey = std::make_pair(owner.kind, owner.id);
         if (borrowedOutputOwners.count(ownerKey)) {
-            if (owner.kind != program::ProgramOwnerKind::Storage || supplied->second->kind != VERNON_PIPELINE_TENSOR) {
+            if (owner.kind != program::ProgramOwnerKind::Storage || supplied->second->kind != VERNON_PROGRAM_TENSOR) {
                 error = "borrowed Program output owner is not Tensor Storage";
                 return false;
             }
@@ -106,7 +106,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             continue;
         ProgramStorageBacking &backing = backings[owner.id];
         backing.external = *supplied->second;
-        if (supplied->second->kind == VERNON_PIPELINE_TENSOR) {
+        if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
             backing.bytes = supplied->second->tensor.byte_size;
             backing.sized = backing.bytes != 0;
         }

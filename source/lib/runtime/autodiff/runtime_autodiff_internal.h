@@ -88,7 +88,7 @@ struct PullbackApplyOptions {
 
 struct ForwardExecutionTarget {
     VernonRuntimeProviderObject encoder{};
-    const VernonPipelineInvocation *invocation{};
+    const VernonProgramSubmitDescriptor *invocation{};
     execution::detail::RhiCommandExecutionPlan *commandPlan{};
     const ProgramInvocationContext *programContext{};
 
@@ -163,9 +163,9 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
                          const Stage &backward, const std::vector<std::string> &gradientPaths,
                          uint64_t staticTapeBytesHint, const std::string &residualStorage,
                          const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
-bool resolvePipelineAutodiff(VernonPipelineBundle &bundle, const AutodiffProfile &profile,
-                             VernonLoadedPipeline &pipeline);
-bool resolveProgramAutodiff(VernonLoadedPipeline &pipeline,
+bool resolvePipelineAutodiff(VernonProgramBundle &bundle, const AutodiffProfile &profile,
+                             VernonProgramExecutable &pipeline);
+bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups);
 
 } // namespace vernon::runtime::ad

@@ -9,9 +9,9 @@
 
 namespace {
 
-VernonPipelineArgument hostTensor(void *data, size_t size) {
-    VernonPipelineArgument argument{};
-    argument.kind = VERNON_PIPELINE_TENSOR;
+VernonProgramArgument hostTensor(void *data, size_t size) {
+    VernonProgramArgument argument{};
+    argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_HOST;
     argument.tensor.host_data = data;

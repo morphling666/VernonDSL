@@ -3,7 +3,7 @@
 
 #include "VernonRuntime.h"
 
-struct VernonLoadedPipeline;
+struct VernonProgramExecutable;
 struct VernonPullback;
 
 namespace vernon::runtime {
@@ -16,11 +16,11 @@ struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
 namespace vernon::runtime::ad {
-VernonStatus forwardProgramInvocation(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
-                                      VernonPullback *&pullback,
+VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
+                                      const VernonProgramSubmitDescriptor &invocation, VernonPullback *&pullback,
                                       const ProgramInvocationContext *programContext = nullptr);
-VernonStatus preparePipelineForwardCommandPlan(VernonLoadedPipeline &pipeline,
-                                               const VernonPipelineInvocation &invocation,
+VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline,
+                                               const VernonProgramSubmitDescriptor &invocation,
                                                const VernonAdValueSet &inputs,
                                                execution::detail::RhiCommandExecutionPlan &plan,
                                                VernonPullback *&pullback);

@@ -124,7 +124,7 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     bundle = withContentHash(nlohmann::json::parse(bundle));
 
     VernonRuntimeBackend target = VERNON_RUNTIME_CPU;
-    ASSERT_TRUE(vernonRuntimePipelineBundleInspectTarget(bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernonRuntimeProgramBundleInspectTarget(bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
     ASSERT_TRUE(target == VERNON_RUNTIME_CUDA);
 
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_CUDA).available) {
@@ -134,38 +134,38 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_CUDA);
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
 
     nlohmann::json unsupportedDocument = nlohmann::json::parse(bundle);
     unsupportedDocument["runtime_requirements"]["minimum_compute_capability"] = nlohmann::json::array({99, 0});
     const std::string unsupported = withContentHash(std::move(unsupportedDocument));
-    ASSERT_FALSE(vernonRuntimeLoadPipelineBundleWithOptions(runtime, unsupported.data(), unsupported.size(), &options));
+    ASSERT_FALSE(vernonRuntimeLoadProgramBundleWithOptions(runtime, unsupported.data(), unsupported.size(), &options));
     const VernonStringView unsupportedError = vernonRuntimeGetLastError(runtime);
     ASSERT_TRUE(std::string(unsupportedError.data, unsupportedError.size)
                     .find("pipeline requires CUDA compute capability 99.0, device provides") != std::string::npos);
 
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_TRUE(loaded);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_TRUE(pipeline);
 
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterCount(pipeline) == 2);
-    VernonPipelineParameterView parameter{};
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
-    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PIPELINE_TENSOR &&
+    ASSERT_TRUE(vernonRuntimeProgramExecutableGetParameterCount(pipeline) == 2);
+    VernonProgramParameterView parameter{};
+    ASSERT_TRUE(vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
+    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PROGRAM_TENSOR &&
                 parameter.element_layout.leaf_count == 1 &&
                 parameter.element_layout.leaves[0].dtype == VERNON_DATA_F32 &&
                 parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 4);
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineFindParameter(pipeline, {"factor", std::strlen("factor")}, &parameter) ==
+    ASSERT_TRUE(vernonRuntimeProgramExecutableFindParameter(pipeline, {"factor", std::strlen("factor")}, &parameter) ==
                 VERNON_STATUS_OK);
-    ASSERT_TRUE(parameter.slot == 1 && parameter.kind == VERNON_PIPELINE_TENSOR);
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineGetOutputCount(pipeline) == 1);
-    VernonPipelineOutputView pipelineOutput{};
-    ASSERT_TRUE(vernonRuntimeLoadedPipelineFindOutput(pipeline, {"result", std::strlen("result")}, &pipelineOutput) ==
-                VERNON_STATUS_OK);
-    ASSERT_TRUE(pipelineOutput.kind == VERNON_PIPELINE_TENSOR && pipelineOutput.dtype == VERNON_DATA_F32 &&
+    ASSERT_TRUE(parameter.slot == 1 && parameter.kind == VERNON_PROGRAM_TENSOR);
+    ASSERT_TRUE(vernonRuntimeProgramExecutableGetOutputCount(pipeline) == 1);
+    VernonProgramOutputView pipelineOutput{};
+    ASSERT_TRUE(vernonRuntimeProgramExecutableFindOutput(pipeline, {"result", std::strlen("result")},
+                                                         &pipelineOutput) == VERNON_STATUS_OK);
+    ASSERT_TRUE(pipelineOutput.kind == VERNON_PROGRAM_TENSOR && pipelineOutput.dtype == VERNON_DATA_F32 &&
                 pipelineOutput.access == VERNON_ACCESS_WRITE && pipelineOutput.rank == 1 &&
                 pipelineOutput.static_shape[0] == 4 && pipelineOutput.location == 0);
 
@@ -174,9 +174,9 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     const uint64_t shape[] = {4};
     const int64_t strides[] = {sizeof(float)};
     const float factor = 3.0f;
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = 0;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = buffer.reference;
@@ -187,14 +187,14 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
     arguments[0].tensor.byte_strides = strides;
     arguments[0].tensor.byte_size = 4 * sizeof(float);
     arguments[1].slot = 1;
-    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
     arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonPipelineInvocation invocation{};
+    VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PIPELINE_VERSION;
     invocation.arguments = arguments;
@@ -209,8 +209,8 @@ TEST(RuntimeCudaPipeline, LoadsAndInvokesBundle) {
         ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
 
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }

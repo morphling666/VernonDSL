@@ -29,7 +29,7 @@ bool isAutodiffInternal(const Parameter &parameter) {
 
 } // namespace
 
-bool planReplayRestoreCopies(const VernonLoadedPipeline &forward, DeviceValues &working, DeviceValues &retained,
+bool planReplayRestoreCopies(const VernonProgramExecutable &forward, DeviceValues &working, DeviceValues &retained,
                              std::vector<DeviceBufferCopy> &copies) {
     copies.clear();
     for (const Parameter &parameter : forward.variant.parameters) {
@@ -100,7 +100,7 @@ bool planReplayRestoreCopies(const VernonLoadedPipeline &forward, DeviceValues &
 bool appendReplayArguments(VernonRuntimeContext &context, const BindingPlan &bindings, DeviceBuffer &tape,
                            size_t tapeBytes, DeviceBuffer &segment, size_t segmentBytes, DeviceBuffer &status,
                            size_t statusBytes, DeviceBuffer &launch, size_t launchBytes, ReplayArgumentViews &views,
-                           std::vector<VernonPipelineArgument> &arguments, std::string &failedParameter) {
+                           std::vector<VernonProgramArgument> &arguments, std::string &failedParameter) {
     arguments.clear();
     arguments.reserve(bindings.size());
     for (const Binding &binding : bindings) {
