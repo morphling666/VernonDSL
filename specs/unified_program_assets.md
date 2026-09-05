@@ -23,9 +23,9 @@ This plan defines the **asset envelope, the layering, and the lifecycle**. It do
 
 Make **Program Asset** the only cookable deployment concept.
 
-Every authored program — bare compute Kernel, graphics `vd.pipeline(...)`, Kernel VJP, compute Module, compute Module
-VJP — lowers to one Program IR, serializes to one manifest schema, and executes through one C/C++ load and invocation
-API. Everything else is deleted, not deprecated.
+Every authored program — bare compute Kernel, graphics `vd.pipeline(...)`, Kernel VJP, Module, Module VJP — lowers to
+one Program IR, serializes to one manifest schema, and executes through one C/C++ load and invocation API. Everything
+else is deleted, not deprecated.
 
 Success is measured by subtraction: after this migration there is exactly one cook front end, one cooked schema, one
 loader, one invocation path, and one autodiff ABI. If any of those still has two forms, the migration is not done.
@@ -82,8 +82,8 @@ Accepted `program` forms, and nothing else:
 | compute Kernel | one-node compute Program |
 | `vd.pipeline(...)` | one-node graphics Program with symbolic render-pass, draw, and dynamic-state boundaries |
 | Kernel VJP (`vd.ad.vjp(kernel, ...)`) | forward/backward Program graphs via `CapturedVjpDslProvider` |
-| compute Module | canonical Program parser |
-| compute Module VJP | canonical Program parser with VJP request |
+| Module | canonical Program parser; the body may mix compute Kernel calls and `vd.pipeline(...)` calls |
+| Module VJP | canonical Program parser with VJP request; compute-only body |
 
 Tuples of graphics entry functions are **not** accepted. `vd.pipeline(...)` is the only graphics authoring form. This
 removes tuple topology validation from the declaration layer entirely, since `vd.pipeline` already owns it.
@@ -129,9 +129,17 @@ descriptor beside it, and a canonical-JSON blob is not a substitute for a type.
 
 Enforce capability limits during capture, before any provider lowering, with one diagnostic vocabulary:
 
-- Module and Module VJP are compute-only; reject graphics Modules.
+- Graphics is supported in both graphics forms. A `vd.pipeline(...)` asset and a Module that calls one both
+  lower to a `GraphicsCallOp` node with symbolic render-pass, draw, and dynamic-state controls. Do not add a
+  "graphics Modules are rejected" rule; that capability already exists and is covered by
+  `test_module_graphics_controls.py`.
+- Reject graphics VJP in every form: a Module VJP whose capture contains a graphics call, and a graphics
+  Program carrying a transform. Today this is enforced twice and inconsistently — `program.py` rejects
+  graphics Module autodiff, while the asset path rejects graphics stage transforms only at cook time, after
+  `parsing.py` has already applied a *different* rule ("graphics VJP requires a named custom rule set") that
+  no input can ever satisfy. Collapse this to one rejection at capture and delete the unreachable rule-set
+  branch.
 - Reject unsupported autodiff resources.
-- Reject graphics VJP.
 
 These are declared capability rules evaluated at one layer, not ad-hoc `isinstance` guards scattered across
 declaration, parsing, and cooking.
@@ -434,8 +442,8 @@ Public C++ cook → load → invoke coverage for all five authored forms:
 - Kernel;
 - graphics `vd.pipeline(...)`;
 - Kernel VJP;
-- compute Module;
-- compute Module VJP.
+- Module, covering both a compute body and a graphics body;
+- Module VJP.
 
 Deployment-boundary tests proving one cooked Program is invocable without recooking across:
 
@@ -447,8 +455,8 @@ Deployment-boundary tests proving one cooked Program is invocable without recook
 Also:
 
 - port numerical, tape, and failure-injection autodiff tests to Program APIs;
-- explicit negative tests for graphics Module, graphics Module VJP, and graphics Kernel VJP, asserting the §4
-  capability diagnostics;
+- explicit negative tests for graphics Module VJP and graphics Kernel VJP, asserting the single §4 graphics-VJP
+  diagnostic. A graphics Module is a *positive* case and needs a cooked-asset test, not a rejection test;
 - a multi-variant cooked Program test, covering the deleted one-variant restriction;
 - source and schema guards preventing reintroduction of the old names, the deleted `type` values, and the deleted
   manifest fields;
