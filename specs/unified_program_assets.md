@@ -105,6 +105,20 @@ the same type for all five branches. Downstream layers cannot tell which branch 
 Kind discrimination therefore happens exactly once, at exactly one place, on real objects. Nothing downstream carries
 a kind tag, a nullable "canonical" field, or a schema selector.
 
+**Convergence is staged, and the staging is a scheduling fact rather than a licence to keep two models.** Four
+branches — Kernel, `vd.pipeline(...)`, Module, Module VJP — reach the canonical Program parser as soon as capture is
+unified. Kernel VJP cannot, because its structured-VJP generator and the `autodiff.profiles` deployment table it
+feeds are only deleted in Phase 4 (§7), and they currently back twelve cooked autodiff fixtures with numerical
+parity coverage. Until that deletion, Kernel VJP is the one branch whose capture result carries a stage plan instead
+of Program IR.
+
+Two constraints keep that from decaying into a permanent second model:
+
+- the discriminant is consumed **only** inside the L3 cook orchestrator. Deployment, load, and execution never
+  observe it, so §5's one-schema guarantee is not weakened while the branch exists;
+- Phase 4 deletes the branch rather than generalizing it. If Phase 4 ends with the discriminant still present, the
+  migration has failed its own goal, and no later phase may add a sixth branch to it.
+
 **Static AST parsing is not a kind oracle.** The current tree guesses a `program_kind` of `"stages"` or `"module"`
 from the AST shape of the `program=` argument, then the Module branch executes the source anyway. The "parse without
 execution" property is already false for half of all inputs, and the guess is wrong for `vd.pipeline(...)`: it parses
@@ -482,16 +496,38 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    Asset terminology. No behavior change. Explicitly excludes the `pipeline_version` key and its coupled generated
    names, which belong to Phase 3; Phase 1 must not touch `versions.toml`, `tools/generate_versions.py`, or the MLIR
    module attribute.
-2. **One capture front end.** Route all five authored forms through `capture_program`, dispatching on Python type.
-   Make `vd.pipeline(...)` declarations work. Remove tuple asset behavior, `program_kind`, and the
-   `python_pipeline_asset` intermediate dict.
+2. **One capture front end, including the symbolic graphics boundary.** Route all five authored forms through
+   `capture_program`, dispatching on Python type. Make `vd.pipeline(...)` declarations work. Remove tuple asset
+   behavior, `program_kind`, and the `python_pipeline_asset` intermediate dict.
+
+   This phase absorbs the graphics half of what was originally Phase 5, because the three goals are not separable.
+   Graphics pipeline state is a PSO — rasterization, depth/stencil, blend, and topology are compile-time facts that
+   must appear in the manifest — and only the canonical Program path can carry them; the stage path has no
+   representation for any of them. So a `vd.pipeline(...)` asset must cook through the canonical path. But that path
+   currently obtains its graphics boundary from two invocation facts: it bakes the vertex buffer as a fixed
+   `outer_shape`/`byte_length`, which would pin a mesh asset to a single vertex count, and it requires a concrete
+   `RenderPass` whose exact format it records, where the stage path instead records format-class constraints and
+   defers validation to load. Both must become symbolic before a graphics asset is deployable. And tuple removal
+   cannot land until `vd.pipeline(...)` cooks, since tuples are otherwise the only graphics asset form.
+
+   Concretely, this phase must:
+
+   - give the render-pass boundary declared attachment structure — count, dimension, format class, aspect, and
+     sample-count class — instead of a concrete `RenderPass`, keeping extents out of the manifest as §8 requires;
+   - give the vertex-input boundary a declared attribute layout without a vertex count or buffer byte length;
+   - carry `GraphicsPipelineState` into the manifest as compile-time PSO state;
+   - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
+     `Pipeline` that carries its own JIT `features` inside an asset.
 3. **One schema.** Move canonical deployment construction into the deployment layer, delete the `serialize.py` upward
    import, emit only `type: "program"` for all variants, and delete the legacy fields in §5. Rename
    `pipeline_version` → `program_version` here, together with all six coupled generated names.
 4. **One runtime surface.** Split `VernonProgramBundle` from `VernonProgramExecutable`, delete the dual loaders,
    kind queries, legacy submit, and direct autodiff entry points.
-5. **Symbolic dynamic controls.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid
-   controls. Add the multi-shape, multi-grid, and multi-attachment deployment tests.
+5. **Symbolic compute dispatch.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid
+   controls. Add the multi-shape, multi-grid, and multi-attachment deployment tests. The graphics boundary is already
+   symbolic by this point, having moved to Phase 2; what remains here is compute dispatch. Note that the attachment
+   extent uses the same zero-sentinel encoding as the compute grid — a cooked graphics attachment currently records
+   `extent [0, 0, 1]` — so this phase replaces one shared sentinel convention, not two unrelated ones.
 6. **Port and delete.** Port fixtures, examples, and docs. Delete obsolete code. Add the source, schema, and layering
    guards. Run complete sequential verification.
 
