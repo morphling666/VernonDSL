@@ -545,7 +545,7 @@ artifact，只要其 stage 和 feature 被该 target 支持。
 
 Cooked output 包含：
 
-- 当前 pipeline 17 `PIPELINE_VERSION`，所有 target 共用 canonical
+- 当前 pipeline 18 `PIPELINE_VERSION`，所有 target 共用 canonical
   Program、ArtifactSystem 与 stage bindings；
 - pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
@@ -578,7 +578,7 @@ static-registration `.c`/`.h`，而不是可由 Runtime 随意 `dlopen` 的 LLVM
 registration function，并通过 module-hashed wrapper symbol 注册 entry。
 Runtime 验证 manifest 中的 symbol、target triple、object format、size 和
 digest，再解析已注册 entry。已移除的 `vernon-compile --compute-bundle` 和
-`compute.json` 不属于 pipeline 17 部署接口。
+`compute.json` 不属于 pipeline 18 部署接口。
 
 ### 9.5 Load、Resolve 与 Invoke
 

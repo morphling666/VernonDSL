@@ -492,9 +492,9 @@ bool resolveOpenGLPipeline(VernonProgramBundle &bundle, const Variant &variant, 
         installRuntimeBackendState(pipeline, state);
         return true;
     }
-    invocationDiagnostic(*bundle.context) =
-        representationError.empty() ? "OpenGL PipelineAsset is not representable by the RuntimeCore provider"
-                                    : std::move(representationError);
+    invocationDiagnostic(*bundle.context) = representationError.empty()
+                                                ? "OpenGL ProgramAsset is not representable by the RuntimeCore provider"
+                                                : std::move(representationError);
     delete state;
     return false;
 }

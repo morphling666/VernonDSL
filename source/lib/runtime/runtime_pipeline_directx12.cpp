@@ -108,7 +108,7 @@ bool resolveDirectX12Pipeline(VernonProgramBundle &bundle, const Variant &varian
                     candidate.layout.set = argument.descriptorSet;
                     // DirectX compute lowering assigns the flattened UAV ABI
                     // in source argument order, independent of canonical
-                    // PipelineAsset slot ordering.
+                    // ProgramAsset slot ordering.
                     candidate.layout.binding = argumentBindings[use.index] + static_cast<uint32_t>(leafIndex);
                     candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
                                                                                ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE

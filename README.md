@@ -234,7 +234,7 @@ vernon-cook-program python/tests/program_asset_fixture.py:scale_asset `
   -o build/cpu_scale
 ```
 
-The output contains the canonical pipeline-16 `*.program.json` manifest and
+The output contains the canonical pipeline-18 `*.program.json` manifest and
 content-addressed files under `artifacts/`. Depending on the target, artifacts
 are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, LLVM IR, or relocatable CPU
 objects. A differentiated asset adds the optional root `autodiff` object to the
