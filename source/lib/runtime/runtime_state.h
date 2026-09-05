@@ -8,6 +8,7 @@
 #include "target_binding_plan.h"
 
 #include <cstddef>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -106,12 +107,28 @@ template <typename Handle> void destroyRuntimeBackendState(Handle &handle) {
     handle.destroyBackendState = nullptr;
 }
 
+namespace vernon::runtime {
+
+// One variant of a canonically cooked Program, held as the JSON its Program and artifact system deploy to. A bundle
+// keeps every variant and materializes none: selecting a feature key is what turns one into an executable, so the
+// canonical schema loads through the same bundle-then-resolve lifecycle the stage schema always did.
+struct CanonicalProgramVariant {
+    std::vector<std::string> key;
+    std::string programJson;
+    std::string artifactSystemJson;
+    std::map<std::string, std::string> stageBindings;
+};
+
+} // namespace vernon::runtime
+
 struct VernonProgramBundle {
     VernonRuntimeContext *context{};
     std::string id;
     std::unordered_map<std::string, vernon::runtime::Stage> stages;
     std::vector<vernon::runtime::Variant> variants;
     std::optional<vernon::runtime::AutodiffManifest> autodiff;
+    std::vector<vernon::runtime::CanonicalProgramVariant> canonicalVariants;
+    std::filesystem::path bundleRoot;
 };
 
 struct VernonDifferentiatedProgram {

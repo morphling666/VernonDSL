@@ -442,6 +442,96 @@ VernonProgramExecutable *vernonRuntimeLoadArtifact(VernonRuntimeContext *context
     return loadBackendArtifactPipeline(*context, artifact, artifactSize, reflection, reflectionSize, entry, entrySize);
 }
 
+namespace {
+
+// The canonical variant list, parsed once for both loaders. Every variant is read; none is selected here, because
+// which variant is wanted is a property of the request rather than of the document.
+bool parseCanonicalProgramVariants(VernonRuntimeContext &context, const nlohmann::json &document,
+                                   std::vector<vernon::runtime::CanonicalProgramVariant> &result) {
+    for (const nlohmann::json &variant : document["variants"]) {
+        if (!variant.is_object() || !variant.contains("key") || !variant["key"].is_array()) {
+            fail(&context, "Program bundle variant has no feature key", VERNON_STATUS_PARSE_ERROR);
+            return false;
+        }
+        vernon::runtime::CanonicalProgramVariant parsed;
+        for (const nlohmann::json &feature : variant["key"]) {
+            if (!feature.is_string()) {
+                fail(&context, "Program bundle feature names must be strings", VERNON_STATUS_PARSE_ERROR);
+                return false;
+            }
+            parsed.key.push_back(feature.get<std::string>());
+        }
+        std::sort(parsed.key.begin(), parsed.key.end());
+        parsed.key.erase(std::unique(parsed.key.begin(), parsed.key.end()), parsed.key.end());
+        if (std::any_of(result.begin(), result.end(), [&](const vernon::runtime::CanonicalProgramVariant &existing) {
+                return existing.key == parsed.key;
+            })) {
+            fail(&context, "Program bundle contains duplicate feature variants", VERNON_STATUS_PARSE_ERROR);
+            return false;
+        }
+        if (!variant.contains("program") || !variant["program"].is_object() || !variant.contains("artifact_system") ||
+            !variant["artifact_system"].is_object() || !variant.contains("stage_bindings") ||
+            !variant["stage_bindings"].is_object()) {
+            fail(&context, "Program bundle variant is incomplete", VERNON_STATUS_PARSE_ERROR);
+            return false;
+        }
+        for (const auto &[request, artifact] : variant["stage_bindings"].items()) {
+            if (!artifact.is_string()) {
+                fail(&context, "Program bundle stage binding is not a string", VERNON_STATUS_PARSE_ERROR);
+                return false;
+            }
+            parsed.stageBindings.emplace(request, artifact.get<std::string>());
+        }
+        parsed.programJson = variant["program"].dump();
+        parsed.artifactSystemJson = variant["artifact_system"].dump();
+        result.push_back(std::move(parsed));
+    }
+    if (result.empty()) {
+        fail(&context, "Program bundle declares no variants", VERNON_STATUS_PARSE_ERROR);
+        return false;
+    }
+    return true;
+}
+
+const vernon::runtime::CanonicalProgramVariant *
+selectCanonicalProgramVariant(VernonRuntimeContext &context,
+                              const std::vector<vernon::runtime::CanonicalProgramVariant> &variants,
+                              VernonFeatureSetView features) {
+    std::vector<std::string> requested;
+    requested.reserve(features.count);
+    for (size_t index = 0; index < features.count; ++index) {
+        if (!features.names[index] || !*features.names[index]) {
+            fail(&context, "Program bundle feature names must not be empty");
+            return nullptr;
+        }
+        requested.emplace_back(features.names[index]);
+    }
+    std::sort(requested.begin(), requested.end());
+    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    const auto found =
+        std::find_if(variants.begin(), variants.end(),
+                     [&](const vernon::runtime::CanonicalProgramVariant &variant) { return variant.key == requested; });
+    if (found == variants.end()) {
+        fail(&context, "Program bundle has no matching variant", VERNON_STATUS_PARSE_ERROR);
+        return nullptr;
+    }
+    return &*found;
+}
+
+VernonProgramExecutable *loadCanonicalProgramVariant(VernonRuntimeContext &context,
+                                                     const vernon::runtime::CanonicalProgramVariant &variant,
+                                                     const std::filesystem::path &bundleRoot) {
+    std::string error;
+    VernonProgramExecutable *pipeline = vernon::runtime::program::loadBackendProgramPipeline(
+        context, variant.programJson.data(), variant.programJson.size(), variant.artifactSystemJson.data(),
+        variant.artifactSystemJson.size(), variant.stageBindings, bundleRoot, error);
+    if (!pipeline)
+        fail(&context, error.empty() ? "cannot load Program bundle" : error, VERNON_STATUS_PARSE_ERROR);
+    return pipeline;
+}
+
+} // namespace
+
 VernonStatus vernonRuntimeExecutableBundleInspectKind(const void *bundleData, size_t bundleSize,
                                                       VernonExecutableBundleKind *kind) {
     if (!bundleData || !bundleSize || !kind)
@@ -531,6 +621,31 @@ VernonProgramBundle *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeCont
                                      : context->backend == VERNON_RUNTIME_METAL
                                          ? "metal"
                                          : (context->backend == VERNON_RUNTIME_OPENGL_ES ? "opengles" : "opengl");
+        // A canonically cooked Program loads through this same entry point. Only the parse differs; the lifecycle is
+        // the one the stage schema already used, so moving an authored form onto the canonical path no longer changes
+        // which function its C++ consumers call.
+        if (root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
+            root.value("type", "") == "program_bundle") {
+            if (!root.contains("variants") || !root["variants"].is_array()) {
+                fail(context, "unsupported or invalid pipeline bundle");
+                return nullptr;
+            }
+            if (!validateManifestHash(root, true, invocationDiagnostic(*context)))
+                return nullptr;
+            auto bundle = std::make_unique<VernonProgramBundle>();
+            bundle->context = context;
+            bundle->id = root.value("id", std::string());
+            if (bundleDirectory)
+                bundle->bundleRoot = *bundleDirectory;
+            if (bundle->id.empty()) {
+                fail(context, "pipeline bundle id is missing or empty");
+                return nullptr;
+            }
+            if (!parseCanonicalProgramVariants(*context, root, bundle->canonicalVariants))
+                return nullptr;
+            ++context->liveBundles;
+            return bundle.release();
+        }
         const bool pipelineSchema = root.is_object() && root.value("pipeline_version", 0) == VERNON_PIPELINE_VERSION &&
                                     root.value("type", "") == "pipeline";
         if (!pipelineSchema || !validatePipelineRootSchema(root, invocationDiagnostic(*context)) ||
@@ -792,67 +907,17 @@ vernonRuntimeLoadManagedProgramBundleWithOptions(VernonRuntimeContext *context, 
             fail(context, "cooked Module asset is not a Program bundle", VERNON_STATUS_PARSE_ERROR);
             return nullptr;
         }
-        std::vector<std::string> requested;
-        requested.reserve(features.count);
-        for (size_t index = 0; index < features.count; ++index) {
-            if (!features.names[index] || !*features.names[index]) {
-                fail(context, "Program bundle feature names must not be empty");
-                return nullptr;
-            }
-            requested.emplace_back(features.names[index]);
-        }
-        std::sort(requested.begin(), requested.end());
-        requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
-        const nlohmann::json *selected = nullptr;
-        for (const nlohmann::json &variant : document["variants"]) {
-            if (!variant.is_object() || !variant.contains("key") || !variant["key"].is_array())
-                continue;
-            std::vector<std::string> key;
-            bool valid = true;
-            for (const nlohmann::json &feature : variant["key"]) {
-                if (!feature.is_string()) {
-                    valid = false;
-                    break;
-                }
-                key.push_back(feature.get<std::string>());
-            }
-            std::sort(key.begin(), key.end());
-            key.erase(std::unique(key.begin(), key.end()), key.end());
-            if (valid && key == requested) {
-                if (selected) {
-                    fail(context, "Program bundle contains duplicate feature variants", VERNON_STATUS_PARSE_ERROR);
-                    return nullptr;
-                }
-                selected = &variant;
-            }
-        }
-        if (!selected || !selected->contains("program") || !(*selected)["program"].is_object() ||
-            !selected->contains("artifact_system") || !(*selected)["artifact_system"].is_object() ||
-            !selected->contains("stage_bindings") || !(*selected)["stage_bindings"].is_object()) {
-            fail(context, selected ? "Program bundle variant is incomplete" : "Program bundle has no matching variant",
-                 VERNON_STATUS_PARSE_ERROR);
+        std::vector<vernon::runtime::CanonicalProgramVariant> variants;
+        if (!parseCanonicalProgramVariants(*context, document, variants))
             return nullptr;
-        }
-        std::map<std::string, std::string> stageBindings;
-        for (const auto &[request, artifact] : (*selected)["stage_bindings"].items()) {
-            if (!artifact.is_string()) {
-                fail(context, "Program bundle stage binding is not a string", VERNON_STATUS_PARSE_ERROR);
-                return nullptr;
-            }
-            stageBindings.emplace(request, artifact.get<std::string>());
-        }
+        const vernon::runtime::CanonicalProgramVariant *selected =
+            selectCanonicalProgramVariant(*context, variants, features);
+        if (!selected)
+            return nullptr;
         std::filesystem::path bundleRoot;
         if (options && options->bundle_directory)
             bundleRoot = options->bundle_directory;
-        const std::string programJson = (*selected)["program"].dump();
-        const std::string artifactSystemJson = (*selected)["artifact_system"].dump();
-        std::string error;
-        VernonProgramExecutable *pipeline = program::loadBackendProgramPipeline(
-            *context, programJson.data(), programJson.size(), artifactSystemJson.data(), artifactSystemJson.size(),
-            stageBindings, bundleRoot, error);
-        if (!pipeline)
-            fail(context, error.empty() ? "cannot load Program bundle" : error, VERNON_STATUS_PARSE_ERROR);
-        return pipeline;
+        return loadCanonicalProgramVariant(*context, *selected, bundleRoot);
     } catch (const std::exception &exception) {
         fail(context, std::string("failed to load Program bundle: ") + exception.what(), VERNON_STATUS_PARSE_ERROR);
         return nullptr;
@@ -1015,6 +1080,13 @@ VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle
         if (features.count && !features.names) {
             invocationDiagnostic(*bundle->context) = "invalid pipeline feature set";
             return nullptr;
+        }
+        if (!bundle->canonicalVariants.empty()) {
+            const vernon::runtime::CanonicalProgramVariant *selected =
+                selectCanonicalProgramVariant(*bundle->context, bundle->canonicalVariants, features);
+            if (!selected)
+                return nullptr;
+            return loadCanonicalProgramVariant(*bundle->context, *selected, bundle->bundleRoot);
         }
         std::vector<std::string> key;
         for (size_t index = 0; index < features.count; ++index) {

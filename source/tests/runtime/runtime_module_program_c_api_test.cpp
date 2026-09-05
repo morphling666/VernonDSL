@@ -179,6 +179,60 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
+TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
+    // A canonically cooked Program loads through the same entry point a stage-cooked one does, and resolves a variant
+    // the same way. Until this worked, moving an authored form to the canonical path changed its cooked type and every
+    // C++ consumer answered 'unsupported or invalid pipeline bundle', which is what stalled the tuple conversions.
+    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    const VernonStringView id = vernonRuntimeProgramBundleGetId(bundle);
+    EXPECT_GT(id.size, 0u);
+
+    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, {nullptr, 1}), nullptr);
+    const char *missing[]{"NO_SUCH_FEATURE"};
+    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, {missing, 1}), nullptr);
+    EXPECT_NE(lastError(context).find("no matching variant"), std::string::npos);
+
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+    EXPECT_EQ(vernonRuntimeProgramExecutableIsManagedProgram(pipeline), 1u);
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
+
+    const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
+    const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
+    float source = 5.0f;
+    float output = 0.0f;
+    VernonProgramArgument sourceArgument = tensorArgument(sourceParameter, source);
+    VernonProgramArgument outputArgument = tensorArgument(outputParameter, output);
+    const VernonProgramBindingToken sourceToken = bindingToken("resolve-source-v1");
+    const VernonProgramBindingToken outputToken = bindingToken("resolve-output-v1");
+
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    EXPECT_FLOAT_EQ(output, 25.0f);
+
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
 TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);

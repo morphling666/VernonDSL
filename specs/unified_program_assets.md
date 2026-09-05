@@ -108,7 +108,7 @@ a kind tag, a nullable "canonical" field, or a schema selector.
 **Convergence is staged, and the staging is a scheduling fact rather than a licence to keep two models.** Four
 branches — Kernel, `vd.pipeline(...)`, Module, Module VJP — reach the canonical Program parser as soon as capture is
 unified. Kernel VJP cannot, because its structured-VJP generator and the `autodiff.profiles` deployment table it
-feeds are only deleted in Phase 4 (§7), and they currently back twelve cooked autodiff fixtures with numerical
+feeds are only deleted in Phase 3 (§7), and they currently back twelve cooked autodiff fixtures with numerical
 parity coverage. Until that deletion, Kernel VJP is the one branch whose capture result carries a stage plan instead
 of Program IR.
 
@@ -116,7 +116,7 @@ Two constraints keep that from decaying into a permanent second model:
 
 - the discriminant is consumed **only** inside the L3 cook orchestrator. Deployment, load, and execution never
   observe it, so §5's one-schema guarantee is not weakened while the branch exists;
-- Phase 4 deletes the branch rather than generalizing it. If Phase 4 ends with the discriminant still present, the
+- Phase 3 deletes the branch rather than generalizing it. If Phase 3 ends with the discriminant still present, the
   migration has failed its own goal, and no later phase may add a sixth branch to it.
 
 **Static AST parsing is not a kind oracle.** The current tree guesses a `program_kind` of `"stages"` or `"module"`
@@ -546,22 +546,35 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    - `GraphicsPipelineState` already reaches the manifest as compile-time PSO state, so no work is needed there;
    - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
      `Pipeline` that carries its own JIT `features` inside an asset.
-3. **One schema, and tuple removal with it.** Move canonical deployment construction into the deployment layer,
-   delete the `serialize.py` upward import, emit only `type: "program"` for all variants, and delete the legacy
-   fields in §5. Rename `pipeline_version` → `program_version` here, together with all six coupled generated names.
-   Then reject the tuple form and convert the remaining tuple assets, which is safe only once one schema serves both
-   paths: `examples/variant_mesh.py`, `examples/shader_lib/mandelbulb.py`, `python/tests/cube_map_shader.py`, and the
-   four assets in `python/tests/program_asset_fixture.py`, plus the docs that show the form and the topology negative
-   test, which moves to `vd.pipeline`. Each converted asset must name the target formats it is cooked for, which the
-   stage path never recorded concretely.
-4. **One runtime surface.** Split `VernonProgramBundle` from `VernonProgramExecutable`, delete the dual loaders,
-   kind queries, legacy submit, and direct autodiff entry points.
-5. **Symbolic compute dispatch.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid
+3. **One schema and one runtime surface, together.** These were separate phases and cannot be. Moving any authored
+   form to the canonical path changes its cooked `type` from `pipeline` to `program_bundle`, and the two loaders
+   differ in lifecycle rather than merely in schema: `vernonRuntimeLoadProgramBundleWithOptions` returns a
+   `VernonProgramBundle` resolved to a variant later, while `vernonRuntimeLoadManagedProgramBundleWithOptions` takes
+   the feature key up front and returns a `VernonProgramExecutable`. No dispatch makes one accept the other's
+   manifest. So every form that moves breaks its C++ consumers until the surface is unified, and the schema cannot
+   collapse to one `type` until every form has moved. Ordered so each step leaves the tree green:
+
+   1. Teach `vernonRuntimeLoadProgramBundleWithOptions` the canonical schema, keeping the bundle-then-resolve shape
+      §6 specifies. Additive: nothing is deleted, so nothing breaks.
+   2. Move compute Kernel assets to the canonical path.
+   3. Reject the tuple form and convert the remaining tuple assets, now safe: `examples/variant_mesh.py`,
+      `examples/shader_lib/mandelbulb.py`, `python/tests/cube_map_shader.py`, and the four assets in
+      `python/tests/program_asset_fixture.py`, plus the docs that show the form and the topology negative test, which
+      moves to `vd.pipeline`. Each converted asset must name the target formats it is cooked for, which the stage
+      path never recorded concretely.
+   4. Move Kernel VJP, which is blocked on §7 rather than on the schema: it deploys through the bundle-level
+      `autodiff.profiles` table that §7 deletes, and eleven cooked parity fixtures in `source/tests/fixtures/`
+      depend on that ABI. It is therefore the last form to move, not the first.
+   5. Emit only `type: "program"`, delete the legacy fields in §5, and rename `pipeline_version` →
+      `program_version` with all six coupled generated names.
+   6. Delete the dual loaders, kind queries, legacy submit, and direct autodiff entry points, and split
+      `VernonProgramBundle` from `VernonProgramExecutable` as §6 requires.
+4. **Symbolic compute dispatch.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid
    controls. Add the multi-shape, multi-grid, and multi-attachment deployment tests. The graphics boundary is already
    symbolic by this point, having moved to Phase 2; what remains here is compute dispatch. Note that the attachment
    extent uses the same zero-sentinel encoding as the compute grid — a cooked graphics attachment currently records
    `extent [0, 0, 1]` — so this phase replaces one shared sentinel convention, not two unrelated ones.
-6. **Port and delete.** Port fixtures, examples, and docs. Delete obsolete code. Add the source, schema, and layering
+5. **Port and delete.** Port fixtures, examples, and docs. Delete obsolete code. Add the source, schema, and layering
    guards. Run complete sequential verification.
 
 ## 13. Completion gate
