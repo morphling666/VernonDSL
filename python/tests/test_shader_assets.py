@@ -9,9 +9,11 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest import mock
 
 import numpy as np
+import vernon_dsl as vd
 from vernon_dsl._program_assets.artifact_io import artifact_extension
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
 from vernon_dsl.bundle import (
@@ -378,6 +380,70 @@ asset = vd.program_asset(
             pipeline.variants,
             ((), ("INSTANCE",), ("SKIN",), ("INSTANCE", "SKIN")),
         )
+
+
+class GraphicsTargetFormatTests(unittest.TestCase):
+    """Attachment formats and sample count are pipeline state, so they are declared on vd.pipeline(...).
+
+    Only the attachment extent, the bound texture, and the dynamic state belong to an invocation. Every backend
+    bakes formats into the pipeline object, so a cooked graphics asset has to name them; a live pipeline reads
+    them from the RenderPass it is called with, so there they stay optional.
+    """
+
+    @staticmethod
+    def _stages() -> tuple[Any, Any]:
+        @vd.vertex
+        def vertex_main() -> None:
+            pass
+
+        @vd.fragment
+        def fragment_main() -> None:
+            pass
+
+        return vertex_main, fragment_main
+
+    def test_cooking_a_graphics_pipeline_requires_declared_target_formats(self) -> None:
+        vertex_main, fragment_main = self._stages()
+        with self.assertRaisesRegex(ValueError, "requires vd.pipeline\\(\\.\\.\\., targets="):
+            vd.program_asset(id="graphics", program=vd.pipeline(vertex_main, fragment_main))
+
+    def test_declared_target_formats_are_carried_on_the_pipeline(self) -> None:
+        vertex_main, fragment_main = self._stages()
+        asset = vd.program_asset(
+            id="graphics",
+            program=vd.pipeline(
+                vertex_main,
+                fragment_main,
+                targets=vd.target_formats(colors={0: vd.rgba8_unorm}, depth=vd.d32_float, samples=4),
+            ),
+        )
+        targets = asset.program._targets
+        self.assertEqual(targets.colors, ((0, vd.rgba8_unorm),))
+        self.assertEqual(targets.depth, vd.d32_float)
+        self.assertEqual(targets.samples, 4)
+
+    def test_live_graphics_pipelines_do_not_require_target_formats(self) -> None:
+        vertex_main, fragment_main = self._stages()
+        self.assertIsNone(vd.pipeline(vertex_main, fragment_main)._targets)
+
+    def test_target_formats_reject_incoherent_attachments(self) -> None:
+        for arguments, message in (
+            ({"colors": {0: vd.d32_float}}, "is not a color format"),
+            ({"depth": vd.rgba8_unorm}, "is not a depth format"),
+            ({"colors": {-1: vd.rgba8_unorm}}, "must be non-negative"),
+            ({}, "at least one color or depth target"),
+            ({"colors": {0: vd.rgba8_unorm}, "samples": 0}, "positive integer"),
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex((TypeError, ValueError), message):
+                    vd.target_formats(**arguments)
+
+    def test_compute_assets_are_unaffected_by_the_graphics_requirement(self) -> None:
+        @vd.kernel(workgroup_size=(1, 1, 1))
+        def compute(out: vd.TensorView[vd.f32, (4,), vd.write]) -> None:
+            out[0] = 1.0
+
+        self.assertEqual(vd.program_asset(id="compute", program=compute).id, "compute")
 
 
 class ShaderAssetCookTests(unittest.TestCase):

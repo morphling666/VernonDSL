@@ -20,6 +20,7 @@ from ..render import (
     DrawCommand,
     DynamicState,
     GraphicsPipelineState,
+    GraphicsTargetFormats,
     PrimitiveTopology,
     RenderPass,
     graphics_state,
@@ -60,6 +61,7 @@ class Pipeline:
         self,
         *stages: Any,
         state: GraphicsPipelineState | None = None,
+        targets: GraphicsTargetFormats | None = None,
         features: Iterable[str] = (),
     ):
         kinds = cast(
@@ -74,6 +76,9 @@ class Pipeline:
         self._graphics_state = graphics_state() if state is None else state
         if not isinstance(self._graphics_state, GraphicsPipelineState):
             raise TypeError("state must be a GraphicsPipelineState")
+        if targets is not None and not isinstance(targets, GraphicsTargetFormats):
+            raise TypeError("targets must be a GraphicsTargetFormats")
+        self._targets = targets
         self._topology = self._graphics_state.topology
         self._stages = stages
         self._vertex = stages[0]
@@ -295,9 +300,10 @@ class Pipeline:
 def pipeline(
     *stages: Any,
     state: GraphicsPipelineState | None = None,
+    targets: GraphicsTargetFormats | None = None,
     features: Iterable[str] = (),
 ) -> Pipeline:
-    return Pipeline(*stages, state=state, features=features)
+    return Pipeline(*stages, state=state, targets=targets, features=features)
 
 
 __all__ = ["Pipeline", "PrimitiveTopology", "lines", "pipeline", "points", "triangles"]

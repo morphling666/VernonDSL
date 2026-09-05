@@ -68,6 +68,7 @@ from .render import (
     DynamicState,
     FrontFace,
     GraphicsPipelineState,
+    GraphicsTargetFormats,
     IndexBufferView,
     LoadOperation,
     PrimitiveTopology,
@@ -90,6 +91,7 @@ from .render import (
     points,
     preserve,
     render_pass,
+    target_formats,
     triangles,
 )
 from .runtime import (
@@ -178,6 +180,7 @@ __all__ = [
     "Feature",
     "FrontFace",
     "GraphicsPipelineState",
+    "GraphicsTargetFormats",
     "IndexBufferView",
     "Kernel",
     "LoadOperation",
@@ -287,6 +290,7 @@ __all__ = [
     "sqrt",
     "storage",
     "struct",
+    "target_formats",
     "texture_sample",
     "texture_load",
     "texture_size",

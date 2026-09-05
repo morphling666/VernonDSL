@@ -198,6 +198,58 @@ class GraphicsPipelineState:
             raise ValueError("color blends require non-negative locations and ColorBlendState values")
 
 
+@dataclass(frozen=True)
+class GraphicsTargetFormats:
+    """Render target formats a graphics pipeline is built against.
+
+    Attachment formats, sample count, and attachment locations are pipeline state: every backend bakes them into the
+    pipeline object, so they cannot be deferred to invocation. Only the attachment extent, the identity of the bound
+    texture, and the genuinely dynamic state travel with an invocation, which is why two formats mean two pipelines.
+
+    Declaring them on `vd.pipeline(...)` keeps them where the rest of the pipeline state lives, and keeps them off
+    `program_asset`, which is neutral across Kernel, Pipeline, Module, and VJP forms and has no business carrying a
+    graphics-only field. Cooking requires them, because an asset has no render target to read them from. A live
+    pipeline does have one, so there they are optional: when declared, the bound RenderPass is checked against them,
+    the same way a Vulkan pipeline created with a set of formats may only be used in a compatible render pass.
+    """
+
+    colors: tuple[tuple[int, Any], ...] = ()
+    depth: Any = None
+    samples: int = 1
+
+    def __post_init__(self) -> None:
+        from ._runtime.texture import TextureFormat
+
+        locations = tuple(location for location, _ in self.colors)
+        if locations != tuple(sorted(set(locations))):
+            raise ValueError("color target locations must be unique and sorted")
+        if any(location < 0 for location in locations):
+            raise ValueError("color target locations must be non-negative")
+        for _, format in self.colors:
+            if not isinstance(format, TextureFormat):
+                raise TypeError("color target formats must be TextureFormat values")
+            if "color" not in format.aspects:
+                raise ValueError(f"color target format {format.name!r} is not a color format")
+        if self.depth is not None:
+            if not isinstance(self.depth, TextureFormat):
+                raise TypeError("depth target format must be a TextureFormat")
+            if "depth" not in self.depth.aspects:
+                raise ValueError(f"depth target format {self.depth.name!r} is not a depth format")
+        if not self.colors and self.depth is None:
+            raise ValueError("graphics target formats require at least one color or depth target")
+        if isinstance(self.samples, bool) or not isinstance(self.samples, int) or self.samples < 1:
+            raise ValueError("graphics target sample count must be a positive integer")
+
+
+def target_formats(
+    *,
+    colors: Mapping[int, Any] | None = None,
+    depth: Any = None,
+    samples: int = 1,
+) -> GraphicsTargetFormats:
+    return GraphicsTargetFormats(tuple(sorted((colors or {}).items())), depth, samples)
+
+
 def graphics_state(
     *,
     topology: PrimitiveTopology = triangles,
@@ -469,6 +521,7 @@ __all__ = [
     "DynamicState",
     "FrontFace",
     "GraphicsPipelineState",
+    "GraphicsTargetFormats",
     "IndexBufferView",
     "LoadOperation",
     "PrimitiveTopology",
@@ -491,5 +544,6 @@ __all__ = [
     "points",
     "preserve",
     "render_pass",
+    "target_formats",
     "triangles",
 ]

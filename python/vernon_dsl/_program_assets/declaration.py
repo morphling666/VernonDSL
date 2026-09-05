@@ -28,6 +28,12 @@ def program_asset(
     from ..program import ModuleVjpExpression
 
     primal = program.program if isinstance(program, ProgramExpression) else program
+    if isinstance(primal, Pipeline) and primal._targets is None:
+        raise ValueError(
+            "cooking a graphics pipeline requires vd.pipeline(..., targets=vd.target_formats(...)); attachment "
+            "formats and sample count are pipeline state that every backend bakes into the pipeline object, so "
+            "unlike the attachment extent they cannot be deferred to invocation"
+        )
     if isinstance(primal, (Module, Pipeline)) or isinstance(program, ModuleVjpExpression):
         return ProgramAssetDeclaration(
             id=id,
