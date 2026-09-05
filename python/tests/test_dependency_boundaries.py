@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 import vernon_dsl as vd
-from vernon_dsl.program_assets import cook_program_asset, encode_runtime_stage, parse_python_program_asset
+from vernon_dsl.program_assets import cook_program_asset, encode_runtime_stage, lint_python_program_asset
 
 ROOT = Path(__file__).parents[1] / "vernon_dsl"
 
@@ -70,7 +70,7 @@ class DependencyBoundaryTests(unittest.TestCase):
             "vernon_dsl._program_assets.artifact_io",
         )
         self.assertEqual(
-            parse_python_program_asset.__module__,
+            lint_python_program_asset.__module__,
             "vernon_dsl._program_assets.parsing",
         )
         self.assertEqual(

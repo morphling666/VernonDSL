@@ -29,7 +29,7 @@ from vernon_dsl.program_assets import (
     ProgramCompileError,
     cook_program_asset,
     encode_runtime_stage,
-    parse_python_program_asset,
+    lint_python_program_asset,
 )
 
 
@@ -173,8 +173,8 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
 
-            descriptor = parse_python_program_asset(source, "asset")
-            self.assertEqual(descriptor.stages["vertex"].entry, "fullscreen_vertex")
+            lint = lint_python_program_asset(source, "asset")
+            self.assertIn("fullscreen_vertex", lint.entries)
             resolution = resolve_project_entry(source, "fullscreen_vertex")
             self.assertIsNotNone(resolution)
             assert resolution is not None
@@ -217,7 +217,7 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "simple imported or local function names"):
-                parse_python_program_asset(qualified, "asset")
+                lint_python_program_asset(qualified, "asset")
 
             (root / "exports.py").write_text(
                 "from fullscreen import fullscreen_vertex\n",
@@ -241,15 +241,17 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "has no symbol 'fullscreen_vertex'"):
-                parse_python_program_asset(reexported, "asset")
+                lint_python_program_asset(reexported, "asset")
 
-    def test_python_pipeline_asset_is_parsed_without_execution(self) -> None:
+    def test_the_lint_reads_a_declaration_without_executing_it(self) -> None:
+        """Cooking evaluates the source; the lint is the part that still promises not to."""
+
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             source.write_text(
                 """
 import vernon_dsl as vd
-raise RuntimeError("the cooker must not execute this module")
+raise RuntimeError("the lint must not execute this module")
 FEATURE = vd.feature("FEATURE")
 
 @vd.vertex
@@ -268,11 +270,10 @@ asset = vd.program_asset(
 """,
                 encoding="utf-8",
             )
-            descriptor = parse_python_program_asset(source, "asset")
-            self.assertEqual(descriptor.id, "pipelines/static")
-            self.assertEqual(descriptor.variants, ((), ("FEATURE",)))
-            self.assertEqual(set(descriptor.stages), {"vertex", "fragment"})
-            self.assertNotIn("targets", json.loads(descriptor.canonical_manifest))
+            lint = lint_python_program_asset(source, "asset")
+            self.assertEqual(lint.id, "pipelines/static")
+            self.assertEqual(lint.variants, ((), ("FEATURE",)))
+            self.assertEqual(set(lint.entries), {"vertex_main", "fragment_main"})
 
     def test_python_pipeline_asset_rejects_legacy_stage_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -295,9 +296,13 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "unknown program_asset argument"):
-                parse_python_program_asset(source, "asset")
+                lint_python_program_asset(source, "asset")
 
     def test_python_pipeline_asset_rejects_graphics_stage_order(self) -> None:
+        """Topology is checked by program_asset itself, so it is checked here where it is enforced."""
+
+        from vernon_dsl._program_assets.cooking import _load_program_asset_declaration
+
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             source.write_text(
@@ -321,7 +326,7 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "topology order"):
-                parse_python_program_asset(source, "asset")
+                _load_program_asset_declaration(source, "asset")
 
     def test_python_pipeline_asset_rejects_noncanonical_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -345,7 +350,7 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "not canonical"):
-                parse_python_program_asset(source, "asset")
+                lint_python_program_asset(source, "asset")
 
     def test_python_pipeline_asset_enforces_variant_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -370,11 +375,11 @@ asset = vd.program_asset(
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(ProgramCompileError, "variant cap 16"):
-                parse_python_program_asset(source, "asset")
+                lint_python_program_asset(source, "asset")
 
     def test_example_pipeline_asset_has_canonical_variants(self) -> None:
         root = Path(__file__).parents[2]
-        pipeline = parse_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
+        pipeline = lint_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
         self.assertEqual(pipeline.id, "shaders/variant_mesh")
         self.assertEqual(
             pipeline.variants,
@@ -1172,6 +1177,7 @@ asset = vd.program_asset(id="module/square", program=Square())
             from vernon_dsl._program_assets.artifact_io import write_external_artifact
             from vernon_dsl._program_assets.cooking import (
                 _canonical_deployment,
+                _canonical_path_descriptor,
                 _compile_module_bundle_plan,
                 _load_program_asset_declaration,
                 _native_module,
@@ -1179,8 +1185,8 @@ asset = vd.program_asset(id="module/square", program=Square())
             )
 
             native = _native_module()
-            pipeline = parse_python_program_asset(source, "asset")
             declaration = _load_program_asset_declaration(source, "asset")
+            pipeline = _canonical_path_descriptor(declaration, source)
             for target_name in ("cpu", "metal", "vulkan"):
                 with self.subTest(target=target_name):
                     target = make_target_options(target_name)

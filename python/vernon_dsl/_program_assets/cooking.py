@@ -45,8 +45,8 @@ from ..program_frontend import (
 )
 from .artifact_io import write_external_artifact
 from .cpu_registration import write_cpu_static_registration
-from .descriptors import ShaderModuleDescriptor, ShaderStageReference
-from .parsing import parse_python_program_asset, program_asset_reference
+from .descriptors import ShaderModuleDescriptor, ShaderProgramDescriptor, ShaderStageReference
+from .parsing import program_asset_reference
 
 
 def _native_module() -> Any:
@@ -435,6 +435,74 @@ def _compile_program_bundle_plan(
     )
 
 
+def _entry_function(entry: Any) -> Any:
+    """The Python function behind a compute Kernel or a graphics entry stage."""
+
+    return getattr(entry, "_function", None) or getattr(entry, "function", None)
+
+
+def _canonical_path_descriptor(declaration: Any, source: Path) -> ShaderProgramDescriptor:
+    """Describe a Pipeline, Module, or Module VJP asset, whose stages come from capture rather than a stage list."""
+
+    return ShaderProgramDescriptor(
+        declaration.id,
+        {},
+        declaration.variant_keys,
+        source,
+        canonical_json({"id": declaration.id, "variants": [list(key) for key in declaration.variant_keys]}),
+        {},
+    )
+
+
+def _stage_path_descriptor(declaration: Any, source: Path, descriptor_name: str) -> ShaderProgramDescriptor:
+    """Describe a compute Kernel or graphics tuple asset from the evaluated declaration rather than from its AST.
+
+    Only the two stage-path forms come through here. A Pipeline, Module, or Module VJP is captured as canonical
+    Program IR instead and never needs a stage list.
+    """
+
+    from ..ad import ProgramExpression
+
+    program = declaration.program
+    expression = program if isinstance(program, ProgramExpression) else None
+    primal = expression.program if expression is not None else program
+    stage_functions: dict[str, str] = {}
+    for entry in primal if isinstance(primal, tuple) else (primal,):
+        stage = getattr(entry, "__vernon_dsl__", (None,))[0]
+        if stage is None or _entry_function(entry) is None:
+            raise ProgramCompileError(
+                "Program Asset program must be a compute Kernel, Pipeline, Module, or VJP expression"
+            )
+        stage_functions[stage] = entry.__name__
+    transform = None if expression is None else expression.transform.to_dict()
+    if transform is not None:
+        transform["identity"] = expression.transform.identity
+    variants = declaration.variant_keys
+    module_id = f"python/{source.stem}"
+    # Provenance for the stage module, in the same shape the canonical path uses. It carries no schema tag, because it
+    # is not a schema: nothing reads it back, and the typed declaration is what describes the asset.
+    manifest: dict[str, Any] = {
+        "source": source.name,
+        "name": descriptor_name,
+        "id": declaration.id,
+        "stages": stage_functions,
+        "variants": [list(key) for key in variants],
+    }
+    if transform is not None:
+        manifest["transform"] = transform
+    encoded = canonical_json(manifest)
+    module = ShaderModuleDescriptor(module_id, source, source, encoded)
+    return ShaderProgramDescriptor(
+        declaration.id,
+        {stage: ShaderStageReference(module_id, entry) for stage, entry in stage_functions.items()},
+        variants,
+        source,
+        encoded,
+        {module_id: module},
+        transform,
+    )
+
+
 def _load_program_asset_declaration(source: Path, descriptor_name: str) -> Any:
     module_name = f"_vernon_program_asset_{hashlib.sha256(str(source).encode()).hexdigest()[:20]}"
     specification = importlib.util.spec_from_file_location(module_name, source)
@@ -688,13 +756,17 @@ def cook_program_asset(
     from ..program import ModuleVjpExpression
 
     source, descriptor_name = program_asset_reference(program_asset)
-    pipeline = parse_python_program_asset(source, descriptor_name)
     declaration = _load_program_asset_declaration(source, descriptor_name)
     # The one place a Program Asset's form is discriminated, on the authored objects rather than on their AST shape.
     program = declaration.program
     primal = program.program if isinstance(program, ProgramExpression) else program
     graphics_pipeline = isinstance(primal, Pipeline)
     host_module = isinstance(primal, Module) or isinstance(program, ModuleVjpExpression)
+    pipeline = (
+        _canonical_path_descriptor(declaration, source)
+        if graphics_pipeline or host_module
+        else _stage_path_descriptor(declaration, source, descriptor_name)
+    )
     if target is None:
         target = OpenGLTargetOptions()
     elif isinstance(target, str):
@@ -714,13 +786,14 @@ def cook_program_asset(
     native = _native_module()
     native_target = _native_target(native, target_name)
     selected_modules: dict[str, ShaderModuleDescriptor] = {}
-    declared_features: set[str] = set()
     for stage, reference in pipeline.stages.items():
         module = pipeline.modules.get(reference.module)
         if module is None:
             raise ProgramCompileError(f"pipeline {stage} stage references unknown module '{reference.module}'")
         selected_modules[stage] = module
-        declared_features.update(load_project(module.source).features)
+    # Features are declared by the asset's own project, so this holds for every form rather than only for the forms
+    # whose stages happen to be listed. A Pipeline or Module asset lists none, and may still declare variants.
+    declared_features = set(load_project(source).features)
     for variant in pipeline.variants:
         unknown = set(variant) - declared_features
         if unknown:

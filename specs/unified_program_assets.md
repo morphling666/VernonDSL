@@ -479,9 +479,14 @@ Also:
 - update every fixture, example, CMake cook rule, installed-wheel check, CLI invocation, public document, and spec;
 - delete obsolete code only after all callers use the canonical path.
 
-Tests that encode a removed design must be removed or rewritten, not skipped. In particular
-`test_python_pipeline_asset_is_parsed_without_execution` asserts a property that §4 retires; rewrite it against the
-declaration-site lint or delete it.
+Tests that encode a removed design must be removed or rewritten, not skipped. `test_python_pipeline_asset_is_parsed_
+without_execution` asserted a property §4 retires for cooking; it now covers the lint, which is the part that still
+promises not to execute the source.
+
+One vestige is worth recording rather than removing blind: `CompiledStage.module_manifest`, and the descriptor
+`canonical_manifest` feeding it, are never serialized and are absent from `CompiledStage.identity`, so both stage
+paths carry provenance that nothing reads back. Phase 3 rewrites the deployment layer and should decide their fate
+there, where the surrounding code is already being changed.
 
 ## 12. Implementation phases
 
@@ -497,8 +502,9 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    names, which belong to Phase 3; Phase 1 must not touch `versions.toml`, `tools/generate_versions.py`, or the MLIR
    module attribute.
 2. **One capture front end, including the symbolic graphics boundary.** Route all five authored forms through
-   `capture_program`, dispatching on Python type. Make `vd.pipeline(...)` declarations work. Remove tuple asset
-   behavior, `program_kind`, and the `python_pipeline_asset` intermediate dict.
+   `capture_program`, dispatching on Python type. Make `vd.pipeline(...)` declarations work. Remove `program_kind`
+   and the `python_pipeline_asset` intermediate dict, and reduce static parsing to a lint that feeds nothing.
+   Tuple **removal** moves to Phase 3 for the reason below; tuple *authoring* keeps working until then.
 
    This phase absorbs the graphics half of what was originally Phase 5, because the three goals are not separable.
    Graphics pipeline state is a PSO — rasterization, depth/stencil, blend, and topology are compile-time facts that
@@ -506,8 +512,15 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    representation for any of them. So a `vd.pipeline(...)` asset must cook through the canonical path. But that path
    took its attachment structure from a concrete `RenderPass` and refused outright without one, which made a graphics
    asset uncookable: an asset has no render target to read. That boundary must come from the pipeline itself before a
-   graphics asset is deployable. And tuple removal cannot land until `vd.pipeline(...)` cooks, since tuples are
-   otherwise the only graphics asset form.
+   graphics asset is deployable.
+
+   Tuple removal needs more than that, which is why it moves to Phase 3. It does need `vd.pipeline(...)` to cook
+   first, since tuples are otherwise the only graphics asset form — but that is necessary, not sufficient. Converting
+   a tuple asset to `vd.pipeline(...)` also moves it from the stage path to the canonical one, changing its cooked
+   `type` from `pipeline` to `program_bundle`. `vernonRuntimeLoadProgramBundleWithOptions` accepts only the former
+   and answers `unsupported or invalid pipeline bundle` for the latter, so every C++ consumer of a converted asset
+   would break — `examples/external_engine/mandelbulb.cpp` among them. Tuple removal therefore lands with the schema
+   that makes the two paths interchangeable, in Phase 3, and not before.
 
    Concretely, this phase must:
 
@@ -533,9 +546,14 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    - `GraphicsPipelineState` already reaches the manifest as compile-time PSO state, so no work is needed there;
    - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
      `Pipeline` that carries its own JIT `features` inside an asset.
-3. **One schema.** Move canonical deployment construction into the deployment layer, delete the `serialize.py` upward
-   import, emit only `type: "program"` for all variants, and delete the legacy fields in §5. Rename
-   `pipeline_version` → `program_version` here, together with all six coupled generated names.
+3. **One schema, and tuple removal with it.** Move canonical deployment construction into the deployment layer,
+   delete the `serialize.py` upward import, emit only `type: "program"` for all variants, and delete the legacy
+   fields in §5. Rename `pipeline_version` → `program_version` here, together with all six coupled generated names.
+   Then reject the tuple form and convert the remaining tuple assets, which is safe only once one schema serves both
+   paths: `examples/variant_mesh.py`, `examples/shader_lib/mandelbulb.py`, `python/tests/cube_map_shader.py`, and the
+   four assets in `python/tests/program_asset_fixture.py`, plus the docs that show the form and the topology negative
+   test, which moves to `vd.pipeline`. Each converted asset must name the target formats it is cooked for, which the
+   stage path never recorded concretely.
 4. **One runtime surface.** Split `VernonProgramBundle` from `VernonProgramExecutable`, delete the dual loaders,
    kind queries, legacy submit, and direct autodiff entry points.
 5. **Symbolic compute dispatch.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid

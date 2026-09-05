@@ -4,10 +4,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 import vernon_dsl as vd
 from vernon_dsl.bundle import BundlePlan, CpuTargetOptions
-from vernon_dsl.program_assets import ProgramCompileError, parse_python_program_asset
+from vernon_dsl.program_assets import ProgramCompileError
 
 
 class AutodiffDeclarationTests(unittest.TestCase):
@@ -90,13 +91,26 @@ class AutodiffDeclarationTests(unittest.TestCase):
 
 
 class AutodiffPipelineParsingTests(unittest.TestCase):
-    def test_storage_outputs_are_parsed_without_executing_module(self) -> None:
+    """The VJP transform a cooked asset carries comes from the typed vd.ad.vjp expression.
+
+    It used to be rebuilt from the AST and round-tripped through a dict. The typed ProgramTransformSpec is the same
+    record with its own validation, so there is one description of a transform rather than two.
+    """
+
+    @staticmethod
+    def _descriptor(directory: str, body: str, name: str = "asset") -> Any:
+        from vernon_dsl._program_assets.cooking import _load_program_asset_declaration, _stage_path_descriptor
+
+        source = Path(directory) / "asset.py"
+        source.write_text(body, encoding="utf-8")
+        return _stage_path_descriptor(_load_program_asset_declaration(source, name), source, name)
+
+    def test_the_declared_transform_reaches_the_stage_descriptor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "asset.py"
-            source.write_text(
+            descriptor = self._descriptor(
+                directory,
                 """
 import vernon_dsl as vd
-raise RuntimeError("must not execute")
 
 @vd.kernel
 def compute(
@@ -110,21 +124,17 @@ asset = vd.program_asset(
     program=vd.ad.vjp(compute, wrt=("value",), outputs=("loss",)),
 )
 """,
-                encoding="utf-8",
             )
-            descriptor = parse_python_program_asset(source, "asset")
-            self.assertIsNotNone(descriptor.transform)
-            assert descriptor.transform is not None
-            self.assertEqual(descriptor.transform["wrt"], ["value"])
-            self.assertEqual(descriptor.transform["output_cotangents"], ["loss"])
-            manifest = json.loads(descriptor.canonical_manifest)
-            self.assertEqual(manifest["transform"], descriptor.transform)
+        self.assertIsNotNone(descriptor.transform)
+        assert descriptor.transform is not None
+        self.assertEqual(descriptor.transform["wrt"], ["value"])
+        self.assertEqual(descriptor.transform["output_cotangents"], ["loss"])
+        self.assertEqual(descriptor.stages["compute"].entry, "compute")
+        manifest = json.loads(descriptor.canonical_manifest)
+        self.assertEqual(manifest["transform"], descriptor.transform)
 
-    def test_named_vjp_program_matches_inline_declaration(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "asset.py"
-            source.write_text(
-                """
+    def test_a_named_vjp_program_describes_the_same_transform_as_an_inline_one(self) -> None:
+        body = """
 import vernon_dsl as vd
 
 @vd.kernel
@@ -140,32 +150,21 @@ inline = vd.program_asset(
     id="compute/vjp",
     program=vd.ad.vjp(compute, wrt=("value",), outputs=("loss",)),
 )
-""",
-                encoding="utf-8",
-            )
-            named = parse_python_program_asset(source, "named")
-            inline = parse_python_program_asset(source, "inline")
-            self.assertEqual(named.transform, inline.transform)
-            self.assertEqual(named.stages["compute"].entry, inline.stages["compute"].entry)
-            self.assertEqual(named.variants, inline.variants)
-
-    def test_dynamic_pipeline_requires_declared_storage_outputs(self) -> None:
+"""
         with tempfile.TemporaryDirectory() as directory:
-            source = Path(directory) / "asset.py"
-            source.write_text(
-                """
-import vernon_dsl as vd
+            named = self._descriptor(directory, body, "named")
+            inline = self._descriptor(directory, body, "inline")
+        self.assertEqual(named.transform, inline.transform)
+        self.assertEqual(named.stages["compute"].entry, inline.stages["compute"].entry)
+        self.assertEqual(named.variants, inline.variants)
 
-@vd.kernel
-def compute(value: vd.f32) -> None:
-    pass
+    def test_a_compute_vjp_without_storage_outputs_is_refused_at_declaration(self) -> None:
+        @vd.kernel
+        def compute(value: vd.f32) -> None:
+            pass
 
-asset = vd.program_asset(id="compute/vjp", program=vd.ad.vjp(compute, wrt=("value",)))
-""",
-                encoding="utf-8",
-            )
-            with self.assertRaisesRegex(ProgramCompileError, "requires non-empty writable Storage outputs"):
-                parse_python_program_asset(source, "asset")
+        with self.assertRaisesRegex(ValueError, "requires non-empty writable Storage outputs"):
+            vd.ad.vjp(compute, wrt=("value",))
 
 
 if __name__ == "__main__":

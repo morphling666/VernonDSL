@@ -1,20 +1,38 @@
+"""Static preflight for Program Asset declarations.
+
+This is a **lint**, not a model of what an asset is. Cooking evaluates the asset source and reads the typed
+declaration, so nothing here decides a form, builds a transform, or lists stages. Keeping only the checks that are
+genuinely static avoids a second, partially-correct answer to questions the typed declaration already answers.
+
+Three things are worth checking without running the source: that the id is a literal, that the variant keys are
+canonical and locally declared, and that statically named entries resolve inside the project. The last one earns its
+place because the compiler's own answer is late and obscure -- an entry reached through a module alias fails with
+"unknown shader entry point" long after cooking has begun.
+"""
+
 from __future__ import annotations
 
 import ast
-import hashlib
 import keyword
-import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ..bundle import ProgramCompileError, canonical_json
+from ..bundle import ProgramCompileError
 from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
-from ..language.stage_registry import ENTRY_DECORATOR_STAGES, validate_graphics_topology
+from ..language.stage_registry import ENTRY_DECORATOR_STAGES
 from ..module_graph import load_project, resolve_project_entry
-from .descriptors import ShaderModuleDescriptor, ShaderProgramDescriptor, ShaderStageReference
+from .declaration import VARIANT_CAP
 
-_AD_PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
+
+@dataclass(frozen=True)
+class ProgramAssetLint:
+    """What a Program Asset declaration says about itself without being run."""
+
+    id: str
+    variants: tuple[tuple[str, ...], ...]
+    entries: tuple[str, ...]
 
 
 def program_asset_reference(value: str | Path) -> tuple[Path, str]:
@@ -29,6 +47,18 @@ def program_asset_reference(value: str | Path) -> tuple[Path, str]:
     if not descriptor_name or not descriptor_name.isidentifier() or keyword.iskeyword(descriptor_name):
         raise ProgramCompileError("Program Asset reference requires a valid Python descriptor name after source.py:")
     return source, descriptor_name
+
+
+def _assigned_values(tree: ast.Module, name: str) -> list[ast.expr]:
+    values = []
+    for statement in tree.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        if len(targets) == 1 and isinstance(targets[0], ast.Name) and targets[0].id == name:
+            if statement.value is not None:
+                values.append(statement.value)
+    return values
 
 
 def _feature_bindings(tree: ast.Module) -> dict[str, str]:
@@ -53,72 +83,95 @@ def _feature_bindings(tree: ast.Module) -> dict[str, str]:
     return bindings
 
 
-def _ad_rule_sets(tree: ast.Module) -> dict[str, tuple[str, tuple[str, ...]]]:
-    declarations: dict[str, tuple[str, tuple[str, ...]]] = {}
-    allowed = {"rasterization", "visibility", "depth", "blend", "texture"}
-    for statement in tree.body:
-        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
-            continue
-        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        value = statement.value
-        if (
-            len(targets) != 1
-            or not isinstance(targets[0], ast.Name)
-            or not isinstance(value, ast.Call)
-            or (dotted_name(value.func) or "").split(".")[-1] != "rule_set"
-        ):
-            continue
-        if value.args or any(item.arg is None for item in value.keywords):
-            raise ProgramCompileError("vd.ad.rule_set accepts keyword arguments only")
-        keywords = {item.arg: item.value for item in value.keywords if item.arg is not None}
-        unknown = set(keywords) - allowed - {"id"}
-        if unknown:
-            raise ProgramCompileError("unknown VJP rule(s): " + ", ".join(sorted(unknown)))
-        rule_id = keywords.get("id")
-        if not isinstance(rule_id, ast.Constant) or not isinstance(rule_id.value, str) or not rule_id.value:
-            raise ProgramCompileError("VJP rule set id must be a non-empty string literal")
-        for name, rule in keywords.items():
-            if name != "id" and not isinstance(rule, ast.Name):
-                raise ProgramCompileError(f"VJP rule '{name}' must reference a module-level function")
-        declarations[targets[0].id] = (rule_id.value, tuple(sorted(set(keywords) - {"id"})))
-    return declarations
+def _declaration_call(tree: ast.Module, descriptor_name: str, source_path: Path) -> ast.Call:
+    declarations = [
+        value
+        for value in _assigned_values(tree, descriptor_name)
+        if isinstance(value, ast.Call) and (dotted_name(value.func) or "").split(".")[-1] == "program_asset"
+    ]
+    if not declarations:
+        raise ProgramCompileError(f"Program Asset declaration '{descriptor_name}' was not found in {source_path}")
+    if len(declarations) != 1:
+        raise ProgramCompileError(f"duplicate Program Asset declaration: {descriptor_name}")
+    return declarations[0]
 
 
-def _transform_record(
-    wrt: tuple[str, ...],
-    outputs: tuple[str, ...],
-    rule_set_id: str | None,
-    rule_set_identity: str | None,
-    planning_policy: str = "min_memory",
-) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "kind": "vjp",
-        "wrt": list(wrt),
-        "output_cotangents": list(outputs),
-        "gradient_policy": "f16:f32,f32:f32,f64:f64",
-        "accumulation_policy": "fresh",
-        "tape_policy": "bounded",
-        "planning_policy": planning_policy,
-        "derivative_rules_version": 1,
-    }
-    if rule_set_id is not None:
-        record["rule_set"] = rule_set_id
-        record["rule_set_identity"] = rule_set_identity
-    record["identity"] = hashlib.sha256(canonical_json(record).encode("utf-8")).hexdigest()
-    return record
+def _static_entries(tree: ast.Module, program: ast.expr) -> list[ast.expr]:
+    """The entry expressions a reader can see without running the source, if any.
+
+    A `vd.pipeline(...)`, Module, or Module VJP declaration contributes none, and that is not a defect: its stages
+    are only knowable once the declaration is evaluated.
+    """
+
+    if isinstance(program, ast.Name):
+        named = [
+            value
+            for value in _assigned_values(tree, program.id)
+            if isinstance(value, ast.Call) and (dotted_name(value.func) or "").split(".")[-1] == "vjp"
+        ]
+        if len(named) > 1:
+            raise ProgramCompileError(f"duplicate VJP program declaration: {program.id}")
+        if named:
+            program = named[0]
+    if isinstance(program, ast.Call) and (dotted_name(program.func) or "").split(".")[-1] == "vjp":
+        if not program.args:
+            return []
+        program = program.args[0]
+    if isinstance(program, ast.Name):
+        return [program]
+    if isinstance(program, ast.Tuple):
+        return list(program.elts)
+    return []
 
 
-def _literal_keyword(keywords: dict[str, ast.expr], name: str) -> Any:
-    node = keywords.get(name)
-    if node is None:
-        raise ProgramCompileError(f"program_asset declaration requires '{name}'")
+def _resolved_entry(source_path: Path, entry: ast.expr) -> str:
+    if not isinstance(entry, ast.Name):
+        raise ProgramCompileError("program_asset program entries must use simple imported or local function names")
     try:
-        return ast.literal_eval(node)
-    except (ValueError, TypeError, SyntaxError):
-        raise ProgramCompileError(f"program_asset '{name}' must be a literal value") from None
+        resolution = resolve_project_entry(source_path, entry.id)
+    except CompileError as error:
+        raise ProgramCompileError(str(error)) from None
+    if resolution is None:
+        raise ProgramCompileError(f"program_asset program entry '{entry.id}' is not a function")
+    stages = {ENTRY_DECORATOR_STAGES[name] for name in resolution.decorators if name in ENTRY_DECORATOR_STAGES}
+    if len(stages) != 1:
+        raise ProgramCompileError(
+            f"program_asset program entry '{entry.id}' must have exactly one entry-stage decorator"
+        )
+    return entry.id
 
 
-def parse_python_program_asset(source: str | Path, descriptor_name: str) -> ShaderProgramDescriptor:
+def _linted_variants(tree: ast.Module, keywords: dict[str, ast.expr]) -> tuple[tuple[str, ...], ...]:
+    node = keywords.get("variants")
+    if node is None:
+        return ((),)
+    if not isinstance(node, (ast.Tuple, ast.List)):
+        raise ProgramCompileError("program_asset variants must be a tuple or list")
+    features = _feature_bindings(tree)
+    parsed: list[tuple[str, ...]] = []
+    for row in node.elts:
+        if not isinstance(row, (ast.Tuple, ast.List)):
+            raise ProgramCompileError("each Program Asset variant must be a tuple or list")
+        if any(not isinstance(item, ast.Name) or item.id not in features for item in row.elts):
+            raise ProgramCompileError("Program Asset variants must reference locally declared features")
+        key = tuple(features[item.id] for item in row.elts if isinstance(item, ast.Name))
+        if list(key) != sorted(key) or len(set(key)) != len(key):
+            raise ProgramCompileError(f"Program Asset variant is not canonical: {list(key)}")
+        if key in parsed:
+            raise ProgramCompileError(f"duplicate Program Asset variant: {list(key)}")
+        parsed.append(key)
+    if not parsed:
+        raise ProgramCompileError("a Program Asset must declare at least one variant")
+    if len(parsed) > VARIANT_CAP:
+        raise ProgramCompileError(
+            f"a Program Asset declares {len(parsed)} variants, exceeding variant cap {VARIANT_CAP}"
+        )
+    return tuple(parsed)
+
+
+def lint_python_program_asset(source: str | Path, descriptor_name: str) -> ProgramAssetLint:
+    """Check a Program Asset declaration statically. Cooking does not depend on this and never consults it."""
+
     source_path = Path(source).resolve()
     if not source_path.is_file():
         raise ProgramCompileError(f"Program Asset source does not exist: {source_path}")
@@ -127,29 +180,7 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
     except (OSError, SyntaxError) as error:
         raise ProgramCompileError(f"cannot parse Program Asset source {source_path}: {error}") from None
 
-    declarations = []
-    for statement in tree.body:
-        targets = (
-            statement.targets
-            if isinstance(statement, ast.Assign)
-            else [statement.target]
-            if isinstance(statement, ast.AnnAssign)
-            else []
-        )
-        value = statement.value if isinstance(statement, (ast.Assign, ast.AnnAssign)) else None
-        if (
-            len(targets) == 1
-            and isinstance(targets[0], ast.Name)
-            and targets[0].id == descriptor_name
-            and isinstance(value, ast.Call)
-            and (dotted_name(value.func) or "").split(".")[-1] == "program_asset"
-        ):
-            declarations.append(value)
-    if not declarations:
-        raise ProgramCompileError(f"Program Asset declaration '{descriptor_name}' was not found in {source_path}")
-    if len(declarations) != 1:
-        raise ProgramCompileError(f"duplicate Program Asset declaration: {descriptor_name}")
-    declaration = declarations[0]
+    declaration = _declaration_call(tree, descriptor_name, source_path)
     if declaration.args:
         raise ProgramCompileError("program_asset accepts keyword arguments only")
     keywords = {item.arg: item.value for item in declaration.keywords if item.arg is not None}
@@ -159,214 +190,27 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
     if unknown:
         raise ProgramCompileError("unknown program_asset argument(s): " + ", ".join(sorted(unknown)))
 
-    pipeline_id = _literal_keyword(keywords, "id")
-    if not isinstance(pipeline_id, str) or not pipeline_id:
+    identifier: Any = keywords.get("id")
+    if identifier is None:
+        raise ProgramCompileError("program_asset declaration requires 'id'")
+    try:
+        identifier = ast.literal_eval(identifier)
+    except (ValueError, TypeError, SyntaxError):
+        raise ProgramCompileError("program_asset 'id' must be a literal value") from None
+    if not isinstance(identifier, str) or not identifier:
         raise ProgramCompileError("Program Asset id must be a non-empty string")
 
-    def entry_stage(entry: ast.expr) -> tuple[str, str]:
-        if not isinstance(entry, ast.Name):
-            raise ProgramCompileError("program_asset program entries must use simple imported or local function names")
-        try:
-            resolution = resolve_project_entry(source_path, entry.id)
-        except CompileError as error:
-            raise ProgramCompileError(str(error)) from None
-        if resolution is None:
-            raise ProgramCompileError(f"program_asset program entry '{entry.id}' is not a function")
-        stages = {ENTRY_DECORATOR_STAGES[name] for name in resolution.decorators if name in ENTRY_DECORATOR_STAGES}
-        if len(stages) != 1:
-            raise ProgramCompileError(
-                f"program_asset program entry '{entry.id}' must have exactly one entry-stage decorator"
-            )
-        return stages.pop(), entry.id
-
-    program_expression = keywords.get("program")
-    if program_expression is None:
+    program = keywords.get("program")
+    if program is None:
         raise ProgramCompileError("program_asset declaration requires 'program'")
-    if isinstance(program_expression, ast.Name):
-        named_expressions = []
-        for statement in tree.body:
-            targets = (
-                statement.targets
-                if isinstance(statement, ast.Assign)
-                else [statement.target]
-                if isinstance(statement, ast.AnnAssign)
-                else []
-            )
-            value = statement.value if isinstance(statement, (ast.Assign, ast.AnnAssign)) else None
-            if (
-                len(targets) == 1
-                and isinstance(targets[0], ast.Name)
-                and targets[0].id == program_expression.id
-                and isinstance(value, ast.Call)
-                and (dotted_name(value.func) or "").split(".")[-1] == "vjp"
-            ):
-                named_expressions.append(value)
-        if len(named_expressions) > 1:
-            raise ProgramCompileError(f"duplicate VJP program declaration: {program_expression.id}")
-        if named_expressions:
-            program_expression = named_expressions[0]
-    transform: dict[str, Any] | None = None
-    if (
-        isinstance(program_expression, ast.Call)
-        and (dotted_name(program_expression.func) or "").split(".")[-1] == "vjp"
-    ):
-        if len(program_expression.args) != 1 or any(item.arg is None for item in program_expression.keywords):
-            raise ProgramCompileError("vd.ad.vjp requires one program operand and keyword arguments")
-        transform_keywords = {item.arg: item.value for item in program_expression.keywords if item.arg is not None}
-        unknown_transform = set(transform_keywords) - {"wrt", "outputs", "rules", "planning_policy"}
-        if unknown_transform:
-            raise ProgramCompileError("unknown vd.ad.vjp argument(s): " + ", ".join(sorted(unknown_transform)))
-        wrt_node = transform_keywords.get("wrt")
-        try:
-            wrt_value = ast.literal_eval(wrt_node) if wrt_node is not None else None
-        except (ValueError, TypeError, SyntaxError):
-            wrt_value = None
-        if (
-            not isinstance(wrt_value, (tuple, list))
-            or not wrt_value
-            or any(not isinstance(path, str) or not _AD_PATH.fullmatch(path) for path in wrt_value)
-        ):
-            raise ProgramCompileError("vd.ad.vjp wrt must be a non-empty literal tuple or list of source paths")
-        if len(set(wrt_value)) != len(wrt_value):
-            raise ProgramCompileError("vd.ad.vjp wrt paths must be unique")
-        outputs_node = transform_keywords.get("outputs")
-        try:
-            outputs_value = ast.literal_eval(outputs_node) if outputs_node is not None else ()
-        except (ValueError, TypeError, SyntaxError):
-            outputs_value = None
-        if not isinstance(outputs_value, (tuple, list)) or any(
-            not isinstance(path, str) or not _AD_PATH.fullmatch(path) for path in outputs_value
-        ):
-            raise ProgramCompileError("vd.ad.vjp outputs must be a literal tuple or list of source paths")
-        if len(set(outputs_value)) != len(outputs_value):
-            raise ProgramCompileError("vd.ad.vjp outputs paths must be unique")
-        rule_set_id = None
-        rule_set_identity = None
-        rules_node = transform_keywords.get("rules")
-        if rules_node is not None:
-            if not isinstance(rules_node, ast.Name):
-                raise ProgramCompileError("vd.ad.vjp rules must reference a module-level vd.ad.rule_set")
-            declared_rule_sets = _ad_rule_sets(tree)
-            if rules_node.id not in declared_rule_sets:
-                raise ProgramCompileError(f"unknown VJP rule set '{rules_node.id}'")
-            rule_set_id, rule_names = declared_rule_sets[rules_node.id]
-            rule_set_record = {"id": rule_set_id, "rules": list(rule_names)}
-            rule_set_identity = hashlib.sha256(canonical_json(rule_set_record).encode("utf-8")).hexdigest()
-        planning_node = transform_keywords.get("planning_policy")
-        try:
-            planning_policy = ast.literal_eval(planning_node) if planning_node is not None else "min_memory"
-        except (ValueError, TypeError, SyntaxError):
-            planning_policy = None
-        if planning_policy not in {"min_memory", "balanced", "min_runtime"}:
-            raise ProgramCompileError("vd.ad.vjp planning_policy must be 'min_memory', 'balanced', or 'min_runtime'")
-        transform = _transform_record(
-            tuple(sorted(wrt_value)),
-            tuple(sorted(outputs_value)),
-            rule_set_id,
-            rule_set_identity,
-            planning_policy,
-        )
-        program = program_expression.args[0]
-    else:
-        program = program_expression
-    stage_functions: dict[str, str] = {}
-    if isinstance(program, ast.Name):
-        try:
-            stage, entry = entry_stage(program)
-        except ProgramCompileError as error:
-            if not any(
-                marker in str(error) for marker in ("is not a function", "must have exactly one entry-stage decorator")
-            ):
-                raise
-        else:
-            if stage != "compute":
-                raise ProgramCompileError("single-entry program_asset program must be a compute Kernel")
-            stage_functions[stage] = entry
-    elif isinstance(program, ast.Call):
-        pass
-    elif isinstance(program, ast.Tuple):
-        if not program.elts:
-            raise ProgramCompileError("graphics program_asset program must contain at least one stage")
-        declared_stages: list[str] = []
-        for item in program.elts:
-            stage, entry = entry_stage(item)
-            if stage == "compute":
-                raise ProgramCompileError("graphics program_asset program cannot contain a compute Kernel")
-            if stage in stage_functions:
-                raise ProgramCompileError(f"graphics program_asset program contains duplicate '{stage}' stage")
-            stage_functions[stage] = entry
-            declared_stages.append(stage)
-        try:
-            validate_graphics_topology(declared_stages)
-        except ValueError as error:
-            message = str(error).replace("graphics pipeline", "graphics program_asset program")
-            raise ProgramCompileError(message) from None
-    else:
-        raise ProgramCompileError("Program Asset program must be a compute Kernel, Pipeline, Module, or VJP expression")
-    # An empty stage set means the program is a Pipeline, Module, or Module VJP, whose stages are not statically known.
-    graphics_stages = bool(stage_functions) and set(stage_functions) != {"compute"}
-    if transform is not None and not graphics_stages:
-        # Graphics VJP is rejected wholesale as a capability, so it is not diagnosed here. The rules that used to live
-        # here contradicted that rejection: one of them demanded a custom rule set that no graphics VJP could use.
-        if "rule_set" in transform:
-            raise ProgramCompileError("compute VJP does not accept graphics custom rules")
-        if not transform["output_cotangents"]:
-            raise ProgramCompileError("compute VJP requires non-empty writable Storage outputs")
+    entries = tuple(_resolved_entry(source_path, entry) for entry in _static_entries(tree, program))
 
-    features = _feature_bindings(tree)
-    variants_node = keywords.get("variants")
-    variants: tuple[tuple[str, ...], ...]
-    if variants_node is None:
-        variants = ((),)
-    elif not isinstance(variants_node, (ast.Tuple, ast.List)):
-        raise ProgramCompileError("program_asset variants must be a tuple or list")
-    else:
-        parsed: list[tuple[str, ...]] = []
-        for row in variants_node.elts:
-            if not isinstance(row, (ast.Tuple, ast.List)):
-                raise ProgramCompileError("each Program Asset variant must be a tuple or list")
-            if any(not isinstance(item, ast.Name) or item.id not in features for item in row.elts):
-                raise ProgramCompileError("Program Asset variants must reference locally declared features")
-            key = tuple(features[item.id] for item in row.elts if isinstance(item, ast.Name))
-            if list(key) != sorted(key) or len(set(key)) != len(key):
-                raise ProgramCompileError(f"Program Asset variant is not canonical: {list(key)}")
-            if key in parsed:
-                raise ProgramCompileError(f"duplicate Program Asset variant: {list(key)}")
-            parsed.append(key)
-        variants = tuple(parsed)
-    if not variants:
-        raise ProgramCompileError("pipeline must include at least one variant")
-    if len(variants) > 16:
-        raise ProgramCompileError(f"pipeline declares {len(variants)}, exceeding variant cap 16")
-
+    variants = _linted_variants(tree, keywords)
     requested = {name for variant in variants for name in variant}
-    unknown_features = requested - set(load_project(source_path).features)
-    if unknown_features:
-        raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(unknown_features)))
-
-    module_id = f"python/{source_path.stem}"
-    manifest = {
-        "type": "python_pipeline_asset",
-        "source": source_path.name,
-        "name": descriptor_name,
-        "id": pipeline_id,
-        "stages": stage_functions,
-        "variants": [list(key) for key in variants],
-    }
-    if transform is not None:
-        manifest["transform"] = transform
-    encoded = canonical_json(manifest)
-    module = ShaderModuleDescriptor(module_id, source_path, source_path, encoded)
-    stages = {stage: ShaderStageReference(module_id, entry) for stage, entry in stage_functions.items()}
-    return ShaderProgramDescriptor(
-        pipeline_id,
-        stages,
-        variants,
-        source_path,
-        encoded,
-        {module_id: module},
-        transform,
-    )
+    undeclared = requested - set(load_project(source_path).features)
+    if undeclared:
+        raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(undeclared)))
+    return ProgramAssetLint(identifier, variants, entries)
 
 
-__all__ = ["parse_python_program_asset", "program_asset_reference"]
+__all__ = ["ProgramAssetLint", "lint_python_program_asset", "program_asset_reference"]
