@@ -512,9 +512,20 @@ definitions, declarations, bindings, tests, and build rules use the new contract
 
    Concretely, this phase must:
 
-   - give the render-pass boundary declared attachment structure — count, dimension, format class, aspect, and
-     sample-count class — instead of a concrete `RenderPass`, keeping extents out of the manifest as §8 requires;
-   - give the vertex-input boundary a declared attribute layout without a vertex count or buffer byte length;
+   - give the render-pass boundary a **derived** attachment structure instead of a concrete `RenderPass`, keeping
+     extents out of the manifest as §8 requires. Do not add authoring surface for this: the structure is already
+     implied by the shaders and the PSO. The fragment stage's `result_type` gives the color attachments and their
+     format class — `Tensor(f32, 4)` for a colour target, `None` for a depth-only pass such as `shadow_fragment` —
+     and the PSO's `depth_stencil` gives depth attachment presence. A declared copy of these facts could only ever
+     drift from the shaders that determine them;
+   - give the vertex-input boundary a **derived** attribute layout, likewise, and likewise with no vertex count or
+     buffer byte length. An `attribute()`-annotated vertex parameter already carries its per-vertex format in the
+     typed signature — `vertices` is `Tensor(f32, 2)` with `interface=['attribute']` — which is the whole layout;
+     the count is an invocation fact and must not appear;
+   - use the frontend's existing unresolved-format convention rather than inventing a second one. A sampled texture
+     parameter already types as `Texture('2d', f32, 'unknown', 'sampled')`, so a format that is not a compile-time
+     fact is already spelled `'unknown'`. The concrete `rgba8_unorm` that attachment capture records today is the
+     outlier, not the precedent;
    - carry `GraphicsPipelineState` into the manifest as compile-time PSO state;
    - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
      `Pipeline` that carries its own JIT `features` inside an asset.
