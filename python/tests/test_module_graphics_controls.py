@@ -767,5 +767,78 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             vd.init(arch=vd.cpu)
 
 
+declared_pipeline = vd.pipeline(
+    managed_vertex,
+    managed_fragment,
+    targets=vd.target_formats(colors={0: vd.rgba16_float}),
+)
+
+
+class DeclaredTargetGraphics(vd.Module):
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        render_pass: vd.RenderPass,
+    ) -> None:
+        declared_pipeline(vertices=vertices, render_pass=render_pass)
+
+
+class UndeclaredTargetGraphics(vd.Module):
+    def forward(
+        self,
+        vertices: vd.TensorView[vd.f32, (3, 2), vd.read],
+        render_pass: vd.RenderPass,
+    ) -> None:
+        managed_pipeline(vertices=vertices, render_pass=render_pass)
+
+
+class DeclaredTargetFormatTests(unittest.TestCase):
+    """A graphics Program can be captured from declared target formats, with no concrete RenderPass.
+
+    This is what makes graphics assets cookable: attachment formats are pipeline state, so they have to be known
+    before any render target exists. The extent stays out of it and is resolved per invocation.
+    """
+
+    @staticmethod
+    def _capture(module: Any, render_pass: Any = None) -> Any:
+        parameter_types: dict[str, Any] = {
+            "vertices": RuntimeParameterDescriptor.storage(vd.f32, (3, 2), "read", True),
+            "render_pass": ProgramControlDescriptor("render_pass", vd.RenderPass, render_pass),
+        }
+        capture, outputs = interpret_module_forward(module, parameter_types)
+        return ProgramTemplate.compile(capture).bind(capture, outputs)
+
+    def test_declared_formats_capture_without_a_render_pass(self) -> None:
+        invocation = self._capture(DeclaredTargetGraphics())
+        operation = invocation.graph.operations[0]
+        self.assertIsInstance(operation, GraphicsCallOp)
+        self.assertEqual(len(operation.attachment_names), 1)
+        self.assertEqual(operation.color_count, 1)
+
+    def test_declared_format_reaches_the_cooked_attachment(self) -> None:
+        from vernon_dsl.program import _parse_module_program
+
+        canonical = ModuleGraphicsControlTests._cook(
+            _parse_module_program(DeclaredTargetGraphics()), "declared/graphics"
+        )
+        operation = canonical["graphs"][0]["nodes"][0]["operation"]
+        self.assertEqual(operation["render_pass"]["colors"][0]["formats"], ["rgba16_float"])
+        images = [
+            storage["descriptor"] for storage in canonical["storages"] if storage["descriptor"].get("tag") == "image"
+        ]
+        self.assertEqual(images[0]["format"], "rgba16_float")
+        self.assertEqual(images[0]["extent"], [0, 0, 1], "the attachment extent is an invocation fact")
+
+    def test_capture_without_declared_formats_or_a_render_pass_is_refused(self) -> None:
+        with self.assertRaisesRegex(TypeError, "requires vd.pipeline\\(\\.\\.\\., targets="):
+            self._capture(UndeclaredTargetGraphics())
+
+    def test_bound_render_pass_must_match_the_declared_formats(self) -> None:
+        color = vd.Texture.zeros(shape=(16, 16))
+        render_pass = vd.RenderPass(vd.RenderTarget.from_attachments(colors={0: color}), ((0, vd.preserve()),))
+        with self.assertRaisesRegex(TypeError, "do not match the formats this pipeline was built for"):
+            self._capture(DeclaredTargetGraphics(), render_pass)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -87,28 +87,102 @@ def _graphics_stage_frontend(pipeline: Any, stage: Any) -> Any:
     return Compiler().compile_request(FrontendCompileRequest(source, function.__name__, tuple(pipeline._features)))
 
 
+# Attachment logical types are built as "2d" below, so a declared attachment has two extent components.
+_ATTACHMENT_RANK = 2
+
+
+@dataclass(frozen=True)
+class _AttachmentDescription:
+    """One attachment's compile-time identity: which slot it fills, in what format, at what rank.
+
+    The extent is deliberately absent. It is an invocation fact, and the attachment resource below carries zeros in
+    its place so that the same cooked Program serves any target size.
+    """
+
+    aspect: str
+    location: int | None
+    format_name: str
+    rank: int
+
+
+def _attachment_format_name(texture: Any) -> str:
+    return getattr(getattr(texture, "format", None), "name", None) or "d32_float"
+
+
+def _render_pass_attachments(prototype: Any) -> tuple[_AttachmentDescription, ...]:
+    """Read the attachment structure off a concrete RenderPass, as a live pipeline or Module invocation can."""
+
+    target = prototype.target
+    descriptions = [
+        _AttachmentDescription("color", location, _attachment_format_name(texture), len(texture.shape))
+        for location, texture in target._color_attachments()
+    ]
+    depth = target._depth_attachment()
+    if depth is not None:
+        descriptions.append(_AttachmentDescription("depth", None, _attachment_format_name(depth), len(depth.shape)))
+    return tuple(descriptions)
+
+
+def _declared_attachments(targets: Any) -> tuple[_AttachmentDescription, ...]:
+    """Read the same structure off vd.pipeline(..., targets=...), which a cooked asset has instead of a RenderPass."""
+
+    descriptions = [
+        _AttachmentDescription("color", location, format.name, _ATTACHMENT_RANK) for location, format in targets.colors
+    ]
+    if targets.depth is not None:
+        descriptions.append(_AttachmentDescription("depth", None, targets.depth.name, _ATTACHMENT_RANK))
+    return tuple(descriptions)
+
+
+def _attachment_slots(descriptions: tuple[_AttachmentDescription, ...]) -> tuple[tuple[str, int | None, str], ...]:
+    return tuple((value.aspect, value.location, value.format_name) for value in descriptions)
+
+
+def _resolve_attachments(pipeline: Any, render_pass: Any) -> tuple[_AttachmentDescription, ...]:
+    """Determine a graphics node's attachment structure from whichever source is authoritative.
+
+    A pipeline that declares target formats is authoritative, and a RenderPass bound to it must agree -- the same
+    compatibility rule a Vulkan pipeline imposes on the render pass it is used in. A pipeline that declares none can
+    still run live by reading the structure off the concrete RenderPass, but it cannot be cooked, because an asset
+    has no RenderPass to read.
+    """
+
+    declared = getattr(pipeline, "_targets", None)
+    prototype = render_pass.prototype if isinstance(render_pass, GraphControlInput) else render_pass
+    if declared is None:
+        if prototype is None:
+            raise TypeError(
+                "cooking a graphics Program requires vd.pipeline(..., targets=vd.target_formats(...)); attachment "
+                "formats are pipeline state, and no RenderPass exists at cook time to read them from"
+            )
+        return _render_pass_attachments(prototype)
+    descriptions = _declared_attachments(declared)
+    if prototype is not None:
+        bound = _render_pass_attachments(prototype)
+        if _attachment_slots(bound) != _attachment_slots(descriptions):
+            raise TypeError(
+                "RenderPass attachments do not match the formats this pipeline was built for: "
+                f"declared {_attachment_slots(descriptions)}, bound {_attachment_slots(bound)}"
+            )
+    return descriptions
+
+
 def _graphics_attachments(
-    render_pass: Any,
+    descriptions: tuple[_AttachmentDescription, ...],
     control: ProgramControlRef,
     cache: dict[AttachmentProjection, GraphControlResource],
 ) -> tuple[tuple[GraphControlResource, ...], int]:
     from .frontend.model import ConcreteType
 
-    prototype = render_pass.prototype if isinstance(render_pass, GraphControlInput) else render_pass
-    if prototype is None:
-        raise TypeError("graphics Module export requires a concrete RenderPass argument")
-    target = prototype.target
-
-    def resource(aspect: str, location: int | None, texture: Any) -> GraphControlResource:
-        projection = AttachmentProjection(control, aspect, location)
+    def resource(description: _AttachmentDescription) -> GraphControlResource:
+        projection = AttachmentProjection(control, description.aspect, description.location)
         existing = cache.get(projection)
         if existing is not None:
             return existing
-        format_name = getattr(getattr(texture, "format", None), "name", None) or "d32_float"
         logical = ConcreteType(
             "texture",
             "Texture",
-            ("2d", ConcreteType("scalar", "f32"), format_name, "read_write"),
+            ("2d", ConcreteType("scalar", "f32"), description.format_name, "read_write"),
         )
         control_name = (
             str(control.identifier)
@@ -116,22 +190,19 @@ def _graphics_attachments(
             else f"{control.source.value}.{control.identifier}"
         )
         result = GraphControlResource(
-            f"{control_name}.{aspect}.{location if location is not None else 0}",
-            tuple(0 for _ in texture.shape),
+            f"{control_name}.{description.aspect}.{description.location if description.location is not None else 0}",
+            tuple(0 for _ in range(description.rank)),
             logical,
             projection,
         )
         cache[projection] = result
         return result
 
-    colors = tuple(target._color_attachments())
-    attachments = [resource("color", location, texture) for location, texture in colors]
-    depth = target._depth_attachment()
-    if depth is not None:
-        attachments.append(resource("depth", None, depth))
-    if not attachments:
+    if not descriptions:
         raise ValueError("graphics Program requires at least one color or depth attachment")
-    return tuple(attachments), len(colors)
+    return tuple(resource(description) for description in descriptions), sum(
+        1 for description in descriptions if description.aspect == "color"
+    )
 
 
 def flatten_program_outputs(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -513,7 +584,7 @@ class ProgramTemplate:
                         graphics_control_slots[ref] = slot
                     control_slots[kind] = slot
                 attachments, color_count = _graphics_attachments(
-                    captured.render_pass,
+                    _resolve_attachments(captured.pipeline, captured.render_pass),
                     captured.render_pass_ref,
                     graphics_attachment_cache,
                 )
