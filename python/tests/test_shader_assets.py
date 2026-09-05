@@ -539,6 +539,75 @@ class BarePipelineAssetCookTests(unittest.TestCase):
             with self.assertRaisesRegex(ProgramCompileError, "must not carry its own features"):
                 self._cook(directory, "featured", extra="features=('SKIN',), ")
 
+    def test_a_graphics_vjp_asset_is_refused_as_an_unsupported_capability(self) -> None:
+        """One diagnostic, not the contradictory demand for a rule set that no graphics VJP could ever use."""
+
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "graphics_vjp.py"
+            source.write_text(
+                """
+from typing import Annotated
+
+import vernon_dsl as vd
+
+
+@vd.vertex
+def vertex_main(
+    vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vertices, 0.0, 1.0])
+
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 1.0, 1.0, 1.0])
+
+
+def rasterization() -> None:
+    return
+
+
+def visibility() -> None:
+    return
+
+
+def depth() -> None:
+    return
+
+
+def blend() -> None:
+    return
+
+
+def texture() -> None:
+    return
+
+
+rules = vd.ad.rule_set(
+    id="render/v1",
+    rasterization=rasterization,
+    visibility=visibility,
+    depth=depth,
+    blend=blend,
+    texture=texture,
+)
+
+asset = vd.program_asset(
+    id="shaders/graphics_vjp",
+    program=vd.ad.vjp((vertex_main, fragment_main), wrt=("vertices",), rules=rules),
+)
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ProgramCompileError, "PROGRAM_GRAPHICS_VJP_UNSUPPORTED"):
+                cook_program_asset(
+                    program_asset=f"{source}:asset",
+                    output=Path(directory) / "out",
+                    target="vulkan",
+                )
+
 
 class ShaderAssetCookTests(unittest.TestCase):
     def test_wasm_relocatable_object_preserves_compound_suffix(self) -> None:

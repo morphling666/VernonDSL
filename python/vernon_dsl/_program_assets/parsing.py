@@ -270,7 +270,6 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
     else:
         program = program_expression
     stage_functions: dict[str, str] = {}
-    program_kind = "stages"
     if isinstance(program, ast.Name):
         try:
             stage, entry = entry_stage(program)
@@ -279,13 +278,12 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
                 marker in str(error) for marker in ("is not a function", "must have exactly one entry-stage decorator")
             ):
                 raise
-            program_kind = "module"
         else:
             if stage != "compute":
                 raise ProgramCompileError("single-entry program_asset program must be a compute Kernel")
             stage_functions[stage] = entry
     elif isinstance(program, ast.Call):
-        program_kind = "module"
+        pass
     elif isinstance(program, ast.Tuple):
         if not program.elts:
             raise ProgramCompileError("graphics program_asset program must contain at least one stage")
@@ -305,15 +303,14 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
             raise ProgramCompileError(message) from None
     else:
         raise ProgramCompileError("Program Asset program must be a compute Kernel, Pipeline, Module, or VJP expression")
-    if transform is not None:
-        graphics = program_kind == "stages" and set(stage_functions) != {"compute"}
-        if graphics and "rule_set" not in transform:
-            raise ProgramCompileError("graphics VJP requires a named custom rule set")
-        if not graphics and "rule_set" in transform:
+    # An empty stage set means the program is a Pipeline, Module, or Module VJP, whose stages are not statically known.
+    graphics_stages = bool(stage_functions) and set(stage_functions) != {"compute"}
+    if transform is not None and not graphics_stages:
+        # Graphics VJP is rejected wholesale as a capability, so it is not diagnosed here. The rules that used to live
+        # here contradicted that rejection: one of them demanded a custom rule set that no graphics VJP could use.
+        if "rule_set" in transform:
             raise ProgramCompileError("compute VJP does not accept graphics custom rules")
-        if graphics and transform["output_cotangents"]:
-            raise ProgramCompileError("graphics VJP does not accept compute Storage outputs")
-        if not graphics and not transform["output_cotangents"]:
+        if not transform["output_cotangents"]:
             raise ProgramCompileError("compute VJP requires non-empty writable Storage outputs")
 
     features = _feature_bindings(tree)
@@ -353,7 +350,6 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
         "source": source_path.name,
         "name": descriptor_name,
         "id": pipeline_id,
-        "program_kind": program_kind,
         "stages": stage_functions,
         "variants": [list(key) for key in variants],
     }
@@ -370,7 +366,6 @@ def parse_python_program_asset(source: str | Path, descriptor_name: str) -> Shad
         encoded,
         {module_id: module},
         transform,
-        program_kind,
     )
 
 
