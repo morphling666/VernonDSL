@@ -1579,6 +1579,8 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
                         },
                         pipeline.context, graphicsContext->plan, graphicsError))
                     return fail(pipeline.context, std::move(graphicsError));
+                if (!checkProgramGraphicsAttachmentSignature(graphics, graphicsContext->plan, graphicsError))
+                    return fail(pipeline.context, std::move(graphicsError));
                 if (!graphicsScopes.canAppend(graphicsContext->plan)) {
                     graphicsBatch.reset();
                     graphicsScopes.reset();

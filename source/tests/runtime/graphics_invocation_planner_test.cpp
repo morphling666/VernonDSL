@@ -1,6 +1,7 @@
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/graphics_scope_planner.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime/program_graphics_executor.h"
 
 #include <gtest/gtest.h>
 
@@ -486,6 +487,95 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     EXPECT_EQ(planned.topology, VERNON_TOPOLOGY_LINE_LIST);
     EXPECT_EQ(planned.resolution[0], 12.0f);
     EXPECT_EQ(planned.resolution[1], 13.0f);
+}
+
+program::GraphicsOperation operationForFormats(const std::vector<VernonTextureFormat> &colors,
+                                               std::optional<VernonTextureFormat> depth = std::nullopt) {
+    program::GraphicsOperation graphics;
+    for (size_t location = 0; location < colors.size(); ++location) {
+        program::GraphicsAttachmentSignature signature;
+        signature.location = static_cast<uint32_t>(location);
+        signature.formats = {colors[location]};
+        signature.sampleCounts = {1};
+        signature.aspects = VERNON_IMAGE_ASPECT_COLOR;
+        graphics.colorAttachments.push_back(std::move(signature));
+    }
+    if (depth) {
+        program::GraphicsAttachmentSignature signature;
+        signature.formats = {*depth};
+        signature.sampleCounts = {1};
+        signature.aspects = VERNON_IMAGE_ASPECT_DEPTH;
+        graphics.depthStencilAttachment = std::move(signature);
+    }
+    return graphics;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, AcceptsABoundTargetInTheCompiledFormatSet) {
+    const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA16_FLOAT});
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA16_FLOAT};
+    std::string error;
+    EXPECT_TRUE(checkProgramGraphicsAttachmentSignature(graphics, plan, error)) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, AcceptsAnyFormatTheSignatureDeclaresCompatible) {
+    program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA8_UNORM});
+    graphics.colorAttachments[0].formats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA8_SRGB};
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_SRGB};
+    std::string error;
+    EXPECT_TRUE(checkProgramGraphicsAttachmentSignature(graphics, plan, error)) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, RejectsAColorFormatTheProgramWasNotCompiledFor) {
+    const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA16_FLOAT});
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
+    std::string error;
+    EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
+    EXPECT_NE(error.find("rgba8_unorm"), std::string::npos) << error;
+    EXPECT_NE(error.find("rgba16_float"), std::string::npos) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, RejectsAMismatchedFormatOnALaterAttachment) {
+    const program::GraphicsOperation graphics =
+        operationForFormats({VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA16_FLOAT});
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_R32_FLOAT};
+    std::string error;
+    EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
+    EXPECT_NE(error.find("r32_float"), std::string::npos) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, RejectsAMismatchedDepthFormat) {
+    const program::GraphicsOperation graphics =
+        operationForFormats({VERNON_TEXTURE_RGBA8_UNORM}, VERNON_TEXTURE_D32_FLOAT);
+    const VernonDepthAttachment depth{};
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
+    plan.depthAttachment = &depth;
+    plan.depthFormat = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    std::string error;
+    EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
+    EXPECT_NE(error.find("depth"), std::string::npos) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, RejectsAMissingDepthAttachment) {
+    const program::GraphicsOperation graphics =
+        operationForFormats({VERNON_TEXTURE_RGBA8_UNORM}, VERNON_TEXTURE_D32_FLOAT);
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM};
+    std::string error;
+    EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
+    EXPECT_NE(error.find("depth-stencil"), std::string::npos) << error;
+}
+
+TEST(ProgramGraphicsAttachmentSignature, RejectsABoundColorAttachmentCountMismatch) {
+    const program::GraphicsOperation graphics = operationForFormats({VERNON_TEXTURE_RGBA8_UNORM});
+    PlannedGraphicsInvocation plan;
+    plan.attachmentFormats = {VERNON_TEXTURE_RGBA8_UNORM, VERNON_TEXTURE_RGBA8_UNORM};
+    std::string error;
+    EXPECT_FALSE(checkProgramGraphicsAttachmentSignature(graphics, plan, error));
 }
 
 } // namespace
