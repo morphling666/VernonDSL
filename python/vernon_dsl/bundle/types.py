@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, TypeAlias
 
 from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+
+
+def canonical_json(value: Any) -> str:
+    """The one encoding every identity, hash, and manifest in the bundle layer is written with.
+
+    It lives here, at the bottom of the layer, because the types that hash themselves and the deployment that
+    serializes them both need it. Keeping it in the serializer forced both to reach sideways with a function-local
+    import to dodge a cycle.
+    """
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 class ProgramCompileError(ValueError):
@@ -221,8 +233,6 @@ class CompiledStage:
 
     @property
     def id(self) -> str:
-        from .serialize import canonical_json
-
         return hashlib.sha256(canonical_json(self.identity).encode("utf-8")).hexdigest()
 
     def logical_record(self) -> dict[str, Any]:

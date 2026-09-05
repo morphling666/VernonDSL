@@ -22,6 +22,7 @@ from vernon_dsl.bundle import (
     CpuTargetOptions,
     build_bundle_plan,
     build_program_bundle_plan,
+    canonical_json,
     make_target_options,
 )
 from vernon_dsl.module_graph import load_project, resolve_project_entry
@@ -543,6 +544,58 @@ class BarePipelineAssetCookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ProgramCompileError, "must not carry its own features"):
                 self._cook(directory, "featured", extra="features=('SKIN',), ")
+
+    def test_every_variant_of_a_canonical_asset_is_deployed(self) -> None:
+        """Canonical deployment used to refuse more than one variant, and its caller split the plan to get around it."""
+
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "multi.py"
+            source.write_text(
+                """
+from typing import Annotated
+
+import vernon_dsl as vd
+
+TINTED = vd.feature("TINTED")
+
+
+@vd.vertex
+def vertex_main(
+    vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vertices, 0.0, 1.0])
+
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    if TINTED:
+        return vd.Vector([1.0, 0.0, 0.0, 1.0])
+    return vd.Vector([1.0, 1.0, 1.0, 1.0])
+
+
+asset = vd.program_asset(
+    id="shaders/multi",
+    program=vd.pipeline(
+        vertex_main,
+        fragment_main,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((), (TINTED,)),
+)
+""",
+                encoding="utf-8",
+            )
+            manifest = cook_program_asset(
+                program_asset=f"{source}:asset",
+                output=Path(directory) / "out",
+                target="vulkan",
+            )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual([variant["key"] for variant in document["variants"]], [[], ["TINTED"]])
+        deployed = [canonical_json(variant["artifact_system"]["blobs"]) for variant in document["variants"]]
+        self.assertEqual(len(set(deployed)), 2, "each variant deploys the binaries compiled for its own feature key")
 
     def test_a_graphics_vjp_asset_is_refused_as_an_unsupported_capability(self) -> None:
         """One diagnostic, not the contradictory demand for a rule set that no graphics VJP could ever use."""
@@ -1176,13 +1229,13 @@ asset = vd.program_asset(id="module/square", program=Square())
 
             from vernon_dsl._program_assets.artifact_io import write_external_artifact
             from vernon_dsl._program_assets.cooking import (
-                _canonical_deployment,
                 _canonical_path_descriptor,
                 _compile_module_bundle_plan,
                 _load_program_asset_declaration,
                 _native_module,
                 _native_target,
             )
+            from vernon_dsl.bundle.deployment import deploy_program_variant
 
             native = _native_module()
             declaration = _load_program_asset_declaration(source, "asset")
@@ -1211,7 +1264,11 @@ asset = vd.program_asset(id="module/square", program=Square())
                         )
                         for stage in plan.stages
                     }
-                    canonical_program, artifact_system, stage_bindings = _canonical_deployment(plan, descriptors)
+                    canonical_program, artifact_system, stage_bindings = deploy_program_variant(
+                        plan,
+                        plan.variants[0],
+                        descriptors,
+                    )
                     host = None
                     if target_name == "cpu":
                         runtime = native.Runtime(native.RuntimeBackend.CPU)

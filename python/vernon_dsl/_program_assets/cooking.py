@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import hashlib
 import importlib.util
 import json
@@ -27,7 +26,6 @@ from ..bundle import (
     materialize_bundle,
     parse_reflection_json,
 )
-from ..bundle.requirements import runtime_requirements
 from ..compiler import Compiler, FrontendCompileRequest, compile_file
 from ..frontend.structured_vjp import (
     build_structured_vjp,
@@ -552,108 +550,6 @@ def _materialize_plan(plan: BundlePlan, output_path: Path, target_name: str) -> 
         newline="\n",
     )
     return manifest
-
-
-def _canonical_deployment(
-    plan: BundlePlan,
-    artifact_descriptors: Mapping[str, Mapping[str, Any]],
-) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, str]]:
-    if len(plan.variants) != 1:
-        raise ProgramCompileError("canonical deployment currently requires exactly one variant")
-    variant = plan.variants[0]
-    if variant.canonical_program is None:
-        raise ProgramCompileError("canonical deployment has no Program")
-    stages = {stage.id: stage for stage in plan.stages}
-    canonical_stage_rows = variant.canonical_program.get("stages")
-    if not isinstance(canonical_stage_rows, Mapping):
-        raise ProgramCompileError("canonical deployment has no logical stages")
-    blobs: dict[str, Any] = {}
-    artifacts: dict[str, Any] = {}
-    stage_bindings: dict[str, str] = {}
-    for logical_stage, implementation_stage in variant.program.items():
-        stage = stages.get(implementation_stage)
-        descriptor = artifact_descriptors.get(implementation_stage)
-        contracts = stage.metadata.get("program_contracts") if stage is not None else None
-        contract = contracts.get(logical_stage) if isinstance(contracts, Mapping) else None
-        canonical_stage = canonical_stage_rows.get(logical_stage)
-        if not isinstance(descriptor, Mapping) or not isinstance(contract, Mapping):
-            raise ProgramCompileError(f"canonical stage {logical_stage} is incomplete")
-        if not isinstance(canonical_stage, Mapping):
-            raise ProgramCompileError(f"canonical Program has no logical stage {logical_stage!r}")
-        path = descriptor.get("path")
-        digest = descriptor.get("sha256")
-        byte_length = descriptor.get("size")
-        symbol = stage.metadata.get("symbol")
-        entry_point = symbol if isinstance(symbol, str) else stage.entry
-        if (
-            not isinstance(path, str)
-            or not isinstance(digest, str)
-            or not isinstance(byte_length, int)
-            or not isinstance(entry_point, str)
-        ):
-            raise ProgramCompileError(f"canonical stage {logical_stage} has invalid artifact metadata")
-        blobs[digest] = {
-            "byte_length": byte_length,
-            "sha256": digest,
-            "location": {"tag": "external", "uri": path},
-        }
-        graphics_stages = stage.metadata.get("graphics_compiled_stages")
-        requirement_stages = tuple(graphics_stages) if isinstance(graphics_stages, tuple) else (stage,)
-        requirements = runtime_requirements(plan.target.target, requirement_stages)
-        if requirements is None:
-            raise ProgramCompileError(f"canonical stage {logical_stage} has no runtime requirements")
-        requirements = dict(requirements)
-        requirements.pop("compute_workgroup_size", None)
-        reflection = contract.get("reflection")
-        if not isinstance(reflection, Mapping):
-            raise ProgramCompileError(f"canonical stage {logical_stage} has no portable reflection")
-        contract_hash = hashlib.sha256(canonical_json(dict(contract)).encode("utf-8")).hexdigest()
-        if canonical_stage.get("contract_hash") != contract_hash:
-            raise ProgramCompileError(f"canonical stage {logical_stage} contract hash disagrees with its Program")
-        graphics_modules = stage.metadata.get("graphics_modules")
-        operation = "graphics" if isinstance(graphics_modules, tuple) else "compute"
-        if isinstance(graphics_modules, tuple):
-            modules = [
-                {
-                    **dict(module),
-                    "blob": digest,
-                }
-                for module in graphics_modules
-            ]
-        else:
-            modules = [
-                {
-                    "role": "compute",
-                    "format": stage.artifact.format,
-                    "entry_point": entry_point,
-                    "blob": digest,
-                    "offset": 0,
-                    "byte_length": byte_length,
-                    "sha256": digest,
-                }
-            ]
-        artifacts[logical_stage] = {
-            "tag": "stage",
-            "operation": operation,
-            "contract_hash": contract_hash,
-            "runtime_requirements": requirements,
-            "modules": modules,
-            "reflection": copy.deepcopy(dict(reflection)),
-        }
-        implementations = stage.metadata.get("program_implementations")
-        implementation = implementations.get(logical_stage) if isinstance(implementations, Mapping) else None
-        if isinstance(implementation, Mapping):
-            artifacts[logical_stage]["implementation"] = copy.deepcopy(dict(implementation))
-        stage_bindings[logical_stage] = logical_stage
-    return (
-        copy.deepcopy(dict(variant.canonical_program)),
-        {
-            "target": copy.deepcopy(plan.target.spec),
-            "blobs": blobs,
-            "artifacts": artifacts,
-        },
-        stage_bindings,
-    )
 
 
 def _merge_variant_plans(pipeline: Any, variant_plans: list[BundlePlan]) -> BundlePlan:

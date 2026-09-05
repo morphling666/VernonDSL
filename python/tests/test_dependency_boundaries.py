@@ -78,6 +78,21 @@ class DependencyBoundaryTests(unittest.TestCase):
             "vernon_dsl._program_assets.cooking",
         )
 
+    def test_deployment_does_not_reach_up_into_the_cook_orchestrator(self) -> None:
+        """The bundle layer builds the deployed form; it must not ask the layer above it how.
+
+        serialize.py used to reach up with a function-local import of a private cooking symbol, which is what
+        inverted layering looks like when it is hidden from the import block.
+        """
+
+        for path in sorted((ROOT / "bundle").glob("*.py")):
+            with self.subTest(module=path.name):
+                imports = imported_modules(path)
+                self.assertFalse(
+                    any("_program_assets" in module or "_runtime" in module for module in imports),
+                    imports,
+                )
+
     def test_frontend_does_not_import_runtime(self) -> None:
         for path in sorted((ROOT / "frontend").glob("*.py")):
             with self.subTest(path=path.name):

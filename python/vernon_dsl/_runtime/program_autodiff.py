@@ -10,11 +10,11 @@ import numpy as np
 
 from .._program_assets.artifact_io import write_external_artifact
 from .._program_assets.cooking import (
-    _canonical_deployment,
     _compile_program_bundle_plan,
     _native_target,
 )
 from ..bundle import canonical_json, make_target_options
+from ..bundle.deployment import deploy_program_variant
 from ..storage import TensorStorage, TensorView
 from . import session as state
 from .autodiff import _pipeline_derivative_groups
@@ -504,7 +504,11 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
         )
         for stage in plan.stages
     }
-    canonical_program, artifact_system, stage_bindings = _canonical_deployment(plan, descriptors)
+    canonical_program, artifact_system, stage_bindings = deploy_program_variant(
+        plan,
+        plan.variants[0],
+        descriptors,
+    )
     return _ProgramDeployment(
         directory,
         canonical_json(dict(canonical_program)).encode(),
