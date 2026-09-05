@@ -435,11 +435,11 @@ def _compile_program_bundle_plan(
     )
 
 
-def _load_pipeline_asset_declaration(source: Path, descriptor_name: str) -> Any:
-    module_name = f"_vernon_pipeline_asset_{hashlib.sha256(str(source).encode()).hexdigest()[:20]}"
+def _load_program_asset_declaration(source: Path, descriptor_name: str) -> Any:
+    module_name = f"_vernon_program_asset_{hashlib.sha256(str(source).encode()).hexdigest()[:20]}"
     specification = importlib.util.spec_from_file_location(module_name, source)
     if specification is None or specification.loader is None:
-        raise ProgramCompileError(f"cannot load pipeline asset source {source}")
+        raise ProgramCompileError(f"cannot load Program Asset source {source}")
     module = importlib.util.module_from_spec(specification)
     inserted_path = str(source.parent)
     sys.modules[module_name] = module
@@ -447,7 +447,7 @@ def _load_pipeline_asset_declaration(source: Path, descriptor_name: str) -> Any:
     try:
         specification.loader.exec_module(module)
     except Exception as error:
-        raise ProgramCompileError(f"cannot evaluate pipeline asset source {source}: {error}") from error
+        raise ProgramCompileError(f"cannot evaluate Program Asset source {source}: {error}") from error
     finally:
         sys.path.pop(0)
         sys.modules.pop(module_name, None)
@@ -455,7 +455,7 @@ def _load_pipeline_asset_declaration(source: Path, descriptor_name: str) -> Any:
     from .declaration import ProgramAssetDeclaration
 
     if not isinstance(declaration, ProgramAssetDeclaration):
-        raise ProgramCompileError(f"pipeline asset declaration '{descriptor_name}' did not evaluate canonically")
+        raise ProgramCompileError(f"Program Asset declaration '{descriptor_name}' did not evaluate canonically")
     return declaration
 
 
@@ -588,6 +588,54 @@ def _canonical_deployment(
     )
 
 
+def _merge_variant_plans(pipeline: Any, variant_plans: list[BundlePlan]) -> BundlePlan:
+    targets = {canonical_json(plan.target.spec): plan.target for plan in variant_plans}
+    if len(targets) != 1:
+        raise ProgramCompileError("compiler returned inconsistent target options across Program variants")
+    stages = {stage.id: stage for plan in variant_plans for stage in plan.stages}
+    return BundlePlan(
+        pipeline.id,
+        next(iter(targets.values())),
+        tuple(sorted({feature for variant in pipeline.variants for feature in variant})),
+        tuple(variant for variant_plan in variant_plans for variant in variant_plan.variants),
+        tuple(stages[key] for key in sorted(stages)),
+    )
+
+
+def _compile_pipeline_bundle_plan(
+    authored: Any,
+    pipeline: Any,
+    target: TargetOptions,
+    native: Any,
+    native_target: Any,
+    retained_programs: list[tuple[CompiledStage, Any]] | None = None,
+) -> BundlePlan:
+    from ..program import _parse_pipeline_program
+
+    if authored._features:
+        raise ProgramCompileError(
+            "a Program Asset drives features from its variants, so a cooked vd.pipeline(...) must not carry its own "
+            "features="
+        )
+    compiler = native.Compiler()
+    # Unlike a Module, a pipeline's stages are compiled by the frontend during capture, so each variant's feature key
+    # has to be captured separately rather than shared across variants.
+    variant_plans = [
+        _compile_program_bundle_plan(
+            _parse_pipeline_program(authored, variant),
+            pipeline_id=pipeline.id,
+            variant=variant,
+            target=target,
+            compiler=compiler,
+            native=native,
+            native_target=native_target,
+            retained_programs=retained_programs,
+        )
+        for variant in pipeline.variants
+    ]
+    return _merge_variant_plans(pipeline, variant_plans)
+
+
 def _compile_module_bundle_plan(
     declaration: Any,
     pipeline: Any,
@@ -602,7 +650,7 @@ def _compile_module_bundle_plan(
     expression = declaration.program
     module = expression.module if isinstance(expression, ModuleVjpExpression) else expression
     if not isinstance(module, Module):
-        raise ProgramCompileError("pipeline asset declared a host Program that is not a Vernon Module")
+        raise ProgramCompileError("Program Asset declared a host Program that is not a Vernon Module")
     parsed = _parse_module_program(
         module,
         vjp_wrt=expression.wrt if isinstance(expression, ModuleVjpExpression) else None,
@@ -625,17 +673,7 @@ def _compile_module_bundle_plan(
         )
         for variant in pipeline.variants
     ]
-    targets = {canonical_json(plan.target.spec): plan.target for plan in variant_plans}
-    if len(targets) != 1:
-        raise ProgramCompileError("compiler returned inconsistent target options across Program variants")
-    stages = {stage.id: stage for plan in variant_plans for stage in plan.stages}
-    return BundlePlan(
-        pipeline.id,
-        next(iter(targets.values())),
-        tuple(sorted({feature for variant in pipeline.variants for feature in variant})),
-        tuple(variant for variant_plan in variant_plans for variant in variant_plan.variants),
-        tuple(stages[key] for key in sorted(stages)),
-    )
+    return _merge_variant_plans(pipeline, variant_plans)
 
 
 def cook_program_asset(
@@ -644,16 +682,28 @@ def cook_program_asset(
     output: str | Path,
     target: TargetOptions | str | None = None,
 ) -> Path:
+    from .._runtime.pipeline import Pipeline
+    from ..ad import ProgramExpression
+    from ..module import Module
+    from ..program import ModuleVjpExpression
+
     source, descriptor_name = program_asset_reference(program_asset)
     pipeline = parse_python_program_asset(source, descriptor_name)
+    declaration = _load_program_asset_declaration(source, descriptor_name)
+    # The one place a Program Asset's form is discriminated, on the authored objects rather than on their AST shape.
+    program = declaration.program
+    primal = program.program if isinstance(program, ProgramExpression) else program
+    graphics_pipeline = isinstance(primal, Pipeline)
+    host_module = isinstance(primal, Module) or isinstance(program, ModuleVjpExpression)
     if target is None:
         target = OpenGLTargetOptions()
     elif isinstance(target, str):
         target = make_target_options(target)
     target_name = target.target
-    if pipeline.transform is not None and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
+    graphics_stages = not graphics_pipeline and not host_module and set(pipeline.stages) != {"compute"}
+    if pipeline.transform is not None and graphics_stages:
         raise ProgramCompileError(_capability_diagnostic("graphics_vjp"))
-    if target_name == "cpu" and pipeline.program_kind == "stages" and set(pipeline.stages) != {"compute"}:
+    if target_name == "cpu" and graphics_stages:
         raise ProgramCompileError("CPU pipeline bundles support one compute stage and no graphics or barrier steps")
     for stage in pipeline.stages:
         try:
@@ -682,8 +732,16 @@ def cook_program_asset(
     differentiated_stages: dict[str, CompiledStage] = {}
     compile_cache: dict[tuple[str, str, str, str], CompiledStage] = {}
     compiler = native.Compiler()
-    if pipeline.program_kind == "module":
-        declaration = _load_pipeline_asset_declaration(source, descriptor_name)
+    if graphics_pipeline:
+        plan = _compile_pipeline_bundle_plan(
+            primal,
+            pipeline,
+            resolved_target,
+            native,
+            native_target,
+        )
+        return _materialize_plan(plan, output_path, target_name)
+    if host_module:
         plan = _compile_module_bundle_plan(
             declaration,
             pipeline,

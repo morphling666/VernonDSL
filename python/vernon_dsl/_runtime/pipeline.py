@@ -86,23 +86,31 @@ class Pipeline:
         self._specializations: dict[str, _CompiledPipeline] = {}
         self.compile_count = 0
 
-    def _frontends(self) -> tuple[Any, ...]:
+    def _frontends(self, features: tuple[str, ...] | None = None) -> tuple[Any, ...]:
         compiler = Compiler()
+        selected = self._features if features is None else features
         result = []
         for stage in self._stages:
             function = stage.function
             source = Path(inspect.getsourcefile(function) or "").resolve()
-            result.append(compiler.compile_request(FrontendCompileRequest(source, function.__name__, self._features)))
+            result.append(compiler.compile_request(FrontendCompileRequest(source, function.__name__, selected)))
         return tuple(result)
 
     def _parameter_types(
         self,
-        arguments: Mapping[str, Any],
+        arguments: Mapping[str, Any] | None,
         frontends: tuple[Any, ...],
-        render_pass: RenderPass,
+        render_pass: RenderPass | None,
         draw: DrawCommand | None,
         dynamic_state: DynamicState | None,
     ) -> dict[str, Any]:
+        """Type this pipeline's parameters from stage reflection, with or without invocation values.
+
+        Cooking has no values and no render target, and passes None for all four. Everything the manifest needs comes
+        from the reflected signature and the annotations; the values only let a live call check itself and resolve
+        the one case reflection leaves open, an attribute parameter fed something other than a vertex buffer.
+        """
+
         reflected: dict[str, tuple[Any, Any]] = {}
         annotations: dict[str, Any] = {}
         for stage, frontend in zip(self._stages, frontends, strict=True):
@@ -130,7 +138,7 @@ class Pipeline:
                     if previous_annotation is not None and previous_annotation != annotation:
                         raise TypeError(f"graphics stages disagree on annotation for {parameter.name!r}")
                     annotations[parameter.name] = annotation
-        if set(reflected) != set(arguments):
+        if arguments is not None and set(reflected) != set(arguments):
             missing = set(reflected) - set(arguments)
             unexpected = set(arguments) - set(reflected)
             if missing:
@@ -138,14 +146,17 @@ class Pipeline:
             raise TypeError(f"unexpected pipeline argument(s): {', '.join(sorted(unexpected))}")
 
         result: dict[str, Any] = {}
-        for name, value in arguments.items():
+        for name in reflected if arguments is None else arguments:
+            value = None if arguments is None else arguments[name]
             parameter, stage = reflected[name]
             interface = {item.kind for item in parameter.interface}
             is_storage = parameter.type.kind == "tensor_view" or (
-                stage.kind == "vertex" and "attribute" in interface and isinstance(value, (TensorStorage, TensorView))
+                stage.kind == "vertex"
+                and "attribute" in interface
+                and (arguments is None or isinstance(value, (TensorStorage, TensorView)))
             )
             if is_storage:
-                if not isinstance(value, (TensorStorage, TensorView)):
+                if arguments is not None and not isinstance(value, (TensorStorage, TensorView)):
                     raise TypeError(f"graphics storage argument {name!r} requires TensorStorage or TensorView")
                 annotation = annotations.get(name)
                 if parameter.type.kind == "tensor_view":

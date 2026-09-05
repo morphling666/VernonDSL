@@ -988,6 +988,32 @@ def _parse_module_program(
     )
 
 
+def _parse_pipeline_program(pipeline: Any, features: tuple[str, ...] = ()) -> Any:
+    """Capture a bare vd.pipeline(...) as a one-node Program, the way a Module calling one is captured.
+
+    The render pass, draw, and dynamic state stay symbolic controls with no prototype, so nothing about a particular
+    invocation reaches the manifest. Attachment formats come from the pipeline's declared targets instead.
+    """
+
+    frontends = pipeline._frontends(tuple(features))
+    parameter_types = pipeline._parameter_types(None, frontends, None, None, None)
+    arguments = tuple(name for name in parameter_types if not name.startswith("__"))
+    _, _, parsed = _one_node_program(
+        pipeline,
+        parameter_types,
+        lambda capture, inputs: capture.capture_graphics(
+            pipeline,
+            {name: inputs[name] for name in arguments},
+            inputs["__render_pass"],
+            inputs["__draw"],
+            inputs["__dynamic_state"],
+            frontends=frontends,
+        ),
+        output_names=None,
+    )
+    return parsed
+
+
 @dataclass(frozen=True)
 class _AllocationSpec:
     dtype: Any

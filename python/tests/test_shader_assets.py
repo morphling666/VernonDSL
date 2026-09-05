@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 
 import numpy as np
@@ -444,6 +444,100 @@ class GraphicsTargetFormatTests(unittest.TestCase):
             out[0] = 1.0
 
         self.assertEqual(vd.program_asset(id="compute", program=compute).id, "compute")
+
+
+_BARE_PIPELINE_ASSET = """
+from typing import Annotated
+
+import vernon_dsl as vd
+
+
+@vd.vertex
+def vertex_main(
+    vertices: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vertices, 0.0, 1.0])
+
+
+@vd.fragment
+def fragment_main() -> vd.Vector[vd.f32, 4]:
+    return vd.Vector([1.0, 0.5, 0.25, 1.0])
+
+
+asset = vd.program_asset(
+    id="shaders/bare",
+    program=vd.pipeline(
+        vertex_main,
+        fragment_main,
+        {extra}targets=vd.target_formats(colors={{0: vd.{format}}}),
+    ),
+)
+"""
+
+
+class BarePipelineAssetCookTests(unittest.TestCase):
+    """A bare vd.pipeline(...) is a cookable asset form, which it previously was not.
+
+    It parses as an ast.Call, so the old AST kind guess routed it to the Module branch and cooking failed with
+    'declared a host Program that is not a Vernon Module'. Dispatch now happens on the evaluated declaration.
+    """
+
+    def _cook(self, directory: str, name: str, *, format: str = "rgba16_float", extra: str = "") -> dict[str, Any]:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        source = Path(directory) / f"{name}.py"
+        source.write_text(_BARE_PIPELINE_ASSET.format(format=format, extra=extra), encoding="utf-8")
+        manifest = cook_program_asset(
+            program_asset=f"{source}:asset",
+            output=Path(directory) / name,
+            target="vulkan",
+        )
+        return cast(dict[str, Any], json.loads(manifest.read_text(encoding="utf-8")))
+
+    def test_a_bare_pipeline_asset_cooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            document = self._cook(directory, "bare")
+        self.assertEqual(document["id"], "shaders/bare")
+        self.assertEqual([variant["key"] for variant in document["variants"]], [[]])
+        program = document["variants"][0]["program"]
+        self.assertEqual(len(program["graphs"][0]["nodes"]), 1)
+
+    def test_the_declared_format_is_what_the_cooked_attachment_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            half = self._cook(directory, "half", format="rgba16_float")
+            byte = self._cook(directory, "byte", format="rgba8_unorm")
+
+        def attachment(document: dict[str, Any]) -> tuple[Any, Any]:
+            program = document["variants"][0]["program"]
+            colors = program["graphs"][0]["nodes"][0]["operation"]["render_pass"]["colors"]
+            images = [
+                storage["descriptor"] for storage in program["storages"] if storage["descriptor"].get("tag") == "image"
+            ]
+            return colors[0]["formats"], images[0]
+
+        half_formats, half_image = attachment(half)
+        byte_formats, byte_image = attachment(byte)
+        self.assertEqual(half_formats, ["rgba16_float"])
+        self.assertEqual(byte_formats, ["rgba8_unorm"])
+        self.assertEqual(half_image["format"], "rgba16_float")
+        self.assertEqual(byte_image["format"], "rgba8_unorm")
+
+    def test_no_invocation_fact_reaches_the_cooked_graphics_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            program = self._cook(directory, "symbolic")["variants"][0]["program"]
+        storages = {
+            storage["descriptor"]["tag"]: storage["descriptor"]
+            for storage in program["storages"]
+            if "tag" in storage["descriptor"]
+        }
+        self.assertEqual(storages["image"]["extent"], [0, 0, 1], "the attachment extent is chosen per invocation")
+        self.assertEqual(storages["buffer"]["byte_length"], 0, "the vertex count is chosen per invocation")
+        self.assertIn("vertex", storages["buffer"]["usage"])
+
+    def test_a_cooked_pipeline_may_not_carry_its_own_features(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ProgramCompileError, "must not carry its own features"):
+                self._cook(directory, "featured", extra="features=('SKIN',), ")
 
 
 class ShaderAssetCookTests(unittest.TestCase):
@@ -1010,14 +1104,14 @@ asset = vd.program_asset(id="module/square", program=Square())
             from vernon_dsl._program_assets.cooking import (
                 _canonical_deployment,
                 _compile_module_bundle_plan,
-                _load_pipeline_asset_declaration,
+                _load_program_asset_declaration,
                 _native_module,
                 _native_target,
             )
 
             native = _native_module()
             pipeline = parse_python_program_asset(source, "asset")
-            declaration = _load_pipeline_asset_declaration(source, "asset")
+            declaration = _load_program_asset_declaration(source, "asset")
             for target_name in ("cpu", "metal", "vulkan"):
                 with self.subTest(target=target_name):
                     target = make_target_options(target_name)
