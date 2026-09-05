@@ -504,29 +504,33 @@ definitions, declarations, bindings, tests, and build rules use the new contract
    Graphics pipeline state is a PSO — rasterization, depth/stencil, blend, and topology are compile-time facts that
    must appear in the manifest — and only the canonical Program path can carry them; the stage path has no
    representation for any of them. So a `vd.pipeline(...)` asset must cook through the canonical path. But that path
-   currently obtains its graphics boundary from two invocation facts: it bakes the vertex buffer as a fixed
-   `outer_shape`/`byte_length`, which would pin a mesh asset to a single vertex count, and it requires a concrete
-   `RenderPass` whose exact format it records, where the stage path instead records format-class constraints and
-   defers validation to load. Both must become symbolic before a graphics asset is deployable. And tuple removal
-   cannot land until `vd.pipeline(...)` cooks, since tuples are otherwise the only graphics asset form.
+   took its attachment structure from a concrete `RenderPass` and refused outright without one, which made a graphics
+   asset uncookable: an asset has no render target to read. That boundary must come from the pipeline itself before a
+   graphics asset is deployable. And tuple removal cannot land until `vd.pipeline(...)` cooks, since tuples are
+   otherwise the only graphics asset form.
 
    Concretely, this phase must:
 
-   - give the render-pass boundary a **derived** attachment structure instead of a concrete `RenderPass`, keeping
-     extents out of the manifest as §8 requires. Do not add authoring surface for this: the structure is already
-     implied by the shaders and the PSO. The fragment stage's `result_type` gives the color attachments and their
-     format class — `Tensor(f32, 4)` for a colour target, `None` for a depth-only pass such as `shadow_fragment` —
-     and the PSO's `depth_stencil` gives depth attachment presence. A declared copy of these facts could only ever
-     drift from the shaders that determine them;
-   - give the vertex-input boundary a **derived** attribute layout, likewise, and likewise with no vertex count or
-     buffer byte length. An `attribute()`-annotated vertex parameter already carries its per-vertex format in the
-     typed signature — `vertices` is `Tensor(f32, 2)` with `interface=['attribute']` — which is the whole layout;
-     the count is an invocation fact and must not appear;
-   - use the frontend's existing unresolved-format convention rather than inventing a second one. A sampled texture
-     parameter already types as `Texture('2d', f32, 'unknown', 'sampled')`, so a format that is not a compile-time
-     fact is already spelled `'unknown'`. The concrete `rgba8_unorm` that attachment capture records today is the
-     outlier, not the precedent;
-   - carry `GraphicsPipelineState` into the manifest as compile-time PSO state;
+   - give the render-pass boundary a **declared** attachment structure instead of a concrete `RenderPass`, keeping
+     extents out of the manifest as §8 requires. Attachment count and aspect are derivable, but the concrete format
+     is not, and that is what the manifest records. A fragment `result_type` of `Tensor(f32, 4)` fixes a four-channel
+     float target and `None` marks a depth-only pass such as `shadow_fragment`, but `rgba8_unorm`, `rgba8_srgb`, and
+     `rgba16_float` are all that same `Tensor(f32, 4)`: shaders write floats, and the format is the storage encoding
+     the target chose. Every backend bakes that encoding into the pipeline object, so it is a deployment choice, and
+     one no shader can imply. It is therefore declared as `vd.pipeline(..., targets=vd.target_formats(...))`,
+     alongside the PSO state it behaves like, and not on `program_asset`, which is neutral across Kernel, Pipeline,
+     Module, and VJP forms and must not carry a graphics-only field. The drift a declaration risks is answered by
+     checking it rather than by refusing to state it: a bound `RenderPass` must agree with the declared formats,
+     which is the compatibility rule Vulkan already imposes on the render pass a pipeline is used in;
+   - the vertex-input boundary already needs no work: an `attribute()`-annotated parameter carries its per-vertex
+     format in the typed signature — `vertices` is `Tensor(f32, 2)` with `interface=['attribute']` — and the leading
+     extent is already symbolic as `("?", *cell)`, so no count or buffer byte length is baked;
+   - enforce the declared formats in the runtime, so the declaration constrains rather than merely documents. The
+     manifest already carries a set of compatible formats and sample counts per attachment and the runtime already
+     parses them, but nothing compared them against the bound target; that gap was invisible only while the format
+     came from the cook-time texture and so could not disagree. Note that the sampled-texture `'unknown'` convention
+     is not the precedent to follow here: an attachment format is a compile-time fact, and a sampled format is not;
+   - `GraphicsPipelineState` already reaches the manifest as compile-time PSO state, so no work is needed there;
    - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
      `Pipeline` that carries its own JIT `features` inside an asset.
 3. **One schema.** Move canonical deployment construction into the deployment layer, delete the `serialize.py` upward
