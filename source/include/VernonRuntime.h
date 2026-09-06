@@ -448,13 +448,6 @@ typedef struct VernonProgramBundleLoadOptions {
     uint32_t reserved[4];
 } VernonProgramBundleLoadOptions;
 
-typedef enum VernonExecutableBundleKind {
-    VERNON_EXECUTABLE_BUNDLE_PIPELINE = 0,
-    VERNON_EXECUTABLE_BUNDLE_PROGRAM = 1
-} VernonExecutableBundleKind;
-
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeExecutableBundleInspectKind(const void *bundle, size_t bundle_size,
-                                                                          VernonExecutableBundleKind *kind);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramBundleInspectTarget(const void *bundle, size_t bundle_size,
                                                                          VernonRuntimeBackend *target);
 /* Loads a cooked single-kernel pipeline or Module Program bundle. CPU
@@ -462,10 +455,6 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramBundleInspectTarget(const v
 VERNON_RUNTIME_CAPI VernonProgramBundle *
 vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
                                           const VernonProgramBundleLoadOptions *options);
-VERNON_RUNTIME_CAPI VernonProgramExecutable *
-vernonRuntimeLoadManagedProgramBundleWithOptions(VernonRuntimeContext *context, const void *bundle, size_t bundle_size,
-                                                 VernonFeatureSetView features,
-                                                 const VernonProgramBundleLoadOptions *options);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramBundleGetId(const VernonProgramBundle *bundle);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramBundleDestroy(VernonProgramBundle *bundle);
 VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
@@ -511,17 +500,27 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetOutputByIndex(
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindOutput(const VernonProgramExecutable *pipeline,
                                                                           VernonStringView name,
                                                                           VernonProgramOutputView *output);
+/* The control slots a graphics node reads its per-invocation controls from.
+ *
+ * A Program assigns each control its own slot when it is compiled, so a caller cannot assume any particular number
+ * and must ask before binding. `node` is the graph node id the controls belong to. */
+typedef struct VernonProgramGraphicsControlsView {
+    uint32_t struct_size;
+    uint32_t node;
+    uint32_t render_pass_control;
+    uint32_t draw_command_control;
+    uint32_t dynamic_state_control;
+} VernonProgramGraphicsControlsView;
+
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetGraphicsNodeCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(
+    const VernonProgramExecutable *pipeline, size_t index, VernonProgramGraphicsControlsView *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramSubmit(VernonProgramExecutable *pipeline,
                                                             const VernonProgramSubmitDescriptor *invocation,
                                                             VernonSubmission **output);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramEncode(VernonRuntimeProviderObject encoder,
                                                             VernonProgramExecutable *pipeline,
                                                             const VernonProgramSubmitDescriptor *invocation);
-/* Executes a compiler-emitted managed Program using its ProgramABI boundary slots.
- * output_pullback may be null when the caller does not retain autodiff state. */
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramForward(VernonProgramExecutable *pipeline,
-                                                             const VernonProgramSubmitDescriptor *invocation,
-                                                             VernonPullback **output_pullback);
 VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
 VERNON_RUNTIME_CAPI VernonProgramInvocation *

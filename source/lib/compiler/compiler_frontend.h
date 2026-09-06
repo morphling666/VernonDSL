@@ -46,6 +46,9 @@ struct LogicalValueModel {
     std::vector<std::string> leafDtypes;
     std::vector<int64_t> shape;
     bool shapeExplicit{};
+    std::string autodiffRole;
+    std::string autodiffSource;
+    std::vector<std::string> autodiffGradientPaths;
 };
 
 struct LogicalEntryModel {

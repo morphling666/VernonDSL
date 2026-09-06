@@ -26,10 +26,10 @@ struct PendingProgramPublication {
 
 bool applyProgramPublicationShapes(const program::Program &program,
                                    const std::vector<PendingProgramPublication> &publications,
-                                   std::vector<ProgramHostValue> &storage, std::string &error);
-bool commitProgramPublications(const std::vector<ProgramHostValue> &storage,
+                                   std::vector<LogicalProgramValue> &storage, std::string &error);
+bool commitProgramPublications(const std::vector<LogicalProgramValue> &storage,
                                const std::vector<PendingProgramPublication> &publications, std::string &error);
-VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, const ProgramInvocationFrame &frame,
+VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, const LogicalValueFrame &frame,
                                              const std::vector<PendingProgramPublication> &publications,
                                              std::string &error);
 

@@ -46,7 +46,7 @@ bool isProgramKernelTapeBuiltin(llvm::StringRef builtin) {
 }
 
 bool prepareCanonicalComputeInterface(const llvm::json::Object &compiledEntry, const llvm::json::Array &rawValues,
-                                      const std::map<std::string, int64_t> &boundValues, int64_t &nextPortableSlot,
+                                      const ProgramNodeBindingIndex &boundValues, int64_t &nextPortableSlot,
                                       std::string &error) {
     std::set<std::string> endpointNames;
     size_t logicalInterfaceCount = 0;
@@ -71,7 +71,10 @@ bool prepareCanonicalComputeInterface(const llvm::json::Object &compiledEntry, c
         return true;
     };
     std::map<std::string, int64_t> namedBound;
-    for (const auto &[name, value] : boundValues) {
+    for (const auto &[name, projections] : boundValues) {
+        if (projections.empty())
+            continue;
+        const int64_t value = projections.front().value;
         const llvm::json::Object *logical = findJsonObjectByIntegerId(rawValues, value);
         const llvm::StringRef type = logical ? logical->getString("type").value_or("") : "";
         if (name == "tape" || isProgramAdTapeType(type))
@@ -100,7 +103,7 @@ bool prepareCanonicalComputeInterface(const llvm::json::Object &compiledEntry, c
 }
 
 bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, const llvm::json::Array &rawValues,
-                                    const std::map<std::string, int64_t> &boundValues,
+                                    const ProgramNodeBindingIndex &boundValues,
                                     std::map<int64_t, ProgramLogicalResource> &resources, int64_t nextPortableSlot,
                                     ProgramComputeEndpointPlan &plan, std::string &error) {
     std::map<int64_t, int64_t> accessByValue;
@@ -118,7 +121,8 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         const int64_t endpointIndex = row.getInteger("index").value_or(static_cast<int64_t>(fallbackIndex));
         if (builtin) {
             if (isProgramKernelTapeBuiltin(*builtin)) {
-                plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(row, "compute", endpointIndex));
+                plan.implementationEndpoints.emplace_back(
+                    compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
                 return true;
             }
             if (isProgramKernelHiddenBuiltin(*builtin))
@@ -144,7 +148,8 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                 {"builtin", builtin->str()},
                 {"abi", llvm::json::Object{{"bindings", std::move(abi)}}},
             });
-            plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(row, "compute", endpointIndex));
+            plan.implementationEndpoints.emplace_back(
+                compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
             return true;
         }
         const std::optional<llvm::StringRef> source = row.getString("vernon.source_name");
@@ -153,7 +158,27 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
             error = "compiled compute endpoint is not present in logical bindings";
             return false;
         }
-        const int64_t valueId = binding->second;
+        std::vector<ProgramLogicalBinding> logicalBindings = binding->second;
+        if (logicalBindings.empty()) {
+            error = "compiled compute endpoint has no logical projections";
+            return false;
+        }
+        if (row.get("vernon.program_storage_shape") && logicalBindings.size() > 1) {
+            const auto firstResource = resources.find(logicalBindings.front().value);
+            if (firstResource == resources.end() || firstResource->second.storage < 0) {
+                error = "Program storage-shape carrier does not project a canonical Storage";
+                return false;
+            }
+            const int64_t storage = firstResource->second.storage;
+            for (const ProgramLogicalBinding &projection : llvm::drop_begin(logicalBindings))
+                if (const auto resource = resources.find(projection.value);
+                    resource == resources.end() || resource->second.storage != storage) {
+                    error = "Program storage-shape carrier combines distinct canonical Storages";
+                    return false;
+                }
+            logicalBindings.resize(1);
+        }
+        const int64_t valueId = logicalBindings.front().value;
         const llvm::json::Object *logicalValue = findJsonObjectByIntegerId(rawValues, valueId);
         auto resourceIt = resources.find(valueId);
         const bool resource = resourceIt != resources.end();
@@ -170,9 +195,77 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                                  autodiffRole && isProgramTapeCarrierRole(*autodiffRole);
         const llvm::json::Object *logicalLayout = logicalValue ? logicalValue->getObject("value_layout") : nullptr;
         const llvm::json::Array *logicalShape = logicalValue ? logicalValue->getArray("shape") : nullptr;
-        const llvm::json::Object *wholeLayout = programEndpointLayout(row, resource);
         const llvm::json::Array *physicalShape =
             row.getArray("source_shape") ? row.getArray("source_shape") : row.getArray("shape");
+        const bool resourceBackedValue = !resource && endpointKind == "tensor" && autodiffRole == "gradient" &&
+                                         logicalShape && logicalShape->empty() && physicalShape &&
+                                         physicalShape->empty();
+        const llvm::json::Object *wholeLayout = programEndpointLayout(row, resource || resourceBackedValue);
+        if (logicalBindings.size() > 1) {
+            const llvm::json::Array *physicalLeaves = wholeLayout ? wholeLayout->getArray("leaves") : nullptr;
+            if (interfaceKind != "result" || !autodiffRole || *autodiffRole != "gradient" || !physicalLeaves ||
+                physicalLeaves->size() != logicalBindings.size()) {
+                error = "aggregate physical endpoint '" + source->str() + "' has " +
+                        std::to_string(physicalLeaves ? physicalLeaves->size() : 0) + " physical leaves but " +
+                        std::to_string(logicalBindings.size()) + " canonical projections (Values";
+                for (const ProgramLogicalBinding &projection : logicalBindings)
+                    error += " " + std::to_string(projection.value);
+                error += ")";
+                return false;
+            }
+            llvm::json::Array projections;
+            std::set<int64_t> coveredPhysicalLeaves;
+            for (const ProgramLogicalBinding &projection : logicalBindings) {
+                if (projection.physicalLeaf < 0 ||
+                    static_cast<size_t>(projection.physicalLeaf) >= physicalLeaves->size() ||
+                    !coveredPhysicalLeaves.insert(projection.physicalLeaf).second) {
+                    error = "aggregate physical endpoint has an invalid or duplicate leaf projection";
+                    return false;
+                }
+                const llvm::json::Object *value = findJsonObjectByIntegerId(rawValues, projection.value);
+                const llvm::json::Object *layout = value ? value->getObject("value_layout") : nullptr;
+                const llvm::json::Array *leaves = layout ? layout->getArray("leaves") : nullptr;
+                const size_t logicalLeaf = projection.leaf ? static_cast<size_t>(*projection.leaf) : 0;
+                const llvm::json::Object *canonicalLeaf =
+                    leaves && logicalLeaf < leaves->size() ? (*leaves)[logicalLeaf].getAsObject() : nullptr;
+                const llvm::json::Object *implementationLeaf =
+                    (*physicalLeaves)[static_cast<size_t>(projection.physicalLeaf)].getAsObject();
+                if (!canonicalLeaf || !implementationLeaf ||
+                    canonicalLeaf->getString("dtype") != implementationLeaf->getString("dtype")) {
+                    error = "aggregate physical endpoint leaf dtype does not match its canonical projection";
+                    return false;
+                }
+                llvm::json::Object item{
+                    {"value", projection.value}, {"physical_leaf", projection.physicalLeaf}, {"direction", "result"}};
+                if (projection.leaf)
+                    item["leaf"] = *projection.leaf;
+                projections.emplace_back(std::move(item));
+            }
+            const std::optional<int64_t> reflectedSlot = row.getInteger("vernon.binding");
+            const int64_t slot = reflectedSlot ? *reflectedSlot : nextPortableSlot++;
+            llvm::json::Array abi{llvm::json::Object{
+                {"semantic", "value"}, {"carrier", programValueCarrier("value_slot", slot, *wholeLayout)}}};
+            plan.endpoints.emplace_back(llvm::json::Object{
+                {"tag", "value"},
+                {"module", "compute"},
+                {"interface", interfaceKind.str()},
+                {"index", endpointIndex},
+                {"role", autodiffRole->str()},
+                {"type", row.getString("type").value_or("").str()},
+                {"layout_hash", wholeLayout->getString("layout_hash").value_or("").str()},
+                {"transport", "by_value"},
+                {"access", "read"},
+                {"abi", llvm::json::Object{{"bindings", std::move(abi)}}},
+            });
+            plan.endpointBindings.emplace_back(llvm::json::Object{{"module", "compute"},
+                                                                  {"interface", interfaceKind.str()},
+                                                                  {"index", endpointIndex},
+                                                                  {"tag", "value"},
+                                                                  {"projections", std::move(projections)}});
+            plan.implementationEndpoints.emplace_back(
+                compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
+            return true;
+        }
         const bool opaqueMatches = opaqueResourceEndpoint && resource && logicalValue &&
                                    logicalValue->getString("type") == row.getString("type");
         const bool byteValueMatches =
@@ -207,16 +300,72 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
             return false;
         }
         if (std::optional<llvm::StringRef> logicalType = logicalValue->getString("type");
-            !resource && logicalType && row.getString("type") && *logicalType != *row.getString("type")) {
+            !resource && !resourceBackedValue && logicalType && row.getString("type") &&
+            *logicalType != *row.getString("type")) {
             error = "compiled compute endpoint type does not match logical value '" + source->str() + "'";
             return false;
+        }
+        if (resourceBackedValue) {
+            const std::optional<int64_t> slot = row.getInteger("vernon.binding");
+            const llvm::json::Object *descriptor = row.getObject("tensor_view_descriptor");
+            const std::optional<int64_t> offset =
+                descriptor ? descriptor->getInteger("offset_binding") : std::optional<int64_t>{};
+            if (!slot || !offset) {
+                error = "compiled resource-backed value has an incomplete TensorView carrier";
+                return false;
+            }
+            llvm::json::Array abi{
+                llvm::json::Object{
+                    {"semantic", "resource"},
+                    {"carrier", llvm::json::Object{{"tag", "resource_slot"}, {"slot", *slot}}},
+                },
+                llvm::json::Object{
+                    {"semantic", "byte_offset"},
+                    {"carrier", llvm::json::Object{{"tag", "value_slot"},
+                                                   {"slot", *offset},
+                                                   {"byte_offset", int64_t{0}},
+                                                   {"byte_size", int64_t{8}},
+                                                   {"alignment", int64_t{8}}}},
+                },
+            };
+            llvm::json::Object endpoint{
+                {"tag", "resource"},
+                {"module", "compute"},
+                {"interface", interfaceKind.str()},
+                {"index", endpointIndex},
+                {"role", autodiffRole->str()},
+                {"type", row.getString("type").value_or("").str()},
+                {"layout",
+                 llvm::json::Object{{"tag", "buffer"},
+                                    {"view_rank", int64_t{0}},
+                                    {"shape", llvm::json::Array{}},
+                                    {"descriptor", true},
+                                    {"element_layout_hash", wholeLayout->getString("layout_hash").value_or("").str()},
+                                    {"minimum_alignment", wholeLayout->getInteger("alignment").value_or(0)}}},
+                {"address_space", row.getString("address_space").value_or("device").str()},
+                {"transport", "resource_handle"},
+                {"access", reflectedProgramResourceAccess(row).value_or("read_write")},
+                {"abi", llvm::json::Object{{"bindings", std::move(abi)}}},
+            };
+            plan.endpoints.emplace_back(std::move(endpoint));
+            llvm::json::Array projections;
+            projections.emplace_back(
+                llvm::json::Object{{"value", valueId}, {"physical_leaf", int64_t{0}}, {"direction", "result"}});
+            plan.endpointBindings.emplace_back(llvm::json::Object{{"module", "compute"},
+                                                                  {"interface", interfaceKind.str()},
+                                                                  {"index", endpointIndex},
+                                                                  {"tag", "value"},
+                                                                  {"projections", std::move(projections)}});
+            llvm::json::Object compiled = compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex);
+            compiled["value_transport"] = "storage_buffer";
+            plan.implementationEndpoints.emplace_back(std::move(compiled));
+            return true;
         }
         if (!resource) {
             const std::optional<int64_t> reflectedSlot = row.getInteger("vernon.binding");
             const int64_t slot = reflectedSlot ? *reflectedSlot : nextPortableSlot++;
-            llvm::json::Array abi;
-            abi.emplace_back(llvm::json::Object{{"semantic", "value"},
-                                                {"carrier", programValueCarrier("value_slot", slot, *wholeLayout)}});
+            llvm::json::Array abi{llvm::json::Object{
+                {"semantic", "value"}, {"carrier", programValueCarrier("value_slot", slot, *wholeLayout)}}};
             llvm::json::Object endpoint{{"tag", "value"},
                                         {"module", "compute"},
                                         {"interface", interfaceKind.str()},
@@ -226,15 +375,22 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                                         {"transport", "by_value"},
                                         {"access", "read"},
                                         {"abi", llvm::json::Object{{"bindings", std::move(abi)}}}};
+            if (autodiffRole)
+                endpoint["role"] = autodiffRole->str();
             if (const llvm::json::Object *elementLayout = row.getObject("element_layout"))
                 endpoint["element_layout_hash"] = elementLayout->getString("layout_hash").value_or("").str();
             plan.endpoints.emplace_back(std::move(endpoint));
+            llvm::json::Array projections;
+            projections.emplace_back(llvm::json::Object{{"value", valueId},
+                                                        {"physical_leaf", int64_t{0}},
+                                                        {"direction", interfaceKind == "result" ? "result" : "input"}});
             plan.endpointBindings.emplace_back(llvm::json::Object{{"module", "compute"},
                                                                   {"interface", interfaceKind.str()},
                                                                   {"index", endpointIndex},
                                                                   {"tag", "value"},
-                                                                  {"value", valueId}});
-            plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(row, "compute", endpointIndex));
+                                                                  {"projections", std::move(projections)}});
+            plan.implementationEndpoints.emplace_back(
+                compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
             return true;
         }
         const std::optional<std::string> physicalAccess = reflectedProgramResourceAccess(row);
@@ -347,7 +503,8 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
         if (projectedLeafIndex)
             endpointBinding["leaf"] = static_cast<int64_t>(*projectedLeafIndex);
         plan.endpointBindings.emplace_back(std::move(endpointBinding));
-        plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(row, "compute", endpointIndex));
+        plan.implementationEndpoints.emplace_back(
+            compiledProgramEndpointAbi(row, "compute", interfaceKind, endpointIndex));
         return true;
     };
 

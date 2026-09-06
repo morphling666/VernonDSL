@@ -27,10 +27,10 @@ ProgramBoundaryAccess forwardResourceAccess(const llvm::json::Array &graphs, int
                 if (!access || access->getInteger("storage") != storageId)
                     continue;
                 const llvm::StringRef mode = access->getString("access").value_or("");
-                const llvm::StringRef kind = access->getString("kind").value_or("");
-                reads |= mode == "read" || mode == "read_write" || (mode.empty() && kind == "read");
-                writes |= mode == "write" || mode == "read_write" ||
-                          (mode.empty() && (kind == "initialize" || kind == "write" || kind == "attachment"));
+                const llvm::StringRef tag = access->getString("tag").value_or("");
+                reads |= mode == "read" || mode == "read_write" || tag == "read" || tag == "attachment";
+                writes |= mode == "write" || mode == "read_write" || tag == "initialize" || tag == "write" ||
+                          tag == "attachment";
             }
         }
     }
@@ -97,6 +97,8 @@ bool appendProgramBoundaries(const llvm::json::Object &signature, llvm::StringRe
             slot.access = direction == ProgramBoundaryDirection::Input ? ProgramBoundaryAccess::Read
                                                                        : ProgramBoundaryAccess::Write;
         }
+        if (direction == ProgramBoundaryDirection::Output)
+            slot.publication = ProgramBoundaryPublication::CommitAfterSuccess;
         plan.slots.push_back(std::move(slot));
     }
     return true;
@@ -116,6 +118,66 @@ bool planProgramBoundaries(const llvm::json::Object &signature, const llvm::json
                                    ProgramBoundaryDirection::Input, values, storages, graphs, plan, error) &&
            appendProgramBoundaries(signature, "gradients", ProgramBoundaryRole::Gradient,
                                    ProgramBoundaryDirection::Output, values, storages, graphs, plan, error);
+}
+
+llvm::StringRef programBoundaryRoleName(ProgramBoundaryRole role) {
+    switch (role) {
+    case ProgramBoundaryRole::Input:
+        return "input";
+    case ProgramBoundaryRole::Output:
+        return "output";
+    case ProgramBoundaryRole::Cotangent:
+        return "cotangent";
+    case ProgramBoundaryRole::Gradient:
+        return "gradient";
+    }
+    return "";
+}
+
+llvm::StringRef programBoundaryDirectionName(ProgramBoundaryDirection direction) {
+    switch (direction) {
+    case ProgramBoundaryDirection::Input:
+        return "input";
+    case ProgramBoundaryDirection::Output:
+        return "output";
+    }
+    return "";
+}
+
+llvm::StringRef programBoundaryCategoryName(ProgramBoundaryCategory category) {
+    switch (category) {
+    case ProgramBoundaryCategory::Value:
+        return "value";
+    case ProgramBoundaryCategory::StorageView:
+        return "storage_view";
+    case ProgramBoundaryCategory::Texture:
+        return "texture";
+    case ProgramBoundaryCategory::Sampler:
+        return "sampler";
+    }
+    return "";
+}
+
+llvm::StringRef programBoundaryAccessName(ProgramBoundaryAccess access) {
+    switch (access) {
+    case ProgramBoundaryAccess::Read:
+        return "read";
+    case ProgramBoundaryAccess::Write:
+        return "write";
+    case ProgramBoundaryAccess::ReadWrite:
+        return "read_write";
+    }
+    return "";
+}
+
+llvm::StringRef programBoundaryPublicationName(ProgramBoundaryPublication publication) {
+    switch (publication) {
+    case ProgramBoundaryPublication::CommitAfterSuccess:
+        return "commit_after_success";
+    case ProgramBoundaryPublication::InPlace:
+        return "in_place";
+    }
+    return "";
 }
 
 } // namespace vernon::compiler

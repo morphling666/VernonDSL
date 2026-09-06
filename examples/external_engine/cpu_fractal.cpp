@@ -169,7 +169,7 @@ public:
         arguments_[1].tensor.access = timeParameter.access;
         arguments_[1].tensor.byte_size = sizeof(time_);
         invocation_.struct_size = sizeof(invocation_);
-        invocation_.abi_version = VERNON_PIPELINE_VERSION;
+        invocation_.abi_version = VERNON_PROGRAM_VERSION;
         invocation_.arguments = arguments_.data();
         invocation_.argument_count = arguments_.size();
         invocation_.compute_grid = {kWidth / 16, kHeight / 16, 1};

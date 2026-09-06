@@ -107,8 +107,10 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonProgramExecutable *pipeline = vernonRuntimeLoadManagedProgramBundleWithOptions(
-        context, manifest.data(), manifest.size(), {nullptr, 0}, &options);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
 
@@ -195,6 +197,7 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     vernonPullbackDestroy(pullback);
     vernonRuntimeProgramInstanceDestroy(instance);
     vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
 }

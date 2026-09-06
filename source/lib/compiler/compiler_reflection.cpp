@@ -92,6 +92,16 @@ mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::Module
                 for (int64_t extent : shape.asArrayRef())
                     value.shape.push_back(extent);
             }
+        if (attributes) {
+            if (auto role = attributes.getAs<mlir::StringAttr>("vernon.autodiff_role"))
+                value.autodiffRole = role.getValue().str();
+            if (auto source = attributes.getAs<mlir::StringAttr>("vernon.autodiff_source"))
+                value.autodiffSource = source.getValue().str();
+            if (auto paths = attributes.getAs<mlir::ArrayAttr>("vernon.autodiff_gradient_paths"))
+                for (mlir::Attribute path : paths)
+                    if (auto string = mlir::dyn_cast<mlir::StringAttr>(path))
+                        value.autodiffGradientPaths.push_back(string.getValue().str());
+        }
         return value;
     };
     for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
@@ -991,6 +1001,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (logicalValue) {
                 if (logicalValue->sourcePathExplicit)
                     argument["vernon.source_name"] = logicalValue->sourcePath;
+                if (!logicalValue->autodiffRole.empty())
+                    argument["vernon.autodiff_role"] = logicalValue->autodiffRole;
+                if (!logicalValue->autodiffSource.empty())
+                    argument["vernon.autodiff_source"] = logicalValue->autodiffSource;
                 if (logicalValue->dtypeExplicit)
                     argument["vernon.dtype"] = logicalValue->dtype;
                 if (logicalValue->shapeExplicit) {
@@ -1320,6 +1334,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (logicalValue) {
                 if (logicalValue->sourcePathExplicit)
                     output["vernon.source_name"] = logicalValue->sourcePath;
+                if (!logicalValue->autodiffRole.empty())
+                    output["vernon.autodiff_role"] = logicalValue->autodiffRole;
+                if (!logicalValue->autodiffSource.empty())
+                    output["vernon.autodiff_source"] = logicalValue->autodiffSource;
+                if (!logicalValue->autodiffGradientPaths.empty()) {
+                    llvm::json::Array paths;
+                    for (const std::string &path : logicalValue->autodiffGradientPaths)
+                        paths.emplace_back(path);
+                    output["vernon.autodiff_gradient_paths"] = std::move(paths);
+                }
                 if (logicalValue->dtypeExplicit)
                     output["vernon.dtype"] = logicalValue->dtype;
                 if (logicalValue->shapeExplicit) {
@@ -1327,6 +1351,19 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     for (int64_t extent : logicalValue->shape)
                         shape.emplace_back(extent);
                     output["vernon.source_shape"] = std::move(shape);
+                }
+            }
+            if (resultAttrs) {
+                if (auto role = resultAttrs.getAs<mlir::StringAttr>("vernon.autodiff_role"))
+                    output["vernon.autodiff_role"] = role.getValue();
+                if (auto source = resultAttrs.getAs<mlir::StringAttr>("vernon.autodiff_source"))
+                    output["vernon.autodiff_source"] = source.getValue();
+                if (auto gradientPaths = resultAttrs.getAs<mlir::ArrayAttr>("vernon.autodiff_gradient_paths")) {
+                    llvm::json::Array paths;
+                    for (mlir::Attribute path : gradientPaths)
+                        if (auto string = mlir::dyn_cast<mlir::StringAttr>(path))
+                            paths.emplace_back(string.getValue());
+                    output["vernon.autodiff_gradient_paths"] = std::move(paths);
                 }
             }
             llvm::json::Object physicalLayouts;
@@ -1509,7 +1546,7 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
 
     llvm::json::Object root;
     root["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
-    root["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
+    root["program_version"] = int64_t{VERNON_PROGRAM_VERSION};
     root["entries"] = std::move(entries);
     mlir::FailureOr<std::optional<ProgramReflection>> programReflection = buildProgramReflection(module);
     if (mlir::failed(programReflection))

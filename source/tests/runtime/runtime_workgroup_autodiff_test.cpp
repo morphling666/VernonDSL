@@ -1,5 +1,6 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -51,26 +52,26 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
+              VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
-    EXPECT_EQ(memory.logicalResidualBytes, 0u);
-    EXPECT_EQ(memory.residentBytes, 0u);
-    EXPECT_EQ(memory.allocatedBytes, 0u);
+    EXPECT_GT(memory.logicalResidualBytes, 0u);
+    EXPECT_GT(memory.residentBytes, 0u);
+    EXPECT_GT(memory.allocatedBytes, 0u);
     for (size_t lane = 0; lane < laneCount; ++lane) {
         const size_t groupBase = lane / 4 * 4;
         const size_t neighbor = groupBase + (lane + 1) % 4;
         EXPECT_FLOAT_EQ(output[lane], carriers[neighbor] * scale * 2.0f);
     }
 
-    float seedValues[laneCount * laneCount]{};
+    float seedValues[laneCount];
     const float weights[laneCount]{1.0f, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f, 13.0f, 17.0f};
     for (size_t lane = 0; lane < laneCount; ++lane)
-        seedValues[lane * laneCount + lane] = weights[lane];
-    const uint64_t seedShape[]{1, 1, laneCount, 1, 1, laneCount};
+        seedValues[lane] = weights[lane];
     VernonAdValue seed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 6, seedShape};
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 3, outputShape};
     VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
     float carrierGradients[laneCount]{};
     float scaleGradient{};

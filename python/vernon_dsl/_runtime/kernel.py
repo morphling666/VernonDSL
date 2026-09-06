@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Protocol
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
@@ -411,7 +411,7 @@ class Kernel:
             canonical_json(
                 {
                     "compiler_contract_version": COMPILER_CONTRACT_VERSION,
-                    "pipeline_version": PIPELINE_VERSION,
+                    "program_version": PROGRAM_VERSION,
                     "frontend": frontend.semantic_inputs,
                     "target": options.spec,
                 }

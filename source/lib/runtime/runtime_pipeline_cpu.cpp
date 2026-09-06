@@ -3,10 +3,12 @@
 #include "backend_cpu.h"
 #include "compute_launch_planner.h"
 #include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/runtime_cpu_preparation.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 
 #include "VernonCpuWorkgroupABI.h"
 
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -48,7 +50,8 @@ bool cpuDispatchVolume(const uint32_t groupCount[3], const uint32_t workgroup[3]
 
 VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsigned char> &packed, std::string &error) {
     if (!state.packedSize || state.packedOffsets.size() != state.layout.size() ||
-        state.packedFieldSizes.size() != state.layout.size()) {
+        state.packedFieldSizes.size() != state.layout.size() || state.packedResults.size() != state.layout.size() ||
+        state.packedResultReductions.size() != state.layout.size()) {
         error = "CPU tape dispatch packed layout is incomplete";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
@@ -59,6 +62,8 @@ VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsign
         return VERNON_STATUS_INTERNAL_ERROR;
     }
     for (size_t index = 0; index < state.layout.size(); ++index) {
+        if (state.packedResults[index])
+            continue;
         const auto &layout = state.layout[index];
         const auto &value = state.values[index];
         const size_t offset = state.packedOffsets[index];
@@ -96,6 +101,106 @@ VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsign
     return VERNON_STATUS_OK;
 }
 
+VernonStatus commitCpuResults(const CpuPipelineState &state, const std::vector<unsigned char> &results,
+                              std::string &error) {
+    for (size_t index = 0; index < state.layout.size(); ++index) {
+        if (!state.packedResults[index])
+            continue;
+        const size_t offset = state.packedOffsets[index];
+        const size_t size = state.packedFieldSizes[index];
+        if (offset > results.size() || size > results.size() - offset) {
+            error = "CPU result field is out of range";
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        const VernonRuntimeProviderBindingValue &value = state.values[index];
+        void *destination = nullptr;
+        size_t destinationSize = 0;
+        if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            const auto &resource = value.payload.buffer.resource;
+            destination = reinterpret_cast<void *>(static_cast<uintptr_t>(resource.resource.value) + resource.offset);
+            destinationSize = resource.size;
+        } else {
+            destination = const_cast<void *>(value.payload.inline_value.data);
+            destinationSize = value.payload.inline_value.size;
+        }
+        if (!destination || destinationSize < size) {
+            error = "CPU result binding has no writable destination";
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        std::memcpy(destination, results.data() + offset, size);
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus reduceCpuLaneResults(VernonRuntimeContext &context, const CpuPipelineState &state,
+                                  const std::vector<std::vector<unsigned char>> &lanes,
+                                  std::vector<unsigned char> &results) {
+    if (lanes.empty())
+        return fail(context, "CPU result reduction has no lane values");
+    for (size_t index = 0; index < state.layout.size(); ++index) {
+        if (!state.packedResults[index])
+            continue;
+        const size_t offset = state.packedOffsets[index];
+        const size_t size = state.packedFieldSizes[index];
+        if (offset > results.size() || size > results.size() - offset)
+            return fail(context, "CPU reduced result field is out of range");
+        if (!state.packedResultReductions[index]) {
+            std::memcpy(results.data() + offset, lanes.back().data() + offset, size);
+            continue;
+        }
+        ad::ValueAbi abi;
+        abi.dtype = *state.packedResultReductions[index];
+        abi.byteSize = size;
+        std::vector<uint8_t> reduced(size);
+        for (const std::vector<unsigned char> &lane : lanes)
+            if (const VernonStatus status =
+                    ad::cpu::accumulateGradientBytes(context, abi, lane.data() + offset, reduced);
+                status != VERNON_STATUS_OK)
+                return status;
+        std::memcpy(results.data() + offset, reduced.data(), size);
+    }
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus dispatchCpuReducedCompute(VernonRuntimeContext &context, CpuPipelineState &state,
+                                       const uint32_t groups[3]) {
+    size_t volume = 0;
+    if (!state.entry || !cpuDispatchVolume(groups, state.workgroup, volume))
+        return fail(context, "CPU reduced dispatch has an invalid entry or volume");
+    std::vector<unsigned char> packed;
+    std::vector<unsigned char> results(state.packedResultSize);
+    std::string error;
+    if (const VernonStatus status = packCpuInvocation(state, packed, error); status != VERNON_STATUS_OK)
+        return fail(context, std::move(error), status);
+    std::vector<const void *> laneArguments(volume, packed.data());
+    std::vector<std::vector<unsigned char>> laneStorage(volume, std::vector<unsigned char>(state.packedResultSize));
+    std::vector<void *> laneResults(volume);
+    for (size_t lane = 0; lane < volume; ++lane)
+        laneResults[lane] = laneStorage[lane].data();
+    CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context);
+    const VernonStatus dispatch = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRangeV1 &range) {
+        range.arguments = packed.data();
+        range.arguments_size = packed.size();
+        range.results = results.data();
+        range.results_size = results.size();
+        range.lane_arguments = laneArguments.data();
+        range.lane_results = laneResults.data();
+        range.lane_table_count = volume;
+        const VernonCpuInvocation invocation{&range, VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1, nullptr, 0, nullptr};
+        return state.entry(&invocation);
+    });
+    if (dispatch != VERNON_STATUS_OK)
+        return fail(context,
+                    scheduler.lastDiagnostic().empty() ? "CPU reduced dispatch failed" : scheduler.lastDiagnostic(),
+                    dispatch);
+    if (const VernonStatus status = reduceCpuLaneResults(context, state, laneStorage, results);
+        status != VERNON_STATUS_OK)
+        return status;
+    if (const VernonStatus status = commitCpuResults(state, results, error); status != VERNON_STATUS_OK)
+        return fail(context, std::move(error), status);
+    return VERNON_STATUS_OK;
+}
+
 VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineState &state, const uint32_t groups[3]) {
     if (!state.entry)
         return fail(context, "CPU tape dispatch has no entry");
@@ -114,15 +219,30 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
         sizeof(VernonAdTapeAllocator *) > state.packedSize - state.tapeAllocatorOffset)
         return fail(context, "CPU tape allocator packed offset is invalid");
     std::vector<unsigned char> packed;
+    std::vector<unsigned char> results;
     std::string packError;
     if (const VernonStatus status = packCpuInvocation(state, packed, packError); status != VERNON_STATUS_OK)
         return fail(context, std::move(packError), status);
+    try {
+        results.resize(state.packedResultSize);
+    } catch (const std::bad_alloc &) {
+        return fail(context, "cannot allocate CPU result frame", VERNON_STATUS_INTERNAL_ERROR);
+    }
     std::vector<std::vector<unsigned char>> lanePacked;
+    std::vector<std::vector<unsigned char>> laneResultStorage;
     std::vector<const void *> laneArguments;
+    std::vector<void *> laneResults;
     std::vector<ad::HostStaticTapeBatch::Reader> readers;
+    const bool reduceResults =
+        std::any_of(state.packedResultReductions.begin(), state.packedResultReductions.end(),
+                    [](const std::optional<VernonDataType> &dtype) { return dtype.has_value(); });
     try {
         lanePacked.assign(volume, packed);
         laneArguments.resize(volume);
+        if (reduceResults) {
+            laneResultStorage.assign(volume, std::vector<unsigned char>(state.packedResultSize));
+            laneResults.resize(volume);
+        }
         if (batch->isCompacted())
             readers.assign(volume, {});
     } catch (const std::bad_alloc &) {
@@ -152,13 +272,16 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
             std::memcpy(lanePacked[lane].data() + state.tapeRootOffset, &root, sizeof(root));
         }
         laneArguments[lane] = lanePacked[lane].data();
+        if (reduceResults)
+            laneResults[lane] = laneResultStorage[lane].data();
     }
     CpuWorkgroupScheduler &scheduler = cpuWorkgroupScheduler(context);
     const VernonStatus status = scheduler.dispatch(groups, state.workgroup, [&](VernonCpuRangeV1 &range) {
         range.arguments = laneArguments.front();
         range.arguments_size = packed.size();
-        range.results = nullptr;
-        range.results_size = 0;
+        range.results = results.empty() ? nullptr : results.data();
+        range.results_size = results.size();
+        range.lane_results = reduceResults ? laneResults.data() : nullptr;
         range.textures = nullptr;
         range.lane_arguments = laneArguments.data();
         range.lane_table_count = laneArguments.size();
@@ -172,7 +295,13 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
                                                                     : "CPU provider entry invocation failed")
                         : scheduler.lastDiagnostic(),
                     status);
-    return status;
+    if (reduceResults)
+        if (const VernonStatus reduceStatus = reduceCpuLaneResults(context, state, laneResultStorage, results);
+            reduceStatus != VERNON_STATUS_OK)
+            return reduceStatus;
+    if (const VernonStatus commitStatus = commitCpuResults(state, results, packError); commitStatus != VERNON_STATUS_OK)
+        return fail(context, std::move(packError), commitStatus);
+    return VERNON_STATUS_OK;
 }
 
 } // namespace
@@ -261,6 +390,9 @@ VernonStatus invokeCpuComputePipeline(VernonProgramExecutable &pipeline, const P
     const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     if (hasTapeBuiltins(state))
         return dispatchCpuTapedCompute(*pipeline.context, state, groups);
+    if (std::any_of(state.packedResultReductions.begin(), state.packedResultReductions.end(),
+                    [](const std::optional<VernonDataType> &dtype) { return dtype.has_value(); }))
+        return dispatchCpuReducedCompute(*pipeline.context, state, groups);
     VernonStatus status =
         state.bindings ? vernonRuntimeCoreUpdateBindings(state.bindings, state.values.data(), state.values.size())
                        : vernonRuntimeCoreCreateBindings(state.pipeline, state.values.data(), state.values.size(),

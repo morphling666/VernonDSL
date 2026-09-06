@@ -3,10 +3,10 @@ from __future__ import annotations
 import unittest
 from importlib import import_module
 from typing import Annotated, Any, cast
-from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
+from vernon_dsl._program_assets.capture import capture_program
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.frontend.module_ast import interpret_module_forward
 from vernon_dsl.frontend.runtime_types import RuntimeParameterDescriptor, runtime_parameter_descriptor
@@ -300,22 +300,20 @@ class _DepthTarget:
 class ModuleGraphicsControlTests(unittest.TestCase):
     @staticmethod
     def _cook(parsed: Any, pipeline_id: str) -> dict[str, Any]:
-        from vernon_dsl._program_assets.cooking import _compile_program_bundle_plan, _native_target
+        from vernon_dsl._program_assets.compile_orchestration import _compile_program_variant, _native_target
         from vernon_dsl.bundle import make_target_options
 
         native = import_module("vernon_dsl._native")
-        plan = _compile_program_bundle_plan(
+        _, _, _, program = _compile_program_variant(
             parsed,
-            pipeline_id=pipeline_id,
+            program_id=pipeline_id,
             variant=(),
             target=make_target_options("opengl", {"version": 410}),
             compiler=native.Compiler(),
             native=native,
             native_target=_native_target(native, "opengl"),
         )
-        canonical = plan.variants[0].canonical_program
-        assert canonical is not None
-        return canonical
+        return dict(program)
 
     def test_every_managed_invocation_requires_render_pass_control(self) -> None:
         vertices = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32)).view(access="read")
@@ -358,27 +356,10 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         )
 
     def test_graphics_module_autodiff_is_diagnosed(self) -> None:
-        from vernon_dsl.program import _parse_module_program
-
-        with self.assertRaisesRegex(TypeError, "graphics Module programs do not support autodiff"):
-            with mock.patch(
-                "vernon_dsl.program._module_parameter_types",
-                return_value={
-                    "vertices": RuntimeParameterDescriptor.storage(vd.f32, (3, 2), "read", True),
-                    "render_pass": ProgramControlDescriptor(
-                        "render_pass",
-                        vd.RenderPass,
-                        vd.RenderPass(cast(vd.RenderTarget, _Target()), ((0, vd.preserve()),)),
-                    ),
-                    "draw": ProgramControlDescriptor("draw", vd.DrawCommand, vd.draw(vertex_count=3)),
-                    "dynamic_state": ProgramControlDescriptor(
-                        "dynamic_state",
-                        vd.DynamicState,
-                        vd.dynamic_state(),
-                    ),
-                },
-            ):
-                _parse_module_program(ManagedGraphics(), vjp_wrt=("vertices",))
+        expression = vd.ad.vjp(ManagedGraphics(), wrt=("vertices",))
+        declaration = vd.program_asset(id="graphics/module_vjp", program=expression)
+        with self.assertRaisesRegex(ValueError, "PROGRAM_GRAPHICS_VJP_UNSUPPORTED"):
+            capture_program(declaration)
 
     def test_two_graphics_nodes_keep_distinct_control_slots(self) -> None:
         render_pass = vd.RenderPass(cast(vd.RenderTarget, _Target()), ((0, vd.preserve()),))
@@ -501,8 +482,8 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         self.assertEqual(set(vertex_storage["descriptor"]["usage"]), {"storage", "vertex"})
 
     def test_managed_graphics_cooking_packages_both_shader_stages(self) -> None:
-        from vernon_dsl._program_assets.cooking import _compile_program_bundle_plan, _native_target
-        from vernon_dsl.bundle import make_target_options
+        from vernon_dsl._program_assets.compile_orchestration import _compile_program_variant, _native_target
+        from vernon_dsl.bundle import build_program_plan, make_target_options
         from vernon_dsl.program import _parse_module_program
 
         render_pass = vd.RenderPass(cast(vd.RenderTarget, _Target()), ((0, vd.preserve()),))
@@ -517,24 +498,24 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         )
         native = import_module("vernon_dsl._native")
         target = make_target_options("opengl", {"version": 410})
-        plan = _compile_program_bundle_plan(
+        reflected_target, key, stages, program = _compile_program_variant(
             parsed,
-            pipeline_id="tests/managed-graphics",
+            program_id="tests/managed-graphics",
             variant=(),
             target=target,
             compiler=native.Compiler(),
             native=native,
             native_target=_native_target(native, "opengl"),
         )
+        plan = build_program_plan("tests/managed-graphics", reflected_target, ((key, stages, program),))
 
-        self.assertEqual(len(plan.stages), 1)
-        self.assertEqual(plan.stages[0].stage, "graphics")
+        self.assertEqual(len(plan.compiled_stages), 1)
+        self.assertEqual(plan.compiled_stages[0].stage, "graphics")
         self.assertEqual(
-            tuple(module["role"] for module in plan.stages[0].metadata["graphics_modules"]),
+            tuple(module["role"] for module in plan.compiled_stages[0].metadata["graphics_modules"]),
             ("vertex", "fragment"),
         )
-        canonical_program = plan.variants[0].canonical_program
-        assert canonical_program is not None
+        canonical_program = plan.variants[0].program
         operation = canonical_program["graphs"][0]["nodes"][0]["operation"]
         self.assertEqual(operation["render_pass"]["control"], 1)
         self.assertEqual(operation["draw"]["control"], 2)

@@ -4,7 +4,7 @@ import ast
 import json
 from collections.abc import Callable, Mapping
 
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from ..ad import ProgramTransformSpec
 from ..bundle import canonical_json
 from ..diagnostics import CompileError
@@ -29,7 +29,7 @@ def emit_mlir_module(
     attributes = [
         'vernon.frontend = "python"',
         f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64",
-        f"vernon.pipeline_version = {PIPELINE_VERSION} : i64",
+        f"vernon.program_version = {PROGRAM_VERSION} : i64",
     ]
     if dependencies:
         encoded = ", ".join(json.dumps(f"{path}={digest}") for path, digest in dependencies)

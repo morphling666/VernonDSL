@@ -53,25 +53,55 @@ def scale(
 
 triangle_asset = vd.program_asset(
     id="pipelines/triangle",
-    program=(triangle_vertex, solid_fragment),
+    program=vd.pipeline(
+        triangle_vertex,
+        solid_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((), (OFFSET,)),
 )
 
 sampled_asset = vd.program_asset(
     id="pipelines/sampled_triangle",
-    program=(triangle_vertex, sampled_fragment),
+    program=vd.pipeline(
+        triangle_vertex,
+        sampled_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
+
+sampled_depth_asset = vd.program_asset(
+    id="pipelines/sampled_depth_triangle",
+    program=vd.pipeline(
+        triangle_vertex,
+        sampled_fragment,
+        state=vd.graphics_state(
+            rasterization=vd.RasterizationState(front_face=vd.FrontFace.CLOCKWISE),
+            depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+        ),
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}, depth=vd.d32_float),
+    ),
     variants=((),),
 )
 
 resolution_asset = vd.program_asset(
     id="pipelines/resolution_triangle",
-    program=(triangle_vertex, resolution_fragment),
+    program=vd.pipeline(
+        triangle_vertex,
+        resolution_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((),),
 )
 
 opengl_runtime_acceptance_asset = vd.program_asset(
     id="pipelines/opengl_runtime_acceptance",
-    program=(triangle_vertex, opengl_runtime_acceptance_fragment),
+    program=vd.pipeline(
+        triangle_vertex,
+        opengl_runtime_acceptance_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((),),
 )
 

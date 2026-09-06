@@ -4,7 +4,7 @@
 // CHECK: [3]
 // CHECK-NOT: vernon.swizzle
 
-module attributes {vernon.compiler_contract_version = 14 : i64, vernon.pipeline_version = 18 : i64} {
+module attributes {vernon.compiler_contract_version = 14 : i64, vernon.program_version = 19 : i64} {
   func.func @swizzle_aliases(%input: tensor<4xf32>)
       -> (tensor<4xf32>, tensor<3xf32>, f32) {
     %rgba = "vernon.swizzle"(%input) {

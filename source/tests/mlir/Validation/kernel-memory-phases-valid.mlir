@@ -1,6 +1,6 @@
 // RUN: %vernon-opt --vernon-validate %s -o %t
 
-module attributes {vernon.compiler_contract_version = 14 : i64, vernon.pipeline_version = 18 : i64} {
+module attributes {vernon.compiler_contract_version = 14 : i64, vernon.program_version = 19 : i64} {
   func.func @same_lane_device_epoch(
       %scratch: !vernon.tensor_view<f32, [-1, -1, -1], "read_write", "device"> {
         vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64

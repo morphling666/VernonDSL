@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Any
 
 import vernon_dsl as vd
-from vernon_dsl.bundle import BundlePlan, CpuTargetOptions
-from vernon_dsl.program_assets import ProgramCompileError
+from vernon_dsl._program_assets.capture import CapturedProgram, capture_program
 
 
 class AutodiffDeclarationTests(unittest.TestCase):
@@ -56,7 +53,7 @@ class AutodiffDeclarationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "outputs paths must be unique"):
             vd.ad.vjp(compute, wrt=("value",), outputs=("loss", "loss"))
 
-    def test_graphics_vjp_contract_is_unchanged(self) -> None:
+    def test_graphics_tuple_vjp_is_not_an_authored_program_form(self) -> None:
         @vd.vertex
         def vertex(value: vd.f32) -> vd.f32:
             return value
@@ -65,49 +62,22 @@ class AutodiffDeclarationTests(unittest.TestCase):
         def fragment(value: vd.f32) -> vd.f32:
             return value
 
-        with self.assertRaisesRegex(ValueError, "custom rule set"):
+        with self.assertRaisesRegex(TypeError, r"must use vd\.pipeline"):
             vd.ad.vjp((vertex, fragment), wrt=("value",))
-        rules = vd.ad.rule_set(
-            id="render/v1",
-            rasterization=lambda: None,
-            visibility=lambda: None,
-            depth=lambda: None,
-            blend=lambda: None,
-            texture=lambda: None,
-        )
-        with self.assertRaisesRegex(ValueError, "does not accept compute Storage outputs"):
-            vd.ad.vjp((vertex, fragment), wrt=("value",), outputs=("loss",), rules=rules)
-
-    def test_bundle_schema_rejects_partial_differentiated_profiles(self) -> None:
-        with self.assertRaisesRegex(ProgramCompileError, "require both"):
-            BundlePlan(
-                "partial",
-                CpuTargetOptions(),
-                (),
-                (),
-                (),
-                transform={"kind": "vjp"},
-            )
 
 
-class AutodiffPipelineParsingTests(unittest.TestCase):
-    """The VJP transform a cooked asset carries comes from the typed vd.ad.vjp expression.
-
-    It used to be rebuilt from the AST and round-tripped through a dict. The typed ProgramTransformSpec is the same
-    record with its own validation, so there is one description of a transform rather than two.
-    """
-
+class AutodiffProgramCaptureTests(unittest.TestCase):
     @staticmethod
-    def _descriptor(directory: str, body: str, name: str = "asset") -> Any:
-        from vernon_dsl._program_assets.cooking import _load_program_asset_declaration, _stage_path_descriptor
+    def _capture(directory: str, body: str, name: str = "asset") -> CapturedProgram:
+        from vernon_dsl._program_assets.source import load_program_asset_declaration
 
         source = Path(directory) / "asset.py"
         source.write_text(body, encoding="utf-8")
-        return _stage_path_descriptor(_load_program_asset_declaration(source, name), source, name)
+        return capture_program(load_program_asset_declaration(source, name))
 
-    def test_the_declared_transform_reaches_the_stage_descriptor(self) -> None:
+    def test_the_declared_transform_reaches_canonical_capture(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            descriptor = self._descriptor(
+            captured = self._capture(
                 directory,
                 """
 import vernon_dsl as vd
@@ -125,13 +95,10 @@ asset = vd.program_asset(
 )
 """,
             )
-        self.assertIsNotNone(descriptor.transform)
-        assert descriptor.transform is not None
-        self.assertEqual(descriptor.transform["wrt"], ["value"])
-        self.assertEqual(descriptor.transform["output_cotangents"], ["loss"])
-        self.assertEqual(descriptor.stages["compute"].entry, "compute")
-        manifest = json.loads(descriptor.canonical_manifest)
-        self.assertEqual(manifest["transform"], descriptor.transform)
+        self.assertEqual(captured.id, "compute/vjp")
+        self.assertEqual(captured.variant_keys, ((),))
+        self.assertEqual(captured.variants[0].ir.vjp_wrt, ("value",))
+        self.assertTrue(captured.variants[0].ir.implementations)
 
     def test_a_named_vjp_program_describes_the_same_transform_as_an_inline_one(self) -> None:
         body = """
@@ -152,11 +119,10 @@ inline = vd.program_asset(
 )
 """
         with tempfile.TemporaryDirectory() as directory:
-            named = self._descriptor(directory, body, "named")
-            inline = self._descriptor(directory, body, "inline")
-        self.assertEqual(named.transform, inline.transform)
-        self.assertEqual(named.stages["compute"].entry, inline.stages["compute"].entry)
-        self.assertEqual(named.variants, inline.variants)
+            named = self._capture(directory, body, "named")
+            inline = self._capture(directory, body, "inline")
+        self.assertEqual(named.variant_keys, inline.variant_keys)
+        self.assertEqual(named.variants[0].ir.identity, inline.variants[0].ir.identity)
 
     def test_a_compute_vjp_without_storage_outputs_is_refused_at_declaration(self) -> None:
         @vd.kernel

@@ -12,7 +12,6 @@ if TYPE_CHECKING:
 from ._program_assets.artifact_io import encode_runtime_stage
 from ._program_assets.cooking import cook_program_asset
 from ._program_assets.declaration import ProgramAssetDeclaration, program_asset
-from ._program_assets.descriptors import ShaderModuleDescriptor, ShaderProgramDescriptor, ShaderStageReference
 from ._program_assets.parsing import ProgramAssetLint, lint_python_program_asset
 from .bundle import ProgramCompileError
 
@@ -41,9 +40,6 @@ __all__ = [
     "ProgramAssetDeclaration",
     "ProgramAssetLint",
     "ProgramCompileError",
-    "ShaderModuleDescriptor",
-    "ShaderProgramDescriptor",
-    "ShaderStageReference",
     "cook_program_asset",
     "encode_runtime_stage",
     "lint_python_program_asset",

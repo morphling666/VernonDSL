@@ -167,8 +167,9 @@ Value createDestinationPassingCompute(OpBuilder &builder, Location location, Str
     return result;
 }
 
-Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {}) {
-    if (source.getType() == destType)
+Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {},
+                bool forceBoundaryCopy = false) {
+    if (source.getType() == destType && !forceBoundaryCopy)
         return source;
     if (!isa<TensorViewType>(source.getType()) || !isa<TensorViewType>(destType))
         return {};
@@ -329,7 +330,8 @@ FailureOr<Value> retargetForwardComputeWithTape(ComputeOp compute) {
     return replacement->getResult(replacement->getNumResults() - 1);
 }
 
-FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const AutodiffVjpBuildContext &context, Value tape) {
+FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const AutodiffVjpBuildContext &context, Value tape,
+                                              llvm::function_ref<Value(Value)> lookupPrimal) {
     OpBuilder &builder = context.builder;
     SmallVector<Value> operands;
     if (tape)
@@ -360,8 +362,7 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
         operandNames.push_back(builder.getStringAttr(("primal." + cast<StringAttr>(name).getValue()).str()));
         operandRoles.push_back(builder.getStringAttr("retained_primal"));
         operandSources.push_back(name);
-        StringRef access = getProgramOperandAccess(operation, static_cast<unsigned>(index));
-        operandAccesses.push_back(builder.getStringAttr(access.empty() ? "read" : access));
+        operandAccesses.push_back(builder.getStringAttr("read"));
     }
     for (Attribute name : operation.getResultNames()) {
         operandNames.push_back(builder.getStringAttr(("result." + cast<StringAttr>(name).getValue()).str()));
@@ -422,6 +423,25 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
     state.addTypes(resultTypes);
     state.addAttribute("callee", builder.getStringAttr((Twine(operation.getCallee()) + ".vjp").str()));
     state.addAttribute("grid", operation.getGridAttr());
+    if (auto controls = operation->getAttrOfType<DenseI64ArrayAttr>("vernon_program.grid_control_arguments")) {
+        SmallVector<int64_t> remapped;
+        remapped.reserve(controls.size());
+        for (int64_t argument : controls.asArrayRef()) {
+            if (argument < 0) {
+                remapped.push_back(-1);
+                continue;
+            }
+            func::FuncOp function = operation->getParentOfType<func::FuncOp>();
+            Value mapped = function && static_cast<unsigned>(argument) < function.getNumArguments()
+                               ? lookupPrimal(function.getArgument(static_cast<unsigned>(argument)))
+                               : Value{};
+            auto backwardArgument = dyn_cast_or_null<BlockArgument>(mapped);
+            if (!backwardArgument)
+                return operation.emitOpError("Program VJP cannot retain a dynamic dispatch control");
+            remapped.push_back(backwardArgument.getArgNumber());
+        }
+        state.addAttribute("vernon_program.grid_control_arguments", builder.getDenseI64ArrayAttr(remapped));
+    }
     state.addAttribute("features", operation.getFeaturesAttr());
     state.addAttribute("operand_names", builder.getArrayAttr(operandNames));
     state.addAttribute(kOperandAccessesAttrName, builder.getArrayAttr(operandAccesses));
@@ -622,6 +642,8 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
 
     llvm::BitVector selected(primal.getNumArguments());
     SmallVector<unsigned> wrtIndices(options.wrtBoundaryIndices);
+    if (!options.wrtBoundaryPaths.empty() && options.wrtBoundaryPaths.size() != wrtIndices.size())
+        return primal.emitError("Program VJP wrt boundary paths do not match their selected inputs");
     for (unsigned index : wrtIndices) {
         if (index >= primal.getNumArguments() || selected.test(index))
             return primal.emitError("Program VJP requires unique valid wrt boundary indices");
@@ -634,6 +656,8 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     if (cotangentIndices.empty())
         for (unsigned index = 0; index < primal.getNumResults(); ++index)
             cotangentIndices.push_back(index);
+    if (!options.cotangentBoundaryPaths.empty() && options.cotangentBoundaryPaths.size() != cotangentIndices.size())
+        return primal.emitError("Program VJP cotangent boundary paths do not match their selected outputs");
     llvm::BitVector selectedCotangents(primal.getNumResults());
     for (unsigned index : cotangentIndices) {
         if (index >= primal.getNumResults() || selectedCotangents.test(index))
@@ -733,7 +757,10 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     }
     for (auto [cotangent, index] : llvm::enumerate(cotangentIndices)) {
         const unsigned argument = retainedValues.size() + cotangent;
-        if (StringRef name = resultSourceName(primal, index); !name.empty())
+        const StringRef name = options.cotangentBoundaryPaths.empty()
+                                   ? resultSourceName(primal, index)
+                                   : StringRef(options.cotangentBoundaryPaths[cotangent]);
+        if (!name.empty())
             backward.setArgAttr(argument, "vernon.source_name", builder.getStringAttr(name));
         backward.setArgAttr(argument, "vernon.autodiff_role", builder.getStringAttr("cotangent"));
         applyProgramLanguageAbi(backward, argument,
@@ -742,7 +769,9 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
                                 false);
     }
     for (auto [result, primalArgument] : llvm::enumerate(wrtIndices)) {
-        if (StringRef name = sourceName(primal, primalArgument); !name.empty())
+        const StringRef name = options.wrtBoundaryPaths.empty() ? sourceName(primal, primalArgument)
+                                                                : StringRef(options.wrtBoundaryPaths[result]);
+        if (!name.empty())
             backward.setResultAttr(result, "vernon.source_name", builder.getStringAttr(name));
         backward.setResultAttr(result, "vernon.autodiff_role", builder.getStringAttr("gradient"));
         applyProgramLanguageAbi(backward, static_cast<unsigned>(result),
@@ -811,7 +840,7 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
             Value tape;
             if (Value forwardTape = forwardTapes.lookup(operation))
                 tape = primals.lookup(forwardTape);
-            contributions = buildComputeVjp(compute, context, tape);
+            contributions = buildComputeVjp(compute, context, tape, lookupPrimal);
         } else if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "matmul") {
             contributions = buildProgramMatmulVjp(intrinsic, context);
         } else if (isa<arith::ConstantOp>(operation) ||
@@ -847,6 +876,8 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
         Type publicType = backwardResults[gradients.size()];
         if (!gradient)
             gradient = createZero(builder, primal.getLoc(), publicType, lookupPrimal(primalArgument));
+        else if (isa<TensorViewType>(publicType))
+            gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument), true);
         else if (gradient.getType() != publicType)
             gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument));
         if (!gradient)
@@ -858,6 +889,12 @@ LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &opti
     for (unsigned index = 0; index < retainedValues.size(); ++index)
         if (backward.getArgument(index).use_empty())
             unusedCaptures.set(index);
+    backward.walk([&](ComputeOp compute) {
+        if (auto controls = compute->getAttrOfType<DenseI64ArrayAttr>("vernon_program.grid_control_arguments"))
+            for (int64_t argument : controls.asArrayRef())
+                if (argument >= 0 && static_cast<unsigned>(argument) < unusedCaptures.size())
+                    unusedCaptures.reset(static_cast<unsigned>(argument));
+    });
     if (unusedCaptures.any() && failed(backward.eraseArguments(unusedCaptures)))
         return backward.emitError("cannot remove unused Program residual captures");
     if (failed(verify(forward)) || failed(verify(backward)))
@@ -910,6 +947,20 @@ struct VernonProgramVjpPass final : PassWrapper<VernonProgramVjpPass, OperationP
             if (failed(indices))
                 return signalPassFailure();
             selected.wrtBoundaryIndices = std::move(*indices);
+            selected.wrtBoundaryPaths.clear();
+            for (unsigned index : selected.wrtBoundaryIndices) {
+                const StringRef root = sourceName(primals.front(), index);
+                SmallVector<StringRef> paths;
+                for (const std::string &path : wrt)
+                    if (path == root ||
+                        (StringRef(path).starts_with(root) && path.size() > root.size() && path[root.size()] == '.'))
+                        paths.push_back(path);
+                if (paths.empty()) {
+                    primals.front().emitError("Program VJP selected boundary has no public path");
+                    return signalPassFailure();
+                }
+                selected.wrtBoundaryPaths.push_back(paths.size() == 1 ? paths.front().str() : root.str());
+            }
         }
         if (failed(buildProgramVjp(primals.front(), selected)))
             signalPassFailure();

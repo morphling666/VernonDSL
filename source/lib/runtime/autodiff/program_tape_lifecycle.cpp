@@ -31,7 +31,7 @@ bool carrierShape(const program::TargetBinding &binding, size_t bytes, std::vect
 
 } // namespace
 
-bool allocateProgramTapeState(ProgramInvocationFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
+bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
                               std::string &error) {
     size_t groupCount = 1;
     size_t workgroupVolume = 1;
@@ -63,7 +63,8 @@ bool allocateProgramTapeState(ProgramInvocationFrame &frame, VernonRuntimeContex
         return false;
     std::vector<gpu::Segment> segments(groupCount);
     for (size_t group = 0; group < groupCount; ++group)
-        if (!gpu::initializeSegment(state.grid, state.workgroup, group, state.stride, workgroupVolume, segments[group]))
+        if (!gpu::initializeBatchSegment(state.grid, state.workgroup, group, group, state.stride, workgroupVolume,
+                                         tapeBytes, segments[group]))
             return error = "Program replay segment initialization overflows", false;
     const gpu::BatchSummary clear{};
     const uint32_t launch[3]{state.grid.x, state.grid.y, state.grid.z};
@@ -75,17 +76,16 @@ bool allocateProgramTapeState(ProgramInvocationFrame &frame, VernonRuntimeContex
             frame.uploadCarrier(state.value, program_plan::TapeCarrier::LaunchMetadata, launch, sizeof(launch), error));
 }
 
-bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContext &context,
+bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &context,
                               const program::Program &execution, const VernonProgramTopology &topology,
                               const program::Graph &forward, std::vector<ProgramTapeState> &states,
                               std::string &error) {
     std::map<uint32_t, ProgramTapeState> byValue;
     for (const program::Node &node : forward.nodes) {
-        const auto stageIndex = topology.stageIndices.find(node.stage);
-        if (stageIndex == topology.stageIndices.end())
+        const auto nodePlan = topology.nodes.find({forward.direction, node.id});
+        if (nodePlan == topology.nodes.end())
             return error = "Program tape stage is not resolved", false;
-        const VernonResolvedProgramStage &stage = topology.stages[stageIndex->second];
-        for (const VernonProgramStageBinding &binding : stage.bindings) {
+        for (const VernonProgramStageBinding &binding : nodePlan->second.bindings) {
             if (!binding.target || !binding.target->tapeCarrier)
                 continue;
             ProgramTapeState &state = byValue[binding.value];
@@ -93,14 +93,14 @@ bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContex
             if (program::executionKind(node) != program::ExecutionKind::Compute)
                 return error = "graphics Program nodes cannot carry autodiff tape dispatch metadata", false;
             const program::ComputeOperation &compute = program::computeOperation(node);
+            uint64_t grid[3]{};
             for (size_t axis = 0; axis < 3; ++axis)
-                if (compute.workgroups[axis].kind != program::ControlKind::Static ||
-                    compute.workgroups[axis].value > std::numeric_limits<uint32_t>::max())
-                    return error = "Program tape dispatch requires resolved static workgroups", false;
-            state.grid = {static_cast<uint32_t>(compute.workgroups[0].value),
-                          static_cast<uint32_t>(compute.workgroups[1].value),
-                          static_cast<uint32_t>(compute.workgroups[2].value)};
-            state.workgroup = stage.pipeline->workgroupSize;
+                if (!frame.resolveControl(execution, compute.workgroups[axis], grid[axis], error) || !grid[axis] ||
+                    grid[axis] > std::numeric_limits<uint32_t>::max())
+                    return error = error.empty() ? "Program tape dispatch control is invalid" : error, false;
+            state.grid = {static_cast<uint32_t>(grid[0]), static_cast<uint32_t>(grid[1]),
+                          static_cast<uint32_t>(grid[2])};
+            state.workgroup = nodePlan->second.pipeline->workgroupSize;
             switch (*binding.target->tapeCarrier) {
             case program_plan::TapeCarrier::TapeData:
                 state.tape = &*binding.target;
@@ -141,7 +141,7 @@ bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContex
     return true;
 }
 
-bool validateProgramTapeStates(ProgramInvocationFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
+bool validateProgramTapeStates(LogicalValueFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error) {
     retry = false;
     for (ProgramTapeState &state : states) {

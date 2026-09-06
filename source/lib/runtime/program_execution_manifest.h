@@ -92,6 +92,7 @@ struct GraphicsFragmentOutput {
 
 struct CompiledEndpointAbi {
     std::string module;
+    std::string interfaceKind;
     uint32_t index{};
     std::string builtin;
     std::string valueTransport;
@@ -157,7 +158,7 @@ enum class StorageMutability {
 
 enum class ControlKind {
     Static,
-    Argument,
+    Value,
     Parameter,
     Capture,
 };
@@ -265,6 +266,7 @@ struct Value {
 enum class GraphInputKind {
     UserInput,
     InvocationControl,
+    Control,
     Parameter,
     Allocation,
 };
@@ -273,6 +275,7 @@ struct GraphInput {
     GraphInputKind kind{GraphInputKind::UserInput};
     uint32_t value{};
     uint32_t slot{};
+    uint32_t axis{};
     uint32_t parameter{};
     uint32_t storage{};
 };
@@ -287,14 +290,26 @@ enum class BindingTag {
     Resource,
 };
 
+enum class ValueBindingDirection {
+    Input,
+    Result,
+};
+
+struct ValueEndpointProjection {
+    uint32_t value{};
+    std::optional<uint32_t> leaf;
+    uint32_t physicalLeaf{};
+    ValueBindingDirection direction{ValueBindingDirection::Input};
+};
+
 struct EndpointBinding {
     std::string module;
     std::string interfaceKind;
     uint32_t index{};
     BindingTag tag{BindingTag::Value};
-    uint32_t value{};
+    std::vector<ValueEndpointProjection> projections;
     uint32_t access{};
-    std::optional<uint32_t> leaf;
+    std::optional<uint32_t> resourceLeaf;
 };
 
 enum class AccessKind {
@@ -427,6 +442,7 @@ struct ProgramOwnerId {
 enum class BoundaryPublication {
     None,
     CommitAfterSuccess,
+    InPlace,
 };
 
 struct BoundarySlot {
@@ -527,9 +543,9 @@ struct ResolvedProgram {
 };
 
 bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic);
-bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic);
-bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<std::string, std::string> &stageBindings,
-             ResolvedProgram &resolved, Diagnostic &diagnostic);
+bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs, const nlohmann::json &value,
+                         ArtifactSystem &artifacts, Diagnostic &diagnostic);
+bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &resolved, Diagnostic &diagnostic);
 const Graph *findGraph(const Program &program, std::string_view direction);
 std::vector<uint32_t> residualCaptures(const Program &program);
 void markGraphValues(const Graph &graph, std::vector<char> &live);

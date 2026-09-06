@@ -4,7 +4,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION, RELEASE_VERSION
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION, RELEASE_VERSION
 
 
 def test_generated_versions_are_current() -> None:
@@ -19,4 +19,4 @@ def test_generated_versions_are_current() -> None:
 def test_public_version_axes_are_valid() -> None:
     assert RELEASE_VERSION
     assert COMPILER_CONTRACT_VERSION > 0
-    assert PIPELINE_VERSION > COMPILER_CONTRACT_VERSION
+    assert PROGRAM_VERSION > COMPILER_CONTRACT_VERSION

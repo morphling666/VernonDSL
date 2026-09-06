@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 
@@ -53,7 +54,7 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
     EXPECT_FALSE(std::string_view(gradientMetadata.path.data, gradientMetadata.path.size).empty());
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline), 4u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline), 3u);
     VernonAdDerivativeGroupView group{sizeof(VernonAdDerivativeGroupView)};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, 0, &group), VERNON_STATUS_OK);
     EXPECT_EQ(group.role, VERNON_AD_DERIVATIVE_GRADIENT);
@@ -68,15 +69,15 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     };
     VernonProgramParameterView valueParameter{};
     ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"value", 5}, &valueParameter), VERNON_STATUS_OK);
-    ASSERT_EQ(valueParameter.rank, 1u);
-    EXPECT_EQ(valueParameter.static_shape[0], 2u);
+    EXPECT_EQ(valueParameter.rank, 0u);
     VernonProgramValueLeafView valueLeaf{sizeof(VernonProgramValueLeafView)};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, {"value", 5}, 0, &valueLeaf),
               VERNON_STATUS_OK);
     EXPECT_EQ(valueLeaf.value.dtype, VERNON_DATA_F32);
-    EXPECT_EQ(valueLeaf.value.scalar_count, 1u);
+    EXPECT_EQ(valueLeaf.value.scalar_count, 2u);
     EXPECT_EQ(valueLeaf.value.byte_offset, 0u);
-    EXPECT_EQ(valueLeaf.static_rank, 0u);
+    ASSERT_EQ(valueLeaf.static_rank, 1u);
+    EXPECT_EQ(valueLeaf.static_shape[0], 2u);
     EXPECT_EQ(valueLeaf.path_count, 0u);
 
     VernonProgramValueLeafView scaleLeaf{sizeof(VernonProgramValueLeafView)};
@@ -103,19 +104,41 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
 
     const uint64_t tensorShape[]{2};
     float value[]{2.0f, 3.0f};
-    float scale = 4.0f;
-    float bias = 1.0f;
+    struct Parameters {
+        float scale;
+        float bias;
+    } parameters{4.0f, 1.0f};
     float outputValues[2]{};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, value, sizeof(value), 1, tensorShape},
-        {sizeof(VernonAdValue), {"parameters.inner.scale", 22}, VERNON_DATA_F32, &scale, sizeof(scale), {}},
-        {sizeof(VernonAdValue), {"parameters.inner.bias", 21}, VERNON_DATA_F32, &bias, sizeof(bias), {}},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 1, tensorShape},
+    VernonProgramParameterView parametersParameter{};
+    VernonProgramParameterView outputParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"parameters", 10}, &parametersParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"output", 6}, &outputParameter), VERNON_STATUS_OK);
+    const int64_t tensorStrides[]{sizeof(float)};
+    auto argument = [&](const VernonProgramParameterView &parameter, void *data, size_t byteSize, uint32_t rank,
+                        const uint64_t *shape, const int64_t *strides) {
+        VernonProgramArgument result{};
+        result.slot = parameter.slot;
+        result.kind = VERNON_PROGRAM_TENSOR;
+        result.tensor.struct_size = sizeof(VernonTensorView);
+        result.tensor.storage = VERNON_TENSOR_HOST;
+        result.tensor.host_data = data;
+        result.tensor.element_layout = parameter.element_layout;
+        result.tensor.access = parameter.access;
+        result.tensor.rank = rank;
+        result.tensor.shape = shape;
+        result.tensor.byte_strides = strides;
+        result.tensor.byte_size = byteSize;
+        return result;
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    VernonProgramArgument arguments[]{
+        argument(valueParameter, value, sizeof(value), 0, nullptr, nullptr),
+        argument(parametersParameter, &parameters, sizeof(parameters), 0, nullptr, nullptr),
+        argument(outputParameter, outputValues, sizeof(outputValues), 1, tensorShape, tensorStrides),
+    };
     VernonPullback *rejectedPullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdProgramForward(pipeline, {2, 1, 1}, &inputs, &outputs, &rejectedPullback),
+    EXPECT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {2, 1, 1},
+                                                                &rejectedPullback),
               VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(rejectedPullback, nullptr);
     EXPECT_NE(lastError(context).find("dispatch grid axis 0 must equal 1"), std::string::npos);
@@ -123,7 +146,9 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     EXPECT_FLOAT_EQ(outputValues[1], 0.0f);
 
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &inputs, &outputs, &pullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {1, 1, 1},
+                                                                &pullback),
+              VERNON_STATUS_OK)
         << lastError(context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(outputValues[0], 9.0f);

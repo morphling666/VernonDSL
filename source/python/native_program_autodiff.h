@@ -42,6 +42,10 @@ PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, Ver
 
 bool pythonAdViewsOverlap(const PythonAdViewDescriptor &left, const PythonAdViewDescriptor &right);
 
+inline nb::object pythonAdArraySource(const nb::object &source) {
+    return nb::hasattr(source, "_native_host_array") ? source.attr("_native_host_array")() : source;
+}
+
 struct PythonAdValue {
     std::string path;
     nb::object source;
@@ -53,8 +57,8 @@ struct PythonAdValue {
 
     PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source,
                   uint32_t access = VERNON_ACCESS_READ)
-        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(source)), array(this->source),
-          writable(access != VERNON_ACCESS_READ) {
+        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(pythonAdArraySource(source))),
+          array(this->source), writable(access != VERNON_ACCESS_READ) {
         originalView = validatePythonAdOriginalView(this->path, dtype, shape, this->source, writable);
         this->shape = originalView.shape;
         if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous"))) {
@@ -425,23 +429,29 @@ private:
         std::vector<VernonAdValue> seedViews;
         VernonAdValueSet seedSet{};
         const VernonAdValueSet *seedView = nullptr;
-        if (!cotangent.is_none()) {
-            const auto seedMetadata = [&](const PythonAdMetadata &metadata) {
-                PythonAdMetadata logical = metadata;
-                if (logicalCotangent && hasCarrierDimensions) {
-                    if (logical.shape.size() < 3)
-                        throw std::runtime_error("autodiff cotangent has no invocation carrier dimensions");
-                    logical.shape.erase(logical.shape.begin(), logical.shape.begin() + 3);
-                }
-                return logical;
-            };
+        const auto seedMetadata = [&](const PythonAdMetadata &metadata) {
+            PythonAdMetadata logical = metadata;
+            if (logicalCotangent && hasCarrierDimensions) {
+                if (logical.shape.size() < 3)
+                    throw std::runtime_error("autodiff cotangent has no invocation carrier dimensions");
+                logical.shape.erase(logical.shape.begin(), logical.shape.begin() + 3);
+            }
+            return logical;
+        };
+        nb::object suppliedCotangent = cotangent;
+        if (suppliedCotangent.is_none() && cotangents.size() == 1) {
+            const PythonAdMetadata metadata = seedMetadata(cotangents.front());
+            suppliedCotangent = nb::module_::import_("numpy").attr("ones")(
+                metadata.shape, nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(metadata.dtype)));
+        }
+        if (!suppliedCotangent.is_none()) {
             if (cotangents.size() == 1) {
                 const PythonAdMetadata metadata = seedMetadata(cotangents.front());
-                seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape, cotangent);
+                seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape, suppliedCotangent);
             } else {
-                if (!nb::isinstance<nb::dict>(cotangent))
+                if (!nb::isinstance<nb::dict>(suppliedCotangent))
                     throw std::invalid_argument("aggregate pullback cotangent must be a leaf-path dictionary");
-                nb::dict values = nb::cast<nb::dict>(cotangent);
+                nb::dict values = nb::cast<nb::dict>(suppliedCotangent);
                 if (values.size() != cotangents.size())
                     throw std::invalid_argument("aggregate pullback requires every output cotangent leaf");
                 for (const PythonAdMetadata &carriedMetadata : cotangents) {
@@ -570,10 +580,8 @@ struct PythonProgramExecutable {
     void programForwardBound(ProgramInvocationBuilder &builder) {
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("Program invocation builder belongs to another pipeline");
-        std::vector<VernonProgramArgument> arguments;
-        VernonProgramSubmitDescriptor invocation = builder.invocation(arguments);
         VernonPullback *pullback = nullptr;
-        const VernonStatus status = vernonRuntimeProgramForward(pipeline, &invocation, &pullback);
+        const VernonStatus status = builder.forwardProgram(&pullback);
         if (pullback)
             vernonPullbackDestroy(pullback);
         if (status != VERNON_STATUS_OK)
@@ -635,13 +643,11 @@ struct PythonProgramExecutable {
         nb::dict outputs;
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("Program invocation builder belongs to another pipeline");
-        std::vector<VernonProgramArgument> arguments;
-        VernonProgramSubmitDescriptor invocation = builder.invocation(arguments);
         VernonPullback *pullback = nullptr;
-        const VernonStatus status = vernonRuntimeProgramForward(pipeline, &invocation, &pullback);
+        const VernonStatus status = builder.forwardProgram(&pullback);
         if (status != VERNON_STATUS_OK) {
             const std::string error = nativeStringView(vernonRuntimeGetLastError(runtime));
-            if (error.find("memory budget") != std::string::npos)
+            if (status == VERNON_STATUS_INVALID_ARGUMENT || error.find("memory budget") != std::string::npos)
                 throw std::invalid_argument(error);
             throw std::runtime_error("Program autodiff forward failed: " + error);
         }
@@ -660,6 +666,8 @@ struct PythonProgramExecutable {
         for (size_t index = 0; index < cotangentCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("cotangent", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path);
+            if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
+                leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
             cotangents.push_back(std::move(leaf));
         }
@@ -668,6 +676,8 @@ struct PythonProgramExecutable {
         for (size_t index = 0; index < gradientCount; ++index) {
             PythonAdMetadata leaf = leafMetadata("gradient", index);
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path);
+            if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
+                leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
             gradients.push_back(std::move(leaf));
         }
@@ -824,9 +834,13 @@ struct PythonProgramExecutable {
         } else {
             forwardStatus = vernonAdProgramForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
         }
-        if (forwardStatus != VERNON_STATUS_OK)
-            throw std::runtime_error("autodiff forward invocation failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
+        if (forwardStatus != VERNON_STATUS_OK) {
+            const std::string message =
+                "autodiff forward invocation failed: " + nativeStringView(vernonRuntimeGetLastError(runtime));
+            if (forwardStatus == VERNON_STATUS_INVALID_ARGUMENT)
+                throw std::invalid_argument(message);
+            throw std::runtime_error(message);
+        }
         if (!encodedBuilder)
             for (PythonAdValue &input : inputValues)
                 input.commit();
@@ -938,7 +952,7 @@ struct PythonProgramExecutable {
         }
         VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_VERSION;
+        invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = arguments.data();
         invocation.argument_count = arguments.size();
         invocation.compute_grid = {x, y, z};
@@ -980,7 +994,31 @@ struct PythonProgramExecutable {
             VernonProgramParameterView view{};
             if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &view) != VERNON_STATUS_OK)
                 throw std::runtime_error("cannot read loaded pipeline parameter");
-            result.push_back(parameterMetadata(view));
+            ProgramParameterMetadata parameter = parameterMetadata(view);
+            parameter.elementLeafPaths.reserve(parameter.elementLeaves.size());
+            parameter.elementLeafShapes.reserve(parameter.elementLeaves.size());
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+                VernonProgramValueLeafView leaf{};
+                leaf.struct_size = sizeof(leaf);
+                const VernonStringView name{parameter.name.data(), parameter.name.size()};
+                if (vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, name, leafIndex, &leaf) !=
+                    VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot read loaded Program parameter leaf path");
+                std::vector<ProgramParameterMetadata::PathComponent> path;
+                path.reserve(leaf.path_count);
+                for (size_t componentIndex = 0; componentIndex < leaf.path_count; ++componentIndex) {
+                    const VernonValuePathComponentView &component = leaf.path[componentIndex];
+                    path.push_back({component.kind == VERNON_VALUE_PATH_FIELD,
+                                    component.kind == VERNON_VALUE_PATH_FIELD ? nativeStringView(component.field) : "",
+                                    component.index});
+                }
+                parameter.elementLeafPaths.push_back(std::move(path));
+                std::vector<uint64_t> shape;
+                if (leaf.static_shape)
+                    shape.assign(leaf.static_shape, leaf.static_shape + leaf.static_rank);
+                parameter.elementLeafShapes.push_back(std::move(shape));
+            }
+            result.push_back(std::move(parameter));
         }
         return result;
     }

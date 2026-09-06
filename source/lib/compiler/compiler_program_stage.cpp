@@ -99,8 +99,9 @@ llvm::json::Object programValueCarrier(llvm::StringRef tag, int64_t slot, const 
                               {"alignment", layout.getInteger("alignment").value_or(0)}};
 }
 
-llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module, int64_t index) {
-    llvm::json::Object compiled{{"module", module.str()}, {"index", index}};
+llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module,
+                                              llvm::StringRef interfaceKind, int64_t index) {
+    llvm::json::Object compiled{{"module", module.str()}, {"interface", interfaceKind.str()}, {"index", index}};
     if (const std::optional<llvm::StringRef> builtin =
             row.getString("vernon.builtin") ? row.getString("vernon.builtin") : row.getString("builtin"))
         compiled["builtin"] = builtin->str();
@@ -123,17 +124,32 @@ llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llv
     return compiled;
 }
 
-bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, std::map<std::string, int64_t> &boundValues,
+bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, ProgramNodeBindingIndex &boundValues,
                               std::string &error) {
     boundValues.clear();
     for (const llvm::json::Value &bindingValue : rawBindings) {
         const llvm::json::Object *binding = bindingValue.getAsObject();
         const std::optional<llvm::StringRef> name = binding ? binding->getString("parameter") : std::nullopt;
+        const std::optional<llvm::StringRef> endpoint = binding ? binding->getString("endpoint") : std::nullopt;
         const std::optional<int64_t> value = binding ? binding->getInteger("value") : std::nullopt;
-        if (!name || name->empty() || !value || !boundValues.emplace(name->str(), *value).second) {
-            error = "canonical compute node has invalid or duplicate parameter bindings";
+        const std::optional<int64_t> leaf = binding ? binding->getInteger("leaf") : std::nullopt;
+        if (!name || name->empty() || !value) {
+            error = "canonical compute node has an invalid parameter binding";
             return false;
         }
+        const std::optional<int64_t> physicalLeaf = binding ? binding->getInteger("physical_leaf") : std::nullopt;
+        auto &projections = boundValues[endpoint ? endpoint->str() : name->str()];
+        const auto duplicate = llvm::find_if(projections, [&](const ProgramLogicalBinding &existing) {
+            return existing.value == *value && existing.leaf == leaf;
+        });
+        if (duplicate != projections.end()) {
+            error = "canonical compute node endpoint '" + (endpoint ? endpoint->str() : name->str()) +
+                    "' has a duplicate projection of value " + std::to_string(*value) +
+                    (leaf ? " leaf " + std::to_string(*leaf) : "") + " at physical leaves " +
+                    std::to_string(duplicate->physicalLeaf) + " and " + std::to_string(physicalLeaf.value_or(0));
+            return false;
+        }
+        projections.push_back({*value, leaf, physicalLeaf.value_or(0)});
     }
     return true;
 }
@@ -208,7 +224,10 @@ bool verifyProgramEndpointAbi(const ProgramEndpointExpectation &expected, const 
                                                      : compatibleProgramBindingShape(expected.role, expected.carrier,
                                                                                      expected.shape, actualShape);
     if ((expected.dtype && actualDtype && *expected.dtype != *actualDtype) || !shapeMatches) {
-        error = "compiled endpoint dtype, shape, or value layout does not match its Program Value";
+        error = "compiled endpoint does not match its Program Value (dtype " + expected.dtype.value_or("<none>").str() +
+                " vs " + actualDtype.value_or("<none>").str() + ", rank " +
+                std::to_string(expected.shape ? expected.shape->size() : 0) + " vs " +
+                std::to_string(actualShape ? actualShape->size() : 0) + ")";
         return false;
     }
     return true;

@@ -9,7 +9,7 @@ from unittest import mock
 
 import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.abi import attribute_layout, value_leaves
 from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
@@ -127,7 +127,7 @@ class LanguageVersionTests(unittest.TestCase):
             "abi_layout.py",
         )
         self.assertIn(f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64", output)
-        self.assertIn(f"vernon.pipeline_version = {PIPELINE_VERSION} : i64", output)
+        self.assertIn(f"vernon.program_version = {PROGRAM_VERSION} : i64", output)
         self.assertIn('abi_leaf_dtypes = ["f32", "f64"]', output)
         self.assertNotIn("abi_alignment", output)
         self.assertNotIn("abi_field_offsets", output)
@@ -216,7 +216,7 @@ class LanguageVersionTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result.semantic_inputs["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-            self.assertEqual(result.semantic_inputs["pipeline_version"], PIPELINE_VERSION)
+            self.assertEqual(result.semantic_inputs["program_version"], PROGRAM_VERSION)
             self.assertEqual(result.semantic_inputs["captured_constants"], [["LIMIT", "int", 3]])
 
     def test_semantic_identity_contains_concrete_helper_specializations(self) -> None:

@@ -40,6 +40,8 @@ struct ReflectedArgument {
     std::string sourceName;
     std::string kind;
     std::string builtin;
+    std::string autodiffRole;
+    std::optional<VernonDataType> dtype;
     bool result{};
     uint32_t index{UINT32_MAX};
     PhysicalArgumentLayout physical;

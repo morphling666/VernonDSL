@@ -14,7 +14,7 @@ struct VernonProgramBundle;
 struct VernonRuntimeContext;
 
 namespace vernon::runtime::ad {
-class ProgramInvocationFrame;
+class LogicalValueFrame;
 }
 
 namespace vernon::runtime {
@@ -52,7 +52,7 @@ VernonStatus invokeBackendPipeline(VernonProgramExecutable &pipeline, const Vern
                                    const PlannedGraphicsInvocation &plan);
 VernonStatus invokeBackendComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &plan);
 VernonStatus executePipelineProgramGraph(VernonProgramExecutable &pipeline, const program::Graph &graph,
-                                         ad::ProgramInvocationFrame &frame);
+                                         ad::LogicalValueFrame &frame);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);

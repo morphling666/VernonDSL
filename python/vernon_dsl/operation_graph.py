@@ -379,7 +379,7 @@ class OperationGraph:
         for path, value in outputs.items():
             if _resource_owner(value) is not None:
                 resolved[path] = self._current_version(value)
-        if not resolved and not any(isinstance(node, GraphicsCallOp) for node in self._nodes):
+        if not resolved and not any(isinstance(node, (KernelCallOp, GraphicsCallOp)) for node in self._nodes):
             raise ValueError("Module.forward() must return at least one Program buffer")
         self._outputs = resolved
         self._validate()

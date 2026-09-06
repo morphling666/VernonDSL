@@ -13,8 +13,9 @@ import copy
 import hashlib
 from typing import Any, Mapping
 
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from .requirements import runtime_requirements
-from .types import BundlePlan, ProgramCompileError, canonical_json
+from .types import BundlePlan, ProgramCompileError, ProgramVariantPlan, canonical_json
 
 
 def _stage_artifact(
@@ -23,7 +24,7 @@ def _stage_artifact(
     descriptor: Mapping[str, Any],
     contract: Mapping[str, Any],
     target: str,
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """The blob, artifact row, and contract hash one logical Program stage deploys to."""
 
     path = descriptor.get("path")
@@ -79,24 +80,22 @@ def _stage_artifact(
     implementation = implementations.get(logical_stage) if isinstance(implementations, Mapping) else None
     if isinstance(implementation, Mapping):
         artifact["implementation"] = copy.deepcopy(dict(implementation))
-    return blob, artifact, contract_hash
+    return blob, artifact
 
 
-def deploy_program_variant(
+def _deploy_program_variant(
     plan: BundlePlan,
-    variant: Any,
+    variant: ProgramVariantPlan,
     artifact_descriptors: Mapping[str, Mapping[str, Any]],
-) -> tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, str]]:
-    if variant.canonical_program is None:
-        raise ProgramCompileError("canonical deployment has no Program")
-    canonical_stage_rows = variant.canonical_program.get("stages")
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    canonical_stage_rows = variant.program.get("stages")
     if not isinstance(canonical_stage_rows, Mapping):
         raise ProgramCompileError("canonical deployment has no logical stages")
-    stages = {stage.id: stage for stage in plan.stages}
+    stages = {stage.id: stage for stage in plan.compiled_stages}
     blobs: dict[str, Any] = {}
     artifacts: dict[str, Any] = {}
-    stage_bindings: dict[str, str] = {}
-    for logical_stage, implementation_stage in variant.program.items():
+    aggregate_stages = []
+    for logical_stage, implementation_stage in variant.stage_implementations.items():
         stage = stages.get(implementation_stage)
         descriptor = artifact_descriptors.get(implementation_stage)
         contracts = stage.metadata.get("program_contracts") if stage is not None else None
@@ -106,43 +105,82 @@ def deploy_program_variant(
             raise ProgramCompileError(f"canonical stage {logical_stage} is incomplete")
         if not isinstance(canonical_stage, Mapping):
             raise ProgramCompileError(f"canonical Program has no logical stage {logical_stage!r}")
-        blob, artifact, contract_hash = _stage_artifact(
+        blob, artifact = _stage_artifact(
             logical_stage,
             stage,
             descriptor,
             contract,
             plan.target.target,
         )
-        if canonical_stage.get("contract_hash") != contract_hash:
+        if canonical_stage.get("contract_hash") != artifact["contract_hash"]:
             raise ProgramCompileError(f"canonical stage {logical_stage} contract hash disagrees with its Program")
         blobs[blob["sha256"]] = blob
         artifacts[logical_stage] = artifact
-        stage_bindings[logical_stage] = logical_stage
+        graphics_stages = stage.metadata.get("graphics_compiled_stages")
+        aggregate_stages.extend(graphics_stages if isinstance(graphics_stages, tuple) else (stage,))
+    requirements = runtime_requirements(plan.target.target, aggregate_stages)
+    if requirements is None:
+        raise ProgramCompileError("canonical Program variant has no runtime requirements")
+    requirements = dict(requirements)
+    requirements.pop("compute_workgroup_size", None)
     return (
-        copy.deepcopy(dict(variant.canonical_program)),
-        {"target": copy.deepcopy(plan.target.spec), "blobs": blobs, "artifacts": artifacts},
-        stage_bindings,
+        {
+            "key": list(variant.key),
+            "program": copy.deepcopy(dict(variant.program)),
+            "artifact_system": {
+                "runtime_requirements": requirements,
+                "artifacts": artifacts,
+            },
+        },
+        blobs,
     )
 
 
-def deploy_program_variants(
+def build_program_deployment(
+    plan: BundlePlan,
+    variant: ProgramVariantPlan,
+    artifact_descriptors: Mapping[str, Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    """Build one canonical Program and its exact variant ArtifactSystem."""
+
+    deployed, _ = _deploy_program_variant(plan, variant, artifact_descriptors)
+    return deployed["program"], deployed["artifact_system"]
+
+
+def build_program_manifest(
     plan: BundlePlan,
     artifact_descriptors: Mapping[str, Mapping[str, Any]],
-) -> list[dict[str, Any]]:
-    """Deploy every variant of a canonical Program plan."""
+) -> dict[str, Any]:
+    """Materialize every planned variant into the exact Program bundle envelope."""
 
-    variants = []
+    stages = {stage.id: stage for stage in plan.compiled_stages}
+    if set(artifact_descriptors) != set(stages):
+        raise ProgramCompileError("artifact descriptors do not exactly match planned compiled stages")
+    for stage_id, descriptor in artifact_descriptors.items():
+        if descriptor.get("sha256") != stages[stage_id].artifact.sha256:
+            raise ProgramCompileError(f"artifact descriptor digest does not match compiled stage {stage_id}")
+
+    variants: list[dict[str, Any]] = []
+    blobs: dict[str, Any] = {}
     for variant in plan.variants:
-        program, artifact_system, stage_bindings = deploy_program_variant(plan, variant, artifact_descriptors)
-        variants.append(
-            {
-                "key": list(variant.key),
-                "program": dict(program),
-                "artifact_system": dict(artifact_system),
-                "stage_bindings": dict(stage_bindings),
-            }
-        )
-    return variants
+        deployed, variant_blobs = _deploy_program_variant(plan, variant, artifact_descriptors)
+        variants.append(deployed)
+        for blob_id, blob in variant_blobs.items():
+            previous = blobs.get(blob_id)
+            if previous is not None and previous != blob:
+                raise ProgramCompileError(f"Program variants disagree on Blob {blob_id}")
+            blobs[blob_id] = blob
+    manifest: dict[str, Any] = {
+        "compiler_contract_version": COMPILER_CONTRACT_VERSION,
+        "program_version": PROGRAM_VERSION,
+        "type": "program",
+        "id": plan.program_id,
+        "target": copy.deepcopy(plan.target.spec),
+        "blobs": blobs,
+        "variants": variants,
+    }
+    manifest["content_hash"] = hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest()
+    return manifest
 
 
-__all__ = ["deploy_program_variant", "deploy_program_variants"]
+__all__ = ["build_program_deployment", "build_program_manifest"]

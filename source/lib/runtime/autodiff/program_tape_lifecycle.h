@@ -17,12 +17,12 @@ struct ProgramTapeState {
     size_t stride{16};
 };
 
-bool allocateProgramTapeState(ProgramInvocationFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
+bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
                               std::string &error);
-bool prepareProgramTapeStates(ProgramInvocationFrame &frame, VernonRuntimeContext &context,
+bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &context,
                               const program::Program &execution, const VernonProgramTopology &topology,
                               const program::Graph &forward, std::vector<ProgramTapeState> &states, std::string &error);
-bool validateProgramTapeStates(ProgramInvocationFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
+bool validateProgramTapeStates(LogicalValueFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error);
 
 } // namespace vernon::runtime::ad

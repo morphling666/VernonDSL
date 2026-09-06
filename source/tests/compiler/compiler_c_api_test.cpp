@@ -276,14 +276,31 @@ module {
     EXPECT_FALSE(canonical.contains("signature"));
     const nlohmann::json &abi = canonical.at("abi");
     ASSERT_EQ(abi.at("boundary_slots").size(), 2u);
-    EXPECT_EQ(abi.at("boundary_slots").at(0).at("id"), 0);
-    EXPECT_EQ(abi.at("boundary_slots").at(0).at("path"), "source");
-    EXPECT_EQ(abi.at("boundary_slots").at(0).at("direction"), "input");
-    EXPECT_EQ(abi.at("boundary_slots").at(0).at("category"), "value");
-    EXPECT_EQ(abi.at("boundary_slots").at(0).at("logical_type"), "f32");
-    EXPECT_TRUE(abi.at("boundary_slots").at(0).contains("value_layout"));
-    EXPECT_EQ(abi.at("boundary_slots").at(1).at("id"), 1);
-    EXPECT_EQ(abi.at("boundary_slots").at(1).at("direction"), "output");
+    const nlohmann::json &inputValue = canonical.at("values").at(0);
+    const nlohmann::json &outputValue = canonical.at("values").at(1);
+    EXPECT_EQ(abi.at("boundary_slots").at(0), nlohmann::json({{"id", 0},
+                                                              {"path", "source"},
+                                                              {"value", 0},
+                                                              {"role", "input"},
+                                                              {"direction", "input"},
+                                                              {"category", "value"},
+                                                              {"access", "read"},
+                                                              {"logical_type", inputValue.at("type")},
+                                                              {"outer_shape", inputValue.at("shape")},
+                                                              {"alias_owner", "value:0"},
+                                                              {"value_layout", inputValue.at("value_layout")}}));
+    EXPECT_EQ(abi.at("boundary_slots").at(1), nlohmann::json({{"id", 1},
+                                                              {"path", "output"},
+                                                              {"value", 1},
+                                                              {"role", "output"},
+                                                              {"direction", "output"},
+                                                              {"category", "value"},
+                                                              {"access", "write"},
+                                                              {"logical_type", outputValue.at("type")},
+                                                              {"outer_shape", outputValue.at("shape")},
+                                                              {"alias_owner", "value:1"},
+                                                              {"value_layout", outputValue.at("value_layout")},
+                                                              {"publication", "commit_after_success"}}));
     EXPECT_TRUE(abi.at("derivative_projections").empty());
     const nlohmann::json &contract = finalizedJson.at("stage_contracts").at(requestId);
     EXPECT_EQ(contract.at("operation"), "compute");
@@ -466,7 +483,7 @@ module {
         }]}
       },
       "target": {"kind": "metal", "options": {}},
-      "pipeline_version": 1
+      "program_version": 1
     })json";
     static const char fragmentReflection[] = R"json({
       "entries": [
@@ -494,7 +511,7 @@ module {
         }]}
       },
       "target": {"kind": "metal", "options": {}},
-      "pipeline_version": 1
+      "program_version": 1
     })json";
     static const char mismatchedFragmentReflection[] = R"json({
       "entries": [{
@@ -511,7 +528,7 @@ module {
       "required_features": [],
       "implementation": {"target": "vulkan", "metadata": {}},
       "target": {"kind": "vulkan", "options": {}},
-      "pipeline_version": 1
+      "program_version": 1
     })json";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
@@ -584,10 +601,12 @@ module {
     EXPECT_EQ(node.at("operation").at("dynamic_state").at("control"), 3);
     EXPECT_FALSE(node.at("operation").contains("render_area"));
     const nlohmann::json &targetAbi = canonical.at("abi").at("boundary_slots").at(0);
-    EXPECT_EQ(targetAbi.at("category"), "texture");
-    EXPECT_EQ(targetAbi.at("outer_shape"), nlohmann::json::array({64, 32}));
-    EXPECT_EQ(targetAbi.at("storage_id"), 0);
-    EXPECT_EQ(targetAbi.at("storage_descriptor").at("tag"), "image");
+    EXPECT_EQ(targetAbi.at("role"), "input");
+    EXPECT_EQ(targetAbi.at("access"), "read_write");
+    const size_t targetValue = targetAbi.at("value").get<size_t>();
+    const size_t targetStorage = canonical.at("values").at(targetValue).at("storage").get<size_t>();
+    EXPECT_EQ(canonical.at("values").at(targetValue).at("shape"), nlohmann::json::array({64, 32}));
+    EXPECT_EQ(canonical.at("storages").at(targetStorage).at("descriptor").at("tag"), "image");
     const nlohmann::json &contract = result.at("stage_contracts").at(requestId);
     EXPECT_EQ(contract.at("operation"), "graphics");
     EXPECT_EQ(contract.at("reflection").at("graphics").at("topology"), "triangle_list");
@@ -678,9 +697,9 @@ module {
     ASSERT_EQ(node.at("resources").size(), 1u);
     EXPECT_EQ(node.at("resources").at(0), nlohmann::json({{"value", 0}, {"access", "read_write"}, {"after", 4}}));
     EXPECT_EQ(node.at("results"), nlohmann::json::array({4}));
-    EXPECT_EQ(node.at("grid"), nlohmann::json::array({{{"control", {{"argument", 1}}}},
-                                                      {{"control", {{"argument", 2}}}},
-                                                      {{"control", {{"argument", 3}}}}}));
+    EXPECT_EQ(node.at("grid"),
+              nlohmann::json::array(
+                  {{{"control", {{"value", 1}}}}, {{"control", {{"value", 2}}}}, {{"control", {{"value", 3}}}}}));
     EXPECT_EQ(request.at("grid"), node.at("grid"));
 
     VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, kernel, strlen(kernel), VERNON_TARGET_CPU);
@@ -707,7 +726,9 @@ module {
     ASSERT_EQ(canonical.at("storages").size(), 1u);
     EXPECT_EQ(canonical.at("storages").at(0).at("initial_value"), 0);
     EXPECT_EQ(canonical.at("storages").at(0).at("descriptor").at("byte_length"), 0);
-    EXPECT_TRUE(canonical.at("shape_symbols").empty());
+    EXPECT_FALSE(canonical.contains("shape_symbols"));
+    EXPECT_FALSE(canonical.contains("shape_constraints"));
+    EXPECT_FALSE(canonical.contains("alias_preconditions"));
     EXPECT_EQ(canonical.at("values").at(0).at("shape"), nlohmann::json::array({-1}));
     EXPECT_EQ(canonical.at("storages").at(0).at("mutability"), "mutable");
     EXPECT_EQ(canonical.at("values").at(0).at("storage"), 0);
@@ -861,8 +882,8 @@ module {
         foundOwnedDyn = true;
         EXPECT_TRUE(storage.at("descriptor").at("byte_length").is_array());
         EXPECT_EQ(storage.at("descriptor").at("byte_length"),
-                  nlohmann::json::array({{{"dimension", {{"control", {{"argument", 0}}}, {"axis", 0}}}},
-                                         {{"dimension", {{"control", {{"argument", 0}}}, {"axis", 1}}}}}));
+                  nlohmann::json::array({{{"dimension", {{"control", {{"value", 0}}}, {"axis", 0}}}},
+                                         {{"dimension", {{"control", {{"value", 0}}}, {"axis", 1}}}}}));
         EXPECT_NE(storage.at("descriptor").at("byte_length"), 0);
         EXPECT_FALSE(json_contains_capture(storage.at("descriptor")));
     }
@@ -874,7 +895,9 @@ module {
         EXPECT_FALSE(value.contains("like"));
     }
     EXPECT_TRUE(foundDynValue);
-    EXPECT_TRUE(canonical.at("shape_symbols").empty());
+    EXPECT_FALSE(canonical.contains("shape_symbols"));
+    EXPECT_FALSE(canonical.contains("shape_constraints"));
+    EXPECT_FALSE(canonical.contains("alias_preconditions"));
 
     vernonCompileResultDestroy(finalized);
     vernonCompileResultDestroy(compiled);
@@ -1051,9 +1074,8 @@ module {
         const std::string graph = canonical.at("values").at(initial).at("origin").at("graph").get<std::string>();
         if (graph == "forward") {
             foundForwardArgument = true;
-            EXPECT_EQ(byteLength,
-                      nlohmann::json::array({{{"dimension", {{"control", {{"argument", 0}}}, {"axis", 0}}}},
-                                             {{"dimension", {{"control", {{"argument", 0}}}, {"axis", 1}}}}}));
+            EXPECT_EQ(byteLength, nlohmann::json::array({{{"dimension", {{"control", {{"value", 0}}}, {"axis", 0}}}},
+                                                         {{"dimension", {{"control", {{"value", 0}}}, {"axis", 1}}}}}));
             EXPECT_FALSE(json_contains_capture(byteLength));
         } else {
             foundBackwardCapture = true;
@@ -1961,7 +1983,7 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonStringView vulkan_reflection = vernonCompileResultGetReflection(vulkan_compile);
     const std::string compilerVersion =
         "\"compiler_contract_version\":" + std::to_string(VERNON_COMPILER_CONTRACT_VERSION);
-    const std::string pipelineVersion = "\"pipeline_version\":" + std::to_string(VERNON_PIPELINE_VERSION);
+    const std::string pipelineVersion = "\"program_version\":" + std::to_string(VERNON_PROGRAM_VERSION);
     ASSERT_TRUE(view_contains(vulkan_reflection, compilerVersion.c_str()));
     ASSERT_TRUE(view_contains(vulkan_reflection, pipelineVersion.c_str()));
     ASSERT_TRUE(view_contains(vulkan_reflection, "\"kind\":\"vulkan\""));
@@ -2304,7 +2326,7 @@ TEST(CompilerCApi, IgnoresOptionalInputVersionMetadata) {
 
     const std::string unsupported = "module attributes {vernon.compiler_contract_version = " +
                                     std::to_string(VERNON_COMPILER_CONTRACT_VERSION + 1) +
-                                    " : i64, vernon.pipeline_version = " + std::to_string(VERNON_PIPELINE_VERSION + 1) +
+                                    " : i64, vernon.program_version = " + std::to_string(VERNON_PROGRAM_VERSION + 1) +
                                     " : i64} { func.func @empty() { return } }";
     result = vernonCompilerValidateMlir(context, unsupported.data(), unsupported.size());
     ASSERT_TRUE(result);
@@ -2312,7 +2334,7 @@ TEST(CompilerCApi, IgnoresOptionalInputVersionMetadata) {
     vernonCompileResultDestroy(result);
 
     const char previous[] = "module attributes {vernon.compiler_contract_version = 11 : i64, "
-                            "vernon.pipeline_version = 15 : i64} { func.func @empty() { return } }";
+                            "vernon.program_version = 15 : i64} { func.func @empty() { return } }";
     result = vernonCompilerValidateMlir(context, previous, strlen(previous));
     ASSERT_TRUE(result);
     EXPECT_EQ(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);

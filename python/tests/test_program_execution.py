@@ -7,6 +7,7 @@ from typing import Annotated
 
 import numpy as np
 import vernon_dsl as vd
+from vernon_dsl._program_assets.capture import capture_program
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 
 from python.tests.storage_vjp_direct_fixture import (
@@ -309,8 +310,10 @@ class ProgramExecutionTests(unittest.TestCase):
         vd.init(arch=vd.cpu)
 
     def test_module_vjp_rejects_forward_only_texture_resources(self) -> None:
-        with self.assertRaisesRegex(TypeError, "Texture and Sampler are forward-only resources"):
-            vd.ad.vjp(TextureRoundTrip(), wrt=("marker",), outputs=("output",))
+        expression = vd.ad.vjp(TextureRoundTrip(), wrt=("marker",), outputs=("output",))
+        declaration = vd.program_asset(id="resources/vjp", program=expression)
+        with self.assertRaisesRegex(ValueError, "Texture and Sampler are forward-only resources"):
+            capture_program(declaration)
 
     def test_module_orders_dependent_kernels(self) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))

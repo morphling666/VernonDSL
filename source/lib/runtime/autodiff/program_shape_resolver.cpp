@@ -9,7 +9,7 @@ namespace {
 class Resolver {
 public:
     Resolver(const program::Program &program, const VernonProgramTopology *topology,
-             std::vector<ProgramHostValue> &values)
+             std::vector<LogicalProgramValue> &values)
         : program_(program), topology_(topology), values_(values) {}
 
     bool resolve(std::string &error) {
@@ -33,14 +33,15 @@ private:
     bool seedCompiledStages(std::string &error) {
         if (!topology_)
             return true;
-        for (const VernonResolvedProgramStage &stage : topology_->stages) {
-            if (stage.pipeline && !stage.pipeline->variant.vertex.empty())
+        for (const auto &[node, nodePlan] : topology_->nodes) {
+            (void)node;
+            if (nodePlan.pipeline && !nodePlan.pipeline->variant.vertex.empty())
                 continue;
-            for (size_t index = 0;
-                 stage.pipeline && index < stage.bindings.size() && index < stage.pipeline->variant.parameters.size();
+            for (size_t index = 0; nodePlan.pipeline && index < nodePlan.bindings.size() &&
+                                   index < nodePlan.pipeline->variant.parameters.size();
                  ++index) {
-                const VernonProgramStageBinding &binding = stage.bindings[index];
-                const Parameter &parameter = stage.pipeline->variant.parameters[index];
+                const VernonProgramStageBinding &binding = nodePlan.bindings[index];
+                const Parameter &parameter = nodePlan.pipeline->variant.parameters[index];
                 if (binding.leaf || parameter.invocationCarrier || (binding.target && binding.target->viewTransform))
                     continue;
                 const uint32_t value = binding.value;
@@ -108,13 +109,13 @@ private:
 
     const program::Program &program_;
     const VernonProgramTopology *topology_;
-    std::vector<ProgramHostValue> &values_;
+    std::vector<LogicalProgramValue> &values_;
 };
 
 } // namespace
 
 bool resolveProgramShapes(const program::Program &program, const VernonProgramTopology *topology,
-                          std::vector<ProgramHostValue> &values, std::string &error) {
+                          std::vector<LogicalProgramValue> &values, std::string &error) {
     return Resolver(program, topology, values).resolve(error);
 }
 

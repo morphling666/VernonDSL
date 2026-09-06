@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
-from ..bundle import CompiledArtifact, ProgramCompileError, inline_artifact_descriptor
+from ..bundle import (
+    BundlePlan,
+    CompiledArtifact,
+    ProgramCompileError,
+    build_program_manifest,
+    inline_artifact_descriptor,
+)
+from .cpu_registration import write_cpu_static_registration
 
 
 def encode_runtime_stage(record: dict[str, Any], artifact: bytes) -> dict[str, Any]:
@@ -83,4 +91,32 @@ def write_external_artifact(
     }
 
 
-__all__ = ["artifact_extension", "encode_runtime_stage", "write_external_artifact"]
+def write_bundle_artifacts(plan: BundlePlan, output: Path) -> Path:
+    """Write a compiled bundle plan and its external artifacts."""
+    output.mkdir(parents=True, exist_ok=True)
+    descriptors = {
+        stage.id: write_external_artifact(
+            output,
+            stage.artifact.data,
+            stage.artifact.format,
+            stage.stage,
+            stage.artifact.filename,
+        )
+        for stage in plan.compiled_stages
+    }
+    bundle = build_program_manifest(plan, descriptors)
+    if plan.target.target == "cpu":
+        write_cpu_static_registration(
+            output,
+            [str(stage.metadata.get("symbol", "")) for stage in plan.compiled_stages],
+        )
+    manifest = output / f"{output.name}.program.json"
+    manifest.write_text(
+        json.dumps(bundle, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    return manifest
+
+
+__all__ = ["artifact_extension", "encode_runtime_stage", "write_bundle_artifacts", "write_external_artifact"]

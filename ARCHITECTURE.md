@@ -478,7 +478,7 @@ shapes into kernel `specialize` to satisfy GPU `finalize`. Graphics pipelines
 may still pass image/attachment extents as `shape_facts`.
 
 Artifact data 内联在 bundle 中：SPIR-V/DXIL 使用 base64，文本 artifact 使用
-UTF-8。交互路径仍使用正式 `PIPELINE_VERSION` schema，不存在另一套私有 runtime
+UTF-8。交互路径仍使用正式 `PROGRAM_VERSION` schema，不存在另一套私有 runtime
 格式。
 
 ## 9. ProgramAsset 与 Cook
@@ -545,8 +545,8 @@ artifact，只要其 stage 和 feature 被该 target 支持。
 
 Cooked output 包含：
 
-- 当前 pipeline 18 `PIPELINE_VERSION`，所有 target 共用 canonical
-  Program、ArtifactSystem 与 stage bindings；
+- 当前 `PROGRAM_VERSION` 19，所有 target 共用 canonical Program；variant
+  artifact system 以 logical Stage ID 直接索引 target artifact；
 - pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
 - feature universe 和显式 variant keys；
 - 每个 variant 的 stage map、parameter slots、internal parameters 和 outputs；
@@ -616,10 +616,10 @@ cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期
 - `RELEASE_VERSION`：包发布版本，不定义 ABI compatibility；
 - `COMPILER_CONTRACT_VERSION`：语言语义、Vernon MLIR contract、reflection 和
   stage topology；
-- `PIPELINE_VERSION`：manifest、artifact descriptor、Runtime Provider SPI 和
+- `PROGRAM_VERSION`：manifest、artifact descriptor、Runtime Provider SPI 和
   RHI ABI。
 
-修改 `PIPELINE_VERSION` 意味着 Runtime、Provider 和 RHI 必须一起重建。当前不
+修改 `PROGRAM_VERSION` 意味着 Runtime、Provider 和 RHI 必须一起重建。当前不
 承诺第三方预编译 Provider/RHI 插件跨 pipeline version 兼容。
 
 ## 11. 典型端到端路径

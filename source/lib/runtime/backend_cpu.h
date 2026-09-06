@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,7 +41,10 @@ struct CpuPipelineState {
     std::vector<std::string> layoutBuiltins;
     std::vector<size_t> packedOffsets;
     std::vector<size_t> packedFieldSizes;
+    std::vector<bool> packedResults;
+    std::vector<std::optional<VernonDataType>> packedResultReductions;
     size_t packedSize{};
+    size_t packedResultSize{};
     size_t tapeAllocatorOffset{std::numeric_limits<size_t>::max()};
     size_t tapeRootOffset{std::numeric_limits<size_t>::max()};
     VernonAdTapeAllocator *tapeAllocator{};

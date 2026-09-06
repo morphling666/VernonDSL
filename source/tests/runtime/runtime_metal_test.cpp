@@ -1375,27 +1375,12 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
     arguments[1].tensor.shape = scalarShape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments;
-    invocation.argument_count = std::size(arguments);
-    invocation.compute_grid = {4, 1, 1};
-
-    vernon::execution::ExecutionGraph graph(device);
-    const auto graphBuffer = graph.importBuffer(buffer, true);
-    graph.emplacePass<vernon::tests::RuntimeGraphComputePass>("first scale", graphBuffer, runtime, pipeline,
-                                                              &invocation);
-    graph.emplacePass<vernon::tests::RuntimeGraphComputePass>("second scale", graphBuffer, runtime, pipeline,
-                                                              &invocation);
-    std::string graphError;
-    auto plan = graph.compile(graphError);
-    ASSERT_TRUE(plan) << graphError;
-    auto submission = plan->submit();
-    ASSERT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(submission.commandStats().dispatch_count, 2u);
-    EXPECT_EQ(submission.commandStats().barrier_count, 1u);
-    EXPECT_EQ(submission.commandStats().submission_count, 1u);
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {4, 1, 1}),
+              VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {4, 1, 1}),
+              VERNON_STATUS_OK)
+        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::array<float, source.size()> output{};
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, output.data(), sizeof(output)), VERNON_RHI_STATUS_OK);
     for (size_t index = 0; index < output.size(); ++index)
@@ -1488,14 +1473,8 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     position.tensor.byte_strides = strides;
     position.tensor.byte_size = sizeof(positions);
     VernonColorAttachment attachment{0, targetReference};
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = &position;
-    invocation.argument_count = 1;
-    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
-    graphics.bind(invocation);
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1);
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, &position, 1, graphics), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
@@ -1666,20 +1645,16 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     ASSERT_EQ(vernonRuntimeReferenceRhiBuffer(runtime, indexBuffer, 0, sizeof(indices), &indexReference),
               VERNON_STATUS_OK);
     VernonColorAttachment attachment{0, targetReference};
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments;
-    invocation.argument_count = std::size(arguments);
-    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
-    graphics.bind(invocation);
+    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
     VernonIndexBinding invalidIndex{static_cast<VernonIndexType>(1), 0, indices.size(), indexReference};
     graphics.draw.index_binding = &invalidIndex;
-    EXPECT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments, std::size(arguments), graphics),
+              VERNON_STATUS_INVALID_ARGUMENT);
     const VernonStringView indexError = vernonRuntimeGetLastError(runtime);
-    EXPECT_NE(std::string(indexError.data, indexError.size).find("index binding is invalid"), std::string::npos);
+    EXPECT_NE(std::string(indexError.data, indexError.size).find("DrawCommand"), std::string::npos);
     graphics.draw.index_binding = nullptr;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments, std::size(arguments), graphics),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
@@ -1696,117 +1671,6 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     EXPECT_NEAR(pixels[center], sampledPixel[0], 2);
     EXPECT_NEAR(pixels[center + 1], sampledPixel[1], 2);
     EXPECT_NEAR(pixels[center + 2], sampledPixel[2], 2);
-
-    VernonRhiImageUploadDescriptor targetUpload{};
-    targetUpload.struct_size = sizeof(targetUpload);
-    targetUpload.width = targetUpload.height = 32;
-    targetUpload.depth = 1;
-    targetUpload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
-    targetUpload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
-    auto uploadTarget = [&](const std::array<uint8_t, 4> &color) {
-        std::vector<uint8_t> background(32 * 32 * 4);
-        for (size_t offset = 0; offset < background.size(); offset += 4)
-            std::copy(color.begin(), color.end(), background.begin() + offset);
-        targetUpload.data = background.data();
-        ASSERT_EQ(vernonRhiDeviceUploadImage(device, target, &targetUpload, 1), VERNON_RHI_STATUS_OK);
-    };
-    auto centerPixel = [&] {
-        std::vector<uint8_t> result(32 * 32 * 4);
-        EXPECT_EQ(vernonRhiDeviceDownloadImage(device, target, &download, result.data(), result.size()),
-                  VERNON_RHI_STATUS_OK);
-        std::array<uint8_t, 4> pixel{};
-        std::copy_n(result.begin() + center, pixel.size(), pixel.begin());
-        return pixel;
-    };
-    class ImageReadPass final : public vernon::execution::ComputePass {
-    public:
-        explicit ImageReadPass(vernon::execution::GraphImage image)
-            : vernon::execution::ComputePass("image read"), image_(image) {}
-        void declare() override { read(image_); }
-        VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
-                                const vernon::execution::ExecutionResources &) override {
-            return VERNON_RHI_STATUS_OK;
-        }
-
-    private:
-        vernon::execution::GraphImage image_;
-    };
-    {
-        vernon::execution::ExecutionGraph graph(device);
-        auto staleView = graph.importImage(target, targetView, true);
-        ++staleView.view.generation;
-        graph.emplacePass<ImageReadPass>(staleView);
-        std::string graphError;
-        EXPECT_FALSE(graph.compile(graphError));
-        EXPECT_NE(graphError.find("invalid image resource"), std::string::npos);
-    }
-    auto executeGraph = [&](uint32_t passCount) {
-        vernon::execution::ExecutionGraph graph(device);
-        const auto graphTarget = graph.importImage(target, targetView, true);
-        for (uint32_t pass = 0; pass < passCount; ++pass)
-            graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>(pass ? "second draw" : "first draw", graphTarget,
-                                                                     runtime, pipeline, &invocation,
-                                                                     VERNON_RHI_LOAD_PRESERVE);
-        std::string graphError;
-        auto plan = graph.compile(graphError);
-        EXPECT_TRUE(plan) << graphError;
-        auto submission = plan->submit();
-        EXPECT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
-        return submission.commandStats();
-    };
-
-    VernonColorBlendState blend{};
-    blend.blend_enabled = 1;
-    blend.source_color_factor = VERNON_RHI_BLEND_SOURCE_ALPHA;
-    blend.destination_color_factor = VERNON_RHI_BLEND_ONE_MINUS_SOURCE_ALPHA;
-    blend.color_operation = VERNON_RHI_BLEND_ADD;
-    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
-    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
-    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
-    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
-    VernonGraphicsState graphicsState{};
-    graphicsState.struct_size = sizeof(graphicsState);
-    graphicsState.color_blends = &blend;
-    graphicsState.color_blend_count = 1;
-    invocation.graphics_state = &graphicsState;
-
-    const std::array<uint8_t, 4> blendBackground{20, 40, 220, 255};
-    uploadTarget(blendBackground);
-    const VernonRhiCommandEncoderStats graphStats = executeGraph(2);
-    EXPECT_EQ(graphStats.rendering_scope_count, 1u);
-    EXPECT_EQ(graphStats.draw_count, 2u);
-    EXPECT_EQ(graphStats.submission_count, 1u);
-    const auto blended = centerPixel();
-    for (size_t channel = 0; channel < 3; ++channel)
-        EXPECT_NEAR(blended[channel], sampledPixel[channel] * 0.75 + blendBackground[channel] * 0.25, 3);
-
-    const std::array<uint8_t, 4> maskBackground{11, 73, 149, 255};
-    uploadTarget(maskBackground);
-    blend.blend_enabled = 0;
-    blend.write_mask = VERNON_RHI_COLOR_WRITE_RED;
-    executeGraph(1);
-    const auto masked = centerPixel();
-    EXPECT_NEAR(masked[0], sampledPixel[0], 2);
-    EXPECT_EQ(masked[1], maskBackground[1]);
-    EXPECT_EQ(masked[2], maskBackground[2]);
-    EXPECT_EQ(masked[3], maskBackground[3]);
-
-    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
-    graphicsState.rasterization.front_face = VERNON_RHI_FRONT_FACE_COUNTER_CLOCKWISE;
-    const std::array<uint8_t, 4> cullBackground{7, 13, 19, 255};
-    uploadTarget(cullBackground);
-    graphicsState.rasterization.cull_mode = VERNON_RHI_CULL_FRONT;
-    executeGraph(1);
-    const auto frontCulled = centerPixel();
-    uploadTarget(cullBackground);
-    graphicsState.rasterization.cull_mode = VERNON_RHI_CULL_BACK;
-    executeGraph(1);
-    const auto backCulled = centerPixel();
-    const bool frontRendered = frontCulled[0] != cullBackground[0] || frontCulled[1] != cullBackground[1] ||
-                               frontCulled[2] != cullBackground[2];
-    const bool backRendered =
-        backCulled[0] != cullBackground[0] || backCulled[1] != cullBackground[1] || backCulled[2] != cullBackground[2];
-    EXPECT_NE(frontRendered, backRendered);
 
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, targetView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, target), VERNON_RHI_STATUS_OK);

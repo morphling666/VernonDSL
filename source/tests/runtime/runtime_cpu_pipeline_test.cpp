@@ -210,7 +210,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     vernonRuntimeProgramBundleDestroy(objectLoaded);
 
     nlohmann::json invalidVersion = nlohmann::json::parse(bundle);
-    invalidVersion["pipeline_version"] = VERNON_PIPELINE_VERSION + 1;
+    invalidVersion["program_version"] = VERNON_PROGRAM_VERSION + 1;
     invalidVersion.erase("content_hash");
     std::string canonical = invalidVersion.dump(-1, ' ', false);
     invalidVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -218,7 +218,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
 
     nlohmann::json previousVersion = nlohmann::json::parse(bundle);
-    previousVersion["pipeline_version"] = 15;
+    previousVersion["program_version"] = 15;
     previousVersion.erase("content_hash");
     canonical = previousVersion.dump(-1, ' ', false);
     previousVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
@@ -305,7 +305,7 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     argument.tensor.byte_size = 16 * sizeof(float);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 2};
@@ -427,7 +427,7 @@ TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
     argument.tensor.byte_size = sizeof(output);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
@@ -605,7 +605,7 @@ TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem
     argument.tensor.byte_size = sizeof(output);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {2, 1, 2};

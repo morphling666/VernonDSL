@@ -300,7 +300,7 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     if (!state->scheduler)
         return false;
     state->provider.struct_size = sizeof(VernonRuntimeDeviceProvider);
-    state->provider.abi_version = VERNON_PIPELINE_VERSION;
+    state->provider.abi_version = VERNON_PROGRAM_VERSION;
     state->provider.user_data = state.get();
     state->provider.get_capabilities = cpuCapabilities;
     state->provider.get_device_identity = cpuDeviceIdentity;
@@ -343,6 +343,8 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     state.entry = kernel.entry;
     if (reflection.packedArguments)
         state.packedSize = reflection.packedArguments->size;
+    if (reflection.packedResults)
+        state.packedResultSize = reflection.packedResults->size;
     for (const ReflectedArgument &argument : reflection.arguments) {
         const bool tapeBuiltin = argument.kind == "builtin" && (argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN ||
                                                                 argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN);
@@ -375,6 +377,9 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
         state.layoutBuiltins.push_back(tapeBuiltin ? argument.builtin : std::string());
         state.packedOffsets.push_back(argument.physical.offset);
         state.packedFieldSizes.push_back(argument.physical.size);
+        state.packedResults.push_back(argument.result);
+        state.packedResultReductions.push_back(argument.result && argument.autodiffRole == "gradient" ? argument.dtype
+                                                                                                      : std::nullopt);
         if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ALLOCATOR_BUILTIN)
             state.tapeAllocatorOffset = argument.physical.offset;
         if (tapeBuiltin && argument.builtin == VERNON_AD_TAPE_ROOT_REGION_BUILTIN)
@@ -421,8 +426,8 @@ VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint
         return VERNON_STATUS_INVALID_ARGUMENT;
     const std::string name(symbol.data, symbol.size);
     std::lock_guard<std::mutex> lock(staticEntriesMutex());
-    auto [found, inserted] = staticEntries().emplace(name, entry);
-    return inserted || found->second == entry ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
+    staticEntries().try_emplace(name, entry);
+    return VERNON_STATUS_OK;
 }
 
 bool findRegisteredCpuEntry(VernonRuntimeContext &context, const std::string &symbol, VernonCpuEntryPoint &entry,

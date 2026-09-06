@@ -13,20 +13,19 @@ def main() -> None:
 
     vd.init(arch=vd.cpu)
     assert session._native_runtime is not None
-    runtime = session._native_runtime
     __import__("vernon_native_autodiff_numeric_cpu_fixture")
 
     try:
-        run_numeric_acceptance(runtime, manifest)
+        run_numeric_acceptance(manifest)
     finally:
         vd.init(arch=vd.cpu)
 
 
-def run_numeric_acceptance(runtime, manifest: Path) -> None:
+def run_numeric_acceptance(manifest: Path) -> None:
     import numpy as np
     import vernon_dsl as vd
 
-    pipeline = runtime.load_cooked_asset(manifest.read_bytes(), str(manifest.parent), [])
+    pipeline = vd.load_cooked_vjp_asset(manifest)
 
     def invoke(native_inputs):
         storages = {}
@@ -40,8 +39,7 @@ def run_numeric_acceptance(runtime, manifest: Path) -> None:
             bindings[name] = storage
         output_storage = vd.storage.zeros(dtype=vd.f32, shape=(1, 1, 1))
         bindings["output"] = output_storage
-        output, pullback = pipeline.vjp(bindings, (1, 1, 1))
-        assert output is None
+        _, pullback = pipeline.vjp(bindings, (1, 1, 1))
         for name in ("values", "auxiliary"):
             np.copyto(native_inputs[name], bindings[name].to_numpy().reshape(native_inputs[name].shape))
 

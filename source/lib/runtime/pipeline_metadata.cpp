@@ -44,7 +44,7 @@ const char *physicalValueProfileName(VernonRuntimeBackend backend, const std::st
 bool parseReflection(const nlohmann::json &root, const std::string &selected, ReflectedEntry &output,
                      VernonRuntimeBackend backend, std::string &error) {
     if (!root.is_object() || root.value("compiler_contract_version", 0) != VERNON_COMPILER_CONTRACT_VERSION ||
-        root.value("pipeline_version", 0) != VERNON_PIPELINE_VERSION || !root.contains("entries") ||
+        root.value("program_version", 0) != VERNON_PROGRAM_VERSION || !root.contains("entries") ||
         !root["entries"].is_array()) {
         error = "unsupported or invalid compute reflection";
         return false;
@@ -95,6 +95,9 @@ bool parseReflection(const nlohmann::json &root, const std::string &selected, Re
             ReflectedArgument argument;
             argument.sourceName = value.value("vernon.source_name", "");
             argument.kind = value["kind"].get<std::string>();
+            argument.autodiffRole = value.value("vernon.autodiff_role", value.value("role", ""));
+            argument.dtype =
+                pipelineDataType(value.value("vernon.dtype", value.value("dtype", value.value("type", ""))));
             if (value.contains("index")) {
                 const auto &indexValue = value["index"];
                 if (!indexValue.is_number_integer()) {

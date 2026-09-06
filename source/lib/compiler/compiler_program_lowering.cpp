@@ -4,9 +4,85 @@
 #include "compiler_program_compute.h"
 #include "compiler_program_graphics.h"
 
+#include <set>
 #include <utility>
 
 namespace vernon::compiler {
+namespace {
+
+bool canonicalComputeClosure(const llvm::json::Array &rawValues, const llvm::json::Array &storages,
+                             const llvm::json::Array &bindings, const llvm::json::Array &accesses,
+                             const llvm::json::Array &workgroups, llvm::json::Array &operands,
+                             llvm::json::Array &results, std::string &error) {
+    std::set<int64_t> operandIds;
+    std::set<int64_t> resultIds;
+    for (const llvm::json::Value &bindingValue : bindings) {
+        const llvm::json::Object *binding = bindingValue.getAsObject();
+        if (!binding)
+            return error = "canonical compute binding is not an object", false;
+        if (binding->getString("tag") != "value")
+            continue;
+        const llvm::json::Array *projections = binding->getArray("projections");
+        if (!projections)
+            return error = "canonical compute value binding has no projections", false;
+        for (const llvm::json::Value &projectionValue : *projections) {
+            const llvm::json::Object *projection = projectionValue.getAsObject();
+            const std::optional<int64_t> value = projection ? projection->getInteger("value") : std::nullopt;
+            const std::optional<llvm::StringRef> direction =
+                projection ? projection->getString("direction") : std::nullopt;
+            if (!value || (direction != "input" && direction != "result"))
+                return error = "canonical compute value binding has an invalid projection", false;
+            (direction == "input" ? operandIds : resultIds).insert(*value);
+        }
+    }
+    for (const llvm::json::Value &accessValue : accesses) {
+        const llvm::json::Object *access = accessValue.getAsObject();
+        const std::optional<llvm::StringRef> tag = access ? access->getString("tag") : std::nullopt;
+        if (!tag)
+            return error = "canonical compute resource access has no tag", false;
+        if (*tag == "read") {
+            if (const std::optional<int64_t> value = access->getInteger("value"))
+                operandIds.insert(*value);
+            else
+                return error = "canonical compute read access has no Value", false;
+        } else if (*tag == "write" || *tag == "attachment") {
+            const std::optional<int64_t> before = access->getInteger("before");
+            const std::optional<int64_t> after = access->getInteger("after");
+            if (!before || !after)
+                return error = "canonical compute write access has incomplete Storage SSA", false;
+            operandIds.insert(*before);
+            resultIds.insert(*after);
+        } else if (*tag == "initialize") {
+            const std::optional<int64_t> after = access->getInteger("after");
+            const std::optional<int64_t> storage = access->getInteger("storage");
+            if (!after || !storage || *storage < 0 || static_cast<size_t>(*storage) >= storages.size())
+                return error = "canonical compute initialize access is invalid", false;
+            resultIds.insert(*after);
+            const llvm::json::Object *storageRow = storages[static_cast<size_t>(*storage)].getAsObject();
+            const std::optional<int64_t> initial = storageRow ? storageRow->getInteger("initial_value") : std::nullopt;
+            const llvm::json::Object *initialValue = initial ? findJsonObjectByIntegerId(rawValues, *initial) : nullptr;
+            const llvm::json::Object *origin = initialValue ? initialValue->getObject("origin") : nullptr;
+            if (initial && origin && origin->getString("tag") == "allocation")
+                operandIds.insert(*initial);
+        } else {
+            return error = "canonical compute resource access has an unsupported tag", false;
+        }
+        if (const std::optional<int64_t> view = access->getInteger("view"))
+            operandIds.insert(*view);
+    }
+    for (const llvm::json::Value &componentValue : workgroups)
+        if (const llvm::json::Object *component = componentValue.getAsObject())
+            if (const llvm::json::Object *control = component->getObject("control"))
+                if (const std::optional<int64_t> value = control->getInteger("value"))
+                    operandIds.insert(*value);
+    for (int64_t value : operandIds)
+        operands.emplace_back(value);
+    for (int64_t value : resultIds)
+        results.emplace_back(value);
+    return true;
+}
+
+} // namespace
 
 bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::vector<CanonicalProgramGraph> &graphs,
                                  ProgramResourceIndex &resourceIndex, llvm::json::Array &storages,
@@ -25,7 +101,7 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
             const llvm::json::Array *rawBindings = node->getArray("bindings");
             const llvm::json::Array *workgroups = node->getArray("grid");
             std::map<int64_t, ProgramLogicalResource> &resources = resourcesByStage[compiled.requestId];
-            std::map<std::string, int64_t> boundValues;
+            ProgramNodeBindingIndex boundValues;
             if (!indexProgramNodeBindings(*rawBindings, boundValues, error))
                 return false;
 
@@ -109,9 +185,8 @@ bool lowerCanonicalProgramStages(const llvm::json::Array &rawValues, const std::
             plan.stages[requestId] = llvm::json::Object{{"operation", "compute"}, {"contract_hash", contractHash}};
             llvm::json::Array operands;
             llvm::json::Array results;
-            if (!canonicalProgramValueIds(*nodeOperands, DuplicateProgramValuePolicy::CollapseOperandUses, operands,
-                                          error) ||
-                !canonicalProgramValueIds(*nodeResults, DuplicateProgramValuePolicy::Reject, results, error))
+            if (!canonicalComputeClosure(rawValues, storages, computePlan.endpointBindings.json(),
+                                         computePlan.accesses.json(), *workgroups, operands, results, error))
                 return false;
             canonicalNodes.emplace_back(llvm::json::Object{
                 {"id", node->getInteger("id").value_or(0)},

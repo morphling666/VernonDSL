@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from ..ad import ProgramTransformSpec
 from .analysis import typed_effect_data
 from .autodiff_profiles import AutodiffProfilePlan
@@ -62,7 +62,7 @@ class FrontendCompileResult:
         )
         return {
             "compiler_contract_version": COMPILER_CONTRACT_VERSION,
-            "pipeline_version": PIPELINE_VERSION,
+            "program_version": PROGRAM_VERSION,
             "entry": self.request.entry,
             "enabled_features": list(self.request.enabled_features),
             "tensor_shapes": [[name, dtype, list(shape)] for name, dtype, shape in self.request.tensor_shapes],

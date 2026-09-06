@@ -1009,8 +1009,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     const std::string_view reflected(reflection.data, reflection.size);
     EXPECT_NE(reflected.find("\"compiler_contract_version\":" + std::to_string(VERNON_COMPILER_CONTRACT_VERSION)),
               std::string_view::npos);
-    EXPECT_NE(reflected.find("\"pipeline_version\":" + std::to_string(VERNON_PIPELINE_VERSION)),
-              std::string_view::npos);
+    EXPECT_NE(reflected.find("\"program_version\":" + std::to_string(VERNON_PROGRAM_VERSION)), std::string_view::npos);
     EXPECT_NE(reflected.find("\"struct_name\":\"Vertex\""), std::string_view::npos);
     EXPECT_NE(reflected.find("\"location_span\":3"), std::string_view::npos);
     EXPECT_NE(reflected.find("\"dtype\":\"u32\""), std::string_view::npos);

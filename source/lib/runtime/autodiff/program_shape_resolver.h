@@ -12,10 +12,10 @@ struct Program;
 
 namespace vernon::runtime::ad {
 
-struct ProgramHostValue;
+struct LogicalProgramValue;
 
 bool resolveProgramShapes(const program::Program &program, const VernonProgramTopology *topology,
-                          std::vector<ProgramHostValue> &values, std::string &error);
+                          std::vector<LogicalProgramValue> &values, std::string &error);
 
 } // namespace vernon::runtime::ad
 

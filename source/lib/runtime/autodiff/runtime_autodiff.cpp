@@ -283,7 +283,7 @@ VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline
     const auto *differentiated = differentiatedPipeline(&pipeline);
     auto *executable = differentiated ? differentiated->executable.get() : nullptr;
     if (!executable || invocation.struct_size < sizeof(VernonProgramSubmitDescriptor) ||
-        invocation.abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation.compute_grid) ||
+        invocation.abi_version != VERNON_PROGRAM_VERSION || !validLaunchSize(invocation.compute_grid) ||
         (invocation.argument_count && !invocation.arguments) || !validSet(&inputs, true)) {
         invocationDiagnostic(*pipeline.context) = "invalid deferred autodiff forward invocation";
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -311,7 +311,7 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
     const auto *differentiated = differentiatedPipeline(&pipeline);
     auto *executable = differentiated ? differentiated->executable.get() : nullptr;
     if (!executable || invocation.struct_size < sizeof(VernonProgramSubmitDescriptor) ||
-        invocation.abi_version != VERNON_PIPELINE_VERSION || (invocation.argument_count && !invocation.arguments)) {
+        invocation.abi_version != VERNON_PROGRAM_VERSION || (invocation.argument_count && !invocation.arguments)) {
         invocationDiagnostic(*pipeline.context) = "invalid canonical Program invocation";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
@@ -709,29 +709,6 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimeProgramForward(VernonProgramExecutable *pipeline,
-                                         const VernonProgramSubmitDescriptor *invocation,
-                                         VernonPullback **outputPullback) {
-    try {
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-        if (outputPullback)
-            *outputPullback = nullptr;
-        if (!pipeline || !pipeline->context || !invocation)
-            return fail(pipeline ? pipeline->context : nullptr, "Program forward requires a pipeline and invocation");
-        VernonPullback *pullback = nullptr;
-        const VernonStatus status = vernon::runtime::ad::forwardProgramInvocation(*pipeline, *invocation, pullback);
-        if (status != VERNON_STATUS_OK)
-            return status;
-        if (outputPullback)
-            *outputPullback = pullback;
-        else if (pullback)
-            vernonPullbackDestroy(pullback);
-        return VERNON_STATUS_OK;
-    } catch (const std::exception &exception) {
-        return fail(pipeline ? pipeline->context : nullptr, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
-    }
-}
-
 VernonStatus vernonAdProgramForward(VernonProgramExecutable *pipeline, VernonLaunchSize computeGrid,
                                     const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
                                     VernonPullback **pullback) {
@@ -741,9 +718,8 @@ VernonStatus vernonAdProgramForward(VernonProgramExecutable *pipeline, VernonLau
         if (pullback)
             *pullback = nullptr;
         if (pipeline && pipeline->topology && pipeline->topology->resolvedProgram)
-            return fail(
-                pipeline->context,
-                "managed Program forward requires VernonProgramSubmitDescriptor and vernonRuntimeProgramForward");
+            return fail(pipeline->context,
+                        "managed Program forward requires VernonProgramInstance and VernonProgramInvocation");
         const auto *differentiated = differentiatedPipeline(pipeline);
         auto *executable = differentiated ? differentiated->executable.get() : nullptr;
         if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||
@@ -790,7 +766,7 @@ VernonStatus vernonAdProgramEncodeForward(VernonRuntimeProviderObject encoder, V
         auto *executable = differentiated ? differentiated->executable.get() : nullptr;
         if (!pipeline || !pullback || !executable || !encoder.value || !invocation ||
             invocation->struct_size < sizeof(VernonProgramSubmitDescriptor) ||
-            invocation->abi_version != VERNON_PIPELINE_VERSION || !validLaunchSize(invocation->compute_grid) ||
+            invocation->abi_version != VERNON_PROGRAM_VERSION || !validLaunchSize(invocation->compute_grid) ||
             (invocation->argument_count && !invocation->arguments) || !validSet(inputs, true))
             return fail(pipeline ? pipeline->context : nullptr, "invalid encoded autodiff forward invocation");
         auto result = std::make_unique<VernonPullback>();

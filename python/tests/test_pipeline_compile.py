@@ -4,7 +4,6 @@ import hashlib
 import json
 import struct
 import unittest
-from dataclasses import replace
 from types import SimpleNamespace
 
 from vernon_dsl.bundle import (
@@ -13,19 +12,24 @@ from vernon_dsl.bundle import (
     MetalTargetOptions,
     OpenGLTargetOptions,
     ProgramCompileError,
-    build_bundle_plan,
+    ProgramVariantPlan,
+    assign_parameter_slots,
+    build_program_manifest,
+    build_program_plan,
     canonical_json,
     compiled_stage_from_program,
     external_parameters,
-    inline_artifact_descriptor,
+    fragment_outputs,
+    internal_parameters,
     make_target_options,
-    materialize_bundle,
+    merge_internal_parameter_uses,
     merge_parameter_uses,
     parse_reflection_json,
     select_artifact,
     select_entry,
     serialize_bundle,
     validate_graphics_interfaces,
+    with_content_hash,
 )
 from vernon_dsl.bundle.requirements import runtime_requirements
 
@@ -173,7 +177,6 @@ def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> Compile
     }
     return CompiledStage(
         "module",
-        '{"id":"module"}',
         entry,
         stage,
         OpenGLTargetOptions(version=330),
@@ -319,7 +322,6 @@ class PipelineCompileTests(unittest.TestCase):
         compiled = compiled_stage_from_program(
             program,
             module="module",
-            module_manifest="manifest",
             entry="main",
             target=MetalTargetOptions(),
         )
@@ -327,88 +329,30 @@ class PipelineCompileTests(unittest.TestCase):
         requirements = runtime_requirements("metal", [compiled])
         self.assertEqual(requirements["minimum_os_version"], [15, 0])
 
-    def test_runtime_requirements_change_content_hash_but_not_stage_identity(self) -> None:
-        stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
-        plan = build_bundle_plan("requirements/hash", stage.target, (), [((), {"compute": stage})])
-        logical = plan.logical_dict()
-        content_hash = hashlib.sha256(canonical_json(logical).encode("utf-8")).hexdigest()
-        changed = json.loads(json.dumps(logical))
-        changed["runtime_requirements"]["glsl_version"] = 440
-        changed_hash = hashlib.sha256(canonical_json(changed).encode("utf-8")).hexdigest()
-
-        self.assertNotEqual(content_hash, changed_hash)
-        self.assertEqual(set(logical["stage_artifacts"]), {stage.id})
-        self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
-
-    def test_manifest_autodiff_profiles_use_canonical_variant_key(self) -> None:
-        stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
-        profiles = {
-            name: {
-                "compute": stage.id,
-                "inputs": [],
-                "outputs": [],
-            }
-            for name in ("primal", "forward_with_tape", "backward")
-        }
-        plan = build_bundle_plan(
-            "autodiff/schema",
-            stage.target,
-            ("INTERNAL_FEATURE",),
-            [((), {"compute": stage})],
-            {
-                "kind": "vjp",
-                "wrt": ["value"],
-                "output_cotangents": ["output"],
-                "gradient_policy": "explicit",
-                "identity": "internal-transform",
-            },
-            {
-                "identity": "internal-profiles",
-                "tape_bytes": 64,
-                "variants": [
-                    {
-                        "key": [],
-                        "workgroup_size": [1, 1, 1],
-                        "profiles": profiles,
-                    }
-                ],
-            },
-        )
-
-        logical = plan.logical_dict()
-        self.assertNotIn("features", logical)
-        self.assertNotIn("program_transform", logical)
-        self.assertNotIn("autodiff_profiles", logical)
-        self.assertEqual(
-            set(logical["autodiff"]),
-            {"kind", "wrt", "output_cotangents", "profiles"},
-        )
-        self.assertNotIn("extensions", logical["variants"][0])
-        self.assertEqual(logical["autodiff"]["profiles"][0]["variant_key"], [])
-        for name, profile in profiles.items():
-            self.assertEqual(logical["autodiff"]["profiles"][0][name], profile)
-
-        duplicate_profiles = replace(
-            plan,
-            autodiff_profiles={
-                "identity": "internal-profiles",
-                "tape_bytes": 64,
-                "variants": [
-                    {"key": [], "workgroup_size": [1, 1, 1], "profiles": profiles},
-                    {"key": [], "workgroup_size": [1, 1, 1], "profiles": profiles},
-                ],
-            },
-        )
-        with self.assertRaisesRegex(ProgramCompileError, "duplicate variant keys"):
-            duplicate_profiles.logical_dict()
-
-        duplicate_variants = replace(plan, variants=(plan.variants[0], plan.variants[0]))
-        with self.assertRaisesRegex(ProgramCompileError, "duplicate canonical keys"):
-            duplicate_variants.logical_dict()
-        self.assertEqual(
-            set(logical["stage_artifacts"][stage.id]),
-            {"stage", "entry", "reflection"},
-        )
+    def test_program_variant_plan_rejects_nullable_and_legacy_shapes(self) -> None:
+        with self.assertRaises(TypeError):
+            ProgramVariantPlan(key=(), stage_implementations={})  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            ProgramVariantPlan(  # type: ignore[call-arg]
+                key=(),
+                program={},
+                stage_implementations={},
+                canonical_program=None,
+            )
+        with self.assertRaisesRegex(ProgramCompileError, "non-contract root members"):
+            ProgramVariantPlan(
+                (),
+                {
+                    "stages": {},
+                    "parameters": [],
+                    "storages": [],
+                    "values": [],
+                    "graphs": [],
+                    "abi": {},
+                    "shape_symbols": [],
+                },
+                {},
+            )
 
     def test_native_options_are_scoped_to_the_selected_target(self) -> None:
         self.assertEqual(OpenGLTargetOptions(version=330).native_options, {"options": {"version": 330}})
@@ -488,54 +432,21 @@ class PipelineCompileTests(unittest.TestCase):
         }
         external = external_parameters(records)
         self.assertEqual(set(external), {"image"})
-        fragment = _stage("fragment", b"fragment", records["fragment"]["interface"])
-        vertex = _stage(
-            "vertex",
-            b"vertex",
-            {
-                "arguments": [],
-                "results": [],
-            },
-        )
-        plan = build_bundle_plan(
-            "pipeline",
-            fragment.target,
-            (),
-            [
-                (
-                    (),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        variant = plan.variants[0].to_dict()
-        self.assertEqual([row["name"] for row in variant["parameters"]], ["image"])
+        internal = internal_parameters(records)
+        self.assertEqual([merge_parameter_uses(name, external[name])["name"] for name in external], ["image"])
         self.assertEqual(
-            [(row["source"], row.get("system_value")) for row in variant["internal_parameters"]],
+            [
+                (row["source"], row.get("system_value"))
+                for row in (merge_internal_parameter_uses(name, internal[name]) for name in sorted(internal))
+            ],
             [("implicit_sampler", None), ("system_value", "resolution")],
         )
 
         unpaired = json.loads(json.dumps(records))
         del unpaired["fragment"]["interface"]["arguments"][1]["sampled_image_bindings"]
-        unpaired_fragment = _stage("fragment", b"fragment", unpaired["fragment"]["interface"])
         with self.assertRaisesRegex(ProgramCompileError, "no reflected sampled image binding"):
-            build_bundle_plan(
-                "pipeline",
-                fragment.target,
-                (),
-                [
-                    (
-                        (),
-                        {
-                            "vertex": vertex,
-                            "fragment": unpaired_fragment,
-                        },
-                    )
-                ],
-            )
+            values = internal_parameters(unpaired)
+            merge_internal_parameter_uses("__image_sampler", values["__image_sampler"])
 
         legacy = json.loads(json.dumps(records))
         sampler = legacy["fragment"]["interface"]["arguments"][1]
@@ -832,28 +743,32 @@ class PipelineCompileTests(unittest.TestCase):
                 ],
             },
         )
-        plan = build_bundle_plan(
-            "pipeline",
-            vertex.target,
-            (),
-            [
-                (
-                    (),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        parameters = plan.variants[0].to_dict()["parameters"]
+        records = {
+            "vertex": {
+                "entry": vertex.entry,
+                "target": vertex.target.target,
+                "interface": dict(vertex.interface),
+            },
+            "fragment": {
+                "entry": fragment.entry,
+                "target": fragment.target.target,
+                "interface": dict(fragment.interface),
+            },
+        }
+        external = external_parameters(records)
+        slots = assign_parameter_slots((records,))
+        parameters = []
+        for name in sorted(external, key=slots.__getitem__):
+            parameter = merge_parameter_uses(name, external[name])
+            parameter["slot"] = slots[name]
+            parameters.append(parameter)
         self.assertEqual([(row["name"], row["slot"]) for row in parameters], [("alpha", 0), ("z_position", 1)])
         self.assertEqual(
             parameters[0]["uses"][0]["uniform_name"],
             "alpha",
         )
 
-    def test_variant_steps_outputs_and_graphics_interface_are_exact(self) -> None:
+    def test_graphics_outputs_and_interface_are_exact(self) -> None:
         vertex = _stage(
             "vertex",
             b"vertex",
@@ -889,41 +804,23 @@ class PipelineCompileTests(unittest.TestCase):
                 ],
             },
         )
-        plan = build_bundle_plan(
-            "pipeline",
-            vertex.target,
-            ("B", "A", "A"),
-            [
-                (
-                    ("A",),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        self.assertEqual(plan.features, ("A", "B"))
+        records = {
+            "vertex": {"interface": dict(vertex.interface)},
+            "fragment": {"interface": dict(fragment.interface)},
+        }
+        validate_graphics_interfaces("vertex", records["vertex"], "fragment", records["fragment"])
         self.assertEqual(
-            plan.variants[0].to_dict(),
-            {
-                "key": ["A"],
-                "program": {
-                    "fragment": fragment.id,
-                    "vertex": vertex.id,
-                },
-                "parameters": [],
-                "outputs": [
-                    {
-                        "name": "output_0",
-                        "kind": "image",
-                        "dtype": "f32",
-                        "shape": [4],
-                        "access": "write",
-                        "location": 0,
-                    }
-                ],
-            },
+            fragment_outputs(records),
+            [
+                {
+                    "name": "output_0",
+                    "kind": "image",
+                    "dtype": "f32",
+                    "shape": [4],
+                    "access": "write",
+                    "location": 0,
+                }
+            ],
         )
 
     def test_stage_identity_and_hashing_are_deterministic(self) -> None:
@@ -956,10 +853,9 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(stage.id, repeated.id)
         self.assertNotEqual(stage.id, changed.id)
 
-        plan = build_bundle_plan("pipeline", stage.target, (), [((), {"compute": stage})])
-        inline = materialize_bundle(plan, {stage.id: inline_artifact_descriptor(stage.artifact)})
-        encoded = serialize_bundle(inline)
-        self.assertEqual(encoded, serialize_bundle(inline))
+        document = with_content_hash({"type": "program", "id": "deterministic"})
+        encoded = serialize_bundle(document)
+        self.assertEqual(encoded, serialize_bundle(document))
         document = json.loads(encoded)
         unhashed = dict(document)
         digest = unhashed.pop("content_hash")
@@ -968,36 +864,79 @@ class PipelineCompileTests(unittest.TestCase):
             hashlib.sha256(canonical_json(unhashed).encode("utf-8")).hexdigest(),
         )
 
-    def test_inline_and_external_storage_preserve_logical_plan(self) -> None:
-        stage = _stage(
-            "compute",
-            b"artifact",
-            {
-                "arguments": [],
-                "results": [],
+    def test_program_manifest_has_exact_canonical_envelope(self) -> None:
+        reflection = {
+            "required_features": [],
+            "endpoints": [],
+            "compute": {
+                "workgroup_size": [1, 1, 1],
+                "subgroup": None,
+                "capabilities": ["direct_dispatch"],
             },
+        }
+        contract = {"operation": "compute", "reflection": reflection}
+        contract_hash = hashlib.sha256(canonical_json(contract).encode()).hexdigest()
+        artifact = CompiledArtifact("glsl", b"#version 430\nvoid main() {}", "main.glsl")
+        stage = CompiledStage(
+            "module",
+            "main",
+            "compute",
+            OpenGLTargetOptions(version=430),
+            {"required_features": []},
+            {"workgroup_size": [1, 1, 1]},
+            artifact,
+            {"program_contracts": {"main": contract}},
         )
-        plan = build_bundle_plan("pipeline", stage.target, ("FEATURE",), [(("FEATURE",), {"compute": stage})])
-        inline = materialize_bundle(plan, {stage.id: inline_artifact_descriptor(stage.artifact)})
-        external = materialize_bundle(
+        program = {
+            "stages": {"main": {"operation": "compute", "contract_hash": contract_hash}},
+            "parameters": [],
+            "storages": [],
+            "values": [],
+            "graphs": [
+                {
+                    "name": "forward",
+                    "direction": "forward",
+                    "inputs": [],
+                    "captures": [],
+                    "outputs": [],
+                    "nodes": [],
+                }
+            ],
+            "abi": {"boundary_slots": [], "derivative_projections": [], "tape_plans": []},
+        }
+        plan = build_program_plan("program", stage.target, [(("FEATURE",), {"main": stage}, program)])
+        manifest = build_program_manifest(
             plan,
             {
                 stage.id: {
                     "format": "glsl",
                     "storage": "external",
-                    "path": f"artifacts/{stage.artifact.sha256}.glsl",
-                    "size": len(stage.artifact.data),
-                    "sha256": stage.artifact.sha256,
+                    "path": f"artifacts/{artifact.sha256}.glsl",
+                    "size": len(artifact.data),
+                    "sha256": artifact.sha256,
                 }
             },
         )
-        self.assertEqual(set(inline["stage_artifacts"]), set(external["stage_artifacts"]))
-        self.assertEqual(inline["variants"], external["variants"])
-        inline_record = dict(inline["stage_artifacts"][stage.id])
-        external_record = dict(external["stage_artifacts"][stage.id])
-        inline_record.pop("artifact")
-        external_record.pop("artifact")
-        self.assertEqual(inline_record, external_record)
+        self.assertEqual(
+            set(manifest),
+            {
+                "compiler_contract_version",
+                "program_version",
+                "type",
+                "id",
+                "target",
+                "blobs",
+                "variants",
+                "content_hash",
+            },
+        )
+        variant = manifest["variants"][0]
+        self.assertEqual(set(variant), {"key", "program", "artifact_system"})
+        self.assertEqual(set(variant["artifact_system"]), {"runtime_requirements", "artifacts"})
+        self.assertEqual(set(variant["artifact_system"]["artifacts"]), {"main"})
+        self.assertNotIn("stage_bindings", variant)
+        self.assertNotIn("blobs", variant["artifact_system"])
+        self.assertNotIn("target", variant["artifact_system"])
 
     def test_reflection_selection_and_error_cases(self) -> None:
         reflection = parse_reflection_json(
@@ -1060,17 +999,6 @@ class PipelineCompileTests(unittest.TestCase):
                     }
                 },
             )
-        stage = _stage(
-            "compute",
-            b"x",
-            {
-                "arguments": [],
-                "results": [],
-            },
-        )
-        plan = build_bundle_plan("pipeline", stage.target, (), [((), {"compute": stage})])
-        with self.assertRaisesRegex(ProgramCompileError, "do not match planned"):
-            materialize_bundle(plan, {})
 
 
 if __name__ == "__main__":

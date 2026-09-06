@@ -20,3 +20,10 @@ class CompileError(Exception):
         self.message = message
         self.location = location
         super().__init__(f"{location}: error: {message}")
+
+
+class ProgramCompileError(ValueError):
+    """A Program cannot be captured, compiled, deployed, or loaded."""
+
+
+__all__ = ["CompileError", "ProgramCompileError", "SourceLocation"]

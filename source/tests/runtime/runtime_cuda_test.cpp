@@ -106,7 +106,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};

@@ -9,36 +9,32 @@ from typing import Any, Iterator, Mapping
 import numpy as np
 
 from .._program_assets.artifact_io import write_external_artifact
-from .._program_assets.cooking import (
-    _compile_program_bundle_plan,
+from .._program_assets.compile_orchestration import (
+    _compile_program_variant,
     _native_target,
 )
-from ..bundle import canonical_json, make_target_options
-from ..bundle.deployment import deploy_program_variant
+from ..bundle import build_program_manifest, build_program_plan, canonical_json, make_target_options
 from ..storage import TensorStorage, TensorView
 from . import session as state
 from .autodiff import _pipeline_derivative_groups
 from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .sampler import SamplerState
+from .tensor import RawBuffer
 from .texture import _TextureResource
 
 
 @dataclass
 class _ProgramDeployment:
     directory: tempfile.TemporaryDirectory[str]
-    canonical_program: bytes
-    artifact_system: bytes
-    stage_bindings: Any
+    manifest: bytes
     compiled_stages: list[tuple[str, str, Any]]
 
     def load(self) -> Any:
         if state._native_runtime is None:
             raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
         return state._native_runtime.load_canonical_program(
-            self.canonical_program,
-            self.artifact_system,
+            self.manifest,
             self.directory.name,
-            self.stage_bindings,
             self.compiled_stages,
         )
 
@@ -174,8 +170,13 @@ def _bound_program_invocation(
     boundary_slots = tuple(
         slot for slot in pipeline.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
     )
-    if set(parameters_by_slot) != {slot["slot"] for slot in boundary_slots}:
-        raise RuntimeError("Program invocation parameters do not match compiler-emitted ProgramABI")
+    boundary_slots_by_slot = {slot["slot"]: slot for slot in boundary_slots}
+    if not set(parameters_by_slot) <= set(boundary_slots_by_slot):
+        raise RuntimeError(
+            "Program invocation parameters do not match compiler-emitted ProgramABI: "
+            f"parameters={sorted(parameters_by_slot)}, "
+            f"boundaries={sorted(boundary_slots_by_slot)}"
+        )
 
     def binding(slot: Mapping[str, Any]) -> tuple[str, Any]:
         path = slot["path"]
@@ -189,8 +190,11 @@ def _bound_program_invocation(
         state._native.ACCESS_WRITE: "write",
         state._native.ACCESS_READ_WRITE: "read_write",
     }
-    resolved = [(parameters_by_slot[slot["slot"]], slot, *binding(slot)) for slot in boundary_slots]
-    borrows = [
+    resolved = [
+        (parameter, boundary_slots_by_slot[parameter.slot], *binding(boundary_slots_by_slot[parameter.slot]))
+        for parameter in parameters
+    ]
+    borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]] = [
         (path, value, access_names[parameter.access])
         for parameter, _, path, value in resolved
         if isinstance(value, (TensorStorage, TensorView, _TextureResource))
@@ -390,10 +394,11 @@ class ProgramAutodiffSpecialization:
         pipeline = self._loaded_pipeline()
         signature = pipeline.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
-        if set(invocation.inputs) != expected_inputs:
+        actual_inputs = {path for path in invocation.inputs if not path.startswith("__grid_")}
+        if actual_inputs != expected_inputs:
             raise RuntimeError(
                 "Program invocation inputs do not match compiler ABI: "
-                f"expected={sorted(expected_inputs)}, actual={sorted(invocation.inputs)}"
+                f"expected={sorted(expected_inputs)}, actual={sorted(actual_inputs)}"
             )
         from ..program import flatten_program_outputs
 
@@ -482,15 +487,20 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
     )
     compiler = native.Compiler()
     retained_programs: list[tuple[Any, Any]] = []
-    plan = _compile_program_bundle_plan(
+    reflected_target, variant_key, stages, program = _compile_program_variant(
         parsed,
-        pipeline_id=f"interactive/program-ad/{parsed.identity}",
+        program_id=f"interactive/program-ad/{parsed.identity}",
         variant=(),
         target=target,
         compiler=compiler,
         native=native,
         native_target=_native_target(native, target.target),
         retained_programs=retained_programs if state._architecture == state.cpu else None,
+    )
+    plan = build_program_plan(
+        f"interactive/program-ad/{parsed.identity}",
+        reflected_target,
+        ((variant_key, stages, program),),
     )
     directory = tempfile.TemporaryDirectory(prefix="vernon-program-ad-")
     root = Path(directory.name)
@@ -502,18 +512,12 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
             stage.stage,
             stage.artifact.filename,
         )
-        for stage in plan.stages
+        for stage in plan.compiled_stages
     }
-    canonical_program, artifact_system, stage_bindings = deploy_program_variant(
-        plan,
-        plan.variants[0],
-        descriptors,
-    )
+    manifest = build_program_manifest(plan, descriptors)
     return _ProgramDeployment(
         directory,
-        canonical_json(dict(canonical_program)).encode(),
-        canonical_json(dict(artifact_system)).encode(),
-        stage_bindings,
+        canonical_json(manifest).encode(),
         [(stage.metadata["symbol"], stage.entry, result) for stage, result in retained_programs],
     )
 

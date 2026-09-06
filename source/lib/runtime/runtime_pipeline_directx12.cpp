@@ -115,6 +115,7 @@ bool resolveDirectX12Pipeline(VernonProgramBundle &bundle, const Variant &varian
                                                                                : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
                                             : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                                                                         : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    configureComputeValueStorage(use, candidate.layout);
                     candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                     candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
                     if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
@@ -591,6 +592,11 @@ VernonStatus invokeDirectX12ComputePipeline(VernonProgramExecutable &pipeline, c
             continue;
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+                if (!bindComputeValueStorage(layout, argument, value))
+                    return fail(*pipeline.context, "D3D12 prepared Value storage binding has invalid bytes");
+                continue;
+            }
             const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
             if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "D3D12 prepared storage binding requires an RHI Tensor");

@@ -112,6 +112,16 @@ bool hasParameter(const llvm::json::Array *bindings, llvm::StringRef name) {
     return false;
 }
 
+bool hasEndpoint(const llvm::json::Array *bindings, llvm::StringRef name) {
+    if (!bindings)
+        return false;
+    for (const llvm::json::Value &value : *bindings)
+        if (const llvm::json::Object *binding = value.getAsObject())
+            if (binding->getString("endpoint") == name)
+                return true;
+    return false;
+}
+
 } // namespace
 
 TEST(CompilerProgramDerivativePlanner, SelectsLongestPrimalAndTypedValuePath) {
@@ -143,7 +153,7 @@ TEST(CompilerProgramDerivativePlanner, RejectsUnprojectableDerivative) {
     EXPECT_NE(error.find("cannot project derivative boundary"), std::string::npos);
 }
 
-TEST(CompilerProgramBoundaryPlanner, AccessAndPublicationAreIndependentTypedPlans) {
+TEST(CompilerProgramBoundaryPlanner, SerializesExactStorageBoundaryContract) {
     using namespace vernon::compiler;
     llvm::json::Value document = parse(R"({
       "signature": {
@@ -174,12 +184,52 @@ TEST(CompilerProgramBoundaryPlanner, AccessAndPublicationAreIndependentTypedPlan
         << error;
     ASSERT_EQ(boundaries.slots.size(), 2u);
     EXPECT_EQ(boundaries.slots[0].access, ProgramBoundaryAccess::ReadWrite);
-    const ProgramPublicationPlan publication = planProgramPublications(boundaries);
-    ASSERT_EQ(publication.targets.size(), 1u);
-    EXPECT_EQ(publication.targets[0].slot, boundaries.slots[1].identity.slot);
-    llvm::json::Array serialized = serializeProgramBoundarySlots(boundaries, publication);
-    EXPECT_EQ(serialized[0].getAsObject()->get("publication"), nullptr);
-    EXPECT_EQ(serialized[1].getAsObject()->getString("publication"), "commit_after_success");
+    EXPECT_EQ(boundaries.slots[1].direction, ProgramBoundaryDirection::Output);
+    llvm::json::Array serialized = serializeProgramBoundarySlots(boundaries);
+    EXPECT_EQ(serialized, *parse(R"([
+                {
+                  "id": 0,
+                  "path": "state",
+                  "value": 0,
+                  "role": "input",
+                  "direction": "input",
+                  "category": "storage_view",
+                  "access": "read_write",
+                  "logical_type": "tensor<1xf32>",
+                  "outer_shape": [1],
+                  "alias_owner": "storage:0",
+                  "storage_id": 0,
+                  "storage_descriptor": {
+                    "tag": "buffer",
+                    "byte_length": 4,
+                    "alignment": 4,
+                    "memory": "device",
+                    "usage": ["storage"]
+                  }
+                },
+                {
+                  "id": 1,
+                  "path": "result",
+                  "value": 1,
+                  "role": "output",
+                  "direction": "output",
+                  "category": "storage_view",
+                  "access": "write",
+                  "logical_type": "tensor<1xf32>",
+                  "outer_shape": [1],
+                  "alias_owner": "storage:0",
+                  "storage_id": 0,
+                  "storage_descriptor": {
+                    "tag": "buffer",
+                    "byte_length": 4,
+                    "alignment": 4,
+                    "memory": "device",
+                    "usage": ["storage"]
+                  },
+                  "publication": "commit_after_success"
+                }
+              ])")
+                               .getAsArray());
 }
 
 TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
@@ -258,7 +308,7 @@ TEST(CompilerProgramFinalization, OmitsInactiveNestedVjpCotangents) {
     const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
     EXPECT_TRUE(hasParameter(requestBindings, "cotangent.divergence"));
     EXPECT_FALSE(hasParameter(requestBindings, "cotangent.pressure_a"));
-    EXPECT_TRUE(hasParameter(requestBindings, "advected_velocity"));
+    EXPECT_TRUE(hasEndpoint(requestBindings, "advected_velocity"));
     const llvm::json::Array *nodeBindings = (*execution.getAsObject()->getArray("graphs"))[0]
                                                 .getAsObject()
                                                 ->getArray("nodes")
@@ -422,16 +472,16 @@ TEST(CompilerProgramFinalization, BindsGradientDestByRoleNotPrimalName) {
         << error;
     const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
     EXPECT_TRUE(hasParameter(requestBindings, "primal.projected_velocity"));
-    EXPECT_TRUE(hasParameter(requestBindings, "projected_velocity.x"));
+    EXPECT_TRUE(hasEndpoint(requestBindings, "projected_velocity.x"));
     EXPECT_FALSE(hasParameter(requestBindings, "projected_velocity"));
-    EXPECT_FALSE(hasParameter(requestBindings, "gradient.projected_velocity"));
+    EXPECT_TRUE(hasParameter(requestBindings, "gradient.projected_velocity"));
     const llvm::json::Array *nodeBindings = (*execution.getAsObject()->getArray("graphs"))[0]
                                                 .getAsObject()
                                                 ->getArray("nodes")
                                                 ->front()
                                                 .getAsObject()
                                                 ->getArray("bindings");
-    EXPECT_TRUE(hasParameter(nodeBindings, "projected_velocity.x"));
+    EXPECT_TRUE(hasEndpoint(nodeBindings, "projected_velocity.x"));
     EXPECT_FALSE(hasParameter(nodeBindings, "projected_velocity"));
 }
 
@@ -480,13 +530,13 @@ TEST(CompilerProgramFinalization, ExpandsAggregateGradientBindingToCanonicalLeaf
         << error;
     const llvm::json::Array *requestBindings = request.getAsObject()->getArray("bindings");
     ASSERT_EQ(requestBindings->size(), 2u);
-    EXPECT_TRUE(hasParameter(requestBindings, "particles.mass"));
-    EXPECT_TRUE(hasParameter(requestBindings, "particles.velocity"));
+    EXPECT_TRUE(hasEndpoint(requestBindings, "particles.mass"));
+    EXPECT_TRUE(hasEndpoint(requestBindings, "particles.velocity"));
     for (const llvm::json::Value &binding : *requestBindings) {
         EXPECT_EQ(binding.getAsObject()->getInteger("value"), 2);
-        const std::optional<llvm::StringRef> parameter = binding.getAsObject()->getString("parameter");
-        ASSERT_TRUE(parameter);
-        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *parameter == "particles.mass" ? 0 : 1);
+        const std::optional<llvm::StringRef> endpoint = binding.getAsObject()->getString("endpoint");
+        ASSERT_TRUE(endpoint);
+        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *endpoint == "particles.mass" ? 0 : 1);
     }
 
     const llvm::json::Array *nodeBindings = (*execution.getAsObject()->getArray("graphs"))[0]
@@ -496,13 +546,13 @@ TEST(CompilerProgramFinalization, ExpandsAggregateGradientBindingToCanonicalLeaf
                                                 .getAsObject()
                                                 ->getArray("bindings");
     ASSERT_EQ(nodeBindings->size(), 2u);
-    EXPECT_TRUE(hasParameter(nodeBindings, "particles.mass"));
-    EXPECT_TRUE(hasParameter(nodeBindings, "particles.velocity"));
+    EXPECT_TRUE(hasEndpoint(nodeBindings, "particles.mass"));
+    EXPECT_TRUE(hasEndpoint(nodeBindings, "particles.velocity"));
     for (const llvm::json::Value &binding : *nodeBindings) {
         EXPECT_EQ(binding.getAsObject()->getInteger("value"), 2);
-        const std::optional<llvm::StringRef> parameter = binding.getAsObject()->getString("parameter");
-        ASSERT_TRUE(parameter);
-        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *parameter == "particles.mass" ? 0 : 1);
+        const std::optional<llvm::StringRef> endpoint = binding.getAsObject()->getString("endpoint");
+        ASSERT_TRUE(endpoint);
+        EXPECT_EQ(binding.getAsObject()->getInteger("leaf"), *endpoint == "particles.mass" ? 0 : 1);
     }
 }
 

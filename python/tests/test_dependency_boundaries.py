@@ -5,6 +5,10 @@ import unittest
 from pathlib import Path
 
 import vernon_dsl as vd
+from vernon_dsl._program_assets.artifact_io import write_bundle_artifacts
+from vernon_dsl._program_assets.capture import capture_program
+from vernon_dsl._program_assets.compile_orchestration import compile_captured_program
+from vernon_dsl._program_assets.source import load_program_asset_declaration
 from vernon_dsl.program_assets import cook_program_asset, encode_runtime_stage, lint_python_program_asset
 
 ROOT = Path(__file__).parents[1] / "vernon_dsl"
@@ -77,6 +81,42 @@ class DependencyBoundaryTests(unittest.TestCase):
             cook_program_asset.__module__,
             "vernon_dsl._program_assets.cooking",
         )
+        self.assertEqual(capture_program.__module__, "vernon_dsl._program_assets.capture")
+        self.assertEqual(
+            compile_captured_program.__module__,
+            "vernon_dsl._program_assets.compile_orchestration",
+        )
+        self.assertEqual(
+            write_bundle_artifacts.__module__,
+            "vernon_dsl._program_assets.artifact_io",
+        )
+        self.assertEqual(
+            load_program_asset_declaration.__module__,
+            "vernon_dsl._program_assets.source",
+        )
+
+    def test_program_asset_layers_have_distinct_authority(self) -> None:
+        assets = ROOT / "_program_assets"
+        forbidden_imports = {
+            "source.py": {"capture", "compile_orchestration", "artifact_io", "cooking"},
+            "capture.py": {"source", "compile_orchestration", "artifact_io", "cooking"},
+            "compile_orchestration.py": {"source", "declaration", "artifact_io", "cooking"},
+            "artifact_io.py": {"source", "declaration", "capture", "compile_orchestration", "cooking"},
+        }
+        for filename, forbidden in forbidden_imports.items():
+            imports = imported_modules(assets / filename)
+            with self.subTest(module=filename):
+                self.assertFalse(
+                    any(any(name in module for name in forbidden) for module in imports),
+                    imports,
+                )
+
+        cooking_definitions = {
+            node.name
+            for node in ast.parse((assets / "cooking.py").read_text(encoding="utf-8")).body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+        self.assertEqual(cooking_definitions, {"_validate_captured_target", "cook_program_asset"})
 
     def test_deployment_does_not_reach_up_into_the_cook_orchestrator(self) -> None:
         """The bundle layer builds the deployed form; it must not ask the layer above it how.

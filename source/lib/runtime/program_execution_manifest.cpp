@@ -487,15 +487,15 @@ bool parseControl(const nlohmann::json &value, ControlComponent &control, Diagno
     if (reference.size() != 1)
         return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", path + "/control",
                     "control reference must have one source");
-    if (reference.contains("argument") && uint32Value(reference["argument"], control.reference))
-        control.kind = ControlKind::Argument;
+    if (reference.contains("value") && uint32Value(reference["value"], control.reference))
+        control.kind = ControlKind::Value;
     else if (reference.contains("parameter") && uint32Value(reference["parameter"], control.reference))
         control.kind = ControlKind::Parameter;
     else if (reference.contains("capture") && uint32Value(reference["capture"], control.reference))
         control.kind = ControlKind::Capture;
     else
         return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", path + "/control",
-                    "control supports argument, parameter, and capture");
+                    "control supports value, parameter, and capture");
     return true;
 }
 
@@ -541,6 +541,28 @@ bool stringArray(const nlohmann::json &value, std::vector<std::string> &result, 
         std::adjacent_find(result.begin(), result.end()) != result.end())
         return fail(diagnostic, "PROGRAM_NON_CANONICAL_ORDER", "parse", path, "string set must be sorted and unique");
     return true;
+}
+
+BoundaryAccess canonicalBoundaryAccess(const Program &program, BoundaryDirection direction,
+                                       const std::optional<uint32_t> &storageId) {
+    if (direction == BoundaryDirection::Output)
+        return BoundaryAccess::Write;
+    if (!storageId)
+        return BoundaryAccess::Read;
+    bool reads = false;
+    bool writes = false;
+    const Graph *forward = findGraph(program, "forward");
+    if (forward)
+        for (const Node &node : forward->nodes)
+            for (const ResourceAccess &access : node.accesses) {
+                if (access.storage != *storageId)
+                    continue;
+                reads |= access.kind == AccessKind::Read || access.kind == AccessKind::Attachment ||
+                         (access.kind == AccessKind::Write && access.access == "read_write");
+                writes |= access.kind == AccessKind::Initialize || access.kind == AccessKind::Write ||
+                          access.kind == AccessKind::Attachment;
+            }
+    return writes ? (reads ? BoundaryAccess::ReadWrite : BoundaryAccess::Write) : BoundaryAccess::Read;
 }
 
 } // namespace
@@ -602,19 +624,12 @@ bool isTapeValueType(std::string_view type) {
 bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
     program = {};
     diagnostic = {};
-    if (!exactObject(value,
-                     {"stages", "parameters", "storages", "values", "shape_symbols", "shape_constraints",
-                      "alias_preconditions", "graphs", "abi"},
-                     {"residual_contract"}, diagnostic, ""))
+    if (!exactObject(value, {"stages", "parameters", "storages", "values", "graphs", "abi"}, {"residual_contract"},
+                     diagnostic, ""))
         return false;
     if (!value["stages"].is_object() || !value["parameters"].is_array() || !value["storages"].is_array() ||
-        !value["values"].is_array() || !value["shape_symbols"].is_array() || !value["shape_symbols"].empty() ||
-        !value["shape_constraints"].is_array() || !value["shape_constraints"].empty() ||
-        !value["alias_preconditions"].is_array() || !value["alias_preconditions"].empty() ||
-        !value["graphs"].is_array()) {
-        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", "",
-                    "phase-one compute requires static shape_symbols and no alias constraints");
-    }
+        !value["values"].is_array() || !value["graphs"].is_array())
+        return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "parse", "", "Program collections are invalid");
 
     for (const auto &[stageId, row] : value["stages"].items()) {
         const std::string path = "/stages/" + stageId;
@@ -869,11 +884,18 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                     return fail(diagnostic, "PROGRAM_VALUE_ORIGIN", "parse", inputPath, "invalid user input");
                 input.kind = GraphInputKind::UserInput;
             } else if (tag == "invocation_control") {
-                if (!exactObject(inputValue, {"tag", "value"}, {}, diagnostic, inputPath) ||
-                    !uint32Value(inputValue["value"], input.value))
+                if (!exactObject(inputValue, {"tag", "value", "axis"}, {}, diagnostic, inputPath) ||
+                    !uint32Value(inputValue["value"], input.value) || !uint32Value(inputValue["axis"], input.axis) ||
+                    input.axis >= 3)
                     return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", inputPath,
                                 "invalid invocation control input");
                 input.kind = GraphInputKind::InvocationControl;
+            } else if (tag == "control") {
+                if (!exactObject(inputValue, {"tag", "value"}, {}, diagnostic, inputPath) ||
+                    !uint32Value(inputValue["value"], input.value))
+                    return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", inputPath,
+                                "invalid typed control input");
+                input.kind = GraphInputKind::Control;
             } else if (tag == "parameter") {
                 if (!exactObject(inputValue, {"tag", "value", "parameter"}, {}, diagnostic, inputPath) ||
                     !uint32Value(inputValue["value"], input.value) ||
@@ -926,8 +948,8 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                 const std::string bindingPath = nodePath + "/bindings/" + std::to_string(bindingIndex);
                 EndpointBinding binding;
                 const std::string module = bindingValue.value("module", "");
-                if (!exactObject(bindingValue, {"module", "interface", "index", "tag"}, {"value", "access", "leaf"},
-                                 diagnostic, bindingPath) ||
+                if (!exactObject(bindingValue, {"module", "interface", "index", "tag"},
+                                 {"projections", "access", "leaf"}, diagnostic, bindingPath) ||
                     !bindingValue["module"].is_string() ||
                     (module != "compute" && module != "vertex" && module != "fragment") ||
                     !bindingValue["interface"].is_string() || !uint32Value(bindingValue["index"], binding.index) ||
@@ -937,13 +959,45 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                 binding.module = module;
                 binding.interfaceKind = bindingValue["interface"].get<std::string>();
                 if (bindingValue["tag"] == "value") {
-                    if (!bindingValue.contains("value") || bindingValue.contains("access") ||
-                        !uint32Value(bindingValue["value"], binding.value))
+                    if (!bindingValue.contains("projections") || !bindingValue["projections"].is_array() ||
+                        bindingValue["projections"].empty() || bindingValue.contains("access"))
                         return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", bindingPath,
                                     "invalid value binding");
                     binding.tag = BindingTag::Value;
+                    std::set<uint32_t> physicalLeaves;
+                    for (size_t projectionIndex = 0; projectionIndex < bindingValue["projections"].size();
+                         ++projectionIndex) {
+                        const auto &projectionValue = bindingValue["projections"][projectionIndex];
+                        const std::string projectionPath =
+                            bindingPath + "/projections/" + std::to_string(projectionIndex);
+                        ValueEndpointProjection projection;
+                        if (!exactObject(projectionValue, {"value", "physical_leaf", "direction"}, {"leaf"}, diagnostic,
+                                         projectionPath) ||
+                            !uint32Value(projectionValue["value"], projection.value) ||
+                            !uint32Value(projectionValue["physical_leaf"], projection.physicalLeaf) ||
+                            !physicalLeaves.insert(projection.physicalLeaf).second ||
+                            !projectionValue["direction"].is_string())
+                            return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", projectionPath,
+                                        "invalid value projection");
+                        const std::string direction = projectionValue["direction"].get<std::string>();
+                        if (direction == "input")
+                            projection.direction = ValueBindingDirection::Input;
+                        else if (direction == "result")
+                            projection.direction = ValueBindingDirection::Result;
+                        else
+                            return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", projectionPath + "/direction",
+                                        "unknown value projection direction");
+                        if (projectionValue.contains("leaf")) {
+                            uint32_t leaf = 0;
+                            if (!uint32Value(projectionValue["leaf"], leaf))
+                                return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", projectionPath + "/leaf",
+                                            "invalid value projection leaf");
+                            projection.leaf = leaf;
+                        }
+                        binding.projections.push_back(std::move(projection));
+                    }
                 } else if (bindingValue["tag"] == "resource") {
-                    if (!bindingValue.contains("access") || bindingValue.contains("value") ||
+                    if (!bindingValue.contains("access") || bindingValue.contains("projections") ||
                         !uint32Value(bindingValue["access"], binding.access))
                         return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", bindingPath,
                                     "invalid resource binding");
@@ -953,11 +1007,14 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                                 "unknown binding tag");
                 }
                 if (bindingValue.contains("leaf")) {
+                    if (binding.tag != BindingTag::Resource)
+                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", bindingPath + "/leaf",
+                                    "only resource bindings may project a leaf directly");
                     uint32_t leaf = 0;
                     if (!uint32Value(bindingValue["leaf"], leaf))
                         return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "parse", bindingPath + "/leaf",
                                     "invalid leaf");
-                    binding.leaf = leaf;
+                    binding.resourceLeaf = leaf;
                 }
                 node.bindings.push_back(std::move(binding));
             }
@@ -1113,14 +1170,12 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         if (!exactObject(row,
                          {"id", "path", "value", "role", "direction", "category", "access", "logical_type",
                           "outer_shape", "alias_owner"},
-                         {"value_layout", "storage_id", "storage_descriptor", "publication"}, diagnostic, path) ||
-            !uint32Value(row["id"], slot.id) || slot.id != index || !row["path"].is_string() ||
+                         {"value_layout", "storage_id", "storage_descriptor", "publication"}, diagnostic, path))
+            return false;
+        if (!uint32Value(row["id"], slot.id) || slot.id != index || !row["path"].is_string() ||
             row["path"].get_ref<const std::string &>().empty() || !uint32Value(row["value"], slot.value) ||
             !row["role"].is_string() || !row["direction"].is_string() || !row["category"].is_string() ||
-            !row["access"].is_string() || !row["logical_type"].is_string() ||
-            row["logical_type"].get_ref<const std::string &>().empty() || !row["alias_owner"].is_string() ||
-            row["alias_owner"].get_ref<const std::string &>().empty() ||
-            !parseShape(row["outer_shape"], slot.outerShape, diagnostic, path + "/outer_shape", true, true))
+            !row["access"].is_string() || !row["logical_type"].is_string() || !row["alias_owner"].is_string())
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "invalid ProgramABI boundary slot");
         slot.path = row["path"].get<std::string>();
         const std::string role = row["role"].get<std::string>();
@@ -1135,26 +1190,44 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         else
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/role",
                         "unknown ProgramABI boundary role");
-        const std::string direction = row["direction"].get<std::string>();
-        if (direction == "input")
+        const BoundaryDirection roleDirection = slot.role == BoundaryRole::Input || slot.role == BoundaryRole::Cotangent
+                                                    ? BoundaryDirection::Input
+                                                    : BoundaryDirection::Output;
+        if (row["direction"] == "input")
             slot.direction = BoundaryDirection::Input;
-        else if (direction == "output")
+        else if (row["direction"] == "output")
             slot.direction = BoundaryDirection::Output;
         else
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/direction",
                         "unknown ProgramABI boundary direction");
-        const BoundaryDirection roleDirection = slot.role == BoundaryRole::Input || slot.role == BoundaryRole::Cotangent
-                                                    ? BoundaryDirection::Input
-                                                    : BoundaryDirection::Output;
-        if (slot.direction != roleDirection || slot.value >= program.values.size())
-            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
-                        "ProgramABI boundary role, direction, or Value is inconsistent");
+        if (slot.direction != roleDirection)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/direction",
+                        "ProgramABI boundary role and direction disagree");
+        if (slot.value >= program.values.size())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path, "ProgramABI boundary Value is inconsistent");
         const Value &logicalValue = program.values[slot.value];
         slot.logicalType = row["logical_type"].get<std::string>();
-        const std::string aliasOwner = row["alias_owner"].get<std::string>();
-        if (slot.logicalType != logicalValue.type || slot.outerShape != logicalValue.shape)
-            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
-                        "ProgramABI logical type or outer shape does not match its Value");
+        if (slot.logicalType != logicalValue.type)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/logical_type",
+                        "ProgramABI logical type disagrees with its Value");
+        if (!parseShape(row["outer_shape"], slot.outerShape, diagnostic, path + "/outer_shape", true, true))
+            return false;
+        if (slot.outerShape != logicalValue.shape)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/outer_shape",
+                        "ProgramABI outer shape disagrees with its Value");
+        const bool hasValueLayout = row.contains("value_layout");
+        if (hasValueLayout != logicalValue.layout.has_value())
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
+                        "ProgramABI ValueLayout presence disagrees with its Value");
+        if (hasValueLayout) {
+            ValueLayout layout;
+            if (!parseLayout(row["value_layout"], layout, diagnostic, path + "/value_layout"))
+                return false;
+            if (row["value_layout"] != value["values"][slot.value]["value_layout"])
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
+                            "ProgramABI ValueLayout disagrees with its Value");
+            slot.layout = std::move(layout);
+        }
         const std::string category = row["category"].get<std::string>();
         if (category == "value")
             slot.category = BoundaryCategory::Value;
@@ -1177,62 +1250,74 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
         else
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/access",
                         "unknown ProgramABI boundary access");
-        if (row.contains("value_layout")) {
-            ValueLayout layout;
-            if (!parseLayout(row["value_layout"], layout, diagnostic, path + "/value_layout"))
-                return false;
-            if (!logicalValue.layout || layout.layoutHash != logicalValue.layout->layoutHash ||
-                layout.scope != logicalValue.layout->scope)
-                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
-                            "ProgramABI layout does not match its Value");
-            slot.layout = std::move(layout);
-        } else if (logicalValue.layout) {
-            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/value_layout",
-                        "ProgramABI omitted a canonical Value layout");
-        }
-        const bool hasStorageId = row.contains("storage_id");
-        const bool hasDescriptor = row.contains("storage_descriptor");
-        if (hasStorageId != hasDescriptor || hasStorageId != logicalValue.storage.has_value() ||
-            (slot.category == BoundaryCategory::Value) != !hasStorageId)
-            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
-                        "ProgramABI resource storage metadata is incomplete");
-        if (hasStorageId) {
-            BoundaryStorage boundaryStorage;
-            if (!uint32Value(row["storage_id"], boundaryStorage.id) || boundaryStorage.id >= program.storages.size() ||
-                boundaryStorage.id != *logicalValue.storage ||
-                row["storage_descriptor"] != value["storages"][boundaryStorage.id]["descriptor"])
+        if (logicalValue.storage) {
+            uint32_t serializedStorage{};
+            if (!row.contains("storage_id") || !uint32Value(row["storage_id"], serializedStorage) ||
+                serializedStorage != *logicalValue.storage)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/storage_id",
+                            "ProgramABI Storage id disagrees with its Value");
+            if (!row.contains("storage_descriptor"))
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/storage_descriptor",
-                            "ProgramABI storage descriptor does not match its Storage");
+                            "resource ProgramABI boundary requires a Storage descriptor");
+            BoundaryStorage boundaryStorage;
+            boundaryStorage.id = serializedStorage;
+            if (boundaryStorage.id >= program.storages.size())
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path,
+                            "ProgramABI boundary Value references an unknown Storage");
             const Storage &storage = program.storages[boundaryStorage.id];
+            if (row["storage_descriptor"] != value["storages"][boundaryStorage.id]["descriptor"])
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/storage_descriptor",
+                            "ProgramABI Storage descriptor disagrees with its Storage");
             boundaryStorage.descriptorKind = storage.descriptorKind;
             boundaryStorage.buffer = storage.buffer;
             boundaryStorage.image = storage.image;
             boundaryStorage.opaqueContractHash = storage.opaqueContractHash;
-            const BoundaryCategory expectedCategory =
+            const BoundaryCategory storageCategory =
                 storage.descriptorKind == StorageDescriptorKind::Buffer  ? BoundaryCategory::StorageView
                 : storage.descriptorKind == StorageDescriptorKind::Image ? BoundaryCategory::Texture
                                                                          : BoundaryCategory::Sampler;
-            if (slot.category != expectedCategory)
+            if (slot.category != storageCategory ||
+                (storage.descriptorKind == StorageDescriptorKind::Opaque && logicalValue.type != "!vernon.sampler"))
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/category",
-                            "ProgramABI category does not match its storage descriptor");
+                            "ProgramABI category disagrees with its Storage");
             slot.storage = std::move(boundaryStorage);
+            slot.aliasOwner = {ProgramOwnerKind::Storage, *logicalValue.storage};
+        } else {
+            if (row.contains("storage_id") || row.contains("storage_descriptor") ||
+                slot.category != BoundaryCategory::Value)
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/category",
+                            "by-value ProgramABI boundary has resource metadata");
+            slot.aliasOwner = {ProgramOwnerKind::Value, logicalValue.id};
         }
-        const std::string expectedAlias = hasStorageId ? "storage:" + std::to_string(*logicalValue.storage)
-                                                       : "value:" + std::to_string(logicalValue.id);
-        if (aliasOwner != expectedAlias)
+        const std::string expectedOwner =
+            std::string(slot.aliasOwner.kind == ProgramOwnerKind::Storage ? "storage:" : "value:") +
+            std::to_string(slot.aliasOwner.id);
+        if (row["alias_owner"] != expectedOwner)
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/alias_owner",
-                        "ProgramABI alias owner does not match its logical Value");
-        slot.aliasOwner = hasStorageId ? ProgramOwnerId{ProgramOwnerKind::Storage, *logicalValue.storage}
-                                       : ProgramOwnerId{ProgramOwnerKind::Value, logicalValue.id};
-        if (slot.direction == BoundaryDirection::Output) {
-            if (!row.contains("publication") || !row["publication"].is_string() ||
-                row["publication"] != "commit_after_success")
+                        "ProgramABI alias owner disagrees with its Value");
+        if (slot.access != canonicalBoundaryAccess(program, slot.direction, logicalValue.storage))
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/access",
+                        "ProgramABI access disagrees with the canonical Program");
+        if (slot.direction == BoundaryDirection::Input) {
+            if (row.contains("publication"))
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
-                            "ProgramABI output requires commit-after-success publication");
-            slot.publication = BoundaryPublication::CommitAfterSuccess;
-        } else if (row.contains("publication")) {
-            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
-                        "ProgramABI input cannot declare output publication");
+                            "input ProgramABI boundary cannot publish");
+        } else {
+            if (!row.contains("publication") || !row["publication"].is_string())
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                            "output ProgramABI boundary requires publication");
+            if (row["publication"] == "commit_after_success") {
+                slot.publication = BoundaryPublication::CommitAfterSuccess;
+            } else if (row["publication"] == "in_place") {
+                if (!logicalValue.storage ||
+                    program.storages[*logicalValue.storage].mutability != StorageMutability::Mutable)
+                    return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                                "in_place publication requires mutable Storage-backed output");
+                slot.publication = BoundaryPublication::InPlace;
+            } else {
+                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                            "unknown ProgramABI publication policy");
+            }
         }
         program.abi.boundarySlots.push_back(std::move(slot));
     }
@@ -1325,8 +1410,7 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     if (!hasBackward)
         return true;
     const auto &residual = value["residual_contract"];
-    if (!exactObject(residual, {"captures", "shape_symbols"}, {}, diagnostic, "/residual_contract") ||
-        !residual["captures"].is_array() || !residual["shape_symbols"].is_array() || !residual["shape_symbols"].empty())
+    if (!exactObject(residual, {"captures"}, {}, diagnostic, "/residual_contract") || !residual["captures"].is_array())
         return fail(diagnostic, "PROGRAM_RESIDUAL_CONTRACT", "parse", "/residual_contract",
                     "invalid residual_contract");
     ResidualContract contract;
@@ -1355,28 +1439,35 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
     return true;
 }
 
-bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts, Diagnostic &diagnostic) {
+bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blobs, const nlohmann::json &value,
+                         ArtifactSystem &artifacts, Diagnostic &diagnostic) {
     artifacts = {};
     diagnostic = {};
-    if (!exactObject(value, {"target", "blobs", "artifacts"}, {}, diagnostic, "/artifact_system"))
+    if (!exactObject(value, {"runtime_requirements", "artifacts"}, {}, diagnostic, "/artifact_system"))
         return false;
-    const auto &target = value["target"];
-    if (!exactObject(target, {"kind", "options"}, {}, diagnostic, "/artifact_system/target") ||
-        !target["kind"].is_string() || !target["options"].is_object())
-        return fail(diagnostic, "PROGRAM_ARTIFACT_TARGET", "parse", "/artifact_system/target",
+    if (!exactObject(target, {"kind", "options"}, {}, diagnostic, "/target") || !target["kind"].is_string() ||
+        !target["options"].is_object())
+        return fail(diagnostic, "PROGRAM_ARTIFACT_TARGET", "parse", "/target",
                     "invalid single-compute ArtifactSystem target");
     artifacts.target = target["kind"].get<std::string>();
     if (artifacts.target != "cpu" && artifacts.target != "cuda" && artifacts.target != "vulkan" &&
         artifacts.target != "opengl" && artifacts.target != "opengles" && artifacts.target != "metal" &&
         artifacts.target != "directx")
-        return fail(diagnostic, "PROGRAM_ARTIFACT_TARGET", "parse", "/artifact_system/target/kind",
+        return fail(diagnostic, "PROGRAM_ARTIFACT_TARGET", "parse", "/target/kind",
                     "ArtifactSystem target kind must be cpu, cuda, vulkan, opengl, opengles, metal, or directx");
-    if (!value["blobs"].is_object() || !value["artifacts"].is_object())
+    if (!blobs.is_object() || !value["runtime_requirements"].is_object() || !value["artifacts"].is_object())
         return fail(diagnostic, "PROGRAM_UNKNOWN_FIELD", "parse", "/artifact_system",
-                    "blobs and artifacts must be objects");
+                    "runtime_requirements, artifacts, and root blobs must be objects");
 
-    for (const auto &[blobId, row] : value["blobs"].items()) {
-        const std::string path = "/artifact_system/blobs/" + blobId;
+    const auto parseCodeBlob = [&](const std::string &blobId) {
+        if (artifacts.blobs.find(blobId) != artifacts.blobs.end())
+            return true;
+        const std::string path = "/blobs/" + blobId;
+        const auto found = blobs.find(blobId);
+        if (found == blobs.end())
+            return fail(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "parse", path,
+                        "CodeModule references an unknown Blob");
+        const nlohmann::json &row = *found;
         Blob blob;
         if (blobId.empty() || !exactObject(row, {"byte_length", "sha256", "location"}, {}, diagnostic, path) ||
             !uint64Value(row["byte_length"], blob.byteLength) || !blob.byteLength || !digestValue(row["sha256"]))
@@ -1394,9 +1485,10 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
             return fail(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "parse", path + "/location/uri",
                         "external Blob URI is not normalized beneath the bundle");
         artifacts.blobs.emplace(blobId, std::move(blob));
-    }
+        return true;
+    };
 
-    std::set<std::string> referencedBlobs;
+    std::vector<nlohmann::json> stageRequirements;
     for (const auto &[artifactId, row] : value["artifacts"].items()) {
         const std::string path = "/artifact_system/artifacts/" + artifactId;
         StageArtifact stage;
@@ -1489,6 +1581,7 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                             "invalid CUDA runtime requirements");
         }
         stage.backend = artifacts.target;
+        stageRequirements.push_back(requirements);
 
         std::set<std::string> moduleRoles;
         for (size_t moduleIndex = 0; moduleIndex < row["modules"].size(); ++moduleIndex) {
@@ -1518,12 +1611,13 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
             code.entryPoint = module["entry_point"].get<std::string>();
             code.blob = module["blob"].get<std::string>();
             code.sha256 = module["sha256"].get<std::string>();
+            if (!parseCodeBlob(code.blob))
+                return false;
             const auto blob = artifacts.blobs.find(code.blob);
             if (blob == artifacts.blobs.end() || code.offset > blob->second.byteLength ||
                 code.byteLength > blob->second.byteLength - code.offset)
                 return fail(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "parse", modulePath + "/blob",
                             "CodeModule range is outside its Blob");
-            referencedBlobs.insert(code.blob);
             stage.modules.push_back(std::move(code));
         }
         if (operation == "graphics" && !moduleRoles.count("vertex"))
@@ -1581,7 +1675,7 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                         : std::initializer_list<std::string_view>{"tag", "module", "interface", "index", "type",
                                                                   "layout_hash", "transport", "access", "abi"},
                     resource ? std::initializer_list<std::string_view>{"write_footprint"}
-                             : std::initializer_list<std::string_view>{"element_layout_hash"},
+                             : std::initializer_list<std::string_view>{"element_layout_hash", "role"},
                     diagnostic, endpointPath) ||
                 (!resource && endpoint.tag != "value") || !endpointValue["module"].is_string() ||
                 (operation == "compute" ? endpointModule != "compute"
@@ -1596,6 +1690,12 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
             endpoint.type = endpointValue["type"].get<std::string>();
             endpoint.transport = endpointValue["transport"].get<std::string>();
             endpoint.access = endpointValue["access"].get<std::string>();
+            if (!resource && endpointValue.contains("role")) {
+                if (!endpointValue["role"].is_string())
+                    return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/role",
+                                "invalid value endpoint role");
+                endpoint.role = endpointValue["role"].get<std::string>();
+            }
             if (systemValue) {
                 if (!endpointValue["builtin"].is_string() ||
                     endpointValue["builtin"].get_ref<const std::string &>().empty())
@@ -1732,8 +1832,10 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                                     "invalid portable ABI semantic");
                     }
                     const auto &carrier = abiBinding["carrier"];
-                    const bool resourceCarrier = binding.semantic == "resource" || binding.semantic == "sampler" ||
-                                                 binding.semantic == "storage_leaf";
+                    const bool resourceCarrier =
+                        binding.semantic == "resource" || binding.semantic == "sampler" ||
+                        binding.semantic == "storage_leaf" ||
+                        (binding.semantic == "value" && carrier.value("tag", "") == "resource_slot");
                     if (!exactObject(carrier,
                                      resourceCarrier
                                          ? std::initializer_list<std::string_view>{"tag", "slot"}
@@ -1830,14 +1932,16 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                 const auto &rowValue = implementation["endpoints"][index];
                 const std::string endpointPath = implementationPath + "/endpoints/" + std::to_string(index);
                 CompiledEndpointAbi compiled;
-                if (!exactObject(rowValue, {"module", "index"},
+                if (!exactObject(rowValue, {"module", "interface", "index"},
                                  {"builtin", "value_transport", "set", "binding", "interface_plan",
                                   "packed_frame_offset", "element_layout", "sampled_image_bindings"},
                                  diagnostic, endpointPath) ||
-                    !rowValue["module"].is_string() || !uint32Value(rowValue["index"], compiled.index))
+                    !rowValue["module"].is_string() || !rowValue["interface"].is_string() ||
+                    !uint32Value(rowValue["index"], compiled.index))
                     return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath,
                                 "invalid compiled endpoint ABI");
                 compiled.module = rowValue["module"].get<std::string>();
+                compiled.interfaceKind = rowValue["interface"].get<std::string>();
                 if (rowValue.contains("builtin")) {
                     if (!rowValue["builtin"].is_string())
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse", endpointPath + "/builtin",
@@ -1998,41 +2102,64 @@ bool parseArtifactSystem(const nlohmann::json &value, ArtifactSystem &artifacts,
                         "StageArtifact contract hash does not match reflection");
         artifacts.stages.emplace(artifactId, std::move(stage));
     }
-    if (referencedBlobs.size() != artifacts.blobs.size())
-        return fail(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "parse", "/artifact_system/blobs",
-                    "ArtifactSystem contains an unreachable Blob");
+    if (stageRequirements.empty())
+        return fail(diagnostic, "PROGRAM_RUNTIME_REQUIREMENTS", "parse", "/artifact_system/runtime_requirements",
+                    "ArtifactSystem requires at least one StageArtifact");
+    nlohmann::json aggregate = stageRequirements.front();
+    std::set<std::string> aggregateFeatures;
+    const std::set<std::string> invariantFields{
+        "target_triple", "object_format", "address_size", "profile", "apple_platform",
+    };
+    const auto pairLess = [](const nlohmann::json &left, const nlohmann::json &right) {
+        return std::pair<uint32_t, uint32_t>{left[0].get<uint32_t>(), left[1].get<uint32_t>()} <
+               std::pair<uint32_t, uint32_t>{right[0].get<uint32_t>(), right[1].get<uint32_t>()};
+    };
+    for (const nlohmann::json &requirements : stageRequirements) {
+        for (const nlohmann::json &feature : requirements["features"])
+            aggregateFeatures.insert(feature.get<std::string>());
+        for (const auto &[name, member] : requirements.items()) {
+            if (name == "backend" || name == "features")
+                continue;
+            if (invariantFields.count(name)) {
+                if (aggregate[name] != member)
+                    return fail(diagnostic, "PROGRAM_RUNTIME_REQUIREMENTS", "parse",
+                                "/artifact_system/runtime_requirements/" + name,
+                                "StageArtifacts disagree on an invariant runtime requirement");
+            } else if ((member.is_array() && pairLess(aggregate[name], member)) ||
+                       (member.is_number_integer() && aggregate[name].get<int64_t>() < member.get<int64_t>())) {
+                aggregate[name] = member;
+            }
+        }
+    }
+    aggregate["features"] = nlohmann::json::array();
+    for (const std::string &feature : aggregateFeatures)
+        aggregate["features"].push_back(feature);
+    if (value["runtime_requirements"] != aggregate)
+        return fail(diagnostic, "PROGRAM_RUNTIME_REQUIREMENTS", "parse", "/artifact_system/runtime_requirements",
+                    "ArtifactSystem aggregate does not match its StageArtifacts");
     return true;
 }
 
-bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<std::string, std::string> &stageBindings,
-             ResolvedProgram &resolved, Diagnostic &diagnostic) {
+bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &resolved, Diagnostic &diagnostic) {
     resolved = {};
     diagnostic = {};
     if (program.graphs.empty() || program.graphs.front().direction != "forward" ||
         (program.graphs.size() == 2 && program.graphs.back().direction != "backward") || program.graphs.size() > 2)
         return fail(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "resolve", "/graphs",
                     "phase-one compute requires one forward graph and at most one backward graph");
-    if (stageBindings.size() != program.stages.size())
-        return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stage_bindings",
-                    "stage_bindings must cover every Program stage exactly once");
+    if (artifacts.stages.size() != program.stages.size())
+        return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/artifact_system/artifacts",
+                    "StageArtifacts must exactly cover every Program stage");
     for (const auto &[stageId, contract] : program.stages) {
-        const auto binding = stageBindings.find(stageId);
-        if (binding == stageBindings.end())
-            return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stage_bindings/" + stageId,
-                        "Program stage has no artifact binding");
-        const auto artifact = artifacts.stages.find(binding->second);
+        const auto artifact = artifacts.stages.find(stageId);
         if (artifact == artifacts.stages.end())
-            return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stage_bindings/" + stageId,
-                        "stage binding references an unknown artifact");
+            return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/artifact_system/artifacts/" + stageId,
+                        "Program stage has no directly keyed StageArtifact");
         if (artifact->second.operation != contract.operation || artifact->second.contractHash != contract.contractHash)
-            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "resolve", "/stage_bindings/" + stageId,
+            return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "resolve", "/artifact_system/artifacts/" + stageId,
                         "StageArtifact does not implement the portable StageContract");
-        resolved.stages.emplace(stageId, ResolvedStage{binding->second, artifact->second});
+        resolved.stages.emplace(stageId, ResolvedStage{stageId, artifact->second});
     }
-    for (const auto &[stageId, unused] : stageBindings)
-        if (program.stages.find(stageId) == program.stages.end())
-            return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", "/stage_bindings/" + stageId,
-                        "stage binding does not name a Program stage");
     for (size_t index = 0; index < program.values.size(); ++index) {
         const Value &value = program.values[index];
         if (value.id != index)
@@ -2077,6 +2204,8 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                  value.origin.kind == OriginKind::Argument && value.origin.graph == graph.direction &&
                  value.origin.slot == input.slot) ||
                 (input.kind == GraphInputKind::InvocationControl && value.origin.kind == OriginKind::Argument &&
+                 value.origin.graph == graph.direction) ||
+                (input.kind == GraphInputKind::Control && value.origin.kind == OriginKind::Argument &&
                  value.origin.graph == graph.direction) ||
                 (input.kind == GraphInputKind::Parameter && input.parameter < program.parameters.size() &&
                  program.parameters[input.parameter].value == input.value &&
@@ -2194,27 +2323,24 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                 const EndpointBinding &binding = node.bindings[bindingIndex];
                 const ReflectedEndpoint &endpoint = *bindableEndpoints[bindingIndex];
                 if (binding.module != endpoint.module || binding.interfaceKind != endpoint.interfaceKind ||
-                    binding.index != endpoint.index || (binding.tag == BindingTag::Value) != (endpoint.tag == "value"))
+                    binding.index != endpoint.index)
                     return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
                                 nodePath + "/bindings/" + std::to_string(bindingIndex),
                                 "EndpointBinding identity does not match artifact reflection");
                 if (binding.tag == BindingTag::Value) {
-                    if (binding.value >= program.values.size())
-                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                                    nodePath + "/bindings/" + std::to_string(bindingIndex),
-                                    "value binding ABI does not match reflection");
-                    const Value &value = program.values[binding.value];
-                    if (value.type != endpoint.type || !value.layout || value.layout->layoutHash != endpoint.layoutHash)
-                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
-                                    nodePath + "/bindings/" + std::to_string(bindingIndex),
-                                    "value binding ABI does not match reflection");
-                    if (binding.interfaceKind == "argument")
-                        expectedOperands.insert(binding.value);
-                    else if (binding.interfaceKind == "result")
-                        expectedResults.insert(binding.value);
-                    else
-                        return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
-                                    "binding interface must be argument or result");
+                    for (const ValueEndpointProjection &projection : binding.projections) {
+                        if (projection.value >= program.values.size() ||
+                            (projection.leaf &&
+                             (!program.values[projection.value].layout ||
+                              *projection.leaf >= program.values[projection.value].layout->leaves.size())))
+                            return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve",
+                                        nodePath + "/bindings/" + std::to_string(bindingIndex),
+                                        "value projection references an unknown canonical Value leaf");
+                        if (projection.direction == ValueBindingDirection::Input)
+                            expectedOperands.insert(projection.value);
+                        else
+                            expectedResults.insert(projection.value);
+                    }
                 } else {
                     if (binding.access >= node.accesses.size())
                         return fail(diagnostic, "PROGRAM_BINDING_MISMATCH", "resolve", nodePath + "/bindings",
@@ -2242,16 +2368,11 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                             return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
                                         "dispatch parameter is unavailable");
                         expectedOperands.insert(program.parameters[control.reference].value);
-                    } else if (control.kind == ControlKind::Argument) {
-                        const auto argument =
-                            std::find_if(program.values.begin(), program.values.end(), [&](const Value &value) {
-                                return value.origin.kind == OriginKind::Argument &&
-                                       value.origin.graph == graph.direction && value.origin.slot == control.reference;
-                            });
-                        if (argument == program.values.end())
+                    } else if (control.kind == ControlKind::Value) {
+                        if (control.reference >= program.values.size())
                             return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
-                                        "dispatch argument is unavailable");
-                        expectedOperands.insert(argument->id);
+                                        "dispatch Value is unavailable");
+                        expectedOperands.insert(control.reference);
                     }
                 }
             } else {
@@ -2368,10 +2489,13 @@ bool resolve(Program program, const ArtifactSystem &artifacts, const std::map<st
                         "ProgramABI does not match graph outputs");
         for (size_t index = 0; index < graph.outputs.size(); ++index) {
             const PublicationTarget *publication = findPublicationTarget(program.abi, slots[index]->id);
-            if (slots[index]->value != graph.outputs[index].value || !publication ||
-                publication->value != slots[index]->value || publication->role != role ||
-                publication->aliasOwner.kind != slots[index]->aliasOwner.kind ||
-                publication->aliasOwner.id != slots[index]->aliasOwner.id)
+            const bool transactionMatches = slots[index]->publication == BoundaryPublication::InPlace
+                                                ? publication == nullptr
+                                                : publication && publication->value == slots[index]->value &&
+                                                      publication->role == role &&
+                                                      publication->aliasOwner.kind == slots[index]->aliasOwner.kind &&
+                                                      publication->aliasOwner.id == slots[index]->aliasOwner.id;
+            if (slots[index]->value != graph.outputs[index].value || !transactionMatches)
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "resolve",
                             "/abi/" + field + "/" + std::to_string(index), "output boundary mismatch");
         }
@@ -2405,16 +2529,10 @@ bool resolveControlValue(const Program &program, const ControlComponent &control
         valueId = program.parameters[control.reference].value;
         return valueId < program.values.size();
     }
-    if (control.kind != ControlKind::Argument)
+    if (control.kind != ControlKind::Value || control.reference >= program.values.size())
         return false;
-    for (const Value &value : program.values) {
-        if (value.origin.kind == OriginKind::Argument && value.origin.graph == graph &&
-            value.origin.slot == control.reference) {
-            valueId = value.id;
-            return true;
-        }
-    }
-    return false;
+    valueId = control.reference;
+    return true;
 }
 
 } // namespace vernon::runtime::program

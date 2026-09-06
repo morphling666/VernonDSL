@@ -32,32 +32,31 @@ void setProgramAbi(nlohmann::json &manifest, std::initializer_list<BoundarySpec>
     for (const BoundarySpec &boundary : boundaries) {
         const uint32_t valueId = boundary.value;
         const auto &value = manifest["values"][valueId];
+        const bool input = std::string_view(boundary.direction) == "input";
         nlohmann::json slot{{"id", slots.size()},
                             {"path", boundary.path},
                             {"value", valueId},
                             {"role", boundary.role},
                             {"direction", boundary.direction},
+                            {"category", "value"},
+                            {"access", input ? "read" : "write"},
                             {"logical_type", value["type"]},
-                            {"alias_owner", "value:" + std::to_string(valueId)},
-                            {"outer_shape", value.value("shape", nlohmann::json::array())}};
-        if (std::string_view(boundary.direction) == "output")
-            slot["publication"] = "commit_after_success";
+                            {"outer_shape", value.value("shape", nlohmann::json::array())},
+                            {"alias_owner", "value:" + std::to_string(valueId)}};
         if (value.contains("value_layout"))
             slot["value_layout"] = value["value_layout"];
         if (value.contains("storage")) {
             const uint32_t storageId = value["storage"].get<uint32_t>();
             const auto &storage = manifest["storages"][storageId];
-            const bool input = std::string_view(boundary.direction) == "input";
-            const std::string tag = storage["descriptor"]["tag"];
+            const std::string tag = storage["descriptor"]["tag"].get<std::string>();
             slot["category"] = tag == "buffer" ? "storage_view" : tag == "image" ? "texture" : "sampler";
-            slot["storage_id"] = storageId;
-            slot["alias_owner"] = "storage:" + std::to_string(storageId);
-            slot["storage_descriptor"] = storage["descriptor"];
             slot["access"] = input && storage["mutability"] == "mutable" ? "read_write" : input ? "read" : "write";
-        } else {
-            slot["category"] = "value";
-            slot["access"] = std::string(boundary.direction) == "input" ? "read" : "write";
+            slot["alias_owner"] = "storage:" + std::to_string(storageId);
+            slot["storage_id"] = storageId;
+            slot["storage_descriptor"] = storage["descriptor"];
         }
+        if (!input)
+            slot["publication"] = "commit_after_success";
         slots.push_back(std::move(slot));
     }
     manifest["abi"] = {{"boundary_slots", std::move(slots)},
@@ -70,7 +69,7 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     float secondSource = 4.0f;
     float firstDestination = -1.0f;
     float secondDestination = -2.0f;
-    std::vector<vernon::runtime::ad::ProgramHostValue> storage(2);
+    std::vector<vernon::runtime::ad::LogicalProgramValue> storage(2);
     storage[0].argument = hostTensor(&firstSource, sizeof(firstSource));
     storage[1].argument = hostTensor(&secondSource, sizeof(secondSource));
 
@@ -301,9 +300,6 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                                            {"shape", nlohmann::json::array()},
                                            {"origin", {{"tag", "parameter"}, {"parameter", 0}}},
                                            {"value_layout", layout("value", u32LayoutHash, "u32")}}})},
-        {"shape_symbols", nlohmann::json::array()},
-        {"shape_constraints", nlohmann::json::array()},
-        {"alias_preconditions", nlohmann::json::array()},
         {"graphs",
          nlohmann::json::array(
              {{{"name", "forward"},
@@ -412,14 +408,18 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     manifest["stages"]["scale"]["contract_hash"] = contractHash;
     const std::string codeBytes = "test";
     const std::string codeHash = vernon::runtime::sha256Hex(codeBytes.data(), codeBytes.size());
-    nlohmann::json artifactSystem{{"target", {{"kind", "cpu"}, {"options", {{"triple", "aarch64-apple-darwin"}}}}},
-                                  {"blobs",
-                                   {{"code",
-                                     {{"byte_length", 4},
-                                      {"sha256", codeHash},
-                                      {"location", {{"tag", "external"}, {"uri", "artifacts/scale.o"}}}}}}},
+    nlohmann::json target{{"kind", "cpu"}, {"options", {{"triple", "aarch64-apple-darwin"}}}};
+    nlohmann::json blobs{{"code",
+                          {{"byte_length", 4},
+                           {"sha256", codeHash},
+                           {"location", {{"tag", "external"}, {"uri", "artifacts/scale.o"}}}}}};
+    nlohmann::json artifactSystem{{"runtime_requirements",
+                                   {{"backend", "cpu"},
+                                    {"features", nlohmann::json::array()},
+                                    {"target_triple", "aarch64-apple-darwin"},
+                                    {"object_format", "macho"}}},
                                   {"artifacts",
-                                   {{"scale-artifact",
+                                   {{"scale",
                                      {{"tag", "stage"},
                                       {"operation", "compute"},
                                       {"contract_hash", contractHash},
@@ -461,17 +461,88 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     std::vector<vernon::runtime::program::BoundarySlot> unpublishedSlots = program.abi.boundarySlots;
     unpublishedSlots[1].publication = vernon::runtime::program::BoundaryPublication::None;
     EXPECT_TRUE(vernon::runtime::program::derivePublicationPlan(unpublishedSlots).targets.empty());
-    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(artifactSystem, artifacts, diagnostic))
+
+    const auto expectBoundaryReject = [&](nlohmann::json rejected, std::string_view field) {
+        vernon::runtime::program::Program rejectedProgram;
+        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_EQ(diagnostic.code, "PROGRAM_UNKNOWN_FIELD") << diagnostic.message;
+        EXPECT_NE(diagnostic.path.find(field), std::string::npos) << diagnostic.path;
+    };
+    nlohmann::json missingId = manifest;
+    missingId["abi"]["boundary_slots"][0].erase("id");
+    expectBoundaryReject(std::move(missingId), "/id");
+    nlohmann::json extraField = manifest;
+    extraField["abi"]["boundary_slots"][0]["legacy"] = true;
+    expectBoundaryReject(std::move(extraField), "/legacy");
+
+    const auto expectBoundaryMismatch = [&](nlohmann::json rejected, std::string_view field) {
+        vernon::runtime::program::Program rejectedProgram;
+        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_EQ(diagnostic.code, "PROGRAM_ABI_MISMATCH") << diagnostic.message;
+        EXPECT_NE(diagnostic.path.find(field), std::string::npos) << diagnostic.path;
+    };
+    nlohmann::json mismatchedType = manifest;
+    mismatchedType["abi"]["boundary_slots"][0]["logical_type"] = "tensor<128xf32>";
+    expectBoundaryMismatch(std::move(mismatchedType), "/logical_type");
+    nlohmann::json mismatchedShape = manifest;
+    mismatchedShape["abi"]["boundary_slots"][0]["outer_shape"] = nlohmann::json::array({128});
+    expectBoundaryMismatch(std::move(mismatchedShape), "/outer_shape");
+    nlohmann::json mismatchedLayout = manifest;
+    mismatchedLayout["abi"]["boundary_slots"][0]["value_layout"]["alignment"] = 2;
+    expectBoundaryMismatch(std::move(mismatchedLayout), "/value_layout");
+    nlohmann::json missingDescriptor = manifest;
+    missingDescriptor["abi"]["boundary_slots"][0].erase("storage_descriptor");
+    expectBoundaryMismatch(std::move(missingDescriptor), "/storage_descriptor");
+    nlohmann::json mismatchedDescriptor = manifest;
+    mismatchedDescriptor["abi"]["boundary_slots"][0]["storage_descriptor"]["byte_length"] = 512;
+    expectBoundaryMismatch(std::move(mismatchedDescriptor), "/storage_descriptor");
+    nlohmann::json inputPublication = manifest;
+    inputPublication["abi"]["boundary_slots"][0]["publication"] = "commit_after_success";
+    expectBoundaryMismatch(std::move(inputPublication), "/publication");
+    nlohmann::json missingPublication = manifest;
+    missingPublication["abi"]["boundary_slots"][1].erase("publication");
+    expectBoundaryMismatch(std::move(missingPublication), "/publication");
+
+    nlohmann::json inPlaceManifest = manifest;
+    inPlaceManifest["abi"]["boundary_slots"][1]["publication"] = "in_place";
+    vernon::runtime::program::Program inPlaceProgram;
+    ASSERT_TRUE(vernon::runtime::program::parse(inPlaceManifest, inPlaceProgram, diagnostic)) << diagnostic.message;
+    EXPECT_EQ(inPlaceProgram.abi.boundarySlots[1].publication, vernon::runtime::program::BoundaryPublication::InPlace);
+    EXPECT_TRUE(inPlaceProgram.abi.publication.targets.empty());
+    nlohmann::json immutableInPlace = inPlaceManifest;
+    immutableInPlace["storages"][1]["mutability"] = "read_only";
+    expectBoundaryMismatch(std::move(immutableInPlace), "/publication");
+    nlohmann::json byValueInPlace = manifest;
+    byValueInPlace["abi"]["boundary_slots"][1] = {
+        {"id", 1},
+        {"path", "y"},
+        {"value", 2},
+        {"role", "output"},
+        {"direction", "output"},
+        {"category", "value"},
+        {"access", "write"},
+        {"logical_type", "u32"},
+        {"outer_shape", nlohmann::json::array()},
+        {"alias_owner", "value:2"},
+        {"value_layout", manifest["values"][2]["value_layout"]},
+        {"publication", "in_place"},
+    };
+    expectBoundaryMismatch(std::move(byValueInPlace), "/publication");
+
+    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, artifacts, diagnostic))
         << diagnostic.message;
     vernon::runtime::program::ResolvedProgram resolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, {{"scale", "scale-artifact"}},
-                                                  resolved, diagnostic))
+    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, resolved, diagnostic))
         << diagnostic.message;
     ASSERT_EQ(resolved.stages.size(), 1u);
     EXPECT_EQ(resolved.stages.at("scale").stage.workgroupSize[0], 64u);
     ASSERT_EQ(resolved.graphs.size(), 1u);
     ASSERT_EQ(resolved.graphs[0].predecessors.size(), 1u);
     EXPECT_TRUE(resolved.graphs[0].predecessors[0].empty());
+    vernon::runtime::program::ResolvedProgram inPlaceResolved;
+    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(inPlaceProgram), artifacts, inPlaceResolved, diagnostic))
+        << diagnostic.message;
+    EXPECT_TRUE(inPlaceResolved.program.abi.publication.targets.empty());
 
     nlohmann::json multiManifest = manifest;
     multiManifest["stages"]["bias"] = {{"operation", "compute"}, {"contract_hash", contractHash}};
@@ -511,17 +582,16 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     setProgramAbi(multiManifest, {{"x", 0, "input", "input"}, {"y", 3, "output", "output"}});
 
     nlohmann::json multiArtifactSystem = artifactSystem;
-    multiArtifactSystem["artifacts"]["bias-artifact"] = multiArtifactSystem["artifacts"]["scale-artifact"];
-    multiArtifactSystem["artifacts"]["bias-artifact"]["modules"][0]["entry_point"] = "bias";
+    multiArtifactSystem["artifacts"]["bias"] = multiArtifactSystem["artifacts"]["scale"];
+    multiArtifactSystem["artifacts"]["bias"]["modules"][0]["entry_point"] = "bias";
     vernon::runtime::program::Program multiProgram;
     vernon::runtime::program::ArtifactSystem multiArtifacts;
     ASSERT_TRUE(vernon::runtime::program::parse(multiManifest, multiProgram, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(multiArtifactSystem, multiArtifacts, diagnostic))
+    ASSERT_TRUE(
+        vernon::runtime::program::parseArtifactSystem(target, blobs, multiArtifactSystem, multiArtifacts, diagnostic))
         << diagnostic.message;
     vernon::runtime::program::ResolvedProgram multiResolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(multiProgram), multiArtifacts,
-                                                  {{"bias", "bias-artifact"}, {"scale", "scale-artifact"}},
-                                                  multiResolved, diagnostic))
+    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(multiProgram), multiArtifacts, multiResolved, diagnostic))
         << diagnostic.message;
     ASSERT_EQ(multiResolved.graphs[0].predecessors.size(), 2u);
     EXPECT_EQ(multiResolved.graphs[0].predecessors[1], std::vector<uint32_t>({0}));
@@ -584,9 +654,6 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                                            {"type", "image<rgba8_unorm>"},
                                            {"origin", {{"tag", "node_result"}, {"graph", "forward"}, {"node", 0}}},
                                            {"storage", 0}}})},
-        {"shape_symbols", nlohmann::json::array()},
-        {"shape_constraints", nlohmann::json::array()},
-        {"alias_preconditions", nlohmann::json::array()},
         {"graphs",
          nlohmann::json::array(
              {{{"name", "forward"},
@@ -654,14 +721,19 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
     setProgramAbi(manifest, {{"target", 0, "input", "input"}, {"target", 1, "output", "output"}});
     const std::string codeBytes = "test";
     const std::string codeHash = vernon::runtime::sha256Hex(codeBytes.data(), codeBytes.size());
-    nlohmann::json artifactSystem{{"target", {{"kind", "metal"}, {"options", {{"platform", "macos"}}}}},
-                                  {"blobs",
-                                   {{"vertex",
-                                     {{"byte_length", 4},
-                                      {"sha256", codeHash},
-                                      {"location", {{"tag", "external"}, {"uri", "artifacts/vertex.metal"}}}}}}},
+    nlohmann::json target{{"kind", "metal"}, {"options", {{"platform", "macos"}}}};
+    nlohmann::json blobs{{"vertex",
+                          {{"byte_length", 4},
+                           {"sha256", codeHash},
+                           {"location", {{"tag", "external"}, {"uri", "artifacts/vertex.metal"}}}}}};
+    nlohmann::json artifactSystem{{"runtime_requirements",
+                                   {{"backend", "metal"},
+                                    {"features", nlohmann::json::array()},
+                                    {"apple_platform", "macos"},
+                                    {"msl_version", nlohmann::json::array({2, 4})},
+                                    {"minimum_os_version", nlohmann::json::array({11, 0})}}},
                                   {"artifacts",
-                                   {{"draw-artifact",
+                                   {{"draw",
                                      {{"tag", "stage"},
                                       {"operation", "graphics"},
                                       {"contract_hash", contractHash},
@@ -684,11 +756,10 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
     vernon::runtime::program::ArtifactSystem artifacts;
     vernon::runtime::program::Diagnostic diagnostic;
     ASSERT_TRUE(vernon::runtime::program::parse(manifest, program, diagnostic)) << diagnostic.message;
-    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(artifactSystem, artifacts, diagnostic))
+    ASSERT_TRUE(vernon::runtime::program::parseArtifactSystem(target, blobs, artifactSystem, artifacts, diagnostic))
         << diagnostic.message;
     vernon::runtime::program::ResolvedProgram resolved;
-    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, {{"draw", "draw-artifact"}}, resolved,
-                                                  diagnostic))
+    ASSERT_TRUE(vernon::runtime::program::resolve(std::move(program), artifacts, resolved, diagnostic))
         << diagnostic.message;
     EXPECT_EQ(vernon::runtime::program::executionKind(resolved.program.graphs.front().nodes.front()),
               vernon::runtime::program::ExecutionKind::Graphics);

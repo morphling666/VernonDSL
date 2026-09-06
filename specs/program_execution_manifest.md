@@ -9,14 +9,14 @@ one-node Program, and a standalone graphics pipeline is a one-node Program.
 The only Program-bearing variant member is the strict `variant.program`
 object. There is no sibling or nested execution object.
 
-The Program representation has no independent schema or version field.
-`COMPILER_CONTRACT_VERSION` and `PIPELINE_VERSION` jointly select exactly one
-Program contract. This document does not change the current constants 12 and
-16, and that pair does **not** map to this schema. A producer MUST NOT emit
-this Program representation until a future coordinated compiler/pipeline
-release assigns a new pair to it. After that release, a loader MUST require
-the unique Program contract mapped by the selected pair and reject every
-other shape. It MUST NOT translate another representation into this one.
+The Program representation has no independent nested schema or version field.
+Top-level `COMPILER_CONTRACT_VERSION` and `PROGRAM_VERSION` jointly select
+exactly one Program contract. The coordinated Program Asset release uses the
+generated values recorded by the repository (`14` and `19` in the examples
+below). A loader MUST require the unique Program contract mapped by the
+selected pair and reject every other shape. It MUST NOT translate a legacy
+pipeline, program-bundle, stage topology, or profile representation into this
+one.
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**,
 and **MAY** are normative.
@@ -34,6 +34,12 @@ operations. It contains these authorities:
 6. `abi` is the sole public call, derivative projection, tape, alias-owner,
    and publication authority.
 7. `residual_contract`, when present, defines forward-to-backward captures.
+
+A Stage is a reusable portable implementation contract. A Node is a concrete
+graph invocation of a Stage and is the sole owner of Program Value
+operands/results, ResourceAccess records, controls, and logical-to-physical
+endpoint projections. Several Nodes MAY reference one Stage; a loader or
+runtime MUST NOT attach one Node's projections to the shared Stage.
 
 The Program object and every ABI object it contains are platform-neutral.
 ArtifactSystem is the only target-specific deployment layer: it selects code
@@ -56,9 +62,12 @@ resource accesses, attachment transitions, and target rules. They are never
 serialized as nodes.
 
 Only direct compute dispatch and direct or indexed graphics draw are
-supported. Transfer, presentation, boundary, barrier, indirect execution, and
-control-flow nodes are invalid. Graph regions, branches, loops, calls, and
-runtime-created nodes are invalid.
+supported semantic Program Nodes. Transfer, presentation, boundary, barrier,
+indirect execution, and control-flow nodes are invalid Program IR.
+Resolve-time physical upload, readback, device-copy, synchronization, and
+publication edges belong to `ResolvedExecutionPlan`; they are not semantic
+Program Nodes. Graph regions, branches, loops, calls, and runtime-created
+nodes are invalid.
 
 ## 3. Canonical JSON profile
 
@@ -89,7 +98,7 @@ ascending UTF-8 member names.
 
 Array order is semantic and canonical as follows:
 
-- `parameters`, `storages`, `values`, `shape_symbols`, and graph `nodes` are
+- `parameters`, `storages`, `values`, and graph `nodes` are
   ordered by contiguous `id` equal to array index;
 - `graphs` are ordered forward, then backward when present;
 - graph `inputs` are ordered by boundary class in this exact order:
@@ -110,7 +119,6 @@ Array order is semantic and canonical as follows:
   are ordered by module ordinal, interface ordinal, then endpoint index;
 - usage, aspect, channel-mask, and capability sets are sorted lexical arrays
   without duplicates;
-- constraints and alias preconditions are sorted by canonical JSON bytes.
 
 No producer or loader may reorder an ABI-order array. Canonicalization MUST
 fail rather than silently repair non-canonical input. Any array not assigned a
@@ -118,19 +126,18 @@ sort rule above or by its defining section preserves declared semantic order.
 
 ### 3.3 Shapes and expressions
 
-A `ShapeDim` is a positive integer, `-1` for TensorView `vd.dyn`, or
-`{"symbol": S}` when a ShapeSymbol is explicitly declared. An empty shape
-denotes rank zero. `null` and bare strings are invalid. Ordinary TensorView
-`vd.dyn` uses `-1` on Value `.shape` and does not allocate a ShapeSymbol.
+A `ShapeDim` is a positive integer or `-1` for TensorView `vd.dyn`. An empty
+shape denotes rank zero. `null`, zero, bare strings, and symbol objects are
+invalid.
 
-A `ShapeExpr` is exactly one of:
+A `ControlExpr` is exactly one of:
 
 ```json
 {"constant": 4}
-{"symbol": 0}
-{"op": "add", "args": [{"symbol": 0}, {"constant": 1}]}
-{"op": "mul", "args": [{"symbol": 0}, {"constant": 4}]}
-{"op": "align_up", "value": {"symbol": 0}, "alignment": 16}
+{"control": {"value": 0}}
+{"op": "add", "args": [{"control": {"value": 0}}, {"constant": 1}]}
+{"op": "mul", "args": [{"control": {"value": 0}}, {"constant": 4}]}
+{"op": "align_up", "value": {"control": {"value": 0}}, "alignment": 16}
 ```
 
 `add` and `mul` have at least two operands. Their operands are flattened and
@@ -203,15 +210,21 @@ A cooked deployment bundle is exactly:
 
 ```json
 {
-  "compiler_contract_version": 13,
-  "pipeline_version": 17,
-  "artifact_system": {
-    "target": {"kind": "vulkan", "options": {}},
-    "blobs": {},
-    "artifacts": {}
-  },
+  "compiler_contract_version": 14,
+  "program_version": 19,
+  "type": "program",
+  "id": "example/program",
+  "target": {"kind": "vulkan", "options": {}},
+  "blobs": {},
   "variants": [
-    {"key": [], "runtime_requirements": {}, "stage_bindings": {}, "program": {}}
+    {
+      "key": [],
+      "program": {},
+      "artifact_system": {
+        "runtime_requirements": {},
+        "artifacts": {}
+      }
+    }
   ],
   "content_hash": "0000000000000000000000000000000000000000000000000000000000000000"
 }
@@ -239,16 +252,17 @@ Blob external URIs point
 from `program.program.json` into this `artifacts/` directory and remain
 normalized relative paths beneath the bundle root.
 
-The object above shows container structure only, not a valid bundle: version
-numbers are illustrative future values, the digest is placeholder text, and
-the nested objects are incomplete. Required root members are exactly those
-shown.
+The object above shows container structure only, not a valid bundle: the
+digest is placeholder text and the nested objects are incomplete. Required
+root members are exactly those shown.
 `content_hash` is lowercase SHA-256 over canonical JSON bytes of the complete
 bundle excluding `content_hash`. A variant contains exactly sorted unique
-non-empty feature strings in `key`, one `stage_bindings` object, and one
-`runtime_requirements` object, and one Program in `program`; variant keys are unique and variants are ordered by
-canonical key bytes. `stage_bindings` maps every Program logical stage ID
-exactly once to a StageArtifact ID in the one root `artifact_system`.
+non-empty feature strings in `key`, one Program in `program`, and one
+`artifact_system`; variant keys are unique and variants are ordered by
+canonical key bytes. The variant artifact system contains exactly its
+aggregate `runtime_requirements` and `artifacts`. Its StageArtifact keys are
+the logical Stage IDs in that variant's Program, so no Stage binding map
+exists. Non-stage value artifacts use the reserved `value/` key namespace.
 One cooked bundle has one target. A different backend is a different bundle,
 not a fat-bundle branch or runtime fallback.
 
@@ -257,26 +271,17 @@ variant. Runtime selects exactly one variant from its canonical feature key
 before artifact resolution and validates only that variant's aggregate Runtime
 requirements. It then resolves, authenticates, loads, or JITs only
 StageArtifacts, CodeModules, and external Blob ranges reachable from that
-variant's `stage_bindings` and ConstantOrigins. It MUST NOT validate or load
+variant's `artifact_system.artifacts` and ConstantOrigins. It MUST NOT validate or load
 code belonging only to an unselected variant. Selection or selected-variant
 capability failure is reported before code I/O; Runtime never falls back to
 another variant.
 
-A deployable Program is resolved with exactly one ArtifactSystem:
+A deployable variant is resolved against the root target and Blob store plus
+exactly one variant ArtifactSystem:
 
 ```json
 {
-  "target": {"kind": "vulkan", "options": {}},
-  "blobs": {
-    "code": {
-      "byte_length": 1024,
-      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-      "location": {
-        "tag": "external",
-        "uri": "artifacts/0000000000000000000000000000000000000000000000000000000000000000.spv"
-      }
-    }
-  },
+  "runtime_requirements": {},
   "artifacts": {}
 }
 ```
@@ -290,10 +295,9 @@ The executable lookup path is exactly:
 ```text
 Node.stage
   -> Program.stages[stage] portable contract
-  -> variant.stage_bindings[stage]
-  -> ArtifactSystem.artifacts[StageArtifactID]
+  -> variant.artifact_system.artifacts[stage]
   -> StageArtifact.modules[*]
-  -> ArtifactSystem.blobs[module.blob]
+  -> root blobs[module.blob]
   -> Blob.location + module [offset, offset + byte_length)
   -> module.entry_point
 ```
@@ -334,7 +338,7 @@ limit directly with device capabilities.
 
 The cooker derives each StageArtifact requirement object from that artifact's
 modules and reflection. For a variant, it then derives one aggregate from only
-the StageArtifacts reachable through that variant's `stage_bindings`.
+the StageArtifacts in that variant's `artifact_system.artifacts`.
 `features` is the sorted union of their
 `reflection.required_features`; minimum version,
 capability, feature-level, shader-model, and OS pairs are maxima under the
@@ -345,15 +349,15 @@ aggregate that differs from recomputation is invalid. Adding an unrelated
 variant does not change existing StageArtifact IDs or another variant's
 requirements.
 
-`artifacts` maps Artifact IDs to a strict union of the value artifact from
-section 3.4 and StageArtifact. A value Artifact ID is the lowercase SHA-256 of
-canonical
-`{compiler_contract_version, pipeline_version, tag, encoding, byte_length,
+`artifacts` maps logical Stage IDs and reserved `value/` keys to a strict
+union of the value artifact from section 3.4 and StageArtifact. A value
+Artifact identity is the lowercase SHA-256 of canonical
+`{compiler_contract_version, program_version, tag, encoding, byte_length,
 sha256}` using the enclosing selected pair. A StageArtifact ID is the
 lowercase SHA-256 of the canonical identity object containing:
 
-- the selected compiler and pipeline contract versions;
-- this ArtifactSystem's complete `target`;
+- the selected compiler and Program contract versions;
+- the bundle's complete `target`;
 - StageArtifact `tag`, `operation`, `contract_hash`,
   `runtime_requirements`, and `reflection`;
 - for each module, `role`, `format`, `entry_point`, `byte_length`, and
@@ -453,13 +457,14 @@ feature vocabulary and is the sole source of ArtifactSystem feature
 aggregation. StageArtifact `modules` array order is `[compute]` or
 `[vertex, fragment]`; fixed sorting ordinals remain compute = 0, vertex = 1,
 fragment = 2. The identity module sequence uses this same order. Artifact maps
-are ordered by Artifact ID and Blob maps by Blob ID.
-Every ArtifactSystem artifact is referenced by at least one variant
-`stage_bindings` entry or ConstantOrigin, and every Blob is referenced by at
-least one artifact range. Unreachable artifacts and Blobs are non-canonical.
+are ordered by logical Stage or reserved value-artifact key and Blob maps by
+Blob ID. Every StageArtifact key names a Stage in its enclosing variant's
+Program, every value artifact is referenced by a ConstantOrigin, and every
+Blob is referenced by at least one artifact range. Unreachable artifacts and
+Blobs are non-canonical.
 
-All StageArtifacts selected by one variant belong to its one ArtifactSystem
-target. Multi-target deployment is represented by separate cooked bundles.
+All StageArtifacts selected by one variant belong to the bundle's one target.
+Multi-target deployment is represented by separate cooked bundles.
 A loader MUST NOT choose modules from another bundle or combine artifacts
 from different targets.
 
@@ -473,9 +478,6 @@ from different targets.
   "parameters": [],
   "storages": [],
   "values": [],
-  "shape_symbols": [],
-  "shape_constraints": [],
-  "alias_preconditions": [],
   "graphs": [],
   "abi": {
     "boundary_slots": [],
@@ -485,12 +487,12 @@ from different targets.
 }
 ```
 
-Required members are `stages`, `parameters`, `storages`, `values`,
-`shape_symbols`, `shape_constraints`, `alias_preconditions`, `graphs`, and
-`abi`. A serialized `signature` member is forbidden; loaders do not accept a
-compatibility projection. `residual_contract` is required exactly when a backward graph
-exists and forbidden otherwise, including when its captures and shape-symbol
-arrays would both be empty.
+Required members are `stages`, `parameters`, `storages`, `values`, `graphs`,
+and `abi`. `shape_symbols`, `shape_constraints`, and
+`alias_preconditions` are not members of this contract; dynamic extents are
+explicit Program Value controls. A serialized `signature` member is forbidden;
+loaders do not accept a compatibility projection. `residual_contract` is
+required exactly when a backward graph exists and forbidden otherwise.
 
 `stages` is an object from non-empty logical stage IDs to strict
 StageContracts:
@@ -504,9 +506,9 @@ SHA-256 of canonical `{operation, reflection}` for the portable StageArtifact
 reflection required by this logical stage. Stage keys are sorted in canonical
 bytes. Every StageContract is referenced by at least one node and every node
 stage exists. A node operation tag MUST equal StageContract operation.
-The enclosing variant `stage_bindings` maps each logical stage ID to one
-StageArtifact with equal operation and contract hash. No node selects an
-Artifact ID, target, module, or entry point directly.
+The enclosing variant's `artifact_system.artifacts[stage]` contains one
+StageArtifact with equal operation and contract hash for every logical Stage
+ID. No node selects an Artifact ID, target, module, or entry point directly.
 
 Every Program has exactly one forward graph and at most one backward graph.
 The backward graph is present exactly for a differentiated Program. The
@@ -610,8 +612,8 @@ Buffer `byte_length` is a non-negative integer. A positive value is a static
 provider constraint or owned allocation size. `0` is legal only on borrowed
 Storage: TensorView `vd.dyn` already records the dynamic rank/extent on the
 Value `.shape` as `-1`, and bind takes the concrete byte length from the
-provider buffer. Do not encode buffer size as a ShapeExpr, ShapeSymbol, or
-control component, and do not bake a Python launch shape into the descriptor.
+provider buffer. Do not encode borrowed buffer size as a ControlExpr or bake a
+Python launch shape into the descriptor.
 `alignment` is a positive power of two. `memory` and `usage` use enums defined
 in Appendix B.
 
@@ -690,7 +692,7 @@ ValueLayout is:
 ```
 
 `scope` is `element` or `value`. The remaining fields are required.
-`byte_size`, leaf offsets, scalar counts, and leaf shapes may use ShapeExpr
+`byte_size`, leaf offsets, scalar counts, and leaf shapes may use ControlExpr
 where dynamic. Leaf paths are arrays of non-empty field strings or unsigned
 aggregate indices. Leaves are sorted by canonical path and do not overlap.
 
@@ -746,7 +748,7 @@ A buffer view descriptor is:
 {
   "tag": "buffer_view",
   "byte_offset": 0,
-  "extents": [{"control": {"parameter": 0}}, 4],
+  "extents": [{"control": {"value": 0}}, 4],
   "byte_strides": [16, 4]
 }
 ```
@@ -775,18 +777,16 @@ declared subresources.
 A ControlValueRef is exactly one of:
 
 ```json
-{"argument": 0}
-{"parameter": 0}
-{"constant": 6}
-{"capture": 9}
+{"value": 0}
 ```
 
-- `argument` names a Value with ArgumentOrigin available at this graph entry;
-- `parameter` names a Parameter ID and thereby its ParameterOrigin Value;
-- `constant` names a scalar or fixed aggregate Value with ConstantOrigin;
-- `capture` names a forward Value ID listed in both the backward graph
-  `captures` and `residual_contract.captures`. PullbackState supplies its
-  retained concrete value at backward entry.
+`value` names one Program Value available at this graph entry. Its origin is
+an invocation argument, instance parameter, constant, allocation descriptor,
+or backward capture. A backward control names the original forward Value ID
+listed in both the backward graph `captures` and
+`residual_contract.captures`; PullbackState supplies its retained concrete
+value. Origin-specific reference tags are forbidden because Value identity is
+the sole control authority.
 
 A control component is a static integer or `{"control": ControlValueRef}`.
 Where a dimension is needed, use
@@ -795,7 +795,7 @@ Where a dimension is needed, use
 ControlValueRef is the only dynamic source for:
 
 - owned allocation byte lengths and image extents;
-- ShapeSymbol sources and shape-dependent layouts;
+- shape-dependent layouts;
 - every ViewDescriptor component;
 - compute workgroup counts;
 - attachment area, layer, clear, resolve, viewport, and scissor metadata;
@@ -812,53 +812,25 @@ viewport depth values, depth bias, line width, and blend constants, MUST be
 Constant Program Values referenced through ControlValueRef. Such values are
 never raw JSON floating-point fields in an operation.
 
-## 9. Shape symbols and alias preconditions
+## 9. Dynamic extent and alias validation
 
-TensorView `vd.dyn` is a type-level `-1` on Value `.shape`. It does not create
-a ShapeSymbol. Phase-one compute keeps `shape_symbols`, `shape_constraints`,
-and `alias_preconditions` empty.
+TensorView `vd.dyn` is the type-level `-1` on Value `.shape`. Dynamic buffer
+lengths, image extents, dispatch axes, and view components reference ordinary
+entry-available Program Value controls as defined in §8. The Program has no
+parallel ShapeSymbol namespace and no empty shape/constraint tables.
 
-A ShapeSymbol is:
+All control-derived extents and constraints are validated before allocation,
+command recording, or externally visible effects. A backward graph that needs
+a forward-derived extent captures the Program Value that supplies it through
+the normal residual contract; it does not create a residual shape-symbol
+table.
 
-```json
-{
-  "id": 0,
-  "name": "width",
-  "source": {"tag": "scalar", "control": {"argument": 0}},
-  "min": 1,
-  "max": 16384
-}
-```
-
-Source is either:
-
-- `{"tag":"scalar","control":R}`; or
-- `{"tag":"dimension","control":R,"axis":A}`.
-
-The source MUST satisfy ControlValueRef rules. Constraints are:
-
-```json
-{"tag": "equal", "lhs": {"symbol": 0}, "rhs": {"constant": 1024}}
-{"tag": "less_equal", "lhs": {"symbol": 0}, "rhs": {"symbol": 1}}
-{"tag": "divisible", "value": {"symbol": 0}, "divisor": 4}
-```
-
-All entry constraints are checked before allocation or external effects.
-Backward symbols needed from forward are listed in `residual_contract` and
-bound from retained capture witnesses.
-
-Alias preconditions are strict records:
-
-```json
-{"tag": "disjoint", "lhs": 0, "rhs": 1}
-{"tag": "may_alias_read_only", "lhs": 0, "rhs": 2}
-```
-
-They refer to borrowed Storage IDs. `may_alias_read_only` is legal only when
-both Storage declarations are `read_only`. Writable aliasing is expressible
-only through views carrying the same Storage ID. Two distinct Storage IDs
-whose physical ranges overlap are invalid if either is mutable, regardless of
-precondition. Failure is an entry validation error, not a request for copying.
+Writable aliasing is expressible only through Values carrying the same Storage
+ID. Two distinct Storage IDs whose concrete physical ranges overlap are
+invalid if either is mutable. Read-only overlap between distinct borrowed
+Storage IDs is permitted by the Storage mutability contract and needs no
+serialized alias precondition. Failure is an entry validation error, not a
+request for copying.
 
 ## 10. Graph boundaries
 
@@ -1176,7 +1148,7 @@ the Program execution DAG.
 ComputeOperation is:
 
 ```json
-{"tag": "compute", "workgroups": [8, {"control": {"parameter": 0}}, 1]}
+{"tag": "compute", "workgroups": [8, {"control": {"value": 0}}, 1]}
 ```
 
 `workgroups` contains exactly three positive control components and specifies
@@ -1370,8 +1342,11 @@ outer shape, and ValueLayout when present. Category is `value`,
 `read_write`. Resource slots also contain the matching `storage_id` and
 `storage_descriptor`. `alias_owner` is exactly `value:<id>` for value slots or
 `storage:<id>` for resource slots. Every output-direction slot contains
-`"publication":"commit_after_success"`; input-direction slots never contain
-publication.
+`publication`, either `commit_after_success` or `in_place`; input-direction
+slots never contain publication. `in_place` is valid only for a mutable
+Storage-backed boundary that explicitly exposes a caller-visible side effect.
+It does not promise rollback after submission. Runtime never chooses a mode
+from the concrete host/device resource kind.
 
 Each derivative slot has exactly one `derivative_projections` record containing
 `derivative:{slot,path}`, `primal:{slot,path}`, and a canonical `value_path`.
@@ -1398,17 +1373,16 @@ ResidualContract is:
         "cost": 40
       }
     }
-  ],
-  "shape_symbols": [0]
+  ]
 }
 ```
 
 Every capture contains required `value` and `replay`. Replay contains required
 boolean `legal`, sorted unique forward `required_values`, and uint64 `cost`.
 The backward graph capture array equals `residual_contract.captures[*].value`
-exactly in order and content. Captured Values and concrete symbol witnesses
-are retained in PullbackState and become backward-entry-available under their
-original forward Value IDs.
+exactly in order and content. Captured Values are retained in PullbackState
+and become backward-entry-available under their original forward Value IDs.
+Dynamic extent witnesses are ordinary captured Program Values.
 
 When `legal` is true, `required_values` is the exact frontier of the unique
 canonical backward slice from the capture producer. The slice is induced by
@@ -1431,8 +1405,9 @@ Tangent type construction is recursive:
   order and preserve aggregate paths;
 - a public derivative root is invalid when all leaves are Zero.
 
-A derivative inherits rank, every static extent, and the exact ShapeSymbol IDs
-of its primal; it MUST NOT mint replacement symbols. Cotangent and gradient
+A derivative inherits rank, every static extent, and the exact dynamic extent
+Value dependencies of its primal; it MUST NOT mint a parallel symbol
+namespace. Cotangent and gradient
 ValueLayout is derived from tangent leaves under the same pipeline Value ABI.
 Every public gradient uses fresh owned Storage that does not alias its primal,
 another public gradient, or caller Storage.
@@ -1476,7 +1451,7 @@ accept, or compare a second signature representation.
 
 ResolveProgram also materializes the validated replay plan from
 ResidualContract: selected captures, replay slices, required capture frontier,
-costs, retained symbol witnesses, and tape lifetimes. Planner policy may
+costs, retained dynamic-extent Value witnesses, and tape lifetimes. Planner policy may
 choose retain versus a legal replay, but it cannot change a replay slice,
 frontier, legality, or cost declared by the Program.
 
@@ -1506,9 +1481,6 @@ uses the entry parameter directly.
     {"id": 1, "name": "y", "type": "tensor<256xf32>", "shape": [256], "origin": {"tag": "node_result", "graph": "forward", "node": 0}, "storage": 1, "value_layout": {"scope": "element", "layout_hash": "95f54cae607cf7751c0ec4327f86b0982056823c49534e9d8dddd66fc98c5f07", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "f32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
     {"id": 2, "name": "groups_x", "type": "u32", "shape": [], "origin": {"tag": "parameter", "parameter": 0}, "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}}
   ],
-  "shape_symbols": [],
-  "shape_constraints": [],
-  "alias_preconditions": [],
   "graphs": [{
     "name": "forward",
     "direction": "forward",
@@ -1522,7 +1494,7 @@ uses the entry parameter directly.
       "results": [1],
       "bindings": [{"module": "compute", "interface": "argument", "index": 0, "tag": "resource", "access": 0}, {"module": "compute", "interface": "argument", "index": 1, "tag": "resource", "access": 1}],
       "accesses": [{"tag": "read", "storage": 0, "value": 0}, {"tag": "initialize", "storage": 1, "after": 1}],
-      "operation": {"tag": "compute", "workgroups": [{"control": {"parameter": 0}}, 1, 1]}
+      "operation": {"tag": "compute", "workgroups": [{"control": {"value": 2}}, 1, 1]}
     }]
   }],
   "abi": {
@@ -1547,7 +1519,7 @@ result resource transfers only after successful commit.
   "stages": {"fullscreen": {"operation": "graphics", "contract_hash": "0000000000000000000000000000000000000000000000000000000000000000"}},
   "parameters": [],
   "storages": [
-    {"id": 0, "name": "color", "initial_value": 2, "ownership": "owned", "lifetime": "invocation", "mutability": "mutable", "descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"argument": 0}}, {"control": {"argument": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}}
+    {"id": 0, "name": "color", "initial_value": 2, "ownership": "owned", "lifetime": "invocation", "mutability": "mutable", "descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}}
   ],
   "values": [
     {"id": 0, "name": "width", "type": "u32", "shape": [], "origin": {"tag": "argument", "graph": "forward", "slot": 0}, "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
@@ -1557,12 +1529,6 @@ result resource transfers only after successful commit.
     {"id": 4, "name": "color.output", "type": "image<rgba16_float>", "origin": {"tag": "node_result", "graph": "forward", "node": 0}, "storage": 0},
     {"id": 5, "name": "clear_color", "type": "vector<4xf32>", "shape": [4], "origin": {"tag": "constant", "payload": {"tag": "inline", "encoding": "value_abi", "data": "AAAAAAAAAAAAAAAAAAAAAA==", "byte_length": 16, "sha256": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb"}}, "value_layout": {"scope": "value", "layout_hash": "d477029ca3234046adda41757e10fe64396ed8d0233ee1c05aeca69e6e734d70", "byte_size": 16, "alignment": 4, "leaves": [{"path": [], "dtype": "f32", "byte_offset": 0, "scalar_count": 4, "shape": [4]}]}}
   ],
-  "shape_symbols": [
-    {"id": 0, "name": "width", "source": {"tag": "scalar", "control": {"argument": 0}}, "min": 1, "max": 16384},
-    {"id": 1, "name": "height", "source": {"tag": "scalar", "control": {"argument": 1}}, "min": 1, "max": 16384}
-  ],
-  "shape_constraints": [],
-  "alias_preconditions": [],
   "graphs": [{
     "name": "forward",
     "direction": "forward",
@@ -1578,7 +1544,7 @@ result resource transfers only after successful commit.
       "accesses": [{"tag": "attachment", "storage": 0, "before": 2, "after": 4, "view": 3}],
       "operation": {
         "tag": "graphics",
-        "attachments": {"colors": [{"location": 0, "access": 0, "load": {"tag": "clear", "value": {"constant": 5}}, "store": "store"}], "depth_stencil": null, "render_area": {"x": 0, "y": 0, "width": {"control": {"argument": 0}}, "height": {"control": {"argument": 1}}}, "layer_count": 1},
+        "attachments": {"colors": [{"location": 0, "access": 0, "load": {"tag": "clear", "value": {"control": {"value": 5}}}, "store": "store"}], "depth_stencil": null, "render_area": {"x": 0, "y": 0, "width": {"control": {"value": 0}}, "height": {"control": {"value": 1}}}, "layer_count": 1},
         "state": {"raster": {"front_face": "counter_clockwise", "cull_mode": "none", "fill_mode": "fill"}, "depth_stencil": {"depth_test": false, "depth_write": false, "depth_compare": "always", "stencil_test": false}, "multisample": {"sample_mask": 4294967295, "alpha_to_coverage": false}, "blend": [{"location": 0, "enabled": false, "write_mask": ["a", "b", "g", "r"]}], "viewport": null, "scissor": null},
         "draw": {"tag": "direct", "vertex_count": 3, "instance_count": 1}
       }
@@ -1588,7 +1554,7 @@ result resource transfers only after successful commit.
     "boundary_slots": [
       {"id": 0, "path": "width", "value": 0, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:0", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
       {"id": 1, "path": "height", "value": 1, "role": "input", "direction": "input", "category": "value", "access": "read", "logical_type": "u32", "outer_shape": [], "alias_owner": "value:1", "value_layout": {"scope": "value", "layout_hash": "280f13e115d9ccfbe2a5a33aaafefb004f2ad59b8312a2807f2dfaa7b0966bc6", "byte_size": 4, "alignment": 4, "leaves": [{"path": [], "dtype": "u32", "byte_offset": 0, "scalar_count": 1, "shape": []}]}},
-      {"id": 2, "path": "color", "value": 4, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba16_float>", "outer_shape": [], "alias_owner": "storage:0", "storage_id": 0, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"argument": 0}}, {"control": {"argument": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}, "publication": "commit_after_success"}
+      {"id": 2, "path": "color", "value": 4, "role": "output", "direction": "output", "category": "texture", "access": "write", "logical_type": "image<rgba16_float>", "outer_shape": [], "alias_owner": "storage:0", "storage_id": 0, "storage_descriptor": {"tag": "image", "dimension": "2d", "extent": [{"control": {"value": 0}}, {"control": {"value": 1}}, 1], "format": "rgba16_float", "sample_count": 1, "mip_levels": 1, "array_layers": 1, "aspects": ["color"], "usage": ["color_attachment", "sampled"]}, "publication": "commit_after_success"}
     ],
     "derivative_projections": [],
     "tape_plans": []
@@ -1623,9 +1589,6 @@ ConstantOrigin view.
     {"id": 7, "name": "color.view", "type": "image_view<rgba8_unorm>", "origin": {"tag": "view", "source": 6}, "storage": 3, "view": {"tag": "image_view", "aspects": ["color"], "base_mip": 0, "mip_count": 1, "base_layer": 0, "layer_count": 1}},
     {"id": 8, "name": "color.output", "type": "image<rgba8_unorm>", "origin": {"tag": "node_result", "graph": "forward", "node": 1}, "storage": 3}
   ],
-  "shape_symbols": [],
-  "shape_constraints": [],
-  "alias_preconditions": [],
   "graphs": [{
     "name": "forward",
     "direction": "forward",
@@ -1634,7 +1597,7 @@ ConstantOrigin view.
     "outputs": [{"tag": "user_output", "value": 8, "disposition": "transfer"}],
     "nodes": [
       {"id": 0, "stage": "build_vertices", "operands": [1, 2], "results": [3], "bindings": [{"module": "compute", "interface": "argument", "index": 0, "tag": "resource", "access": 0}, {"module": "compute", "interface": "argument", "index": 1, "tag": "resource", "access": 1}], "accesses": [{"tag": "read", "storage": 0, "value": 1}, {"tag": "initialize", "storage": 1, "after": 3}], "operation": {"tag": "compute", "workgroups": [1, 1, 1]}},
-      {"id": 1, "stage": "draw_mesh", "operands": [0, 3, 4, 5, 6, 7], "results": [8], "bindings": [{"module": "vertex", "interface": "argument", "index": 0, "tag": "resource", "access": 0}], "accesses": [{"tag": "read", "storage": 1, "value": 3}, {"tag": "read", "storage": 2, "value": 4, "view": 5}, {"tag": "attachment", "storage": 3, "before": 6, "after": 8, "view": 7}], "operation": {"tag": "graphics", "attachments": {"colors": [{"location": 0, "access": 2, "load": {"tag": "discard"}, "store": "store"}], "depth_stencil": null, "render_area": {"x": 0, "y": 0, "width": 640, "height": 480}, "layer_count": 1}, "state": {"raster": {"front_face": "counter_clockwise", "cull_mode": "back", "fill_mode": "fill"}, "depth_stencil": {"depth_test": false, "depth_write": false, "depth_compare": "always", "stencil_test": false}, "multisample": {"sample_mask": 4294967295, "alpha_to_coverage": false}, "blend": [{"location": 0, "enabled": false, "write_mask": ["a", "b", "g", "r"]}], "viewport": null, "scissor": null}, "draw": {"tag": "indexed", "index_access": 1, "index_count": 3, "instance_count": {"control": {"parameter": 0}}}}}
+      {"id": 1, "stage": "draw_mesh", "operands": [0, 3, 4, 5, 6, 7], "results": [8], "bindings": [{"module": "vertex", "interface": "argument", "index": 0, "tag": "resource", "access": 0}], "accesses": [{"tag": "read", "storage": 1, "value": 3}, {"tag": "read", "storage": 2, "value": 4, "view": 5}, {"tag": "attachment", "storage": 3, "before": 6, "after": 8, "view": 7}], "operation": {"tag": "graphics", "attachments": {"colors": [{"location": 0, "access": 2, "load": {"tag": "discard"}, "store": "store"}], "depth_stencil": null, "render_area": {"x": 0, "y": 0, "width": 640, "height": 480}, "layer_count": 1}, "state": {"raster": {"front_face": "counter_clockwise", "cull_mode": "back", "fill_mode": "fill"}, "depth_stencil": {"depth_test": false, "depth_write": false, "depth_compare": "always", "stencil_test": false}, "multisample": {"sample_mask": 4294967295, "alpha_to_coverage": false}, "blend": [{"location": 0, "enabled": false, "write_mask": ["a", "b", "g", "r"]}], "viewport": null, "scissor": null}, "draw": {"tag": "indexed", "index_access": 1, "index_count": 3, "instance_count": {"control": {"value": 0}}}}}
     ]
   }],
   "abi": {
@@ -1665,19 +1628,24 @@ Resolve is pure with respect to caller resources and backend execution:
    before external code I/O.
 3. Validate IDs, array ordering, origins, Storage descriptors, ValueLayout,
    graph boundaries, exact operand/result closure, and ProgramABI.
-4. Resolve every logical stage ID through variant `stage_bindings` to one
-   StageArtifact and validate its operation, contract hash, modules, and
-   reflection.
+4. Resolve every logical Stage ID directly through
+   `variant.artifact_system.artifacts[stage]` and validate its operation,
+   contract hash, modules, and reflection.
 5. Recompute selected Artifact IDs, authenticate only selected reachable Blob
    ranges, and select exact code modules and entry points.
-6. Build exact endpoint bindings and resource-access plans.
+6. Build exact per-Node endpoint projections; Stage pipelines may be shared,
+   Node projections may not.
 7. Validate ControlValueRef provenance without reading device resources.
 8. Derive the complete producer and resource dependency edge set.
 9. Validate DAG topology, resource version chains, attachment compatibility,
    draw mode, and target capabilities.
-10. Construct an immutable `ResolvedProgram` containing resolved code handles,
-   entry points, bindings, accesses, dependency edges, canonical derivative
-   groups, and the validated capture/replay plan.
+10. Derive physical residency, upload, readback, device-copy, barrier, tape,
+    replay, and publication transactions from the logical Program and target
+    reflection.
+11. Construct an immutable `ResolvedExecutionPlan` containing resolved code
+    handles, entry points, per-Node projections, transfers, accesses,
+    dependency edges, canonical derivative groups, and the validated
+    capture/replay and publication plans. `VernonProgramExecutable` owns it.
 
 Resolve never patches missing members, infers bindings from names, changes a
 descriptor, inserts a node, converts a Program representation, or executes
@@ -1688,7 +1656,7 @@ backend work.
 Instance creation binds every parameter and creates owned instance Storage.
 Invocation entry binds arguments, creates owned invocation Storage, restores
 captured forward Values when applicable, evaluates control values, checks
-borrowed providers, binds symbols, and checks entry constraints before
+borrowed providers, and checks entry constraints before
 submitting work.
 
 Before instance creation, Runtime loads or performs the target-defined JIT for
@@ -1697,11 +1665,11 @@ JIT, link, reflection, or entry-point failure rejects the resolved Program;
 Runtime does not try another format, module, symbol, artifact, or target.
 
 Runtime executes nodes in any schedule equivalent to the canonical DAG.
-Resource barriers and synchronization are derived after validation. Runtime
-MUST NOT insert semantic resource copies or device-to-host reads to satisfy
-metadata.
+L7 follows the resolved transfer, barrier, and synchronization plan. It MUST
+NOT rescan carriers or Storage aliases to derive new physical policy, and MUST
+NOT insert an unplanned device-to-host read while materializing a later Node.
 
-All externally observable changes are transactional. Outputs, state updates,
+Every `commit_after_success` change is transactional. Outputs, state updates,
 and transferred ownership become visible only after every submitted operation
 completes successfully and all postconditions pass. Failure:
 
@@ -1712,12 +1680,14 @@ completes successfully and all postconditions pass. Failure:
 - retires submitted backend work before releasing referenced resources;
 - emits one stable diagnostic.
 
-A write to borrowed caller-visible Storage is transactional too. Runtime MUST
-execute it against a private shadow or retain sufficient original contents to
-restore the exact provider bytes/subresources before reporting failure. Merely
-delaying publication of outputs is insufficient. If backend failure makes a
-borrowed write, instance Storage, or ownership state impossible to restore
-safely, the Program instance enters terminal-failed state; every later
+A `commit_after_success` write to borrowed caller-visible Storage is
+transactional too. Runtime MUST execute it against a private shadow or retain
+sufficient original contents to restore the exact provider bytes/subresources
+before reporting failure. An explicitly declared `in_place` boundary may
+mutate the borrowed resource directly and does not promise rollback after
+submission; Runtime must never infer that mode from the resource being an RHI
+object. If backend failure makes committed instance Storage or ownership state
+unsafe, the Program instance enters terminal-failed state; every later
 instance bind, invocation, or pullback fails without backend execution.
 
 A borrowed output is valid only for its declared provider lifetime. A
@@ -1814,8 +1784,8 @@ preconditions use `PROGRAM_SHAPE_CONSTRAINT` and
 A conforming implementation rejects at least:
 
 - a cooked bundle with missing/unknown root members, wrong content hash,
-  duplicate/non-canonical variant keys, or a missing/extra variant
-  `stage_bindings` entry;
+  duplicate/non-canonical variant keys, or a missing/extra logical Stage
+  artifact;
 - an unreachable Artifact or Blob;
 - a Program object with missing or unknown members;
 - any second Program/executable object adjacent to or inside
@@ -1872,20 +1842,18 @@ A conforming implementation rejects at least:
   Storage;
 - ownership becoming visible before successful commit;
 - ProgramABI and graph-boundary disagreement;
-- backward captures or symbol witnesses differing from ResidualContract.
+- backward captures differing from ResidualContract.
 
 ### 19.1 Key negative fixtures
 
 Node-produced dispatch metadata:
 
 ```json
-{"control": {"constant": 7}}
+{"control": {"value": 7}}
 ```
 
-The `constant` ControlValueRef tag can denote only ConstantOrigin. If Value 7
-instead has NodeResultOrigin, the record is syntactically expressible but has
-a tag/provenance mismatch and is rejected with
-`PROGRAM_CONTROL_NODE_RESULT` during resolve.
+If Value 7 has NodeResultOrigin, it is unavailable at graph entry and is
+rejected with `PROGRAM_CONTROL_NODE_RESULT` during resolve.
 
 Direct constant tensor view:
 
@@ -1962,9 +1930,9 @@ Program fixtures covering:
 15. strict reflected endpoint variants, whole-root/leaf matching, compute
     limits, graphics roles/capabilities, and system endpoints;
 16. every Attachment, RenderState, and Draw field and enum combination;
-17. derivative recursion, inherited ShapeSymbols, fresh gradient Storage,
+17. derivative recursion, inherited dynamic extent dependencies, fresh gradient Storage,
     capture equality, canonical replay, reuse, and poison validation;
-18. alias preconditions and resource-version hazards;
+18. concrete alias validation and resource-version hazards;
 19. exact operand/result closure, producer/version edges, overlapping-reader
     write-after-read anti-dependencies, disjoint and unknown-overlap behavior,
     fork rejection, cycles, and canonical topological order;

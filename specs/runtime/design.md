@@ -5,7 +5,7 @@
 CPU cooking emits the canonical `*.program.json` manifest, a target
 relocatable `.o`/`.obj` with stable module-hashed C entry wrappers, and
 generated registration `.c`/`.h` sources. The manifest records
-`PIPELINE_VERSION`, the target triple, object format, exported symbol, artifact
+`PROGRAM_VERSION`, the target triple, object format, exported symbol, artifact
 size, and SHA-256. Applications link the object and generated registration
 source at build time and call its registration function before loading the
 pipeline. Runtime validates the external descriptor but never parses or
@@ -109,7 +109,7 @@ Engine owners; backend behavior never branches on context origin.
 
 ## Vulkan graphics bundles (shipped pre-breaking format)
 
-The current `PIPELINE_VERSION` format stores each SPIR-V stage as a content-addressed
+The legacy pre-Program format stored each SPIR-V stage as a content-addressed
 external `.spv` artifact. The manifest records its relative path, byte size,
 and SHA-256, all of which the common artifact resolver validates before Vulkan
 sees the bytes. Non-persistent interactive execution uses the same descriptor
@@ -150,8 +150,8 @@ ordered vertex and fragment modules, as specified by
 
 Python exposes compiler services and all runtime backends through one `_native`
 module. The module links the compiler DLL and `VernonRuntime`; the runtime DLL
-itself retains its dependency boundary. Interactive GPU pipelines serialize
-the current `PIPELINE_VERSION` format with inline artifact descriptors; the
+itself retains its dependency boundary. Interactive GPU Programs serialize
+the current `PROGRAM_VERSION` format with inline artifact descriptors; the
 cooker emits the same format with external descriptors only. CPU execution uses native AOT bundles
 and remains compute-only because Vernon does not provide a software rasterizer.
 
@@ -527,7 +527,7 @@ Graphics accepts imported host buffer, texture, and sampler names without
 deleting them. It also creates owned child resources for standalone execution;
 all GL allocation, transfer, deletion, and invocation operations first make
 the associated context current.
-The current `PIPELINE_VERSION` invocation ABI represents every numeric argument
+The current `PROGRAM_VERSION` invocation ABI represents every numeric argument
 as one `VernonTensorView`. The storage discriminator selects immutable host
 Value transport, borrowed TensorStorage memory, or a runtime-owned device
 allocation. TensorView records carry shape, signed byte strides, and byte
@@ -607,10 +607,9 @@ host data is not uploaded again, shader writes remain device-resident, and
 
 ## Target unified Program invocation
 
-This section defines the coordinated breaking Program architecture. Current
-contract numbers remain unchanged until that release. After it, Runtime does
-not load the shipped manifest/profile forms described above and has no
-compatibility normalizer.
+This section defines the coordinated breaking Program architecture. The tree
+is mid-cutover; release is blocked until Runtime loads only this representation
+and has no compatibility normalizer.
 
 Standalone compute, standalone graphics, and Module inputs all produce one
 Program object and follow `ResolveProgram` then `ExecuteProgram`. Standalone
@@ -620,9 +619,17 @@ profile manifest, name-binding table, direct topology, `structural_inputs`,
 `configure`, or `graphics_config` channel. The target Program graphs are static
 compute/graphics DAGs. Transfer nodes and deployment control-flow nodes are not
 accepted.
-Program `stages` are portable contracts. The enclosing cooked variant
-`stage_bindings` selects target StageArtifacts; native API binding locations
-are derived by the backend and never serialized in Program reflection.
+Program `stages` are reusable portable contracts. Each variant stores the
+implementing StageArtifact directly at `artifact_system.artifacts[stage]`.
+Each graph Node, not its shared Stage, owns Value bindings and endpoint
+projections. Native API binding locations are derived by the backend and never
+serialized in Program reflection.
+
+`ResolveProgram` produces one immutable `ResolvedExecutionPlan` containing
+per-Node endpoint projections, physical residency, transfer edges, resource
+hazards, backend barriers, graphics scopes, tape/replay requirements, and
+publication transactions. Execution follows that plan and does not rediscover
+physical policy by scanning carriers or Storage aliases.
 
 Compute and graphics nodes use one resolved endpoint-binding path. Source and
 Program IR may expose typed
@@ -685,20 +692,22 @@ interfaces are merged and validated, making the specialized reflection the
 only runtime binding contract.
 
 The target contract carries normalized index binding, attachment operations,
-viewport/scissor, compute workgroup grid, an optional active encoder, and
-reflected argument slots as entry control metadata. This metadata supplies only
+viewport/scissor, compute workgroup Value controls, and reflected argument
+slots as entry control metadata. This metadata supplies only
 the selected node entry and never owns a resource, defines a resource extent,
 or overrides a `StorageDescriptor`. Topology is already selected by the
 graphics artifact. Backend-specific command encoding consumes this common
 invocation.
 
-Runtime planning separates the two pipeline kinds before backend dispatch.
-The compute grid stores workgroup counts; total invocation extent is the
-component-wise product of grid and reflected workgroup size. Compute
-validation, argument packing, and grid inference produce one
-`PlannedComputeLaunch`; graphics attachment, resource-pairing, vertex-input,
-and draw-state validation produce one `PlannedGraphicsInvocation`. Backends
-consume the corresponding plan and do not repeat frontend invocation planning.
+Runtime internally owns command recording, submission, synchronization, and
+readback. An external encoder is not a Program binding; optional embedding in
+an engine-owned ExecutionGraph is a separate facility.
+
+Compute workgroup counts are explicit Program Value controls. There is no
+zero-grid sentinel, first-Tensor inference, or separate mutable invocation grid.
+Compute validation and argument packing consume the resolved Node plan;
+graphics attachment, resource-pairing, vertex-input, and draw-state validation
+do the same. Backends do not repeat resolve-time planning.
 
 For Program graphics nodes, the immutable resolved node directly contains the
 normalized attachment, state, and draw fields. Shader-visible sampled/storage
@@ -769,7 +778,7 @@ device-only methods may coexist on a shared struct; duplicate names are
 rejected rather than treated as host/device overloads. Device compilation
 continues to forbid recursion and mutable `self`.
 
-The current `PIPELINE_VERSION` graphics manifest carries explicit
+The current `PROGRAM_VERSION` graphics manifest carries explicit
 vertex-attribute leaves. A bound
 Tensor has shape `(record_count, *logical_shape)`, contiguous row-major inner
 dimensions, an arbitrary positive record stride, and an independent base

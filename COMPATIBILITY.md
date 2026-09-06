@@ -1,8 +1,8 @@
 # Compatibility policy
 
-VernonDSL has independent release, compiler-contract, and pipeline version
-axes. The unpublished 0.1.2 release uses compiler contract 13 and pipeline
-contract 17.
+VernonDSL has independent release, compiler-contract, and Program version
+axes. The in-development 0.2.0 release uses compiler contract 14 and Program
+contract 19.
 
 ## Release and ABI
 
@@ -18,19 +18,19 @@ Applications embedding that source must rebuild when changing VernonDSL
 versions; mixing headers or generated files from different releases is
 unsupported.
 
-## Compiler and pipeline contracts
+## Compiler and Program contracts
 
 Compiler input must carry the exact supported `vernon.compiler_contract_version`.
-Cooked Program bundles must carry the exact supported `pipeline_version`.
-Pipeline 17 packages canonical Program, ArtifactSystem, and stage-binding
-documents; execution topology and autodiff signatures come only from Program.
-Compiler-contract 12 and Pipeline 16 documents are rejected rather than
-normalized or interpreted as current-schema aliases.
+Cooked Program bundles must carry the exact supported `program_version`.
+Program 19 packages one canonical Program and direct logical-Stage artifacts;
+execution topology and autodiff signatures come only from Program.
+Older pipeline/program-bundle documents are rejected rather than normalized or
+interpreted as current-schema aliases.
 Incompatible input, reflection, manifests, and artifacts are rejected before
 publication or execution rather than interpreted using best-effort fallback.
 
 Generated artifacts and caches include their contract inputs. A compiler- or
-pipeline-contract bump invalidates incompatible cache entries. Artifact bytes
+Program-contract bump invalidates incompatible cache entries. Artifact bytes
 are portable only to the target, options, backend capabilities, and ABI
 recorded by their manifest.
 

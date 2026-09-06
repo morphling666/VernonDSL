@@ -15,11 +15,11 @@ struct ProgramResidualPlan {
 
 std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const program::Graph &forward,
                                                                        const program::Program &execution,
-                                                                       const std::vector<ProgramHostValue> &storage,
+                                                                       const std::vector<LogicalProgramValue> &storage,
                                                                        const ProgramResidualPlan &plan);
 
 bool planProgramResiduals(const program::Program &execution, const VernonProgramTopology *topology,
-                          const Variant &variant, const std::vector<ProgramHostValue> &materialized,
+                          const Variant &variant, const std::vector<LogicalProgramValue> &materialized,
                           uint64_t memoryBudget, const std::string &policy, bool rematerializeTapes,
                           ProgramResidualPlan &result, std::string &error);
 

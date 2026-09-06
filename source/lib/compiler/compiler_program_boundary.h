@@ -30,6 +30,11 @@ enum class ProgramBoundaryAccess {
     ReadWrite,
 };
 
+enum class ProgramBoundaryPublication {
+    CommitAfterSuccess,
+    InPlace,
+};
+
 struct ProgramBoundaryOwnerId {
     bool storage{};
     int64_t id{};
@@ -47,6 +52,7 @@ struct ProgramBoundarySlotPlan {
     std::optional<int64_t> storage;
     std::optional<llvm::json::Object> storageDescriptor;
     std::optional<llvm::json::Object> valueLayout;
+    std::optional<ProgramBoundaryPublication> publication;
 };
 
 struct ProgramBoundaryPlan {
@@ -56,6 +62,12 @@ struct ProgramBoundaryPlan {
 bool planProgramBoundaries(const llvm::json::Object &signature, const llvm::json::Array &values,
                            const llvm::json::Array &storages, const llvm::json::Array &graphs,
                            ProgramBoundaryPlan &plan, std::string &error);
+
+llvm::StringRef programBoundaryRoleName(ProgramBoundaryRole role);
+llvm::StringRef programBoundaryDirectionName(ProgramBoundaryDirection direction);
+llvm::StringRef programBoundaryCategoryName(ProgramBoundaryCategory category);
+llvm::StringRef programBoundaryAccessName(ProgramBoundaryAccess access);
+llvm::StringRef programBoundaryPublicationName(ProgramBoundaryPublication publication);
 
 } // namespace vernon::compiler
 

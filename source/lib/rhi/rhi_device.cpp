@@ -2,7 +2,7 @@
 
 #include "rhi_internal.h"
 
-extern "C" uint32_t vernonRhiGetApiVersion(void) { return VERNON_PIPELINE_VERSION; }
+extern "C" uint32_t vernonRhiGetApiVersion(void) { return VERNON_PROGRAM_VERSION; }
 
 extern "C" VernonRhiDevice vernonRhiCreateDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
     return vernon::rhi::createDevice(descriptor);

@@ -260,11 +260,8 @@ Program
   - parameters[]       # canonical public/entry binding declarations
   - storages[]
   - values[]
-  - shape_symbols[]
-  - shape_constraints[]
-  - alias_preconditions[]
   - graphs[]          # forward and optional backward
-  - signature
+  - abi
   - residual_contract # required exactly with backward
 ```
 
@@ -295,8 +292,9 @@ Per-artifact reflection must not duplicate the Program graph topology.
 The ArtifactSystem has one exact target. Each StageArtifact carries its own
 requirements, and each variant carries only its reachable aggregate.
 StageArtifact IDs cover target, requirements, modules, entry points, and
-reflection. Each cooked variant `stage_bindings` maps portable Program
-StageContracts to those target artifacts. Compute has one compute module;
+reflection. Each cooked variant stores its StageArtifact directly at
+`artifact_system.artifacts[stage]` for every portable Program StageContract;
+there is no Stage binding table. Compute has one compute module;
 graphics has ordered vertex and fragment modules. Separate targets are never
 mixed at resolution.
 
@@ -386,26 +384,28 @@ does not create another top-level Program.
 
 ## 9. Runtime model
 
-`ResolveProgram(Program, StageBindings, ArtifactSystem, Target)` produces one immutable
-resolved Program owner containing:
+`ResolveProgram(Program, ArtifactSystem, Target)` produces one immutable
+`ResolvedExecutionPlan`, owned by the Program executable, containing:
 
 - authenticated target code modules and exact entry points;
-- resolved forward node stages and derived dependency edges;
-- resolved backward node stages when differentiated;
+- resolved forward and backward Node implementations and dependency edges;
+- exact per-Node endpoint projections, distinct even when Nodes share a Stage;
+- host/device residency and ordered upload, device-copy, and readback edges;
+- tape, replay, checkpoint, and publication transactions;
 - public signature and derivative groups;
 - residual contract;
-- checkpoint/replay planning metadata;
 - backend-independent value/resource mapping.
 
-`ExecuteProgram` accepts only this owner. Interactive standalone execution,
+`ExecuteProgram` accepts only this plan. Interactive standalone execution,
 cooked execution, graphics execution, and Module execution do not bypass
-resolution.
+resolution or re-derive physical carrier policy.
 
 Primal invocation:
 
 1. binds all public Program Values through one binding operation;
-2. materializes Program values and normalized compute/graphics nodes;
-3. submits `ForwardGraph` through ExecutionGraph.
+2. materializes each Node from its resolved projection;
+3. executes the resolved forward schedule and transfer edges;
+4. commits `commit_after_success` publications.
 
 VJP forward:
 
@@ -418,12 +418,14 @@ Pullback application:
 
 1. binds public cotangents;
 2. resolves each backward capture from retention, tape, checkpoint or replay;
-3. materializes and submits `BackwardGraph`;
+3. materializes and executes the resolved backward schedule;
 4. publishes fresh public gradients transactionally.
 
-The ExecutionGraph checkpoint planner receives the complete primal/reverse DAG.
-Runtime AD emits replay, checkpoint and derivative command nodes; it does not
-perform hidden nested submit/wait operations behind the graph scheduler.
+The internal ExecutionGraph checkpoint planner receives the complete
+primal/reverse DAG. Runtime owns command recording, submission, synchronization,
+and readback. Runtime AD emits replay, checkpoint and derivative command nodes;
+it does not perform unplanned nested submit/wait or synchronous device readback
+while materializing a later Node.
 
 ## 10. Reuse and retirement
 

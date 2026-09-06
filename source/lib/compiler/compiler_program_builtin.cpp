@@ -182,7 +182,7 @@ bool buildProgramBuiltinMlir(llvm::StringRef operation, llvm::StringRef elementT
               "region = \"unknown\"}]";
     std::ostringstream output;
     output << "module attributes {vernon.frontend = \"program\", vernon.compiler_contract_version = "
-           << VERNON_COMPILER_CONTRACT_VERSION << " : i64, vernon.pipeline_version = " << VERNON_PIPELINE_VERSION
+           << VERNON_COMPILER_CONTRACT_VERSION << " : i64, vernon.program_version = " << VERNON_PROGRAM_VERSION
            << " : i64} {\n  func.func @" << entry << '(';
     for (size_t index = 0; index < arguments.size(); ++index) {
         if (index)

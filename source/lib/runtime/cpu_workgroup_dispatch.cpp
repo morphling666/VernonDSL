@@ -590,7 +590,8 @@ private:
             return false;
         }
         if (rangeStatus != VERNON_STATUS_OK) {
-            failRange(groupState, range, rangeStatus, "CPU range returned an error");
+            const std::string diagnostic = "CPU range returned an error (status " + std::to_string(rangeStatus) + ")";
+            failRange(groupState, range, rangeStatus, diagnostic.c_str());
             return false;
         }
         if (groupState.context.status() != VERNON_STATUS_OK) {

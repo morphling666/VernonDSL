@@ -35,7 +35,7 @@ bool appendProgramTargetModuleMetadata(CanonicalProgramStage &stage, const llvm:
     stage.targetIdentity = identity;
     stage.targetImplementation.target = targetKind->str();
 
-    const std::optional<int64_t> pipelineVersion = reflection.getInteger("pipeline_version");
+    const std::optional<int64_t> pipelineVersion = reflection.getInteger("program_version");
     if (!stage.modules.empty() && stage.pipelineVersion != pipelineVersion) {
         error = "compiled Program modules disagree on pipeline version";
         return false;

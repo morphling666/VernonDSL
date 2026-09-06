@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -12,6 +13,7 @@
 namespace vernon::runtime::ad {
 
 class HostStaticTapeBatch;
+class LogicalValueFrame;
 struct PendingProgramPublication;
 struct ValueAbi;
 
@@ -52,6 +54,7 @@ struct PullbackInvocationSpec {
     const std::vector<std::vector<uint8_t>> &captures;
     const std::vector<std::vector<uint64_t>> &captureShapes;
     const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures{};
+    const LogicalValueFrame *retainedValues{};
 };
 
 } // namespace vernon::runtime::ad

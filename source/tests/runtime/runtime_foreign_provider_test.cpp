@@ -30,7 +30,7 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     mock.capabilities = capabilities;
     VernonRuntimeDeviceProvider provider{};
     provider.struct_size = sizeof(provider);
-    provider.abi_version = VERNON_PIPELINE_VERSION;
+    provider.abi_version = VERNON_PROGRAM_VERSION;
     provider.user_data = &mock;
     provider.get_capabilities = [](void *data) -> uint32_t { return static_cast<MockProvider *>(data)->capabilities; };
     provider.get_device_identity = [](void *) -> VernonRuntimeProviderDeviceIdentity { return {11, 22, 33}; };

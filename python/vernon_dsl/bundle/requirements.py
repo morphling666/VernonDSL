@@ -15,7 +15,7 @@ def _single(values: Iterable[Any], name: str) -> Any:
     if len(unique) != 1:
         from .types import ProgramCompileError
 
-        raise ProgramCompileError(f"pipeline stages have inconsistent {name}")
+        raise ProgramCompileError(f"Program stages have inconsistent {name}")
     return next(iter(unique))
 
 

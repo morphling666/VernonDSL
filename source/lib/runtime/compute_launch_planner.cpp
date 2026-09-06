@@ -281,7 +281,10 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
             for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
                 if ((use.shape[dimension] && use.shape[dimension] != tensor.shape[dimension]) ||
                     tensor.byte_strides[dimension] % static_cast<int64_t>(tensor.element_layout.byte_size))
-                    return fail(error, "pipeline TensorView descriptor violates static shape or element stride");
+                    return error = "pipeline Tensor argument '" + parameter.name +
+                                   "' TensorView descriptor violates static shape or element stride at axis " +
+                                   std::to_string(dimension),
+                           false;
             }
         }
         if (parameter.source != "direct") {
@@ -305,7 +308,17 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
     for (size_t left = 0; left < tensors.size(); ++left)
         for (size_t right = left + 1; right < tensors.size(); ++right)
             if (tensorViewsHaveWritableOverlap(*tensors[left], *tensors[right]))
-                return fail(error, "pipeline Tensor arguments have incompatible physical overlap");
+                return error = "pipeline Tensor arguments #" + std::to_string(left) + " and #" + std::to_string(right) +
+                               " have incompatible physical overlap (offsets " +
+                               std::to_string(tensors[left]->byte_offset) + " and " +
+                               std::to_string(tensors[right]->byte_offset) + ", element bytes " +
+                               std::to_string(tensors[left]->element_layout.byte_size) + " and " +
+                               std::to_string(tensors[right]->element_layout.byte_size) + ", ranks " +
+                               std::to_string(tensors[left]->rank) + " and " + std::to_string(tensors[right]->rank) +
+                               ", first strides " +
+                               std::to_string(tensors[left]->rank ? tensors[left]->byte_strides[0] : 0) + " and " +
+                               std::to_string(tensors[right]->rank ? tensors[right]->byte_strides[0] : 0) + ")",
+                       false;
     return planComputeArguments(variant, arguments, workgroup, invocation, plan, error);
 }
 

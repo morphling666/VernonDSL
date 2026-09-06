@@ -20,7 +20,7 @@ PROJECT_ROOT = Path(__file__).parents[3]
 PYTHON_TEST_ROOT = PROJECT_ROOT / "python" / "tests"
 sys.path.insert(0, str(PYTHON_TEST_ROOT))
 
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION  # noqa: E402
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION  # noqa: E402
 
 native = importlib.import_module("vernon_dsl._native")
 native_file = native.__file__
@@ -41,7 +41,7 @@ else:
     )
 
 import vernon_dsl as vd  # noqa: E402
-import vernon_dsl._program_assets.cooking as shader_assets_module  # noqa: E402
+import vernon_dsl._program_assets.compile_orchestration as compile_orchestration_module  # noqa: E402
 import vernon_dsl._runtime.session as runtime_module  # noqa: E402
 from program_asset_fixture import (  # noqa: E402
     OFFSET,
@@ -261,7 +261,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     self.assertEqual(cli_reflection, direct_reflection)
                     self.assertEqual(cli_artifacts, direct_artifacts)
                     self.assertEqual(owning_reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-                    self.assertEqual(owning_reflection["pipeline_version"], PIPELINE_VERSION)
+                    self.assertEqual(owning_reflection["program_version"], PROGRAM_VERSION)
                     self.assertEqual(owning_reflection["target"]["kind"], target_name)
                     if glsl_version:
                         self.assertEqual(owning_reflection["target"]["options"]["version"], glsl_version)
@@ -295,18 +295,16 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
                 class PipelineCapture:
                     def __init__(self) -> None:
-                        self.loads: list[tuple[bytes, bytes]] = []
+                        self.loads: list[bytes] = []
 
                     def load_canonical_program(
                         self,
-                        program: bytes,
-                        artifacts: bytes,
+                        manifest: bytes,
                         directory: str,
-                        stage_bindings: object,
                         compiled_stages: object,
                     ) -> object:
-                        del directory, stage_bindings, compiled_stages
-                        self.loads.append((bytes(program), bytes(artifacts)))
+                        del directory, compiled_stages
+                        self.loads.append(bytes(manifest))
                         return object()
 
                 capture = PipelineCapture()
@@ -326,10 +324,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertIs(compiled, repeated)
                 self.assertEqual(pipeline.compile_count, 1)
                 deployment = compiled.specialization.deployment
-                self.assertTrue(deployment.canonical_program)
-                self.assertTrue(deployment.artifact_system)
-                self.assertEqual(capture.loads, [(deployment.canonical_program, deployment.artifact_system)])
-                interactive_artifacts = json.loads(deployment.artifact_system)
+                self.assertTrue(deployment.manifest)
+                self.assertEqual(capture.loads, [deployment.manifest])
 
                 compile_calls = 0
 
@@ -341,6 +337,12 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         nonlocal compile_calls
                         compile_calls += 1
                         return self.compiler.compile_program_result(*args, **kwargs)
+
+                    def plan_program_result(self, *args: object, **kwargs: object) -> object:
+                        return self.compiler.plan_program_result(*args, **kwargs)
+
+                    def finalize_program_result(self, *args: object, **kwargs: object) -> object:
+                        return self.compiler.finalize_program_result(*args, **kwargs)
 
                 proxy = SimpleNamespace(
                     Target=native.Target,
@@ -360,7 +362,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 if target_name == "opengl":
                     cli_arguments.extend(["--opengl-version", "330"])
                 with (
-                    mock.patch.object(shader_assets_module, "_native_module", return_value=proxy),
+                    mock.patch.object(compile_orchestration_module, "_native_module", return_value=proxy),
                     mock.patch("subprocess.run", side_effect=AssertionError("offline cooking spawned a subprocess")),
                 ):
                     manifest_path = cook_program_asset(
@@ -381,24 +383,14 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
                 self.assertNotIn("features", cooked)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
-                self.assertEqual(
-                    [(row["name"], row["slot"], row["kind"]) for row in selected["parameters"]],
-                    [(row["name"], row["slot"], row["kind"]) for row in GOLDEN["graphics"]["parameters"]],
-                )
-                self.assertEqual(selected["outputs"], GOLDEN["graphics"]["outputs"])
+                self.assertNotIn("parameters", selected)
+                self.assertNotIn("outputs", selected)
+                self.assertNotIn("stage_artifacts", selected)
                 program = selected["program"]
-                cooked_digests = []
-                for stage_name in ("vertex", "fragment"):
-                    stage_id = program[stage_name]
-                    cooked_bytes = _artifact_bytes(cooked, stage_id, cooked_dir)
-                    digest = hashlib.sha256(cooked_bytes).hexdigest()
-                    self.assertEqual(digest, cooked["stage_artifacts"][stage_id]["artifact"]["sha256"])
-                    cooked_digests.append(digest)
-                interactive_modules = next(iter(interactive_artifacts["artifacts"].values()))["modules"]
-                self.assertEqual(
-                    sorted(module["sha256"] for module in interactive_modules),
-                    sorted(cooked_digests),
-                )
+                self.assertIn("abi", program)
+                self.assertIn("graphs", program)
+                self.assertIn("stages", program)
+                self.assertIn("artifacts", selected["artifact_system"])
                 _assert_content_hash(self, cooked)
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:

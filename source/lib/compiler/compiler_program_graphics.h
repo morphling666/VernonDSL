@@ -2,6 +2,7 @@
 #define VERNON_COMPILER_PROGRAM_GRAPHICS_H
 
 #include "compiler_program_plan_records.h"
+#include "compiler_program_stage.h"
 #include "compiler_program_storage.h"
 
 #include "llvm/Support/JSON.h"
@@ -28,14 +29,12 @@ struct ProgramGraphicsInterfacePlan {
 };
 
 bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflection, const llvm::json::Array &rawValues,
-                                      const llvm::json::Array &storages,
-                                      const std::map<std::string, int64_t> &boundValues,
+                                      const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                       std::map<int64_t, ProgramLogicalResource> &resources,
                                       ProgramGraphicsInterfacePlan &plan, std::string &error);
 
 bool buildCanonicalGraphicsOperation(const llvm::json::Object &node, const llvm::json::Array &rawValues,
-                                     const llvm::json::Array &storages,
-                                     const std::map<std::string, int64_t> &boundValues,
+                                     const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                      std::map<int64_t, ProgramLogicalResource> &resources,
                                      const llvm::json::Array &fragmentOutputs, std::optional<int64_t> vertexCountValue,
                                      std::map<int64_t, int64_t> &accessByValue, llvm::json::Array &accesses,

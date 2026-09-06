@@ -192,8 +192,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("load_autodiff", &Runtime::loadAutodiff, nb::keep_alive<0, 1>())
         .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
         .def("load_cooked_asset", &Runtime::loadCookedAsset, nb::keep_alive<0, 1>())
-        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("program"), nb::arg("artifact_system"),
-             nb::arg("directory"), nb::arg("stage_bindings"), nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
+        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("manifest"), nb::arg("directory"),
+             nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
     nb::class_<ProgramParameterMetadata>(module, "ProgramParameter")
         .def_ro("slot", &ProgramParameterMetadata::slot)
         .def_ro("name", &ProgramParameterMetadata::name)
@@ -208,6 +208,21 @@ void bindNativeCompiler(nb::module_ &module) {
                              leaves.append(nb::make_tuple(leaf.dtype, leaf.scalar_count, leaf.byte_offset));
                          return leaves;
                      })
+        .def_prop_ro("element_leaf_paths",
+                     [](const ProgramParameterMetadata &value) {
+                         nb::list paths;
+                         for (const auto &path : value.elementLeafPaths) {
+                             nb::list components;
+                             for (const auto &component : path)
+                                 if (component.field)
+                                     components.append(component.name);
+                                 else
+                                     components.append(component.index);
+                             paths.append(std::move(components));
+                         }
+                         return paths;
+                     })
+        .def_ro("element_leaf_shapes", &ProgramParameterMetadata::elementLeafShapes)
         .def_prop_ro("access",
                      [](const ProgramParameterMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &ProgramParameterMetadata::shape);

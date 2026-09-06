@@ -374,7 +374,7 @@ A target lowers semantic accumulation to disjoint direct stores, a supported
 atomic-add fast path, or canonical X-fastest deterministic serial reduction.
 Backend capability does not change the frontend derivative graph.
 
-## 8. Deferred graphics and custom VJP rules
+## 8. Deferred graphics VJP
 
 Compute GPU autodiff supports no-Tape and captured static/dynamic Storage
 pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured implementations use
@@ -390,23 +390,14 @@ differentiable graphics pipeline. The Pipeline ProgramGraph would model varying
 interpolation, rasterization, visibility, depth, blending, and texture
 sampling as versioned stage-boundary primitives.
 
-Ordinary differentiable arithmetic uses built-in versioned rules.
-Rasterization, visibility, depth, blend, and texture sampling require a named
-custom VJP rule set. Each rule declares:
-
-- primal inputs and outputs;
-- saved Values and tape bounds;
-- accepted cotangent and produced-gradient ABI;
-- supported formats, topology, sampling modes, and backend capabilities;
-- behavior at discontinuities.
-
-Missing or incompatible rules are compile errors. Resource handles and sampler
-state remain non-differentiable. A texture rule may produce gradients for
-coordinates and for texel data explicitly exposed as differentiable Storage;
-it does not differentiate the Texture handle.
-
-Rule-set identity participates in compiler and pipeline contracts, cache keys,
-reflection, and manifests.
+Ordinary differentiable arithmetic uses built-in versioned rules. Graphics
+Program VJP is rejected during Program capture, before provider lowering.
+There is no public custom-rule set, transform identity, or manifest field for
+graphics autodiff in this contract. Resource handles and sampler state remain
+non-differentiable. A future graphics differentiation contract must first
+define rasterization, visibility, depth, blend, and texture semantics as
+versioned Program operations; it cannot be added as an authored-form
+compatibility branch.
 
 ## 9. Program composition
 

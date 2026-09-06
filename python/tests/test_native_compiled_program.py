@@ -8,14 +8,14 @@ import unittest
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl import _native as native
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.frontend.compiler import compile_source
 
 
 def _versioned(module: str) -> str:
     attributes = (
         f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64, "
-        f"vernon.pipeline_version = {PIPELINE_VERSION} : i64"
+        f"vernon.program_version = {PROGRAM_VERSION} : i64"
     )
     return module.replace("$VERNON_VERSION_ATTRIBUTES", attributes)
 
@@ -237,9 +237,9 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(
             node["grid"],
             [
-                {"control": {"argument": 1}},
+                {"control": {"value": 1}},
                 7,
-                {"control": {"argument": 2}},
+                {"control": {"value": 2}},
             ],
         )
         self.assertEqual(reflection["kernel_compile_requests"][0]["grid"], node["grid"])
@@ -488,7 +488,7 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertTrue(program.has_cpu_entry("tuple_first"))
         reflection = json.loads(program.reflection)
         self.assertEqual(reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-        self.assertEqual(reflection["pipeline_version"], PIPELINE_VERSION)
+        self.assertEqual(reflection["program_version"], PROGRAM_VERSION)
         self.assertEqual(
             reflection["struct_layouts"],
             [

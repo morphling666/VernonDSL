@@ -175,7 +175,8 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     const std::array<uint64_t, 2> invalidStaticShape{3, 4};
     supplied.tensor.shape = invalidStaticShape.data();
     ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline TensorView descriptor violates static shape or element stride");
+    EXPECT_EQ(error,
+              "pipeline Tensor argument '' TensorView descriptor violates static shape or element stride at axis 0");
 
     supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
@@ -296,7 +297,8 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
 
     supplied[1].tensor.byte_offset = 2;
     EXPECT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
-    EXPECT_EQ(error, "pipeline Tensor arguments have incompatible physical overlap");
+    EXPECT_EQ(error, "pipeline Tensor arguments #0 and #1 have incompatible physical overlap "
+                     "(offsets 0 and 2, element bytes 4 and 4, ranks 1 and 1, first strides 8 and 8)");
 
     supplied[0].tensor.access = VERNON_ACCESS_READ;
     supplied[1].tensor.access = VERNON_ACCESS_READ;

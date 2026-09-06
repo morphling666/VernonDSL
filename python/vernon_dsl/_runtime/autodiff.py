@@ -135,7 +135,44 @@ class CookedVjpProgram:
         grid: tuple[int, int, int],
     ) -> tuple[Any, _StructuredPullback]:
         self._load()
-        return _invoke_structured_pipeline(self._native, bindings, grid)
+        _validate_grid(grid)
+        parameters = tuple(self._native.parameters)
+        grid_values = dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True))
+        grid_parameters = {parameter.name for parameter in parameters if parameter.name in grid_values}
+        if grid_parameters != set(grid_values):
+            raise RuntimeError("cooked Program is missing compute workgroup boundary Values")
+        if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
+            raise ValueError("autodiff bindings do not match pipeline parameters")
+        state = _session_state()
+        access_names = {
+            state._native.ACCESS_READ: "read",
+            state._native.ACCESS_WRITE: "write",
+            state._native.ACCESS_READ_WRITE: "read_write",
+        }
+        borrows = [
+            (parameter.name, bindings[parameter.name], access_names[parameter.access])
+            for parameter in parameters
+            if parameter.name not in grid_values
+            if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
+        ]
+        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
+            for parameter in parameters:
+                value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
+                self._binding_cache.bind_argument(builder, self._native, parameter, value)
+            output, native_pullback = self._native.program_vjp_bound(builder, bindings)
+        groups = _pipeline_derivative_groups(self._native)
+        return output, _StructuredPullback(
+            native_pullback,
+            tuple(group for group in groups if group.role == "gradient"),
+            tuple(group for group in groups if group.role == "cotangent"),
+            bindings,
+            (),
+            int(native_pullback.logical_residual_bytes),
+            0,
+            0,
+            "capture",
+            "dynamic_capture",
+        )
 
     def primal(self, bindings: dict[str, Any], grid: tuple[int, int, int]) -> None:
         self._load()

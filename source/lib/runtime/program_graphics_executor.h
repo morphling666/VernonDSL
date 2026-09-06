@@ -13,7 +13,7 @@ namespace vernon::runtime {
 using ResolveProgramRenderPass = std::function<const VernonRenderPass *(uint32_t control)>;
 
 bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedGraph &resolved, ad::ProgramInvocationFrame &invocation,
+                                         const program::ResolvedGraph &resolved, ad::LogicalValueFrame &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error);
 
 /// Check the bound render target against the attachment signature the Program was compiled for.

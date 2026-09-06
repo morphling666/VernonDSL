@@ -187,13 +187,13 @@ bool captureCpuAbiMetadata(mlir::ModuleOp module, std::vector<vernon::CpuAbiWrap
             metadata.argumentsSize += packing.size;
         }
 
-        if (function.getNumResults() > 1) {
-            diagnostics = "CPU entry '" + function.getSymName().str() + "' has more than one result";
-            return false;
-        }
         if (function.getNumResults() == 0) {
             metadata.resultsSize = 0;
         } else {
+            if (function.getNumResults() > 1) {
+                diagnostics = "CPU entry '" + function.getSymName().str() + "' has more than one result";
+                return false;
+            }
             mlir::FailureOr<llvm::SmallVector<llvm::StringRef>> dtypes = logicalDtypes(function.getResultAttrDict(0));
             if (mlir::failed(dtypes)) {
                 diagnostics = "malformed CPU ABI result dtype metadata in entry '" + function.getSymName().str() + "'";

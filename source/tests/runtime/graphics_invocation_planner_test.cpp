@@ -96,7 +96,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.graphics_state = &state;
@@ -184,7 +184,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     invocation.graphics_state = &state;
@@ -474,7 +474,7 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
 
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.render_pass = &renderPass;
     invocation.draw_command = &draw;
     invocation.dynamic_state = &dynamic;

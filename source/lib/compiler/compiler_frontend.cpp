@@ -281,6 +281,22 @@ static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::Owni
         if (mlir::failed(indices))
             return VERNON_STATUS_VERIFICATION_ERROR;
         options.wrtBoundaryIndices = std::move(*indices);
+        if (options.wrtBoundaryIndices.size() == publicPaths.size()) {
+            for (llvm::StringRef path : publicPaths)
+                options.wrtBoundaryPaths.push_back(path.str());
+        } else {
+            auto names = primal->getAttrOfType<mlir::ArrayAttr>("vernon_program.argument_names");
+            for (unsigned index : options.wrtBoundaryIndices) {
+                auto source = primal.getArgAttrOfType<mlir::StringAttr>(index, "vernon.source_name");
+                if (!source && names && index < names.size())
+                    source = mlir::dyn_cast<mlir::StringAttr>(names[index]);
+                if (!source || source.getValue().empty()) {
+                    (*module).emitError("Program VJP selected boundary has no public path");
+                    return VERNON_STATUS_VERIFICATION_ERROR;
+                }
+                options.wrtBoundaryPaths.push_back(source.getValue().str());
+            }
+        }
         if (auto outputs = (*module)->getAttrOfType<mlir::ArrayAttr>("vernon_program.vjp_outputs")) {
             publicPaths.clear();
             for (mlir::Attribute value : outputs) {
@@ -296,6 +312,12 @@ static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::Owni
             if (mlir::failed(outputIndices))
                 return VERNON_STATUS_VERIFICATION_ERROR;
             options.cotangentBoundaryIndices = std::move(*outputIndices);
+            if (options.cotangentBoundaryIndices.size() != publicPaths.size()) {
+                (*module).emitError("Program VJP does not support selecting multiple paths from one output");
+                return VERNON_STATUS_VERIFICATION_ERROR;
+            }
+            for (llvm::StringRef path : publicPaths)
+                options.cotangentBoundaryPaths.push_back(path.str());
         }
         programVjp = std::move(options);
     }

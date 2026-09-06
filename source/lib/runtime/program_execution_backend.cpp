@@ -25,6 +25,22 @@ bool reject(Diagnostic &diagnostic, std::string code, std::string path, std::str
     return false;
 }
 
+std::string physicalStageIdentity(const StageArtifact &stage) {
+    nlohmann::json modules = nlohmann::json::array();
+    for (const CodeModule &module : stage.modules)
+        modules.push_back({{"role", module.role},
+                           {"format", module.format},
+                           {"entry_point", module.entryPoint},
+                           {"byte_length", module.byteLength},
+                           {"sha256", module.sha256}});
+    const nlohmann::json identity{{"backend", stage.backend},
+                                  {"operation", stage.operation},
+                                  {"contract_hash", stage.contractHash},
+                                  {"modules", std::move(modules)}};
+    const std::string bytes = identity.dump(-1, ' ', false, nlohmann::json::error_handler_t::strict);
+    return sha256Hex(bytes.data(), bytes.size());
+}
+
 std::string backendName(VernonRuntimeBackend backend) {
     switch (backend) {
     case VERNON_RUNTIME_CPU:
@@ -49,7 +65,7 @@ bool loadCodeModuleBytes(const ArtifactSystem &artifacts, const std::string &art
                          Diagnostic &diagnostic) {
     const auto blob = artifacts.blobs.find(module.blob);
     if (blob == artifacts.blobs.end())
-        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/artifact_system/blobs/" + module.blob,
+        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/blobs/" + module.blob,
                       "CodeModule references an unknown Blob");
 
     std::error_code error;
@@ -58,28 +74,25 @@ bool loadCodeModuleBytes(const ArtifactSystem &artifacts, const std::string &art
     if (error || !std::filesystem::is_directory(root, error) || relative.empty() || relative.is_absolute() ||
         relative.has_root_path() || relative.lexically_normal() != relative ||
         std::find(relative.begin(), relative.end(), std::filesystem::path("..")) != relative.end())
-        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION",
-                      "/artifact_system/blobs/" + module.blob + "/location/uri",
+        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/blobs/" + module.blob + "/location/uri",
                       "external Blob URI is not a normalized path beneath the bundle root");
     const std::filesystem::path path = std::filesystem::canonical(root / relative, error);
     const std::filesystem::path contained = path.lexically_relative(root);
     if (error || !std::filesystem::is_regular_file(path, error) || contained.empty() || contained.is_absolute() ||
         *contained.begin() == std::filesystem::path(".."))
-        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION",
-                      "/artifact_system/blobs/" + module.blob + "/location/uri",
+        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/blobs/" + module.blob + "/location/uri",
                       "external Blob cannot be opened beneath the bundle root");
     const uintmax_t fileSize = std::filesystem::file_size(path, error);
     if (error || fileSize != blob->second.byteLength || fileSize > std::numeric_limits<size_t>::max() ||
         fileSize > static_cast<uintmax_t>(std::numeric_limits<std::streamsize>::max()))
-        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION",
-                      "/artifact_system/blobs/" + module.blob + "/byte_length",
+        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/blobs/" + module.blob + "/byte_length",
                       "external Blob length does not match its manifest");
     std::vector<uint8_t> blobBytes(static_cast<size_t>(fileSize));
     std::ifstream input(path, std::ios::binary);
     if ((!blobBytes.empty() &&
          !input.read(reinterpret_cast<char *>(blobBytes.data()), static_cast<std::streamsize>(blobBytes.size()))) ||
         sha256Hex(blobBytes.data(), blobBytes.size()) != blob->second.sha256)
-        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/artifact_system/blobs/" + module.blob + "/sha256",
+        return reject(diagnostic, "PROGRAM_BLOB_AUTHENTICATION", "/blobs/" + module.blob + "/sha256",
                       "external Blob SHA-256 does not match its manifest");
     if (module.offset > blobBytes.size() || module.byteLength > blobBytes.size() - module.offset ||
         sha256Hex(blobBytes.data() + module.offset, static_cast<size_t>(module.byteLength)) != module.sha256)
@@ -207,29 +220,34 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
     auto topology = std::make_shared<VernonProgramTopology>();
     topology->resolvedProgram = std::move(program);
     topology->residualValues = residualCaptures(topology->resolvedProgram->program);
+    std::unordered_map<std::string, size_t> cachedStages;
     for (const ResolvedExecutableNode &node : executable.nodes) {
-        if (topology->stageIndices.find(node.node->stage) != topology->stageIndices.end())
-            continue;
-        std::unique_ptr<VernonProgramExecutable> child(
-            executionKind(*node.node) == ExecutionKind::Graphics
-                ? loadGraphicsProgramPipeline(context, *topology->resolvedProgram, artifacts, bundleRoot, *node.node,
-                                              *node.stage, diagnostic)
-                : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic));
-        if (!child) {
-            if (diagnostic.code.empty())
-                reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/stages/" + node.node->stage,
-                       invocationDiagnostic(context).empty() ? "backend did not report a stage load error"
-                                                             : invocationDiagnostic(context));
-            return nullptr;
+        const std::string identity = physicalStageIdentity(node.stage->stage);
+        auto cached = cachedStages.find(identity);
+        if (cached == cachedStages.end()) {
+            std::unique_ptr<VernonProgramExecutable> child(
+                executionKind(*node.node) == ExecutionKind::Graphics
+                    ? loadGraphicsProgramPipeline(context, *topology->resolvedProgram, artifacts, bundleRoot,
+                                                  *node.node, *node.stage, diagnostic)
+                    : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic));
+            if (!child) {
+                if (diagnostic.code.empty())
+                    reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/stages/" + node.node->stage,
+                           invocationDiagnostic(context).empty() ? "backend did not report a stage load error"
+                                                                 : invocationDiagnostic(context));
+                return nullptr;
+            }
+            --context.livePipelines;
+            cached = cachedStages.emplace(identity, topology->stages.size()).first;
+            topology->stages.push_back(VernonCompiledProgramStage{std::move(child)});
         }
-        --context.livePipelines;
         std::vector<VernonProgramStageBinding> bindings;
         for (const TargetBinding &binding : node.plan.bindings)
-            if (binding.source != SourceRepresentation::SystemValue)
+            if (!internalSource(binding.source))
                 bindings.push_back({binding.projection.value, binding.projection.leaf, binding});
-        topology->stageIndices.emplace(node.node->stage, topology->stages.size());
-        topology->stages.push_back(
-            VernonResolvedProgramStage{std::move(child), std::move(bindings), node.plan.dispatchMapping});
+        topology->nodes.emplace(std::make_pair(node.graph, node.node->id),
+                                VernonResolvedProgramNode{topology->stages[cached->second].pipeline.get(),
+                                                          std::move(bindings), node.plan.dispatchMapping});
     }
     pipeline->topology = std::move(topology);
     if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
@@ -242,9 +260,9 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
 }
 
 VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                    size_t programJsonSize, const char *artifactSystemJson,
-                                                    size_t artifactSystemJsonSize,
-                                                    const std::map<std::string, std::string> &stageBindings,
+                                                    size_t programJsonSize, const char *targetJson,
+                                                    size_t targetJsonSize, const char *blobsJson, size_t blobsJsonSize,
+                                                    const char *artifactSystemJson, size_t artifactSystemJsonSize,
                                                     const std::filesystem::path &bundleRoot, std::string &error) {
     Diagnostic diagnostic;
     Program program;
@@ -260,7 +278,9 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
                 reject(diagnostic, "PROGRAM_PARSE_FAILED", "", "Program parser rejected input without a diagnostic");
             return failed();
         }
-        if (!parseArtifactSystem(nlohmann::json::parse(artifactSystemJson, artifactSystemJson + artifactSystemJsonSize),
+        if (!parseArtifactSystem(nlohmann::json::parse(targetJson, targetJson + targetJsonSize),
+                                 nlohmann::json::parse(blobsJson, blobsJson + blobsJsonSize),
+                                 nlohmann::json::parse(artifactSystemJson, artifactSystemJson + artifactSystemJsonSize),
                                  artifacts, diagnostic)) {
             if (diagnostic.code.empty())
                 reject(diagnostic, "PROGRAM_ARTIFACT_PARSE_FAILED", "",
@@ -272,7 +292,7 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
         return failed();
     }
     ResolvedProgram resolved;
-    if (!resolve(std::move(program), artifacts, stageBindings, resolved, diagnostic)) {
+    if (!resolve(std::move(program), artifacts, resolved, diagnostic)) {
         if (diagnostic.code.empty())
             reject(diagnostic, "PROGRAM_RESOLUTION_FAILED", "", "Program resolver rejected input without a diagnostic");
         return failed();

@@ -139,7 +139,7 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
 
     const VernonTarget target = compileTargetKind(compileOptions);
     (*root)["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
-    (*root)["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
+    (*root)["program_version"] = int64_t{VERNON_PROGRAM_VERSION};
     llvm::json::Object options;
     llvm::json::Object output;
     if (const auto *cpu = std::get_if<CpuCodegenOptions>(&compileOptions)) {

@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_AUTODIFF_PROGRAM_VALUE_ARENA_H
 
 #include "runtime/autodiff/host_tape_allocator.h"
+#include "runtime/autodiff/runtime_gpu_commands.h"
 #include "runtime/autodiff/runtime_gpu_resources.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/target_binding_plan.h"
@@ -13,7 +14,7 @@
 #include <vector>
 
 struct VernonRuntimeContext;
-struct VernonResolvedProgramStage;
+struct VernonResolvedProgramNode;
 
 namespace vernon::runtime {
 struct ProgramInvocationContext;
@@ -21,10 +22,27 @@ struct ProgramInvocationContext;
 
 namespace vernon::runtime::ad {
 
-struct MaterializedProgramArguments {
+struct MaterializedNodeFrame {
+    struct HostCopy {
+        const uint8_t *source{};
+        uint8_t *destination{};
+        size_t sourceOffset{};
+        size_t destinationOffset{};
+        size_t size{};
+    };
+
     std::vector<VernonProgramArgument> arguments;
     std::vector<std::vector<uint64_t>> shapes;
     std::vector<std::vector<int64_t>> strides;
+    std::vector<std::vector<uint8_t>> hostStorage;
+    std::vector<std::shared_ptr<gpu::DeviceBuffer>> deviceStorage;
+    std::vector<HostCopy> copiesBefore;
+    std::vector<HostCopy> copiesAfter;
+    std::vector<gpu::DeviceBufferCopy> deviceCopiesBefore;
+    std::vector<gpu::DeviceBufferCopy> deviceCopiesAfter;
+
+    bool prepareHost(std::string &error) const;
+    bool commitHost(std::string &error) const;
 };
 
 enum class ProgramValueOwnership {
@@ -35,7 +53,7 @@ enum class ProgramValueOwnership {
     TapeCarrier,
 };
 
-struct ProgramHostValue {
+struct LogicalProgramValue {
     std::vector<uint8_t> owned;
     std::vector<int64_t> strides;
     std::optional<shape::ConcreteShape> concreteShape;
@@ -44,21 +62,29 @@ struct ProgramHostValue {
     ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};
 };
 
+bool resolveProgramControl(const program::Program &program, const std::vector<LogicalProgramValue> &hostValues,
+                           const program::ControlComponent &control, uint64_t &value, std::string &error);
+
 struct ProgramDeviceUpload {
     VernonRhiBuffer destination{};
     const void *source{};
     size_t size{};
 };
 
-class ProgramInvocationFrame {
+class LogicalValueFrame {
 public:
-    ProgramInvocationFrame() = default;
-    explicit ProgramInvocationFrame(const std::vector<VernonProgramArgument> &hostArguments);
-    explicit ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues);
+    LogicalValueFrame() = default;
+    explicit LogicalValueFrame(const std::vector<VernonProgramArgument> &hostArguments);
+    explicit LogicalValueFrame(std::vector<LogicalProgramValue> hostValues);
+    LogicalValueFrame(LogicalValueFrame &&other) noexcept;
+    LogicalValueFrame(const LogicalValueFrame &) = delete;
+    LogicalValueFrame &operator=(const LogicalValueFrame &) = delete;
+    LogicalValueFrame &operator=(LogicalValueFrame &&) = delete;
 
     bool materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required, std::string &error);
     bool restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error);
-    bool adoptRetainedValue(uint32_t value, const ProgramInvocationFrame &retained, std::string &error);
+    bool adoptRetainedValue(uint32_t value, const LogicalValueFrame &retained, std::string &error);
+    void retainOnly(const std::vector<char> &retained);
     bool allocateCarrier(VernonRuntimeContext &context, uint32_t value, const program::TargetBinding &binding,
                          size_t byteSize, std::vector<uint64_t> shape, std::vector<int64_t> strides,
                          std::string &error);
@@ -68,7 +94,7 @@ public:
                          std::string &error) const;
     bool downloadLogicalToHost(const std::vector<char> &required, std::string &error) const;
     bool materializeNodeArguments(const program::Program &program, const program::Node &node,
-                                  const VernonResolvedProgramStage &stage, MaterializedProgramArguments &output,
+                                  const VernonResolvedProgramNode &nodePlan, MaterializedNodeFrame &output,
                                   std::string &error) const;
     bool bindControlImageStorage(const program::Program &program, uint32_t storage,
                                  VernonRuntimeProviderResourceReference view, std::string &error);
@@ -85,8 +111,8 @@ public:
     bool deviceResident() const { return deviceResident_; }
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
     const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
-    const std::vector<ProgramHostValue> &hostValues() const { return hostValues_; }
-    std::vector<ProgramHostValue> &hostValues() { return hostValues_; }
+    const std::vector<LogicalProgramValue> &hostValues() const { return hostValues_; }
+    std::vector<LogicalProgramValue> &hostValues() { return hostValues_; }
 
 private:
     struct Carrier {
@@ -101,7 +127,7 @@ private:
     const Carrier *carrier(uint32_t value, program_plan::TapeCarrier carrier) const;
     void rebindLogicalDescriptor(uint32_t value);
 
-    std::vector<ProgramHostValue> hostValues_;
+    std::vector<LogicalProgramValue> hostValues_;
     std::vector<VernonProgramArgument> logicalArguments_;
     std::vector<std::shared_ptr<gpu::DeviceBuffer>> logicalBuffers_;
     std::vector<ProgramDeviceUpload> deviceUploads_;

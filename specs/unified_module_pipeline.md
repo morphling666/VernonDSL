@@ -9,8 +9,9 @@ VernonDSL uses one Program model for:
 - composite `Module`s;
 - transforms such as VJP.
 
-All paths produce the same typed Program IR and use the same compiler, pipeline artifact, loader, and native runtime.
-The existing public asset name remains `program_asset`; do not add `program_asset` or a second contract.
+All paths produce the same typed Program IR and use the same compiler, Program
+Asset, loader, resolver, and native runtime. The only public asset declaration
+is `program_asset`; do not add a second contract.
 
 Standalone kernels and graphics pipelines are normalized to one-node Programs
 at the asset/compiler boundary. Node count must not select a different
@@ -26,7 +27,8 @@ remains region-capable so structured runtime control can be added later without 
 This refactor must also remove the transitional Python interpreter path. Python may enter the compiler and run host-static
 frontend logic, but it must not execute lowered operations, reverse fragments, or checkpoint decisions.
 
-The compiler contract, pipeline contract, bundle schema, and manifest version remain unchanged until a separate release.
+The coordinated Program Asset release changes the deployment contract
+atomically. Intermediate dual-schema state is not a supported contract.
 
 ## 1.1 Compute kernel stages (locked)
 
@@ -46,8 +48,9 @@ Rules:
 - `specialize` / `finalize` produce one native artifact per (source, features,
   target). Static annotation extents may appear in the Program. TensorView
   `vd.dyn` stays `-1` on Value `.shape`, the same marker as shader endpoints.
-  Borrowed Storage with a dyn view records `byte_length` / image `extent` `0`:
-  size comes from the bound provider, not a formula. CPU and GPU share this
+  Borrowed Storage with a dyn view omits concrete byte length/image extent and
+  declares only static compatibility constraints. Size comes from the bound
+  provider, not a zero sentinel or cook-time formula. CPU and GPU share this
   artifact. Different launch sizes must not recompile.
 - C++ bind/invoke is the only place that reads runtime shape, strides, offset,
   and byte length from the bound buffer. Direct C++ `load → bind → invoke`
@@ -369,21 +372,25 @@ choose retain/rematerialize heuristics, synthesize telemetry, or execute reverse
 ## 8. Program Assets and runtime
 
 For `scene.py:pbr_asset`, cooking imports the descriptor in a clean worker, obtains the initialized Program, enters the
-same compiler frontend used by an interactive cache miss, and writes the existing pipeline artifact format.
+same compiler frontend used by an interactive cache miss, and writes one
+`.program.json` Program Asset.
 
 C++ loads only cooked artifacts:
 
 ```cpp
-auto pipeline = runtime.loadPipeline(asset, variantId);
-auto bindings = pipeline.createBindings(values);
-auto submission = pipeline.invoke(bindings);
+auto bundle = runtime.loadProgram(asset);
+auto executable = bundle.resolve(features);
+auto instance = executable.createInstance();
+auto invocation = instance.beginInvocation();
+invocation.bind(values);
+invocation.forward();
 ```
 
 C++ does not construct Modules, embed Python, or receive constructor configuration. Multiple specializations are exposed
 through stable variant IDs.
 
-The existing static parser may remain temporarily for legacy kernel/graphics declarations, but all declarations must
-converge on the same MLIR Program IR before lowering.
+The static parser is an optional declaration-site lint only. It does not
+select capture, schema, compiler, or runtime behavior.
 
 ## 9. Migration
 
@@ -404,9 +411,9 @@ lowered explicit accumulation.
 Migrate examples and public tests from pass/encoder APIs to Module and callable pipeline APIs. Runtime graph/pass tests
 move to internal coverage.
 
-Do not change existing compiler/pipeline contract versions before the
-coordinated breaking release. That release assigns a new compiler/pipeline
-pair and rejects every older cooked artifact rather than normalizing it.
+The coordinated breaking release changes generated compiler/Program contract
+names and values only through their authoritative generator inputs and rejects
+every older cooked artifact rather than normalizing it.
 
 ## 10. Implementation order
 

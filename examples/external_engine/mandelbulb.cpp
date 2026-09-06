@@ -145,7 +145,7 @@ public:
         arguments_[6] = hostArgument(parameters[6], &maxSteps_, sizeof(maxSteps_));
         arguments_[7] = hostArgument(parameters[7], &shadowSteps_, sizeof(shadowSteps_));
         invocation_.struct_size = sizeof(invocation_);
-        invocation_.abi_version = VERNON_PIPELINE_VERSION;
+        invocation_.abi_version = VERNON_PROGRAM_VERSION;
         invocation_.arguments = arguments_.data();
         invocation_.argument_count = arguments_.size();
         attachment_.location = 0;

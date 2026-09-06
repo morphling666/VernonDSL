@@ -112,6 +112,7 @@ bool resolveVulkanPipeline(VernonProgramBundle &bundle, const Variant &variant, 
                                                                                : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
                                             : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
                                                                         : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    configureComputeValueStorage(use, candidate.layout);
                     candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
                     if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
                         return false;
@@ -561,6 +562,11 @@ VernonStatus invokeVulkanComputePipeline(VernonProgramExecutable &pipeline, cons
             continue;
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+                if (!bindComputeValueStorage(layout, argument, value))
+                    return fail(*pipeline.context, "Vulkan prepared Value storage binding has invalid bytes");
+                continue;
+            }
             const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
             if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "Vulkan prepared storage binding requires an RHI Tensor");
@@ -578,8 +584,18 @@ VernonStatus invokeVulkanComputePipeline(VernonProgramExecutable &pipeline, cons
             value.payload.image.view = image->view;
         } else {
             const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
-            if (!scalar || !scalar->data)
-                return fail(*pipeline.context, "Vulkan prepared inline binding requires host data");
+            if (!scalar || !scalar->data) {
+                std::string parameterContract;
+                for (const Parameter &parameter : pipeline.variant.parameters)
+                    for (const ParameterUse &use : parameter.uses)
+                        if (use.index == layout.argument_index)
+                            parameterContract = " for parameter '" + parameter.name + "' (interface " +
+                                                use.interfaceKind + ", transport " + use.transport + ")";
+                return fail(*pipeline.context, "Vulkan prepared inline binding requires host data at argument " +
+                                                   std::to_string(layout.argument_index) + " (kind " +
+                                                   std::to_string(argument.index()) + ", size " +
+                                                   std::to_string(scalar ? scalar->size : 0) + ")" + parameterContract);
+            }
             value.payload.inline_value.data = scalar->data;
             value.payload.inline_value.size = scalar->size;
         }

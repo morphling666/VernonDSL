@@ -59,7 +59,7 @@ bool checkAttachmentFormat(const program::GraphicsAttachmentSignature &signature
 } // namespace
 
 bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedGraph &resolved, ad::ProgramInvocationFrame &invocation,
+                                         const program::ResolvedGraph &resolved, ad::LogicalValueFrame &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error) {
     for (const program::ResolvedGraph::ControlResourceProjection &projection : resolved.controlResources) {
         if (projection.node >= graph.nodes.size())

@@ -55,7 +55,10 @@ function(
             ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${Python_EXECUTABLE} -m
             vernon_dsl.program_asset_cli "${asset_reference}" --target "${architecture}" --output
             "${_vernon_bundle_directory}"
-        DEPENDS vernon-dsl-native "${_vernon_asset_source}" ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
+        DEPENDS vernon-dsl-native
+                "$<TARGET_FILE:vernon-dsl-native>"
+                "${_vernon_asset_source}"
+                ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
         VERBATIM)
     add_custom_target("vernon-${name}-test-bundle" DEPENDS "${_vernon_bundle_manifest}")
     set(${output_variable}
@@ -116,10 +119,7 @@ function(
     set(_vernon_manifest "${_vernon_directory}/${manifest_name}")
     set(_vernon_registration "${_vernon_directory}/autodiff_registration.c")
     set(_vernon_wrapper "${_vernon_directory}/autodiff_registration_wrapper.c")
-    set(_vernon_objects)
-    foreach(index RANGE 0 2)
-        list(APPEND _vernon_objects "${_vernon_directory}/autodiff_artifact_${index}${CMAKE_C_OUTPUT_EXTENSION}")
-    endforeach()
+    set(_vernon_artifact_archive "${_vernon_directory}/autodiff_artifacts.a")
     string(
         REGEX
         REPLACE ":[^:]+$"
@@ -137,21 +137,25 @@ function(
         OUTPUT "${_vernon_manifest}"
                "${_vernon_registration}"
                "${_vernon_wrapper}"
-               ${_vernon_objects}
+               "${_vernon_artifact_archive}"
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_directory}"
         COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${_vernon_cook_command}
-        COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
-                "${_vernon_manifest}" "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}"
+        COMMAND
+            ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py" "${_vernon_manifest}"
+            "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}" --archiver "${CMAKE_AR}"
         DEPENDS vernon-dsl-native
+                "$<TARGET_FILE:vernon-dsl-native>"
                 "${_vernon_asset_source}"
                 ${FIXTURE_COOK_SCRIPT}
                 ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
                 "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
         VERBATIM)
     set_source_files_properties("${_vernon_registration}" "${_vernon_wrapper}" PROPERTIES GENERATED TRUE)
-    set_source_files_properties(${_vernon_objects} PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
     set(_vernon_target "vernon-${name}-fixture")
-    add_library(${_vernon_target} STATIC "${_vernon_registration}" "${_vernon_wrapper}" ${_vernon_objects})
+    add_library(${_vernon_target} STATIC "${_vernon_registration}" "${_vernon_wrapper}")
+    add_custom_target(${_vernon_target}-artifacts DEPENDS "${_vernon_artifact_archive}")
+    add_dependencies(${_vernon_target} ${_vernon_target}-artifacts)
+    target_link_libraries(${_vernon_target} PUBLIC "${_vernon_artifact_archive}")
     set_target_properties(${_vernon_target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(${_vernon_target} PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
     set(${manifest_variable}
@@ -621,7 +625,8 @@ if(TARGET VernonRuntime)
 
         if(gpu_autodiff_fixture_targets)
             add_executable(VernonGpuAutodiffTests runtime/runtime_gpu_autodiff_test.cpp)
-            target_include_directories(VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+            target_include_directories(VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                      "${VERNON_TEST_ROOT}/support")
             target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
             add_dependencies(VernonGpuAutodiffTests ${gpu_autodiff_fixture_targets})
             if(VERNON_ENABLE_VULKAN_RUNTIME)
@@ -718,13 +723,13 @@ if(TARGET VernonRuntime)
                     ${structured_scalar_balanced_autodiff_fixture_target}
                     ${structured_dynamic_autodiff_fixture_target}
                     ${structured_f64_autodiff_fixture_target})
-        target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+        target_include_directories(VernonStructuredScalarAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                               "${VERNON_TEST_ROOT}/support")
         target_compile_definitions(
             VernonStructuredScalarAutodiffTests
             PRIVATE
                 VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST="${structured_scalar_autodiff_manifest}"
                 VERNON_STRUCTURED_SCALAR_BALANCED_AUTODIFF_MANIFEST="${structured_scalar_balanced_autodiff_manifest}"
-                VERNON_AUTODIFF_BALANCED_EVIDENCE="${VERNON_REPOSITORY_ROOT}/specs/autodiff_balanced_frontend_evidence.json"
                 VERNON_STRUCTURED_DYNAMIC_AUTODIFF_MANIFEST="${structured_dynamic_autodiff_manifest}"
                 VERNON_STRUCTURED_F64_AUTODIFF_MANIFEST="${structured_f64_autodiff_manifest}")
         if(VERNON_HOST_TAPE_INSTRUMENTATION)
@@ -738,6 +743,7 @@ if(TARGET VernonRuntime)
         add_executable(VernonStructuredAggregateAutodiffTests runtime/runtime_structured_aggregate_autodiff_test.cpp)
         target_link_libraries(VernonStructuredAggregateAutodiffTests
                               PRIVATE GTest::gtest_main Vernon::Runtime ${structured_aggregate_autodiff_fixture_target})
+        target_include_directories(VernonStructuredAggregateAutodiffTests PRIVATE "${VERNON_TEST_ROOT}/support")
         target_compile_definitions(
             VernonStructuredAggregateAutodiffTests
             PRIVATE VERNON_STRUCTURED_AGGREGATE_AUTODIFF_MANIFEST="${structured_aggregate_autodiff_manifest}")
@@ -755,7 +761,8 @@ if(TARGET VernonRuntime)
         if(VERNON_HOST_TAPE_INSTRUMENTATION)
             target_compile_definitions(VernonStructuredStorageAutodiffTests PRIVATE VERNON_HOST_TAPE_INSTRUMENTATION=1)
         endif()
-        target_include_directories(VernonStructuredStorageAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+        target_include_directories(VernonStructuredStorageAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                                "${VERNON_TEST_ROOT}/support")
         set_target_properties(VernonStructuredStorageAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                               "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonStructuredStorageAutodiffTests VernonRuntime)
@@ -770,7 +777,8 @@ if(TARGET VernonRuntime)
             PRIVATE
                 VERNON_STRUCTURED_STORAGE_WORKGROUP_AUTODIFF_MANIFEST="${structured_storage_workgroup_autodiff_manifest}"
         )
-        target_include_directories(VernonRuntimeWorkgroupAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+        target_include_directories(VernonRuntimeWorkgroupAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                               "${VERNON_TEST_ROOT}/support")
         set_target_properties(VernonRuntimeWorkgroupAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                              "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonRuntimeWorkgroupAutodiffTests VernonRuntime)
@@ -971,7 +979,7 @@ if(TARGET VernonRuntime)
             vernon_add_pipeline_test_bundle(
                 directx-pipeline
                 directx
-                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_depth_asset"
                 directx_pipeline_bundle
                 directx_pipeline_test_manifest)
             vernon_add_pipeline_test_bundle(
@@ -1007,7 +1015,7 @@ if(TARGET VernonRuntime)
         vernon_add_pipeline_test_bundle(
             vulkan-pipeline
             vulkan
-            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_depth_asset"
             vulkan_pipeline_bundle
             vulkan_pipeline_test_manifest)
         vernon_add_pipeline_test_bundle(

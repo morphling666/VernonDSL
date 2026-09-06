@@ -208,6 +208,12 @@ std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std
                                                                        const nb::dict &targetOptions);
 
 struct ProgramParameterMetadata {
+    struct PathComponent {
+        bool field{};
+        std::string name;
+        uint64_t index{};
+    };
+
     uint32_t slot{};
     std::string name;
     VernonProgramArgumentKind kind{};
@@ -215,6 +221,8 @@ struct ProgramParameterMetadata {
     uint32_t elementAlignment{};
     std::string layoutHash;
     std::vector<VernonValueLeafView> elementLeaves;
+    std::vector<std::vector<PathComponent>> elementLeafPaths;
+    std::vector<std::vector<uint64_t>> elementLeafShapes;
     VernonValueAccess access{};
     VernonImageBindingRole imageBindingRole{VERNON_IMAGE_BINDING_SAMPLED};
     VernonTextureFormat storageImageFormat{};
@@ -407,9 +415,6 @@ struct ProgramInvocationBuilder {
         }
         argument.shape.assign(arrayShape.begin(), arrayShape.begin() + static_cast<std::ptrdiff_t>(rank));
         argument.strides.assign(arrayStrides.begin(), arrayStrides.begin() + static_cast<std::ptrdiff_t>(rank));
-        for (uint64_t extent : argument.shape)
-            if (!extent)
-                throw std::invalid_argument("NumPy Tensor dimensions must be positive");
         VernonTensorView layoutProbe{};
         layoutProbe.element_layout = argument.value.tensor.element_layout;
         layoutProbe.rank = static_cast<uint32_t>(rank);
@@ -683,7 +688,7 @@ struct ProgramInvocationBuilder {
             values.push_back(argument->value);
         VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_VERSION;
+        invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
         invocation.argument_count = values.size();
         invocation.compute_grid = computeGrid;
@@ -709,6 +714,52 @@ struct ProgramInvocationBuilder {
             invocation.dynamic_state = &dynamicState;
         }
         return invocation;
+    }
+
+    VernonStatus forwardProgram(VernonPullback **pullback) const {
+        if (pullback)
+            *pullback = nullptr;
+        std::vector<VernonProgramArgument> values;
+        const VernonProgramSubmitDescriptor descriptor = invocation(values);
+
+        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
+        if (!instance)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        VernonProgramInvocation *programInvocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+        if (!programInvocation) {
+            vernonRuntimeProgramInstanceDestroy(instance);
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        }
+        VernonStatus status = VERNON_STATUS_OK;
+        for (size_t index = 0; index < values.size() && status == VERNON_STATUS_OK; ++index) {
+            const std::string text = "python-argument-" + std::to_string(index);
+            const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
+            status = vernonRuntimeProgramInvocationBind(programInvocation, &token, &values[index], nullptr, 0, 0);
+        }
+        const size_t graphicsCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(pipeline);
+        for (size_t index = 0; index < graphicsCount && status == VERNON_STATUS_OK; ++index) {
+            VernonProgramGraphicsControlsView controls{};
+            controls.struct_size = sizeof(controls);
+            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline, index, &controls);
+            const std::string text = "python-graphics-" + std::to_string(index);
+            const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
+            if (status == VERNON_STATUS_OK && descriptor.render_pass)
+                status = vernonRuntimeProgramInvocationBindRenderPass(programInvocation, controls.render_pass_control,
+                                                                      &token, descriptor.render_pass, nullptr, 0);
+            if (status == VERNON_STATUS_OK && descriptor.draw_command)
+                status = vernonRuntimeProgramInvocationBindDrawCommand(programInvocation, controls.draw_command_control,
+                                                                       &token, descriptor.draw_command, nullptr);
+            if (status == VERNON_STATUS_OK && descriptor.dynamic_state)
+                status = vernonRuntimeProgramInvocationBindDynamicState(
+                    programInvocation, controls.dynamic_state_control, &token, descriptor.dynamic_state);
+        }
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramInvocationForward(programInvocation, pullback);
+        else
+            vernonRuntimeProgramInvocationRollback(programInvocation);
+        vernonRuntimeProgramInvocationDestroy(programInvocation);
+        vernonRuntimeProgramInstanceDestroy(instance);
+        return status;
     }
 
     std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {

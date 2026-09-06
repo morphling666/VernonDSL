@@ -5,15 +5,14 @@
 
 #include <cstddef>
 #include <filesystem>
-#include <map>
 #include <string>
 
 namespace vernon::runtime::program {
 
 VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                    size_t programJsonSize, const char *artifactSystemJson,
-                                                    size_t artifactSystemJsonSize,
-                                                    const std::map<std::string, std::string> &stageBindings,
+                                                    size_t programJsonSize, const char *targetJson,
+                                                    size_t targetJsonSize, const char *blobsJson, size_t blobsJsonSize,
+                                                    const char *artifactSystemJson, size_t artifactSystemJsonSize,
                                                     const std::filesystem::path &bundleRoot, std::string &error);
 
 } // namespace vernon::runtime::program

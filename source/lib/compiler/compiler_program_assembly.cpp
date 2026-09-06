@@ -27,6 +27,18 @@ bool assembleCanonicalProgram(const llvm::json::Object &rawSignature,
     for (const CanonicalProgramGraph &view : selectedGraphs) {
         llvm::json::Array graphInputs;
         size_t userSlot = 0;
+        size_t controlAxis = 0;
+        std::set<int64_t> invocationControls;
+        for (const llvm::json::Object *node : view.nodes) {
+            if (node->getString("kind") == "render")
+                continue;
+            if (const llvm::json::Array *grid = node->getArray("grid"))
+                for (const llvm::json::Value &componentValue : *grid)
+                    if (const llvm::json::Object *component = componentValue.getAsObject())
+                        if (const llvm::json::Object *control = component->getObject("control"))
+                            if (const std::optional<int64_t> value = control->getInteger("value"))
+                                invocationControls.insert(*value);
+        }
         for (int64_t valueId : view.arguments) {
             if (publicArgumentValues.count(valueId)) {
                 for (llvm::json::Value &value : values)
@@ -36,8 +48,15 @@ bool assembleCanonicalProgram(const llvm::json::Object &rawSignature,
                             (*origin)["slot"] = static_cast<int64_t>(userSlot);
                 graphInputs.emplace_back(llvm::json::Object{
                     {"tag", "user_input"}, {"value", valueId}, {"slot", static_cast<int64_t>(userSlot++)}});
+            } else if (invocationControls.count(valueId)) {
+                if (controlAxis >= 3) {
+                    error = "canonical Program graph has more than three invocation grid controls";
+                    return false;
+                }
+                graphInputs.emplace_back(llvm::json::Object{
+                    {"tag", "invocation_control"}, {"value", valueId}, {"axis", static_cast<int64_t>(controlAxis++)}});
             } else
-                graphInputs.emplace_back(llvm::json::Object{{"tag", "invocation_control"}, {"value", valueId}});
+                graphInputs.emplace_back(llvm::json::Object{{"tag", "control"}, {"value", valueId}});
         }
         for (const llvm::json::Value &rowValue : values) {
             const llvm::json::Object *row = rowValue.getAsObject();
@@ -101,8 +120,7 @@ bool assembleCanonicalProgram(const llvm::json::Object &rawSignature,
                 {"value", value},
                 {"replay", llvm::json::Object{
                                {"legal", false}, {"required_values", llvm::json::Array()}, {"cost", int64_t{0}}}}});
-        residualContract =
-            llvm::json::Object{{"captures", std::move(residualCaptures)}, {"shape_symbols", llvm::json::Array()}};
+        residualContract = llvm::json::Object{{"captures", std::move(residualCaptures)}};
     }
     program = serializeCanonicalProgram({std::move(stages), std::move(storages), std::move(values),
                                          std::move(canonicalGraphs), std::move(abi), std::move(residualContract)});

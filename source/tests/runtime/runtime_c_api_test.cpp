@@ -29,10 +29,7 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
     return VERNON_STATUS_OK;
 }
 
-TEST(RuntimeCApi, AutodiffOpaqueHandleRejectsInvalidCalls) {
-    VernonPullback *pullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    EXPECT_EQ(vernonAdProgramForward(nullptr, {1, 1, 1}, nullptr, nullptr, &pullback), VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(pullback, nullptr);
+TEST(RuntimeCApi, PullbackOpaqueHandleRejectsInvalidCalls) {
     EXPECT_EQ(vernonPullbackApply(nullptr, nullptr, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
     vernonPullbackDestroy(nullptr);
 }
@@ -70,7 +67,7 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_TRUE(runtime);
     static const char bad_reflection[] = "{\"compiler_contract_version\":" VERNON_COMPILER_CONTRACT_VERSION_STRING
-                                         ",\"pipeline_version\":0,\"entries\":[]}";
+                                         ",\"program_version\":0,\"entries\":[]}";
     ASSERT_TRUE(!vernonRuntimeLoadCpuEntry(runtime, fill_grid, bad_reflection, sizeof(bad_reflection) - 1, "fill", 4));
     VernonProgramExecutable *pipeline =
         vernonRuntimeLoadCpuEntry(runtime, fill_grid, reflection, sizeof(reflection) - 1, "fill", 4);
@@ -93,7 +90,7 @@ TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {
     VernonLaunchSize grid = {2, 1, 2};
     VernonProgramSubmitDescriptor invocation = {};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = grid;

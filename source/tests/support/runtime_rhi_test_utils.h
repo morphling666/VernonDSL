@@ -4,8 +4,10 @@
 #include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -69,6 +71,208 @@ struct GraphicsInvocationControls {
         invocation.dynamic_state = &dynamic;
     }
 };
+
+/*
+ * The canonical counterpart of GraphicsInvocationControls.
+ *
+ * A canonical Program reads its render pass, draw, and dynamic state as Program controls off an invocation, so a
+ * cooked `vd.pipeline(...)` asset is driven through this rather than through the submit descriptor. There is no
+ * graphics state to bind: topology, rasterization, and blending are pipeline state the asset declares at cook time,
+ * which is why `vd.pipeline` takes `state=` and `targets=`.
+ */
+struct CanonicalGraphicsControls {
+    VernonRenderPass renderPass{};
+    VernonDrawCommand draw{};
+    VernonDynamicState dynamic{};
+
+    CanonicalGraphicsControls(const VernonColorAttachment *colors, size_t colorCount, uint32_t vertexCount = 0,
+                              uint32_t instanceCount = 1) {
+        renderPass.struct_size = sizeof(renderPass);
+        renderPass.color_attachments = colors;
+        renderPass.color_attachment_count = colorCount;
+        draw.struct_size = sizeof(draw);
+        draw.vertex_count = vertexCount;
+        draw.instance_count = instanceCount;
+        dynamic.struct_size = sizeof(dynamic);
+    }
+
+    VernonStatus bind(VernonProgramInvocation *invocation, const VernonProgramGraphicsControlsView &controls) const {
+        const auto token = [](const char *value) {
+            return VernonProgramBindingToken{sizeof(VernonProgramBindingToken), value, std::strlen(value)};
+        };
+        const VernonProgramBindingToken renderPassToken = token("render-pass");
+        const VernonProgramBindingToken drawToken = token("draw-command");
+        const VernonProgramBindingToken dynamicToken = token("dynamic-state");
+        VernonStatus status = vernonRuntimeProgramInvocationBindRenderPass(invocation, controls.render_pass_control,
+                                                                           &renderPassToken, &renderPass, nullptr, 0);
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramInvocationBindDrawCommand(invocation, controls.draw_command_control,
+                                                                   &drawToken, &draw, nullptr);
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramInvocationBindDynamicState(invocation, controls.dynamic_state_control,
+                                                                    &dynamicToken, &dynamic);
+        return status;
+    }
+};
+
+/*
+ * Run one canonical graphics invocation to completion: bind every argument and control, then forward.
+ *
+ * Forward executes and waits, so this is the canonical equivalent of completeSubmission for a Program, and the
+ * arguments carry their own slots exactly as they do in a submit descriptor.
+ */
+inline VernonStatus completeCanonicalInvocation(VernonProgramExecutable *pipeline,
+                                                const VernonProgramArgument *arguments, size_t argumentCount,
+                                                const CanonicalGraphicsControls &controls) {
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
+    if (!instance)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    if (!invocation) {
+        vernonRuntimeProgramInstanceDestroy(instance);
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    VernonStatus status = VERNON_STATUS_OK;
+    for (size_t index = 0; index < argumentCount && status == VERNON_STATUS_OK; ++index) {
+        const std::string name = "argument-" + std::to_string(index);
+        const VernonProgramBindingToken argumentToken{sizeof(VernonProgramBindingToken), name.data(), name.size()};
+        status = vernonRuntimeProgramInvocationBind(invocation, &argumentToken, &arguments[index], nullptr, 0, 0);
+    }
+    VernonProgramGraphicsControlsView controlSlots{};
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline, 0, &controlSlots);
+    if (status == VERNON_STATUS_OK)
+        status = controls.bind(invocation, controlSlots);
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
+    else
+        vernonRuntimeProgramInvocationRollback(invocation);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    return status;
+}
+
+inline VernonStatus completeCanonicalComputeInvocation(VernonProgramExecutable *pipeline,
+                                                       const VernonProgramArgument *arguments, size_t argumentCount,
+                                                       VernonLaunchSize grid, VernonPullback **pullback = nullptr) {
+    std::vector<VernonProgramArgument> bindings(arguments, arguments + argumentCount);
+    const size_t parameterCount = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
+    std::vector<VernonProgramParameterView> parameters(parameterCount);
+    for (size_t index = 0; index < parameterCount; ++index)
+        if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &parameters[index]) != VERNON_STATUS_OK)
+            return VERNON_STATUS_INVALID_ARGUMENT;
+    bindings.reserve(parameterCount);
+    const uint32_t gridAxes[3]{grid.x, grid.y, grid.z};
+    for (const VernonProgramParameterView &parameter : parameters) {
+        if (std::any_of(bindings.begin(), bindings.end(),
+                        [&](const VernonProgramArgument &argument) { return argument.slot == parameter.slot; }))
+            continue;
+        std::optional<size_t> gridAxis;
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const std::string name = "__grid_" + std::string(1, "xyz"[axis]);
+            if (parameter.name.size == name.size() && std::memcmp(parameter.name.data, name.data(), name.size()) == 0) {
+                gridAxis = axis;
+                break;
+            }
+        }
+        if (gridAxis) {
+            VernonProgramArgument control{};
+            control.slot = parameter.slot;
+            control.kind = VERNON_PROGRAM_TENSOR;
+            control.tensor.struct_size = sizeof(VernonTensorView);
+            control.tensor.storage = VERNON_TENSOR_HOST;
+            control.tensor.host_data = &gridAxes[*gridAxis];
+            control.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_U32);
+            control.tensor.access = VERNON_ACCESS_READ;
+            control.tensor.byte_size = sizeof(uint32_t);
+            bindings.push_back(control);
+            continue;
+        }
+        const auto source = std::find_if(bindings.begin(), bindings.end(), [&](const VernonProgramArgument &argument) {
+            const auto sourceParameter =
+                std::find_if(parameters.begin(), parameters.end(), [&](const VernonProgramParameterView &candidate) {
+                    return candidate.slot == argument.slot;
+                });
+            return sourceParameter != parameters.end() && sourceParameter->name.size == parameter.name.size &&
+                   std::memcmp(sourceParameter->name.data, parameter.name.data, parameter.name.size) == 0;
+        });
+        if (source != bindings.end()) {
+            VernonProgramArgument alias = *source;
+            alias.slot = parameter.slot;
+            bindings.push_back(alias);
+        }
+    }
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
+    if (!instance)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    if (!invocation) {
+        vernonRuntimeProgramInstanceDestroy(instance);
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    }
+    VernonStatus status = VERNON_STATUS_OK;
+    for (size_t index = 0; index < bindings.size() && status == VERNON_STATUS_OK; ++index) {
+        const std::string token = "argument-" + std::to_string(index);
+        const VernonProgramBindingToken bindingToken{sizeof(VernonProgramBindingToken), token.data(), token.size()};
+        status = vernonRuntimeProgramInvocationBind(invocation, &bindingToken, &bindings[index], nullptr, 0, 0);
+    }
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeProgramInvocationForward(invocation, pullback);
+    else
+        vernonRuntimeProgramInvocationRollback(invocation);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    return status;
+}
+
+inline VernonStatus completeCanonicalAutodiffInvocation(VernonProgramExecutable *pipeline, VernonLaunchSize grid,
+                                                        const VernonAdValueSet &inputs, const VernonAdValueSet &outputs,
+                                                        VernonPullback **pullback) {
+    const size_t valueCount = inputs.value_count + outputs.value_count;
+    std::vector<VernonProgramArgument> arguments;
+    std::vector<std::vector<int64_t>> strides;
+    arguments.reserve(valueCount);
+    strides.reserve(valueCount);
+
+    auto appendValues = [&](const VernonAdValueSet &values) -> VernonStatus {
+        for (size_t index = 0; index < values.value_count; ++index) {
+            const VernonAdValue &value = values.values[index];
+            VernonProgramParameterView parameter{};
+            if (vernonRuntimeProgramExecutableFindParameter(pipeline, value.path, &parameter) != VERNON_STATUS_OK ||
+                parameter.kind != VERNON_PROGRAM_TENSOR)
+                return VERNON_STATUS_INVALID_ARGUMENT;
+
+            strides.emplace_back(value.rank);
+            int64_t stride = static_cast<int64_t>(vernonRuntimeGetScalarValueLayout(value.dtype).byte_size);
+            for (size_t axis = value.rank; axis-- > 0;) {
+                strides.back()[axis] = stride;
+                stride *= static_cast<int64_t>(value.shape[axis]);
+            }
+
+            VernonProgramArgument argument{};
+            argument.slot = parameter.slot;
+            argument.kind = VERNON_PROGRAM_TENSOR;
+            argument.tensor.struct_size = sizeof(VernonTensorView);
+            argument.tensor.storage = VERNON_TENSOR_HOST;
+            argument.tensor.host_data = value.data;
+            argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(value.dtype);
+            argument.tensor.access = parameter.access;
+            argument.tensor.rank = value.rank;
+            argument.tensor.shape = value.shape;
+            argument.tensor.byte_strides = strides.back().empty() ? nullptr : strides.back().data();
+            argument.tensor.byte_size = value.size;
+            arguments.push_back(argument);
+        }
+        return VERNON_STATUS_OK;
+    };
+
+    VernonStatus status = appendValues(inputs);
+    if (status == VERNON_STATUS_OK)
+        status = appendValues(outputs);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    return completeCanonicalComputeInvocation(pipeline, arguments.data(), arguments.size(), grid, pullback);
+}
 
 inline VernonStatus completeSubmission(VernonProgramExecutable *pipeline,
                                        const VernonProgramSubmitDescriptor *invocation) {

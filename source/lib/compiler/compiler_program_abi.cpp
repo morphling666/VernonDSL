@@ -17,8 +17,7 @@ bool buildCanonicalProgramAbi(const llvm::json::Object &signature, const llvm::j
     if (!planProgramBoundaries(signature, values, storages, graphs, boundaries, error))
         return false;
 
-    const ProgramPublicationPlan publication = planProgramPublications(boundaries);
-    llvm::json::Array boundarySlots = serializeProgramBoundarySlots(boundaries, publication);
+    llvm::json::Array boundarySlots = serializeProgramBoundarySlots(boundaries);
     std::vector<ProgramBoundaryIdentity> slots;
     slots.reserve(boundaries.slots.size());
     for (const ProgramBoundarySlotPlan &slot : boundaries.slots)

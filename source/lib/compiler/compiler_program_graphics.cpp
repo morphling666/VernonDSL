@@ -58,8 +58,7 @@ std::string programGraphicsVertexFormat(llvm::StringRef dtype, int64_t component
 } // namespace
 
 bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflection, const llvm::json::Array &rawValues,
-                                      const llvm::json::Array &storages,
-                                      const std::map<std::string, int64_t> &boundValues,
+                                      const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                       std::map<int64_t, ProgramLogicalResource> &resources,
                                       ProgramGraphicsInterfacePlan &plan, std::string &error) {
     const llvm::json::Array *entries = compiledReflection.getArray("entries");
@@ -143,7 +142,8 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         {"builtin", "resolution"},
                         {"abi", llvm::json::Object{{"bindings", std::move(abiBindings)}}},
                     });
-                    plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(*row, role, endpointIndex));
+                    plan.implementationEndpoints.emplace_back(
+                        compiledProgramEndpointAbi(*row, role, "system_value", endpointIndex));
                     continue;
                 }
                 if (builtin || implicit) {
@@ -155,6 +155,12 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         {"semantic", builtin ? builtin->str() : implicit->str()},
                         {"abi", llvm::json::Object{{"bindings", llvm::json::Array()}}},
                     });
+                    /* An implicit sampler carries no portable ABI binding, because a caller never supplies one.
+                     * The target still has to bind it, so it needs the compiled row's descriptor set, binding, and
+                     * the sampled images it pairs with. */
+                    if (implicit == "sampler")
+                        plan.implementationEndpoints.emplace_back(
+                            compiledProgramEndpointAbi(*row, role, interfaceKind, endpointIndex));
                     continue;
                 }
                 const std::optional<llvm::StringRef> source = row->getString("vernon.source_name");
@@ -164,7 +170,11 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                     return false;
                 }
                 coveredBindings.insert(source->str());
-                const int64_t valueId = logicalBinding->second;
+                if (logicalBinding->second.size() != 1) {
+                    error = "graphics physical endpoints require exactly one canonical projection";
+                    return false;
+                }
+                const int64_t valueId = logicalBinding->second.front().value;
                 const llvm::json::Object *logicalValue = findJsonObjectByIntegerId(rawValues, valueId);
                 if (!logicalValue) {
                     error = "compiled graphics endpoint references an unknown logical value";
@@ -278,7 +288,8 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                                                                           {"index", endpointIndex},
                                                                           {"tag", "resource"},
                                                                           {"access", *accessIndex}});
-                    plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(*row, role, endpointIndex));
+                    plan.implementationEndpoints.emplace_back(
+                        compiledProgramEndpointAbi(*row, role, interfaceKind, endpointIndex));
                     if (vertexAttribute) {
                         if (!plan.vertexCountValue)
                             plan.vertexCountValue = valueId;
@@ -320,12 +331,18 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
                         {"access", "read"},
                         {"abi", llvm::json::Object{{"bindings", std::move(abiBindings)}}},
                     });
+                    llvm::json::Array projections;
+                    projections.emplace_back(
+                        llvm::json::Object{{"value", valueId},
+                                           {"physical_leaf", int64_t{0}},
+                                           {"direction", interfaceKind == "result" ? "result" : "input"}});
                     plan.endpointBindings.emplace_back(llvm::json::Object{{"module", role.str()},
                                                                           {"interface", interfaceKind.str()},
                                                                           {"index", endpointIndex},
                                                                           {"tag", "value"},
-                                                                          {"value", valueId}});
-                    plan.implementationEndpoints.emplace_back(compiledProgramEndpointAbi(*row, role, endpointIndex));
+                                                                          {"projections", std::move(projections)}});
+                    plan.implementationEndpoints.emplace_back(
+                        compiledProgramEndpointAbi(*row, role, interfaceKind, endpointIndex));
                 }
             }
             return true;
@@ -341,8 +358,7 @@ bool buildCanonicalGraphicsInterfaces(const llvm::json::Object &compiledReflecti
 }
 
 bool buildCanonicalGraphicsOperation(const llvm::json::Object &node, const llvm::json::Array &rawValues,
-                                     const llvm::json::Array &storages,
-                                     const std::map<std::string, int64_t> &boundValues,
+                                     const llvm::json::Array &storages, const ProgramNodeBindingIndex &boundValues,
                                      std::map<int64_t, ProgramLogicalResource> &resources,
                                      const llvm::json::Array &fragmentOutputs, std::optional<int64_t> vertexCountValue,
                                      std::map<int64_t, int64_t> &accessByValue, llvm::json::Array &accesses,

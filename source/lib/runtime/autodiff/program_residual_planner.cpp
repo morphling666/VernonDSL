@@ -47,7 +47,7 @@ std::string passName(const program::Node &node) {
 
 std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const program::Graph &forward,
                                                                        const program::Program &execution,
-                                                                       const std::vector<ProgramHostValue> &storage,
+                                                                       const std::vector<LogicalProgramValue> &storage,
                                                                        const ProgramResidualPlan &plan) {
     std::vector<char> retained(execution.values.size());
     for (uint32_t value : plan.retainedValues)
@@ -76,7 +76,7 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
         for (uint32_t value : node.results) {
             if (value >= storage.size())
                 continue;
-            const ProgramHostValue &slot = storage[value];
+            const LogicalProgramValue &slot = storage[value];
             if (slot.tapeBatch) {
                 hasTape = true;
                 estimated += slot.tapeBatch->logicalBytes();
@@ -117,7 +117,7 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
 }
 
 bool planProgramResiduals(const program::Program &execution, const VernonProgramTopology *topology,
-                          const Variant &variant, const std::vector<ProgramHostValue> &materialized,
+                          const Variant &variant, const std::vector<LogicalProgramValue> &materialized,
                           uint64_t memoryBudget, const std::string &policy, bool rematerializeTapes,
                           ProgramResidualPlan &result, std::string &error) {
     const program::Graph *forward = program::findGraph(execution, "forward");
@@ -144,7 +144,8 @@ bool planProgramResiduals(const program::Program &execution, const VernonProgram
                                        const Parameter *parameter) -> std::optional<size_t> {
         if (value < materialized.size() && materialized[value].tapeBatch)
             return std::max<size_t>(materialized[value].tapeBatch->logicalBytes(), 1);
-        if (value < materialized.size() && materialized[value].argument.tensor.byte_size)
+        if (value < materialized.size() && materialized[value].argument.kind == VERNON_PROGRAM_TENSOR &&
+            (materialized[value].argument.tensor.byte_size || materialized[value].concreteShape))
             return materialized[value].argument.tensor.byte_size;
         return program::isTapeValueType(slot.type) ? std::optional<size_t>(1) : programValueByteSize(slot, parameter);
     };
@@ -182,6 +183,13 @@ bool planProgramResiduals(const program::Program &execution, const VernonProgram
     for (uint32_t value : program::residualCaptures(execution))
         if (!producers[value] || *producers[value] >= result.replayEnd)
             result.retainedValues.push_back(value);
+    // Invocation controls are ordinary canonical Values. Retain them through
+    // the same dependency state as data values so pullback replay never needs
+    // a parallel control cache.
+    for (const program::Graph &graph : execution.graphs)
+        for (const program::GraphInput &input : graph.inputs)
+            if (input.kind == program::GraphInputKind::InvocationControl)
+                result.retainedValues.push_back(input.value);
     std::sort(result.retainedValues.begin(), result.retainedValues.end());
     result.retainedValues.erase(std::unique(result.retainedValues.begin(), result.retainedValues.end()),
                                 result.retainedValues.end());
@@ -189,6 +197,12 @@ bool planProgramResiduals(const program::Program &execution, const VernonProgram
     for (uint32_t value : result.retainedValues)
         if (value < execution.values.size() && execution.values[value].storage)
             retainedStorages.insert(*execution.values[value].storage);
+    for (const program::Value &value : execution.values)
+        if (value.storage && retainedStorages.count(*value.storage))
+            result.retainedValues.push_back(value.id);
+    std::sort(result.retainedValues.begin(), result.retainedValues.end());
+    result.retainedValues.erase(std::unique(result.retainedValues.begin(), result.retainedValues.end()),
+                                result.retainedValues.end());
     uint64_t logicalResidualBytes = 0;
     for (uint32_t value : program::residualCaptures(execution)) {
         if (!producers[value])

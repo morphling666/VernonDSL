@@ -1,1 +1,1 @@
-"""Shader declaration, descriptor, cooking, and artifact I/O phases."""
+"""Program Asset declaration, capture, cooking, and artifact I/O phases."""

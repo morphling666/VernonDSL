@@ -9,12 +9,12 @@ version axes:
   compatibility.
 - `COMPILER_CONTRACT_VERSION` covers Python semantics, MLIR module attributes,
   canonical Value layout, stage topology, and compiler reflection.
-- `PIPELINE_VERSION` covers pipeline manifests and invocation, CPU/GPU
+- `PROGRAM_VERSION` covers Program manifests and invocation, CPU/GPU
   artifacts, graphics draw data, device providers, and the RHI API.
 
 Generated Python, C/C++, and CMake constants are consumed directly. Caches use
-the compiler-contract and pipeline versions instead of private cache epochs.
-Changing `PIPELINE_VERSION` requires rebuilding every Runtime, Provider, and RHI
+the compiler-contract and Program versions instead of private cache epochs.
+Changing `PROGRAM_VERSION` requires rebuilding every Runtime, Provider, and RHI
 component; third-party precompiled Provider/RHI plugins are not supported.
 
 ## Compute kernel compile vs bind
@@ -330,8 +330,10 @@ can use the same mechanism without changing `ProgramAsset` syntax or Program
 structure. Unknown stages, duplicate singleton stages, invalid ordering, and
 incompatible stage families are program-validation errors. Stage topology is
 part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
-additions use the Program portable `stages` contract map and variant
-`stage_bindings`; incompatible changes bump the compiler contract.
+additions use the Program portable `stages` contract map; each variant stores
+the implementing target artifact directly at
+`artifact_system.artifacts[stage]`. Incompatible changes bump the compiler
+contract.
 
 `variants=` explicitly enumerates every accepted canonical feature
 combination, preventing implicit powerset growth. It contains at least one
@@ -476,7 +478,7 @@ target-native inline uniforms. Elementwise operations on native matrices lower
 per column vector and reconstruct the matrix; they are distinct from `matmul`.
 
 Compiler reflection is the only source of descriptor `(set, binding)` records.
-Cooking never invents missing bindings. Current `PIPELINE_VERSION` manifests
+Cooking never invents missing bindings. Current `PROGRAM_VERSION` manifests
 retain sampler-to-texture provenance, and Runtime validates duplicate descriptors, stage
 visibility, and sampler resolution before preparing provider state. OpenGL
 accepts descriptor set zero and rejects other sets before provider mutation;
@@ -718,8 +720,9 @@ content-addressed external StageArtifacts, exactly one per selected stage ID;
 nodes may share a stage ID, and a graphics StageArtifact contains both shader
 modules. The Program directly contains
 `stages`, `parameters`, `storages`, `values`, `graphs`, and `abi`.
-`stages` identify portable StageContracts; variant `stage_bindings` select
-target StageArtifacts without creating a second name-binding authority. The
+`stages` identify portable StageContracts; each variant stores its target
+StageArtifact directly at `artifact_system.artifacts[stage]`, without a second
+name-binding authority. The
 command compiles in process through
 `vernon_dsl._native`; there is no compiler-executable argument, compatibility
 manifest, legacy profile input, or direct topology. For runtime-backed targets,

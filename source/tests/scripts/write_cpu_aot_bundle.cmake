@@ -29,7 +29,7 @@ else()
 endif()
 
 set(PIPELINE_CANONICAL
-    "{\"id\":\"cpu/fill\",\"pipeline_version\":${VERNON_PIPELINE_VERSION},\
+    "{\"id\":\"cpu/fill\",\"program_version\":${VERNON_PROGRAM_VERSION},\
 \"runtime_requirements\":{\"backend\":\"cpu\",\"features\":[\"compute\",\"tensor_views\"],\
 \"object_format\":\"${OBJECT_FORMAT}\",\"target_triple\":\"${TARGET_TRIPLE}\"},\
 \"stage_artifacts\":{\"fill\":{\"artifact\":{\"format\":\"native_library\",\"path\":\"${ARTIFACT_NAME}\",\
@@ -52,7 +52,7 @@ set(PIPELINE_CANONICAL
 \"name\":\"fill\",\"physical_layouts\":{\"host_value\":{\"packed_arguments_size\":20,\
 \"profile\":\"host_value\"}},\"workgroup_size\":[2,2,1]}],\
 \"implementation\":{\"metadata\":{},\"target\":\"cpu\"},\
-\"pipeline_version\":${VERNON_PIPELINE_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\"}},\
+\"program_version\":${VERNON_PROGRAM_VERSION}},\"stage\":\"compute\",\"symbol\":\"vernon_test_fill\"}},\
 \"target\":{\"kind\":\"cpu\",\"options\":{\"triple\":\"${TARGET_TRIPLE}\"}},\"type\":\"pipeline\",\
 \"variants\":[{\"key\":[],\"outputs\":[{\"access\":\"write\",\"dtype\":\"f32\",\
 \"kind\":\"tensor\",\"location\":0,\"name\":\"result\",\"shape\":[16]}],\

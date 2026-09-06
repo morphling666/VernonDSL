@@ -30,6 +30,10 @@ def mesh_fragment(
 
 mesh_asset = vd.program_asset(
     id="shaders/variant_mesh",
-    program=(mesh_vertex, mesh_fragment),
+    program=vd.pipeline(
+        mesh_vertex,
+        mesh_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
 )

@@ -118,7 +118,8 @@ SmallVector<StringRef> languageLeafDtypes(DictionaryAttr attrs, Type valueType =
 
 DictionaryAttr makeInterfaceAttrs(MLIRContext *context, StringRef interfaceName, StringRef sourceName,
                                   ArrayRef<StringRef> dtypes, int64_t location, Type valueType = {},
-                                  StringRef autodiffRole = {}, StringRef autodiffSource = {}) {
+                                  StringRef autodiffRole = {}, StringRef autodiffSource = {},
+                                  bool storageShape = false) {
     NamedAttrList attributes;
     attributes.set("vernon.interface", StringAttr::get(context, interfaceName));
     attributes.set("vernon.source_name", StringAttr::get(context, sourceName));
@@ -135,6 +136,8 @@ DictionaryAttr makeInterfaceAttrs(MLIRContext *context, StringRef interfaceName,
         attributes.set("vernon.autodiff_role", StringAttr::get(context, autodiffRole));
     if (!autodiffSource.empty())
         attributes.set("vernon.autodiff_source", StringAttr::get(context, autodiffSource));
+    if (storageShape)
+        attributes.set("vernon.program_storage_shape", UnitAttr::get(context));
     return attributes.getDictionary(context);
 }
 
@@ -1965,7 +1968,7 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
             context, "input", ("shape." + sourceName.getValue()).str(),
             languageLeafDtypes(primal.getArgAttrDict(cast<BlockArgument>(identity.binding).getArgNumber()),
                                identity.binding.getType()),
-            shapeBase + shapeSourceIndex, identity.binding.getType(), "retained_primal", sourceName.getValue()));
+            shapeBase + shapeSourceIndex, identity.binding.getType(), "retained_primal", sourceName.getValue(), true));
         ++shapeSourceIndex;
     }
     const unsigned cotangentBase = shapeBase + profileTypes.shapeSources.size();
@@ -2004,8 +2007,8 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
         }
     }
     if (profileTypes.result) {
-        NamedAttrList gradientResultAttrs(
-            makeInterfaceAttrs(context, "output", "gradients", profileTypes.valueGradientDtypes, 0));
+        NamedAttrList gradientResultAttrs(makeInterfaceAttrs(context, "output", "gradients",
+                                                             profileTypes.valueGradientDtypes, 0, Type{}, "gradient"));
         SmallVector<Attribute> gradientPaths;
         for (const AutodiffLeaf &leaf : analysis.getWrtLeaves())
             if (!isa<TensorViewType>(leaf.value.getType()))

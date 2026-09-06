@@ -34,7 +34,7 @@ Do not reopen those adapters to fix AD.
   separate follow-up.
 - Keep `program_execution_manifest.md` portable. Native bindings and physical
   layouts must not enter Program, StageContract, or endpoint ABI.
-- Do not update `COMPILER_CONTRACT_VERSION` or `PIPELINE_VERSION` before the
+- Do not update `COMPILER_CONTRACT_VERSION` or `PROGRAM_VERSION` before the
   coordinated release.
 - Legacy cooked loading may remain isolated until release, but canonical
   cooking, examples, and new tests must not call it.

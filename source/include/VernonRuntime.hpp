@@ -355,7 +355,7 @@ public:
         }
         VernonProgramSubmitDescriptor result{};
         result.struct_size = sizeof(VernonProgramSubmitDescriptor);
-        result.abi_version = VERNON_PIPELINE_VERSION;
+        result.abi_version = VERNON_PROGRAM_VERSION;
         result.arguments = arguments_.empty() ? nullptr : arguments_.data();
         result.argument_count = arguments_.size();
         result.compute_grid = {1, 1, 1};
@@ -572,10 +572,13 @@ public:
     static ProgramExecutable load(VernonRuntimeContext *context, const void *bundle, size_t bundleSize,
                                   VernonFeatureSetView features = {nullptr, 0},
                                   const VernonProgramBundleLoadOptions *options = nullptr) {
-        VernonProgramExecutable *handle =
-            vernonRuntimeLoadManagedProgramBundleWithOptions(context, bundle, bundleSize, features, options);
-        if (!handle)
+        VernonProgramBundle *loaded = vernonRuntimeLoadProgramBundleWithOptions(context, bundle, bundleSize, options);
+        if (!loaded)
             throw std::runtime_error("failed to load Program bundle");
+        VernonProgramExecutable *handle = vernonRuntimeResolveProgram(loaded, features);
+        vernonRuntimeProgramBundleDestroy(loaded);
+        if (!handle)
+            throw std::runtime_error("failed to resolve Program variant");
         return ProgramExecutable(handle);
     }
 

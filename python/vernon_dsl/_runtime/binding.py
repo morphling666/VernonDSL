@@ -175,27 +175,68 @@ class _PersistentBindingTable:
             leaves = tuple(parameter.element_leaves)
             dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][2] == 0 else None
             if dtype is None:
-                raise TypeError(f"aggregate parameter {parameter.name!r} requires canonical TensorStorage")
-            source = np.asarray(value, dtype=dtype)
-            whole_value = not parameter.shape and leaves[0][1] > 1
-            if whole_value:
-                packed = np.ascontiguousarray(source)
-                if packed.size != leaves[0][1] or packed.nbytes != parameter.element_byte_size:
-                    raise ValueError(
-                        f"parameter {parameter.name!r} expects {leaves[0][1]} scalar values, got {packed.size}"
-                    )
+                packed_bytes = np.zeros(parameter.element_byte_size, dtype=np.uint8)
+                paths = tuple(parameter.element_leaf_paths)
+                if len(paths) != len(leaves):
+                    raise RuntimeError(f"aggregate parameter {parameter.name!r} has an incomplete canonical ABI")
+                for leaf, path in zip(leaves, paths, strict=True):
+                    leaf_value = value
+                    for component in path:
+                        if isinstance(component, str):
+                            if not isinstance(leaf_value, dict) or component not in leaf_value:
+                                raise ValueError(f"parameter {parameter.name!r} missing field {component!r}")
+                            leaf_value = leaf_value[component]
+                        else:
+                            try:
+                                leaf_value = leaf_value[component]
+                            except (IndexError, KeyError, TypeError) as error:
+                                raise ValueError(f"parameter {parameter.name!r} missing index {component}") from error
+                    leaf_dtype = numpy_dtypes.get(leaf[0])
+                    if leaf_dtype is None:
+                        raise TypeError(f"aggregate parameter {parameter.name!r} has an unsupported leaf dtype")
+                    leaf_array = np.ascontiguousarray(np.asarray(leaf_value, dtype=leaf_dtype)).reshape(-1)
+                    if leaf_array.size != leaf[1]:
+                        raise ValueError(
+                            f"parameter {parameter.name!r} leaf expects {leaf[1]} scalar values, got {leaf_array.size}"
+                        )
+                    encoded = leaf_array.view(np.uint8)
+                    begin = leaf[2]
+                    end = begin + encoded.size
+                    if end > packed_bytes.size:
+                        raise RuntimeError(f"aggregate parameter {parameter.name!r} exceeds its canonical ABI")
+                    packed_bytes[begin:end] = encoded
                 host_array = np.empty(
                     (),
                     dtype=np.dtype([("_bytes", np.uint8, (parameter.element_byte_size,))]),
                 )
-                host_array["_bytes"] = packed.view(np.uint8).reshape(-1)
+                host_array["_bytes"] = packed_bytes
             else:
-                host_array = source
-            if not whole_value and tuple(host_array.shape) != tuple(parameter.shape):
-                raise ValueError(
-                    f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
-                    f"got {tuple(host_array.shape)}"
-                )
+                source = np.asarray(value, dtype=dtype)
+                whole_value = not parameter.shape and leaves[0][1] > 1
+                if whole_value:
+                    packed = np.ascontiguousarray(source)
+                    expected_shape = tuple(parameter.element_leaf_shapes[0])
+                    if expected_shape and tuple(packed.shape) != expected_shape:
+                        raise ValueError(
+                            f"parameter {parameter.name!r} shape {list(packed.shape)} "
+                            f"does not match reflection {list(expected_shape)}"
+                        )
+                    if packed.size != leaves[0][1] or packed.nbytes != parameter.element_byte_size:
+                        raise ValueError(
+                            f"parameter {parameter.name!r} expects {leaves[0][1]} scalar values, got {packed.size}"
+                        )
+                    host_array = np.empty(
+                        (),
+                        dtype=np.dtype([("_bytes", np.uint8, (parameter.element_byte_size,))]),
+                    )
+                    host_array["_bytes"] = packed.view(np.uint8).reshape(-1)
+                else:
+                    host_array = source
+                if not whole_value and tuple(host_array.shape) != tuple(parameter.shape):
+                    raise ValueError(
+                        f"parameter {parameter.name!r} expects shape {tuple(parameter.shape)}, "
+                        f"got {tuple(host_array.shape)}"
+                    )
         token = execution_token or (
             "host-value",
             host_array.dtype.str,

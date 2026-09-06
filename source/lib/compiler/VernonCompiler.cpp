@@ -337,6 +337,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
             for (llvm::json::Value &bindingValue : *bindings) {
                 llvm::json::Object *binding = bindingValue.getAsObject();
                 std::optional<llvm::StringRef> parameter = binding ? binding->getString("parameter") : std::nullopt;
+                std::optional<llvm::StringRef> endpoint = binding ? binding->getString("endpoint") : std::nullopt;
                 std::optional<int64_t> valueId = binding ? binding->getInteger("value") : std::nullopt;
                 llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
                 const std::optional<llvm::StringRef> role =
@@ -346,7 +347,9 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                 const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
                 if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
                     continue;
-                auto parameterIt = parameter ? interface.find(parameter->str()) : interface.end();
+                auto parameterIt = endpoint    ? interface.find(endpoint->str())
+                                   : parameter ? interface.find(parameter->str())
+                                               : interface.end();
                 if (!parameter || !valueId || parameterIt == interface.end() || !value) {
                     result->status = VERNON_STATUS_VERIFICATION_ERROR;
                     result->diagnostics =
@@ -354,8 +357,88 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                     return result.release();
                 }
                 llvm::json::Object *parameterRow = parameterIt->second;
+                const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
+                const std::optional<int64_t> logicalLeaf = binding->getInteger("leaf");
+                const std::optional<int64_t> physicalLeaf = binding->getInteger("physical_leaf");
+                if (physicalLeaf) {
+                    llvm::json::Object *logicalLayout = value->getObject("value_layout");
+                    llvm::json::Array *logicalLeaves = logicalLayout ? logicalLayout->getArray("leaves") : nullptr;
+                    llvm::json::Object *physicalLayout = parameterRow->getObject("value_layout");
+                    llvm::json::Array *physicalLeaves = physicalLayout ? physicalLayout->getArray("leaves") : nullptr;
+                    std::optional<size_t> logicalLeafIndex;
+                    if (logicalLeaf && *logicalLeaf >= 0)
+                        logicalLeafIndex = static_cast<size_t>(*logicalLeaf);
+                    else if (logicalLeaves && logicalLeaves->size() == 1)
+                        logicalLeafIndex = 0;
+                    llvm::json::Object *logical =
+                        logicalLeaves && logicalLeafIndex && *logicalLeafIndex < logicalLeaves->size()
+                            ? (*logicalLeaves)[*logicalLeafIndex].getAsObject()
+                            : nullptr;
+                    llvm::json::Object *physical =
+                        physicalLeaves && *physicalLeaf >= 0 &&
+                                static_cast<size_t>(*physicalLeaf) < physicalLeaves->size()
+                            ? (*physicalLeaves)[static_cast<size_t>(*physicalLeaf)].getAsObject()
+                            : nullptr;
+                    llvm::json::Array logicalShape;
+                    if (llvm::json::Array *ownerShape = value->getArray("shape"))
+                        for (const llvm::json::Value &extent : *ownerShape)
+                            logicalShape.emplace_back(extent);
+                    const size_t logicalOwnerRank = logicalShape.size();
+                    llvm::json::Array physicalShape;
+                    llvm::json::Array *physicalOwnerShape = parameterRow->getArray("shape");
+                    if (!physicalOwnerShape)
+                        physicalOwnerShape = parameterRow->getArray("source_shape");
+                    if (physicalOwnerShape)
+                        for (const llvm::json::Value &extent : *physicalOwnerShape)
+                            physicalShape.emplace_back(extent);
+                    if (llvm::json::Array *leafShape = physical ? physical->getArray("shape") : nullptr)
+                        for (const llvm::json::Value &extent : *leafShape)
+                            physicalShape.emplace_back(extent);
+                    if (parameterKind != "tensor" || physicalShape.size() > logicalOwnerRank)
+                        if (llvm::json::Array *leafShape = logical ? logical->getArray("shape") : nullptr)
+                            for (const llvm::json::Value &extent : *leafShape)
+                                logicalShape.emplace_back(extent);
+                    std::optional<llvm::StringRef> physicalDtype =
+                        physical ? physical->getString("dtype") : std::nullopt;
+                    if (!physicalDtype)
+                        if (llvm::json::Array *dtypes = parameterRow->getArray("vernon.abi_leaf_dtypes");
+                            dtypes && *physicalLeaf >= 0 && static_cast<size_t>(*physicalLeaf) < dtypes->size())
+                            physicalDtype = (*dtypes)[static_cast<size_t>(*physicalLeaf)].getAsString();
+                    const bool shapeMatches = vernon::compiler::compatibleProgramBindingShape(
+                        role.value_or(""), parameterRow->getString("vernon.autodiff_carrier").value_or(""),
+                        &logicalShape, &physicalShape);
+                    if (!logical || logical->getString("dtype") != physicalDtype || !shapeMatches) {
+                        const auto shapeText = [](const llvm::json::Array &shape) {
+                            std::string text = "[";
+                            for (const llvm::json::Value &extent : shape) {
+                                if (text.size() > 1)
+                                    text += ",";
+                                text += std::to_string(extent.getAsInteger().value_or(0));
+                            }
+                            return text + "]";
+                        };
+                        result->status = VERNON_STATUS_VERIFICATION_ERROR;
+                        result->diagnostics =
+                            "compiled kernel physical leaf does not match Program projection for request '" +
+                            requestId + "', value " + std::to_string(*valueId) + ", logical leaf " +
+                            (logicalLeafIndex ? std::to_string(*logicalLeafIndex) : "<whole>") + ", physical leaf " +
+                            std::to_string(*physicalLeaf) + " (logical dtype " +
+                            (logical ? logical->getString("dtype").value_or("<missing>").str() : "<missing>") +
+                            ", physical dtype " + (physicalDtype ? physicalDtype->str() : "<missing>") +
+                            ", logical rank " + std::to_string(logicalShape.size()) + ", physical rank " +
+                            std::to_string(physicalShape.size()) + ", logical shape " + shapeText(logicalShape) +
+                            ", physical shape " + shapeText(physicalShape) + ")";
+                        return result.release();
+                    }
+                    continue;
+                }
                 std::optional<llvm::StringRef> expectedDtype = value->getString("dtype");
                 llvm::json::Array *expectedShape = value->getArray("shape");
+                if (!expectedDtype || expectedDtype->empty())
+                    if (llvm::json::Object *layout = value->getObject("value_layout"))
+                        if (llvm::json::Array *leaves = layout->getArray("leaves"); leaves && leaves->size() == 1)
+                            if (llvm::json::Object *leaf = (*leaves)[0].getAsObject())
+                                expectedDtype = leaf->getString("dtype");
                 llvm::json::Array aggregateExpectedShape;
                 if (expectedStage == "compute" && (!expectedShape || expectedShape->empty()) &&
                     !value->getInteger("storage"))
@@ -418,7 +501,6 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                         actualShape = &derivativeActualShape;
                     }
                 }
-                const llvm::StringRef parameterKind = parameterRow->getString("kind").value_or("");
                 llvm::json::Object *expectedLayout = value->getObject("value_layout");
                 const vernon::compiler::ProgramEndpointExpectation expectation{
                     expectedDtype,

@@ -2,12 +2,13 @@
 
 ## 1. Status
 
-This document is an implementation plan for the next coordinated compiler/runtime release. It is not the current
-contract.
+This document defines the target architecture for the coordinated Program Asset release. The source tree is currently
+mid-migration: the Program names and part of the canonical execution path exist, but legacy stage deployment, schema
+dispatch, direct submit/autodiff entry points, and sentinel controls have not all been removed. The implementation is
+not release-complete until §13 passes.
 
-The tree today ships the coherent pre-migration `Pipeline Asset` / `VernonPipelineBundle` / `VernonLoadedPipeline`
-contracts. Every phase below is pending. Land them atomically, without compatibility aliases, dual schemas, or
-partially renamed APIs.
+Contract changes land atomically at the release boundary, without compatibility aliases, dual schemas, or partially
+renamed APIs. Intermediate working-tree state is not a supported contract and must never be described as one.
 
 Normative documents this plan depends on and must not contradict:
 
@@ -41,15 +42,17 @@ so fix the vocabulary first.
 | **Program Asset** | A Program in cookable (declared) or deployed (cooked) form. |
 | **Pipeline** | Two narrow, non-asset uses only: the live `vd.pipeline(...)` graphics authoring object, and an internal native compute/graphics stage pipeline owned by the Program executor. |
 | **Variant** | One feature-key specialization of a Program Asset. |
-| **Stage** | One logical node of a Program that owns a compiled implementation. |
+| **Node** | One invocation in a Program graph. It owns Program Value operands/results, resource accesses, controls, and endpoint projections. |
+| **Stage** | A reusable portable implementation contract referenced by one or more Nodes. It owns no invocation-specific Value binding. |
 | **Artifact** | One target-native compiled blob plus its entry point. |
+| **Resolved Execution Plan** | The immutable per-variant physical plan: node implementations, carriers, transfers, residency, hazards, and publication transactions. |
 
 `Pipeline` is never again an asset type, a bundle type, a manifest `type` value, a cooked file suffix, or a public
 load/invoke type.
 
 ## 4. Layered architecture
 
-Seven layers, strictly one-way dependencies. A layer may depend only on layers above it in this list. No layer may
+Eight layers, strictly one-way dependencies. A layer may depend only on layers above it in this list. No layer may
 import a private symbol from a lower layer, and no layer may re-derive a decision an upper layer already made.
 
 ```
@@ -64,9 +67,11 @@ L3  Compile          implementation requests -> CompiledStage
 L4  Deployment       CapturedProgram + CompiledStage -> ProgramManifest + blobs
                      -> .program.json
 --------------------------------------------- process boundary
-L5  Load             .program.json -> VernonProgramBundle -> VernonProgramExecutable
-                     -> immutable deployment description
-L6  Execute          VernonProgramInstance -> VernonProgramInvocation
+L5  Load             .program.json -> VernonProgramBundle
+                     -> immutable authenticated deployment description
+L6  Resolve          bundle + feature key -> VernonProgramExecutable
+                     -> immutable ResolvedExecutionPlan + backend stage pipelines
+L7  Execute          VernonProgramInstance -> VernonProgramInvocation
                      -> concrete bindings, forward, pullback
 ```
 
@@ -105,19 +110,10 @@ the same type for all five branches. Downstream layers cannot tell which branch 
 Kind discrimination therefore happens exactly once, at exactly one place, on real objects. Nothing downstream carries
 a kind tag, a nullable "canonical" field, or a schema selector.
 
-**Convergence is staged, and the staging is a scheduling fact rather than a licence to keep two models.** Four
-branches — Kernel, `vd.pipeline(...)`, Module, Module VJP — reach the canonical Program parser as soon as capture is
-unified. Kernel VJP cannot, because its structured-VJP generator and the `autodiff.profiles` deployment table it
-feeds are only deleted in Phase 3 (§7), and they currently back twelve cooked autodiff fixtures with numerical
-parity coverage. Until that deletion, Kernel VJP is the one branch whose capture result carries a stage plan instead
-of Program IR.
-
-Two constraints keep that from decaying into a permanent second model:
-
-- the discriminant is consumed **only** inside the L3 cook orchestrator. Deployment, load, and execution never
-  observe it, so §5's one-schema guarantee is not weakened while the branch exists;
-- Phase 3 deletes the branch rather than generalizing it. If Phase 3 ends with the discriminant still present, the
-  migration has failed its own goal, and no later phase may add a sixth branch to it.
+All five branches produce the same non-null `CapturedProgram`. Kernel structured VJP is an implementation provider
+used while compiling differentiated compute requests; it is not a sixth capture result, a stage plan alternative, or
+a deployment ABI. `CapturedProgram`, variant deployment types, and `VernonProgramBundle` contain no nullable
+"canonical" member and no legacy alternative.
 
 **Static AST parsing is not a kind oracle.** The current tree guesses a `program_kind` of `"stages"` or `"module"`
 from the AST shape of the `program=` argument, then the Module branch executes the source anyway. The "parse without
@@ -148,11 +144,8 @@ Enforce capability limits during capture, before any provider lowering, with one
   "graphics Modules are rejected" rule; that capability already exists and is covered by
   `test_module_graphics_controls.py`.
 - Reject graphics VJP in every form: a Module VJP whose capture contains a graphics call, and a graphics
-  Program carrying a transform. Today this is enforced twice and inconsistently — `program.py` rejects
-  graphics Module autodiff, while the asset path rejects graphics stage transforms only at cook time, after
-  `parsing.py` has already applied a *different* rule ("graphics VJP requires a named custom rule set") that
-  no input can ever satisfy. Collapse this to one rejection at capture and delete the unreachable rule-set
-  branch.
+  Program carrying a transform. Both are rejected by `capture_program`; the public API has no graphics
+  custom-rule-set branch.
 - Reject unsupported autodiff resources.
 
 These are declared capability rules evaluated at one layer, not ad-hoc `isinstance` guards scattered across
@@ -170,6 +163,24 @@ build_program_manifest(captured, compiled_stages, target) -> ProgramManifest
 It owns the whole envelope for every variant. It does not sniff its input to choose a schema, does not accept a
 nullable Program, and does not import anything from the cook orchestrator.
 
+### L6 Resolve — one physical planning authority
+
+Resolve selects a variant and constructs one immutable `ResolvedExecutionPlan`. This is the only layer that projects
+logical Program semantics onto physical backend execution. Its plan contains:
+
+- one record per `(graph, node)`, never one mutable binding record per Stage;
+- the selected StageArtifact and backend pipeline for each Node;
+- exact logical-value/leaf to physical-endpoint projections;
+- required host/device residency and explicit upload, readback, and device-copy edges;
+- resource alias domains, derived RAW/WAR/WAW dependencies, and backend barriers;
+- graphics scope planning and render-pass compatibility;
+- tape, residual, replay, and checkpoint storage requirements;
+- publication transactions and their commit mode.
+
+Stage contracts and backend pipelines may be shared by several Nodes; Node projections may not. L7 executes this
+plan and must not inspect target carriers to rediscover residency, scan Storage aliases to rebuild transfer policy, or
+choose publication behavior from the concrete resource kind.
+
 The current `bundle/serialize.py` does the opposite on all three counts: it picks between two schemas by duck-typing
 `variant.canonical_program`, and reaches upward with a function-local
 `from .._shader_assets.cooking import _canonical_deployment` to dodge a circular import. Deleting that import is a
@@ -182,15 +193,20 @@ One schema, all variants, all program forms. Top-level envelope:
 
 ```json
 {
-  "program_version": 18,
+  "compiler_contract_version": 14,
+  "program_version": 19,
   "type": "program",
   "id": "shaders/example",
   "target": { "kind": "vulkan", "options": {} },
+  "blobs": {},
   "variants": [
     {
       "key": ["FEATURE"],
       "program": {},
-      "artifact_system": {}
+      "artifact_system": {
+        "runtime_requirements": {},
+        "artifacts": {}
+      }
     }
   ],
   "content_hash": ""
@@ -198,7 +214,12 @@ One schema, all variants, all program forms. Top-level envelope:
 ```
 
 - `program` is the canonical Program object defined by `specs/program_execution_manifest.md`.
-- `artifact_system` holds `target`, content-addressed `blobs`, and `artifacts` keyed by logical Program stage.
+- `compiler_contract_version` and `program_version` jointly select the compiler/reflection and Program contracts;
+- root `target` is the one target shared by every variant in the bundle;
+- root `blobs` is the content-addressed authenticated byte store shared across variants;
+- variant `artifact_system.runtime_requirements` is the selected variant's aggregate requirement;
+- variant `artifact_system.artifacts` is keyed directly by that variant's logical Program Stage ID. There is no
+  Stage-to-artifact binding table. Identical code ranges are shared through root Blob IDs.
 - `content_hash` is the SHA-256 of the canonical JSON of the document with `content_hash` removed.
 
 `program_version` replaces the `pipeline_version` manifest key. Only the name changes; the **value** is not bumped by
@@ -244,6 +265,10 @@ The rightmost column cites the §9 rule the field violates, so each removal is v
 Keep target-native stage artifacts and `implementation.metadata` behind canonical stage contracts. Backend pipeline
 construction stays private to the Program executor.
 
+The physical transfer schedule is not serialized. The loader authenticates artifacts; L6 derives the
+`ResolvedExecutionPlan` from Program Value/Storage semantics, Node endpoint projections, portable artifact reflection,
+and backend capabilities.
+
 Two nearby cases are **not** deletions, and the rule-4 sweep must not remove them. A graphics `forward` graph's
 `captures` must be empty because captures belong to the backward graph, and a graphics `system` endpoint's
 `abi.bindings` must be empty because a system value has no bindings. Both are semantic rules about a specific variant,
@@ -264,7 +289,7 @@ Four types, four transitions, one direction. No kind flags, no optional "actuall
 | Type | Created by | Mutability | Holds |
 | --- | --- | --- | --- |
 | `VernonProgramBundle` | `vernonRuntimeLoadProgramBundleWithOptions` | **immutable** | parsed manifest for all variants; no backend objects |
-| `VernonProgramExecutable` | select one variant by feature key | **immutable** | that variant's Program plus materialized backend stage pipelines |
+| `VernonProgramExecutable` | select one variant by feature key | **immutable** | that variant's Program, materialized backend stage pipelines, and one `ResolvedExecutionPlan` |
 | `VernonProgramInstance` | `vernonRuntimeProgramInstanceCreate` | mutable | persistent binding state, resource leases, caches, telemetry |
 | `VernonProgramInvocation` | `vernonRuntimeProgramInstanceBeginInvocation` | mutable | one transaction: concrete bindings, grid, render pass, draw, dynamic state |
 
@@ -274,10 +299,15 @@ Public surface, and nothing beyond it:
 - `vernonRuntimeLoadProgramBundleWithOptions`
 - Program boundary reflection (parameters, outputs, image constraints, AD boundaries)
 - `vernonRuntimeProgramInstanceCreate` / `Destroy` / `BeginInvocation` / `GetTelemetry`
-- `vernonRuntimeProgramInvocationBind*` (resources, render pass, draw command, dynamic state, command encoder)
+- `vernonRuntimeProgramInvocationBind*` (Program Values/resources, render pass, draw command, dynamic state)
 - `vernonRuntimeProgramInvocationForward`
 - `vernonRuntimeProgramInvocationRollback` / `Destroy`
 - `vernonProgramPullbackApply*` / `vernonProgramPullbackDestroy`
+
+Runtime owns command recording, submission, synchronization, and readback for this API. An external command encoder is
+not a Program binding and is not part of the Program Asset lifecycle. Embedding a resolved execution plan in a larger
+engine-owned ExecutionGraph is a separate optional facility with its own capability and completion contract; it must
+not add a second Program loader, invocation ABI, or forward path.
 
 ### Deleted from the runtime surface
 
@@ -288,7 +318,7 @@ Public surface, and nothing beyond it:
 | `vernonRuntimeResolvePipeline` | Its job becomes variant selection producing an immutable `VernonProgramExecutable`. It currently mutates the loaded object in place. | 8 |
 | `vernonRuntimeLoadedPipelineIsManagedProgram` | Runtime kind query for a distinction that no longer exists. | 1 |
 | `VernonLoadedPipeline` | Conflates deployment description with resolved executable; signals "is a Program" through an optional `topology` field and "is differentiated" through an optional `differentiated` field. Split into `VernonProgramBundle` and `VernonProgramExecutable`. | 7 |
-| `vernonRuntimePipelineSubmit`, `VernonPipelineInvocation` | Legacy cooked submit path. Command-encoder encoding survives as a binding on `VernonProgramInvocation`. | 9 |
+| `vernonRuntimePipelineSubmit`, `VernonPipelineInvocation` | Legacy cooked submit path. Runtime submission is owned by `VernonProgramInvocation`. | 9 |
 | `vernonAdPipelineForward`, `vernonAdPipelineEncodeForward` | Direct cooked autodiff entry points. See §7. | 9 |
 | `vernonRuntimeProgramForward` (unbound) | Second forward path beside the instance/invocation model. | 9 |
 | Python `CookedVjpPipeline`, `load_cooked_vjp_asset` | Second Python cooked type and loader. | 9 |
@@ -373,6 +403,29 @@ and the expression that derives it. The runtime evaluates that expression agains
 There is no zero sentinel, no parameter scan, and no dependence on parameter order. An unbound grid control is an
 error naming the slot, not a fallback.
 
+The C ABI does not store a separate `compute_grid` in `VernonProgramInvocation`. A convenience wrapper may accept
+three integers only by resolving and binding the Program's three declared grid-control Value slots through the normal
+binding transaction. Zero is an ordinary invalid dispatch extent, never an absence marker.
+
+Attachment dimensions follow the same rule. The manifest contains format/sample compatibility and symbolic extent
+dependencies, not `[0, 0, 1]` or another placeholder. Concrete dimensions come from the currently bound attachment
+view and are validated without mutating the executable.
+
+### Publication and externally visible mutation
+
+Publication semantics are declared by ProgramABI and are independent of whether a concrete binding is host memory or
+an RHI resource:
+
+- `commit_after_success` writes into invocation-owned staging and publishes only after every planned command,
+  validation, tape check, and required synchronization succeeds. Host and device destinations use the same
+  transaction semantics.
+- `in_place` explicitly permits externally visible mutation during execution and therefore does not promise rollback
+  after submission. It is valid only for an ABI boundary documented as an in-place side effect.
+
+Runtime must not silently turn `commit_after_success` into `in_place` because the destination is a borrowed device
+resource. Failure before commit leaves every `commit_after_success` destination unchanged. Pullback application uses
+the same publication contract.
+
 ### Immutability of the deployment description
 
 Loading a Program produces an immutable deployment description. Beginning or executing an invocation creates separate
@@ -412,6 +465,10 @@ A change in this migration is a workaround, and is not acceptable, if it does an
     as such, or it is removed.
 11. **Keeps a compatibility alias, typedef, wrapper, or dual schema.** Rename hard; delete the old name in the same
     change.
+12. **Re-derives a resolved physical decision during execution.** L7 does not rescan target carriers, Storage aliases,
+    or resource kinds to infer residency, transfers, or publication. Those decisions belong to L6.
+13. **Attaches Node-specific state to a reusable Stage.** Endpoint projections, controls, and Value bindings are
+    indexed by graph and Node; only immutable implementation contracts and backend pipelines may be Stage-shared.
 
 The deletion tables in §5 and §6 cite these rule numbers directly. The remaining named workarounds map as follows:
 `program_kind` AST guessing violates rule 1; the `materialize_bundle` schema sniff violates rule 2; the zero
@@ -466,6 +523,15 @@ Deployment-boundary tests proving one cooked Program is invocable without recook
 - multiple attachment extents;
 - multiple dynamic graphics states.
 
+Resolved-plan tests proving:
+
+- one reusable Stage referenced by multiple Nodes receives distinct Node endpoint projections;
+- a device result consumed by a later inline/uniform endpoint is represented by an ordered transfer edge and observes
+  the producer's result;
+- Storage aliases receive one resolve-time residency/transfer plan rather than invocation-time rescanning;
+- `commit_after_success` leaves host and device destinations unchanged under failure injection, while explicitly
+  declared `in_place` effects document their non-rollback behavior.
+
 Also:
 
 - port numerical, tape, and failure-injection autodiff tests to Program APIs;
@@ -474,7 +540,7 @@ Also:
 - a multi-variant cooked Program test, covering the deleted one-variant restriction;
 - source and schema guards preventing reintroduction of the old names, the deleted `type` values, and the deleted
   manifest fields;
-- a layering guard asserting the L0→L6 dependency direction, including that the deployment layer imports nothing from
+- a layering guard asserting the L0→L7 dependency direction, including that the deployment layer imports nothing from
   the cook orchestrator;
 - update every fixture, example, CMake cook rule, installed-wheel check, CLI invocation, public document, and spec;
 - delete obsolete code only after all callers use the canonical path.
@@ -488,94 +554,24 @@ One vestige is worth recording rather than removing blind: `CompiledStage.module
 paths carry provenance that nothing reads back. Phase 3 rewrites the deployment layer and should decide their fate
 there, where the surrounding code is already being changed.
 
-## 12. Implementation phases
+## 12. Migration discipline
 
-Precondition: start from a clean working tree on a dedicated branch. Phase 1 alone rewrites on the order of 150
-files, so it must not share a working tree with any other in-flight change — least of all a release or contract
-version bump, which touches the same generated version files this migration renames.
+The executable checklist lives in `/Users/yuanxinyu/.cursor/plans/统一_program_asset_bdd7bbe3.plan.md`; this normative
+document defines outcomes rather than recording transient attempts.
 
-Each phase must leave the tree internally coherent, buildable, and green. Do not land a public rename before all
-definitions, declarations, bindings, tests, and build rules use the new contract.
+The migration order is architectural:
 
-1. **Rename the asset surface.** Hard-rename Python, CLI, C/C++, files, docs, and the cooked output suffix to Program
-   Asset terminology. No behavior change. Explicitly excludes the `pipeline_version` key and its coupled generated
-   names, which belong to Phase 3; Phase 1 must not touch `versions.toml`, `tools/generate_versions.py`, or the MLIR
-   module attribute.
-2. **One capture front end, including the symbolic graphics boundary.** Route all five authored forms through
-   `capture_program`, dispatching on Python type. Make `vd.pipeline(...)` declarations work. Remove `program_kind`
-   and the `python_pipeline_asset` intermediate dict, and reduce static parsing to a lint that feeds nothing.
-   Tuple **removal** moves to Phase 3 for the reason below; tuple *authoring* keeps working until then.
+1. freeze the corrected manifest, Stage/Node, resolved-plan, invocation, and publication contracts;
+2. introduce non-null typed capture, compile, deployment, and resolve products;
+3. make all authored forms and variants produce those products;
+4. atomically switch to one schema and one loader;
+5. move all physical carrier, transfer, residency, hazard, and publication decisions into L6;
+6. delete tuple/stage cooking, direct submit/autodiff paths, sentinels, and nullable kind signals;
+7. migrate consumers and complete §11 and §13.
 
-   This phase absorbs the graphics half of what was originally Phase 5, because the three goals are not separable.
-   Graphics pipeline state is a PSO — rasterization, depth/stencil, blend, and topology are compile-time facts that
-   must appear in the manifest — and only the canonical Program path can carry them; the stage path has no
-   representation for any of them. So a `vd.pipeline(...)` asset must cook through the canonical path. But that path
-   took its attachment structure from a concrete `RenderPass` and refused outright without one, which made a graphics
-   asset uncookable: an asset has no render target to read. That boundary must come from the pipeline itself before a
-   graphics asset is deployable.
-
-   Tuple removal needs more than that, which is why it moves to Phase 3. It does need `vd.pipeline(...)` to cook
-   first, since tuples are otherwise the only graphics asset form — but that is necessary, not sufficient. Converting
-   a tuple asset to `vd.pipeline(...)` also moves it from the stage path to the canonical one, changing its cooked
-   `type` from `pipeline` to `program_bundle`. `vernonRuntimeLoadProgramBundleWithOptions` accepts only the former
-   and answers `unsupported or invalid pipeline bundle` for the latter, so every C++ consumer of a converted asset
-   would break — `examples/external_engine/mandelbulb.cpp` among them. Tuple removal therefore lands with the schema
-   that makes the two paths interchangeable, in Phase 3, and not before.
-
-   Concretely, this phase must:
-
-   - give the render-pass boundary a **declared** attachment structure instead of a concrete `RenderPass`, keeping
-     extents out of the manifest as §8 requires. Attachment count and aspect are derivable, but the concrete format
-     is not, and that is what the manifest records. A fragment `result_type` of `Tensor(f32, 4)` fixes a four-channel
-     float target and `None` marks a depth-only pass such as `shadow_fragment`, but `rgba8_unorm`, `rgba8_srgb`, and
-     `rgba16_float` are all that same `Tensor(f32, 4)`: shaders write floats, and the format is the storage encoding
-     the target chose. Every backend bakes that encoding into the pipeline object, so it is a deployment choice, and
-     one no shader can imply. It is therefore declared as `vd.pipeline(..., targets=vd.target_formats(...))`,
-     alongside the PSO state it behaves like, and not on `program_asset`, which is neutral across Kernel, Pipeline,
-     Module, and VJP forms and must not carry a graphics-only field. The drift a declaration risks is answered by
-     checking it rather than by refusing to state it: a bound `RenderPass` must agree with the declared formats,
-     which is the compatibility rule Vulkan already imposes on the render pass a pipeline is used in;
-   - the vertex-input boundary already needs no work: an `attribute()`-annotated parameter carries its per-vertex
-     format in the typed signature — `vertices` is `Tensor(f32, 2)` with `interface=['attribute']` — and the leading
-     extent is already symbolic as `("?", *cell)`, so no count or buffer byte length is baked;
-   - enforce the declared formats in the runtime, so the declaration constrains rather than merely documents. The
-     manifest already carries a set of compatible formats and sample counts per attachment and the runtime already
-     parses them, but nothing compared them against the bound target; that gap was invisible only while the format
-     came from the cook-time texture and so could not disagree. Note that the sampled-texture `'unknown'` convention
-     is not the precedent to follow here: an attachment format is a compile-time fact, and a sampled format is not;
-   - `GraphicsPipelineState` already reaches the manifest as compile-time PSO state, so no work is needed there;
-   - drive feature variants from the asset's `variants`, cooking one binary set per variant key, and reject a
-     `Pipeline` that carries its own JIT `features` inside an asset.
-3. **One schema and one runtime surface, together.** These were separate phases and cannot be. Moving any authored
-   form to the canonical path changes its cooked `type` from `pipeline` to `program_bundle`, and the two loaders
-   differ in lifecycle rather than merely in schema: `vernonRuntimeLoadProgramBundleWithOptions` returns a
-   `VernonProgramBundle` resolved to a variant later, while `vernonRuntimeLoadManagedProgramBundleWithOptions` takes
-   the feature key up front and returns a `VernonProgramExecutable`. No dispatch makes one accept the other's
-   manifest. So every form that moves breaks its C++ consumers until the surface is unified, and the schema cannot
-   collapse to one `type` until every form has moved. Ordered so each step leaves the tree green:
-
-   1. Teach `vernonRuntimeLoadProgramBundleWithOptions` the canonical schema, keeping the bundle-then-resolve shape
-      §6 specifies. Additive: nothing is deleted, so nothing breaks.
-   2. Move compute Kernel assets to the canonical path.
-   3. Reject the tuple form and convert the remaining tuple assets, now safe: `examples/variant_mesh.py`,
-      `examples/shader_lib/mandelbulb.py`, `python/tests/cube_map_shader.py`, and the four assets in
-      `python/tests/program_asset_fixture.py`, plus the docs that show the form and the topology negative test, which
-      moves to `vd.pipeline`. Each converted asset must name the target formats it is cooked for, which the stage
-      path never recorded concretely.
-   4. Move Kernel VJP, which is blocked on §7 rather than on the schema: it deploys through the bundle-level
-      `autodiff.profiles` table that §7 deletes, and eleven cooked parity fixtures in `source/tests/fixtures/`
-      depend on that ABI. It is therefore the last form to move, not the first.
-   5. Emit only `type: "program"`, delete the legacy fields in §5, and rename `pipeline_version` →
-      `program_version` with all six coupled generated names.
-   6. Delete the dual loaders, kind queries, legacy submit, and direct autodiff entry points, and split
-      `VernonProgramBundle` from `VernonProgramExecutable` as §6 requires.
-4. **Symbolic compute dispatch.** Replace the zero-grid sentinel and parameter-scan inference with Program Value grid
-   controls. Add the multi-shape, multi-grid, and multi-attachment deployment tests. The graphics boundary is already
-   symbolic by this point, having moved to Phase 2; what remains here is compute dispatch. Note that the attachment
-   extent uses the same zero-sentinel encoding as the compute grid — a cooked graphics attachment currently records
-   `extent [0, 0, 1]` — so this phase replaces one shared sentinel convention, not two unrelated ones.
-5. **Port and delete.** Port fixtures, examples, and docs. Delete obsolete code. Add the source, schema, and layering
-   guards. Run complete sequential verification.
+Do not repair failures by adding a compatibility branch to the old model. When a root cause exposes a missing
+authority, add that authority at its owning layer, migrate its consumers, and delete the displaced derivation in the
+same checklist item.
 
 ## 13. Completion gate
 
@@ -586,6 +582,7 @@ definitions, declarations, bindings, tests, and build rules use the new contract
 - Pass full Python tests.
 - Pass type and lint checks.
 - Verify installed-package and example workflows.
-- Confirm no symbol, manifest field, or `type` value from the deleted lists in §5, §6, §7, and §10 remains anywhere in
-  the tree, including tests, fixtures, examples, and docs.
+- Confirm no symbol, manifest field, or `type` value from the deleted lists in §5, §6, §7, and §10 remains as an
+  active contract or implementation anywhere in source, tests, fixtures, examples, or public docs. The deletion
+  tables in this migration record are the only identifier-level allowlist.
 - Do not bump the compiler or Program contract version until the release step.

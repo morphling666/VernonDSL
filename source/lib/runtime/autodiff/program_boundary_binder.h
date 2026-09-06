@@ -19,11 +19,12 @@ struct Program;
 
 namespace vernon::runtime::ad {
 
-struct ProgramStorageBacking {
+struct ProgramStorageState {
     uint32_t owner{UINT32_MAX};
     size_t bytes{};
     bool sized{};
     std::optional<VernonProgramArgument> external;
+    std::optional<VernonProgramArgument> initial;
 };
 
 struct ProgramBoundaryBindingRequest {
@@ -35,7 +36,7 @@ struct ProgramBoundaryBindingRequest {
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
                            const ProgramBoundaryBindingRequest &request,
                            std::map<uint32_t, VernonProgramArgument> &externalValues,
-                           std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
+                           std::map<uint32_t, ProgramStorageState> &backings, std::vector<char> &live,
                            std::string &error);
 
 } // namespace vernon::runtime::ad

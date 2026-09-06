@@ -157,14 +157,9 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         {0, colorView.reference},
         {1, bloomView.reference},
     };
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments.data();
-    invocation.argument_count = arguments.size();
-    vernon::tests::GraphicsInvocationControls graphics(attachments, std::size(attachments), 3);
-    graphics.bind(invocation);
-    const VernonStatus invokeStatus = vernon::tests::completeSubmission(pipeline, &invocation);
+    const vernon::tests::CanonicalGraphicsControls graphics(attachments, std::size(attachments), 3);
+    const VernonStatus invokeStatus =
+        vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics);
     expectRuntimeOk(runtime, invokeStatus);
     ASSERT_EQ(invokeStatus, VERNON_STATUS_OK);
 

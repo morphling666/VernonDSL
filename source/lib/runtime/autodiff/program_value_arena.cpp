@@ -51,12 +51,106 @@ std::optional<shape::DeclaredShape> logicalProjectionShape(const Parameter &para
     return result;
 }
 
+struct TensorCopyRegion {
+    size_t sourceOffset{};
+    size_t destinationOffset{};
+    size_t size{};
+};
+
+bool planTensorCopy(const VernonTensorView &source, const VernonTensorView &destination,
+                    std::vector<TensorCopyRegion> &regions, std::string &error) {
+    if (source.rank != destination.rank ||
+        (source.rank && (!source.shape || !source.byte_strides || !destination.shape || !destination.byte_strides)) ||
+        !source.element_layout.byte_size || source.element_layout.byte_size != destination.element_layout.byte_size) {
+        return error = "node endpoint materialization has incompatible tensor layouts", false;
+    }
+    for (uint32_t axis = 0; axis < source.rank; ++axis)
+        if (source.shape[axis] != destination.shape[axis])
+            return error = "node endpoint materialization has incompatible tensor shapes", false;
+    if (source.rank &&
+        std::any_of(source.shape, source.shape + source.rank, [](uint64_t extent) { return extent == 0; }))
+        return true;
+
+    const size_t elementBytes = source.element_layout.byte_size;
+    std::vector<uint64_t> index(source.rank);
+    for (;;) {
+        if (source.byte_offset > std::numeric_limits<int64_t>::max() ||
+            destination.byte_offset > std::numeric_limits<int64_t>::max())
+            return error = "node endpoint materialization offset exceeds the portable range", false;
+        int64_t sourceOffset = static_cast<int64_t>(source.byte_offset);
+        int64_t destinationOffset = static_cast<int64_t>(destination.byte_offset);
+        const auto advance = [](int64_t &offset, uint64_t coordinate, int64_t stride) {
+            if (stride >= 0) {
+                const uint64_t positive = static_cast<uint64_t>(stride);
+                if (positive &&
+                    coordinate > static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - offset) / positive)
+                    return false;
+                offset += static_cast<int64_t>(coordinate * positive);
+                return true;
+            }
+            const uint64_t magnitude = static_cast<uint64_t>(-(stride + 1)) + 1;
+            if (magnitude && coordinate > static_cast<uint64_t>(offset) / magnitude)
+                return false;
+            offset -= static_cast<int64_t>(coordinate * magnitude);
+            return true;
+        };
+        for (uint32_t axis = 0; axis < source.rank; ++axis)
+            if (!advance(sourceOffset, index[axis], source.byte_strides[axis]) ||
+                !advance(destinationOffset, index[axis], destination.byte_strides[axis]))
+                return error = "node endpoint materialization layout overflows", false;
+        const auto validOffset = [&](int64_t offset, size_t capacity) {
+            return offset >= 0 && static_cast<uint64_t>(offset) <= capacity &&
+                   elementBytes <= capacity - static_cast<size_t>(offset);
+        };
+        if (!validOffset(sourceOffset, source.byte_size) || !validOffset(destinationOffset, destination.byte_size))
+            return error = "node endpoint materialization exceeds its Storage backing", false;
+        const size_t sourceByte = static_cast<size_t>(sourceOffset);
+        const size_t destinationByte = static_cast<size_t>(destinationOffset);
+        if (!regions.empty() && regions.back().sourceOffset + regions.back().size == sourceByte &&
+            regions.back().destinationOffset + regions.back().size == destinationByte) {
+            regions.back().size += elementBytes;
+        } else {
+            regions.push_back({sourceByte, destinationByte, elementBytes});
+        }
+        if (source.rank == 0)
+            break;
+        uint32_t axis = source.rank;
+        while (axis) {
+            --axis;
+            if (++index[axis] < source.shape[axis])
+                break;
+            index[axis] = 0;
+        }
+        if (axis == 0 && index[0] == 0)
+            break;
+    }
+    return true;
+}
+
 } // namespace
 
-ProgramInvocationFrame::ProgramInvocationFrame(const std::vector<VernonProgramArgument> &hostArguments)
+bool MaterializedNodeFrame::prepareHost(std::string &error) const {
+    for (const HostCopy &copy : copiesBefore) {
+        if (!copy.source || !copy.destination)
+            return error = "node endpoint input transfer has no host backing", false;
+        std::memcpy(copy.destination + copy.destinationOffset, copy.source + copy.sourceOffset, copy.size);
+    }
+    return true;
+}
+
+bool MaterializedNodeFrame::commitHost(std::string &error) const {
+    for (const HostCopy &copy : copiesAfter) {
+        if (!copy.source || !copy.destination)
+            return error = "node endpoint result transfer has no host backing", false;
+        std::memcpy(copy.destination + copy.destinationOffset, copy.source + copy.sourceOffset, copy.size);
+    }
+    return true;
+}
+
+LogicalValueFrame::LogicalValueFrame(const std::vector<VernonProgramArgument> &hostArguments)
     : logicalArguments_(hostArguments), logicalBuffers_(hostArguments.size()), carriers_(hostArguments.size()) {}
 
-ProgramInvocationFrame::ProgramInvocationFrame(std::vector<ProgramHostValue> hostValues)
+LogicalValueFrame::LogicalValueFrame(std::vector<LogicalProgramValue> hostValues)
     : hostValues_(std::move(hostValues)), logicalArguments_(hostValues_.size()), logicalBuffers_(hostValues_.size()),
       carriers_(hostValues_.size()) {
     for (size_t value = 0; value < hostValues_.size(); ++value) {
@@ -65,8 +159,24 @@ ProgramInvocationFrame::ProgramInvocationFrame(std::vector<ProgramHostValue> hos
     }
 }
 
-bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required,
-                                               std::string &error) {
+LogicalValueFrame::LogicalValueFrame(LogicalValueFrame &&other) noexcept
+    : hostValues_(std::move(other.hostValues_)), logicalArguments_(std::move(other.logicalArguments_)),
+      logicalBuffers_(std::move(other.logicalBuffers_)), deviceUploads_(std::move(other.deviceUploads_)),
+      carriers_(std::move(other.carriers_)), controlImages_(std::move(other.controlImages_)),
+      invocationContext_(other.invocationContext_), deviceResident_(other.deviceResident_) {
+    for (size_t value = 0; value < logicalArguments_.size(); ++value) {
+        rebindLogicalDescriptor(static_cast<uint32_t>(value));
+        for (Carrier &carrier : carriers_[value]) {
+            if (carrier.argument.kind != VERNON_PROGRAM_TENSOR)
+                continue;
+            carrier.argument.tensor.shape = carrier.shape.empty() ? nullptr : carrier.shape.data();
+            carrier.argument.tensor.byte_strides = carrier.strides.empty() ? nullptr : carrier.strides.data();
+        }
+    }
+}
+
+bool LogicalValueFrame::materializeDevice(VernonRuntimeContext &context, const std::vector<char> &required,
+                                          std::string &error) {
     if (required.size() != logicalArguments_.size()) {
         error = "Program invocation frame requirement set does not match its values";
         return false;
@@ -82,9 +192,6 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
         if (!required[value])
             continue;
         const VernonProgramArgument &argument = logicalArguments_[value];
-        if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
-                                           hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
-            continue;
         if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
@@ -106,9 +213,6 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
         if (!required[value])
             continue;
         VernonProgramArgument &argument = logicalArguments_[value];
-        if (value < hostValues_.size() && (hostValues_[value].ownership == ProgramValueOwnership::BorrowedHost ||
-                                           hostValues_[value].ownership == ProgramValueOwnership::BorrowedDevice))
-            continue;
         if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
             !argument.tensor.host_data || !argument.tensor.byte_size)
             continue;
@@ -130,7 +234,7 @@ bool ProgramInvocationFrame::materializeDevice(VernonRuntimeContext &context, co
     return true;
 }
 
-bool ProgramInvocationFrame::restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error) {
+bool LogicalValueFrame::restoreDeviceValuesFromHost(const std::vector<char> &required, std::string &error) {
     if (required.size() != logicalArguments_.size() || hostValues_.size() != logicalArguments_.size()) {
         error = "Program device restore set does not match its values";
         return false;
@@ -151,8 +255,7 @@ bool ProgramInvocationFrame::restoreDeviceValuesFromHost(const std::vector<char>
     return true;
 }
 
-bool ProgramInvocationFrame::adoptRetainedValue(uint32_t value, const ProgramInvocationFrame &retained,
-                                                std::string &error) {
+bool LogicalValueFrame::adoptRetainedValue(uint32_t value, const LogicalValueFrame &retained, std::string &error) {
     if (value >= logicalArguments_.size() || value >= retained.logicalArguments_.size()) {
         error = "Program retained Value exceeds its invocation frame";
         return false;
@@ -177,19 +280,48 @@ bool ProgramInvocationFrame::adoptRetainedValue(uint32_t value, const ProgramInv
         if (retained.carriers_[value][index].buffer)
             carriers_[value][index] = retained.carriers_[value][index];
     if (value < hostValues_.size() && value < retained.hostValues_.size()) {
-        hostValues_[value].concreteShape = retained.hostValues_[value].concreteShape;
-        hostValues_[value].strides = retained.hostValues_[value].strides;
+        hostValues_[value] = retained.hostValues_[value];
+        if (!hostValues_[value].owned.empty() && hostValues_[value].argument.kind == VERNON_PROGRAM_TENSOR)
+            hostValues_[value].argument.tensor.host_data = hostValues_[value].owned.data();
+        if (!retained.logicalBuffers_[value])
+            logicalArguments_[value] = hostValues_[value].argument;
     }
     rebindLogicalDescriptor(value);
     return true;
 }
 
-void ProgramInvocationFrame::rebindLogicalDescriptor(uint32_t value) {
+void LogicalValueFrame::retainOnly(const std::vector<char> &retained) {
+    for (size_t value = 0; value < logicalArguments_.size(); ++value) {
+        if (value < retained.size() && retained[value]) {
+            LogicalProgramValue &host = hostValues_[value];
+            if (!logicalBuffers_[value] && host.owned.empty() && host.argument.kind == VERNON_PROGRAM_TENSOR &&
+                host.argument.tensor.storage == VERNON_TENSOR_HOST && host.argument.tensor.host_data &&
+                host.argument.tensor.byte_size) {
+                const auto *data = static_cast<const uint8_t *>(host.argument.tensor.host_data);
+                host.owned.assign(data, data + host.argument.tensor.byte_size);
+                host.argument.tensor.host_data = host.owned.data();
+                logicalArguments_[value] = host.argument;
+            }
+            continue;
+        }
+        hostValues_[value] = {};
+        logicalArguments_[value] = {};
+        logicalBuffers_[value].reset();
+        carriers_[value] = {};
+    }
+    deviceUploads_.clear();
+}
+
+void LogicalValueFrame::rebindLogicalDescriptor(uint32_t value) {
     if (value >= hostValues_.size() || value >= logicalArguments_.size())
         return;
-    ProgramHostValue &host = hostValues_[value];
+    LogicalProgramValue &host = hostValues_[value];
     if (host.argument.kind != VERNON_PROGRAM_TENSOR || logicalArguments_[value].kind != VERNON_PROGRAM_TENSOR)
         return;
+    if (!host.owned.empty() && host.argument.tensor.storage == VERNON_TENSOR_HOST) {
+        host.argument.tensor.host_data = host.owned.data();
+        logicalArguments_[value].tensor.host_data = host.owned.data();
+    }
     if (host.concreteShape) {
         host.argument.tensor.rank = static_cast<uint32_t>(host.concreteShape->size());
         host.argument.tensor.shape = host.concreteShape->data();
@@ -202,10 +334,9 @@ void ProgramInvocationFrame::rebindLogicalDescriptor(uint32_t value) {
     }
 }
 
-bool ProgramInvocationFrame::allocateCarrier(VernonRuntimeContext &context, uint32_t value,
-                                             const program::TargetBinding &binding, size_t byteSize,
-                                             std::vector<uint64_t> shape, std::vector<int64_t> strides,
-                                             std::string &error) {
+bool LogicalValueFrame::allocateCarrier(VernonRuntimeContext &context, uint32_t value,
+                                        const program::TargetBinding &binding, size_t byteSize,
+                                        std::vector<uint64_t> shape, std::vector<int64_t> strides, std::string &error) {
     if (value >= carriers_.size() || !byteSize || shape.size() != strides.size()) {
         error = "Program carrier allocation has an invalid value or layout";
         return false;
@@ -240,8 +371,8 @@ bool ProgramInvocationFrame::allocateCarrier(VernonRuntimeContext &context, uint
     return true;
 }
 
-bool ProgramInvocationFrame::uploadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, const void *data,
-                                           size_t byteSize, std::string &error) {
+bool LogicalValueFrame::uploadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, const void *data,
+                                      size_t byteSize, std::string &error) {
     Carrier *slot = carrier(value, carrierKind);
     if (!slot || !slot->buffer || byteSize > slot->buffer->size() || !slot->buffer->upload(data, byteSize)) {
         error = "Program carrier upload exceeds its device allocation";
@@ -250,8 +381,8 @@ bool ProgramInvocationFrame::uploadCarrier(uint32_t value, program_plan::TapeCar
     return true;
 }
 
-bool ProgramInvocationFrame::downloadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, void *data,
-                                             size_t byteSize, std::string &error) const {
+bool LogicalValueFrame::downloadCarrier(uint32_t value, program_plan::TapeCarrier carrierKind, void *data,
+                                        size_t byteSize, std::string &error) const {
     const Carrier *slot = carrier(value, carrierKind);
     if (!slot || !slot->buffer || byteSize > slot->buffer->size() || !slot->buffer->download(data, byteSize)) {
         error = "Program carrier readback exceeds its device allocation";
@@ -260,7 +391,7 @@ bool ProgramInvocationFrame::downloadCarrier(uint32_t value, program_plan::TapeC
     return true;
 }
 
-bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &required, std::string &error) const {
+bool LogicalValueFrame::downloadLogicalToHost(const std::vector<char> &required, std::string &error) const {
     if (required.size() != logicalArguments_.size()) {
         error = "Program device readback set does not match its values";
         return false;
@@ -268,7 +399,7 @@ bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &requ
     for (size_t value = 0; value < logicalArguments_.size(); ++value) {
         if (!required[value] || !logicalBuffers_[value])
             continue;
-        const ProgramHostValue &host = hostValues_[value];
+        const LogicalProgramValue &host = hostValues_[value];
         if (host.argument.kind != VERNON_PROGRAM_TENSOR || !host.argument.tensor.host_data ||
             !logicalBuffers_[value]->download(host.argument.tensor.byte_offset,
                                               const_cast<void *>(host.argument.tensor.host_data),
@@ -280,8 +411,8 @@ bool ProgramInvocationFrame::downloadLogicalToHost(const std::vector<char> &requ
     return true;
 }
 
-bool ProgramInvocationFrame::resolveControl(const program::Program &program, const program::ControlComponent &control,
-                                            uint64_t &value, std::string &error) const {
+bool resolveProgramControl(const program::Program &program, const std::vector<LogicalProgramValue> &hostValues,
+                           const program::ControlComponent &control, uint64_t &value, std::string &error) {
     if (control.kind == program::ControlKind::Static) {
         value = control.value;
         return true;
@@ -298,12 +429,17 @@ bool ProgramInvocationFrame::resolveControl(const program::Program &program, con
         if (argument != program.values.end())
             valueId = argument->id;
     }
-    if (valueId >= hostValues_.size())
+    if (valueId >= hostValues.size())
         return error = "Program dispatch control references an unavailable value", false;
-    const VernonProgramArgument &argument = hostValues_[valueId].argument;
+    const LogicalProgramValue &host = hostValues[valueId];
+    const VernonProgramArgument &argument = host.argument;
     if (argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
         !argument.tensor.host_data || argument.tensor.byte_offset > argument.tensor.byte_size)
-        return error = "Program dispatch control is not a host scalar value", false;
+        return error = "Program dispatch control Value " + std::to_string(valueId) +
+                       " is not a retained host scalar (kind " + std::to_string(argument.kind) + ", storage " +
+                       std::to_string(argument.tensor.storage) + ", bytes " +
+                       std::to_string(argument.tensor.byte_size) + ", owned " + std::to_string(host.owned.size()) + ")",
+               false;
     const uint8_t *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
     const std::string &dtype = program.values[valueId].canonicalType.dtype;
     if (dtype == "u32" || dtype == "ui32") {
@@ -330,8 +466,13 @@ bool ProgramInvocationFrame::resolveControl(const program::Program &program, con
     return true;
 }
 
-bool ProgramInvocationFrame::bindControlImageStorage(const program::Program &program, uint32_t storage,
-                                                     VernonRuntimeProviderResourceReference view, std::string &error) {
+bool LogicalValueFrame::resolveControl(const program::Program &program, const program::ControlComponent &control,
+                                       uint64_t &value, std::string &error) const {
+    return resolveProgramControl(program, hostValues_, control, value, error);
+}
+
+bool LogicalValueFrame::bindControlImageStorage(const program::Program &program, uint32_t storage,
+                                                VernonRuntimeProviderResourceReference view, std::string &error) {
     if (!view.identity || !view.resource.value)
         return error = "Program attachment Storage has no runtime image view", false;
     if (storage >= program.storages.size())
@@ -340,17 +481,17 @@ bool ProgramInvocationFrame::bindControlImageStorage(const program::Program &pro
            (error = "Program Storage is projected from multiple runtime image views", false);
 }
 
-bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &program, const program::Node &node,
-                                                      const VernonResolvedProgramStage &stage,
-                                                      MaterializedProgramArguments &output, std::string &error) const {
-    if (!stage.pipeline || stage.bindings.size() != stage.pipeline->variant.parameters.size()) {
+bool LogicalValueFrame::materializeNodeArguments(const program::Program &program, const program::Node &node,
+                                                 const VernonResolvedProgramNode &nodePlan,
+                                                 MaterializedNodeFrame &output, std::string &error) const {
+    if (!nodePlan.pipeline || nodePlan.bindings.size() != nodePlan.pipeline->variant.parameters.size()) {
         error = "resolved Program stage has an invalid binding plan";
         return false;
     }
     output = {};
-    output.arguments.reserve(stage.bindings.size());
-    output.shapes.reserve(stage.bindings.size());
-    output.strides.reserve(stage.bindings.size());
+    output.arguments.reserve(nodePlan.bindings.size());
+    output.shapes.reserve(nodePlan.bindings.size());
+    output.strides.reserve(nodePlan.bindings.size());
     uint64_t dispatchInvocations = 1;
     if (program::executionKind(node) == program::ExecutionKind::Compute) {
         for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
@@ -366,16 +507,16 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
         }
     }
     for (uint32_t extent :
-         {stage.pipeline->workgroupSize.x, stage.pipeline->workgroupSize.y, stage.pipeline->workgroupSize.z})
+         {nodePlan.pipeline->workgroupSize.x, nodePlan.pipeline->workgroupSize.y, nodePlan.pipeline->workgroupSize.z})
         if (!extent || dispatchInvocations > std::numeric_limits<uint64_t>::max() / extent) {
             error = "Program dispatch invocation count overflows";
             return false;
         } else {
             dispatchInvocations *= extent;
         }
-    for (size_t parameterIndex = 0; parameterIndex < stage.bindings.size(); ++parameterIndex) {
-        const Parameter &parameter = stage.pipeline->variant.parameters[parameterIndex];
-        const VernonProgramStageBinding &binding = stage.bindings[parameterIndex];
+    for (size_t parameterIndex = 0; parameterIndex < nodePlan.bindings.size(); ++parameterIndex) {
+        const Parameter &parameter = nodePlan.pipeline->variant.parameters[parameterIndex];
+        const VernonProgramStageBinding &binding = nodePlan.bindings[parameterIndex];
         if (binding.value >= logicalArguments_.size() || binding.value >= program.values.size()) {
             error = "resolved Program stage binding exceeds the invocation frame";
             return false;
@@ -383,12 +524,20 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
         VernonProgramArgument controlImage{};
         const VernonProgramArgument *source = nullptr;
         const program::Value &programValue = program.values[binding.value];
+        const bool requiresHostProjection =
+            std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
+                return !use.tensorViewDescriptor && (use.interfaceKind == "value" || use.interfaceKind == "uniform" ||
+                                                     use.interfaceKind == "result");
+            });
         const auto image = programValue.storage ? controlImages_.find(*programValue.storage) : controlImages_.end();
         if (image != controlImages_.end()) {
             controlImage.slot = binding.value;
             controlImage.kind = VERNON_PROGRAM_IMAGE;
             controlImage.image.view = image->second;
             source = &controlImage;
+        } else if (requiresHostProjection && binding.value < hostValues_.size() &&
+                   hostValues_[binding.value].ownership == ProgramValueOwnership::BorrowedHost) {
+            source = &hostValues_[binding.value].argument;
         } else {
             source = argument(binding.value, binding.target ? &*binding.target : nullptr);
         }
@@ -398,6 +547,23 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
         }
         VernonProgramArgument materialized = *source;
         materialized.slot = parameter.slot;
+        if (requiresHostProjection && materialized.kind == VERNON_PROGRAM_TENSOR &&
+            materialized.tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+            if (!logicalBuffers_[binding.value]) {
+                error = "resolved Program inline value has no logical device backing";
+                return false;
+            }
+            output.hostStorage.emplace_back(materialized.tensor.byte_size);
+            if (!logicalBuffers_[binding.value]->download(materialized.tensor.byte_offset,
+                                                          output.hostStorage.back().data(),
+                                                          output.hostStorage.back().size())) {
+                error = "resolved Program inline value could not be downloaded";
+                return false;
+            }
+            materialized.tensor.storage = VERNON_TENSOR_HOST;
+            materialized.tensor.host_data = output.hostStorage.back().data();
+            materialized.tensor.byte_offset = 0;
+        }
         if (binding.target && materialized.kind == VERNON_PROGRAM_TENSOR) {
             materialized.tensor.access = valueAccess(binding.target->access);
             materialized.tensor.element_layout = pipelineValueLayout(binding.target->elementLayout);
@@ -431,17 +597,19 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             materialized.tensor.byte_strides = output.strides.back().data();
         }
         if (binding.target && binding.target->semantic == program::CarrierSemantic::Tape) {
-            const shape::DeclaredShape &declared = binding.target->shape;
-            if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared)) {
-                size_t elements = 0;
-                size_t bytes = 0;
-                if (!shape::checkedElementCount(*concrete, elements) || !binding.target->elementLayout.byteSize ||
-                    elements > std::numeric_limits<size_t>::max() / binding.target->elementLayout.byteSize ||
-                    (bytes = elements * binding.target->elementLayout.byteSize) > materialized.tensor.resource.size) {
-                    error = "resolved Program carrier stage-local view exceeds its retained allocation";
-                    return false;
+            if (binding.target->tapeCarrier &&
+                (*binding.target->tapeCarrier == program_plan::TapeCarrier::ReplayStatus ||
+                 *binding.target->tapeCarrier == program_plan::TapeCarrier::LaunchMetadata)) {
+                if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(binding.target->shape)) {
+                    size_t elements = 0;
+                    if (!shape::checkedElementCount(*concrete, elements) || !binding.target->elementLayout.byteSize ||
+                        elements > std::numeric_limits<size_t>::max() / binding.target->elementLayout.byteSize ||
+                        elements * binding.target->elementLayout.byteSize > materialized.tensor.byte_size) {
+                        error = "resolved Program fixed tape carrier is smaller than its stage ABI";
+                        return false;
+                    }
+                    materialized.tensor.byte_size = elements * binding.target->elementLayout.byteSize;
                 }
-                materialized.tensor.byte_size = bytes;
             }
             gpu::InternalBufferView view;
             if (materialized.kind != VERNON_PROGRAM_TENSOR ||
@@ -473,18 +641,89 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
             materialized.tensor.element_layout = pipelineValueLayout(parameterLayout);
             const std::optional<shape::DeclaredShape> projectionShape =
                 logicalProjectionShape(parameter, binding.target ? &*binding.target : nullptr);
-            const bool wholeElementProjection = valueLayout.leaves.size() == 1 && leaf.path.empty();
-            const bool materializedProjection =
-                projectionShape && parameterLayout.byteSize &&
-                (wholeElementProjection ? shape::materializeLeafProjection(output.shapes.back(), output.strides.back(),
-                                                                           *projectionShape, parameterLayout.byteSize,
-                                                                           output.shapes.back(), output.strides.back())
-                                        : shape::materializeCompactProjection(
-                                              output.shapes.back(), *projectionShape, parameterLayout.byteSize,
-                                              output.shapes.back(), output.strides.back()));
-            if (!materializedProjection) {
+            std::vector<uint64_t> projectedShape;
+            std::vector<int64_t> projectedStrides;
+            std::vector<uint64_t> compactShape;
+            std::vector<int64_t> compactStrides;
+            if (!projectionShape || !parameterLayout.byteSize ||
+                !shape::materializeLeafProjection(output.shapes.back(), output.strides.back(), *projectionShape,
+                                                  parameterLayout.byteSize, projectedShape, projectedStrides) ||
+                !shape::materializeCompactProjection(output.shapes.back(), *projectionShape, parameterLayout.byteSize,
+                                                     compactShape, compactStrides)) {
                 error = "Program aggregate leaf projection has an incompatible physical shape";
                 return false;
+            }
+            if (projectedShape != compactShape || projectedStrides != compactStrides) {
+                size_t elements = 0;
+                size_t byteSize = 0;
+                if (!shape::checkedElementCount(compactShape, elements) ||
+                    elements > std::numeric_limits<size_t>::max() / parameterLayout.byteSize ||
+                    !(byteSize = elements * parameterLayout.byteSize)) {
+                    error = "Program aggregate leaf endpoint size overflows";
+                    return false;
+                }
+                VernonTensorView canonical = materialized.tensor;
+                canonical.rank = static_cast<uint32_t>(projectedShape.size());
+                canonical.shape = projectedShape.empty() ? nullptr : projectedShape.data();
+                canonical.byte_strides = projectedStrides.empty() ? nullptr : projectedStrides.data();
+
+                output.shapes.back() = std::move(compactShape);
+                output.strides.back() = std::move(compactStrides);
+                materialized.tensor.byte_offset = 0;
+                materialized.tensor.byte_size = byteSize;
+                materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
+                materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
+                materialized.tensor.byte_strides =
+                    output.strides.back().empty() ? nullptr : output.strides.back().data();
+
+                const bool reads = materialized.tensor.access != VERNON_ACCESS_WRITE;
+                const bool writes = materialized.tensor.access != VERNON_ACCESS_READ;
+                std::vector<TensorCopyRegion> regions;
+                if (canonical.storage == VERNON_TENSOR_HOST) {
+                    output.hostStorage.emplace_back(byteSize);
+                    materialized.tensor.host_data = output.hostStorage.back().data();
+                    VernonTensorView compact = materialized.tensor;
+                    if (!planTensorCopy(canonical, compact, regions, error))
+                        return false;
+                    const auto *canonicalBytes = static_cast<const uint8_t *>(canonical.host_data);
+                    auto *compactBytes = output.hostStorage.back().data();
+                    for (const TensorCopyRegion &region : regions) {
+                        if (reads)
+                            output.copiesBefore.push_back({canonicalBytes, compactBytes, region.sourceOffset,
+                                                           region.destinationOffset, region.size});
+                        if (writes)
+                            output.copiesAfter.push_back({compactBytes, const_cast<uint8_t *>(canonicalBytes),
+                                                          region.destinationOffset, region.sourceOffset, region.size});
+                    }
+                } else if (canonical.storage == VERNON_TENSOR_RHI_RESOURCE && nodePlan.pipeline->context) {
+                    auto storage = std::make_shared<gpu::DeviceBuffer>(*nodePlan.pipeline->context, byteSize);
+                    if (!storage->valid() || !storage->reference(materialized.tensor.resource))
+                        return error = "Program aggregate leaf endpoint allocation failed", false;
+                    output.deviceStorage.push_back(storage);
+                    VernonTensorView compact = materialized.tensor;
+                    if (!planTensorCopy(canonical, compact, regions, error))
+                        return false;
+                    VernonRhiBuffer canonicalBuffer{};
+                    if (!resolveBackendRhiBufferReference(*nodePlan.pipeline->context, canonical.resource,
+                                                          canonicalBuffer))
+                        return error = "Program aggregate leaf endpoint has no RHI Storage backing", false;
+                    for (const TensorCopyRegion &region : regions) {
+                        if (reads)
+                            output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(),
+                                                                 canonical.resource.offset + region.sourceOffset,
+                                                                 region.destinationOffset, region.size});
+                        if (writes)
+                            output.deviceCopiesAfter.push_back(
+                                {storage->handle(), canonicalBuffer, region.destinationOffset,
+                                 canonical.resource.offset + region.sourceOffset, region.size});
+                    }
+                } else {
+                    error = "Program aggregate leaf endpoint has no materializable Storage backing";
+                    return false;
+                }
+            } else {
+                output.shapes.back() = std::move(projectedShape);
+                output.strides.back() = std::move(projectedStrides);
             }
             materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
             materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
@@ -549,8 +788,7 @@ bool ProgramInvocationFrame::materializeNodeArguments(const program::Program &pr
     return true;
 }
 
-const VernonProgramArgument *ProgramInvocationFrame::argument(uint32_t value,
-                                                              const program::TargetBinding *binding) const {
+const VernonProgramArgument *LogicalValueFrame::argument(uint32_t value, const program::TargetBinding *binding) const {
     if (value >= logicalArguments_.size())
         return nullptr;
     if (binding) {
@@ -561,12 +799,11 @@ const VernonProgramArgument *ProgramInvocationFrame::argument(uint32_t value,
     return &logicalArguments_[value];
 }
 
-VernonProgramArgument *ProgramInvocationFrame::argument(uint32_t value, const program::TargetBinding *binding) {
-    return const_cast<VernonProgramArgument *>(
-        static_cast<const ProgramInvocationFrame &>(*this).argument(value, binding));
+VernonProgramArgument *LogicalValueFrame::argument(uint32_t value, const program::TargetBinding *binding) {
+    return const_cast<VernonProgramArgument *>(static_cast<const LogicalValueFrame &>(*this).argument(value, binding));
 }
 
-VernonRhiBuffer ProgramInvocationFrame::buffer(uint32_t value, const program::TargetBinding *binding) const {
+VernonRhiBuffer LogicalValueFrame::buffer(uint32_t value, const program::TargetBinding *binding) const {
     if (binding)
         if (const Carrier *physical = binding->tapeCarrier ? carrier(value, *binding->tapeCarrier) : nullptr)
             if (physical->buffer)
@@ -580,7 +817,7 @@ VernonRhiBuffer ProgramInvocationFrame::buffer(uint32_t value, const program::Ta
     return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
-size_t ProgramInvocationFrame::carrierIndex(program_plan::TapeCarrier carrierKind) {
+size_t LogicalValueFrame::carrierIndex(program_plan::TapeCarrier carrierKind) {
     if (carrierKind == program_plan::TapeCarrier::TapeData)
         return 0;
     if (carrierKind == program_plan::TapeCarrier::ReplaySegment)
@@ -592,14 +829,13 @@ size_t ProgramInvocationFrame::carrierIndex(program_plan::TapeCarrier carrierKin
     return invalidCarrier;
 }
 
-ProgramInvocationFrame::Carrier *ProgramInvocationFrame::carrier(uint32_t value,
-                                                                 program_plan::TapeCarrier carrierKind) {
+LogicalValueFrame::Carrier *LogicalValueFrame::carrier(uint32_t value, program_plan::TapeCarrier carrierKind) {
     const size_t index = carrierIndex(carrierKind);
     return value < carriers_.size() && index != invalidCarrier ? &carriers_[value][index] : nullptr;
 }
 
-const ProgramInvocationFrame::Carrier *ProgramInvocationFrame::carrier(uint32_t value,
-                                                                       program_plan::TapeCarrier carrierKind) const {
+const LogicalValueFrame::Carrier *LogicalValueFrame::carrier(uint32_t value,
+                                                             program_plan::TapeCarrier carrierKind) const {
     const size_t index = carrierIndex(carrierKind);
     return value < carriers_.size() && index != invalidCarrier ? &carriers_[value][index] : nullptr;
 }

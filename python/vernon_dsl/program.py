@@ -1014,6 +1014,55 @@ def _parse_pipeline_program(pipeline: Any, features: tuple[str, ...] = ()) -> An
     return parsed
 
 
+def _parse_kernel_program(
+    kernel: Any,
+    features: tuple[str, ...] = (),
+    *,
+    transform: Any | None = None,
+) -> Any:
+    """Capture a compute Kernel or Kernel VJP as the same one-node Program used by Modules."""
+
+    from .frontend.runtime_types import runtime_parameter_descriptor
+    from .types import u32
+
+    function = kernel._function
+    lowered = kernel._lower(features)
+    annotations = inspect.get_annotations(function, eval_str=True)
+    parameter_names = tuple(name for name in inspect.signature(function).parameters if name not in lowered.builtins)
+    parameter_types: dict[str, Any] = {}
+    for name in parameter_names:
+        annotation = annotations.get(name)
+        if annotation is None:
+            raise TypeError(f"kernel argument {name!r} requires a runtime annotation")
+        parameter_types[name] = runtime_parameter_descriptor(annotation)
+    for axis in "xyz":
+        parameter_types[f"__grid_{axis}"] = runtime_parameter_descriptor(u32)
+
+    _, invocation, parsed = _one_node_program(
+        kernel,
+        parameter_types,
+        lambda capture, inputs: capture.capture_kernel(
+            kernel,
+            tuple(inputs[name] for name in parameter_names),
+            tuple(inputs[f"__grid_{axis}"] for axis in "xyz"),
+            features,
+            lowered=lowered,
+        ),
+        output_names=None,
+    )
+    if transform is not None:
+        from .program_frontend import parse_program
+
+        selected_outputs = transform.output_cotangents or tuple(invocation.graph.outputs)
+        return parse_program(
+            invocation,
+            vjp_wrt=transform.wrt,
+            vjp_outputs=selected_outputs,
+            autodiff_planning_policy=transform.planning_policy,
+        )
+    return parsed
+
+
 @dataclass(frozen=True)
 class _AllocationSpec:
     dtype: Any

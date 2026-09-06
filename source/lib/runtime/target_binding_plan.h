@@ -20,7 +20,13 @@ enum class SourceRepresentation {
     TensorViewDescriptor,
     ResourceHandle,
     SystemValue,
+    ImplicitSampler,
 };
+
+/* True when the runtime supplies the binding itself, so it projects no Program Value and has no parameter. */
+inline bool internalSource(SourceRepresentation source) {
+    return source == SourceRepresentation::SystemValue || source == SourceRepresentation::ImplicitSampler;
+}
 
 enum class TargetCarrier {
     InlineValue,
@@ -64,6 +70,7 @@ struct ViewTransform {
 struct ProgramProjection {
     uint32_t value{UINT32_MAX};
     std::optional<size_t> leaf;
+    ValueBindingDirection direction{ValueBindingDirection::Input};
 };
 
 struct TargetEndpointIdentity {
@@ -148,6 +155,7 @@ struct TargetBindingPlan {
 };
 
 struct ResolvedExecutableNode {
+    std::string graph;
     const Node *node{};
     const ResolvedStage *stage{};
     TargetBindingPlan plan;

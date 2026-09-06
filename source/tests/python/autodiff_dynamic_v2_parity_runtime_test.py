@@ -275,7 +275,11 @@ def main() -> None:
                 loss,
                 grid=(2, 1, 1),
             )
-        cotangent = np.array([[[[1.0, 0.0], [0.0, 3.0]]]], dtype=np.float32)
+        cotangent = (
+            np.array([1.0, 3.0], dtype=np.float32)
+            if cooked
+            else np.array([[[[1.0, 0.0], [0.0, 3.0]]]], dtype=np.float32)
+        )
         first = pullback(cotangent)
         second = pullback(cotangent)
         if first["left"] is not first["right"] or second["left"] is not second["right"]:
@@ -340,7 +344,7 @@ def main() -> None:
             (1, 1, 1),
         )
     except ValueError as error:
-        if "shape [3, 3, 4, 5] does not match reflection [3, 2, 4, 5]" not in str(error):
+        if "bound shape for Program value 0 conflicts with the declared Program shape" not in str(error):
             raise
     else:
         raise AssertionError("partially dynamic cooked VJP accepted a mismatched static extent")

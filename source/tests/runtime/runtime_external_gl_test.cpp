@@ -601,7 +601,7 @@ nlohmann::json vectorValueLayout(const char *dtype, uint32_t components) {
 
 std::string pipelineBundle(const nlohmann::json &artifact) {
     nlohmann::json root = {
-        {"pipeline_version", VERNON_PIPELINE_VERSION},
+        {"program_version", VERNON_PROGRAM_VERSION},
         {"type", "pipeline"},
         {"id", "pipeline/gl"},
         {"target", {{"kind", "opengl"}, {"options", nlohmann::json::object()}}},
@@ -837,7 +837,7 @@ void expectMatrixUpload(VernonRuntimeBackend backend, const char *target, uint16
     VernonColorAttachment attachment{0, renderTargetView.reference};
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
@@ -891,7 +891,7 @@ void expectIntegerUniformUpload(const char *dtype, VernonDataType dataType, cons
     VernonColorAttachment attachment{0, renderTargetView.reference};
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
@@ -1075,7 +1075,7 @@ TEST(RuntimeExternalGl, InvokesDirectComputePipelineThroughRuntimeCoreProvider) 
     arguments[1].tensor.byte_size = sizeof(factor);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
@@ -1165,7 +1165,7 @@ TEST(RuntimeExternalGl, RejectsStorageImageMetadataThatDisagreesWithRhiResource)
     argument.image.view = imageView.reference;
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};
@@ -1241,13 +1241,19 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     const std::string bundleData((std::istreambuf_iterator<char>(manifestInput)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundleData.empty());
     const nlohmann::json manifest = nlohmann::json::parse(bundleData);
-    const std::string fragmentId = manifest["variants"][0]["program"]["fragment"];
-    const std::filesystem::path fragmentPath =
-        manifestPath.parent_path() / manifest["stage_artifacts"][fragmentId]["artifact"]["path"].get<std::string>();
-    std::ifstream fragmentInput(fragmentPath, std::ios::binary);
-    const std::string fragmentSource((std::istreambuf_iterator<char>(fragmentInput)), std::istreambuf_iterator<char>());
-    EXPECT_NE(fragmentSource.find("uniform int max_steps;"), std::string::npos);
-    EXPECT_NE(fragmentSource.find("uniform vec2 _vernon_resolution;"), std::string::npos);
+    const auto &artifactSystem = manifest["variants"][0]["artifact_system"];
+    const auto &artifact = artifactSystem["artifacts"].begin().value();
+    const auto fragmentModule =
+        std::find_if(artifact["modules"].begin(), artifact["modules"].end(),
+                     [](const nlohmann::json &module) { return module.value("role", "") == "fragment"; });
+    ASSERT_NE(fragmentModule, artifact["modules"].end());
+    const std::string blob = (*fragmentModule)["blob"].get<std::string>();
+    const std::filesystem::path shaderPath =
+        manifestPath.parent_path() / manifest["blobs"][blob]["location"]["uri"].get<std::string>();
+    std::ifstream shaderInput(shaderPath, std::ios::binary);
+    const std::string shaderSource((std::istreambuf_iterator<char>(shaderInput)), std::istreambuf_iterator<char>());
+    EXPECT_NE(shaderSource.find("uniform int max_steps;"), std::string::npos);
+    EXPECT_NE(shaderSource.find("uniform vec2 _vernon_resolution;"), std::string::npos);
 
     resolutionUpload.fill(0.0F);
     signedUniformUpload.fill(0);
@@ -1275,8 +1281,14 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     constexpr GlInt maxSteps = 19;
     constexpr std::array<uint64_t, 2> positionShape{3, 2};
     constexpr std::array<int64_t, 2> positionStrides{2 * sizeof(float), sizeof(float)};
+    VernonProgramParameterView maxStepsParameter{};
+    VernonProgramParameterView positionParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"max_steps", 9}, &maxStepsParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
+              VERNON_STATUS_OK);
     std::array<VernonProgramArgument, 2> arguments{};
-    arguments[0].slot = 0;
+    arguments[0].slot = maxStepsParameter.slot;
     arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_HOST;
@@ -1284,7 +1296,7 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     arguments[0].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
     arguments[0].tensor.access = VERNON_ACCESS_READ;
     arguments[0].tensor.byte_size = sizeof(maxSteps);
-    arguments[1].slot = 1;
+    arguments[1].slot = positionParameter.slot;
     arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
@@ -1296,14 +1308,9 @@ TEST(RuntimeExternalGl, InvokesGeneratedResolutionAndSignedUniformPipeline) {
     arguments[1].tensor.byte_strides = positionStrides.data();
     arguments[1].tensor.byte_size = sizeof(positions);
     VernonColorAttachment attachment{0, renderTargetView.reference};
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments.data();
-    invocation.argument_count = arguments.size();
-    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
-    graphics.bind(invocation);
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    const vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(gl).data, vernonRuntimeGetLastError(gl).size);
     EXPECT_EQ(resolutionUpload, (std::array<float, 2>{37.0F, 23.0F}));
     EXPECT_EQ(signedUniformUpload[0], maxSteps);
@@ -1479,7 +1486,7 @@ TEST(RuntimeExternalGl, SuppliesImplicitSamplerAndEffectiveResolution) {
     attachment.view = targetView.reference;
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
@@ -1587,7 +1594,7 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
     ASSERT_EQ(vernonRuntimeReferenceRhiImageView(gl, targetView, &attachment.view), VERNON_STATUS_OK);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
@@ -1671,7 +1678,7 @@ TEST(RuntimeExternalGl, BindsExplicitSamplerSeparately) {
     VernonColorAttachment attachment{0, targetView.reference};
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = std::size(arguments);
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3);
@@ -1733,7 +1740,7 @@ TEST(RuntimeExternalGl, BindsVertexAndIndexBuffersThroughRhi) {
     const VernonColorAttachment attachment{0, targetView.reference};
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3, 3);
@@ -1817,7 +1824,7 @@ TEST(RuntimeExternalGl, BindsAllFormalVertexNumericFormatsAndRejectsUnsupportedF
         const VernonColorAttachment attachment{0, targetView.reference};
         VernonProgramSubmitDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PIPELINE_VERSION;
+        invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = &argument;
         invocation.argument_count = 1;
         vernon::tests::GraphicsInvocationControls graphics(&attachment, 1, 3, 3);
@@ -1947,7 +1954,7 @@ TEST(RuntimeExternalGl, LoadsAssetsAndInvokesPipeline) {
     dynamic.stencil_reference = 23;
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.graphics_state = &graphicsState;
     invocation.render_pass = &renderPass;
     invocation.draw_command = &draw;

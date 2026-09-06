@@ -1524,9 +1524,9 @@ bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &er
 
 bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error) {
     static constexpr std::string_view keys[] = {
-        "pipeline_version", "type",     "id",          "target", "runtime_requirements", "variants",
-        "stage_artifacts",  "autodiff", "content_hash"};
-    for (std::string_view required : {"pipeline_version", "type", "id", "target", "runtime_requirements", "variants",
+        "program_version", "type",     "id",          "target", "runtime_requirements", "variants",
+        "stage_artifacts", "autodiff", "content_hash"};
+    for (std::string_view required : {"program_version", "type", "id", "target", "runtime_requirements", "variants",
                                       "stage_artifacts", "content_hash"})
         if (!root.contains(std::string(required))) {
             error = "pipeline manifest is missing a required root field";

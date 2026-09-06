@@ -56,7 +56,6 @@ def compiled_stage_from_program(
     program: Any,
     *,
     module: str,
-    module_manifest: str,
     entry: str,
     target: TargetOptions,
     metadata: Mapping[str, Any] = MappingProxyType({}),
@@ -83,7 +82,6 @@ def compiled_stage_from_program(
         target = make_target_options(kind, options)
     return CompiledStage(
         module,
-        module_manifest,
         entry,
         stage,
         target,

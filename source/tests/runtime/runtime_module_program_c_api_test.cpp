@@ -54,15 +54,13 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    VernonExecutableBundleKind bundleKind{};
-    ASSERT_EQ(vernonRuntimeExecutableBundleInspectKind(manifest.data(), manifest.size(), &bundleKind),
-              VERNON_STATUS_OK);
-    ASSERT_EQ(bundleKind, VERNON_EXECUTABLE_BUNDLE_PROGRAM);
 
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
-    VernonProgramExecutable *pipeline = vernonRuntimeLoadManagedProgramBundleWithOptions(
-        context, manifest.data(), manifest.size(), {nullptr, 0}, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
     ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
@@ -71,13 +69,6 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
     ASSERT_EQ(sourceParameter.kind, VERNON_PROGRAM_TENSOR);
     ASSERT_EQ(outputParameter.kind, VERNON_PROGRAM_TENSOR);
-
-    VernonAdValueSet emptyValues{sizeof(VernonAdValueSet), nullptr, 0, {}};
-    VernonPullback *legacyPullback = nullptr;
-    EXPECT_EQ(vernonAdProgramForward(pipeline, {1, 1, 1}, &emptyValues, &emptyValues, &legacyPullback),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(legacyPullback, nullptr);
-    EXPECT_NE(lastError(context).find("vernonRuntimeProgramForward"), std::string::npos);
 
     VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
     ASSERT_NE(instance, nullptr);
@@ -176,6 +167,7 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
     vernonRuntimeProgramInstanceDestroy(instance);
     EXPECT_EQ(controlLeaseCount, 0);
     vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 

@@ -6,7 +6,8 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, TypeAlias
 
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..diagnostics import ProgramCompileError
 
 
 def canonical_json(value: Any) -> str:
@@ -18,10 +19,6 @@ def canonical_json(value: Any) -> str:
     """
 
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-class ProgramCompileError(ValueError):
-    pass
 
 
 def frozen_mapping(value: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -201,7 +198,6 @@ class CompiledArtifact:
 @dataclass(frozen=True)
 class CompiledStage:
     module: str
-    module_manifest: str
     entry: str
     stage: str
     target: TargetOptions
@@ -221,7 +217,7 @@ class CompiledStage:
     def identity(self) -> dict[str, Any]:
         return {
             "compiler_contract_version": COMPILER_CONTRACT_VERSION,
-            "pipeline_version": PIPELINE_VERSION,
+            "program_version": PROGRAM_VERSION,
             "module": self.module,
             "entry": self.entry,
             "stage": self.stage,
@@ -235,112 +231,63 @@ class CompiledStage:
     def id(self) -> str:
         return hashlib.sha256(canonical_json(self.identity).encode("utf-8")).hexdigest()
 
-    def logical_record(self) -> dict[str, Any]:
-        record = {
-            "entry": self.entry,
-            "stage": self.stage,
-            "reflection": dict(self.reflection),
-        }
-        return record
-
 
 @dataclass(frozen=True)
-class VariantPlan:
+class ProgramVariantPlan:
     key: tuple[str, ...]
-    program: Mapping[str, str]
-    parameters: tuple[Mapping[str, Any], ...]
-    internal_parameters: tuple[Mapping[str, Any], ...]
-    outputs: tuple[Mapping[str, Any], ...]
-    canonical_program: Mapping[str, Any] | None = None
+    program: Mapping[str, Any]
+    stage_implementations: Mapping[str, str]
 
     def __post_init__(self) -> None:
         if any(not feature for feature in self.key) or tuple(sorted(set(self.key))) != self.key:
-            raise ProgramCompileError("pipeline variant key must contain unique non-empty features in sorted order")
+            raise ProgramCompileError("Program variant key must contain unique non-empty features in sorted order")
+        required = {"stages", "parameters", "storages", "values", "graphs", "abi"}
+        optional = {"residual_contract"}
+        if set(self.program) - optional != required or set(self.program) - required - optional:
+            raise ProgramCompileError("canonical Program has non-contract root members")
+        graphs = self.program.get("graphs")
+        if not isinstance(graphs, list):
+            raise ProgramCompileError("canonical Program graphs must be an array")
+        has_backward = any(isinstance(graph, Mapping) and graph.get("direction") == "backward" for graph in graphs)
+        if ("residual_contract" in self.program) != has_backward:
+            raise ProgramCompileError("canonical Program residual contract does not match its graphs")
+        stages = self.program.get("stages")
+        if not isinstance(stages, Mapping):
+            raise ProgramCompileError("canonical Program has no stage contracts")
+        implementations = dict(self.stage_implementations)
+        if set(implementations) != set(stages):
+            raise ProgramCompileError("Program stage implementations must exactly cover its logical stages")
+        if any(not isinstance(value, str) or not value for value in implementations.values()):
+            raise ProgramCompileError("Program stage implementation identities must be non-empty strings")
         object.__setattr__(self, "program", frozen_mapping(self.program))
-        if self.canonical_program is not None:
-            object.__setattr__(self, "canonical_program", frozen_mapping(self.canonical_program))
-        for name in ("parameters", "internal_parameters", "outputs"):
-            values = tuple(frozen_mapping(value) for value in getattr(self, name))
-            object.__setattr__(self, name, values)
-
-    def to_dict(self) -> dict[str, Any]:
-        result = {
-            "key": list(self.key),
-            "program": dict(self.program),
-            "parameters": [dict(value) for value in self.parameters],
-            "outputs": [dict(value) for value in self.outputs],
-        }
-        if self.internal_parameters:
-            result["internal_parameters"] = [dict(value) for value in self.internal_parameters]
-        return result
+        object.__setattr__(self, "stage_implementations", frozen_mapping(implementations))
 
 
 @dataclass(frozen=True)
 class BundlePlan:
-    pipeline_id: str
+    program_id: str
     target: TargetOptions
-    features: tuple[str, ...]
-    variants: tuple[VariantPlan, ...]
-    stages: tuple[CompiledStage, ...]
-    transform: Mapping[str, Any] | None = None
-    autodiff_profiles: Mapping[str, Any] | None = None
+    variants: tuple[ProgramVariantPlan, ...]
+    compiled_stages: tuple[CompiledStage, ...]
 
     def __post_init__(self) -> None:
-        if (self.transform is None) != (self.autodiff_profiles is None):
-            raise ProgramCompileError("differentiated bundles require both program_transform and autodiff_profiles")
-        if self.transform is not None:
-            object.__setattr__(self, "transform", frozen_mapping(self.transform))
-        if self.autodiff_profiles is not None:
-            object.__setattr__(self, "autodiff_profiles", frozen_mapping(self.autodiff_profiles))
-
-    def logical_dict(self) -> dict[str, Any]:
-        from .requirements import runtime_requirements
-
-        variant_records = [variant.to_dict() for variant in self.variants]
-        variant_keys = [variant.key for variant in self.variants]
-        if len(set(variant_keys)) != len(variant_keys):
-            raise ProgramCompileError("pipeline variants contain duplicate canonical keys")
-        if self.transform is not None:
-            profile_rows = (self.autodiff_profiles or {})["variants"]
-            profile_keys = [tuple(profile["key"]) for profile in profile_rows]
-            if any(any(not feature for feature in key) or tuple(sorted(set(key))) != key for key in profile_keys):
-                raise ProgramCompileError("autodiff profile variant keys are not canonical")
-            if len(set(profile_keys)) != len(profile_keys):
-                raise ProgramCompileError("autodiff profiles contain duplicate variant keys")
-            profiles = {
-                tuple(profile["key"]): {name: value for name, value in profile.items() if name != "key"}
-                for profile in profile_rows
-            }
-            if set(profiles) != {variant.key for variant in self.variants}:
-                raise ProgramCompileError("autodiff profiles do not exactly cover pipeline variants")
-        result = {
-            "pipeline_version": PIPELINE_VERSION,
-            "type": "pipeline",
-            "id": self.pipeline_id,
-            "target": self.target.spec,
-            "variants": variant_records,
-            "stage_artifacts": {
-                stage.id: stage.logical_record() for stage in sorted(self.stages, key=lambda value: value.id)
-            },
-        }
-        if self.transform is not None:
-            result["autodiff"] = {
-                "kind": self.transform["kind"],
-                "wrt": list(self.transform["wrt"]),
-                "output_cotangents": list(self.transform["output_cotangents"]),
-                "profiles": [
-                    {
-                        "variant_key": list(variant.key),
-                        **{name: value for name, value in profiles[variant.key].items() if name != "profiles"},
-                        **profiles[variant.key]["profiles"],
-                    }
-                    for variant in self.variants
-                ],
-            }
-        requirements = runtime_requirements(self.target.target, self.stages)
-        if requirements is not None:
-            result["runtime_requirements"] = requirements
-        return result
+        if not isinstance(self.program_id, str) or not self.program_id:
+            raise ProgramCompileError("Program plan id must be a non-empty string")
+        if not self.variants:
+            raise ProgramCompileError("Program plan requires at least one variant")
+        keys = tuple(variant.key for variant in self.variants)
+        if len(set(keys)) != len(keys):
+            raise ProgramCompileError("Program variants contain duplicate canonical keys")
+        if keys != tuple(sorted(keys, key=lambda key: canonical_json(list(key)))):
+            raise ProgramCompileError("Program variants are not ordered by canonical key bytes")
+        stages = {stage.id: stage for stage in self.compiled_stages}
+        if len(stages) != len(self.compiled_stages):
+            raise ProgramCompileError("compiled Program stages contain duplicate identities")
+        referenced = {stage_id for variant in self.variants for stage_id in variant.stage_implementations.values()}
+        if referenced != set(stages):
+            raise ProgramCompileError("compiled stages must exactly cover Program variant implementations")
+        if any(stage.target.spec != self.target.spec for stage in self.compiled_stages):
+            raise ProgramCompileError("compiled Program stage target does not match the bundle target")
 
 
 __all__ = [
@@ -356,6 +303,6 @@ __all__ = [
     "ProgramCompileError",
     "TargetOptions",
     "VulkanTargetOptions",
-    "VariantPlan",
+    "ProgramVariantPlan",
     "make_target_options",
 ]

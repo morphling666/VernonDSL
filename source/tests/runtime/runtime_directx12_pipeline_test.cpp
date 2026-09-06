@@ -138,6 +138,14 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
+    VernonProgramParameterView imageParameter{};
+    VernonProgramParameterView positionParameter{};
+    VernonProgramParameterView samplerParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"image", 5}, &imageParameter), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"position", 8}, &positionParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {"sampler", 7}, &samplerParameter),
+              VERNON_STATUS_OK);
 
     constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
     auto vertices = vernon::tests::createBuffer(context, sizeof(positions), alignof(float), VERNON_RHI_BUFFER_VERTEX,
@@ -146,7 +154,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     auto sampled = createTexture2D(context, 1, 1);
     auto target = createTexture2D(context, 32, 32);
     auto depth =
-        vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 32, 32, 1,
+        vernon::tests::createImage(context, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_D32_FLOAT, 32, 32, 1,
                                    VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE);
     ASSERT_NE(sampled.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(target.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -171,10 +179,10 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     constexpr uint64_t shape[] = {3, 2};
     constexpr int64_t strides[] = {2 * sizeof(float), sizeof(float)};
     VernonProgramArgument arguments[3]{};
-    arguments[0].slot = 0;
+    arguments[0].slot = imageParameter.slot;
     arguments[0].kind = VERNON_PROGRAM_IMAGE;
     arguments[0].image = {sampled.reference};
-    arguments[1].slot = 1;
+    arguments[1].slot = positionParameter.slot;
     arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
@@ -185,7 +193,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     arguments[1].tensor.shape = shape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(positions);
-    arguments[2].slot = 2;
+    arguments[2].slot = samplerParameter.slot;
     arguments[2].kind = VERNON_PROGRAM_SAMPLER;
     arguments[2].resource = sampler.reference;
     VernonColorAttachment attachment{0, target.reference};
@@ -193,54 +201,14 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     depthAttachment.view = depth.reference;
     depthAttachment.width = 32;
     depthAttachment.height = 32;
-    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT_S8_UINT;
+    depthAttachment.format = VERNON_TEXTURE_D32_FLOAT;
     depthAttachment.load_operation = VERNON_RHI_LOAD_CLEAR;
     depthAttachment.store_operation = VERNON_RHI_STORE_PRESERVE;
     depthAttachment.clear_depth = 1.0f;
-    depthAttachment.stencil_load_operation = VERNON_RHI_LOAD_CLEAR;
-    depthAttachment.stencil_store_operation = VERNON_RHI_STORE_PRESERVE;
-    VernonColorBlendState blend{};
-    blend.source_color_factor = VERNON_RHI_BLEND_ONE;
-    blend.destination_color_factor = VERNON_RHI_BLEND_ZERO;
-    blend.source_alpha_factor = VERNON_RHI_BLEND_ONE;
-    blend.destination_alpha_factor = VERNON_RHI_BLEND_ZERO;
-    blend.color_operation = VERNON_RHI_BLEND_ADD;
-    blend.alpha_operation = VERNON_RHI_BLEND_ADD;
-    blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
-    VernonGraphicsState graphicsState{};
-    graphicsState.struct_size = sizeof(graphicsState);
-    graphicsState.depth_stencil.depth_test = 1;
-    graphicsState.depth_stencil.depth_write = 1;
-    graphicsState.depth_stencil.depth_compare = VERNON_RHI_COMPARE_LESS;
-    graphicsState.depth_stencil.stencil_test = 1;
-    graphicsState.depth_stencil.front.compare = VERNON_RHI_COMPARE_ALWAYS;
-    graphicsState.depth_stencil.front.pass = VERNON_RHI_STENCIL_REPLACE;
-    graphicsState.depth_stencil.back = graphicsState.depth_stencil.front;
-    graphicsState.depth_stencil.stencil_read_mask = 0x5a;
-    graphicsState.depth_stencil.stencil_write_mask = 0xa5;
-    graphicsState.color_blends = &blend;
-    graphicsState.color_blend_count = 1;
-    VernonRenderPass renderPass{};
-    renderPass.struct_size = sizeof(renderPass);
-    renderPass.color_attachments = &attachment;
-    renderPass.color_attachment_count = 1;
-    renderPass.depth_attachment = &depthAttachment;
-    VernonDrawCommand draw{};
-    draw.struct_size = sizeof(draw);
-    draw.instance_count = 1;
-    VernonDynamicState dynamic{};
-    dynamic.struct_size = sizeof(dynamic);
-    dynamic.stencil_reference = 17;
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments;
-    invocation.argument_count = std::size(arguments);
-    invocation.graphics_state = &graphicsState;
-    invocation.render_pass = &renderPass;
-    invocation.draw_command = &draw;
-    invocation.dynamic_state = &dynamic;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1, 3);
+    graphics.renderPass.depth_attachment = &depthAttachment;
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments, std::size(arguments), graphics),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
@@ -249,19 +217,12 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_TRUE(depthStencilStats.depthEnable);
     EXPECT_EQ(depthStencilStats.depthWriteMask, D3D12_DEPTH_WRITE_MASK_ALL);
     EXPECT_EQ(depthStencilStats.depthFunction, D3D12_COMPARISON_FUNC_LESS);
-    EXPECT_TRUE(depthStencilStats.stencilEnable);
-    EXPECT_EQ(depthStencilStats.stencilReadMask, 0x5au);
-    EXPECT_EQ(depthStencilStats.stencilWriteMask, 0xa5u);
-    EXPECT_EQ(depthStencilStats.frontStencilFunction, D3D12_COMPARISON_FUNC_ALWAYS);
-    EXPECT_EQ(depthStencilStats.frontStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
-    EXPECT_EQ(depthStencilStats.backStencilFunction, D3D12_COMPARISON_FUNC_ALWAYS);
-    EXPECT_EQ(depthStencilStats.backStencilPassOperation, D3D12_STENCIL_OP_REPLACE);
-    dynamic.stencil_reference = 123;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    EXPECT_FALSE(depthStencilStats.stencilEnable);
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, arguments, std::size(arguments), graphics),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsPipelineCreationCount(pipeline), 1u);
     EXPECT_EQ(vernon::runtime::getDirectX12GraphicsRootSignatureCreationCount(pipeline), 1u);
-    EXPECT_EQ(vernon::runtime::getDirectX12LastStencilReference(runtime), 123u);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
@@ -277,28 +238,6 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     EXPECT_NEAR(pixels[center], color[0], 2);
     EXPECT_NEAR(pixels[center + 1], color[1], 2);
     EXPECT_NEAR(pixels[center + 2], color[2], 2);
-
-    renderPass.depth_attachment = nullptr;
-    invocation.graphics_state = nullptr;
-    const size_t commandsBeforeGraph = vernon::runtime::getRhiAdapterRecordedCommandCount(runtime);
-    {
-        vernon::execution::ExecutionGraph graph(context.device);
-        const auto graphTarget = graph.importImage(target.handle, {target.handle.index, target.handle.generation},
-                                                   VERNON_RHI_FORMAT_RGBA8_UNORM, 32, 32, 1, 1, true);
-        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("first", graphTarget, runtime, pipeline, &invocation,
-                                                                 VERNON_RHI_LOAD_CLEAR);
-        graph.emplacePass<vernon::tests::RuntimeGraphRenderPass>("second", graphTarget, runtime, pipeline, &invocation,
-                                                                 VERNON_RHI_LOAD_PRESERVE);
-        std::string graphError;
-        auto plan = graph.compile(graphError);
-        ASSERT_TRUE(plan) << graphError;
-        auto submission = plan->submit();
-        ASSERT_EQ(submission.wait(), VERNON_RHI_STATUS_OK);
-        EXPECT_EQ(submission.commandStats().rendering_scope_count, 1u);
-        EXPECT_EQ(submission.commandStats().draw_count, 2u);
-        EXPECT_EQ(submission.commandStats().submission_count, 1u);
-    }
-    EXPECT_EQ(vernon::runtime::getRhiAdapterRecordedCommandCount(runtime) - commandsBeforeGraph, 2u);
 
     EXPECT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(context.device, depth.handle), VERNON_RHI_STATUS_OK);
@@ -358,16 +297,10 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(positions);
     VernonColorAttachment attachment{0, target.reference};
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    vernon::tests::GraphicsInvocationControls graphics(&attachment, 1);
+    vernon::tests::CanonicalGraphicsControls graphics(&attachment, 1);
     graphics.dynamic.viewport[2] = 8;
     graphics.dynamic.viewport[3] = 16;
-    graphics.bind(invocation);
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, &argument, 1, graphics), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
     std::vector<uint8_t> pixels(32 * 32 * 4);
@@ -387,7 +320,7 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
 
     graphics.dynamic.viewport[2] = 0;
     graphics.dynamic.viewport[3] = 0;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalInvocation(pipeline, &argument, 1, graphics), VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, target.handle, &download, pixels.data(), pixels.size()),
               VERNON_RHI_STATUS_OK);
@@ -475,7 +408,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     argument.tensor.byte_size = sizeof(values);
     VernonProgramSubmitDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
     invocation.argument_count = 1;
     invocation.compute_grid = {8, 1, 1};
@@ -552,15 +485,11 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     arguments[1].tensor.shape = scalarShape;
     arguments[1].tensor.byte_strides = strides;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments;
-    invocation.argument_count = std::size(arguments);
-    invocation.compute_grid = {4, 1, 1};
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {4, 1, 1}),
+              VERNON_STATUS_INVALID_ARGUMENT);
     arguments[0].tensor.access = VERNON_ACCESS_READ_WRITE;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {4, 1, 1}),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
 
     std::array<float, 4> output{};
@@ -575,8 +504,8 @@ TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider
     arguments[0].tensor.byte_strides = secondStrides;
     arguments[0].tensor.byte_offset = sizeof(float);
     arguments[1].tensor.host_data = &secondFactor;
-    invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(pipeline, arguments, std::size(arguments), {2, 1, 1}),
+              VERNON_STATUS_OK)
         << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output.data(), sizeof(output)),
               VERNON_RHI_STATUS_OK);

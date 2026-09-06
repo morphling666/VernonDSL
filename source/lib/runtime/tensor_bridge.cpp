@@ -120,8 +120,9 @@ bool tensorPhysicalRange(const VernonTensorView &tensor, TensorPhysicalRange &ra
             return false;
         range.base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tensor.host_data));
     } else if (tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-        if (!tensor.resource.identity || !tensor.resource.resource.value || tensor.byte_size > tensor.resource.size ||
-            tensor.resource.size > std::numeric_limits<uint64_t>::max() - tensor.resource.offset)
+        if (!tensor.resource.identity || !tensor.resource.resource.value ||
+            (tensor.resource.size && tensor.byte_size > tensor.resource.size) ||
+            tensor.byte_size > std::numeric_limits<uint64_t>::max() - tensor.resource.offset)
             return false;
         range.base = tensor.resource.offset;
     } else {

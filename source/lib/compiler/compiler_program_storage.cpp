@@ -113,7 +113,7 @@ controlValueReference(int64_t like, llvm::StringRef allocationGraph, bool captur
                       const std::map<int64_t, ProgramArgumentSlot> &argumentSlots, const std::set<int64_t> &captures,
                       const std::map<int64_t, ProgramValueProducer> &producerByValue, std::string &error) {
     if (isCurrentGraphArgument(like, allocationGraph, argumentSlots))
-        return llvm::json::Object{{"argument", argumentSlots.at(like).slot}};
+        return llvm::json::Object{{"value", like}};
     if (captureLegal && captures.count(like))
         return llvm::json::Object{{"capture", like}};
     error = producerByValue.count(like) ? "owned Program Storage like-source has NodeResultOrigin"
@@ -216,7 +216,11 @@ bool indexProgramResources(const llvm::json::Array &values, const std::vector<Ca
                 const bool writable = logical.access == "write" || logical.access == "read_write";
                 if ((!writable && logical.after) ||
                     (writable && !logical.after && !index.producerByValue.count(*value))) {
-                    error = "canonical Program writable resources require exact before/after Storage SSA";
+                    error = "canonical Program stage '" + requestId->str() + "' resource Value " +
+                            std::to_string(*value) + " ('" +
+                            (logicalValue ? logicalValue->getString("name").value_or("<unnamed>").str() : "<unknown>") +
+                            "', type '" + type.str() + "') with access '" + logical.access +
+                            "' violates exact before/after Storage SSA";
                     return false;
                 }
                 index.storageParents.emplace(*value, *value);

@@ -49,6 +49,20 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
     };
     llvm::StringMap<mlir::Type> primalInputs;
     llvm::StringMap<mlir::Type> primalOutputs;
+    const auto findPrimalType = [&](const llvm::StringMap<mlir::Type> &boundaries, llvm::StringRef path) {
+        path = publicPath(path);
+        mlir::Type result;
+        size_t matched = 0;
+        for (const auto &boundary : boundaries) {
+            const llvm::StringRef root = boundary.getKey();
+            if ((path == root || (path.starts_with(root) && path.size() > root.size() && path[root.size()] == '.')) &&
+                root.size() > matched) {
+                result = boundary.getValue();
+                matched = root.size();
+            }
+        }
+        return result;
+    };
     for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
         auto direction = function->getAttrOfType<mlir::StringAttr>("vernon_program.graph");
         if (!direction || direction.getValue() != "forward")
@@ -82,6 +96,11 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             mlir::vernon::getAutodiffDerivativeValueLayout(derivativeOf, derivativeType, module, logicalDtypes);
         if (mlir::failed(layout))
             return mlir::failure();
+        if (mlir::isa<mlir::vernon::TensorType, mlir::RankedTensorType>(derivativeType)) {
+            layout = mlir::vernon::getValueAbiLayout(derivativeType, module, logicalDtypes);
+            if (mlir::failed(layout))
+                return mlir::failure();
+        }
         mlir::Type logicalType = derivativeType;
         if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(logicalType))
             logicalType = view.getElementType();
@@ -253,8 +272,7 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     logicalDtypes.push_back(mlir::cast<mlir::StringAttr>(dtype).getValue());
             mlir::Type derivativeOf;
             if (!capture && direction.getValue() == "backward")
-                if (auto found = primalOutputs.find(publicPath(name)); found != primalOutputs.end())
-                    derivativeOf = found->second;
+                derivativeOf = findPrimalType(primalOutputs, name);
             std::optional<llvm::StringRef> logicalDtype;
             if (auto dtype = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.dtype"))
                 logicalDtype = dtype.getValue();
@@ -323,14 +341,10 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 auto source = mlir::dyn_cast<mlir::StringAttr>(sources[index]);
                 if (!role || !source)
                     return {};
-                if (role.getValue() == "gradient") {
-                    auto found = primalInputs.find(publicPath(source.getValue()));
-                    return found == primalInputs.end() ? mlir::Type{} : found->second;
-                }
-                if (role.getValue() == "cotangent") {
-                    auto found = primalOutputs.find(publicPath(source.getValue()));
-                    return found == primalOutputs.end() ? mlir::Type{} : found->second;
-                }
+                if (role.getValue() == "gradient")
+                    return findPrimalType(primalInputs, source.getValue());
+                if (role.getValue() == "cotangent")
+                    return findPrimalType(primalOutputs, source.getValue());
                 return {};
             };
             const size_t operandOffset =
@@ -490,7 +504,7 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     auto valueId =
                         function.getArgAttrOfType<mlir::IntegerAttr>(argumentIndex, "vernon_program.value_id");
                     grid.emplace_back(llvm::json::Object{
-                        {"control", llvm::json::Object{{"argument", valueId ? valueId.getInt() : -1}}}});
+                        {"control", llvm::json::Object{{"value", valueId ? valueId.getInt() : -1}}}});
                 }
             } else if (auto compute = mlir::dyn_cast<mlir::vernon::program::ComputeOp>(operation))
                 for (int64_t extent : compute.getGrid())
@@ -539,7 +553,7 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     auto valueId =
                         function.getArgAttrOfType<mlir::IntegerAttr>(argumentIndex, "vernon_program.value_id");
                     requestGrid.emplace_back(llvm::json::Object{
-                        {"control", llvm::json::Object{{"argument", valueId ? valueId.getInt() : -1}}}});
+                        {"control", llvm::json::Object{{"value", valueId ? valueId.getInt() : -1}}}});
                 }
             } else if (auto compute = mlir::dyn_cast<mlir::vernon::program::ComputeOp>(operation))
                 for (int64_t extent : compute.getGrid())
@@ -584,8 +598,7 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                         logicalDtypes.push_back(mlir::cast<mlir::StringAttr>(dtype).getValue());
                 mlir::Type derivativeOf;
                 if (direction.getValue() == "backward")
-                    if (auto found = primalInputs.find(publicPath(name)); found != primalInputs.end())
-                        derivativeOf = found->second;
+                    derivativeOf = findPrimalType(primalInputs, name);
                 std::optional<llvm::StringRef> logicalDtype;
                 if (auto dtype = function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.dtype"))
                     logicalDtype = dtype.getValue();

@@ -77,7 +77,7 @@ const VernonRuntimeProviderResourceReference *bindingResource(const VernonRuntim
 }
 
 bool providerIsValid(const VernonRuntimeDeviceProvider &provider, VernonRuntimeProviderPipelineKind kind) {
-    if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) || provider.abi_version != VERNON_PIPELINE_VERSION ||
+    if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) || provider.abi_version != VERNON_PROGRAM_VERSION ||
         !provider.get_capabilities || !provider.get_device_identity || !provider.prepare_shader ||
         !provider.prepare_pipeline_layout || !provider.prepare_pipeline || !provider.create_binding_set ||
         !provider.update_binding_set || !provider.retain_resource || !provider.release_resource ||

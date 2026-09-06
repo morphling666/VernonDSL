@@ -48,7 +48,8 @@ AutodiffResourceRole autodiffResourceRole(std::string_view role) {
 const CompiledEndpointAbi *findCompiledAbi(const StageArtifact &stage, const ReflectedEndpoint &endpoint) {
     const auto found =
         std::find_if(stage.compiledAbi.begin(), stage.compiledAbi.end(), [&](const CompiledEndpointAbi &compiled) {
-            return compiled.module == endpoint.module && compiled.index == endpoint.index;
+            return compiled.module == endpoint.module && compiled.interfaceKind == endpoint.interfaceKind &&
+                   compiled.index == endpoint.index;
         });
     return found == stage.compiledAbi.end() ? nullptr : &*found;
 }
@@ -62,12 +63,30 @@ const EndpointBinding *findBinding(const Node &node, const ReflectedEndpoint &en
 }
 
 uint32_t boundValueId(const Node &node, const EndpointBinding &binding) {
-    if (binding.tag != BindingTag::Resource || binding.access >= node.accesses.size())
-        return binding.value;
+    if (binding.tag != BindingTag::Resource)
+        return binding.projections.empty() ? UINT32_MAX : binding.projections.front().value;
+    if (binding.access >= node.accesses.size())
+        return UINT32_MAX;
     const ResourceAccess &access = node.accesses[binding.access];
     return access.kind == AccessKind::Initialize ? access.after
            : access.kind == AccessKind::Write    ? access.before
                                                  : access.value;
+}
+
+struct PhysicalValueLeaf {
+    TransportNode transport;
+    uint64_t offset{};
+};
+
+void collectPhysicalValueLeaves(const TransportNode &node, uint64_t base, std::vector<PhysicalValueLeaf> &leaves) {
+    if (node.kind != TransportNodeKind::Product) {
+        TransportNode leaf = node;
+        leaf.offset = 0;
+        leaves.push_back({std::move(leaf), base + node.offset});
+        return;
+    }
+    for (const TransportNode &child : node.children)
+        collectPhysicalValueLeaves(child, base + node.offset, leaves);
 }
 
 const EndpointAbiBinding *semantic(const ReflectedEndpoint &endpoint, const std::string &name,
@@ -331,8 +350,29 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         target.writeFootprintKind = endpoint.writeFootprintKind;
         target.writeFootprintIndices = endpoint.writeFootprintIndices;
 
-        if (endpoint.tag == "system")
+        if (endpoint.tag == "system") {
+            /* An implicit sampler is the one system endpoint a target must still bind. It has no boundary slot, so
+             * it never becomes a Program parameter, but the backend needs the images it pairs with. */
+            if (endpoint.builtin != "sampler")
+                continue;
+            if (compute) {
+                const program_capabilities::Entry &capability =
+                    program_capabilities::get(program_capabilities::Id::ComputeSamplerBinding);
+                return reject(diagnostic, std::string(capability.diagnosticCode), "/endpoints",
+                              std::string(capability.diagnostic));
+            }
+            const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
+            if (!compiled || compiled->sampledImageBindings.empty())
+                return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                              "implicit sampler is missing the sampled images it pairs with");
+            target.source = SourceRepresentation::ImplicitSampler;
+            target.kind = "sampler";
+            target.carrier = TargetCarrier::Sampler;
+            target.sampledImageBindings = compiled->sampledImageBindings;
+            target.native = {compiled->descriptorSet, compiled->binding, UINT32_MAX};
+            plan.bindings.push_back(std::move(target));
             continue;
+        }
         if (endpoint.interfaceKind == "system_value") {
             const EndpointAbiBinding *valueSlot = semantic(endpoint, "value");
             if (!valueSlot || !valueSlot->byteSize || !valueSlot->alignment)
@@ -404,21 +444,97 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         if (!binding)
             return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
                           "node does not bind a reflected endpoint");
+        if (binding->tag == BindingTag::Value && binding->projections.size() > 1) {
+            const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
+            const EndpointAbiBinding *slot = semantic(endpoint, "value");
+            if (backend != VERNON_RUNTIME_CPU || endpoint.tag != "value" || !compiled || !compiled->interfacePlan ||
+                !compiled->interfacePlan->root || !slot)
+                return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                              "aggregate value projections require a compiled CPU value transport");
+            std::vector<PhysicalValueLeaf> physicalLeaves;
+            collectPhysicalValueLeaves(*compiled->interfacePlan->root, 0, physicalLeaves);
+            for (const ValueEndpointProjection &projection : binding->projections) {
+                if (projection.value >= program.program.values.size() ||
+                    projection.physicalLeaf >= physicalLeaves.size())
+                    return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                                  "aggregate projection references value " + std::to_string(projection.value) + " of " +
+                                      std::to_string(program.program.values.size()) + " or physical leaf " +
+                                      std::to_string(projection.physicalLeaf) + " of " +
+                                      std::to_string(physicalLeaves.size()));
+                const Value &logical = program.program.values[projection.value];
+                if (!logical.layout)
+                    return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                                  "aggregate value projection has no canonical layout");
+                program::ValueLayout projectedLayout = *logical.layout;
+                if (projection.leaf) {
+                    if (*projection.leaf >= projectedLayout.leaves.size())
+                        return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                                      "aggregate value projection references an unknown canonical leaf");
+                    LayoutLeaf leaf = projectedLayout.leaves[*projection.leaf];
+                    const uint64_t scalarSize = scalarByteSize(leaf.dtype);
+                    leaf.byteOffset = 0;
+                    projectedLayout.leaves = {leaf};
+                    projectedLayout.byteSize = scalarSize * leaf.scalarCount;
+                    projectedLayout.alignment = scalarSize;
+                }
+                const PhysicalValueLeaf &physicalLeaf = physicalLeaves[projection.physicalLeaf];
+                if (projectedLayout.byteSize != physicalLeaf.transport.size)
+                    return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                                  "aggregate physical leaf size disagrees with its canonical projection");
+                TargetBinding projected = target;
+                projected.projection = {projection.value, projection.leaf, projection.direction};
+                if (projection.direction == ValueBindingDirection::Result) {
+                    projected.access = "write";
+                    projected.endpoint.access = "write";
+                }
+                projected.valueType = logical.canonicalType;
+                projected.name = valueName(program, projection.value);
+                projected.sourceName = projected.name;
+                projected.kind = "tensor";
+                projected.reflectedKind = logical.canonicalType.rankedValue ? "tensor_value" : "scalar";
+                projected.source = SourceRepresentation::WholeValueBytes;
+                projected.semantic = CarrierSemantic::Value;
+                projected.carrier = TargetCarrier::InlineValue;
+                projected.wholeValueLayout = materializeValueLayout(projectedLayout, logical.type);
+                projected.elementLayout = *projected.wholeValueLayout;
+                projected.endpoint.portableSlot = slot->slot;
+                InterfacePlan leafPlan = *compiled->interfacePlan;
+                leafPlan.root = physicalLeaf.transport;
+                leafPlan.frameOffset += physicalLeaf.offset;
+                projected.physical = {static_cast<size_t>(leafPlan.frameOffset),
+                                      static_cast<size_t>(physicalLeaf.transport.size),
+                                      static_cast<size_t>(physicalLeaf.transport.alignment)};
+                projected.transport = TargetPhysicalTransport{std::move(leafPlan), {}};
+                uint64_t &frameSize = cpuFrameOffset(projected);
+                const uint64_t projectedEnd =
+                    static_cast<uint64_t>(projected.physical.offset) + projected.physical.size;
+                frameSize = std::max(frameSize, projectedEnd);
+                plan.bindings.push_back(std::move(projected));
+            }
+            continue;
+        }
         const uint32_t valueId = boundValueId(node, *binding);
         if (valueId >= program.program.values.size())
             return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
                           "endpoint binding references an unknown Program value");
         const Value &value = program.program.values[valueId];
         target.projection.value = valueId;
-        target.projection.leaf = binding->leaf;
+        target.projection.leaf =
+            binding->tag == BindingTag::Resource ? binding->resourceLeaf : binding->projections.front().leaf;
+        target.projection.direction = binding->tag == BindingTag::Resource ? ValueBindingDirection::Input
+                                                                           : binding->projections.front().direction;
+        if (target.projection.direction == ValueBindingDirection::Result) {
+            target.access = "write";
+            target.endpoint.access = "write";
+        }
         target.valueType = value.canonicalType;
         target.name = valueName(program, valueId);
         target.sourceName = target.name;
-        if (binding->leaf) {
-            if (!value.layout || *binding->leaf >= value.layout->leaves.size())
+        if (target.projection.leaf) {
+            if (!value.layout || *target.projection.leaf >= value.layout->leaves.size())
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
                               "endpoint binding projects an unknown Program value leaf");
-            for (const LayoutPathComponent &component : value.layout->leaves[*binding->leaf].path) {
+            for (const LayoutPathComponent &component : value.layout->leaves[*target.projection.leaf].path) {
                 target.name.push_back('.');
                 target.name += component.field.empty() ? std::to_string(component.index.value_or(0)) : component.field;
             }
@@ -530,18 +646,21 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
             if (!value.layout)
                 return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/values/" + std::to_string(valueId),
                               "typed target binding requires a canonical value layout");
-            if (endpoint.tag == "value") {
+            if (binding->tag == BindingTag::Value) {
                 target.semantic = CarrierSemantic::Value;
-                const EndpointAbiBinding *slot = semantic(endpoint, "value");
+                const EndpointAbiBinding *slot = semantic(endpoint, endpoint.tag == "value" ? "value" : "resource");
                 if (!slot)
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint lacks its portable value carrier");
-                if (value.layout->layoutHash != endpoint.layoutHash || value.layout->byteSize != slot->byteSize ||
-                    value.layout->alignment != slot->alignment)
+                if (value.layout->layoutHash != endpoint.layoutHash ||
+                    (endpoint.tag == "value" && !endpoint.viewDescriptor &&
+                     (value.layout->byteSize != slot->byteSize || value.layout->alignment != slot->alignment)))
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint whole-value ABI disagrees with its Program Value");
                 target.wholeValueLayout = materializeValueLayout(*value.layout, value.type);
-                if (!compiled || !compiled->interfacePlan || !compiled->interfacePlan->root)
+                if (!compiled || (compiled->interfacePlan && !compiled->interfacePlan->root) ||
+                    (!compiled->interfacePlan && compiled->valueTransport != "storage_buffer" &&
+                     compiled->valueTransport != "uniform_buffer"))
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint is missing the compiler-selected physical plan");
                 target.source = SourceRepresentation::WholeValueBytes;
@@ -552,7 +671,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                                                                 : TargetCarrier::InlineValue;
                 target.native = {compiled->descriptorSet == UINT32_MAX ? 0 : compiled->descriptorSet,
                                  compiled->binding == UINT32_MAX ? slot->slot : compiled->binding, UINT32_MAX};
-                InterfacePlan physical = *compiled->interfacePlan;
+                InterfacePlan physical = compiled->interfacePlan ? *compiled->interfacePlan
+                                                                 : computeValuePlan(valueTransport(*value.layout),
+                                                                                    value.layout->layoutHash, backend);
                 if (backend == VERNON_RUNTIME_CPU) {
                     if (!assignCpuPhysical(cpuFrameOffset(target), compiled, value.layout->alignment,
                                            value.layout->byteSize, target.physical, &physical, diagnostic, "value"))
@@ -563,6 +684,18 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 }
                 target.transport = TargetPhysicalTransport{std::move(physical), target.native};
                 target.endpoint.portableSlot = slot->slot;
+                if (endpoint.tag == "resource") {
+                    const EndpointAbiBinding *offset = semantic(endpoint, "byte_offset");
+                    if (!offset || endpoint.viewRank != 0 || target.carrier != TargetCarrier::StorageBuffer)
+                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                      "physical resource projection has an incompatible TensorView descriptor");
+                    target.storageLeaves.push_back(
+                        {static_cast<size_t>(value.layout->byteSize), size_t{0}, slot->slot});
+                    TensorViewDescriptorUse descriptor;
+                    descriptor.rank = 0;
+                    descriptor.offsetBinding = offset->slot;
+                    target.tensorViewDescriptor = std::move(descriptor);
+                }
                 hasSlots = true;
             } else {
                 std::vector<std::pair<uint32_t, const EndpointAbiBinding *>> indexedStorageBindings;
@@ -779,9 +912,16 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
         argument.sourceName = binding.name;
         argument.index = runtimeArgumentIndex;
         argument.kind = binding.reflectedKind.empty() ? binding.kind : binding.reflectedKind;
-        if (argument.kind == "tensor_value")
+        if (plan.backend != VERNON_RUNTIME_CPU && binding.carrier == TargetCarrier::StorageBuffer)
+            argument.kind = "tensor";
+        else if (argument.kind == "tensor_value")
             argument.kind = "scalar";
         argument.builtin = binding.builtin;
+        argument.autodiffRole = binding.role;
+        if (!binding.elementLayout.leaves.empty())
+            argument.dtype = pipelineDataType(binding.elementLayout.leaves.front().dtype);
+        else if (binding.wholeValueLayout && !binding.wholeValueLayout->leaves.empty())
+            argument.dtype = pipelineDataType(binding.wholeValueLayout->leaves.front().dtype);
         argument.result = binding.endpoint.interfaceKind == "result";
         argument.physical = binding.physical;
         if (!argument.physical.alignment)
@@ -845,7 +985,10 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
                             binding.valueType->rankedValue
                         ? binding.valueType->innerShape
                         : parameter.shape;
-        use.transport = plan.backend == VERNON_RUNTIME_CPU ? "host_value" : "storage_buffer";
+        use.transport = plan.backend == VERNON_RUNTIME_CPU                ? "host_value"
+                        : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
+                        : binding.carrier == TargetCarrier::InlineValue   ? "push_constant"
+                                                                          : "storage_buffer";
         use.valueLayout = binding.wholeValueLayout;
         use.interfacePlan = binding.transport ? std::optional<InterfacePlan>(binding.transport->targetAbi)
                                               : std::optional<InterfacePlan>{};
@@ -948,9 +1091,10 @@ bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBa
                                    : backend == VERNON_RUNTIME_OPENGL_ES ? "opengles"
                                                                          : "";
             if (resolvedStage->second.stage.backend != expected)
-                return reject(diagnostic, "PROGRAM_ARTIFACT_TARGET", "/artifact_system/target",
+                return reject(diagnostic, "PROGRAM_ARTIFACT_TARGET", "/target",
                               "ArtifactSystem target does not match Runtime backend");
             ResolvedExecutableNode resolved;
+            resolved.graph = graph.direction;
             resolved.node = &node;
             resolved.stage = &resolvedStage->second;
             if (!buildTargetBindingPlan(program, node, resolvedStage->second, backend, resolved.plan, diagnostic))
@@ -970,6 +1114,24 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
     variant = {};
     std::map<uint32_t, size_t> parameterByValue;
     for (const TargetBinding &binding : plan.bindings) {
+        if (binding.source == SourceRepresentation::ImplicitSampler) {
+            vernon::runtime::Parameter parameter;
+            parameter.name =
+                "__vernon_implicit_sampler_" + binding.endpoint.module + "_" + std::to_string(binding.endpoint.index);
+            parameter.kind = "sampler";
+            parameter.source = "implicit_sampler";
+            parameter.access = "read";
+            ParameterUse use;
+            use.stage = binding.endpoint.module;
+            use.interfaceKind = "resource";
+            use.index = binding.endpoint.index;
+            use.descriptorSet = binding.native.descriptorSet == UINT32_MAX ? 0 : binding.native.descriptorSet;
+            use.binding = binding.native.binding;
+            use.sampledImageBindings = binding.sampledImageBindings;
+            parameter.uses.push_back(std::move(use));
+            variant.internalParameters.push_back(std::move(parameter));
+            continue;
+        }
         if (binding.source == SourceRepresentation::SystemValue) {
             vernon::runtime::Parameter parameter;
             parameter.name = binding.name.empty() ? "__vernon_system_value_" + binding.endpoint.module + "_" +

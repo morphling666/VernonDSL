@@ -176,7 +176,7 @@ def _source_parameter_order(bundle: bytes) -> tuple[str, ...]:
     except (json.JSONDecodeError, UnicodeDecodeError):
         return ()
     artifacts = manifest.get("stage_artifacts")
-    if manifest.get("type") == "program_bundle":
+    if manifest.get("type") == "program":
         return ()
     if not isinstance(artifacts, dict):
         return ()

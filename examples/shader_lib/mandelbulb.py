@@ -204,6 +204,10 @@ def mandelbulb_fragment(
 
 mandelbulb_asset = vd.program_asset(
     id="examples/external_engine/mandelbulb",
-    program=(fullscreen_vertex, mandelbulb_fragment),
+    program=vd.pipeline(
+        fullscreen_vertex,
+        mandelbulb_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((),),
 )

@@ -138,7 +138,7 @@ bool ProgramOwnerBindings::bind(program::ProgramOwnerId owner, const VernonProgr
 
 bool applyProgramPublicationShapes(const program::Program &program,
                                    const std::vector<PendingProgramPublication> &publications,
-                                   std::vector<ProgramHostValue> &storage, std::string &error) {
+                                   std::vector<LogicalProgramValue> &storage, std::string &error) {
     for (const PendingProgramPublication &publication : publications) {
         if (!publication.target || publication.target->aliasOwner.kind != program::ProgramOwnerKind::Storage)
             continue;
@@ -158,7 +158,7 @@ bool applyProgramPublicationShapes(const program::Program &program,
     return true;
 }
 
-bool commitProgramPublications(const std::vector<ProgramHostValue> &storage,
+bool commitProgramPublications(const std::vector<LogicalProgramValue> &storage,
                                const std::vector<PendingProgramPublication> &publications, std::string &error) {
     struct PendingCopy {
         void *destination{};
@@ -197,8 +197,7 @@ bool commitProgramPublications(const std::vector<ProgramHostValue> &storage,
 
 namespace {
 
-bool devicePublicationCopies(const ProgramInvocationFrame &frame,
-                             const std::vector<PendingProgramPublication> &publications,
+bool devicePublicationCopies(const LogicalValueFrame &frame, const std::vector<PendingProgramPublication> &publications,
                              std::vector<gpu::DeviceBufferCopy> &copies, std::string &error) {
     for (const PendingProgramPublication &publication : publications) {
         if (!publication.destinationBuffer)
@@ -231,7 +230,7 @@ bool devicePublicationCopies(const ProgramInvocationFrame &frame,
 
 } // namespace
 
-VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, const ProgramInvocationFrame &frame,
+VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, const LogicalValueFrame &frame,
                                              const std::vector<PendingProgramPublication> &publications,
                                              std::string &error) {
     std::vector<gpu::DeviceBufferCopy> copies;

@@ -24,8 +24,18 @@
 
 #include <gtest/gtest.h>
 
+#include <initializer_list>
+
 namespace mlir::vernon {
 namespace {
+
+program::ProgramVjpOptions programVjpOptions(std::initializer_list<unsigned> wrt) {
+    program::ProgramVjpOptions options;
+    options.wrtBoundaryIndices.assign(wrt.begin(), wrt.end());
+    options.forwardSymbol = "forward";
+    options.backwardSymbol = "backward";
+    return options;
+}
 
 class VernonStructuredVjpTest : public testing::Test {
 protected:
@@ -81,7 +91,7 @@ module {
     ASSERT_TRUE(module);
     auto primal = module->lookupSymbol<func::FuncOp>("primal");
     ASSERT_TRUE(primal);
-    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0, 1}, "forward", "backward"})));
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, programVjpOptions({0, 1}))));
     EXPECT_FALSE(module->lookupSymbol<func::FuncOp>("primal"));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
@@ -144,7 +154,7 @@ module {
     ASSERT_TRUE(module);
     auto primal = module->lookupSymbol<func::FuncOp>("primal");
     ASSERT_TRUE(primal);
-    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, programVjpOptions({0}))));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
     unsigned allocs = 0;
@@ -275,7 +285,7 @@ module {
     ASSERT_TRUE(module);
     auto primal = module->lookupSymbol<func::FuncOp>("primal");
     ASSERT_TRUE(primal);
-    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, programVjpOptions({0}))));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
     program::ComputeOp nested;
@@ -399,7 +409,7 @@ module {
         ParserConfig(&context));
     ASSERT_TRUE(module);
     auto primal = module->lookupSymbol<func::FuncOp>("primal");
-    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, programVjpOptions({0}))));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
     SmallVector<arith::AddFOp> accumulations;
@@ -447,7 +457,7 @@ module {
         ParserConfig(&context));
     ASSERT_TRUE(module);
     auto primal = module->lookupSymbol<func::FuncOp>("primal");
-    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, program::ProgramVjpOptions{{0}, "forward", "backward"})));
+    ASSERT_TRUE(succeeded(program::buildProgramVjp(primal, programVjpOptions({0}))));
     auto backward = module->lookupSymbol<func::FuncOp>("backward");
     ASSERT_TRUE(backward);
     // Shaped Values keep the tensor constructor; the struct payload maps to ABI

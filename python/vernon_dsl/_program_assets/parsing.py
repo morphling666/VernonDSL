@@ -99,8 +99,8 @@ def _declaration_call(tree: ast.Module, descriptor_name: str, source_path: Path)
 def _static_entries(tree: ast.Module, program: ast.expr) -> list[ast.expr]:
     """The entry expressions a reader can see without running the source, if any.
 
-    A `vd.pipeline(...)`, Module, or Module VJP declaration contributes none, and that is not a defect: its stages
-    are only knowable once the declaration is evaluated.
+    A directly authored `vd.pipeline(vertex, fragment, ...)` contributes its positional stage entries. Module and
+    Module VJP declarations contribute none because their implementation stages only exist after capture.
     """
 
     if isinstance(program, ast.Name):
@@ -117,10 +117,12 @@ def _static_entries(tree: ast.Module, program: ast.expr) -> list[ast.expr]:
         if not program.args:
             return []
         program = program.args[0]
+    if isinstance(program, ast.Call) and (dotted_name(program.func) or "").split(".")[-1] == "pipeline":
+        return list(program.args)
     if isinstance(program, ast.Name):
         return [program]
     if isinstance(program, ast.Tuple):
-        return list(program.elts)
+        raise ProgramCompileError("Program Asset graphics must use vd.pipeline(...), not a tuple of entry functions")
     return []
 
 

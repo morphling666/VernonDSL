@@ -6,14 +6,11 @@ import hashlib
 import re
 from dataclasses import dataclass
 from importlib import import_module
-from types import MappingProxyType
-from typing import Any, Callable, Mapping, cast
+from typing import Any, Callable
 
 from .bundle import canonical_json
-from .language.stage_registry import GRAPHICS_STAGES, validate_graphics_topology
 
 _PATH = re.compile(r"^[A-Za-z_]\w*(?:\.(?:[A-Za-z_]\w*|\d+))*$", re.ASCII)
-_RULE_NAMES = ("rasterization", "visibility", "depth", "blend", "texture")
 
 
 def _capability_diagnostic(name: str) -> str:
@@ -46,35 +43,9 @@ class BoundarySelection:
 
 
 @dataclass(frozen=True)
-class RuleSet:
-    id: str
-    rules: Mapping[str, Callable[..., Any]]
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.id, str) or not self.id:
-            raise ValueError("rule set id must be a non-empty string")
-        unknown = set(self.rules) - set(_RULE_NAMES)
-        if unknown:
-            raise TypeError("unknown VJP rule(s): " + ", ".join(sorted(unknown)))
-        if any(not callable(rule) for rule in self.rules.values()):
-            raise TypeError("VJP rules must be callable")
-        object.__setattr__(self, "rules", MappingProxyType(dict(sorted(self.rules.items()))))
-
-    @property
-    def identity(self) -> dict[str, Any]:
-        return {"id": self.id, "rules": sorted(self.rules)}
-
-    @property
-    def digest(self) -> str:
-        return hashlib.sha256(canonical_json(self.identity).encode("utf-8")).hexdigest()
-
-
-@dataclass(frozen=True)
 class ProgramTransformSpec:
     kind: str
     wrt: tuple[str, ...]
-    rule_set: str | None = None
-    rule_set_identity: str | None = None
     output_cotangents: tuple[str, ...] = ()
     gradient_policy: str = "f16:f32,f32:f32,f64:f64"
     accumulation_policy: str = "fresh"
@@ -95,8 +66,6 @@ class ProgramTransformSpec:
             raise ValueError("autodiff planning policy must be 'min_memory', 'balanced', or 'min_runtime'")
         if self.derivative_rules_version != 1:
             raise ValueError("unsupported derivative rules version")
-        if (self.rule_set is None) != (self.rule_set_identity is None):
-            raise ValueError("rule set name and identity must be provided together")
         object.__setattr__(self, "wrt", BoundarySelection.create(self.wrt, label="wrt").ordered_paths)
         if self.output_cotangents:
             object.__setattr__(
@@ -116,9 +85,6 @@ class ProgramTransformSpec:
             "planning_policy": self.planning_policy,
             "derivative_rules_version": self.derivative_rules_version,
         }
-        if self.rule_set is not None:
-            result["rule_set"] = self.rule_set
-            result["rule_set_identity"] = self.rule_set_identity
         return result
 
     @property
@@ -128,9 +94,8 @@ class ProgramTransformSpec:
 
 @dataclass(frozen=True)
 class ProgramExpression:
-    program: Callable[..., Any] | tuple[Callable[..., Any], ...]
+    program: object
     transform: ProgramTransformSpec
-    rules: RuleSet | None = None
 
     def __call__(
         self,
@@ -142,41 +107,19 @@ class ProgramExpression:
         return execute_direct_vjp(self, arguments, grid)
 
 
-def rule_set(*, id: str, **rules: Callable[..., Any]) -> RuleSet:
-    """Declare an immutable, versioned graphics VJP rule set."""
-
-    return RuleSet(id, rules)
-
-
 def vjp(
     program: Any,
     *,
     wrt: tuple[str, ...] | list[str],
     outputs: tuple[str, ...] | list[str] | None = None,
-    rules: RuleSet | None = None,
     planning_policy: str = "min_memory",
 ) -> Any:
     """Describe a VJP transform that may be cooked or directly executed on CPU."""
 
+    from ._runtime.pipeline import Pipeline
     from .module import Module
 
     if isinstance(program, Module):
-        if rules is not None:
-            raise ValueError("Module VJP does not accept graphics custom rules")
-        from .types import TypeExpr
-
-        for path, child in program.named_modules():
-            definition = child._module_definition
-            for name in definition.signature.parameters:
-                annotation = definition.resolved_annotations.get(name)
-                if annotation is None:
-                    continue
-                if isinstance(annotation, TypeExpr) and annotation.name in {"Texture", "Sampler"}:
-                    qualified = f"{path}.{name}" if path else name
-                    raise TypeError(
-                        f"Module VJP does not support {annotation.name} parameter {qualified!r}; "
-                        f"{_capability_diagnostic('opaque_resource_vjp')}"
-                    )
         from .program import ModuleVjpExpression
 
         return ModuleVjpExpression(
@@ -188,37 +131,25 @@ def vjp(
     if isinstance(program, ProgramExpression):
         raise TypeError("higher-order program transforms are not supported")
     if isinstance(program, tuple):
-        if not program:
-            raise ValueError("graphics program must contain at least one stage")
-        kinds = [getattr(value, "__vernon_dsl__", (None,))[0] for value in program]
-        if any(kind not in GRAPHICS_STAGES for kind in kinds):
-            raise TypeError("graphics VJP program must contain only graphics entry stages")
-        validate_graphics_topology(cast(list[str], kinds))
-        if rules is None:
-            raise ValueError("graphics VJP requires a named custom rule set")
+        raise TypeError("graphics programs must use vd.pipeline(...), not a tuple of entry functions")
+    if isinstance(program, Pipeline):
         if outputs is not None:
             raise ValueError("graphics VJP does not accept compute Storage outputs")
     else:
         if getattr(program, "__vernon_dsl__", (None,))[0] != "compute":
             raise TypeError("single-entry VJP program must be a compute Kernel")
-        if rules is not None:
-            raise ValueError("compute VJP does not accept graphics custom rules")
         if outputs is None:
             raise ValueError("compute VJP requires non-empty writable Storage outputs")
-    if rules is not None and not isinstance(rules, RuleSet):
-        raise TypeError("rules must be declared with vd.ad.rule_set")
     wrt_selection = BoundarySelection.create(wrt, label="wrt")
     spec = ProgramTransformSpec(
         "vjp",
         wrt_selection.canonical_key,
-        rule_set=rules.id if rules is not None else None,
-        rule_set_identity=rules.digest if rules is not None else None,
         output_cotangents=(
             BoundarySelection.create(outputs, label="outputs").canonical_key if outputs is not None else ()
         ),
         planning_policy=planning_policy,
     )
-    return ProgramExpression(program, spec, rules)
+    return ProgramExpression(program, spec)
 
 
-__all__ = ["BoundarySelection", "ProgramExpression", "ProgramTransformSpec", "RuleSet", "rule_set", "vjp"]
+__all__ = ["BoundarySelection", "ProgramExpression", "ProgramTransformSpec", "vjp"]

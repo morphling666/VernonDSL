@@ -192,7 +192,7 @@ into the native artifact. Graphics `shape_facts` exist only for
 image/attachment extents.
 
 Language-level typed shape, strides, and offset use units of the recursively
-resolved leaf element. Compiler reflection and `PIPELINE_VERSION` manifests
+resolved leaf element. Compiler reflection and `PROGRAM_VERSION` manifests
 record static shape constraints and descriptor binding positions, never
 concrete dispatch values. Runtime descriptors record byte strides and byte
 offsets after Tensor and Struct layout is resolved. Runtime validation performs
@@ -411,7 +411,7 @@ Project processing order is:
 7. validate target capabilities and materialize artifacts.
 
 Semantic cache identity includes `COMPILER_CONTRACT_VERSION`,
-`PIPELINE_VERSION`, all source dependency
+`PROGRAM_VERSION`, all source dependency
 digests, entry, enabled features, concrete shapes and interfaces, captured
 constants, workgroup size, helper specializations, and derivative-transform
 identity. Diagnostics include source path, one-based line and column, and a
@@ -496,11 +496,10 @@ tape, effect-preserving reverse traversal, alias/race validation, and
 deterministic or capability-checked gather/scatter accumulation.
 
 Arithmetic, casts, Tensor construction, `matmul`, and supported math intrinsics
-use versioned built-in VJP rules. Graphics pipelines require a named versioned
-custom-rule set for rasterization, visibility, depth, blending, and texture
-sampling. Missing rules are errors. Texture rules may differentiate
-coordinates and texel data explicitly exposed as Storage; Texture handles and
-sampler state remain non-differentiable.
+use versioned built-in VJP rules. Graphics Program VJP is not a supported
+capability and is rejected during Program capture. There is no public graphics
+custom-rule API in this contract. Texture handles and sampler state remain
+non-differentiable.
 
 Applying `vd.ad.vjp` to a Module produces explicit forward, backward, and
 residual Program topology. Runtime executes that topology without a separate

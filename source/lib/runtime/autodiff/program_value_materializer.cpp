@@ -29,7 +29,7 @@ std::optional<size_t> parameterByteSize(const Parameter &parameter, const progra
     return result;
 }
 
-bool fillHostTensor(ProgramHostValue &value, const program::Value &slot, const ValueLayout &layout, size_t byteSize,
+bool fillHostTensor(LogicalProgramValue &value, const program::Value &slot, const ValueLayout &layout, size_t byteSize,
                     void *hostData, std::string &error) {
     if (!value.concreteShape) {
         value.concreteShape = shape::concrete(shape::decodeRuntimeContractShape(slot.shape));
@@ -38,7 +38,9 @@ bool fillHostTensor(ProgramHostValue &value, const program::Value &slot, const V
     }
     if (value.strides.empty()) {
         if (!shape::rowMajorByteStrides(*value.concreteShape, layout.byteSize, value.strides))
-            return error = "Program autodiff tensor layout overflows", false;
+            return error = "Program Value " + std::to_string(slot.id) + " ('" + slot.name +
+                           "') has a zero or overflowing materialized layout",
+                   false;
     } else if (value.strides.size() != value.concreteShape->size()) {
         return error = "Program autodiff tensor shape and strides have different ranks", false;
     }
@@ -56,7 +58,7 @@ bool fillHostTensor(ProgramHostValue &value, const program::Value &slot, const V
 }
 
 bool evaluateOwnedExtents(const program::Program &program, const program::Storage &storage,
-                          const std::vector<ProgramHostValue> &hosts,
+                          const std::vector<LogicalProgramValue> &hosts,
                           const std::vector<std::optional<ValueLayout>> &layouts, size_t &bytes,
                           std::vector<uint64_t> &concreteShape, std::string &error) {
     bytes = 0;
@@ -76,15 +78,15 @@ bool evaluateOwnedExtents(const program::Program &program, const program::Storag
                 return error = "owned dyn like-source dimension is unavailable at invocation bind", false;
             length = (*hosts[value].concreteShape)[extent.axis];
         }
-        if (!length || product > std::numeric_limits<uint64_t>::max() / length)
+        if (length && product > std::numeric_limits<uint64_t>::max() / length)
             return error = "owned dyn Storage extent overflows", false;
         product *= length;
         concreteShape.push_back(length);
     }
-    if (layouts[owner]->byteSize > std::numeric_limits<uint64_t>::max() / product)
+    if (product && layouts[owner]->byteSize > std::numeric_limits<uint64_t>::max() / product)
         return error = "owned dyn Storage byte length overflows", false;
     bytes = static_cast<size_t>(layouts[owner]->byteSize * product);
-    return bytes != 0;
+    return true;
 }
 
 bool tapePayloadStride(const std::string &type, size_t &stride, std::string &error) {
@@ -103,8 +105,9 @@ bool tapePayloadStride(const std::string &type, size_t &stride, std::string &err
     return true;
 }
 
-bool tapeLaneCount(const program::Program &execution, const VernonProgramTopology *topology, uint32_t tapeValue,
-                   size_t &lanes, std::string &error) {
+bool tapeLaneCount(const program::Program &execution, const VernonProgramTopology *topology,
+                   const std::vector<LogicalProgramValue> &hosts, uint32_t tapeValue, size_t &lanes,
+                   std::string &error) {
     lanes = 1;
     for (const program::Graph &graph : execution.graphs) {
         for (const program::Node &node : graph.nodes) {
@@ -114,9 +117,9 @@ bool tapeLaneCount(const program::Program &execution, const VernonProgramTopolog
                 continue;
             uint32_t workgroup[3]{256, 1, 1};
             if (topology) {
-                const auto found = topology->stageIndices.find(node.stage);
-                if (found != topology->stageIndices.end() && found->second < topology->stages.size()) {
-                    const VernonProgramExecutable *pipeline = topology->stages[found->second].pipeline.get();
+                const auto found = topology->nodes.find({graph.direction, node.id});
+                if (found != topology->nodes.end()) {
+                    const VernonProgramExecutable *pipeline = found->second.pipeline;
                     if (pipeline) {
                         workgroup[0] = pipeline->workgroupSize.x ? pipeline->workgroupSize.x : 1;
                         workgroup[1] = pipeline->workgroupSize.y ? pipeline->workgroupSize.y : 1;
@@ -129,10 +132,11 @@ bool tapeLaneCount(const program::Program &execution, const VernonProgramTopolog
                 continue;
             const program::ComputeOperation &compute = program::computeOperation(node);
             for (int axis = 0; axis < 3; ++axis) {
-                if (compute.workgroups[axis].kind != program::ControlKind::Static)
-                    return error = "Program autodiff tape dispatch volume requires resolved static workgroups", false;
-                const size_t groups =
-                    compute.workgroups[axis].value ? static_cast<size_t>(compute.workgroups[axis].value) : 1;
+                uint64_t resolvedGroups = 0;
+                if (!resolveProgramControl(execution, hosts, compute.workgroups[axis], resolvedGroups, error) ||
+                    !resolvedGroups || resolvedGroups > std::numeric_limits<size_t>::max())
+                    return error = error.empty() ? "Program autodiff tape dispatch control is invalid" : error, false;
+                const size_t groups = static_cast<size_t>(resolvedGroups);
                 const size_t wg = workgroup[axis] ? workgroup[axis] : 1;
                 if (groups > std::numeric_limits<size_t>::max() / wg ||
                     volume > std::numeric_limits<size_t>::max() / (groups * wg))
@@ -145,9 +149,10 @@ bool tapeLaneCount(const program::Program &execution, const VernonProgramTopolog
     return true;
 }
 
-bool attachTape(const program::Program &execution, const VernonProgramTopology *topology, const program::Value &slot,
+bool attachTape(const program::Program &execution, const VernonProgramTopology *topology,
+                const std::vector<LogicalProgramValue> &hosts, const program::Value &slot,
                 const std::vector<std::shared_ptr<HostStaticTapeBatch>> *captures,
-                const std::shared_ptr<AutodiffMemoryPolicy> &policy, ProgramHostValue &value, std::string &error) {
+                const std::shared_ptr<AutodiffMemoryPolicy> &policy, LogicalProgramValue &value, std::string &error) {
     std::shared_ptr<HostStaticTapeBatch> batch;
     if (captures && slot.id < captures->size())
         batch = (*captures)[slot.id];
@@ -156,7 +161,8 @@ bool attachTape(const program::Program &execution, const VernonProgramTopology *
             return error = "Program autodiff tape has no memory policy", false;
         size_t lanes = 1;
         size_t stride = 1;
-        if (!tapeLaneCount(execution, topology, slot.id, lanes, error) || !tapePayloadStride(slot.type, stride, error))
+        if (!tapeLaneCount(execution, topology, hosts, slot.id, lanes, error) ||
+            !tapePayloadStride(slot.type, stride, error))
             return false;
         batch = HostStaticTapeBatch::create(lanes, stride, policy->invocationLimit(), policy, nullptr);
     }
@@ -192,7 +198,8 @@ VernonValueLayoutView programValueLayoutView(const ValueLayout &layout) {
             layout.abiLeaves.size()};
 }
 
-bool fillProgramTapeHostValue(ProgramHostValue &value, std::shared_ptr<HostStaticTapeBatch> batch, std::string &error) {
+bool fillProgramTapeHostValue(LogicalProgramValue &value, std::shared_ptr<HostStaticTapeBatch> batch,
+                              std::string &error) {
     if (!batch)
         return error = "Program autodiff tape has no allocator batch", false;
     VernonAdTapeAllocator *descriptor = batch->descriptor(0);
@@ -216,9 +223,9 @@ bool fillProgramTapeHostValue(ProgramHostValue &value, std::shared_ptr<HostStati
 }
 
 bool materializeProgramOwnedStorages(const program::Program &execution, const VernonProgramTopology *topology,
-                                     std::vector<ProgramHostValue> &storage, const std::vector<char> &liveStorage,
+                                     std::vector<LogicalProgramValue> &storage, const std::vector<char> &liveStorage,
                                      const std::vector<std::optional<ValueLayout>> &layouts,
-                                     std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
+                                     std::map<uint32_t, ProgramStorageState> &backings, std::string &error) {
     if (!resolveProgramShapes(execution, topology, storage, error))
         return false;
     for (const program::Storage &slot : execution.storages) {
@@ -226,7 +233,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const Ve
             (slot.initialValue < execution.values.size() &&
              program::isTapeValueType(execution.values[slot.initialValue].type)))
             continue;
-        ProgramStorageBacking &backing = backings[slot.id];
+        ProgramStorageState &backing = backings[slot.id];
         if (backing.external || backing.sized)
             continue;
         if (slot.buffer.byteLengthExtents.empty()) {
@@ -277,7 +284,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const Ve
         for (const program::Storage &slot : execution.storages) {
             if (slot.id >= liveStorage.size() || !liveStorage[slot.id] || slot.buffer.byteLengthExtents.empty())
                 continue;
-            ProgramStorageBacking &backing = backings[slot.id];
+            ProgramStorageState &backing = backings[slot.id];
             if (backing.external || backing.sized)
                 continue;
             pending = true;
@@ -314,36 +321,44 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const Ve
             (slot.initialValue < execution.values.size() &&
              program::isTapeValueType(execution.values[slot.initialValue].type)))
             continue;
-        ProgramStorageBacking &backing = backings[slot.id];
+        ProgramStorageState &backing = backings[slot.id];
         if (backing.external)
             continue;
-        if (backing.owner >= storage.size() || !backing.bytes)
+        if (backing.owner >= storage.size() || !backing.sized)
             return error = "Program autodiff storage has no materializable backing", false;
-        storage[backing.owner].owned.resize(backing.bytes);
+        storage[backing.owner].owned.resize(std::max<size_t>(backing.bytes, 1));
+        if (backing.initial) {
+            const VernonTensorView &initial = backing.initial->tensor;
+            if (initial.byte_size > backing.bytes) {
+                error = "staged Program Storage input exceeds its canonical backing";
+                return false;
+            }
+            std::memcpy(storage[backing.owner].owned.data(), initial.host_data, initial.byte_size);
+        }
     }
     return true;
 }
 
 bool materializeProgramValues(const program::Program &execution, const VernonProgramTopology *topology,
-                              std::vector<ProgramHostValue> &storage, const std::vector<char> &live,
+                              std::vector<LogicalProgramValue> &storage, const std::vector<char> &live,
                               const std::vector<std::optional<ValueLayout>> &layouts,
-                              const std::map<uint32_t, ProgramStorageBacking> &backings,
+                              const std::map<uint32_t, ProgramStorageState> &backings,
                               const std::map<uint32_t, VernonProgramArgument> &externalValues,
                               const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures,
                               const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, std::string &error) {
     for (const program::Value &slot : execution.values) {
         if (!live[slot.id])
             continue;
-        ProgramHostValue &value = storage[slot.id];
+        LogicalProgramValue &value = storage[slot.id];
         if (program::isTapeValueType(slot.type)) {
-            if (!attachTape(execution, topology, slot, tapeCaptures, tapePolicy, value, error))
+            if (!attachTape(execution, topology, storage, slot, tapeCaptures, tapePolicy, value, error))
                 return false;
             continue;
         }
         void *hostData = nullptr;
         size_t byteSize = 0;
         if (slot.storage) {
-            const ProgramStorageBacking &backing = backings.at(*slot.storage);
+            const ProgramStorageState &backing = backings.at(*slot.storage);
             if (backing.external) {
                 value.argument = *backing.external;
                 if (value.argument.kind == VERNON_PROGRAM_TENSOR) {

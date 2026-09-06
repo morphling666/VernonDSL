@@ -207,9 +207,15 @@ nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, co
         if (paths.empty())
             throw std::runtime_error("gradient group has no derivative leaves");
         nb::object first = nb::borrow<nb::object>(leafResults[nb::str(paths.front().c_str())]);
+        bool sharedOwner = true;
         for (size_t index = 1; index < paths.size(); ++index)
             if (leafResults[nb::str(paths[index].c_str())].ptr() != first.ptr())
-                throw std::runtime_error("gradient leaves did not materialize into one owner");
+                sharedOwner = false;
+        if (!sharedOwner) {
+            for (const std::string &path : paths)
+                grouped[nb::str(path.c_str())] = nb::borrow<nb::object>(leafResults[nb::str(path.c_str())]);
+            continue;
+        }
         const std::string declaredPath = nb::cast<std::string>(group.attr("declared_path"));
         grouped[nb::str(declaredPath.c_str())] = std::move(first);
     }
@@ -394,7 +400,8 @@ nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &le
     }
     if (leafPath == root)
         return value;
-    const size_t tensorRank = nb::cast<std::vector<uint64_t>>(value.attr("shape")).size();
+    const size_t tensorRank =
+        nb::hasattr(value, "shape") ? nb::cast<std::vector<uint64_t>>(value.attr("shape")).size() : 0;
     size_t begin = root.size() + 1;
     while (begin <= leafPath.size()) {
         const size_t end = std::min(leafPath.find('.', begin), leafPath.size());

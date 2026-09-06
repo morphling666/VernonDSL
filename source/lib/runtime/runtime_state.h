@@ -114,9 +114,10 @@ namespace vernon::runtime {
 // canonical schema loads through the same bundle-then-resolve lifecycle the stage schema always did.
 struct CanonicalProgramVariant {
     std::vector<std::string> key;
+    std::string targetJson;
+    std::string blobsJson;
     std::string programJson;
     std::string artifactSystemJson;
-    std::map<std::string, std::string> stageBindings;
 };
 
 } // namespace vernon::runtime
@@ -162,8 +163,12 @@ struct VernonProgramStageBinding {
     std::optional<vernon::runtime::program::TargetBinding> target;
 };
 
-struct VernonResolvedProgramStage {
+struct VernonCompiledProgramStage {
     std::unique_ptr<VernonProgramExecutable> pipeline;
+};
+
+struct VernonResolvedProgramNode {
+    VernonProgramExecutable *pipeline{};
     std::vector<VernonProgramStageBinding> bindings;
     vernon::runtime::program::DispatchMapping dispatchMapping{vernon::runtime::program::DispatchMapping::StaticGrid};
 };
@@ -176,8 +181,8 @@ struct VernonProgramTopology {
     // category, access, shape and ownership remain exclusively in ProgramABI.
     std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
     std::vector<uint32_t> residualValues;
-    std::vector<VernonResolvedProgramStage> stages;
-    std::unordered_map<std::string, size_t> stageIndices;
+    std::vector<VernonCompiledProgramStage> stages;
+    std::map<std::pair<std::string, uint32_t>, VernonResolvedProgramNode> nodes;
     std::optional<uint64_t> programCheckpointMemoryBudget;
     std::string programCheckpointPolicy;
 };

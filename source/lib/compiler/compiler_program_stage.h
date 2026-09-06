@@ -11,6 +11,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace vernon::compiler {
 
@@ -19,7 +20,8 @@ bool programAbiShapesCompatible(const llvm::json::Array *logical, const llvm::js
 std::optional<std::string> reflectedProgramResourceAccess(const llvm::json::Object &row);
 const llvm::json::Object *programEndpointLayout(const llvm::json::Object &row, bool resource);
 llvm::json::Object programValueCarrier(llvm::StringRef tag, int64_t slot, const llvm::json::Object &layout);
-llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module, int64_t index);
+llvm::json::Object compiledProgramEndpointAbi(const llvm::json::Object &row, llvm::StringRef module,
+                                              llvm::StringRef interfaceKind, int64_t index);
 
 struct ProgramEndpointExpectation {
     std::optional<llvm::StringRef> dtype;
@@ -32,10 +34,18 @@ struct ProgramEndpointExpectation {
     bool canonicalValueLayout{};
 };
 
+struct ProgramLogicalBinding {
+    int64_t value{};
+    std::optional<int64_t> leaf;
+    int64_t physicalLeaf{};
+};
+
+using ProgramNodeBindingIndex = std::map<std::string, std::vector<ProgramLogicalBinding>>;
+
 bool verifyProgramEndpointAbi(const ProgramEndpointExpectation &expected, const llvm::json::Object &compiled,
                               std::string &error);
 
-bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, std::map<std::string, int64_t> &boundValues,
+bool indexProgramNodeBindings(const llvm::json::Array &rawBindings, ProgramNodeBindingIndex &boundValues,
                               std::string &error);
 
 std::optional<int64_t> ensureProgramResourceAccess(int64_t valueId, bool attachment,

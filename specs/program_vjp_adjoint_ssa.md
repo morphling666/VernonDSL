@@ -5,7 +5,7 @@ remains [`unified_program_vjp.md`](unified_program_vjp.md). Public gradient
 rules remain [`autodiff.md`](autodiff.md) §3 and
 [`language/contract.md`](language/contract.md) (TensorView gradients are newly
 owned Storage; compute-node ABI is a writable TensorView, not a kernel that
-returns Storage). Do not bump `COMPILER_CONTRACT_VERSION` / `PIPELINE_VERSION`.
+returns Storage). Do not bump `COMPILER_CONTRACT_VERSION` / `PROGRAM_VERSION`.
 
 ## 1. Symptom
 

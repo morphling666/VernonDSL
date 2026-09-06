@@ -215,7 +215,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         nlohmann::json::parse(compiledView.data, compiledView.data + compiledView.size);
 
     for (std::string_view field :
-         {"compiler_contract_version", "pipeline_version", "struct_layouts", "dependencies", "module_hash"})
+         {"compiler_contract_version", "program_version", "struct_layouts", "dependencies", "module_hash"})
         EXPECT_EQ(validationReflection.at(field), compiledReflection.at(field));
     const nlohmann::json &validationEntry = entry(validationReflection, "compute");
     const nlohmann::json &compiledEntry = entry(compiledReflection, "compute");

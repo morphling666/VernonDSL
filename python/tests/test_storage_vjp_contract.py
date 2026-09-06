@@ -409,7 +409,7 @@ def objective(
         values["mass"][0] = np.float32(4.0)
         particles.copy_from_numpy(values)
         output = vd.storage.zeros(dtype=Particle, shape=(1,))
-        with self.assertRaisesRegex(RuntimeError, "dispatch grid axis 0 must equal 1"):
+        with self.assertRaisesRegex(ValueError, "dispatch grid axis 0 must equal 1"):
             aggregate_output_objective_vjp(particles, output, grid=(2, 1, 1))
 
     def test_nested_input_and_output_route_every_tangent_leaf(self) -> None:

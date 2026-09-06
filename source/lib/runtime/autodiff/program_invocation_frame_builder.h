@@ -11,15 +11,15 @@ namespace vernon::runtime::ad {
 
 bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi);
 
-bool buildProgramInvocationFrame(VernonRuntimeContext &context, const program::Program &execution,
-                                 const VernonProgramTopology *topology, std::vector<ProgramHostValue> &storage,
-                                 const ForwardInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
-                                 std::string &error);
+bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
+                            const VernonProgramTopology *topology, std::vector<LogicalProgramValue> &storage,
+                            const ForwardInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
+                            std::string &error);
 
-bool buildProgramInvocationFrame(VernonRuntimeContext &context, const program::Program &execution,
-                                 const VernonProgramTopology *topology, std::vector<ProgramHostValue> &storage,
-                                 const PullbackInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
-                                 std::string &error);
+bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
+                            const VernonProgramTopology *topology, std::vector<LogicalProgramValue> &storage,
+                            const PullbackInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
+                            std::string &error);
 
 } // namespace vernon::runtime::ad
 
