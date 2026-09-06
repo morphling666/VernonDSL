@@ -2,10 +2,7 @@
 #define VERNON_RUNTIME_RUNTIME_STATE_H
 
 #include "VernonRuntime.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
-#include "pipeline_metadata.h"
-#include "target_binding_plan.h"
+#include "program_execution_manifest.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -13,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,8 +22,8 @@ size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &p
 } // namespace vernon::runtime::ad
 namespace vernon::runtime::program {
 struct ResolvedProgram;
+struct ResolvedExecutionPlan;
 } // namespace vernon::runtime::program
-struct VernonProgramTopology;
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
@@ -108,16 +106,12 @@ template <typename Handle> void destroyRuntimeBackendState(Handle &handle) {
 }
 
 namespace vernon::runtime {
-
-// One variant of a canonically cooked Program, held as the JSON its Program and artifact system deploy to. A bundle
-// keeps every variant and materializes none: selecting a feature key is what turns one into an executable, so the
-// canonical schema loads through the same bundle-then-resolve lifecycle the stage schema always did.
-struct CanonicalProgramVariant {
+// One fully validated deployment variant. Loading parses the immutable
+// descriptor; resolving copies the Program into a fresh physical executable.
+struct ProgramVariantDeployment {
     std::vector<std::string> key;
-    std::string targetJson;
-    std::string blobsJson;
-    std::string programJson;
-    std::string artifactSystemJson;
+    program::Program program;
+    program::ArtifactSystem artifactSystem;
 };
 
 } // namespace vernon::runtime
@@ -125,70 +119,36 @@ struct CanonicalProgramVariant {
 struct VernonProgramBundle {
     VernonRuntimeContext *context{};
     std::string id;
-    std::unordered_map<std::string, vernon::runtime::Stage> stages;
-    std::vector<vernon::runtime::Variant> variants;
-    std::optional<vernon::runtime::AutodiffManifest> autodiff;
-    std::vector<vernon::runtime::CanonicalProgramVariant> canonicalVariants;
+    std::vector<vernon::runtime::ProgramVariantDeployment> deployments;
     std::filesystem::path bundleRoot;
 };
 
 struct VernonDifferentiatedProgram {
     std::shared_ptr<vernon::runtime::ad::Executable> executable;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
+    std::optional<uint64_t> checkpointMemoryBudget;
+    std::string checkpointPolicy;
 };
 
 struct VernonProgramExecutable {
-    VernonProgramExecutable() = default;
+    VernonProgramExecutable(VernonRuntimeContext &runtime,
+                            std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan);
     VernonProgramExecutable(const VernonProgramExecutable &) = delete;
     VernonProgramExecutable &operator=(const VernonProgramExecutable &) = delete;
-    VernonProgramExecutable(VernonProgramExecutable &&) noexcept;
-    VernonProgramExecutable &operator=(VernonProgramExecutable &&) noexcept;
-    ~VernonProgramExecutable();
+    VernonProgramExecutable(VernonProgramExecutable &&) = delete;
+    VernonProgramExecutable &operator=(VernonProgramExecutable &&) = delete;
+    ~VernonProgramExecutable() = default;
 
-    VernonRuntimeContext *context{};
-    vernon::runtime::Variant variant;
-    VernonLaunchSize workgroupSize{1, 1, 1};
-    vernon::runtime::DispatchContract dispatchContract;
-    std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
-    std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
-    std::shared_ptr<VernonProgramTopology> topology;
-    std::optional<VernonDifferentiatedProgram> differentiated;
-    void *backendState{};
-    void (*destroyBackendState)(void *){};
+    VernonRuntimeContext *context;
+    const std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> executionPlan;
+    VernonDifferentiatedProgram autodiff;
 };
 
-struct VernonProgramStageBinding {
-    uint32_t value{};
-    std::optional<size_t> leaf;
-    std::optional<vernon::runtime::program::TargetBinding> target;
-};
-
-struct VernonCompiledProgramStage {
-    std::unique_ptr<VernonProgramExecutable> pipeline;
-};
-
-struct VernonResolvedProgramNode {
-    VernonProgramExecutable *pipeline{};
-    std::vector<VernonProgramStageBinding> bindings;
-    vernon::runtime::program::DispatchMapping dispatchMapping{vernon::runtime::program::DispatchMapping::StaticGrid};
-};
-
-struct VernonProgramTopology {
-    ~VernonProgramTopology();
-
-    std::shared_ptr<const vernon::runtime::program::ResolvedProgram> resolvedProgram;
-    // Stable leaf/path backing for C-ABI reflection. Slot identity, role,
-    // category, access, shape and ownership remain exclusively in ProgramABI.
-    std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
-    std::vector<uint32_t> residualValues;
-    std::vector<VernonCompiledProgramStage> stages;
-    std::map<std::pair<std::string, uint32_t>, VernonResolvedProgramNode> nodes;
-    std::optional<uint64_t> programCheckpointMemoryBudget;
-    std::string programCheckpointPolicy;
-};
-
-inline VernonProgramExecutable::VernonProgramExecutable(VernonProgramExecutable &&) noexcept = default;
-inline VernonProgramExecutable &VernonProgramExecutable::operator=(VernonProgramExecutable &&) noexcept = default;
-inline VernonProgramExecutable::~VernonProgramExecutable() = default;
+inline VernonProgramExecutable::VernonProgramExecutable(
+    VernonRuntimeContext &runtime, std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan)
+    : context(&runtime), executionPlan(std::move(plan)) {
+    if (!executionPlan)
+        throw std::invalid_argument("ProgramExecutable requires a resolved execution plan");
+}
 
 #endif

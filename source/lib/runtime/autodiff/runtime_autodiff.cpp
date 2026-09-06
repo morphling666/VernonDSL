@@ -2,8 +2,9 @@
 
 #include "runtime/pipeline_metadata.h"
 #include "runtime/program_execution_manifest.h"
+#include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
-#include "runtime_direct_autodiff.h"
+#include "runtime_autodiff_telemetry.h"
 
 #include <algorithm>
 #include <cstring>
@@ -18,11 +19,11 @@
 namespace {
 
 VernonDifferentiatedProgram *differentiatedPipeline(VernonProgramExecutable *pipeline) {
-    return pipeline && pipeline->differentiated ? &*pipeline->differentiated : nullptr;
+    return pipeline ? &pipeline->autodiff : nullptr;
 }
 
 const VernonDifferentiatedProgram *differentiatedPipeline(const VernonProgramExecutable *pipeline) {
-    return pipeline && pipeline->differentiated ? &*pipeline->differentiated : nullptr;
+    return pipeline ? &pipeline->autodiff : nullptr;
 }
 
 } // namespace
@@ -247,42 +248,15 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
     return true;
 }
 
-bool resolvePipelineAutodiff(VernonProgramBundle &bundle, const AutodiffProfile &profiles,
-                             VernonProgramExecutable &pipeline) {
-    if (!bundle.context || !bundle.autodiff)
-        return false;
-    const Stage &primal = bundle.stages.at(profiles.primal);
-    const Stage &forward = bundle.stages.at(profiles.forwardWithTape);
-    const Stage &backward = bundle.stages.at(profiles.backward);
-    const std::vector<std::string> gradientPaths =
-        autodiffDerivativeLeafPaths(bundle.autodiff->derivativeGroups, AutodiffDerivativeRole::Gradient);
-    std::shared_ptr<Executable> executable;
-    const bool resolved =
-        bundle.context->backend == VERNON_RUNTIME_CPU
-            ? createCpuExecutable(*bundle.context, primal, forward, backward, gradientPaths,
-                                  profiles.staticTapeBytesHint, profiles.residualStorage, profiles.selectedPolicy,
-                                  profiles.wholeDispatchRetentionPermitted, executable)
-            : createGpuExecutable(*bundle.context, primal, forward, backward, gradientPaths,
-                                  profiles.staticTapeBytesHint, profiles.residualStorage, profiles.selectedPolicy,
-                                  executable);
-    if (!resolved)
-        return false;
-    if (!validateDerivativeGroupsAgainstSignature(*bundle.context, bundle.autodiff->derivativeGroups,
-                                                  executable->signature()))
-        return false;
-    pipeline.differentiated = VernonDifferentiatedProgram{std::move(executable), bundle.autodiff->derivativeGroups};
-    return true;
-}
-
 VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline,
-                                               const VernonProgramSubmitDescriptor &invocation,
+                                               const VernonStageInvocationDescriptor &invocation,
                                                const VernonAdValueSet &inputs,
                                                execution::detail::RhiCommandExecutionPlan &plan,
                                                VernonPullback *&pullback) {
     pullback = nullptr;
     const auto *differentiated = differentiatedPipeline(&pipeline);
     auto *executable = differentiated ? differentiated->executable.get() : nullptr;
-    if (!executable || invocation.struct_size < sizeof(VernonProgramSubmitDescriptor) ||
+    if (!executable || invocation.struct_size < sizeof(VernonStageInvocationDescriptor) ||
         invocation.abi_version != VERNON_PROGRAM_VERSION || !validLaunchSize(invocation.compute_grid) ||
         (invocation.argument_count && !invocation.arguments) || !validSet(&inputs, true)) {
         invocationDiagnostic(*pipeline.context) = "invalid deferred autodiff forward invocation";
@@ -305,12 +279,12 @@ VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline
 }
 
 VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
-                                      const VernonProgramSubmitDescriptor &invocation, VernonPullback *&pullback,
+                                      const VernonStageInvocationDescriptor &invocation, VernonPullback *&pullback,
                                       const ProgramInvocationContext *programContext) {
     pullback = nullptr;
     const auto *differentiated = differentiatedPipeline(&pipeline);
     auto *executable = differentiated ? differentiated->executable.get() : nullptr;
-    if (!executable || invocation.struct_size < sizeof(VernonProgramSubmitDescriptor) ||
+    if (!executable || invocation.struct_size < sizeof(VernonStageInvocationDescriptor) ||
         invocation.abi_version != VERNON_PROGRAM_VERSION || (invocation.argument_count && !invocation.arguments)) {
         invocationDiagnostic(*pipeline.context) = "invalid canonical Program invocation";
         return VERNON_STATUS_INVALID_ARGUMENT;
@@ -413,9 +387,9 @@ bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size
 }
 
 const vernon::runtime::program::Program *programExecution(const VernonProgramExecutable *pipeline) {
-    if (!pipeline || !pipeline->topology || !pipeline->topology->resolvedProgram || !pipeline->differentiated)
+    if (!pipeline)
         return nullptr;
-    const vernon::runtime::program::Program &program = pipeline->topology->resolvedProgram->program;
+    const vernon::runtime::program::Program &program = pipeline->executionPlan->resolvedProgram->program;
     return vernon::runtime::program::findGraph(program, "backward") ? &program : nullptr;
 }
 
@@ -445,37 +419,6 @@ const vernon::runtime::program::BoundarySlot *programBoundaryAt(const vernon::ru
 }
 
 } // namespace
-
-bool vernon::runtime::hasAutodiffStorageObjectives(const VernonProgramExecutable *pipeline) {
-    const ad::Executable *executable = autodiffExecutable(pipeline);
-    return executable && executable->signature().storageObjectives;
-}
-
-VernonLaunchSize vernon::runtime::autodiffWorkgroupSize(const VernonProgramExecutable *pipeline) {
-    return pipeline ? pipeline->workgroupSize : VernonLaunchSize{};
-}
-
-std::vector<vernon::runtime::AutodiffWriteFootprint>
-vernon::runtime::autodiffWriteFootprints(const VernonProgramExecutable *pipeline) {
-    std::vector<AutodiffWriteFootprint> result;
-    if (!pipeline)
-        return result;
-    result.reserve(pipeline->writeFootprints.size());
-    for (const TensorViewWriteFootprint &footprint : pipeline->writeFootprints)
-        result.push_back({footprint.owner, footprint.wholeView, footprint.indices});
-    return result;
-}
-
-std::vector<vernon::runtime::AutodiffWriteFootprint>
-vernon::runtime::autodiffReadFootprints(const VernonProgramExecutable *pipeline) {
-    std::vector<AutodiffWriteFootprint> result;
-    if (!pipeline)
-        return result;
-    result.reserve(pipeline->readFootprints.size());
-    for (const TensorViewWriteFootprint &footprint : pipeline->readFootprints)
-        result.push_back({footprint.owner, footprint.wholeView, footprint.indices});
-    return result;
-}
 
 vernon::runtime::AutodiffPullbackMemoryUsage
 vernon::runtime::autodiffPullbackMemoryUsage(const VernonPullback *pullback) {
@@ -526,13 +469,13 @@ uint64_t vernon::runtime::autodiffPullbackPeakRuntimeManagedBytes(const VernonPu
 
 void vernon::runtime::autodiffSetProgramCheckpointPlan(VernonProgramExecutable *pipeline, const uint64_t *memoryBudget,
                                                        std::string_view policy) {
-    if (!pipeline || !pipeline->topology)
+    if (!pipeline)
         return;
     if (memoryBudget)
-        pipeline->topology->programCheckpointMemoryBudget = *memoryBudget;
+        pipeline->autodiff.checkpointMemoryBudget = *memoryBudget;
     else
-        pipeline->topology->programCheckpointMemoryBudget.reset();
-    pipeline->topology->programCheckpointPolicy = std::string(policy);
+        pipeline->autodiff.checkpointMemoryBudget.reset();
+    pipeline->autodiff.checkpointPolicy = std::string(policy);
 }
 
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
@@ -709,91 +652,6 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonAdProgramForward(VernonProgramExecutable *pipeline, VernonLaunchSize computeGrid,
-                                    const VernonAdValueSet *inputs, VernonAdValueSet *outputs,
-                                    VernonPullback **pullback) {
-    try {
-        using namespace vernon::runtime::ad;
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-        if (pullback)
-            *pullback = nullptr;
-        if (pipeline && pipeline->topology && pipeline->topology->resolvedProgram)
-            return fail(pipeline->context,
-                        "managed Program forward requires VernonProgramInstance and VernonProgramInvocation");
-        const auto *differentiated = differentiatedPipeline(pipeline);
-        auto *executable = differentiated ? differentiated->executable.get() : nullptr;
-        if (!pipeline || !pullback || !executable || !validLaunchSize(computeGrid) || !validSet(inputs, true) ||
-            !validSet(outputs, true))
-            return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff forward invocation");
-        auto result = std::make_unique<VernonPullback>();
-        result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
-        std::unique_ptr<PullbackExecution> execution;
-        const VernonStatus status = executable->forward({}, computeGrid, *inputs, outputs, execution);
-        if (status != VERNON_STATUS_OK)
-            return status;
-        if (!execution) {
-            const bool forwardOnlyProgram =
-                pipeline->topology && pipeline->topology->resolvedProgram &&
-                !vernon::runtime::program::findGraph(pipeline->topology->resolvedProgram->program, "backward");
-            return forwardOnlyProgram
-                       ? VERNON_STATUS_OK
-                       : fail(pipeline->context, "autodiff forward produced no pullback", VERNON_STATUS_INTERNAL_ERROR);
-        }
-        result->execution = std::move(execution);
-        *pullback = result.release();
-        return VERNON_STATUS_OK;
-    } catch (const std::bad_alloc &) {
-        return fail(pipeline ? pipeline->context : nullptr, "cannot allocate autodiff forward state",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    } catch (const std::length_error &) {
-        return fail(pipeline ? pipeline->context : nullptr, "autodiff forward allocation is too large",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    } catch (...) {
-        return fail(pipeline ? pipeline->context : nullptr, "unexpected autodiff forward failure",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    }
-}
-
-VernonStatus vernonAdProgramEncodeForward(VernonRuntimeProviderObject encoder, VernonProgramExecutable *pipeline,
-                                          const VernonProgramSubmitDescriptor *invocation,
-                                          const VernonAdValueSet *inputs, VernonPullback **pullback) {
-    try {
-        using namespace vernon::runtime::ad;
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-        if (pullback)
-            *pullback = nullptr;
-        const auto *differentiated = differentiatedPipeline(pipeline);
-        auto *executable = differentiated ? differentiated->executable.get() : nullptr;
-        if (!pipeline || !pullback || !executable || !encoder.value || !invocation ||
-            invocation->struct_size < sizeof(VernonProgramSubmitDescriptor) ||
-            invocation->abi_version != VERNON_PROGRAM_VERSION || !validLaunchSize(invocation->compute_grid) ||
-            (invocation->argument_count && !invocation->arguments) || !validSet(inputs, true))
-            return fail(pipeline ? pipeline->context : nullptr, "invalid encoded autodiff forward invocation");
-        auto result = std::make_unique<VernonPullback>();
-        result->contextLease = vernon::runtime::acquireContextLease(*pipeline->context);
-        std::unique_ptr<PullbackExecution> execution;
-        const ForwardExecutionTarget target{encoder, invocation};
-        const VernonStatus status = executable->forward(target, invocation->compute_grid, *inputs, nullptr, execution);
-        if (status != VERNON_STATUS_OK)
-            return status;
-        if (!execution)
-            return fail(pipeline->context, "encoded autodiff forward produced no pullback",
-                        VERNON_STATUS_INTERNAL_ERROR);
-        result->execution = std::move(execution);
-        *pullback = result.release();
-        return VERNON_STATUS_OK;
-    } catch (const std::bad_alloc &) {
-        return fail(pipeline ? pipeline->context : nullptr, "cannot allocate encoded autodiff forward state",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    } catch (const std::length_error &) {
-        return fail(pipeline ? pipeline->context : nullptr, "encoded autodiff forward allocation is too large",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    } catch (...) {
-        return fail(pipeline ? pipeline->context : nullptr, "unexpected encoded autodiff forward failure",
-                    VERNON_STATUS_INTERNAL_ERROR);
-    }
-}
-
 VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const VernonAdValueSet *cotangents,
                                             VernonAdValueSet *gradients, const VernonPullbackApplyOptions *options) {
     VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
@@ -819,38 +677,6 @@ VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const Vern
         return fail(context, "pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
     } catch (...) {
         return fail(context, "unexpected pullback failure", VERNON_STATUS_INTERNAL_ERROR);
-    }
-}
-
-VernonStatus vernonPullbackApplyDeviceWithOptions(VernonPullback *pullback, const VernonAdDeviceValueSet *cotangents,
-                                                  VernonAdDeviceValueSet *gradients,
-                                                  const VernonPullbackApplyOptions *options) {
-    VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
-    try {
-        using namespace vernon::runtime::ad;
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        auto *deviceExecution = pullback && pullback->execution
-                                    ? dynamic_cast<DevicePullbackExecution *>(pullback->execution.get())
-                                    : nullptr;
-        if (!deviceExecution || !validDeviceSet(cotangents, false) || !validDeviceSet(gradients, true) || !options ||
-            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
-            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
-            std::any_of(std::begin(options->reserved), std::end(options->reserved),
-                        [](uint32_t value) { return value != 0; }))
-            return fail(context, "invalid device pullback invocation");
-        const auto boundedSize = [](uint64_t value) {
-            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
-                                                              : static_cast<size_t>(value);
-        };
-        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
-                                                  boundedSize(options->maximum_reusable_construction_bytes)};
-        return deviceExecution->applyDevice(cotangents, *gradients, runtimeOptions);
-    } catch (const std::bad_alloc &) {
-        return fail(context, "cannot allocate device pullback state", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (const std::length_error &) {
-        return fail(context, "device pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (...) {
-        return fail(context, "unexpected device pullback failure", VERNON_STATUS_INTERNAL_ERROR);
     }
 }
 

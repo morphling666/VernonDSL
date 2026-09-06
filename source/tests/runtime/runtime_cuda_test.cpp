@@ -78,7 +78,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
       ]
     }]
   })";
-    VernonProgramExecutable *pipeline =
+    VernonStageExecutable *pipeline =
         vernonRuntimeLoadArtifact(runtime, ptx, std::strlen(ptx), reflection, std::strlen(reflection), "scale", 5);
     ASSERT_TRUE(pipeline);
     const float factor = 2.0f;
@@ -104,7 +104,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
@@ -115,7 +115,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
               VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 4; ++index)
         ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
 
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);

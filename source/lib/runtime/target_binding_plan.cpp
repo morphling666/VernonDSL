@@ -482,7 +482,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                     return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
                                   "aggregate physical leaf size disagrees with its canonical projection");
                 TargetBinding projected = target;
-                projected.projection = {projection.value, projection.leaf, projection.direction};
+                projected.projection = {projection.value, projection.leaf, projection.physicalLeaf,
+                                        projection.direction};
                 if (projection.direction == ValueBindingDirection::Result) {
                     projected.access = "write";
                     projected.endpoint.access = "write";
@@ -521,6 +522,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         target.projection.value = valueId;
         target.projection.leaf =
             binding->tag == BindingTag::Resource ? binding->resourceLeaf : binding->projections.front().leaf;
+        target.projection.physicalLeaf =
+            binding->tag == BindingTag::Resource ? 0 : binding->projections.front().physicalLeaf;
         target.projection.direction = binding->tag == BindingTag::Resource ? ValueBindingDirection::Input
                                                                            : binding->projections.front().direction;
         if (target.projection.direction == ValueBindingDirection::Result) {
@@ -564,6 +567,28 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         target.kind = endpoint.role == "sampler" ? "sampler" : !endpoint.imageDimension.empty() ? "image" : "tensor";
         const CompiledEndpointAbi *compiled = findCompiledAbi(stage.stage, endpoint);
+        if (binding->tag == BindingTag::Value && target.projection.leaf && compiled && compiled->interfacePlan &&
+            compiled->interfacePlan->root && value.layout && *target.projection.leaf < value.layout->leaves.size()) {
+            std::vector<PhysicalValueLeaf> physicalLeaves;
+            collectPhysicalValueLeaves(*compiled->interfacePlan->root, 0, physicalLeaves);
+            if (target.projection.physicalLeaf >= physicalLeaves.size())
+                return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                              "projected endpoint references an unknown physical carrier leaf");
+            const LayoutLeaf &logicalLeaf = value.layout->leaves[*target.projection.leaf];
+            const uint64_t logicalScalarSize = scalarByteSize(logicalLeaf.dtype);
+            const PhysicalValueLeaf &physicalLeaf = physicalLeaves[target.projection.physicalLeaf];
+            if (!logicalScalarSize ||
+                logicalLeaf.scalarCount > std::numeric_limits<uint64_t>::max() / logicalScalarSize ||
+                logicalLeaf.scalarCount * logicalScalarSize != physicalLeaf.transport.size)
+                return reject(diagnostic, "PROGRAM_BINDING_MISMATCH", "/bindings",
+                              "logical leaf size disagrees with its physical endpoint projection");
+            target.endpointProjection = PhysicalEndpointProjection{
+                static_cast<size_t>(compiled->interfacePlan->root->size),
+                static_cast<size_t>(compiled->interfacePlan->root->alignment),
+                static_cast<size_t>(physicalLeaf.offset),
+                static_cast<size_t>(physicalLeaf.transport.size),
+            };
+        }
         const std::optional<program_plan::TapeCarrier> tapeCarrier =
             program_plan::tapeCarrierFromRoleName(endpoint.role);
         const bool typedTapeCarrier = value.type.rfind("!vernon.ad_tape", 0) == 0 && tapeCarrier;
@@ -652,9 +677,10 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                 if (!slot)
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint lacks its portable value carrier");
-                if (value.layout->layoutHash != endpoint.layoutHash ||
-                    (endpoint.tag == "value" && !endpoint.viewDescriptor &&
-                     (value.layout->byteSize != slot->byteSize || value.layout->alignment != slot->alignment)))
+                if (!target.endpointProjection &&
+                    (value.layout->layoutHash != endpoint.layoutHash ||
+                     (endpoint.tag == "value" && !endpoint.viewDescriptor &&
+                      (value.layout->byteSize != slot->byteSize || value.layout->alignment != slot->alignment))))
                     return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
                                   "value endpoint whole-value ABI disagrees with its Program Value");
                 target.wholeValueLayout = materializeValueLayout(*value.layout, value.type);
@@ -783,6 +809,19 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                                     static_cast<size_t>(layoutLeaf.byteOffset),
                                                     storageBindings[vertexBuffer ? 0 : leaf]->slot});
                     hasSlots = true;
+                }
+                if (target.projection.leaf && target.elementLayout.leaves.size() == 1) {
+                    const vernon::runtime::ValueLeaf &physicalLeaf = target.elementLayout.leaves.front();
+                    const uint64_t scalarSize = scalarByteSize(physicalLeaf.dtype);
+                    if (!scalarSize || physicalLeaf.scalarCount > std::numeric_limits<uint64_t>::max() / scalarSize)
+                        return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                                      "projected TensorView endpoint has an invalid physical leaf");
+                    target.endpointProjection = PhysicalEndpointProjection{
+                        target.elementLayout.byteSize,
+                        target.elementLayout.alignment,
+                        physicalLeaf.byteOffset,
+                        static_cast<size_t>(physicalLeaf.scalarCount * scalarSize),
+                    };
                 }
                 if (endpoint.viewDescriptor) {
                     TensorViewDescriptorUse descriptor;

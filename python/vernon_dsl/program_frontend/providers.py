@@ -86,11 +86,6 @@ class CapturedVjpDslProvider:
                 if path and path not in seen_wrt:
                     seen_wrt.add(path)
                     wrt.append(path)
-        overlap = sorted(set(wrt) & set(outputs))
-        if overlap:
-            raise ImplementationUnavailable(
-                "Program VJP kernel request has wrt paths that collide with outputs: " + ", ".join(overlap)
-            )
         if not wrt or not outputs:
             raise ImplementationUnavailable("Program VJP request has no gradient or cotangent bindings")
         identity = hashlib.sha256(

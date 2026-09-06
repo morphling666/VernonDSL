@@ -187,11 +187,10 @@ void bindNativeCompiler(nb::module_ &module) {
     nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<Runtime>(module, "Runtime")
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
-        .def("load", &Runtime::load, nb::keep_alive<0, 1>())
-        .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::keep_alive<0, 1>())
-        .def("load_autodiff", &Runtime::loadAutodiff, nb::keep_alive<0, 1>())
-        .def("load_pipeline", &Runtime::loadPipeline, nb::keep_alive<0, 1>())
-        .def("load_cooked_asset", &Runtime::loadCookedAsset, nb::keep_alive<0, 1>())
+        .def("load", &Runtime::load, nb::arg("artifact"), nb::arg("reflection"), nb::arg("entry"),
+             nb::keep_alive<0, 1>())
+        .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::arg("program"), nb::arg("entry"), nb::keep_alive<0, 1>())
+        .def("load_program", &Runtime::loadProgramAsset, nb::keep_alive<0, 1>())
         .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("manifest"), nb::arg("directory"),
              nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
     nb::class_<ProgramParameterMetadata>(module, "ProgramParameter")
@@ -256,6 +255,15 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("clear", &vernon::runtime::DirtyIndexSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
     nb::class_<PreparedProgramArgument>(module, "_PreparedPipelineArgument");
+    nb::class_<StageInvocationBuilder>(module, "StageInvocationBuilder")
+        .def("host_tensor", &StageInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
+             nb::rv_policy::reference_internal)
+        .def("grid", &StageInvocationBuilder::grid, nb::arg("x"), nb::arg("y"), nb::arg("z"),
+             nb::rv_policy::reference_internal)
+        .def("submit", &StageInvocationBuilder::submit);
+    nb::class_<PythonStageExecutable>(module, "StageExecutable")
+        .def("invocation_builder", &PythonStageExecutable::invocationBuilder, nb::keep_alive<0, 1>())
+        .def_prop_ro("parameters", &PythonStageExecutable::parameters);
     nb::class_<ProgramInvocationBuilder>(module, "ProgramInvocationBuilder")
         .def("prepare_host_tensor", &ProgramInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
@@ -296,12 +304,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("graphics_state", &ProgramInvocationBuilder::setGraphicsState, nb::arg("state"),
              nb::rv_policy::reference_internal)
         .def("stencil_reference", &ProgramInvocationBuilder::setStencilReference, nb::arg("value"),
-             nb::rv_policy::reference_internal)
-        .def("encode", [](ProgramInvocationBuilder &builder,
-                          const vernon::execution::GraphicsEncoder &encoder) { builder.encode(encoder); })
-        .def("encode", [](ProgramInvocationBuilder &builder,
-                          const vernon::execution::ComputeEncoder &encoder) { builder.encode(encoder); })
-        .def("submit", [](ProgramInvocationBuilder &builder) { return builder.submit(); });
+             nb::rv_policy::reference_internal);
     nb::class_<PythonProgramInvocationAdapter>(module, "_ProgramInvocation")
         .def_prop_ro("builder", &PythonProgramInvocationAdapter::builderView, nb::rv_policy::reference_internal)
         .def("bind", &PythonProgramInvocationAdapter::bind, nb::arg("slot"), nb::arg("token"), nb::arg("prepare"),
@@ -350,77 +353,6 @@ void bindNativeCompiler(nb::module_ &module) {
                                                                       pipeline.pipeline);
             },
             nb::keep_alive<0, 1>())
-        .def(
-            "submit",
-            [](PythonProgramExecutable &pipeline, uint32_t x, uint32_t y, uint32_t z, const nb::list &values) {
-                return pipeline.submitCompute(x, y, z, values);
-            },
-            nb::arg("x"), nb::arg("y"), nb::arg("z"), nb::arg("values"))
-        .def(
-            "submit",
-            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder) {
-                if (builder.pipeline != pipeline.pipeline)
-                    throw std::invalid_argument("invocation builder belongs to another pipeline");
-                return builder.submit();
-            },
-            nb::arg("builder"))
-        .def(
-            "vjp",
-            [](PythonProgramExecutable &pipeline, const nb::dict &bindings, const nb::tuple &grid) {
-                if (grid.size() != 3)
-                    throw std::invalid_argument("autodiff grid must contain three dimensions");
-                const auto dimension = [&](size_t index) {
-                    if (PyBool_Check(grid[index].ptr()))
-                        throw std::invalid_argument("autodiff grid dimensions must be positive integers");
-                    const uint64_t value = nb::cast<uint64_t>(grid[index]);
-                    if (!value || value > UINT32_MAX)
-                        throw std::invalid_argument("autodiff grid dimensions must be positive uint32 values");
-                    return static_cast<uint32_t>(value);
-                };
-                const uint32_t x = dimension(0);
-                const uint32_t y = dimension(1);
-                const uint32_t z = dimension(2);
-                return pipeline.vjp(x, y, z, bindings, nb::cast(&pipeline, nb::rv_policy::reference));
-            },
-            nb::arg("bindings"), nb::arg("grid"))
-        .def(
-            "vjp_encode",
-            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder,
-               vernon::execution::ComputeEncoder &encoder, const nb::dict &bindings, const nb::tuple &grid) {
-                if (grid.size() != 3)
-                    throw std::invalid_argument("autodiff grid must contain three dimensions");
-                const auto dimension = [&](size_t index) {
-                    if (PyBool_Check(grid[index].ptr()))
-                        throw std::invalid_argument("autodiff grid dimensions must be positive integers");
-                    const uint64_t value = nb::cast<uint64_t>(grid[index]);
-                    if (!value || value > UINT32_MAX)
-                        throw std::invalid_argument("autodiff grid dimensions must be positive uint32 values");
-                    return static_cast<uint32_t>(value);
-                };
-                const VernonRhiCommandEncoder native = encoder.native();
-                return pipeline.vjp(dimension(0), dimension(1), dimension(2), bindings,
-                                    nb::cast(&pipeline, nb::rv_policy::reference), &builder, &native);
-            },
-            nb::arg("builder"), nb::arg("encoder"), nb::arg("bindings"), nb::arg("grid"))
-        .def(
-            "vjp_plan",
-            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder,
-               vernon::execution::detail::RhiCommandExecutionPlan &plan, const nb::dict &bindings,
-               const nb::tuple &grid) {
-                if (grid.size() != 3)
-                    throw std::invalid_argument("autodiff grid must contain three dimensions");
-                const auto dimension = [&](size_t index) {
-                    if (PyBool_Check(grid[index].ptr()))
-                        throw std::invalid_argument("autodiff grid dimensions must be positive integers");
-                    const uint64_t value = nb::cast<uint64_t>(grid[index]);
-                    if (!value || value > UINT32_MAX)
-                        throw std::invalid_argument("autodiff grid dimensions must be positive uint32 values");
-                    return static_cast<uint32_t>(value);
-                };
-                return pipeline.vjp(dimension(0), dimension(1), dimension(2), bindings,
-                                    nb::cast(&pipeline, nb::rv_policy::reference), &builder, nullptr, &plan);
-            },
-            nb::arg("builder"), nb::arg("plan"), nb::arg("bindings"), nb::arg("grid"))
         .def("program_forward_bound", &PythonProgramExecutable::programForwardBound, nb::arg("builder"),
              nb::call_guard<nb::gil_scoped_release>())
         .def(
@@ -435,12 +367,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("derivative_groups", &PythonProgramExecutable::derivativeGroups)
         .def_prop_ro("program_ad_signature", &PythonProgramExecutable::programAdSignature)
         .def_prop_ro("program_abi", &PythonProgramExecutable::programAbi)
-        .def_prop_ro("is_managed_program", &PythonProgramExecutable::isManagedProgram)
-        .def_prop_ro("workgroup_size", &PythonProgramExecutable::workgroupSize)
-        .def_prop_ro("read_footprints", &PythonProgramExecutable::readFootprints)
-        .def_prop_ro("write_footprints", &PythonProgramExecutable::writeFootprints)
-        .def_prop_ro("parameters", &PythonProgramExecutable::parameters)
-        .def_prop_ro("outputs", &PythonProgramExecutable::outputs);
+        .def_prop_ro("parameters", &PythonProgramExecutable::parameters);
     module.attr("DATA_BOOL") = static_cast<uint32_t>(VERNON_DATA_BOOL);
     module.attr("DATA_I32") = static_cast<uint32_t>(VERNON_DATA_I32);
     module.attr("DATA_U32") = static_cast<uint32_t>(VERNON_DATA_U32);

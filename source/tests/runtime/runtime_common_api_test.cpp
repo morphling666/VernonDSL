@@ -30,7 +30,7 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     EXPECT_EQ(vernonRuntimeGetLastError(context).size, 0);
 
     constexpr char malformedBundle[] = "{";
-    constexpr char diagnosticPrefix[] = "invalid pipeline bundle:";
+    constexpr char diagnosticPrefix[] = "invalid Program bundle:";
     bundleOptions.bundle_directory = ".";
     EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, malformedBundle, sizeof(malformedBundle) - 1,
                                                         &bundleOptions),

@@ -64,7 +64,7 @@ uint64_t cpuProviderResourceIdentity(const VernonRuntimeContext &context);
 VernonStringView cpuProviderLastError(const VernonRuntimeContext &context);
 bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState kernel, ReflectedEntry reflection,
                                CpuPipelineState &state);
-void setCpuProgramTape(VernonProgramExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root);
+void setCpuProgramTape(VernonStageExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root);
 
 VernonStatus registerStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entry);
 

@@ -1,5 +1,5 @@
-#ifndef VERNON_RUNTIME_RUNTIME_DIRECT_AUTODIFF_H
-#define VERNON_RUNTIME_RUNTIME_DIRECT_AUTODIFF_H
+#ifndef VERNON_RUNTIME_AUTODIFF_TELEMETRY_H
+#define VERNON_RUNTIME_AUTODIFF_TELEMETRY_H
 
 #include "VernonRuntime.h"
 #include "autodiff_metadata.h"
@@ -10,13 +10,6 @@
 #include <vector>
 
 namespace vernon::runtime {
-
-struct AutodiffDerivativeGroupView {
-    AutodiffDerivativeRole role{};
-    VernonStringView declaredPath;
-    const VernonStringView *leafPaths{};
-    size_t leafCount{};
-};
 
 struct AutodiffPullbackMemoryUsage {
     size_t logicalResidualBytes{};
@@ -35,39 +28,6 @@ struct AutodiffPullbackControlPlaneUsage {
     uint64_t deviceWaitNanoseconds{};
 };
 
-struct AutodiffWriteFootprint {
-    std::string owner;
-    bool wholeView{true};
-    std::vector<uint64_t> indices;
-};
-
-struct AutodiffGpuStageView {
-    const void *artifact{};
-    size_t artifactSize{};
-    VernonStringView reflection;
-    VernonStringView entry;
-};
-
-VERNON_RUNTIME_CAPI VernonProgramExecutable *loadBackendCpuAutodiffPipeline(
-    VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry, VernonStringView primalReflection,
-    VernonStringView primalName, VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
-    VernonStringView forwardName, VernonCpuEntryPoint backwardEntry, VernonStringView backwardReflection,
-    VernonStringView backwardName, const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount,
-    uint64_t staticTapeBytesHint, VernonStringView residualStorage, VernonStringView selectedPolicy,
-    bool wholeDispatchRetentionPermitted);
-
-VERNON_RUNTIME_CAPI VernonProgramExecutable *
-loadBackendGpuAutodiffPipeline(VernonRuntimeContext &context, const AutodiffGpuStageView &primal,
-                               const AutodiffGpuStageView &forward, const AutodiffGpuStageView &backward,
-                               const AutodiffDerivativeGroupView *derivativeGroups, size_t derivativeGroupCount,
-                               uint64_t staticTapeBytesHint, VernonStringView residualStorage,
-                               VernonStringView selectedPolicy);
-
-VERNON_RUNTIME_CAPI bool hasAutodiffStorageObjectives(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonLaunchSize autodiffWorkgroupSize(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint> autodiffReadFootprints(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI std::vector<AutodiffWriteFootprint>
-autodiffWriteFootprints(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI AutodiffPullbackMemoryUsage autodiffPullbackMemoryUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI AutodiffPullbackControlPlaneUsage autodiffPullbackControlPlaneUsage(const VernonPullback *pullback);
 VERNON_RUNTIME_CAPI size_t autodiffHostTapeContextLimit(const VernonRuntimeContext *context);

@@ -50,36 +50,11 @@ bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, std
     return true;
 }
 
-void markDeviceResidentValues(const program::Program &program, const program::Graph &graph,
-                              const VernonProgramTopology &topology, std::vector<char> &required) {
-    const auto markAliasDomain = [&](uint32_t value) {
-        if (value >= required.size() || value >= program.values.size())
-            return;
-        required[value] = 1;
-        if (!program.values[value].storage)
-            return;
-        for (size_t candidate = 0; candidate < program.values.size(); ++candidate)
-            if (program.values[candidate].storage == program.values[value].storage)
-                required[candidate] = 1;
-    };
-    for (const program::Node &node : graph.nodes) {
-        const auto nodePlan = topology.nodes.find({graph.direction, node.id});
-        if (nodePlan == topology.nodes.end())
-            continue;
-        for (const VernonProgramStageBinding &binding : nodePlan->second.bindings) {
-            if (!binding.target || binding.value >= required.size())
-                continue;
-            switch (binding.target->carrier) {
-            case program::TargetCarrier::StorageBuffer:
-            case program::TargetCarrier::VertexBuffer:
-            case program::TargetCarrier::IndexBuffer:
-                markAliasDomain(binding.value);
-                break;
-            default:
-                break;
-            }
-        }
-    }
+void applyPlannedDeviceResidency(program::GraphDirection graph, const program::ResolvedExecutionPlan &plan,
+                                 std::vector<char> &required) {
+    for (size_t value = 0; value < required.size(); ++value)
+        if (plan.requiresDevice(graph, static_cast<uint32_t>(value)))
+            required[value] = 1;
 }
 
 bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonProgramArgument> &values,
@@ -117,15 +92,31 @@ bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi
         const ProgramLeafBinding &binding = bindings[index];
         if (!value || !matchesProgramValueAbi(*value, abi) || binding.value >= storage.size())
             return error = "Program autodiff leaf does not match graph reflection", false;
-        auto *packed = static_cast<uint8_t *>(const_cast<void *>(storage[binding.value].argument.tensor.host_data));
         auto *leaf = static_cast<uint8_t *>(const_cast<void *>(value->data));
         size_t elementCount = binding.elementCount;
         if (!elementCount) {
             const size_t bytes = publish ? storage[binding.value].argument.tensor.byte_size : value->size;
-            if (!binding.elementStride || bytes % binding.elementStride)
+            const size_t stride = publish ? binding.elementStride : binding.leafElementBytes;
+            if (!stride || bytes % stride)
                 return error = "Program autodiff leaf does not match its dynamic footprint", false;
-            elementCount = bytes / binding.elementStride;
+            elementCount = bytes / stride;
         }
+        HostProgramValue &host = storage[binding.value];
+        if (!publish) {
+            if (binding.elementStride && elementCount > std::numeric_limits<size_t>::max() / binding.elementStride)
+                return error = "Program autodiff leaf footprint overflows", false;
+            const size_t required = elementCount * binding.elementStride;
+            if (host.argument.tensor.byte_size < required) {
+                host.owned.resize(required);
+                host.argument.tensor.host_data = host.owned.data();
+                host.argument.tensor.byte_size = required;
+                if (host.concreteShape &&
+                    !shape::rowMajorByteStrides(*host.concreteShape, binding.elementStride, host.strides))
+                    return error = "Program autodiff aggregate stride overflows", false;
+                host.argument.tensor.byte_strides = host.strides.empty() ? nullptr : host.strides.data();
+            }
+        }
+        auto *packed = static_cast<uint8_t *>(const_cast<void *>(host.argument.tensor.host_data));
         for (size_t element = 0; element < elementCount; ++element) {
             uint8_t *packedElement = packed + element * binding.elementStride + binding.byteOffset;
             uint8_t *leafElement = leaf + element * binding.leafElementBytes;
@@ -160,8 +151,8 @@ struct ProgramPullbackState {
 
 class ProgramPullback final : public PullbackExecution {
 public:
-    ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<VernonProgramTopology> topology, Variant variant,
-                    Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
+    ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<const program::ResolvedExecutionPlan> topology,
+                    Variant variant, Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
                     std::vector<ProgramLeafBinding> gradientBindings, std::shared_ptr<const ProgramPullbackState> state,
                     std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
@@ -235,18 +226,15 @@ public:
         LogicalValueFrame values(std::move(storage));
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         std::vector<char> deviceRequired(execution.values.size());
-        markDeviceResidentValues(execution, *backward, *topology_, deviceRequired);
+        applyPlannedDeviceResidency(program::GraphDirection::Backward, *topology_, deviceRequired);
         if (replay)
-            markDeviceResidentValues(execution, *replay, *topology_, deviceRequired);
+            applyPlannedDeviceResidency(program::GraphDirection::Forward, *topology_, deviceRequired);
         for (uint32_t value : state_->plan.retainedValues)
             if (!values.adoptRetainedValue(value, *state_->values, error))
                 return fail(*context_, error);
         if (device && !values.materializeDevice(*context_, deviceRequired, error))
             return fail(*context_, error);
-        VernonProgramExecutable proxy;
-        proxy.context = context_;
-        proxy.variant = variant_;
-        proxy.topology = topology_;
+        VernonProgramExecutable proxy(*context_, topology_);
         if (replay) {
             if (device) {
                 std::vector<ProgramTapeState> tapeStates;
@@ -356,7 +344,7 @@ public:
 
 private:
     VernonRuntimeContext *context_;
-    std::shared_ptr<VernonProgramTopology> topology_;
+    std::shared_ptr<const program::ResolvedExecutionPlan> topology_;
     Variant variant_;
     Signature signature_;
     std::vector<ProgramLeafBinding> cotangentBindings_;
@@ -369,10 +357,12 @@ private:
 
 class ProgramExecutable final : public Executable {
 public:
-    ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<VernonProgramTopology> topology, Variant variant)
-        : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)) {
+    ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<const program::ResolvedExecutionPlan> topology,
+                      VernonDifferentiatedProgram &programAutodiff, Variant variant)
+        : context_(&context), topology_(std::move(topology)), programAutodiff_(&programAutodiff),
+          variant_(std::move(variant)) {
         rebuildVariantLayoutViews(variant_);
-        const std::shared_ptr<VernonProgramTopology> locked = topology_.lock();
+        const std::shared_ptr<const program::ResolvedExecutionPlan> locked = topology_.lock();
         if (!locked || !locked->resolvedProgram) {
             signatureError_ = "Program executable has no resolved canonical owner";
             return;
@@ -488,7 +478,7 @@ public:
 
     VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize, const VernonAdValueSet &inputs,
                          VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) override {
-        const std::shared_ptr<VernonProgramTopology> topology = topology_.lock();
+        const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
         const program::Program *execution =
             topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
         const program::Graph *forward = execution ? program::findGraph(*execution, "forward") : nullptr;
@@ -522,10 +512,7 @@ public:
             return fail(*context_, error);
         LogicalValueFrame arena(std::move(hostStorage));
         arena.setInvocationContext(target.programContext);
-        VernonProgramExecutable proxy;
-        proxy.context = context_;
-        proxy.variant = variant_;
-        proxy.topology = topology;
+        VernonProgramExecutable proxy(*context_, topology);
         for (const program::Node &node : forward->nodes)
             if (program::executionKind(node) == program::ExecutionKind::Compute)
                 for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
@@ -536,7 +523,7 @@ public:
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (device) {
             std::vector<char> deviceRequired(execution->values.size());
-            markDeviceResidentValues(*execution, *forward, *topology, deviceRequired);
+            applyPlannedDeviceResidency(program::GraphDirection::Forward, *topology, deviceRequired);
             if (!arena.materializeDevice(*context_, deviceRequired, error))
                 return fail(*context_, error);
             std::vector<ProgramTapeState> tapeStates;
@@ -592,11 +579,11 @@ public:
 
         ProgramResidualPlan plan;
         uint64_t memoryBudget = context_->autodiffMemoryPolicy->invocationLimit();
-        const bool rematerializeTapes = topology->programCheckpointMemoryBudget.has_value();
+        const bool rematerializeTapes = programAutodiff_->checkpointMemoryBudget.has_value();
         if (rematerializeTapes)
-            memoryBudget = *topology->programCheckpointMemoryBudget;
+            memoryBudget = *programAutodiff_->checkpointMemoryBudget;
         if (!planProgramResiduals(*execution, topology.get(), variant_, arena.hostValues(), memoryBudget,
-                                  topology->programCheckpointPolicy, rematerializeTapes, plan, error))
+                                  programAutodiff_->checkpointPolicy, rematerializeTapes, plan, error))
             return fail(*context_, error);
         for (uint32_t value : plan.retainedValues) {
             if (value >= arena.hostValues().size())
@@ -623,7 +610,8 @@ public:
 
 private:
     VernonRuntimeContext *context_;
-    std::weak_ptr<VernonProgramTopology> topology_;
+    std::weak_ptr<const program::ResolvedExecutionPlan> topology_;
+    const VernonDifferentiatedProgram *programAutodiff_{};
     Variant variant_;
     Signature signature_;
     std::vector<ProgramLeafBinding> inputBindings_;
@@ -638,30 +626,17 @@ private:
 
 bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups) {
-    if (!pipeline.context || !pipeline.topology || !pipeline.topology->resolvedProgram)
+    if (!pipeline.context)
         return false;
-    const program::Program &execution = pipeline.topology->resolvedProgram->program;
+    VernonDifferentiatedProgram &state = pipeline.autodiff;
+    const program::Program &execution = pipeline.executionPlan->resolvedProgram->program;
     if (!program::findGraph(execution, "forward")) {
         invocationDiagnostic(*pipeline.context) = "Program execution topology requires a forward graph";
         return false;
     }
-    if (!pipeline.variant.parameters.empty()) {
-        invocationDiagnostic(*pipeline.context) =
-            "managed Program public parameters must come exclusively from compiler-emitted ProgramABI";
-        return false;
-    }
     if (!pipeline.context->autodiffMemoryPolicy)
         pipeline.context->autodiffMemoryPolicy = std::make_shared<AutodiffMemoryPolicy>();
-    std::vector<ValueLayout> &layoutViews = pipeline.topology->boundaryLayoutViews;
-    layoutViews.clear();
-    layoutViews.resize(execution.abi.boundarySlots.size());
-    for (size_t index = 0; index < execution.abi.boundarySlots.size(); ++index)
-        if (const std::optional<program::ValueLayout> &layout = execution.abi.boundarySlots[index].layout) {
-            layoutViews[index] =
-                program::materializeValueLayout(*layout, execution.abi.boundarySlots[index].logicalType);
-            rebuildValueLayoutPathViews(layoutViews[index]);
-        }
-    auto executable = std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.topology, pipeline.variant);
+    auto executable = std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.executionPlan, state, Variant{});
     std::vector<AutodiffDerivativeGroup> groups = derivativeGroups;
     const auto appendGroups = [&](AutodiffDerivativeRole role, program::BoundaryRole boundaryRole,
                                   const std::vector<ValueAbi> &leaves, std::vector<AutodiffDerivativeGroup> &result) {
@@ -740,7 +715,8 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
             invocationDiagnostic(*pipeline.context) = "Program autodiff derivative groups do not match its signature";
         return false;
     }
-    pipeline.differentiated = VernonDifferentiatedProgram{std::move(executable), std::move(groups)};
+    state.executable = std::move(executable);
+    state.derivativeGroups = std::move(groups);
     return true;
 }
 

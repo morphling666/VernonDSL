@@ -8,7 +8,7 @@ namespace {
 
 class Resolver {
 public:
-    Resolver(const program::Program &program, const VernonProgramTopology *topology,
+    Resolver(const program::Program &program, const program::ResolvedExecutionPlan *topology,
              std::vector<LogicalProgramValue> &values)
         : program_(program), topology_(topology), values_(values) {}
 
@@ -35,14 +35,16 @@ private:
             return true;
         for (const auto &[node, nodePlan] : topology_->nodes) {
             (void)node;
-            if (nodePlan.pipeline && !nodePlan.pipeline->variant.vertex.empty())
+            if (!nodePlan.stage)
                 continue;
-            for (size_t index = 0; nodePlan.pipeline && index < nodePlan.bindings.size() &&
-                                   index < nodePlan.pipeline->variant.parameters.size();
+            const Variant &bindingProjection = nodePlan.stage->bindingProjection;
+            if (!bindingProjection.vertex.empty())
+                continue;
+            for (size_t index = 0; index < nodePlan.projections.size() && index < bindingProjection.parameters.size();
                  ++index) {
-                const VernonProgramStageBinding &binding = nodePlan.bindings[index];
-                const Parameter &parameter = nodePlan.pipeline->variant.parameters[index];
-                if (binding.leaf || parameter.invocationCarrier || (binding.target && binding.target->viewTransform))
+                const program::NodeEndpointProjection &binding = nodePlan.projections[index];
+                const Parameter &parameter = bindingProjection.parameters[index];
+                if (binding.logicalLeaf || parameter.invocationCarrier || binding.target.viewTransform)
                     continue;
                 const uint32_t value = binding.value;
                 if (value >= program_.values.size())
@@ -108,13 +110,13 @@ private:
     }
 
     const program::Program &program_;
-    const VernonProgramTopology *topology_;
+    const program::ResolvedExecutionPlan *topology_;
     std::vector<LogicalProgramValue> &values_;
 };
 
 } // namespace
 
-bool resolveProgramShapes(const program::Program &program, const VernonProgramTopology *topology,
+bool resolveProgramShapes(const program::Program &program, const program::ResolvedExecutionPlan *topology,
                           std::vector<LogicalProgramValue> &values, std::string &error) {
     return Resolver(program, topology, values).resolve(error);
 }

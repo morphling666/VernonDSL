@@ -255,8 +255,8 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     ASSERT_TRUE(runtime);
     VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
     VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    VernonProgramExecutable *pipeline = vernonRuntimeLoadArtifact(
-        runtime, artifact.data, artifact.size, reflection.data, reflection.size, "increment", std::strlen("increment"));
+    VernonStageExecutable *pipeline = vernonRuntimeLoadArtifact(runtime, artifact.data, artifact.size, reflection.data,
+                                                                reflection.size, "increment", std::strlen("increment"));
     ASSERT_TRUE(pipeline);
 
     float input[8] = {0, 1, 2, 3, 4, 5, 6, 7};
@@ -277,7 +277,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(input);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
@@ -292,7 +292,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         ASSERT_TRUE(output[index] == input[index] + 1.0f);
 
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);

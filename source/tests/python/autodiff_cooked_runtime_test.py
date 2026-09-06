@@ -14,7 +14,7 @@ def main() -> None:
     from autodiff_cooked_aggregate_asset import objective
 
     vd.init(arch=vd.cpu)
-    cooked = vd.load_cooked_vjp_asset(manifest)
+    cooked = vd.load_program(manifest)
 
     def output_storage() -> vd.TensorStorage:
         return vd.storage.zeros(dtype=vd.f32, shape=(2,))

@@ -41,7 +41,7 @@ def main() -> None:
     )
     direct_gradient = direct_pullback(cotangent)["particles"]
 
-    cooked = vd.load_cooked_vjp_asset(manifest)
+    cooked = vd.load_program(manifest)
     cooked_particles = primal_storage()
     cooked_output = vd.storage.zeros(dtype=Particle, shape=(1,))
     _, cooked_pullback = cooked.vjp(

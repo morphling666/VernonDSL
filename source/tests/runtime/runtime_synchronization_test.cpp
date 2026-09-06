@@ -120,8 +120,8 @@ TEST(CompilerRuntimeSynchronization, CpuJitEntryExecutesCooperativeWorkgroups) {
     const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
     VernonCpuEntryPoint entry = vernonCompileResultGetCpuEntry(compiled, "synchronize", std::strlen("synchronize"));
     ASSERT_NE(entry, nullptr);
-    VernonProgramExecutable *pipeline = vernonRuntimeLoadCpuEntry(runtime, entry, reflection.data, reflection.size,
-                                                                  "synchronize", std::strlen("synchronize"));
+    VernonStageExecutable *pipeline = vernonRuntimeLoadCpuEntry(runtime, entry, reflection.data, reflection.size,
+                                                                "synchronize", std::strlen("synchronize"));
     ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
 
     std::array<int32_t, 10> result{};
@@ -139,7 +139,7 @@ TEST(CompilerRuntimeSynchronization, CpuJitEntryExecutesCooperativeWorkgroups) {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(result);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
@@ -149,7 +149,7 @@ TEST(CompilerRuntimeSynchronization, CpuJitEntryExecutesCooperativeWorkgroups) {
         << stringValue(vernonRuntimeGetLastError(runtime));
     verifySynchronizationResult(result);
 
-    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonCompileResultDestroy(compiled);
     vernonCompilerDestroy(compiler);
@@ -187,7 +187,7 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     ASSERT_NE(context.runtime, nullptr);
     const VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
     const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    VernonProgramExecutable *pipeline =
+    VernonStageExecutable *pipeline =
         vernonRuntimeLoadArtifact(context.runtime, artifact.data, artifact.size, reflection.data, reflection.size,
                                   "synchronize", std::strlen("synchronize"));
     ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(context.runtime));
@@ -210,7 +210,7 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(result);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
@@ -224,7 +224,7 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     verifySynchronizationResult(result);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);

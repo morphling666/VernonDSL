@@ -3,16 +3,16 @@
 
 #include "VernonRuntime.h"
 
-#include <cstddef>
 #include <filesystem>
 #include <string>
 
 namespace vernon::runtime::program {
 
-VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                    size_t programJsonSize, const char *targetJson,
-                                                    size_t targetJsonSize, const char *blobsJson, size_t blobsJsonSize,
-                                                    const char *artifactSystemJson, size_t artifactSystemJsonSize,
+struct ArtifactSystem;
+struct Program;
+
+VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const Program &program,
+                                                    const ArtifactSystem &artifacts,
                                                     const std::filesystem::path &bundleRoot, std::string &error);
 
 } // namespace vernon::runtime::program

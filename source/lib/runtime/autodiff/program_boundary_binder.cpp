@@ -1,6 +1,7 @@
 #include "program_boundary_binder.h"
 
 #include "runtime/program_execution_manifest.h"
+#include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/tensor_bridge.h"
 
@@ -31,11 +32,11 @@ bool boundaryAccessMatches(program::BoundaryAccess access, VernonValueAccess sup
 } // namespace
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
-                           const ProgramBoundaryBindingRequest &request,
+                           const program::ResolvedExecutionPlan &plan, const ProgramBoundaryBindingRequest &request,
                            std::map<uint32_t, VernonProgramArgument> &externalValues,
                            std::map<uint32_t, ProgramStorageState> &backings, std::vector<char> &live,
                            std::string &error) {
-    const VernonProgramSubmitDescriptor &invocation = request.invocation;
+    const VernonStageInvocationDescriptor &invocation = request.invocation;
     if (invocation.argument_count != request.valueBySlot.size() ||
         (invocation.argument_count && !invocation.arguments)) {
         error = "Program invocation does not match its canonical boundary slots";
@@ -52,13 +53,23 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
     ProgramOwnerBindings ownerBindings;
     std::vector<std::pair<program::ProgramOwnerId, const VernonTensorView *>> tensorOwners;
     std::map<std::pair<program::ProgramOwnerKind, uint32_t>, size_t> stagedOwners;
-    std::set<std::pair<program::ProgramOwnerKind, uint32_t>> borrowedOutputOwners;
+    std::set<std::pair<program::ProgramOwnerKind, uint32_t>> inPlaceOwners;
     if (request.publications) {
-        for (const program::PublicationTarget &target : execution.abi.publication.targets) {
-            const uint32_t slot = target.slot;
+        for (const program::ResolvedPublicationTransaction &transaction : plan.publications.transactions) {
+            const uint32_t slot = transaction.slot;
             if (slot >= execution.abi.boundarySlots.size())
                 continue;
             const program::BoundarySlot &boundary = execution.abi.boundarySlots[slot];
+            const auto key = std::make_pair(transaction.stagingOwner.kind, transaction.stagingOwner.id);
+            if (transaction.mode == program::PublicationCommitMode::InPlace) {
+                inPlaceOwners.insert(key);
+                continue;
+            }
+            const program::PublicationTarget *target = program::findPublicationTarget(execution.abi, slot);
+            if (!target) {
+                error = "resolved commit-after-success publication has no canonical target";
+                return false;
+            }
             auto supplied = bySlot.find(slot);
             if (supplied == bySlot.end())
                 for (const auto &[candidateSlot, value] : request.valueBySlot) {
@@ -66,13 +77,14 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                     if (candidateSlot >= execution.abi.boundarySlots.size())
                         continue;
                     const program::ProgramOwnerId &candidate = execution.abi.boundarySlots[candidateSlot].aliasOwner;
-                    if (candidate.kind == target.aliasOwner.kind && candidate.id == target.aliasOwner.id) {
+                    if (candidate.kind == transaction.stagingOwner.kind &&
+                        candidate.id == transaction.stagingOwner.id) {
                         supplied = bySlot.find(candidateSlot);
                         if (supplied != bySlot.end())
                             break;
                     }
                 }
-            if (target.role != program::BoundaryRole::Output || supplied == bySlot.end() ||
+            if (target->role != program::BoundaryRole::Output || supplied == bySlot.end() ||
                 boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage ||
                 supplied->second->kind != VERNON_PROGRAM_TENSOR)
                 continue;
@@ -83,13 +95,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 error = "Program output boundary references an unknown Storage";
                 return false;
             }
-            const auto key = std::make_pair(boundary.aliasOwner.kind, boundary.aliasOwner.id);
-            if (storage->ownership == program::StorageOwnership::Borrowed &&
-                supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                borrowedOutputOwners.insert(key);
-                continue;
-            }
-            PendingProgramPublication publication{&target, *supplied->second};
+            PendingProgramPublication publication{target, *supplied->second};
             if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 VernonRhiBuffer destination{};
                 if (!resolveBackendRhiBufferReference(context, supplied->second->tensor.resource, destination)) {
@@ -129,9 +135,9 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
         if (!ownerBindings.bind(owner, *supplied->second, error))
             return false;
         const auto ownerKey = std::make_pair(owner.kind, owner.id);
-        if (borrowedOutputOwners.count(ownerKey)) {
+        if (inPlaceOwners.count(ownerKey)) {
             if (owner.kind != program::ProgramOwnerKind::Storage || supplied->second->kind != VERNON_PROGRAM_TENSOR) {
-                error = "borrowed Program output owner is not Tensor Storage";
+                error = "in-place Program output owner is not Tensor Storage";
                 return false;
             }
             ProgramStorageState &backing = backings[owner.id];
@@ -144,11 +150,10 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
         }
         const auto staged = stagedOwners.find(ownerKey);
         if (staged != stagedOwners.end()) {
-            if (execution.abi.boundarySlots[slot].role == program::BoundaryRole::Input) {
+            if (boundary.role == program::BoundaryRole::Input && boundary.access != program::BoundaryAccess::Write) {
                 if (owner.kind != program::ProgramOwnerKind::Storage ||
-                    supplied->second->kind != VERNON_PROGRAM_TENSOR ||
-                    supplied->second->tensor.storage != VERNON_TENSOR_HOST || !supplied->second->tensor.host_data) {
-                    error = "staged Program Storage input requires host Tensor data";
+                    supplied->second->kind != VERNON_PROGRAM_TENSOR) {
+                    error = "staged Program Storage input requires Tensor data";
                     return false;
                 }
                 ProgramStorageState &backing = backings[owner.id];

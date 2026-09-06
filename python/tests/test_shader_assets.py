@@ -1088,10 +1088,16 @@ asset = vd.program_asset(id="module/square", program=Square())
                     source_array = np.array([3.0], dtype=np.float32)
                     output_array = np.zeros(1, dtype=np.float32)
                     output_buffer = None
-                    builder = loaded.invocation_builder()
+                    invocation = loaded.program_instance().begin_invocation()
+                    builder = invocation.builder
                     if target_name == "cpu":
                         for parameter, array in zip(loaded.parameters, (source_array, output_array), strict=True):
-                            builder.host_tensor(parameter.slot, array)
+                            prepared = builder.prepare_host_tensor(parameter.slot, array)
+                            invocation.bind(
+                                parameter.slot,
+                                ("test", parameter.slot),
+                                lambda prepared=prepared: prepared,
+                            )
                     else:
                         assert host is not None
                         source_buffer = host.create_buffer(source_array.nbytes)
@@ -1099,8 +1105,20 @@ asset = vd.program_asset(id="module/square", program=Square())
                         source_buffer.upload(source_array.tobytes())
                         output_buffer.upload(output_array.tobytes())
                         for parameter, buffer in zip(loaded.parameters, (source_buffer, output_buffer), strict=True):
-                            builder.rhi_tensor(parameter.slot, buffer, parameter.access, [1], [4])
-                    builder.grid(1, 1, 1).submit().wait()
+                            prepared = builder.prepare_rhi_tensor(
+                                parameter.slot,
+                                buffer,
+                                parameter.access,
+                                [1],
+                                [4],
+                            )
+                            invocation.bind(
+                                parameter.slot,
+                                ("test", parameter.slot),
+                                lambda prepared=prepared: prepared,
+                            )
+                    invocation.forward()
+                    invocation.commit()
                     if target_name != "cpu":
                         assert output_buffer is not None
                         output_array = np.frombuffer(output_buffer.download(), dtype=np.float32)

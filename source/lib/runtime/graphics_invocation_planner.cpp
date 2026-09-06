@@ -44,7 +44,7 @@ bool fail(std::string &error, const char *message) {
 
 } // namespace
 
-bool planGraphicsState(const VernonProgramSubmitDescriptor &invocation, size_t colorCount, bool hasDepth,
+bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t colorCount, bool hasDepth,
                        bool hasStencil, PlannedGraphicsState &state, std::string &error) {
     state = {};
     state.depthStencil.depth_test = hasDepth;
@@ -156,7 +156,7 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
     prepared = {};
 }
 
-bool planGraphicsInvocation(const Variant &variant, const VernonProgramSubmitDescriptor &source,
+bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationDescriptor &source,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
     plan = {};

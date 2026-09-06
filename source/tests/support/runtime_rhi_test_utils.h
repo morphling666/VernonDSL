@@ -64,7 +64,7 @@ struct GraphicsInvocationControls {
         dynamic.struct_size = sizeof(dynamic);
     }
 
-    void bind(VernonProgramSubmitDescriptor &invocation) {
+    void bind(VernonStageInvocationDescriptor &invocation) {
         invocation.graphics_state = &state;
         invocation.render_pass = &renderPass;
         invocation.draw_command = &draw;
@@ -274,10 +274,10 @@ inline VernonStatus completeCanonicalAutodiffInvocation(VernonProgramExecutable 
     return completeCanonicalComputeInvocation(pipeline, arguments.data(), arguments.size(), grid, pullback);
 }
 
-inline VernonStatus completeSubmission(VernonProgramExecutable *pipeline,
-                                       const VernonProgramSubmitDescriptor *invocation) {
+inline VernonStatus completeSubmission(VernonStageExecutable *pipeline,
+                                       const VernonStageInvocationDescriptor *invocation) {
     VernonSubmission *submission{};
-    const VernonStatus submitStatus = vernonRuntimeProgramSubmit(pipeline, invocation, &submission);
+    const VernonStatus submitStatus = vernonRuntimeStageSubmit(pipeline, invocation, &submission);
     if (submitStatus != VERNON_STATUS_OK)
         return submitStatus;
     const VernonStatus completionStatus = vernonSubmissionWait(submission);
@@ -301,7 +301,7 @@ inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiComma
 class RuntimeGraphRenderPass final : public execution::RenderPass {
 public:
     RuntimeGraphRenderPass(std::string name, execution::GraphImage target, VernonRuntimeContext *runtime,
-                           VernonProgramExecutable *pipeline, const VernonProgramSubmitDescriptor *invocation,
+                           VernonStageExecutable *pipeline, const VernonStageInvocationDescriptor *invocation,
                            VernonRhiLoadOperation load = VERNON_RHI_LOAD_CLEAR,
                            VernonRhiStoreOperation store = VERNON_RHI_STORE_PRESERVE)
         : RenderPass(std::move(name)), target_(target), runtime_(runtime), pipeline_(pipeline), invocation_(invocation),
@@ -320,7 +320,7 @@ public:
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+        return vernonRuntimeStageEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
                    ? VERNON_RHI_STATUS_OK
                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -328,8 +328,8 @@ public:
 private:
     execution::GraphImage target_;
     VernonRuntimeContext *runtime_{};
-    VernonProgramExecutable *pipeline_{};
-    const VernonProgramSubmitDescriptor *invocation_{};
+    VernonStageExecutable *pipeline_{};
+    const VernonStageInvocationDescriptor *invocation_{};
     VernonRhiLoadOperation load_{};
     VernonRhiStoreOperation store_{};
 };
@@ -337,7 +337,7 @@ private:
 class RuntimeGraphComputePass final : public execution::ComputePass {
 public:
     RuntimeGraphComputePass(std::string name, execution::GraphBuffer buffer, VernonRuntimeContext *runtime,
-                            VernonProgramExecutable *pipeline, const VernonProgramSubmitDescriptor *invocation)
+                            VernonStageExecutable *pipeline, const VernonStageInvocationDescriptor *invocation)
         : ComputePass(std::move(name)), buffer_(buffer), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -347,7 +347,7 @@ public:
         VernonRuntimeProviderObject providerEncoder{};
         if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
+        return vernonRuntimeStageEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
                    ? VERNON_RHI_STATUS_OK
                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -355,8 +355,8 @@ public:
 private:
     execution::GraphBuffer buffer_;
     VernonRuntimeContext *runtime_{};
-    VernonProgramExecutable *pipeline_{};
-    const VernonProgramSubmitDescriptor *invocation_{};
+    VernonStageExecutable *pipeline_{};
+    const VernonStageInvocationDescriptor *invocation_{};
 };
 
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {

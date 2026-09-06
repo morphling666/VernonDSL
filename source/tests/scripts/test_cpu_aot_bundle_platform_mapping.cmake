@@ -29,31 +29,55 @@ function(
     file(READ "${output_directory}/cpu_fill.program.json" manifest)
     string(
         JSON
+        envelope_type
+        GET
+        "${manifest}"
+        type)
+    string(
+        JSON
+        target_kind
+        GET
+        "${manifest}"
+        target
+        kind)
+    string(
+        JSON
         actual_triple
         GET
         "${manifest}"
-        runtime_requirements
-        target_triple)
+        target
+        options
+        triple)
     string(
         JSON
         actual_format
         GET
         "${manifest}"
-        runtime_requirements
+        variants
+        0
+        artifact_system
         object_format)
+    if(NOT
+       envelope_type
+       STREQUAL
+       "program"
+       OR NOT
+          target_kind
+          STREQUAL
+          "cpu")
+        message(FATAL_ERROR "CPU AOT mapping fixture is not an exact type:program CPU envelope")
+    endif()
     if(NOT
        actual_triple
        STREQUAL
        expected_triple)
-        message(
-            FATAL_ERROR "${operating_system} mapped to target triple '${actual_triple}', expected '${expected_triple}'")
+        message(FATAL_ERROR "${operating_system} mapped to '${actual_triple}', expected '${expected_triple}'")
     endif()
     if(NOT
        actual_format
        STREQUAL
        expected_format)
-        message(
-            FATAL_ERROR "${operating_system} mapped to object format '${actual_format}', expected '${expected_format}'")
+        message(FATAL_ERROR "${operating_system} mapped to '${actual_format}', expected '${expected_format}'")
     endif()
 endfunction()
 

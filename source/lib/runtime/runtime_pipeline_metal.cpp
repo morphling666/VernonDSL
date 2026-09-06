@@ -129,7 +129,7 @@ bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t text
 #endif
 }
 
-bool resolveMetalPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
+bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     if (variant.compute.empty()) {
         const Stage &vertex = bundle.stages.at(variant.vertex);
@@ -524,7 +524,7 @@ bool resolveMetalPipeline(VernonProgramBundle &bundle, const Variant &variant, V
 #endif
 }
 
-void destroyMetalPipeline(VernonProgramExecutable &pipeline) {
+void destroyMetalPipeline(VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -537,8 +537,8 @@ void destroyMetalPipeline(VernonProgramExecutable &pipeline) {
 #endif
 }
 
-VernonStatus invokeMetalGraphicsPipeline(VernonProgramExecutable &pipeline,
-                                         const VernonProgramSubmitDescriptor &invocation,
+VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
+                                         const VernonStageInvocationDescriptor &invocation,
                                          const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
@@ -664,7 +664,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonProgramExecutable &pipeline,
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;

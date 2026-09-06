@@ -1,7 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>

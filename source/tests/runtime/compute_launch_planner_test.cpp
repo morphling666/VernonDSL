@@ -99,7 +99,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
                           stridedStride.data(),
                           0,
                           sizeof(stridedValues)};
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.arguments = supplied;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
@@ -148,7 +148,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 12 * sizeof(float);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
     PlannedComputeLaunch plan;
@@ -204,7 +204,7 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
     supplied.tensor.access = VERNON_ACCESS_READ_WRITE;
     supplied.tensor.rank = 0;
     supplied.tensor.byte_size = sizeof(float);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};
@@ -245,7 +245,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     supplied.tensor.shape = shape.data();
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_size = 2 * sizeof(float);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
 
@@ -275,7 +275,7 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
                           zeroStride.data(),
                           0,
                           sizeof(values)};
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.arguments = supplied;
     invocation.argument_count = 1;
     invocation.compute_grid = {1, 1, 1};

@@ -4,6 +4,7 @@
 #include "autodiff/program_value_arena.h"
 #include "graphics_invocation_planner.h"
 #include "program_execution_manifest.h"
+#include "resolved_execution_plan.h"
 
 #include <functional>
 #include <string>
@@ -13,7 +14,8 @@ namespace vernon::runtime {
 using ResolveProgramRenderPass = std::function<const VernonRenderPass *(uint32_t control)>;
 
 bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedGraph &resolved, ad::LogicalValueFrame &invocation,
+                                         const program::ResolvedExecutionPlan &resolved,
+                                         ad::LogicalValueFrame &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error);
 
 /// Check the bound render target against the attachment signature the Program was compiled for.

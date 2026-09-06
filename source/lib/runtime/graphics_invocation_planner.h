@@ -69,10 +69,10 @@ struct PreparedGraphicsVariant {
     VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
-bool planGraphicsInvocation(const Variant &variant, const VernonProgramSubmitDescriptor &invocation,
+bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error);
-bool planGraphicsState(const VernonProgramSubmitDescriptor &invocation, size_t colorCount, bool hasDepth,
+bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t colorCount, bool hasDepth,
                        bool hasStencil, PlannedGraphicsState &state, std::string &error);
 VernonStatus ensureGraphicsVariant(VernonRuntimeCorePipeline *pipeline, const GraphicsVariantKey &key,
                                    PreparedGraphicsVariant &prepared);

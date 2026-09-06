@@ -64,7 +64,7 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
                                                      const ComputeBindingSource &source);
 
 bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
-                           const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                           const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
                            std::string &error);
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 

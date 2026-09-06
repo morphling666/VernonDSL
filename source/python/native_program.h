@@ -681,12 +681,12 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
-    VernonProgramSubmitDescriptor invocation(std::vector<VernonProgramArgument> &values) const {
+    VernonStageInvocationDescriptor invocation(std::vector<VernonProgramArgument> &values) const {
         values.clear();
         values.reserve(arguments.size());
         for (const PreparedProgramArgument *argument : arguments)
             values.push_back(argument->value);
-        VernonProgramSubmitDescriptor invocation{};
+        VernonStageInvocationDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
@@ -720,7 +720,7 @@ struct ProgramInvocationBuilder {
         if (pullback)
             *pullback = nullptr;
         std::vector<VernonProgramArgument> values;
-        const VernonProgramSubmitDescriptor descriptor = invocation(values);
+        const VernonStageInvocationDescriptor descriptor = invocation(values);
 
         VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
         if (!instance)
@@ -760,31 +760,6 @@ struct ProgramInvocationBuilder {
         vernonRuntimeProgramInvocationDestroy(programInvocation);
         vernonRuntimeProgramInstanceDestroy(instance);
         return status;
-    }
-
-    std::unique_ptr<PythonRuntimeSubmission> submit(VernonRuntimeProviderObject *encoder) {
-        std::vector<VernonProgramArgument> values;
-        VernonProgramSubmitDescriptor invocation = this->invocation(values);
-        if (encoder) {
-            if (vernonRuntimeProgramEncode(*encoder, pipeline, &invocation) != VERNON_STATUS_OK)
-                throw std::runtime_error("pipeline encoding failed: " +
-                                         nativeStringView(vernonRuntimeGetLastError(runtime)));
-            return {};
-        }
-        VernonSubmission *submission{};
-        if (vernonRuntimeProgramSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
-            throw std::runtime_error("pipeline submission failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
-        return std::make_unique<PythonRuntimeSubmission>(submission);
-    }
-
-    std::unique_ptr<PythonRuntimeSubmission> submit() { return submit(nullptr); }
-
-    template <typename Encoder> void encode(const Encoder &encoder) {
-        VernonRuntimeProviderObject providerEncoder{};
-        if (vernonRuntimeReferenceRhiCommandEncoder(runtime, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
-            throw std::invalid_argument("command encoder belongs to another Runtime device");
-        (void)submit(&providerEncoder);
     }
 
     Runtime *owner{};
@@ -921,7 +896,7 @@ struct PythonProgramInvocationAdapter {
 
     void bindRenderPass(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonProgramSubmitDescriptor frame = control.invocation(values);
+        VernonStageInvocationDescriptor frame = control.invocation(values);
         if (!frame.render_pass)
             throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
@@ -933,7 +908,7 @@ struct PythonProgramInvocationAdapter {
 
     void bindDrawCommand(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonProgramSubmitDescriptor frame = control.invocation(values);
+        VernonStageInvocationDescriptor frame = control.invocation(values);
         if (!frame.draw_command)
             throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
@@ -945,7 +920,7 @@ struct PythonProgramInvocationAdapter {
 
     void bindDynamicState(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonProgramSubmitDescriptor frame = control.invocation(values);
+        VernonStageInvocationDescriptor frame = control.invocation(values);
         if (!frame.dynamic_state)
             throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);

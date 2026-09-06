@@ -70,7 +70,15 @@ struct ViewTransform {
 struct ProgramProjection {
     uint32_t value{UINT32_MAX};
     std::optional<size_t> leaf;
+    uint32_t physicalLeaf{};
     ValueBindingDirection direction{ValueBindingDirection::Input};
+};
+
+struct PhysicalEndpointProjection {
+    size_t carrierByteSize{};
+    size_t carrierAlignment{};
+    size_t leafByteOffset{};
+    size_t leafByteSize{};
 };
 
 struct TargetEndpointIdentity {
@@ -114,6 +122,7 @@ struct TargetBinding {
     std::vector<int64_t> viewShape;
     std::optional<vernon::runtime::ValueLayout> wholeValueLayout;
     vernon::runtime::ValueLayout elementLayout;
+    std::optional<PhysicalEndpointProjection> endpointProjection;
     std::optional<TargetPhysicalTransport> transport;
     TargetNativeLocation native;
     std::vector<vernon::runtime::AttributeLeaf> attributeLeaves;

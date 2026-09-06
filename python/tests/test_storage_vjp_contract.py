@@ -442,6 +442,13 @@ def objective(
         cotangent["samples"].copy_from_numpy(np.array([[4.0, -5.0], [9.0, 9.0]], dtype=np.float32))
         gradient = pullback(cotangent)["source"]
 
+        # Stage-local aggregate carriers must not overwrite the canonical
+        # logical Storage or any independently owned cotangent leaf.
+        np.testing.assert_array_equal(source.to_numpy(), values)
+        np.testing.assert_array_equal(
+            cotangent["particle.position"].to_numpy(),
+            np.array([[1.5, -2.0], [9.0, 9.0]], dtype=np.float32),
+        )
         self.assertEqual(
             gradient.dtype.names,
             ("particle", "pair", "samples"),
@@ -557,7 +564,7 @@ def objective(
             np.testing.assert_array_equal(pullback(cotangent)["values"].to_numpy(), expected_gradient)
             np.testing.assert_array_equal(cotangent, cotangent_before)
         self.assertEqual(
-            len(runtime_autodiff._direct_state(storage_objective_vjp.program, storage_objective_vjp).compiled),
+            len(runtime_autodiff._kernel_state(storage_objective_vjp.program, storage_objective_vjp).compiled),
             1,
         )
 
@@ -585,7 +592,7 @@ def objective(
             np.testing.assert_array_equal(pullback(None)["values"].to_numpy(), expected)
         self.assertEqual(
             len(
-                runtime_autodiff._direct_state(
+                runtime_autodiff._kernel_state(
                     partially_dynamic_objective_vjp.program,
                     partially_dynamic_objective_vjp,
                 ).compiled
@@ -595,7 +602,7 @@ def objective(
 
         invalid = vd.storage.zeros(dtype=vd.f32, shape=(3, 3, 4, 5))
         loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
-        with self.assertRaisesRegex(ValueError, r"shape \[3, 3, 4, 5\] does not match reflection \[3, 2, 4, 5\]"):
+        with self.assertRaisesRegex(ValueError, "bound shape for Program value 0 conflicts"):
             partially_dynamic_objective_vjp(invalid, np.int32(3), np.int32(5), loss, grid=(1, 1, 1))
 
     def test_tensor_view_gradient_scatter_targets_its_owner_descriptor(self) -> None:

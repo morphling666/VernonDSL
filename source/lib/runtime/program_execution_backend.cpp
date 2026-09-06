@@ -4,6 +4,7 @@
 #include "content_hash.h"
 #include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
+#include "resolved_execution_plan.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime_dispatch.h"
 #include "runtime_state.h"
@@ -113,10 +114,10 @@ bool loadModuleBytes(const ArtifactSystem &artifacts, const std::string &artifac
     return loadCodeModuleBytes(artifacts, artifactId, bundleRoot, stage->second.modules.front(), bytes, diagnostic);
 }
 
-VernonProgramExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
-                                                     const ArtifactSystem &artifacts,
-                                                     const std::filesystem::path &bundleRoot, const Node &node,
-                                                     const ResolvedStage &resolvedStage, Diagnostic &diagnostic) {
+VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context, const ResolvedProgram &program,
+                                                   const ArtifactSystem &artifacts,
+                                                   const std::filesystem::path &bundleRoot, const Node &node,
+                                                   const ResolvedStage &resolvedStage, Diagnostic &diagnostic) {
     const StageArtifact &artifact = resolvedStage.stage;
     if (context.backend == VERNON_RUNTIME_CPU || context.backend == VERNON_RUNTIME_CUDA)
         return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs/0/nodes/0/operation",
@@ -130,7 +131,7 @@ VernonProgramExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &conte
     if (!buildExecutableBindingView(bindingPlan, variant, reflection, diagnostic))
         return nullptr;
 
-    VernonProgramBundle bundle;
+    BackendPipelineBundle bundle;
     bundle.context = &context;
     for (const CodeModule &module : artifact.modules) {
         std::vector<uint8_t> bytes;
@@ -154,21 +155,20 @@ VernonProgramExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &conte
         else if (module.role == "fragment")
             variant.fragment = key;
     }
-    auto pipeline = std::make_unique<VernonProgramExecutable>();
+    auto pipeline = std::make_unique<VernonStageExecutable>();
     pipeline->context = &context;
-    pipeline->variant = std::move(variant);
-    rebuildVariantLayoutViews(pipeline->variant);
-    if (!resolveBackendPipeline(bundle, pipeline->variant, *pipeline))
+    pipeline->bindingProjection = std::move(variant);
+    rebuildVariantLayoutViews(pipeline->bindingProjection);
+    if (!resolveBackendPipeline(bundle, pipeline->bindingProjection, *pipeline))
         return reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
                       invocationDiagnostic(context)),
                nullptr;
-    ++context.livePipelines;
     return pipeline.release();
 }
 
-VernonProgramExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
-                                                 const std::filesystem::path &bundleRoot,
-                                                 const ResolvedExecutableNode &node, Diagnostic &diagnostic) {
+VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, const ArtifactSystem &artifacts,
+                                               const std::filesystem::path &bundleRoot,
+                                               const ResolvedExecutableNode &node, Diagnostic &diagnostic) {
     const ResolvedStage &stage = *node.stage;
     if (stage.stage.modules.size() != 1)
         return reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
@@ -196,7 +196,7 @@ VernonProgramExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, 
             return nullptr;
         }
     }
-    VernonProgramExecutable *pipeline = loadBackendTypedComputePipeline(
+    VernonStageExecutable *pipeline = loadBackendTypedComputePipeline(
         context, std::move(variant), std::move(reflection), moduleBytes.empty() ? nullptr : moduleBytes.data(),
         moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
     if (!pipeline)
@@ -215,20 +215,25 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
     ResolvedExecutablePlan executable;
     if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
         return nullptr;
-    auto pipeline = std::make_unique<VernonProgramExecutable>();
-    pipeline->context = &context;
-    auto topology = std::make_shared<VernonProgramTopology>();
-    topology->resolvedProgram = std::move(program);
-    topology->residualValues = residualCaptures(topology->resolvedProgram->program);
+    auto plan = std::make_shared<ResolvedExecutionPlan>();
+    plan->resolvedProgram = std::move(program);
+    plan->boundaryLayoutViews.resize(plan->resolvedProgram->program.abi.boundarySlots.size());
+    for (size_t index = 0; index < plan->resolvedProgram->program.abi.boundarySlots.size(); ++index) {
+        const auto &slot = plan->resolvedProgram->program.abi.boundarySlots[index];
+        if (slot.layout) {
+            plan->boundaryLayoutViews[index] = materializeValueLayout(*slot.layout, slot.logicalType);
+            rebuildValueLayoutPathViews(plan->boundaryLayoutViews[index]);
+        }
+    }
     std::unordered_map<std::string, size_t> cachedStages;
     for (const ResolvedExecutableNode &node : executable.nodes) {
         const std::string identity = physicalStageIdentity(node.stage->stage);
         auto cached = cachedStages.find(identity);
         if (cached == cachedStages.end()) {
-            std::unique_ptr<VernonProgramExecutable> child(
+            std::shared_ptr<VernonStageExecutable> child(
                 executionKind(*node.node) == ExecutionKind::Graphics
-                    ? loadGraphicsProgramPipeline(context, *topology->resolvedProgram, artifacts, bundleRoot,
-                                                  *node.node, *node.stage, diagnostic)
+                    ? loadGraphicsProgramPipeline(context, *plan->resolvedProgram, artifacts, bundleRoot, *node.node,
+                                                  *node.stage, diagnostic)
                     : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic));
             if (!child) {
                 if (diagnostic.code.empty())
@@ -237,19 +242,53 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
                                                                  : invocationDiagnostic(context));
                 return nullptr;
             }
-            --context.livePipelines;
-            cached = cachedStages.emplace(identity, topology->stages.size()).first;
-            topology->stages.push_back(VernonCompiledProgramStage{std::move(child)});
+            cached = cachedStages.emplace(identity, plan->stageCache.size()).first;
+            plan->stageCache.push_back(std::move(child));
         }
-        std::vector<VernonProgramStageBinding> bindings;
+        std::vector<NodeEndpointProjection> projections;
         for (const TargetBinding &binding : node.plan.bindings)
             if (!internalSource(binding.source))
-                bindings.push_back({binding.projection.value, binding.projection.leaf, binding});
-        topology->nodes.emplace(std::make_pair(node.graph, node.node->id),
-                                VernonResolvedProgramNode{topology->stages[cached->second].pipeline.get(),
-                                                          std::move(bindings), node.plan.dispatchMapping});
+                projections.push_back({binding.projection.value, binding.projection.leaf, binding});
+        const std::optional<GraphDirection> direction = graphDirection(node.graph);
+        if (!direction)
+            return reject(diagnostic, "PROGRAM_GRAPH_DIRECTION", "/graphs",
+                          "resolved node has an unsupported graph direction"),
+                   nullptr;
+        ResolvedOperationControls controls;
+        if (executionKind(*node.node) == ExecutionKind::Compute) {
+            const ComputeOperation &compute = computeOperation(*node.node);
+            controls = ResolvedComputeControls{
+                {compute.workgroups[0], compute.workgroups[1], compute.workgroups[2]},
+                node.plan.dispatchMapping,
+            };
+        } else {
+            const GraphicsOperation &graphics = graphicsOperation(*node.node);
+            ResolvedGraphicsControls resolvedGraphics;
+            resolvedGraphics.renderPassControl = graphics.renderPassControl;
+            resolvedGraphics.drawCommandControl = graphics.drawCommandControl;
+            resolvedGraphics.dynamicStateControl = graphics.dynamicStateControl;
+            const auto attachment = [&](const GraphicsAttachmentSignature &signature) {
+                const ResourceAccess &access = node.node->accesses[signature.access];
+                return ResolvedGraphicsAttachment{
+                    signature.access,
+                    access.storage,
+                    signature.location,
+                    signature.aspects,
+                };
+            };
+            for (const GraphicsAttachmentSignature &signature : graphics.colorAttachments)
+                resolvedGraphics.colorAttachments.push_back(attachment(signature));
+            if (graphics.depthStencilAttachment)
+                resolvedGraphics.depthStencilAttachment = attachment(*graphics.depthStencilAttachment);
+            controls = std::move(resolvedGraphics);
+        }
+        const NodeKey key{*direction, node.node->id};
+        plan->nodes.emplace(
+            key, ResolvedNodePlan{key, plan->stageCache[cached->second], std::move(projections), std::move(controls)});
     }
-    pipeline->topology = std::move(topology);
+    if (!buildResolvedExecutionPolicies(*plan, diagnostic) || !validateResolvedExecutionPlan(*plan, diagnostic))
+        return nullptr;
+    auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(plan));
     if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
         return reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
                       invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
@@ -259,40 +298,17 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
     return pipeline.release();
 }
 
-VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const char *programJson,
-                                                    size_t programJsonSize, const char *targetJson,
-                                                    size_t targetJsonSize, const char *blobsJson, size_t blobsJsonSize,
-                                                    const char *artifactSystemJson, size_t artifactSystemJsonSize,
+VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &context, const Program &program,
+                                                    const ArtifactSystem &artifacts,
                                                     const std::filesystem::path &bundleRoot, std::string &error) {
     Diagnostic diagnostic;
-    Program program;
-    ArtifactSystem artifacts;
     const auto failed = [&]() -> VernonProgramExecutable * {
         error =
             diagnostic.code + (diagnostic.path.empty() ? ": " : " at " + diagnostic.path + ": ") + diagnostic.message;
         return nullptr;
     };
-    try {
-        if (!parse(nlohmann::json::parse(programJson, programJson + programJsonSize), program, diagnostic)) {
-            if (diagnostic.code.empty())
-                reject(diagnostic, "PROGRAM_PARSE_FAILED", "", "Program parser rejected input without a diagnostic");
-            return failed();
-        }
-        if (!parseArtifactSystem(nlohmann::json::parse(targetJson, targetJson + targetJsonSize),
-                                 nlohmann::json::parse(blobsJson, blobsJson + blobsJsonSize),
-                                 nlohmann::json::parse(artifactSystemJson, artifactSystemJson + artifactSystemJsonSize),
-                                 artifacts, diagnostic)) {
-            if (diagnostic.code.empty())
-                reject(diagnostic, "PROGRAM_ARTIFACT_PARSE_FAILED", "",
-                       "artifact parser rejected input without a diagnostic");
-            return failed();
-        }
-    } catch (const nlohmann::json::exception &exception) {
-        reject(diagnostic, "PROGRAM_JSON_INVALID", "", exception.what());
-        return failed();
-    }
     ResolvedProgram resolved;
-    if (!resolve(std::move(program), artifacts, resolved, diagnostic)) {
+    if (!resolve(program, artifacts, resolved, diagnostic)) {
         if (diagnostic.code.empty())
             reject(diagnostic, "PROGRAM_RESOLUTION_FAILED", "", "Program resolver rejected input without a diagnostic");
         return failed();

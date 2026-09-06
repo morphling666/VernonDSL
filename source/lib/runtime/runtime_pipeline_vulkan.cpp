@@ -62,7 +62,7 @@ VkFormat vulkanTextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveVulkanPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
+bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     auto *state = new VulkanPipelineState();
     if (!variant.compute.empty()) {
@@ -394,7 +394,7 @@ bool resolveVulkanPipeline(VernonProgramBundle &bundle, const Variant &variant, 
 #endif
 }
 
-void destroyVulkanPipeline(VernonProgramExecutable &pipeline) {
+void destroyVulkanPipeline(VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -407,8 +407,8 @@ void destroyVulkanPipeline(VernonProgramExecutable &pipeline) {
 #endif
 }
 
-VernonStatus invokeVulkanGraphicsPipeline(VernonProgramExecutable &pipeline,
-                                          const VernonProgramSubmitDescriptor &invocation,
+VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
+                                          const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
@@ -541,7 +541,7 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonProgramExecutable &pipeline,
 #endif
 }
 
-VernonStatus invokeVulkanComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeVulkanComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(pipeline);
     for (size_t index = 0; index < state.rhiComputeLayout.size(); ++index) {
@@ -586,7 +586,7 @@ VernonStatus invokeVulkanComputePipeline(VernonProgramExecutable &pipeline, cons
             const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
             if (!scalar || !scalar->data) {
                 std::string parameterContract;
-                for (const Parameter &parameter : pipeline.variant.parameters)
+                for (const Parameter &parameter : pipeline.bindingProjection.parameters)
                     for (const ParameterUse &use : parameter.uses)
                         if (use.index == layout.argument_index)
                             parameterContract = " for parameter '" + parameter.name + "' (interface " +

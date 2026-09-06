@@ -1266,7 +1266,7 @@ class VulkanPipelineTests(unittest.TestCase):
         ):
             render(position=positions, render_pass=render_target(target))
         compiled = next(iter(render._specializations.values()))
-        self.assertTrue(compiled.specialization.pipeline.is_managed_program)
+        self.assertGreater(len(compiled.specialization.pipeline.program_abi["boundary_slots"]), 0)
         self.assertEqual(len(compiled.invocation.graph.operations), 1)
 
     def test_program_abi_keeps_attachments_as_invocation_controls(self) -> None:

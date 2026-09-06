@@ -363,7 +363,7 @@ class ModuleTests(unittest.TestCase):
     def test_plain_module_call_does_not_compile_or_retain_vjp(self) -> None:
         module = FanIn()
         with mock.patch(
-            "vernon_dsl._runtime.autodiff._compile_direct_vjp",
+            "vernon_dsl._runtime.autodiff._compile_kernel_vjp",
             side_effect=AssertionError("plain Module call compiled VJP"),
         ):
             outputs = module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))

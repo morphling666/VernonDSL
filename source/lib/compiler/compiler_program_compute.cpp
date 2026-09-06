@@ -381,9 +381,12 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                 endpoint["element_layout_hash"] = elementLayout->getString("layout_hash").value_or("").str();
             plan.endpoints.emplace_back(std::move(endpoint));
             llvm::json::Array projections;
-            projections.emplace_back(llvm::json::Object{{"value", valueId},
-                                                        {"physical_leaf", int64_t{0}},
-                                                        {"direction", interfaceKind == "result" ? "result" : "input"}});
+            llvm::json::Object projection{{"value", valueId},
+                                          {"physical_leaf", int64_t{0}},
+                                          {"direction", interfaceKind == "result" ? "result" : "input"}};
+            if (projectedLeafIndex)
+                projection["leaf"] = static_cast<int64_t>(*projectedLeafIndex);
+            projections.emplace_back(std::move(projection));
             plan.endpointBindings.emplace_back(llvm::json::Object{{"module", "compute"},
                                                                   {"interface", interfaceKind.str()},
                                                                   {"index", endpointIndex},

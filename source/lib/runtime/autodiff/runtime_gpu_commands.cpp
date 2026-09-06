@@ -116,7 +116,7 @@ struct TransferCommandContext {
 };
 
 struct PipelineCommandContext {
-    PipelineCommandContext(VernonRuntimeContext &runtimeValue, VernonProgramExecutable &pipelineValue,
+    PipelineCommandContext(VernonRuntimeContext &runtimeValue, VernonStageExecutable &pipelineValue,
                            const std::vector<VernonProgramArgument> &argumentValues, VernonLaunchSize gridValue)
         : runtime(runtimeValue), pipeline(pipelineValue), arguments(argumentValues), grid(gridValue) {
         shapes.resize(arguments.size());
@@ -133,7 +133,7 @@ struct PipelineCommandContext {
     }
 
     VernonRuntimeContext &runtime;
-    VernonProgramExecutable &pipeline;
+    VernonStageExecutable &pipeline;
     std::vector<VernonProgramArgument> arguments;
     VernonLaunchSize grid;
     std::vector<std::vector<uint64_t>> shapes;
@@ -144,12 +144,19 @@ struct PipelineCommandContext {
 
 bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                         const std::vector<DeviceBufferCopy> &copies) {
-    for (const DeviceBufferCopy &copy : copies)
+    for (size_t index = 0; index < copies.size(); ++index) {
+        const DeviceBufferCopy &copy = copies[index];
         if (injectFailure(FailureBoundary::Copy) ||
             vernonRhiCommandEncoderCopyBuffer(context.rhiDevice, encoder, copy.source, copy.sourceOffset,
                                               copy.destination, copy.destinationOffset,
-                                              copy.size) != VERNON_RHI_STATUS_OK)
+                                              copy.size) != VERNON_RHI_STATUS_OK) {
+            invocationDiagnostic(context) = "GPU buffer copy " + std::to_string(index) + " failed (source offset " +
+                                            std::to_string(copy.sourceOffset) + ", destination offset " +
+                                            std::to_string(copy.destinationOffset) + ", size " +
+                                            std::to_string(copy.size) + ")";
             return false;
+        }
+    }
     return true;
 }
 
@@ -218,18 +225,18 @@ VernonRhiStatus encodeWithFailureBoundary(void *opaque, VernonRhiCommandEncoder 
 } // namespace
 
 VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
-                                   VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
+                                   VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                    VernonLaunchSize grid) {
     VernonRuntimeProviderObject provider{};
     if (referenceBackendCommandEncoder(context, encoder, provider) != VERNON_STATUS_OK)
         return fail(context, "cannot reference GPU autodiff command encoder", VERNON_STATUS_INTERNAL_ERROR);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return vernonRuntimeProgramEncode(provider, &pipeline, &invocation);
+    return vernonRuntimeStageEncode(provider, &pipeline, &invocation);
 }
 
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
@@ -295,19 +302,25 @@ VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std
     return executeCommandPlanAndWait(context, plan);
 }
 
-VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
-                                          execution::detail::RhiCommandExecutionPlan &plan) {
+VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies,
+                                            const std::vector<DeviceBufferUpload> &uploads,
+                                            execution::detail::RhiCommandExecutionPlan &plan) {
     plan = {};
-    if (uploads.empty())
+    if (copies.empty() && uploads.empty())
         return VERNON_STATUS_OK;
+    for (const DeviceBufferCopy &copy : copies)
+        if (!copy.size)
+            return fail(context, "Program Storage copy has no payload");
     for (const DeviceBufferUpload &upload : uploads)
         if (!upload.source || !upload.size)
             return fail(context, "Program Storage upload has no source bytes");
+    appendCopyBindings(plan.bindings, copies);
     appendUploadBindings(plan.bindings, uploads);
-    auto transferContext = std::make_shared<TransferCommandContext>(context, std::vector<DeviceBufferCopy>{}, uploads);
+    auto transferContext = std::make_shared<TransferCommandContext>(context, copies, uploads);
     execution::detail::CommandNode transfer;
     transfer.kind = execution::detail::CommandNodeKind::Transfer;
     transfer.queue = execution::detail::CommandQueueClass::Transfer;
+    appendCopyAccesses(transfer, copies);
     appendUploadAccesses(transfer, uploads);
     plan.commands.nodes.push_back(std::move(transfer));
     plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
@@ -315,7 +328,12 @@ VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const s
     return VERNON_STATUS_OK;
 }
 
-VernonStatus executePipelineCommandDagAndWait(VernonProgramExecutable &pipeline, VernonLaunchSize grid,
+VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
+                                          execution::detail::RhiCommandExecutionPlan &plan) {
+    return buildBufferTransferCommandPlan(context, {}, uploads, plan);
+}
+
+VernonStatus executePipelineCommandDagAndWait(VernonStageExecutable &pipeline, VernonLaunchSize grid,
                                               std::vector<VernonProgramArgument> &arguments,
                                               const std::vector<DeviceBufferUpload> &uploadsBefore,
                                               execution::detail::CommandNodeKind kind,
@@ -327,7 +345,7 @@ VernonStatus executePipelineCommandDagAndWait(VernonProgramExecutable &pipeline,
 
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                      VernonProgramExecutable &pipeline,
+                                      VernonStageExecutable &pipeline,
                                       const std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
                                       const std::vector<DeviceBufferCopy> &copiesAfter,
                                       execution::detail::CommandNodeKind kind,
@@ -394,9 +412,9 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
 
 VernonStatus
 executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                 const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                 VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
-                                 VernonLaunchSize grid, const std::vector<DeviceBufferCopy> &copiesAfter,
+                                 const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
+                                 std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
+                                 const std::vector<DeviceBufferCopy> &copiesAfter,
                                  execution::detail::CommandNodeKind kind, PullbackControlPlaneUsage *telemetry,
                                  execution::detail::RhiCommandPlanSink *sink) {
     if (injectFailure(FailureBoundary::Submit))
@@ -411,7 +429,7 @@ executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vecto
 
 VernonStatus
 executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                       VernonProgramExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
+                                       VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
                                        VernonLaunchSize grid, const std::vector<DeviceBufferUpload> &uploadsBefore,
                                        VernonRhiBuffer statusBuffer, size_t statusOffset, size_t statusSize,
                                        GpuCommandCompletionCallback complete, void *completionContext,

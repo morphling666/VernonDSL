@@ -7,8 +7,6 @@
 #include <map>
 #include <optional>
 
-struct VernonProgramTopology;
-
 namespace vernon::runtime::ad {
 
 std::optional<ValueLayout> resolvedProgramValueLayout(const program::Value &value);
@@ -20,12 +18,12 @@ inline bool programValueHasDynamicShape(const program::Value &value) {
 bool fillProgramTapeHostValue(LogicalProgramValue &value, std::shared_ptr<HostStaticTapeBatch> batch,
                               std::string &error);
 
-bool materializeProgramOwnedStorages(const program::Program &execution, const VernonProgramTopology *topology,
+bool materializeProgramOwnedStorages(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                                      std::vector<LogicalProgramValue> &storage, const std::vector<char> &liveStorage,
                                      const std::vector<std::optional<ValueLayout>> &layouts,
                                      std::map<uint32_t, ProgramStorageState> &backings, std::string &error);
 
-bool materializeProgramValues(const program::Program &execution, const VernonProgramTopology *topology,
+bool materializeProgramValues(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                               std::vector<LogicalProgramValue> &storage, const std::vector<char> &live,
                               const std::vector<std::optional<ValueLayout>> &layouts,
                               const std::map<uint32_t, ProgramStorageState> &backings,

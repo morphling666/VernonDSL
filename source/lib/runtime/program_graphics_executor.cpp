@@ -59,33 +59,47 @@ bool checkAttachmentFormat(const program::GraphicsAttachmentSignature &signature
 } // namespace
 
 bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedGraph &resolved, ad::LogicalValueFrame &invocation,
+                                         const program::ResolvedExecutionPlan &resolved,
+                                         ad::LogicalValueFrame &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error) {
-    for (const program::ResolvedGraph::ControlResourceProjection &projection : resolved.controlResources) {
-        if (projection.node >= graph.nodes.size())
-            return error = "resolved control resource references an unknown graph node", false;
-        const program::GraphicsOperation &graphics = program::graphicsOperation(graph.nodes[projection.node]);
-        const VernonRenderPass *renderPass = resolveRenderPass(projection.control);
+    const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
+    if (!direction)
+        return error = "resolved graphics graph has an invalid direction", false;
+    for (const program::Node &node : graph.nodes) {
+        if (program::executionKind(node) != program::ExecutionKind::Graphics)
+            continue;
+        const program::ResolvedNodePlan *nodePlan = resolved.node(*direction, node.id);
+        const auto *controls = nodePlan ? std::get_if<program::ResolvedGraphicsControls>(&nodePlan->controls) : nullptr;
+        if (!controls)
+            return error = "graphics Node has no resolved operation controls", false;
+        const program::GraphicsOperation &graphics = program::graphicsOperation(node);
+        const VernonRenderPass *renderPass = resolveRenderPass(controls->renderPassControl);
         if (!renderPass)
             return error = "managed graphics node has no bound RenderPass control", false;
         if (renderPass->color_attachment_count != graphics.colorAttachments.size())
             return error = "managed graphics fragment outputs must exactly match the color attachments", false;
-        VernonRuntimeProviderResourceReference view{};
-        if (projection.aspects & VERNON_IMAGE_ASPECT_COLOR) {
-            const auto attachment = std::find_if(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
-                                                 [&](const program::GraphicsAttachmentSignature &candidate) {
-                                                     return candidate.location == projection.location;
-                                                 });
-            if (attachment == graphics.colorAttachments.end())
-                return error = "resolved color control resource has no attachment signature", false;
-            const size_t index = static_cast<size_t>(attachment - graphics.colorAttachments.begin());
-            view = renderPass->color_attachments[index].view;
-        } else {
-            if (!renderPass->depth_attachment)
-                return error = "managed graphics node requires a depth-stencil attachment", false;
-            view = renderPass->depth_attachment->view;
-        }
-        if (!invocation.bindControlImageStorage(program, projection.storage, view, error))
+        const auto bind = [&](const program::ResolvedGraphicsAttachment &attachment) {
+            VernonRuntimeProviderResourceReference view{};
+            if (attachment.aspects & VERNON_IMAGE_ASPECT_COLOR) {
+                const auto signature = std::find_if(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
+                                                    [&](const program::GraphicsAttachmentSignature &candidate) {
+                                                        return candidate.location == attachment.location;
+                                                    });
+                if (signature == graphics.colorAttachments.end())
+                    return error = "resolved color control resource has no attachment signature", false;
+                const size_t index = static_cast<size_t>(signature - graphics.colorAttachments.begin());
+                view = renderPass->color_attachments[index].view;
+            } else {
+                if (!renderPass->depth_attachment)
+                    return error = "managed graphics node requires a depth-stencil attachment", false;
+                view = renderPass->depth_attachment->view;
+            }
+            return invocation.bindControlImageStorage(program, attachment.storage, view, error);
+        };
+        for (const program::ResolvedGraphicsAttachment &attachment : controls->colorAttachments)
+            if (!bind(attachment))
+                return false;
+        if (controls->depthStencilAttachment && !bind(*controls->depthStencilAttachment))
             return false;
     }
     return true;

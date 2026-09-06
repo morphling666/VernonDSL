@@ -1,7 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/runtime_state.h"
 #include "runtime_rhi_test_utils.h"
 
@@ -228,7 +228,6 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    ASSERT_FALSE(bundle->autodiff.has_value());
     auto objective = [](double x, double y, double z) {
         const double linear = x + y;
         const double difference = x - y;

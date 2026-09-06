@@ -320,7 +320,7 @@ template <typename Handle> bool decodeResourceHandle(uint64_t key, Handle &handl
     return true;
 }
 
-const VernonProgramArgument *findInvocationArgument(const VernonProgramSubmitDescriptor &invocation, uint32_t slot) {
+const VernonProgramArgument *findInvocationArgument(const VernonStageInvocationDescriptor &invocation, uint32_t slot) {
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (invocation.arguments[index].slot == slot)
             return &invocation.arguments[index];
@@ -418,15 +418,16 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     std::vector<DeviceBufferUpload> uploads;
     std::vector<DeviceBufferCopy> copies;
     VernonRhiCommandEncoder nativeEncoder{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    const Variant &bindingProjection = pipeline->bindingProjection;
     if (!target.encodedInvocation()) {
-        if (!buildForwardArguments(context, pipeline->variant, inputs, prepared.working, prepared.retainedDevices,
+        if (!buildForwardArguments(context, bindingProjection, inputs, prepared.working, prepared.retainedDevices,
                                    prepared.retainedHosts, arguments, uploads, false))
             return fail(context, std::string("cannot prepare GPU autodiff ") + resourceName + " resources",
                         VERNON_STATUS_INTERNAL_ERROR);
     } else {
         if (!target.invocation)
             return fail(context, "encoded GPU autodiff forward has no invocation");
-        const VernonProgramSubmitDescriptor &invocation = *target.invocation;
+        const VernonStageInvocationDescriptor &invocation = *target.invocation;
         if (target.externalEncoder() &&
             (!decodeResourceHandle(target.encoder.value, nativeEncoder) ||
              vernon::rhi::commandEncoderKey(context.rhiDevice, nativeEncoder) != target.encoder.value))
@@ -434,7 +435,7 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
         if (invocation.argument_count)
             arguments.assign(invocation.arguments, invocation.arguments + invocation.argument_count);
         arguments.reserve(arguments.size() + 1);
-        for (const Parameter &parameter : pipeline->variant.parameters) {
+        for (const Parameter &parameter : bindingProjection.parameters) {
             if (isAutodiffInternal(parameter))
                 continue;
             const VernonAdValue *value = findParameterValues(inputs, parameter);
@@ -517,7 +518,7 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     const uint32_t launchData[3]{computeGrid.x, computeGrid.y, computeGrid.z};
     DeviceBuffer launchBuffer(context, sizeof(launchData));
     InternalBufferView launchView;
-    for (const Parameter &parameter : pipeline->variant.parameters) {
+    for (const Parameter &parameter : bindingProjection.parameters) {
         if (parameter.autodiffRole != AutodiffResourceRole::LaunchMetadata)
             continue;
         if (!launchBuffer.valid())
@@ -558,17 +559,18 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     if (!target.externalEncoder())
         return executePipelineCommandDagAndWait(*pipeline, computeGrid, arguments, uploads,
                                                 execution::detail::CommandNodeKind::Derivative);
-    VernonProgramSubmitDescriptor encoded = *target.invocation;
+    VernonStageInvocationDescriptor encoded = *target.invocation;
     encoded.arguments = arguments.empty() ? nullptr : arguments.data();
     encoded.argument_count = arguments.size();
     encoded.command_encoder = {};
-    return vernonRuntimeProgramEncode(target.encoder, pipeline.get(), &encoded);
+    return vernonRuntimeStageEncode(target.encoder, pipeline.get(), &encoded);
 }
 
 bool stageForwardResults(const Signature &signature, const OwnedPipeline &pipeline, DeviceValues &working,
                          const VernonAdValueSet &inputs, VernonAdValueSet &outputs,
                          PreparedForwardPublication &publication) {
-    return stageForwardValues(signature, pipeline->variant, working, inputs, outputs, publication);
+    const Variant &bindingProjection = pipeline->bindingProjection;
+    return stageForwardValues(signature, bindingProjection, working, inputs, outputs, publication);
 }
 
 bool publishForwardResults(const PreparedForwardPublication &publication) {

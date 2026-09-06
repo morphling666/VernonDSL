@@ -1,5 +1,5 @@
 #include "VernonRuntime.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/autodiff/runtime_gpu_failure_injection.h"
 #include "runtime/autodiff/runtime_gpu_replay.h"
 #include "runtime_rhi_test_utils.h"

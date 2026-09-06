@@ -45,7 +45,7 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
 }
 
 bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments, VernonLaunchSize workgroup,
-                          const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                          const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
                           std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
     size_t computeArgumentSpan = 0;
@@ -220,7 +220,7 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
 }
 
 bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
-                           const VernonProgramSubmitDescriptor &invocation, PlannedComputeLaunch &plan,
+                           const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
                            std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)

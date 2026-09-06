@@ -77,16 +77,19 @@ bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &co
 }
 
 bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &context,
-                              const program::Program &execution, const VernonProgramTopology &topology,
+                              const program::Program &execution, const program::ResolvedExecutionPlan &topology,
                               const program::Graph &forward, std::vector<ProgramTapeState> &states,
                               std::string &error) {
     std::map<uint32_t, ProgramTapeState> byValue;
+    const std::optional<program::GraphDirection> direction = program::graphDirection(forward.direction);
+    if (!direction)
+        return error = "Program tape graph direction is invalid", false;
     for (const program::Node &node : forward.nodes) {
-        const auto nodePlan = topology.nodes.find({forward.direction, node.id});
-        if (nodePlan == topology.nodes.end())
+        const program::ResolvedNodePlan *nodePlan = topology.node(*direction, node.id);
+        if (!nodePlan)
             return error = "Program tape stage is not resolved", false;
-        for (const VernonProgramStageBinding &binding : nodePlan->second.bindings) {
-            if (!binding.target || !binding.target->tapeCarrier)
+        for (const program::NodeEndpointProjection &binding : nodePlan->projections) {
+            if (!binding.target.tapeCarrier)
                 continue;
             ProgramTapeState &state = byValue[binding.value];
             state.value = binding.value;
@@ -100,19 +103,19 @@ bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &co
                     return error = error.empty() ? "Program tape dispatch control is invalid" : error, false;
             state.grid = {static_cast<uint32_t>(grid[0]), static_cast<uint32_t>(grid[1]),
                           static_cast<uint32_t>(grid[2])};
-            state.workgroup = nodePlan->second.pipeline->workgroupSize;
-            switch (*binding.target->tapeCarrier) {
+            state.workgroup = nodePlan->stage->workgroupSize;
+            switch (*binding.target.tapeCarrier) {
             case program_plan::TapeCarrier::TapeData:
-                state.tape = &*binding.target;
+                state.tape = &binding.target;
                 break;
             case program_plan::TapeCarrier::ReplaySegment:
-                state.segment = &*binding.target;
+                state.segment = &binding.target;
                 break;
             case program_plan::TapeCarrier::ReplayStatus:
-                state.status = &*binding.target;
+                state.status = &binding.target;
                 break;
             case program_plan::TapeCarrier::LaunchMetadata:
-                state.launch = &*binding.target;
+                state.launch = &binding.target;
                 break;
             }
         }

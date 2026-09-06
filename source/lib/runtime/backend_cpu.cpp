@@ -1,5 +1,6 @@
 #include "backend_cpu.h"
 
+#include "backend_stage_pipeline.h"
 #include "cpu_workgroup_dispatch.h"
 #include "runtime_state.h"
 
@@ -415,7 +416,7 @@ bool prepareCpuComputePipeline(VernonRuntimeContext &context, CpuKernelState ker
     return false;
 }
 
-void setCpuProgramTape(VernonProgramExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root) {
+void setCpuProgramTape(VernonStageExecutable &pipeline, VernonAdTapeAllocator *allocator, VernonAdRegionHandle root) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     state.tapeAllocator = allocator;
     state.tapeRoot = root;

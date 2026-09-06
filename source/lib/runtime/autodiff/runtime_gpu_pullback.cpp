@@ -98,7 +98,7 @@ public:
         PreparedDerivativeValues derivatives;
         std::string derivativeError;
         VernonLaunchSize extent{};
-        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+        if (!invocationExtent(grid_, (**backward_).workgroupSize, extent))
             return fail(context_, "GPU pullback invocation extent overflows");
         if (!derivatives.prepare(context_, *signature_, cotangents, gradients, *bindingSpecs_, extent,
                                  3 * sizeof(uint32_t), temporaryLimit, derivativeError))
@@ -110,7 +110,7 @@ public:
                              const PullbackApplyOptions &options,
                              execution::detail::RhiCommandPlanSink *sink) override {
         VernonLaunchSize extent{};
-        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+        if (!invocationExtent(grid_, (**backward_).workgroupSize, extent))
             return fail(context_, "GPU device pullback invocation extent overflows");
         for (bool retry = sink != nullptr;; retry = false) {
             control_ = {};
@@ -169,8 +169,8 @@ private:
         DeviceValues working;
         BindingPlan bindings;
         std::string bindingError;
-        if (!materializeBindingPlan((*backward_)->variant, *bindingSpecs_, retainedDevices_, retainedHosts_, working,
-                                    derivatives.devices, bindings, bindingError))
+        if (!materializeBindingPlan((**backward_).bindingProjection, *bindingSpecs_, retainedDevices_, retainedHosts_,
+                                    working, derivatives.devices, bindings, bindingError))
             return fail(context_, std::move(bindingError), VERNON_STATUS_INTERNAL_ERROR);
         std::vector<VernonProgramArgument> arguments;
         arguments.reserve(bindings.size());
@@ -266,7 +266,7 @@ public:
         PreparedDerivativeValues derivatives;
         std::string derivativeError;
         VernonLaunchSize extent{};
-        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+        if (!invocationExtent(grid_, (**backward_).workgroupSize, extent))
             return fail(context_, "GPU pullback invocation extent overflows");
         if (!derivatives.prepare(context_, *signature_, cotangents, gradients, *backwardBindingSpecs_, extent,
                                  3 * sizeof(uint32_t), temporaryLimit, derivativeError))
@@ -278,7 +278,7 @@ public:
                              const PullbackApplyOptions &options,
                              execution::detail::RhiCommandPlanSink *sink) override {
         VernonLaunchSize extent{};
-        if (!invocationExtent(grid_, (*backward_)->workgroupSize, extent))
+        if (!invocationExtent(grid_, (**backward_).workgroupSize, extent))
             return fail(context_, "GPU device pullback invocation extent overflows");
         uint64_t retryReadbacks = 0;
         for (bool retry = sink != nullptr;; retry = false) {
@@ -362,15 +362,15 @@ private:
         BindingPlan forwardBindings;
         BindingPlan backwardBindings;
         std::string bindingError;
-        if (!materializeBindingPlan((*forward_)->variant, *forwardBindingSpecs_, retainedDevices_, retainedHosts_,
-                                    working, derivatives.devices, forwardBindings, bindingError) ||
-            !materializeBindingPlan((*backward_)->variant, *backwardBindingSpecs_, retainedDevices_, retainedHosts_,
-                                    working, derivatives.devices, backwardBindings, bindingError))
+        if (!materializeBindingPlan((**forward_).bindingProjection, *forwardBindingSpecs_, retainedDevices_,
+                                    retainedHosts_, working, derivatives.devices, forwardBindings, bindingError) ||
+            !materializeBindingPlan((**backward_).bindingProjection, *backwardBindingSpecs_, retainedDevices_,
+                                    retainedHosts_, working, derivatives.devices, backwardBindings, bindingError))
             return fail(context_, std::move(bindingError), VERNON_STATUS_INTERNAL_ERROR);
 
         size_t workgroupVolume = 1;
-        for (uint32_t extent :
-             {(*forward_)->workgroupSize.x, (*forward_)->workgroupSize.y, (*forward_)->workgroupSize.z})
+        const VernonLaunchSize forwardWorkgroup = (**forward_).workgroupSize;
+        for (uint32_t extent : {forwardWorkgroup.x, forwardWorkgroup.y, forwardWorkgroup.z})
             if (!checkedMultiply(workgroupVolume, static_cast<size_t>(extent), workgroupVolume))
                 return fail(context_, "GPU bounded-replay workgroup volume overflows", VERNON_STATUS_INTERNAL_ERROR);
         constexpr size_t statusBytes = sizeof(BatchSummary);
@@ -395,8 +395,8 @@ private:
         size_t statusBufferBytes = batchBudget.statusBytes;
         size_t peakTemporaryBytes = batchBudget.memory.peakTemporaryBytes;
 
-        if (!findTape((*forward_)->variant) || !findTape((*backward_)->variant) ||
-            !findReplaySegment((*forward_)->variant) || !findReplaySegment((*backward_)->variant))
+        if (!findTape((**forward_).bindingProjection) || !findTape((**backward_).bindingProjection) ||
+            !findReplaySegment((**forward_).bindingProjection) || !findReplaySegment((**backward_).bindingProjection))
             return fail(context_, "GPU Tape profile has no bounded-replay Tape and segment resources",
                         VERNON_STATUS_INTERNAL_ERROR);
 
@@ -432,7 +432,7 @@ private:
                 const BatchRange batch = staticScheduler.current();
                 std::vector<Segment> metadata(batch.count);
                 for (size_t index = 0; index < batch.count; ++index)
-                    if (!initializeBatchSegment(grid_, (*forward_)->workgroupSize, batch.begin + index, index,
+                    if (!initializeBatchSegment(grid_, (**forward_).workgroupSize, batch.begin + index, index,
                                                 tapeStride, workgroupVolume, tapeBytes, metadata[index]))
                         return fail(context_, "cannot build static GPU replay segment metadata",
                                     VERNON_STATUS_INTERNAL_ERROR);
@@ -517,7 +517,7 @@ private:
             for (;;) {
                 std::vector<Segment> metadata(batchGroups);
                 for (size_t index = 0; index < batchGroups; ++index)
-                    if (!initializeBatchSegment(grid_, (*forward_)->workgroupSize, batchBegin + index, index,
+                    if (!initializeBatchSegment(grid_, (**forward_).workgroupSize, batchBegin + index, index,
                                                 tapeStride, workgroupVolume, tapeBytes, metadata[index]))
                         return fail(context_, "cannot initialize GPU replay segment", VERNON_STATUS_INTERNAL_ERROR);
                 const BatchSummary emptySummary{};

@@ -1,14 +1,10 @@
 #include "VernonCpuWorkgroupABI.h"
-#include "runtime/autodiff/host_tape_allocator.h"
-#include "runtime/autodiff/program_value_arena.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
-#include "runtime/content_hash.h"
-#include "runtime/runtime_dispatch.h"
-#include "runtime_rhi_test_utils.h"
+#include "runtime/backend_stage_pipeline.h"
+#include "runtime/runtime_state.h"
 
 #include <nlohmann/json.hpp>
 
-#include <cstdint>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -16,16 +12,12 @@
 #include <iterator>
 #include <string>
 
-#ifndef VERNON_CPU_BUNDLE_PATH
-#error VERNON_CPU_BUNDLE_PATH must name the CPU bundle test fixture
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
+#ifndef VERNON_CPU_CANONICAL_PROGRAM_MANIFEST
+#define VERNON_CPU_CANONICAL_PROGRAM_MANIFEST ""
 #endif
 
-#ifndef VERNON_RUNTIME_TEST_OS
-#error VERNON_RUNTIME_TEST_OS must name the host operating system
-#endif
-
-#ifndef VERNON_RUNTIME_TEST_ARCH
-#error VERNON_RUNTIME_TEST_ARCH must name the host architecture
+extern "C" VernonStatus vernonRegisterModuleProgramFixture(void);
 #endif
 
 namespace {
@@ -35,20 +27,71 @@ std::string readFile(const std::filesystem::path &path) {
     return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
-VernonProgramBundle *loadWithDirectory(VernonRuntimeContext *runtime, const std::string &bundle,
-                                       const std::string &directory) {
-    VernonProgramBundleLoadOptions options{};
-    options.struct_size = sizeof(options);
-    options.bundle_directory = directory.c_str();
-    return vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+std::string lastError(VernonRuntimeContext *context) {
+    const VernonStringView error = vernonRuntimeGetLastError(context);
+    return std::string(error.data ? error.data : "", error.size);
 }
 
-std::string withContentHash(nlohmann::json root) {
-    root.erase("content_hash");
-    const std::string canonical = root.dump(-1, ' ', false);
-    root["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
-    return root.dump(-1, ' ', false);
+VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
+    VernonProgramParameterView result{};
+    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, {name, std::strlen(name)}, &result),
+              VERNON_STATUS_OK);
+    return result;
 }
+
+VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter, float &value) {
+    static const uint64_t shape[]{1};
+    static const int64_t strides[]{sizeof(float)};
+    VernonProgramArgument result{};
+    result.slot = parameter.slot;
+    result.kind = VERNON_PROGRAM_TENSOR;
+    result.tensor.struct_size = sizeof(VernonTensorView);
+    result.tensor.storage = VERNON_TENSOR_HOST;
+    result.tensor.host_data = &value;
+    result.tensor.element_layout = parameter.element_layout;
+    result.tensor.access = parameter.access;
+    result.tensor.rank = 1;
+    result.tensor.shape = shape;
+    result.tensor.byte_strides = strides;
+    result.tensor.byte_size = sizeof(value);
+    return result;
+}
+
+VernonProgramBindingToken token(const char *value) {
+    return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
+}
+
+#if !defined(VERNON_RUNTIME_PROFILE_WEB)
+struct CanonicalCpuProgram {
+    VernonRuntimeContext *context{};
+    VernonProgramBundle *bundle{};
+    VernonProgramExecutable *pipeline{};
+};
+
+CanonicalCpuProgram loadCanonicalCpuProgram() {
+    EXPECT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
+    EXPECT_FALSE(manifest.empty());
+    CanonicalCpuProgram result;
+    result.context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    EXPECT_NE(result.context, nullptr);
+    result.bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(result.context, manifest.data(), manifest.size(), nullptr);
+    EXPECT_NE(result.bundle, nullptr) << lastError(result.context);
+    if (result.bundle)
+        result.pipeline = vernonRuntimeResolveProgram(result.bundle, {nullptr, 0});
+    EXPECT_NE(result.pipeline, nullptr) << lastError(result.context);
+    return result;
+}
+
+void destroy(CanonicalCpuProgram &program) {
+    vernonRuntimeProgramExecutableDestroy(program.pipeline);
+    vernonRuntimeProgramBundleDestroy(program.bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(program.context), VERNON_STATUS_OK);
+}
+#endif
+
+std::atomic<uint32_t> staticInvocationCount{};
 
 VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
     if (!invocation || invocation->arguments_size != VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1)
@@ -56,567 +99,219 @@ VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
     auto *range = reinterpret_cast<VernonCpuRangeV1 *>(const_cast<void *>(invocation->arguments));
     if (!range || range->struct_size != sizeof(*range))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    uintptr_t address = 0;
-    std::memcpy(&address, range->arguments, sizeof(address));
-    float *values = reinterpret_cast<float *>(address);
-    for (size_t lane = range->lane_begin; lane < range->lane_end; ++lane) {
-        const uint32_t localX = static_cast<uint32_t>(lane % range->workgroup[0]);
-        const uint32_t localY = static_cast<uint32_t>((lane / range->workgroup[0]) % range->workgroup[1]);
-        const uint32_t localZ =
-            static_cast<uint32_t>(lane / (static_cast<size_t>(range->workgroup[0]) * range->workgroup[1]));
-        const uint32_t x = range->group[0] * range->workgroup[0] + localX;
-        const uint32_t y = range->group[1] * range->workgroup[1] + localY;
-        const uint32_t z = range->group[2] * range->workgroup[2] + localZ;
-        values[z * 8 + y * 4 + x] = static_cast<float>(x + 10 * y + 100 * z);
-    }
+    ++staticInvocationCount;
     return VERNON_STATUS_OK;
 }
 
+constexpr char kDirectCpuReflection[] =
+    "{" VERNON_JSON_VERSION_FIELDS ",\"entries\":[{\"name\":\"fill\","
+    "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"packed_arguments_size\":12}},"
+    "\"workgroup_size\":[1,1,1],"
+    "\"dispatch_contract\":{\"unit_grid_axes\":[],\"requires_unit_workgroup\":false},"
+    "\"arguments\":[{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
+    "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"kind\":\"cpu_call\","
+    "\"frame_offset\":0,\"root\":{\"kind\":\"array\",\"offset\":0,\"size\":12,\"alignment\":4,"
+    "\"shape\":[3],\"byte_strides\":[4],\"children\":[{\"kind\":\"scalar\","
+    "\"representation\":\"i32\",\"offset\":0,\"size\":4,\"alignment\":4}]}}},\"index\":0}]}]}";
+
 } // namespace
+
+TEST(RuntimeCpuPipeline, LoadsAndInvokesDirectCpuEntry) {
+    staticInvocationCount = 0;
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    VernonStageExecutable *pipeline = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
+                                                                sizeof(kDirectCpuReflection) - 1, "fill", 4);
+    ASSERT_NE(pipeline, nullptr) << lastError(runtime);
+    VernonStageInvocationDescriptor invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
+    invocation.compute_grid = {2, 3, 4};
+    VernonSubmission *submission = nullptr;
+    ASSERT_EQ(vernonRuntimeStageSubmit(pipeline, &invocation, &submission), VERNON_STATUS_OK) << lastError(runtime);
+    ASSERT_NE(submission, nullptr) << lastError(runtime);
+    EXPECT_EQ(vernonSubmissionWait(submission), VERNON_STATUS_OK);
+    vernonSubmissionDestroy(submission);
+    EXPECT_EQ(staticInvocationCount.load(), 24u);
+    vernonRuntimeStageExecutableDestroy(pipeline);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+}
 
 #if !defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
-    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string directoryUtf8 = directory.u8string();
-    const std::string bundle = readFile(directory / "cpu_fill.program.json");
-    ASSERT_FALSE(bundle.empty());
-
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
+    VernonStageExecutable pipeline;
+    pipeline.context = runtime;
+    vernon::runtime::Parameter tensor;
+    tensor.slot = 0;
+    tensor.name = "values";
+    tensor.kind = "tensor";
+    pipeline.bindingProjection.parameters.push_back(tensor);
+    vernon::runtime::Parameter image;
+    image.slot = 1;
+    image.name = "output";
+    image.kind = "image";
+    image.dimension = "3d";
+    image.bindingRole = "sampled";
+    image.sampleResultClass = "float";
+    image.access = "read";
+    pipeline.bindingProjection.parameters.push_back(image);
 
-    VernonProgramBundle *tensorBundle = loadWithDirectory(runtime, bundle, directoryUtf8);
-    ASSERT_NE(tensorBundle, nullptr);
-    VernonProgramExecutable *tensorPipeline = vernonRuntimeResolveProgram(tensorBundle, {nullptr, 0});
-    ASSERT_NE(tensorPipeline, nullptr);
     VernonProgramImageConstraintView constraint{};
     constraint.struct_size = sizeof(constraint);
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(tensorPipeline, 0, &constraint),
+    EXPECT_EQ(vernonRuntimeStageExecutableGetImageConstraintByParameterIndex(&pipeline, 0, &constraint),
               VERNON_STATUS_INVALID_ARGUMENT);
-
-    nlohmann::json constrained = nlohmann::json::parse(bundle);
-    nlohmann::json &parameter = constrained["variants"][0]["parameters"][0];
-    parameter["kind"] = "image";
-    parameter["type"] = "!vernon.texture<\"3d\", f32, \"unknown\", \"sampled\">";
-    parameter.erase("address_space");
-    parameter.erase("element_layout");
-    parameter["access"] = "read";
-    parameter["dimension"] = "3d";
-    parameter["binding_role"] = "sampled";
-    parameter["sample_result_class"] = "float";
-    parameter["shape"] = nlohmann::json::array();
-    VernonProgramBundle *textureBundle = loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8);
-    ASSERT_NE(textureBundle, nullptr);
-    VernonProgramExecutable *texturePipeline = vernonRuntimeResolveProgram(textureBundle, {nullptr, 0});
-    ASSERT_NE(texturePipeline, nullptr);
-
-    constraint = {};
-    constraint.struct_size = sizeof(constraint);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(texturePipeline, 0, &constraint),
+    ASSERT_EQ(vernonRuntimeStageExecutableGetImageConstraintByParameterIndex(&pipeline, 1, &constraint),
               VERNON_STATUS_OK);
     EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
     EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_SAMPLED);
-
-    constraint = {};
-    constraint.struct_size = sizeof(constraint);
-    ASSERT_EQ(vernonRuntimeProgramExecutableFindImageConstraint(texturePipeline, {"output", std::strlen("output")},
-                                                                &constraint),
-              VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeStageExecutableFindImageConstraint(&pipeline, {"output", std::strlen("output")}, &constraint),
+        VERNON_STATUS_OK);
     EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
 
-    constraint = {};
-    constraint.struct_size = sizeof(constraint) - 1;
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(texturePipeline, 0, &constraint),
-              VERNON_STATUS_INVALID_ARGUMENT);
-
-    constrained["variants"][0]["parameters"][0]["texture_format"] = "rgba16_float";
-    EXPECT_EQ(loadWithDirectory(runtime, withContentHash(constrained), directoryUtf8), nullptr);
-
-    vernonRuntimeProgramExecutableDestroy(texturePipeline);
-    vernonRuntimeProgramBundleDestroy(textureBundle);
-    vernonRuntimeProgramExecutableDestroy(tensorPipeline);
-    vernonRuntimeProgramBundleDestroy(tensorBundle);
-    vernonRuntimeDestroy(runtime);
+    constexpr char legacyReflection[] = "{" VERNON_JSON_VERSION_FIELDS ",\"legacy\":true,\"entries\":[]}";
+    EXPECT_EQ(vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, legacyReflection, sizeof(legacyReflection) - 1,
+                                        "fill", 4),
+              nullptr);
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
-    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string directoryUtf8 = directory.u8string();
-    const std::string bundle = readFile(directory / "cpu_fill.program.json");
-    ASSERT_TRUE(!bundle.empty());
-
+    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
     VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;
-    ASSERT_TRUE(vernonRuntimeProgramBundleInspectTarget(bundle.data(), bundle.size(), &target) == VERNON_STATUS_OK);
-    ASSERT_TRUE(target == VERNON_RUNTIME_CPU);
+    ASSERT_EQ(vernonRuntimeProgramBundleInspectTarget(manifest.data(), manifest.size(), &target), VERNON_STATUS_OK);
+    EXPECT_EQ(target, VERNON_RUNTIME_CPU);
 
-    nlohmann::json mixedTargetOptions = nlohmann::json::parse(bundle);
-    mixedTargetOptions["target"]["options"]["version"] = 330;
-    const std::string mixedTargetBundle = withContentHash(mixedTargetOptions);
-    EXPECT_EQ(vernonRuntimeProgramBundleInspectTarget(mixedTargetBundle.data(), mixedTargetBundle.size(), &target),
-              VERNON_STATUS_PARSE_ERROR);
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    EXPECT_EQ(context->livePipelines, 0u);
+    VernonProgramExecutable *first = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    ASSERT_NE(first, nullptr) << lastError(context);
+    ASSERT_NE(second, nullptr) << lastError(context);
+    EXPECT_NE(first, second);
+    EXPECT_EQ(context->livePipelines, 2u);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_TRUE(runtime);
+    const VernonProgramParameterView source = parameter(first, "source");
+    const VernonProgramParameterView output = parameter(first, "output");
+    float sourceValue = 3.0f;
+    float outputValue = 0.0f;
+    VernonProgramArgument sourceArgument = tensorArgument(source, sourceValue);
+    VernonProgramArgument outputArgument = tensorArgument(output, outputValue);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(first);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    const VernonProgramBindingToken sourceToken = token("source");
+    const VernonProgramBindingToken outputToken = token("output");
+    ASSERT_EQ(
+        vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(sourceValue), 1),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_FLOAT_EQ(outputValue, 9.0f);
 
-    ASSERT_TRUE(!vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), nullptr));
-
-    VernonProgramBundle *loaded = loadWithDirectory(runtime, bundle, directoryUtf8);
-    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
-    ASSERT_TRUE(loaded) << std::string(loadError.data ? loadError.data : "", loadError.size);
-
-    const std::string objectBytes = "test relocatable object";
-    const std::filesystem::path objectPath = directory / "test_static.o";
-    {
-        std::ofstream objectOutput(objectPath, std::ios::binary);
-        objectOutput << objectBytes;
-    }
-    nlohmann::json objectBundle = nlohmann::json::parse(bundle);
-    nlohmann::json &objectStage = objectBundle["stage_artifacts"]["fill"];
-    objectStage["artifact"]["format"] = "relocatable_object";
-    objectStage["artifact"]["path"] = objectPath.filename().string();
-    objectStage["artifact"]["size"] = objectBytes.size();
-    objectStage["artifact"]["sha256"] = vernon::runtime::sha256Hex(objectBytes.data(), objectBytes.size());
-    objectStage["symbol"] = "vernon_missing_static_fill";
-    objectBundle.erase("content_hash");
-    std::string objectCanonical = objectBundle.dump(-1, ' ', false);
-    objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
-    const std::string missingObjectManifest = objectBundle.dump(-1, ' ', false);
-    // The object is a link-time input, not a runtime artifact. A deployed
-    // application carries the linked symbol and metadata, but not the .o/.obj.
-    ASSERT_TRUE(std::filesystem::remove(objectPath));
-    VernonProgramBundle *missingObjectLoaded = vernonRuntimeLoadProgramBundleWithOptions(
-        runtime, missingObjectManifest.data(), missingObjectManifest.size(), nullptr);
-    ASSERT_TRUE(missingObjectLoaded);
-    EXPECT_EQ(vernonRuntimeResolveProgram(missingObjectLoaded, {nullptr, 0}), nullptr);
-    const VernonStringView missingRegistrationError = vernonRuntimeGetLastError(runtime);
-    EXPECT_NE(
-        std::string(missingRegistrationError.data ? missingRegistrationError.data : "", missingRegistrationError.size)
-            .find("was not statically registered"),
-        std::string::npos);
-    vernonRuntimeProgramBundleDestroy(missingObjectLoaded);
-
-    objectStage["symbol"] = "vernon_test_fill";
-    objectBundle.erase("content_hash");
-    objectCanonical = objectBundle.dump(-1, ' ', false);
-    objectBundle["content_hash"] = vernon::runtime::sha256Hex(objectCanonical.data(), objectCanonical.size());
-    const std::string objectManifest = objectBundle.dump(-1, ' ', false);
-    ASSERT_TRUE(vernonRuntimeRegisterStaticCpuEntry({"vernon_test_fill", std::strlen("vernon_test_fill")},
-                                                    staticallyLinkedFill) == VERNON_STATUS_OK);
-    VernonProgramBundle *objectLoaded =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, objectManifest.data(), objectManifest.size(), nullptr);
-    ASSERT_TRUE(objectLoaded);
-    VernonProgramExecutable *objectPipeline = vernonRuntimeResolveProgram(objectLoaded, {nullptr, 0});
-    ASSERT_TRUE(objectPipeline);
-    vernonRuntimeProgramExecutableDestroy(objectPipeline);
-    vernonRuntimeProgramBundleDestroy(objectLoaded);
-
-    nlohmann::json invalidVersion = nlohmann::json::parse(bundle);
-    invalidVersion["program_version"] = VERNON_PROGRAM_VERSION + 1;
-    invalidVersion.erase("content_hash");
-    std::string canonical = invalidVersion.dump(-1, ' ', false);
-    invalidVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
-    canonical = invalidVersion.dump(-1, ' ', false);
-    ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
-
-    nlohmann::json previousVersion = nlohmann::json::parse(bundle);
-    previousVersion["program_version"] = 15;
-    previousVersion.erase("content_hash");
-    canonical = previousVersion.dump(-1, ' ', false);
-    previousVersion["content_hash"] = vernon::runtime::sha256Hex(canonical.data(), canonical.size());
-    canonical = previousVersion.dump(-1, ' ', false);
-    ASSERT_TRUE(!loadWithDirectory(runtime, canonical, directoryUtf8));
-
-    VernonProgramBundleLoadOptions shortOptions{};
-    shortOptions.struct_size = sizeof(shortOptions) - 1;
-    shortOptions.bundle_directory = directoryUtf8.c_str();
-    ASSERT_TRUE(!vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &shortOptions));
-
-    nlohmann::json invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["variants"][0]["program"] = nlohmann::json::object();
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["variants"][0]["program"] = {{"compute", "fill"}, {"vertex", "fill"}, {"fragment", "fill"}};
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    std::string &artifactHash =
-        invalidDocument["stage_artifacts"]["fill"]["artifact"]["sha256"].get_ref<std::string &>();
-    artifactHash[0] = artifactHash[0] == '0' ? '1' : '0';
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["stage_artifacts"]["fill"]["artifact"]["path"] =
-        "../" + invalidDocument["stage_artifacts"]["fill"]["artifact"]["path"].get<std::string>();
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["stage_artifacts"]["fill"]["operating_system"] = "unsupported";
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["stage_artifacts"]["fill"]["architecture"] = "unsupported";
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["features"] = nlohmann::json::array();
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    invalidDocument = nlohmann::json::parse(bundle);
-    invalidDocument["stage_artifacts"]["fill"]["artifact"]["legacy"] = true;
-    ASSERT_TRUE(!loadWithDirectory(runtime, withContentHash(invalidDocument), directoryUtf8));
-
-    const VernonStringView id = vernonRuntimeProgramBundleGetId(loaded);
-    ASSERT_TRUE(id.size == std::strlen("cpu/fill"));
-    ASSERT_TRUE(std::memcmp(id.data, "cpu/fill", id.size) == 0);
-
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
-    ASSERT_TRUE(pipeline);
-    EXPECT_EQ(pipeline->topology, nullptr);
-    ASSERT_TRUE(vernonRuntimeProgramExecutableGetParameterCount(pipeline) == 1);
-    VernonProgramParameterView parameter{};
-    ASSERT_TRUE(vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, 0, &parameter) == VERNON_STATUS_OK);
-    ASSERT_TRUE(parameter.slot == 0 && parameter.kind == VERNON_PROGRAM_TENSOR &&
-                parameter.element_layout.leaf_count == 1 &&
-                parameter.element_layout.leaves[0].dtype == VERNON_DATA_F32 &&
-                parameter.access == VERNON_ACCESS_WRITE && parameter.rank == 1 && parameter.static_shape[0] == 16);
-    ASSERT_TRUE(vernonRuntimeProgramExecutableFindParameter(pipeline, {"output", std::strlen("output")}, &parameter) ==
-                VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeProgramExecutableGetOutputCount(pipeline) == 1);
-    VernonProgramOutputView outputView{};
-    ASSERT_TRUE(vernonRuntimeProgramExecutableFindOutput(pipeline, {"result", std::strlen("result")}, &outputView) ==
-                VERNON_STATUS_OK);
-    ASSERT_TRUE(outputView.kind == VERNON_PROGRAM_TENSOR && outputView.dtype == VERNON_DATA_F32 &&
-                outputView.rank == 1 && outputView.static_shape[0] == 16 && outputView.location == 0);
-
-    float output[16]{};
-    const uint64_t shape[] = {16};
-    const int64_t strides[] = {sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = 0;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = output;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = VERNON_ACCESS_WRITE;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = 16 * sizeof(float);
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    invocation.compute_grid = {2, 1, 2};
-    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
-
-    ASSERT_TRUE(output[0] == 0.0f && output[3] == 3.0f);
-    ASSERT_TRUE(output[4] == 10.0f && output[15] == 113.0f);
-
-    nlohmann::json constantWriteBundle = nlohmann::json::parse(bundle);
-    nlohmann::json &constantEntry = constantWriteBundle["stage_artifacts"]["fill"]["reflection"]["entries"][0];
-    constantEntry["dispatch_contract"] = {{"unit_grid_axes", {0, 1, 2}}, {"requires_unit_workgroup", true}};
-    VernonProgramBundle *constantLoaded =
-        loadWithDirectory(runtime, withContentHash(constantWriteBundle), directoryUtf8);
-    ASSERT_TRUE(constantLoaded);
-    VernonProgramExecutable *constantPipeline = vernonRuntimeResolveProgram(constantLoaded, {nullptr, 0});
-    ASSERT_TRUE(constantPipeline);
-    EXPECT_EQ(vernon::tests::completeSubmission(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
-    const VernonStringView constantError = vernonRuntimeGetLastError(runtime);
-    EXPECT_NE(std::string(constantError.data ? constantError.data : "", constantError.size)
-                  .find("compute dispatch grid axis"),
-              std::string::npos);
-    invocation.compute_grid = {1, 1, 1};
-    EXPECT_EQ(vernon::tests::completeSubmission(constantPipeline, &invocation), VERNON_STATUS_INVALID_ARGUMENT);
-
-    vernonRuntimeProgramExecutableDestroy(constantPipeline);
-    vernonRuntimeProgramBundleDestroy(constantLoaded);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(loaded);
-    ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(second);
+    vernonRuntimeProgramExecutableDestroy(first);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
-    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string directoryUtf8 = directory.u8string();
-    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.program.json"));
-    nlohmann::json &variant = bundle["variants"][0];
-    variant["program"] = {{"forward:0", "fill"}, {"forward:1", "fill"}};
-    nlohmann::json internal = variant["parameters"][0];
-    internal.erase("slot");
-    internal["name"] = "temporary";
-    internal["source"] = "program_value";
-    internal["uses"][0]["stage"] = "forward:0";
-    variant["internal_parameters"] = nlohmann::json::array({std::move(internal)});
-    variant["parameters"][0]["uses"][0]["stage"] = "forward:1";
-    variant["execution"] = {
-        {"values", nlohmann::json::array({{{"id", 0},
-                                           {"name", "temporary"},
-                                           {"type", "tensor<16xf32>"},
-                                           {"dtype", "f32"},
-                                           {"shape", {16}},
-                                           {"external", false},
-                                           {"output", false}},
-                                          {{"id", 1},
-                                           {"name", "output"},
-                                           {"type", "tensor<16xf32>"},
-                                           {"dtype", "f32"},
-                                           {"shape", {16}},
-                                           {"external", true},
-                                           {"output", true}}})},
-        {"graphs",
-         nlohmann::json::array(
-             {{{"name", "forward"},
-               {"direction", "forward"},
-               {"arguments", nlohmann::json::array()},
-               {"results", {1}},
-               {"nodes", nlohmann::json::array(
-                             {{{"id", 0},
-                               {"name", "fill temporary"},
-                               {"kind", "compute"},
-                               {"stage", "forward:0"},
-                               {"operands", nlohmann::json::array()},
-                               {"results", {0}},
-                               {"dependencies", nlohmann::json::array()},
-                               {"bindings", nlohmann::json::array({{{"parameter", "temporary"}, {"value", 0}}})},
-                               {"resources", nlohmann::json::array({{{"value", 0}, {"access", "write"}}})},
-                               {"grid", {2, 1, 2}}},
-                              {{"id", 1},
-                               {"name", "fill output"},
-                               {"kind", "compute"},
-                               {"stage", "forward:1"},
-                               {"operands", nlohmann::json::array()},
-                               {"results", {1}},
-                               {"dependencies", {0}},
-                               {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 1}}})},
-                               {"resources", nlohmann::json::array({{{"value", 1}, {"access", "write"}}})},
-                               {"grid", {2, 1, 2}}}})}}})}};
+    std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
+    manifest.insert(manifest.rfind('}'), R"(,"stage_artifacts":{"legacy":{"artifact":{"path":"../does-not-exist"}}})");
+    const size_t typeField = manifest.find("\"type\"");
+    const size_t type = manifest.find("\"program\"", typeField);
+    ASSERT_NE(type, std::string::npos);
+    manifest.replace(type, std::strlen("\"program\""), "\"pipeline\"");
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(runtime, nullptr);
-    VernonProgramBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
-    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
-    EXPECT_EQ(loaded, nullptr);
-    EXPECT_NE(std::string(loadError.data ? loadError.data : "", loadError.size).find("unknown or legacy field"),
-              std::string::npos);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-    return;
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
-    const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
-    ASSERT_NE(pipeline, nullptr) << std::string(resolveError.data ? resolveError.data : "", resolveError.size);
-    ASSERT_NE(pipeline->topology, nullptr);
-    EXPECT_EQ(pipeline->topology->stages.size(), 2u);
-
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, 0, &parameter), VERNON_STATUS_OK);
-    float output[16]{};
-    const uint64_t shape[] = {16};
-    const int64_t strides[] = {sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = parameter.slot;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = output;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = VERNON_ACCESS_WRITE;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = sizeof(output);
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(output[0], 0.0f);
-    EXPECT_EQ(output[3], 3.0f);
-    EXPECT_EQ(output[4], 10.0f);
-    EXPECT_EQ(output[15], 113.0f);
-
-    vernonRuntimeProgramExecutableDestroy(pipeline);
-    vernonRuntimeProgramBundleDestroy(loaded);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr), nullptr);
+    EXPECT_EQ(lastError(context), "unsupported or invalid Program bundle");
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
 TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
-    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string directoryUtf8 = directory.u8string();
-    nlohmann::json bundle = nlohmann::json::parse(readFile(directory / "cpu_fill.program.json"));
-    nlohmann::json &variant = bundle["variants"][0];
-    nlohmann::json gradient = variant["parameters"][0];
-    gradient["slot"] = 1;
-    gradient["name"] = "gradient";
-    gradient["uses"][0]["stage"] = "backward:0";
-    nlohmann::json residual = variant["parameters"][0];
-    residual["slot"] = 2;
-    residual["name"] = "residual";
-    residual["uses"][0]["stage"] = "forward:residual";
-    variant["parameters"][0]["uses"][0]["stage"] = "forward:0";
-    nlohmann::json captureUse = variant["parameters"][0]["uses"][0];
-    captureUse["stage"] = "backward:capture_output";
-    variant["parameters"][0]["uses"].push_back(std::move(captureUse));
-    nlohmann::json residualCaptureUse = residual["uses"][0];
-    residualCaptureUse["stage"] = "backward:capture_residual";
-    residual["uses"].push_back(std::move(residualCaptureUse));
-    variant["parameters"].push_back(std::move(gradient));
-    variant["parameters"].push_back(std::move(residual));
-    variant["program"] = {{"forward:residual", "fill"},
-                          {"forward:0", "fill"},
-                          {"backward:capture_output", "fill"},
-                          {"backward:capture_residual", "fill"},
-                          {"backward:0", "fill"}};
-    const auto value = [](uint32_t id, const char *name) {
-        return nlohmann::json{{"id", id},       {"name", name},  {"type", "tensor<16xf32>"},
-                              {"dtype", "f32"}, {"shape", {16}}, {"external", true},
-                              {"output", true}};
-    };
-    const auto node = [](uint32_t id, const char *name, const char *stage, uint32_t result, const char *parameter,
-                         nlohmann::json dependencies) {
-        return nlohmann::json{{"id", id},
-                              {"name", name},
-                              {"kind", "compute"},
-                              {"stage", stage},
-                              {"operands", nlohmann::json::array()},
-                              {"results", {result}},
-                              {"dependencies", std::move(dependencies)},
-                              {"bindings", nlohmann::json::array({{{"parameter", parameter}, {"value", result}}})},
-                              {"resources", nlohmann::json::array({{{"value", result}, {"access", "write"}}})},
-                              {"grid", {2, 1, 2}}};
-    };
-    variant["execution"] = {
-        {"values", nlohmann::json::array({value(0, "output"), value(1, "gradient"), value(2, "residual")})},
-        {"graphs",
-         nlohmann::json::array(
-             {{{"name", "forward"},
-               {"direction", "forward"},
-               {"arguments", nlohmann::json::array()},
-               {"results", {0}},
-               {"nodes", nlohmann::json::array(
-                             {node(0, "fill residual", "forward:residual", 2, "residual", nlohmann::json::array()),
-                              node(1, "fill output", "forward:0", 0, "output", {0})})}},
-              {{"name", "backward"},
-               {"direction", "backward"},
-               {"arguments", nlohmann::json::array()},
-               {"results", {1}},
-               {"nodes", nlohmann::json::array(
-                             {{{"id", 0},
-                               {"name", "consume output capture"},
-                               {"kind", "compute"},
-                               {"stage", "backward:capture_output"},
-                               {"operands", {0}},
-                               {"results", nlohmann::json::array()},
-                               {"dependencies", nlohmann::json::array()},
-                               {"bindings", nlohmann::json::array({{{"parameter", "output"}, {"value", 0}}})},
-                               {"resources", nlohmann::json::array({{{"value", 0}, {"access", "read_write"}}})},
-                               {"grid", {2, 1, 2}}},
-                              {{"id", 1},
-                               {"name", "consume residual capture"},
-                               {"kind", "compute"},
-                               {"stage", "backward:capture_residual"},
-                               {"operands", {2}},
-                               {"results", nlohmann::json::array()},
-                               {"dependencies", {0}},
-                               {"bindings", nlohmann::json::array({{{"parameter", "residual"}, {"value", 2}}})},
-                               {"resources", nlohmann::json::array({{{"value", 2}, {"access", "read_write"}}})},
-                               {"grid", {2, 1, 2}}},
-                              {{"id", 2},
-                               {"name", "fill gradient"},
-                               {"kind", "compute"},
-                               {"stage", "backward:0"},
-                               {"operands", nlohmann::json::array()},
-                               {"results", {1}},
-                               {"dependencies", {1}},
-                               {"bindings", nlohmann::json::array({{{"parameter", "gradient"}, {"value", 1}}})},
-                               {"resources", nlohmann::json::array({{{"value", 1}, {"access", "write"}}})},
-                               {"grid", {2, 1, 2}}}})}}})}};
+    CanonicalCpuProgram program = loadCanonicalCpuProgram();
+    ASSERT_NE(program.pipeline, nullptr);
+    EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(program.pipeline), 1u);
+    const VernonProgramParameterView source = parameter(program.pipeline, "source");
+    const VernonProgramParameterView output = parameter(program.pipeline, "output");
+    float sourceValue = 3.0f;
+    float outputValue = 0.0f;
+    VernonProgramArgument sourceArgument = tensorArgument(source, sourceValue);
+    VernonProgramArgument outputArgument = tensorArgument(output, outputValue);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(program.pipeline);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    const VernonProgramBindingToken sourceToken = token("source-vjp");
+    const VernonProgramBindingToken outputToken = token("output-vjp");
+    ASSERT_EQ(
+        vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(sourceValue), 1),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK)
+        << lastError(program.context);
+    ASSERT_NE(pullback, nullptr);
+    EXPECT_FLOAT_EQ(outputValue, 9.0f);
 
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(runtime, nullptr);
-    VernonProgramBundle *loaded = loadWithDirectory(runtime, withContentHash(bundle), directoryUtf8);
-    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
-    EXPECT_EQ(loaded, nullptr);
-    EXPECT_NE(std::string(loadError.data ? loadError.data : "", loadError.size).find("unknown or legacy field"),
-              std::string::npos);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+    const uint64_t shape[]{1};
+    float seedValue = 1.0f;
+    float gradientValue = 0.0f;
+    VernonAdValue seed{sizeof(VernonAdValue),
+                       {"output", std::strlen("output")},
+                       VERNON_DATA_F32,
+                       &seedValue,
+                       sizeof(seedValue),
+                       1,
+                       shape};
+    VernonAdValue gradient{sizeof(VernonAdValue),
+                           {"source", std::strlen("source")},
+                           VERNON_DATA_F32,
+                           &gradientValue,
+                           sizeof(gradientValue),
+                           1,
+                           shape};
+    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
+    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(program.context);
+    EXPECT_FLOAT_EQ(gradientValue, 6.0f);
+
+    vernonPullbackDestroy(pullback);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    destroy(program);
 }
 #endif
 
 #if defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem) {
-    const std::filesystem::path directory = VERNON_CPU_BUNDLE_PATH;
-    const std::string fixture = readFile(directory / "cpu_fill.program.json");
-    ASSERT_FALSE(fixture.empty());
-
-    auto wasmManifest = [&](const char *id, const char *symbol) {
-        nlohmann::json root = nlohmann::json::parse(fixture);
-        root["id"] = id;
-        root["target"]["options"] = {{"triple", "wasm32-unknown-emscripten"}};
-        root["runtime_requirements"]["target_triple"] = "wasm32-unknown-emscripten";
-        root["runtime_requirements"]["object_format"] = "wasm";
-        nlohmann::json &stage = root["stage_artifacts"]["fill"];
-        stage["symbol"] = symbol;
-        stage["artifact"] = {{"format", "relocatable_object"},
-                             {"storage", "external"},
-                             {"path", std::string(symbol) + ".wasm.o"},
-                             {"size", 16},
-                             {"sha256", std::string(64, 'a')}};
-        stage["reflection"]["target"]["options"] = {{"triple", "wasm32-unknown-emscripten"}};
-        return withContentHash(std::move(root));
-    };
-
-    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({"vernon_web_fill_a", 17}, staticallyLinkedFill), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeRegisterStaticCpuEntry({"vernon_web_fill_b", 17}, staticallyLinkedFill), VERNON_STATUS_OK);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
-
-    const std::string firstManifest = wasmManifest("cpu/web/a", "vernon_web_fill_a");
-    const std::string secondManifest = wasmManifest("cpu/web/b", "vernon_web_fill_b");
-    VernonProgramBundle *firstBundle =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, firstManifest.data(), firstManifest.size(), nullptr);
-    VernonProgramBundle *secondBundle =
-        vernonRuntimeLoadProgramBundleWithOptions(runtime, secondManifest.data(), secondManifest.size(), nullptr);
-    const VernonStringView loadError = vernonRuntimeGetLastError(runtime);
-    ASSERT_NE(firstBundle, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
-    ASSERT_NE(secondBundle, nullptr) << std::string(loadError.data ? loadError.data : "", loadError.size);
-    VernonProgramExecutable *first = vernonRuntimeResolveProgram(firstBundle, {nullptr, 0});
-    VernonProgramExecutable *second = vernonRuntimeResolveProgram(secondBundle, {nullptr, 0});
+    VernonStageExecutable *first = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
+                                                             sizeof(kDirectCpuReflection) - 1, "fill", 4);
+    VernonStageExecutable *second = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
+                                                              sizeof(kDirectCpuReflection) - 1, "fill", 4);
     ASSERT_NE(first, nullptr);
     ASSERT_NE(second, nullptr);
-
-    VernonProgramParameterView parameter{};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterByIndex(first, 0, &parameter), VERNON_STATUS_OK);
-    float output[16]{};
-    const uint64_t shape[] = {16};
-    const int64_t strides[] = {sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = 0;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = output;
-    argument.tensor.element_layout = parameter.element_layout;
-    argument.tensor.access = VERNON_ACCESS_WRITE;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = sizeof(output);
-    VernonProgramSubmitDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    invocation.compute_grid = {2, 1, 2};
-    EXPECT_EQ(vernon::tests::completeSubmission(first, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(vernon::tests::completeSubmission(second, &invocation), VERNON_STATUS_OK);
-    EXPECT_EQ(output[15], 113.0f);
-
-    vernonRuntimeProgramExecutableDestroy(second);
-    vernonRuntimeProgramExecutableDestroy(first);
-    vernonRuntimeProgramBundleDestroy(secondBundle);
-    vernonRuntimeProgramBundleDestroy(firstBundle);
+    EXPECT_NE(first, second);
+    EXPECT_EQ(runtime->livePipelines, 2u);
+    vernonRuntimeStageExecutableDestroy(second);
+    vernonRuntimeStageExecutableDestroy(first);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 #endif

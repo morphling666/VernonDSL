@@ -48,7 +48,7 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 
 } // namespace
 
-bool resolveOpenGLPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
+bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
     auto *state = new OpenGLPipelineState();
     struct OpenGLBindingCandidate {
         VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -500,15 +500,15 @@ bool resolveOpenGLPipeline(VernonProgramBundle &bundle, const Variant &variant, 
     return false;
 }
 
-void destroyOpenGLPipeline(VernonProgramExecutable &pipeline) {
+void destroyOpenGLPipeline(VernonStageExecutable &pipeline) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     destroyGraphicsVariant(state.rhiGraphicsVariant);
     vernonRuntimeCoreBindingsDestroy(state.rhiBindings);
     vernonRuntimeCorePipelineDestroy(state.rhiPipeline);
 }
 
-VernonStatus invokeOpenGLGraphicsPipeline(VernonProgramExecutable &pipeline,
-                                          const VernonProgramSubmitDescriptor &invocation,
+VernonStatus invokeOpenGLGraphicsPipeline(VernonStageExecutable &pipeline,
+                                          const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
@@ -637,7 +637,7 @@ VernonStatus invokeOpenGLGraphicsPipeline(VernonProgramExecutable &pipeline,
     return VERNON_STATUS_OK;
 }
 
-VernonStatus invokeOpenGLComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeOpenGLComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
     OpenGLPipelineState &state = runtimeBackendState<OpenGLPipelineState>(pipeline);
     if (!state.rhiPipeline)
         return fail(*pipeline.context, "OpenGL provider compute pipeline is not loaded");

@@ -5,6 +5,7 @@
 #include "runtime/autodiff/runtime_gpu_commands.h"
 #include "runtime/autodiff/runtime_gpu_resources.h"
 #include "runtime/program_execution_manifest.h"
+#include "runtime/resolved_execution_plan.h"
 #include "runtime/target_binding_plan.h"
 
 #include <array>
@@ -14,7 +15,6 @@
 #include <vector>
 
 struct VernonRuntimeContext;
-struct VernonResolvedProgramNode;
 
 namespace vernon::runtime {
 struct ProgramInvocationContext;
@@ -54,10 +54,20 @@ enum class ProgramValueOwnership {
 };
 
 struct LogicalProgramValue {
+    struct StagedDeviceInitial {
+        VernonRuntimeProviderResourceReference source{};
+        size_t byteOffset{};
+        size_t byteSize{};
+        VernonValueLayoutView elementLayout{};
+        std::vector<uint64_t> shape;
+        std::vector<int64_t> strides;
+    };
+
     std::vector<uint8_t> owned;
     std::vector<int64_t> strides;
     std::optional<shape::ConcreteShape> concreteShape;
     VernonProgramArgument argument{};
+    std::optional<StagedDeviceInitial> stagedDeviceInitial;
     std::shared_ptr<HostStaticTapeBatch> tapeBatch;
     ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};
 };
@@ -94,7 +104,7 @@ public:
                          std::string &error) const;
     bool downloadLogicalToHost(const std::vector<char> &required, std::string &error) const;
     bool materializeNodeArguments(const program::Program &program, const program::Node &node,
-                                  const VernonResolvedProgramNode &nodePlan, MaterializedNodeFrame &output,
+                                  const program::ResolvedNodePlan &nodePlan, MaterializedNodeFrame &output,
                                   std::string &error) const;
     bool bindControlImageStorage(const program::Program &program, uint32_t storage,
                                  VernonRuntimeProviderResourceReference view, std::string &error);
@@ -108,6 +118,7 @@ public:
     const std::vector<VernonProgramArgument> &logicalArguments() const { return logicalArguments_; }
     std::vector<VernonProgramArgument> &logicalArguments() { return logicalArguments_; }
     const std::vector<ProgramDeviceUpload> &deviceUploads() const { return deviceUploads_; }
+    const std::vector<gpu::DeviceBufferCopy> &deviceInitialCopies() const { return deviceInitialCopies_; }
     bool deviceResident() const { return deviceResident_; }
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
     const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
@@ -131,6 +142,7 @@ private:
     std::vector<VernonProgramArgument> logicalArguments_;
     std::vector<std::shared_ptr<gpu::DeviceBuffer>> logicalBuffers_;
     std::vector<ProgramDeviceUpload> deviceUploads_;
+    std::vector<gpu::DeviceBufferCopy> deviceInitialCopies_;
     std::vector<std::array<Carrier, 4>> carriers_;
     std::map<uint32_t, VernonRuntimeProviderResourceReference> controlImages_;
     const ProgramInvocationContext *invocationContext_{};

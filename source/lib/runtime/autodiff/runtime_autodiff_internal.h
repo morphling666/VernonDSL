@@ -2,7 +2,7 @@
 #define VERNON_RUNTIME_RUNTIME_AUTODIFF_INTERNAL_H
 
 #include "VernonRuntime.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
@@ -88,7 +88,7 @@ struct PullbackApplyOptions {
 
 struct ForwardExecutionTarget {
     VernonRuntimeProviderObject encoder{};
-    const VernonProgramSubmitDescriptor *invocation{};
+    const VernonStageInvocationDescriptor *invocation{};
     execution::detail::RhiCommandExecutionPlan *commandPlan{};
     const ProgramInvocationContext *programContext{};
 
@@ -163,8 +163,6 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
                          const Stage &backward, const std::vector<std::string> &gradientPaths,
                          uint64_t staticTapeBytesHint, const std::string &residualStorage,
                          const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
-bool resolvePipelineAutodiff(VernonProgramBundle &bundle, const AutodiffProfile &profile,
-                             VernonProgramExecutable &pipeline);
 bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups);
 

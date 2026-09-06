@@ -384,8 +384,8 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[1])) << " "
         << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[2])) << " "
         << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[3]));
-    VernonProgramExecutable *pipeline = vernonRuntimeLoadArtifact(
-        runtime, artifact.data, artifact.size, reflection.data, reflection.size, "increment", std::strlen("increment"));
+    VernonStageExecutable *pipeline = vernonRuntimeLoadArtifact(runtime, artifact.data, artifact.size, reflection.data,
+                                                                reflection.size, "increment", std::strlen("increment"));
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
     std::array<float, 8> values{0, 1, 2, 3, 4, 5, 6, 7};
@@ -406,7 +406,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(values);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
@@ -421,7 +421,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
         EXPECT_EQ(result[index], values[index] + 1.0f);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);

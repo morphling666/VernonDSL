@@ -2240,20 +2240,6 @@ bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &
                 return fail(diagnostic, "PROGRAM_STAGE_MISSING", "resolve", nodePath + "/stage",
                             "Node references an unknown or incompatible stage");
             usedStages.insert(node.stage);
-            if (executionKind(node) == ExecutionKind::Graphics) {
-                const GraphicsOperation &graphics = graphicsOperation(node);
-                const auto project = [&](const GraphicsAttachmentSignature &attachment) {
-                    if (attachment.access >= node.accesses.size())
-                        return;
-                    resolvedGraph.controlResources.push_back({node.id, graphics.renderPassControl,
-                                                              node.accesses[attachment.access].storage,
-                                                              attachment.location, attachment.aspects});
-                };
-                for (const GraphicsAttachmentSignature &attachment : graphics.colorAttachments)
-                    project(attachment);
-                if (graphics.depthStencilAttachment)
-                    project(*graphics.depthStencilAttachment);
-            }
             const StageArtifact &stageArtifact = resolved.stages.at(node.stage).stage;
             std::vector<const ReflectedEndpoint *> bindableEndpoints;
             for (const ReflectedEndpoint &endpoint : stageArtifact.endpoints)

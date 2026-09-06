@@ -212,33 +212,8 @@ if(TARGET VernonRuntime)
         vernon_discover_gtests(VernonRuntimeRHIAdapterTests)
     endif()
 
-    if(WIN32)
-        set(runtime_test_os windows)
-    elseif(APPLE)
-        set(runtime_test_os macos)
-    else()
-        set(runtime_test_os linux)
-    endif()
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64)$")
-        set(runtime_test_arch x86_64)
-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|arm64|aarch64)$")
-        set(runtime_test_arch aarch64)
-    else()
-        set(runtime_test_arch unknown)
-    endif()
-
     add_library(vernon-cpu-aot-fixture SHARED fixtures/cpu_aot_fixture.c)
     target_include_directories(vernon-cpu-aot-fixture PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include")
-    set(cpu_bundle "${VERNON_TEST_BINARY_ROOT}/cpu_aot_bundle")
-    add_custom_command(
-        OUTPUT "${cpu_bundle}/cpu_fill.program.json"
-        COMMAND
-            ${CMAKE_COMMAND} "-DARTIFACT=$<TARGET_FILE:vernon-cpu-aot-fixture>" "-DOUTPUT=${cpu_bundle}"
-            "-DOPERATING_SYSTEM=${runtime_test_os}" "-DARCHITECTURE=${runtime_test_arch}" -P
-            "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
-        DEPENDS vernon-cpu-aot-fixture "${VERNON_TEST_ROOT}/scripts/write_cpu_aot_bundle.cmake"
-        VERBATIM)
-    add_custom_target(vernon-cpu-aot-test-bundle DEPENDS "${cpu_bundle}/cpu_fill.program.json")
     add_test(
         NAME vernon-cpu-aot-bundle-platform-mapping
         COMMAND
@@ -257,8 +232,10 @@ if(TARGET VernonRuntime)
         runtime/pipeline_manifest_requirements_test.cpp
         runtime/program_instance_test.cpp
         runtime/program_manifest_test.cpp
+        runtime/resolved_execution_plan_test.cpp
         runtime/rhi_adapter_backend_storage_test.cpp
         runtime/rhi_resource_lifetime_test.cpp
+        runtime/runtime_architecture_type_test.cpp
         runtime/runtime_autodiff_test.cpp
         runtime/runtime_c_api_test.cpp
         runtime/runtime_common_api_test.cpp
@@ -281,10 +258,6 @@ if(TARGET VernonRuntime)
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
         target_link_libraries(VernonRuntimeTests PRIVATE VernonRuntimeInternals Vernon::RuntimeCore)
     endif()
-    target_compile_definitions(
-        VernonRuntimeTests PRIVATE VERNON_CPU_BUNDLE_PATH="${cpu_bundle}" VERNON_RUNTIME_TEST_OS="${runtime_test_os}"
-                                   VERNON_RUNTIME_TEST_ARCH="${runtime_test_arch}")
-    add_dependencies(VernonRuntimeTests vernon-cpu-aot-test-bundle)
     add_dependencies(VernonRuntimeTests VernonRuntimeAutodiffAbiCHeaderCheck VernonRuntimePublicCHeaderCheck)
     vernon_stage_target_files(VernonRuntimeTests VernonRuntime VernonRHI)
     add_executable(VernonRuntimeCpuWorkgroupTests runtime/cpu_workgroup_dispatch_test.cpp)
@@ -614,6 +587,9 @@ if(TARGET VernonRuntime)
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
         add_executable(VernonModuleProgramRuntimeTests runtime/runtime_module_program_c_api_test.cpp)
+        target_link_libraries(VernonRuntimeTests PRIVATE ${module_program_cooked_fixture_target})
+        target_compile_definitions(VernonRuntimeTests
+                                   PRIVATE VERNON_CPU_CANONICAL_PROGRAM_MANIFEST="${module_program_cooked_manifest}")
         target_link_libraries(VernonModuleProgramRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
                                                                       ${module_program_cooked_fixture_target})
         target_compile_definitions(VernonModuleProgramRuntimeTests

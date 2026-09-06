@@ -1,5 +1,6 @@
 #include "program_boundary_view.h"
 
+#include "resolved_execution_plan.h"
 #include "runtime_state.h"
 
 #include <stdexcept>
@@ -38,10 +39,9 @@ const char *categoryName(program::BoundaryCategory category) {
 } // namespace
 
 std::vector<ProgramBoundaryView> programBoundaryViews(const VernonProgramExecutable &pipeline) {
-    if (!pipeline.topology || !pipeline.topology->resolvedProgram)
-        throw std::runtime_error("pipeline has no compiler-emitted ProgramABI");
+    const program::ResolvedExecutionPlan &execution = *pipeline.executionPlan;
     std::vector<ProgramBoundaryView> result;
-    for (const program::BoundarySlot &slot : pipeline.topology->resolvedProgram->program.abi.boundarySlots)
+    for (const program::BoundarySlot &slot : execution.resolvedProgram->program.abi.boundarySlots)
         result.push_back({slot.id, slot.value, slot.path, roleName(slot.role), categoryName(slot.category)});
     return result;
 }

@@ -54,12 +54,12 @@ def _symbolic_program_inputs(parameter_types: Mapping[str, Any]) -> dict[str, An
     return inputs
 
 
-def _one_node_program(
+def _capture_one_node_program(
     root: Any,
     parameter_types: Mapping[str, Any],
     capture_operation: Any,
     output_names: tuple[str, ...] | None = (),
-) -> tuple[ProgramTemplate, ProgramInvocation, Any]:
+) -> tuple[ProgramCapture, ProgramTemplate, ProgramInvocation, Any]:
     """Build a one-node Program through the same capture/parser path as Module."""
 
     inputs = _symbolic_program_inputs(parameter_types)
@@ -76,7 +76,22 @@ def _one_node_program(
     invocation = template.bind(capture, outputs)
     from .program_frontend import parse_program
 
-    return template, invocation, parse_program(invocation)
+    return capture, template, invocation, parse_program(invocation)
+
+
+def _one_node_program(
+    root: Any,
+    parameter_types: Mapping[str, Any],
+    capture_operation: Any,
+    output_names: tuple[str, ...] | None = (),
+) -> tuple[ProgramTemplate, ProgramInvocation, Any]:
+    _, template, invocation, parsed = _capture_one_node_program(
+        root,
+        parameter_types,
+        capture_operation,
+        output_names,
+    )
+    return template, invocation, parsed
 
 
 def _graphics_stage_frontend(pipeline: Any, stage: Any) -> Any:
@@ -1022,6 +1037,17 @@ def _parse_kernel_program(
 ) -> Any:
     """Capture a compute Kernel or Kernel VJP as the same one-node Program used by Modules."""
 
+    return _capture_kernel_program(kernel, features, transform=transform)[3]
+
+
+def _capture_kernel_program(
+    kernel: Any,
+    features: tuple[str, ...] = (),
+    *,
+    transform: Any | None = None,
+) -> tuple[ProgramCapture, ProgramTemplate, ProgramInvocation, Any, tuple[str, ...], Any]:
+    """Capture a compute Kernel as an executable canonical one-node Program."""
+
     from .frontend.runtime_types import runtime_parameter_descriptor
     from .types import u32
 
@@ -1038,7 +1064,7 @@ def _parse_kernel_program(
     for axis in "xyz":
         parameter_types[f"__grid_{axis}"] = runtime_parameter_descriptor(u32)
 
-    _, invocation, parsed = _one_node_program(
+    capture, template, invocation, parsed = _capture_one_node_program(
         kernel,
         parameter_types,
         lambda capture, inputs: capture.capture_kernel(
@@ -1054,13 +1080,13 @@ def _parse_kernel_program(
         from .program_frontend import parse_program
 
         selected_outputs = transform.output_cotangents or tuple(invocation.graph.outputs)
-        return parse_program(
+        parsed = parse_program(
             invocation,
             vjp_wrt=transform.wrt,
             vjp_outputs=selected_outputs,
             autodiff_planning_policy=transform.planning_policy,
         )
-    return parsed
+    return capture, template, invocation, parsed, parameter_names, lowered.frontend
 
 
 @dataclass(frozen=True)
@@ -1111,6 +1137,8 @@ class _ValueRecipe:
                 raise ValueError("allocation tree recipe requires an allocation index")
             owner = allocations[self.key]
         if isinstance(owner, TensorView):
+            if self.as_view:
+                return owner
             owner = owner.owner
         if self.as_view:
             view = getattr(owner, "view", None)

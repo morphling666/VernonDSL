@@ -72,12 +72,13 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
         return false;
     }
     auto signature = std::make_shared<Signature>();
-    if (!gpu::buildSignature(context, (*forwardPipeline)->variant, (*backwardPipeline)->variant, gradientPaths,
-                             *signature))
+    const Variant &forwardProjection = (**forwardPipeline).bindingProjection;
+    const Variant &backwardProjection = (**backwardPipeline).bindingProjection;
+    if (!gpu::buildSignature(context, forwardProjection, backwardProjection, gradientPaths, *signature))
         return false;
     if (noTape) {
         auto backwardBindingSpecs = std::make_shared<BindingSpecPlan>();
-        if (!gpu::buildBindingSpecPlan((*backwardPipeline)->variant, *signature, *backwardBindingSpecs,
+        if (!gpu::buildBindingSpecPlan(backwardProjection, *signature, *backwardBindingSpecs,
                                        invocationDiagnostic(context)))
             return false;
         executable = gpu::createNoTapeExecutable(context, std::move(forwardPipeline), std::move(backwardPipeline),
@@ -87,17 +88,17 @@ bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, con
     const auto tapeCount = [](const Variant &variant) {
         return static_cast<size_t>(std::count_if(variant.parameters.begin(), variant.parameters.end(), isTape));
     };
-    if (tapeCount((*forwardPipeline)->variant) != 1 || tapeCount((*backwardPipeline)->variant) != 1 ||
-        !findReplaySegment((*forwardPipeline)->variant) || !findReplaySegment((*backwardPipeline)->variant)) {
+    if (tapeCount(forwardProjection) != 1 || tapeCount(backwardProjection) != 1 ||
+        !findReplaySegment(forwardProjection) || !findReplaySegment(backwardProjection)) {
         invocationDiagnostic(context) =
             "GPU captured Tape profile does not expose one Tape and one bounded-replay segment resource";
         return false;
     }
     auto forwardBindingSpecs = std::make_shared<BindingSpecPlan>();
     auto backwardBindingSpecs = std::make_shared<BindingSpecPlan>();
-    if (!gpu::buildBindingSpecPlan((*forwardPipeline)->variant, *signature, *forwardBindingSpecs,
+    if (!gpu::buildBindingSpecPlan(forwardProjection, *signature, *forwardBindingSpecs,
                                    invocationDiagnostic(context)) ||
-        !gpu::buildBindingSpecPlan((*backwardPipeline)->variant, *signature, *backwardBindingSpecs,
+        !gpu::buildBindingSpecPlan(backwardProjection, *signature, *backwardBindingSpecs,
                                    invocationDiagnostic(context)))
         return false;
     auto primalPipeline = std::make_shared<OwnedPipeline>();

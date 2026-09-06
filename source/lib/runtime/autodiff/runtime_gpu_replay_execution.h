@@ -14,7 +14,7 @@ struct ReplayArgumentViews {
     InternalBufferView launch;
 };
 
-bool planReplayRestoreCopies(const VernonProgramExecutable &forward, DeviceValues &working, DeviceValues &retained,
+bool planReplayRestoreCopies(const VernonStageExecutable &forward, DeviceValues &working, DeviceValues &retained,
                              std::vector<DeviceBufferCopy> &copies);
 
 bool appendReplayArguments(VernonRuntimeContext &context, const BindingPlan &bindings, DeviceBuffer &tape,

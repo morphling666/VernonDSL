@@ -521,14 +521,6 @@ struct Program {
 
 struct ResolvedGraph {
     std::vector<std::vector<uint32_t>> predecessors;
-    struct ControlResourceProjection {
-        uint32_t node{};
-        uint32_t control{};
-        uint32_t storage{};
-        uint32_t location{};
-        uint32_t aspects{};
-    };
-    std::vector<ControlResourceProjection> controlResources;
 };
 
 struct ResolvedStage {

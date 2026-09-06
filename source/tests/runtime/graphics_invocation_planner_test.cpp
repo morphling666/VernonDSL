@@ -32,7 +32,7 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
     return VERNON_STATUS_OK;
 }
 
-bool planForTest(const Variant &variant, const VernonProgramSubmitDescriptor &invocation,
+bool planForTest(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
                  PlannedGraphicsInvocation &plan, std::string &error) {
     return planGraphicsInvocation(variant, invocation, describeTestImage, nullptr, plan, error);
 }
@@ -94,7 +94,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
     VernonGraphicsState state{};
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = &argument;
@@ -182,7 +182,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     VernonGraphicsState state{};
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
@@ -312,7 +312,7 @@ TEST(GraphicsInvocationPlanner, NormalizesGraphicsStateForEveryProvider) {
     source.depth_stencil.back = source.depth_stencil.front;
     source.color_blends = blends;
     source.color_blend_count = std::size(blends);
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.graphics_state = &source;
     VernonDynamicState dynamic{};
     dynamic.struct_size = sizeof(dynamic);
@@ -348,7 +348,7 @@ TEST(GraphicsInvocationPlanner, NormalizesInactiveGraphicsState) {
     source.depth_stencil.stencil_write_mask = 0xff;
     source.color_blends = &blend;
     source.color_blend_count = 1;
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
@@ -369,7 +369,7 @@ TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
     VernonGraphicsState source{};
     source.struct_size = sizeof(source);
     source.rasterization.depth_bias_constant = std::numeric_limits<float>::infinity();
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.graphics_state = &source;
     PlannedGraphicsState planned;
     std::string error;
@@ -472,7 +472,7 @@ TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
     state.struct_size = sizeof(state);
     state.topology = VERNON_TOPOLOGY_LINE_LIST;
 
-    VernonProgramSubmitDescriptor invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
     invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.render_pass = &renderPass;

@@ -13,7 +13,7 @@ def main() -> None:
     import vernon_native_autodiff_f16_fixture  # noqa: F401
 
     vd.init(arch=vd.cpu)
-    pipeline = vd.load_cooked_vjp_asset(manifest)
+    pipeline = vd.load_program(manifest)
 
     objective = vd.storage.zeros(dtype=vd.f16, shape=(1,))
     _, pullback = pipeline.vjp({"x": np.float16(1.5), "output": objective}, (1, 1, 1))

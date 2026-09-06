@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -25,18 +26,14 @@ struct FrameRequest {
     const LogicalValueFrame *retainedValues{};
 };
 
-bool applyBoundShape(LogicalProgramValue &host, ProgramStorageState *backing, const VernonAdValue &value,
-                     const program::Value &slot, std::string &error) {
+bool applyBoundShape(LogicalProgramValue &host, const VernonAdValue &value, const program::Value &slot,
+                     std::string &error) {
     if (value.rank < slot.shape.size() || (value.rank && !value.shape))
         return error = "Program autodiff bound value rank does not match its Program type", false;
     shape::ConcreteShape concrete(value.shape, value.shape + slot.shape.size());
     if (!shape::matches(shape::decodeRuntimeContractShape(slot.shape), concrete))
         return error = "Program autodiff bound value shape does not match its Program type", false;
     host.concreteShape = std::move(concrete);
-    if (backing) {
-        backing->bytes = std::max(backing->bytes, value.size);
-        backing->sized = true;
-    }
     return true;
 }
 
@@ -63,8 +60,21 @@ bool applyLeaves(const ProgramLeafFrameSource &source, const program::Program &e
                    false;
         const program::Value &slot = execution.values[binding.value];
         ProgramStorageState *backing = slot.storage ? &backings[*slot.storage] : nullptr;
-        if (!layouts[binding.value] || !applyBoundShape(storage[binding.value], backing, *value, slot, error))
+        if (!layouts[binding.value] || !applyBoundShape(storage[binding.value], *value, slot, error))
             return false;
+        if (backing && !backing->external) {
+            size_t elements = 0;
+            const size_t elementBytes = layouts[binding.value]->byteSize;
+            if (!storage[binding.value].concreteShape ||
+                !shape::checkedElementCount(*storage[binding.value].concreteShape, elements) || !elementBytes ||
+                elements > std::numeric_limits<size_t>::max() / elementBytes)
+                return error = "Program autodiff leaf has an invalid canonical Storage extent", false;
+            const size_t canonicalBytes = elements * elementBytes;
+            if (backing->sized && backing->bytes != canonicalBytes)
+                return error = "Program autodiff leaves disagree on their canonical Storage extent", false;
+            backing->bytes = canonicalBytes;
+            backing->sized = true;
+        }
         if (backing && backing->owner < storage.size() && !storage[backing->owner].concreteShape)
             storage[backing->owner].concreteShape = storage[binding.value].concreteShape;
     }
@@ -95,9 +105,9 @@ bool attachResiduals(const FrameRequest &request, const program::Program &execut
     return true;
 }
 
-bool build(VernonRuntimeContext &context, const program::Program &execution, const VernonProgramTopology *topology,
-           std::vector<LogicalProgramValue> &storage, const FrameRequest &request,
-           std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
+bool build(VernonRuntimeContext &context, const program::Program &execution,
+           const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
+           const FrameRequest &request, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     storage.assign(execution.values.size(), {});
     std::vector<char> typedControls(execution.values.size());
     std::set<uint32_t> typedControlStorages;
@@ -141,7 +151,8 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
     if (request.canonical) {
         ProgramBoundaryBindingRequest binding{request.canonical->invocation, request.canonical->valueBySlot,
                                               &request.canonical->publications};
-        if (!bindProgramBoundaries(context, execution, binding, externalValues, backings, live, error) ||
+        if (!topology ||
+            !bindProgramBoundaries(context, execution, *topology, binding, externalValues, backings, live, error) ||
             !applyProgramPublicationShapes(execution, request.canonical->publications, storage, error))
             return false;
         for (auto &[value, argument] : externalValues) {
@@ -239,7 +250,7 @@ bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi) {
 }
 
 bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
-                            const VernonProgramTopology *topology, std::vector<LogicalProgramValue> &storage,
+                            const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
                             const ForwardInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
                             std::string &error) {
     if (const auto *canonical = std::get_if<CanonicalForwardBindings>(&spec.bindings))
@@ -251,7 +262,7 @@ bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Progra
 }
 
 bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
-                            const VernonProgramTopology *topology, std::vector<LogicalProgramValue> &storage,
+                            const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
                             const PullbackInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
                             std::string &error) {
     return build(context, execution, topology, storage,

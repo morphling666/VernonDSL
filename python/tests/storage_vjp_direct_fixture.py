@@ -207,7 +207,7 @@ aggregate_multi_output_objective_vjp = vd.ad.vjp(
 @vd.kernel
 def storage_objective(
     values: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
-    loss: vd.TensorView[vd.f32, (1,), vd.read_write],
+    loss: vd.TensorView[vd.f32, (1,), vd.write],
 ) -> None:
     vd.atomic_add(loss, 0, values[0] * values[0] + values[1])
 

@@ -198,42 +198,13 @@ struct Variant {
 // Pipeline manifests parse into it; Program plans project into it exactly once.
 using ExecutableBindingView = Variant;
 
-struct AutodiffLaunchPlan {
-    VernonLaunchSize workgroupSize{1, 1, 1};
-};
-
-struct AutodiffProfile {
-    std::vector<std::string> key;
-    std::string primal;
-    std::string forwardWithTape;
-    std::string backward;
-    uint64_t staticTapeBytesHint{};
-    std::string residualStorage;
-    std::vector<std::string> requiredPrimalPaths;
-    std::map<std::string, uint64_t> sourceKindCounts;
-    std::map<std::string, uint64_t> costComponents;
-    std::string selectedPolicy;
-    bool wholeDispatchRetentionPermitted{};
-    AutodiffLaunchPlan launch;
-};
-
-struct AutodiffManifest {
-    std::vector<AutodiffDerivativeGroup> derivativeGroups;
-    std::vector<AutodiffProfile> profiles;
-};
-
 std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);
 std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
 
-bool parseVariant(const nlohmann::json &value, Variant &variant, std::string &error);
-bool parseAutodiffManifest(const nlohmann::json &root, AutodiffManifest &manifest, std::string &error);
-bool validatePipelineRootSchema(const nlohmann::json &root, std::string &error);
 bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
 bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);
 void rebuildVariantLayoutViews(Variant &variant);
-bool parseRuntimeRequirements(const nlohmann::json &root, const std::string &target, RuntimeRequirements &requirements,
-                              std::string &error);
 bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required);
 uint32_t glslVersionForApi(RuntimeVersion apiVersion);
 

@@ -268,13 +268,18 @@ class ProgramNativePullback:
         self._cotangent_groups = tuple(group for group in derivative_groups if group.role == "cotangent")
 
     def __call__(self, cotangents: Any = None) -> dict[str, Any]:
+        return self.apply_with_carrier(cotangents, ())
+
+    def apply_with_carrier(
+        self,
+        cotangents: Any,
+        carrier_shape: tuple[int, ...],
+    ) -> dict[str, Any]:
         paths = tuple(row["path"] for row in self._signature["cotangents"])
         if cotangents is None:
             if len(paths) != 1:
                 raise ValueError("implicit Program cotangent requires exactly one output")
-            output = self._outputs[paths[0]]
-            host = _program_host_array(output)
-            supplied: Any = np.ones(host.shape, dtype=host.dtype)
+            supplied: Any = None
         elif isinstance(cotangents, Mapping):
             if set(cotangents) != set(paths):
                 raise ValueError("Program pullback requires exactly one cotangent per output")
@@ -299,7 +304,7 @@ class ProgramNativePullback:
                     supplied,
                     self._gradient_groups,
                     self._cotangent_groups,
-                    (),
+                    carrier_shape,
                     False,
                 )
             )
@@ -394,7 +399,7 @@ class ProgramAutodiffSpecialization:
         pipeline = self._loaded_pipeline()
         signature = pipeline.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
-        actual_inputs = {path for path in invocation.inputs if not path.startswith("__grid_")}
+        actual_inputs = set(invocation.inputs)
         if actual_inputs != expected_inputs:
             raise RuntimeError(
                 "Program invocation inputs do not match compiler ABI: "

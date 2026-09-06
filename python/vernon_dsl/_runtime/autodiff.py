@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 import weakref
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,195 +11,12 @@ import numpy as np
 from ..ad import ProgramExpression
 from ..bundle import make_target_options
 from ..frontend.autodiff_profiles import DerivativeGroup
-from ..frontend.structured_vjp import build_structured_vjp
-from .binding import _dispatch_borrow_scope, _PersistentBindingTable
 from .kernel import Kernel, _session_state
-from .tensor import TensorStorage, TensorView
-
-
-@dataclass
-class _CompiledDirectVjp:
-    primal: Any
-    forward: Any
-    backward: Any
-    primal_symbol: str
-    forward_symbol: str
-    backward_symbol: str
-    derivative_groups: tuple[DerivativeGroup, ...]
-    tape_bytes_per_invocation: int
-    residual_storage_kind: str
-    selected_policy: str
-    whole_dispatch_retention_permitted: bool
-    active_operation_count: int
-    recomputation_cost: int
-    resource_reload_cost: int
-    deterministic_reduction_legal: bool
-    required_primal_paths: tuple[str, ...]
-    user_parameters: tuple[str, ...]
-    pipeline: Any
-    runtime_generation: int
-    dependency_hashes: tuple[tuple[Path, str], ...]
-
-
-@dataclass
-class _DirectVjpState:
-    compiled: dict[tuple[Any, ...], _CompiledDirectVjp] = field(default_factory=dict)
-
-
-_kernel_states: weakref.WeakKeyDictionary[Kernel, dict[str, _DirectVjpState]] = weakref.WeakKeyDictionary()
 
 
 def _validate_grid(grid: tuple[int, int, int]) -> None:
     if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
         raise ValueError("grid must contain three positive integers")
-
-
-@dataclass(frozen=True)
-class _StructuredPullback:
-    native: Any
-    gradient_groups: tuple[DerivativeGroup, ...]
-    cotangent_groups: tuple[DerivativeGroup, ...]
-    bindings: dict[str, Any]
-    carrier_shape: tuple[int, ...]
-    estimated_tape_bytes: int
-    active_operation_count: int
-    recomputation_cost: int
-    residual_source_kind: str
-    control_history_kind: str
-
-    @property
-    def logical_residual_bytes(self) -> int:
-        return int(self.native.logical_residual_bytes)
-
-    @property
-    def resident_tape_bytes(self) -> int:
-        return int(self.native.resident_bytes)
-
-    @property
-    def allocated_tape_bytes(self) -> int:
-        return int(self.native.allocated_bytes)
-
-    @property
-    def peak_temporary_tape_bytes(self) -> int:
-        return int(self.native.peak_temporary_bytes)
-
-    @property
-    def recomputation_factor(self) -> float:
-        return 1.0 + self.recomputation_cost / max(self.active_operation_count, 1)
-
-    def __call__(self, cotangent: Any = None) -> dict[str, Any]:
-        return self._apply(cotangent, logical=False)
-
-    def apply_logical(self, cotangent: Any) -> dict[str, Any]:
-        return self._apply(cotangent, logical=True)
-
-    def _apply(self, cotangent: Any, *, logical: bool) -> dict[str, Any]:
-        return dict(
-            self.native.apply_grouped(
-                cotangent,
-                self.gradient_groups,
-                self.cotangent_groups,
-                self.carrier_shape,
-                logical,
-            )
-        )
-
-
-@dataclass
-class CookedVjpProgram:
-    _bundle: bytes
-    _directory: str
-    _features: tuple[str, ...]
-    _native: Any = None
-    _runtime_generation: int = -1
-    _binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
-
-    def _load(self) -> None:
-        state = _session_state()
-        if state._native_runtime is None:
-            raise RuntimeError("cooked structured VJP assets require the native runtime")
-        if self._native is not None and self._runtime_generation == state._runtime_generation:
-            return
-        native = state._native_runtime.load_cooked_asset(
-            self._bundle,
-            self._directory,
-            list(self._features),
-        )
-        _pipeline_derivative_groups(native)
-        self._native = native
-        self._runtime_generation = state._runtime_generation
-
-    def vjp(
-        self,
-        bindings: dict[str, Any],
-        grid: tuple[int, int, int],
-    ) -> tuple[Any, _StructuredPullback]:
-        self._load()
-        _validate_grid(grid)
-        parameters = tuple(self._native.parameters)
-        grid_values = dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True))
-        grid_parameters = {parameter.name for parameter in parameters if parameter.name in grid_values}
-        if grid_parameters != set(grid_values):
-            raise RuntimeError("cooked Program is missing compute workgroup boundary Values")
-        if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
-            raise ValueError("autodiff bindings do not match pipeline parameters")
-        state = _session_state()
-        access_names = {
-            state._native.ACCESS_READ: "read",
-            state._native.ACCESS_WRITE: "write",
-            state._native.ACCESS_READ_WRITE: "read_write",
-        }
-        borrows = [
-            (parameter.name, bindings[parameter.name], access_names[parameter.access])
-            for parameter in parameters
-            if parameter.name not in grid_values
-            if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
-        ]
-        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
-            for parameter in parameters:
-                value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
-                self._binding_cache.bind_argument(builder, self._native, parameter, value)
-            output, native_pullback = self._native.program_vjp_bound(builder, bindings)
-        groups = _pipeline_derivative_groups(self._native)
-        return output, _StructuredPullback(
-            native_pullback,
-            tuple(group for group in groups if group.role == "gradient"),
-            tuple(group for group in groups if group.role == "cotangent"),
-            bindings,
-            (),
-            int(native_pullback.logical_residual_bytes),
-            0,
-            0,
-            "capture",
-            "dynamic_capture",
-        )
-
-    def primal(self, bindings: dict[str, Any], grid: tuple[int, int, int]) -> None:
-        self._load()
-        parameters = tuple(self._native.parameters)
-        if set(bindings) != {parameter.name for parameter in parameters}:
-            raise ValueError("cooked VJP primal bindings do not match pipeline parameters")
-        state = _session_state()
-        access_names = {
-            state._native.ACCESS_READ: "read",
-            state._native.ACCESS_WRITE: "write",
-            state._native.ACCESS_READ_WRITE: "read_write",
-        }
-        borrows = [
-            (parameter.name, bindings[parameter.name], access_names[parameter.access])
-            for parameter in parameters
-            if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
-        ]
-        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
-            for parameter in parameters:
-                self._binding_cache.bind_argument(
-                    builder,
-                    self._native,
-                    parameter,
-                    bindings[parameter.name],
-                )
-            builder.grid(*grid)
-            builder.submit().wait()
 
 
 def _pipeline_derivative_groups(pipeline: Any) -> tuple[DerivativeGroup, ...]:
@@ -208,187 +25,51 @@ def _pipeline_derivative_groups(pipeline: Any) -> tuple[DerivativeGroup, ...]:
         for role, path, leaves in pipeline.derivative_groups
     )
     if not groups or {group.role for group in groups} != {"gradient", "cotangent"}:
-        raise RuntimeError("structured VJP pipeline has no validated derivative groups")
+        raise RuntimeError("structured VJP Program has no validated derivative groups")
     return groups
 
 
-def _retained_primal_allocation_bytes(bindings: dict[str, Any], required_paths: tuple[str, ...]) -> int:
-    total = 0
-    retained_roots: set[str] = set()
-    for path in required_paths:
-        root = path.removeprefix("primal.").split(".", 1)[0]
-        if root in retained_roots:
-            continue
-        value = bindings.get(root)
-        if isinstance(value, TensorView):
-            total += len(value.shape) * 8 + math.prod(value.shape) * value.dtype.itemsize
-            retained_roots.add(root)
-        elif isinstance(value, TensorStorage):
-            total += len(value.shape) * 8 + value._array.nbytes
-            retained_roots.add(root)
-        elif isinstance(value, np.ndarray):
-            total += value.nbytes
-            retained_roots.add(root)
-        elif isinstance(value, np.generic):
-            total += value.dtype.itemsize
-            retained_roots.add(root)
-        elif isinstance(value, (bool, int, float)):
-            total += 8
-            retained_roots.add(root)
-    return total
+@dataclass
+class _CompiledKernelVjp:
+    compiled: Any
+    invocation: Any
+    parameter_names: tuple[str, ...]
+    output_recipe: Any
+    workgroup_size: tuple[int, int, int]
+    dependency_hashes: tuple[tuple[Any, str], ...]
 
 
-def _invoke_structured_pipeline(
-    pipeline: Any,
-    bindings: dict[str, Any],
-    grid: tuple[int, int, int],
-    tape_bytes_per_invocation: int = 0,
-    active_operation_count: int = 0,
-    recomputation_cost: int = 0,
-    residual_storage_kind: str = "unknown",
-    *,
-    encoder: Any | None = None,
-    command_plan: Any | None = None,
-    binding_cache: _PersistentBindingTable | None = None,
-) -> tuple[Any, _StructuredPullback]:
-    _validate_grid(grid)
-    derivative_groups = _pipeline_derivative_groups(pipeline)
-    state = _session_state()
-    access_names = {
-        state._native.ACCESS_READ: "read",
-        state._native.ACCESS_WRITE: "write",
-        state._native.ACCESS_READ_WRITE: "read_write",
-    }
-    access_by_name = {parameter.name: access_names[parameter.access] for parameter in pipeline.parameters}
-    borrows: list[tuple[str, Any, str]] = [
-        (name, value, access_by_name[name])
-        for name, value in bindings.items()
-        if name in access_by_name and isinstance(value, (TensorStorage, TensorView))
-    ]
-    if encoder is None and command_plan is None:
-        with _dispatch_borrow_scope(borrows):
-            output, pullback = pipeline.vjp(bindings, grid)
-    else:
-        if encoder is not None and command_plan is not None:
-            raise RuntimeError("VJP cannot use an encoder and command plan together")
-        if binding_cache is None:
-            raise RuntimeError("encoded VJP requires a binding cache")
-        parameters = tuple(pipeline.parameters)
-        if set(bindings) != {parameter.name for parameter in parameters}:
-            raise ValueError("encoded VJP bindings do not match pipeline parameters")
-        with binding_cache.invocation(pipeline) as builder:
-            for parameter in parameters:
-                binding_cache.bind_argument(builder, pipeline, parameter, bindings[parameter.name])
-            builder.grid(*grid)
-            if command_plan is None:
-                if encoder is None:
-                    raise RuntimeError("encoded VJP requires a command encoder")
-                output, pullback = pipeline.vjp_encode(builder, encoder._native, bindings, grid)
-            else:
-                output, pullback = pipeline.vjp_plan(builder, command_plan, bindings, grid)
-        for parameter in parameters:
-            value = bindings[parameter.name]
-            if parameter.access != state._native.ACCESS_READ and isinstance(value, (TensorStorage, TensorView)):
-                value._mark_device_dirty()
-    workgroup = tuple(pipeline.workgroup_size)
-    extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
-    carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
-    invocation_count = extent[0] * extent[1] * extent[2]
-    return output, _StructuredPullback(
-        pullback,
-        tuple(group for group in derivative_groups if group.role == "gradient"),
-        tuple(group for group in derivative_groups if group.role == "cotangent"),
-        bindings,
-        carrier_shape,
-        tape_bytes_per_invocation * invocation_count,
-        active_operation_count * invocation_count,
-        recomputation_cost * invocation_count,
-        (
-            (f"{residual_storage_kind}_capture" if residual_storage_kind in {"static", "dynamic"} else "capture")
-            + ("+pure_rematerialization" if recomputation_cost else "")
-        ),
-        "dynamic_capture"
-        if residual_storage_kind == "dynamic"
-        else "none"
-        if residual_storage_kind == "static"
-        else "unknown",
-    )
+@dataclass
+class _KernelVjpState:
+    compiled: dict[tuple[Any, ...], _CompiledKernelVjp] = field(default_factory=dict)
 
 
-def load_cooked_vjp_asset(
-    manifest: str | Path,
-    *,
-    features: tuple[str, ...] = (),
-) -> CookedVjpProgram:
-    manifest_path = Path(manifest).resolve()
-    if any(not isinstance(feature, str) or not feature for feature in features):
-        raise ValueError("pipeline asset features must be non-empty strings")
-    selected_features = tuple(sorted(set(features)))
-    pipeline = CookedVjpProgram(
-        manifest_path.read_bytes(),
-        str(manifest_path.parent),
-        selected_features,
-    )
-    pipeline._load()
-    return pipeline
+_kernel_states: weakref.WeakKeyDictionary[Kernel, dict[str, _KernelVjpState]] = weakref.WeakKeyDictionary()
 
 
-def _direct_state(kernel: Kernel, expression: ProgramExpression) -> _DirectVjpState:
+def _kernel_state(kernel: Kernel, expression: ProgramExpression) -> _KernelVjpState:
     transforms = _kernel_states.setdefault(kernel, {})
-    return transforms.setdefault(expression.transform.identity, _DirectVjpState())
+    return transforms.setdefault(expression.transform.identity, _KernelVjpState())
 
 
 def invalidate_loaded_vjps() -> None:
     for transforms in list(_kernel_states.values()):
         for state in transforms.values():
-            for compiled in state.compiled.values():
-                compiled.pipeline = None
-                compiled.runtime_generation = -1
+            for specialization in state.compiled.values():
+                specialization.compiled._release_runtime_native()
 
 
 def clear_vjp_cache() -> None:
     _kernel_states.clear()
 
 
-def _load(compiled: _CompiledDirectVjp, runtime_state: Any) -> None:
-    if compiled.pipeline is not None and compiled.runtime_generation == runtime_state._runtime_generation:
-        return
-    if runtime_state._native_runtime is None:
-        raise RuntimeError("VJP execution requires the native runtime")
-    compiled.pipeline = runtime_state._native_runtime.load_autodiff(
-        compiled.primal,
-        compiled.primal_symbol,
-        compiled.forward,
-        compiled.forward_symbol,
-        compiled.backward,
-        compiled.backward_symbol,
-        compiled.tape_bytes_per_invocation,
-        compiled.residual_storage_kind,
-        compiled.selected_policy,
-        compiled.whole_dispatch_retention_permitted,
-        [(group.role, group.declared_path, list(group.leaf_paths)) for group in compiled.derivative_groups],
-    )
-    compiled.runtime_generation = runtime_state._runtime_generation
-
-
-def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...]) -> _CompiledDirectVjp:
+def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
     kernel = expression.program
     if not isinstance(kernel, Kernel):
-        raise TypeError("direct VJP execution requires one compute Kernel")
+        raise TypeError("single-entry VJP execution requires one compute Kernel")
     runtime_state = _session_state()
     if runtime_state._native is None or runtime_state._native_runtime is None:
         raise RuntimeError("VJP execution requires the native compiler and runtime")
-    target = {
-        runtime_state.cpu: runtime_state._native.Target.CPU,
-        runtime_state.cuda: runtime_state._native.Target.CUDA,
-        runtime_state.vulkan: runtime_state._native.Target.VULKAN,
-        runtime_state.directx: runtime_state._native.Target.DIRECTX,
-        runtime_state.metal: runtime_state._native.Target.METAL,
-        runtime_state.opengl: runtime_state._native.Target.OPENGL,
-        runtime_state.opengles: runtime_state._native.Target.OPENGL_ES,
-    }.get(runtime_state._architecture)
-    if target is None:
-        raise RuntimeError(f"unsupported VJP architecture {runtime_state._architecture.name!r}")
     options = make_target_options(
         runtime_state._architecture.name,
         {"version": runtime_state._interactive_glsl_version()}
@@ -396,67 +77,30 @@ def _compile_direct_vjp(expression: ProgramExpression, arguments: tuple[Any, ...
         else {},
     )
     key = kernel._specialization_key((), options.target, tuple(sorted(options.options.items())))
-    direct = _direct_state(kernel, expression)
-    compiled = direct.compiled.get(key)
-    if compiled is not None and not kernel._dependencies_current(compiled):
-        del direct.compiled[key]
-        compiled = None
-    if compiled is None:
-        lowered = kernel._lower()
-        frontend, function, builtins = lowered.frontend, lowered.function, lowered.builtins
-        structured = build_structured_vjp(
-            runtime_state._native,
-            frontend,
-            expression.transform,
+    state = _kernel_state(kernel, expression)
+    specialization = state.compiled.get(key)
+    if specialization is not None and not kernel._dependencies_current(specialization):
+        del state.compiled[key]
+        specialization = None
+    if specialization is None:
+        from ..program import _capture_kernel_program, _capture_recipes
+        from .program_autodiff import compile_program_autodiff
+
+        capture, template, invocation, parsed, parameter_names, frontend = _capture_kernel_program(
+            kernel,
+            transform=expression.transform,
         )
-        profiles = {profile.name: profile for profile in structured.plan.profiles}
-        modules = [
-            frontend.mlir,
-            structured.profiles["forward_with_tape"],
-            structured.profiles["backward"],
-        ]
-        if runtime_state._architecture == runtime_state.cpu:
-            programs = runtime_state._native._compile_cpu_program_results(
-                modules,
-                options.native_options["options"],
-            )
-        else:
-            compiler = runtime_state._native.Compiler()
-            programs = [compiler.compile_program_result(module, target, **options.native_options) for module in modules]
-        if len(programs) != 3:
-            raise RuntimeError("VJP profile compilation returned an invalid result count")
-        for program in programs:
-            if not program.ok:
-                raise RuntimeError(program.diagnostics)
-        primal, forward, backward = programs
-        derivative_groups = structured.plan.derivative_groups
-        compiled = _CompiledDirectVjp(
-            primal=primal,
-            forward=forward,
-            backward=backward,
-            primal_symbol=structured.entry.symbol,
-            forward_symbol=profiles["forward_with_tape"].symbol,
-            backward_symbol=profiles["backward"].symbol,
-            derivative_groups=derivative_groups,
-            tape_bytes_per_invocation=int(structured.plan.tape_bytes),
-            residual_storage_kind=structured.residual_storage_kind,
-            selected_policy=structured.selected_policy,
-            whole_dispatch_retention_permitted=structured.whole_dispatch_retention_permitted,
-            active_operation_count=structured.active_operation_count,
-            recomputation_cost=structured.recomputation_cost,
-            resource_reload_cost=int(structured.cost_components.get("resource_reload_cost", 0)),
-            deterministic_reduction_legal=True,
-            required_primal_paths=tuple(structured.plan.required_primal_paths),
-            user_parameters=tuple(argument.arg for argument in function.args.args if argument.arg not in builtins),
-            pipeline=None,
-            runtime_generation=-1,
-            dependency_hashes=kernel._dependency_hashes(frontend),
+        _, _, output_recipe = _capture_recipes(capture, invocation.outputs)
+        specialization = _CompiledKernelVjp(
+            compile_program_autodiff(parsed, template),
+            invocation,
+            parameter_names,
+            output_recipe,
+            kernel._workgroup_size,
+            kernel._dependency_hashes(frontend),
         )
-        direct.compiled[key] = compiled
-        _load(compiled, runtime_state)
-    else:
-        _load(compiled, runtime_state)
-    return compiled
+        state.compiled[key] = specialization
+    return specialization
 
 
 def execute_direct_vjp(
@@ -465,27 +109,56 @@ def execute_direct_vjp(
     grid: tuple[int, int, int] | None,
 ) -> tuple[Any, Any]:
     if grid is None:
-        raise TypeError("grid is required for direct structured VJP execution")
+        raise TypeError("grid is required for single-entry structured VJP execution")
     _validate_grid(grid)
-    compiled = _compile_direct_vjp(expression, arguments)
-    if len(arguments) != len(compiled.user_parameters):
-        raise TypeError(f"direct VJP expects {len(compiled.user_parameters)} launch arguments")
-    bindings = dict(zip(compiled.user_parameters, arguments, strict=True))
-    return _invoke_structured_pipeline(
-        compiled.pipeline,
-        bindings,
-        grid,
-        compiled.tape_bytes_per_invocation,
-        compiled.active_operation_count,
-        compiled.recomputation_cost,
-        compiled.residual_storage_kind,
+    specialization = _compile_kernel_vjp(expression)
+    if len(arguments) != len(specialization.parameter_names):
+        raise TypeError(f"single-entry VJP expects {len(specialization.parameter_names)} launch arguments")
+    inputs = dict(zip(specialization.parameter_names, arguments, strict=True))
+    inputs.update(dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True)))
+    invocation = dataclasses.replace(
+        specialization.invocation,
+        inputs=inputs,
+        outputs=specialization.output_recipe.resolve(inputs, ()),
     )
+    _, pullback = specialization.compiled.invoke(invocation)
+    pullback._lease.release()
+    extent = tuple(count * size for count, size in zip(grid, specialization.workgroup_size, strict=True))
+    carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
+    return None, _KernelPullback(pullback, carrier_shape)
+
+
+@dataclass
+class _KernelPullback:
+    pullback: Any
+    carrier_shape: tuple[int, ...]
+
+    def __call__(self, cotangent: Any = None) -> dict[str, Any]:
+        return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
+
+    def apply_logical(self, cotangent: Any) -> dict[str, Any]:
+        return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
+
+    def _canonical_cotangent(self, cotangent: Any) -> Any:
+        if cotangent is None or not self.carrier_shape:
+            return cotangent
+        if isinstance(cotangent, dict):
+            return {path: self._canonical_cotangent(value) for path, value in cotangent.items()}
+        source = cotangent._native_host_array() if hasattr(cotangent, "_native_host_array") else cotangent
+        array = np.asarray(source)
+        rank = len(self.carrier_shape)
+        if tuple(array.shape[:rank]) == self.carrier_shape:
+            if math.prod(array.shape[rank:]) == math.prod(self.carrier_shape):
+                return array.sum(axis=tuple(range(rank)))
+            return array[(0,) * rank]
+        return cotangent
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.pullback, name)
 
 
 __all__ = [
-    "CookedVjpProgram",
     "clear_vjp_cache",
     "execute_direct_vjp",
     "invalidate_loaded_vjps",
-    "load_cooked_vjp_asset",
 ]

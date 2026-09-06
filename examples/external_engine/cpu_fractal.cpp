@@ -36,7 +36,7 @@ std::string runtimeError(VernonRuntimeContext *runtime) {
 class FractalComputePass final : public vernon::execution::ComputePass {
 public:
     FractalComputePass(vernon::execution::GraphBuffer pixels, VernonRuntimeContext *runtime,
-                       VernonProgramExecutable *pipeline, VernonProgramSubmitDescriptor *invocation)
+                       VernonProgramExecutable *pipeline, VernonStageInvocationDescriptor *invocation)
         : ComputePass("fractal-compute"), pixels_(pixels), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -44,13 +44,22 @@ public:
 
     VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
                             const vernon::execution::ExecutionResources &) override {
-        VernonSubmission *submission{};
-        if (vernonRuntimeProgramSubmit(pipeline_, invocation_, &submission) == VERNON_STATUS_OK &&
-            vernonSubmissionWait(submission) == VERNON_STATUS_OK) {
-            vernonSubmissionDestroy(submission);
-            return VERNON_RHI_STATUS_OK;
+        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline_);
+        VernonProgramInvocation *invocation =
+            instance ? vernonRuntimeProgramInstanceBeginInvocation(instance) : nullptr;
+        VernonStatus status = invocation ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
+        for (size_t index = 0; invocation && index < invocation_->argument_count && status == VERNON_STATUS_OK;
+             ++index) {
+            const VernonProgramBindingToken token{sizeof(token), &index, sizeof(index)};
+            status =
+                vernonRuntimeProgramInvocationBind(invocation, &token, &invocation_->arguments[index], nullptr, 0, 0);
         }
-        vernonSubmissionDestroy(submission);
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
+        vernonRuntimeProgramInvocationDestroy(invocation);
+        vernonRuntimeProgramInstanceDestroy(instance);
+        if (status == VERNON_STATUS_OK)
+            return VERNON_RHI_STATUS_OK;
         std::cerr << "fractal invocation failed: " << runtimeError(runtime_) << '\n';
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -59,7 +68,7 @@ private:
     vernon::execution::GraphBuffer pixels_;
     VernonRuntimeContext *runtime_{};
     VernonProgramExecutable *pipeline_{};
-    VernonProgramSubmitDescriptor *invocation_{};
+    VernonStageInvocationDescriptor *invocation_{};
 };
 
 class FractalPresentPass final : public vernon::execution::ComputePass {
@@ -244,7 +253,7 @@ private:
     std::vector<uint8_t> rgba_;
     float time_{};
     std::array<VernonProgramArgument, 2> arguments_{};
-    VernonProgramSubmitDescriptor invocation_{};
+    VernonStageInvocationDescriptor invocation_{};
     std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
 };
 

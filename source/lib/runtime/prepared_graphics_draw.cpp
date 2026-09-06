@@ -4,7 +4,7 @@
 
 namespace vernon::runtime {
 
-bool prepareGraphicsDraw(const VernonProgramSubmitDescriptor &source, const PlannedGraphicsInvocation &plan,
+bool prepareGraphicsDraw(const VernonStageInvocationDescriptor &source, const PlannedGraphicsInvocation &plan,
                          std::vector<uint32_t> attachmentFormats, uint32_t depthFormat,
                          const std::vector<VernonRuntimeProviderBindingLayoutEntry> &layout,
                          const std::vector<VernonRuntimeProviderBindingValue> &values, PreparedGraphicsDraw &prepared,

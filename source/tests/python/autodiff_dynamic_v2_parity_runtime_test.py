@@ -71,7 +71,7 @@ def main() -> None:
     cooked_particles = particle_storage((2,))
     cooked_output_owner = vd.storage.zeros(dtype=Particle, shape=(3,))
     cooked_output = cooked_output_owner.view(shape=(2,), strides=(-1,), offset=2, access="write")
-    signed_pipeline = vd.load_cooked_vjp_asset(signed_manifest)
+    signed_pipeline = vd.load_program(signed_manifest)
     cooked_signed_pullback = cooked_pullback(
         signed_pipeline,
         {"particles": cooked_particles, "output": cooked_output},
@@ -103,7 +103,7 @@ def main() -> None:
 
     cooked_field_particles = particle_storage((2,))
     cooked_field_output = vd.storage.zeros(dtype=Particle, shape=(2,))
-    field_pipeline = vd.load_cooked_vjp_asset(field_manifest)
+    field_pipeline = vd.load_program(field_manifest)
     cooked_field_pullback = cooked_pullback(
         field_pipeline,
         {"particles": cooked_field_particles, "output": cooked_field_output},
@@ -128,7 +128,7 @@ def main() -> None:
         loss_owner = vd.storage.zeros(dtype=vd.f32, shape=(3,))
         loss = loss_owner.view(shape=(1,), strides=(1,), offset=1, access="write")
         if cooked:
-            pipeline = vd.load_cooked_vjp_asset(scatter_manifest)
+            pipeline = vd.load_program(scatter_manifest)
             pullback = cooked_pullback(pipeline, {"values": values, "loss": loss})
         else:
             pullback = direct_pullback(
@@ -163,7 +163,7 @@ def main() -> None:
         values = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
         output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
         if cooked:
-            pipeline = vd.load_cooked_vjp_asset(gather_manifest)
+            pipeline = vd.load_program(gather_manifest)
             pullback = cooked_pullback(
                 pipeline,
                 {"values": values, "count": np.int32(4), "output": output},
@@ -201,7 +201,7 @@ def main() -> None:
         np.int32(0),
         direct_output,
     )
-    gather_pipeline = vd.load_cooked_vjp_asset(gather_manifest)
+    gather_pipeline = vd.load_program(gather_manifest)
     cooked_output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
     cooked_empty_pullback = cooked_pullback(
         gather_pipeline,
@@ -228,7 +228,7 @@ def main() -> None:
         first = vd.storage.zeros(dtype=Particle, shape=(1,))
         second = vd.storage.zeros(dtype=Particle, shape=(1,))
         if cooked:
-            pipeline = vd.load_cooked_vjp_asset(multi_manifest)
+            pipeline = vd.load_program(multi_manifest)
             pullback = cooked_pullback(
                 pipeline,
                 {"particles": particles, "first": first, "second": second},
@@ -251,7 +251,7 @@ def main() -> None:
     np.testing.assert_array_equal(cooked_multi["velocity"].to_numpy(), np.array([[5.0, 7.0]], dtype=np.float32))
     np.testing.assert_array_equal(cooked_multi["mass"].to_numpy(), np.array([45.0], dtype=np.float32))
 
-    mixed_pipeline = vd.load_cooked_vjp_asset(mixed_manifest)
+    mixed_pipeline = vd.load_program(mixed_manifest)
 
     def run_mixed(cooked: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         owner = vd.storage.from_numpy(np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32))
@@ -298,7 +298,7 @@ def main() -> None:
     np.testing.assert_array_equal(cooked_scale_gradient, np.float32(4.0))
     np.testing.assert_array_equal(cooked_loss, np.array([18.0, 18.0], dtype=np.float32))
 
-    partial_pipeline = vd.load_cooked_vjp_asset(partial_manifest)
+    partial_pipeline = vd.load_program(partial_manifest)
     for outer, inner in ((3, 5), (7, 9)):
         shape = (outer, 2, 4, inner)
         values_array = np.zeros(shape, dtype=np.float32)

@@ -25,7 +25,7 @@ def run_numeric_acceptance(manifest: Path) -> None:
     import numpy as np
     import vernon_dsl as vd
 
-    pipeline = vd.load_cooked_vjp_asset(manifest)
+    pipeline = vd.load_program(manifest)
 
     def invoke(native_inputs):
         storages = {}

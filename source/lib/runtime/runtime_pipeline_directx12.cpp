@@ -63,7 +63,7 @@ DXGI_FORMAT directX12TextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveDirectX12Pipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
+bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     auto *pipelineState = new DirectX12PipelineState();
     if (!variant.compute.empty()) {
@@ -420,7 +420,7 @@ bool resolveDirectX12Pipeline(VernonProgramBundle &bundle, const Variant &varian
 #endif
 }
 
-void destroyDirectX12Pipeline(VernonProgramExecutable &pipeline) {
+void destroyDirectX12Pipeline(VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -433,8 +433,8 @@ void destroyDirectX12Pipeline(VernonProgramExecutable &pipeline) {
 #endif
 }
 
-VernonStatus invokeDirectX12GraphicsPipeline(VernonProgramExecutable &pipeline,
-                                             const VernonProgramSubmitDescriptor &invocation,
+VernonStatus invokeDirectX12GraphicsPipeline(VernonStageExecutable &pipeline,
+                                             const VernonStageInvocationDescriptor &invocation,
                                              const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
@@ -568,7 +568,7 @@ VernonStatus invokeDirectX12GraphicsPipeline(VernonProgramExecutable &pipeline,
 #endif
 }
 
-VernonStatus invokeDirectX12ComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeDirectX12ComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     DirectX12PipelineState &state = runtimeBackendState<DirectX12PipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *directX12State(*pipeline.context).adapter;

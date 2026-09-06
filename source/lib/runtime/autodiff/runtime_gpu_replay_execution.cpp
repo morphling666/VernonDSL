@@ -29,10 +29,10 @@ bool isAutodiffInternal(const Parameter &parameter) {
 
 } // namespace
 
-bool planReplayRestoreCopies(const VernonProgramExecutable &forward, DeviceValues &working, DeviceValues &retained,
+bool planReplayRestoreCopies(const VernonStageExecutable &forward, DeviceValues &working, DeviceValues &retained,
                              std::vector<DeviceBufferCopy> &copies) {
     copies.clear();
-    for (const Parameter &parameter : forward.variant.parameters) {
+    for (const Parameter &parameter : forward.bindingProjection.parameters) {
         if (parameter.access == "read" || isAutodiffInternal(parameter))
             continue;
         const auto current = working.find(parameter.name);

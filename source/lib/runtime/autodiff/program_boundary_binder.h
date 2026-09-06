@@ -15,7 +15,8 @@ struct VernonRuntimeContext;
 
 namespace vernon::runtime::program {
 struct Program;
-}
+struct ResolvedExecutionPlan;
+} // namespace vernon::runtime::program
 
 namespace vernon::runtime::ad {
 
@@ -28,13 +29,13 @@ struct ProgramStorageState {
 };
 
 struct ProgramBoundaryBindingRequest {
-    const VernonProgramSubmitDescriptor &invocation;
+    const VernonStageInvocationDescriptor &invocation;
     const std::vector<std::pair<uint32_t, uint32_t>> &valueBySlot;
     std::vector<PendingProgramPublication> *publications{};
 };
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
-                           const ProgramBoundaryBindingRequest &request,
+                           const program::ResolvedExecutionPlan &plan, const ProgramBoundaryBindingRequest &request,
                            std::map<uint32_t, VernonProgramArgument> &externalValues,
                            std::map<uint32_t, ProgramStorageState> &backings, std::vector<char> &live,
                            std::string &error);

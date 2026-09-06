@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 # pyright: reportMissingImports=false
-import base64
 import ctypes
 import hashlib
 import importlib
@@ -170,17 +169,6 @@ class _DirectCompiler:
             return reflection, artifacts
         finally:
             self.library.vernonCompileResultDestroy(result)
-
-
-def _artifact_bytes(bundle: dict[str, object], stage_id: str, root: Path | None = None) -> bytes:
-    stage = bundle["stage_artifacts"][stage_id]  # type: ignore[index]
-    artifact = stage["artifact"]  # type: ignore[index]
-    if artifact["storage"] == "external":
-        assert root is not None
-        return (root / artifact["path"]).read_bytes()
-    if artifact["encoding"] == "base64":
-        return base64.b64decode(artifact["data"], validate=True)
-    return artifact["data"].encode("utf-8")
 
 
 def _assert_content_hash(test: unittest.TestCase, bundle: dict[str, object]) -> None:

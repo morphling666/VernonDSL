@@ -217,8 +217,10 @@ bool devicePublicationCopies(const LogicalValueFrame &frame, const std::vector<P
             error = "PublicationPlan device target has no Tensor view";
             return false;
         }
+        VernonTensorView canonicalStaging = stagedArgument->tensor;
+        canonicalStaging.byte_offset = 0;
         std::vector<TensorCopyRegion> regions;
-        if (!planTensorCopy(stagedArgument->tensor, destination, regions, error))
+        if (!planTensorCopy(canonicalStaging, destination, regions, error))
             return false;
         for (const TensorCopyRegion &region : regions)
             copies.push_back({staged, *publication.destinationBuffer, region.sourceOffset,
@@ -236,7 +238,10 @@ VernonStatus commitDeviceProgramPublications(VernonRuntimeContext &context, cons
     std::vector<gpu::DeviceBufferCopy> copies;
     if (!devicePublicationCopies(frame, publications, copies, error))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return gpu::executeBufferCopiesAndWait(context, copies);
+    const VernonStatus status = gpu::executeBufferCopiesAndWait(context, copies);
+    if (status != VERNON_STATUS_OK)
+        error = "PublicationPlan device commit failed: " + invocationDiagnostic(context);
+    return status;
 }
 
 } // namespace vernon::runtime::ad

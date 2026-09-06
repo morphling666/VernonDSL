@@ -50,7 +50,7 @@ VernonProgramArgument hostArgument(const VernonProgramParameterView &parameter, 
 class MandelbulbRenderPass final : public vernon::execution::RenderPass {
 public:
     MandelbulbRenderPass(vernon::execution::GraphImage target, VernonRuntimeContext *runtime,
-                         VernonProgramExecutable *pipeline, VernonProgramSubmitDescriptor *invocation)
+                         VernonProgramExecutable *pipeline, VernonStageInvocationDescriptor *invocation)
         : RenderPass("mandelbulb-raymarch"), target_(target), runtime_(runtime), pipeline_(pipeline),
           invocation_(invocation) {}
 
@@ -66,10 +66,36 @@ public:
 
     VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
                             const vernon::execution::ExecutionResources &) override {
-        VernonRuntimeProviderObject providerEncoder{};
-        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        if (vernonRuntimeProgramEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK)
+        (void)encoder;
+        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline_);
+        VernonProgramInvocation *invocation =
+            instance ? vernonRuntimeProgramInstanceBeginInvocation(instance) : nullptr;
+        VernonStatus status = invocation ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
+        for (size_t index = 0; invocation && index < invocation_->argument_count && status == VERNON_STATUS_OK;
+             ++index) {
+            const VernonProgramBindingToken token{sizeof(token), &index, sizeof(index)};
+            status =
+                vernonRuntimeProgramInvocationBind(invocation, &token, &invocation_->arguments[index], nullptr, 0, 0);
+        }
+        VernonProgramGraphicsControlsView controls{};
+        controls.struct_size = sizeof(controls);
+        const VernonProgramBindingToken controlToken{sizeof(controlToken), this, sizeof(*this)};
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline_, 0, &controls);
+        if (status == VERNON_STATUS_OK && invocation_->render_pass)
+            status = vernonRuntimeProgramInvocationBindRenderPass(invocation, controls.render_pass_control,
+                                                                  &controlToken, invocation_->render_pass, nullptr, 0);
+        if (status == VERNON_STATUS_OK && invocation_->draw_command)
+            status = vernonRuntimeProgramInvocationBindDrawCommand(invocation, controls.draw_command_control,
+                                                                   &controlToken, invocation_->draw_command, nullptr);
+        if (status == VERNON_STATUS_OK && invocation_->dynamic_state)
+            status = vernonRuntimeProgramInvocationBindDynamicState(invocation, controls.dynamic_state_control,
+                                                                    &controlToken, invocation_->dynamic_state);
+        if (status == VERNON_STATUS_OK)
+            status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
+        vernonRuntimeProgramInvocationDestroy(invocation);
+        vernonRuntimeProgramInstanceDestroy(instance);
+        if (status == VERNON_STATUS_OK)
             return VERNON_RHI_STATUS_OK;
         std::cerr << "Mandelbulb encode failed: " << runtimeError(runtime_) << '\n';
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -79,7 +105,7 @@ private:
     vernon::execution::GraphImage target_;
     VernonRuntimeContext *runtime_{};
     VernonProgramExecutable *pipeline_{};
-    VernonProgramSubmitDescriptor *invocation_{};
+    VernonStageInvocationDescriptor *invocation_{};
 };
 
 class MandelbulbPanel final : public ExternalEnginePanel {
@@ -275,7 +301,7 @@ private:
     int32_t shadowSteps_{32};
     std::array<VernonProgramArgument, 8> arguments_{};
     VernonColorAttachment attachment_{};
-    VernonProgramSubmitDescriptor invocation_{};
+    VernonStageInvocationDescriptor invocation_{};
     std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
     uint32_t renderWidth_{};
     uint32_t renderHeight_{};

@@ -306,7 +306,7 @@ VernonStatus dispatchCpuTapedCompute(VernonRuntimeContext &context, CpuPipelineS
 
 } // namespace
 
-bool resolveCpuPipeline(VernonProgramBundle &bundle, const Variant &variant, VernonProgramExecutable &pipeline) {
+bool resolveCpuPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
     auto state = std::make_unique<CpuPipelineState>();
     CpuKernelState kernel;
     ReflectedEntry reflection;
@@ -318,13 +318,13 @@ bool resolveCpuPipeline(VernonProgramBundle &bundle, const Variant &variant, Ver
     return true;
 }
 
-void destroyCpuPipeline(VernonProgramExecutable &pipeline) {
+void destroyCpuPipeline(VernonStageExecutable &pipeline) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.bindings);
     vernonRuntimeCorePipelineDestroy(state.pipeline);
 }
 
-VernonStatus invokeCpuComputePipeline(VernonProgramExecutable &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeCpuComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
     CpuPipelineState &state = runtimeBackendState<CpuPipelineState>(pipeline);
     for (size_t index = 0; index < state.layout.size(); ++index) {
         const auto &layout = state.layout[index];
@@ -372,7 +372,7 @@ VernonStatus invokeCpuComputePipeline(VernonProgramExecutable &pipeline, const P
                 value.payload.inline_value.size = tensor->tensorViewSize;
             } else {
                 std::string parameterName;
-                for (const Parameter &parameter : pipeline.variant.parameters)
+                for (const Parameter &parameter : pipeline.bindingProjection.parameters)
                     if (std::any_of(parameter.uses.begin(), parameter.uses.end(), [&](const ParameterUse &use) {
                             return use.stage == "compute" && use.index == layout.argument_index;
                         })) {

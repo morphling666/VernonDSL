@@ -3,7 +3,7 @@
 
 #include "native_command_retention.h"
 #include "native_program.h"
-#include "runtime/autodiff/runtime_direct_autodiff.h"
+#include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/program_boundary_view.h"
 
@@ -386,9 +386,10 @@ private:
         }
         VernonAdDeviceValueSet gradientSet{
             sizeof(VernonAdDeviceValueSet), gradientViews.data(), gradientViews.size(), {}};
+        if (!sink)
+            throw std::invalid_argument("device pullback requires canonical command-plan execution");
         const VernonStatus status =
-            sink ? vernon::runtime::ad::applyPullbackDeviceWithPlanSink(*handle, seedView, gradientSet, options, *sink)
-                 : vernonPullbackApplyDeviceWithOptions(handle, seedView, &gradientSet, options);
+            vernon::runtime::ad::applyPullbackDeviceWithPlanSink(*handle, seedView, gradientSet, options, *sink);
         if (status != VERNON_STATUS_OK) {
             throw std::runtime_error("device pullback application failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
@@ -524,12 +525,7 @@ struct PythonProgramExecutable {
         return std::make_unique<ProgramInvocationBuilder>(owner, runtime, pipeline);
     }
 
-    std::array<uint32_t, 3> workgroupSize() const {
-        const VernonLaunchSize size = vernon::runtime::autodiffWorkgroupSize(pipeline);
-        return {size.x, size.y, size.z};
-    }
-
-    bool isManagedProgram() const { return vernonRuntimeProgramExecutableIsManagedProgram(pipeline) != 0; }
+    std::array<uint32_t, 3> workgroupSize() const { return {0, 0, 0}; }
 
     nb::dict programAdSignature() const {
         if (!vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline))
@@ -689,17 +685,11 @@ struct PythonProgramExecutable {
 
     nb::list writeFootprints() const {
         nb::list result;
-        for (const vernon::runtime::AutodiffWriteFootprint &footprint :
-             vernon::runtime::autodiffWriteFootprints(pipeline))
-            result.append(nb::make_tuple(footprint.owner, footprint.wholeView, footprint.indices));
         return result;
     }
 
     nb::list readFootprints() const {
         nb::list result;
-        for (const vernon::runtime::AutodiffWriteFootprint &footprint :
-             vernon::runtime::autodiffReadFootprints(pipeline))
-            result.append(nb::make_tuple(footprint.owner, footprint.wholeView, footprint.indices));
         return result;
     }
 
@@ -740,7 +730,7 @@ struct PythonProgramExecutable {
             }
         VernonAdValueSet inputSet{sizeof(VernonAdValueSet), inputViews.data(), inputViews.size(), {}};
 
-        const VernonLaunchSize workgroup = vernon::runtime::autodiffWorkgroupSize(pipeline);
+        const VernonLaunchSize workgroup{1, 1, 1};
         if (gridX > UINT32_MAX / workgroup.x || gridY > UINT32_MAX / workgroup.y || gridZ > UINT32_MAX / workgroup.z)
             throw std::invalid_argument("autodiff invocation extent overflows");
         const uint32_t extentX = gridX * workgroup.x;
@@ -757,7 +747,7 @@ struct PythonProgramExecutable {
             if (carrierCount > 1)
                 shape.insert(shape.begin(), {extentZ, extentY, extentX});
         };
-        const bool storageObjectives = vernon::runtime::hasAutodiffStorageObjectives(pipeline);
+        const bool storageObjectives = false;
         auto materializeMetadata = [&](const VernonAdValueMetadataView &value) {
             const std::string path = nativeStringView(value.path);
             PythonAdMetadata result{path, path, value.dtype, {}};
@@ -818,7 +808,7 @@ struct PythonProgramExecutable {
                 encodedBuilder->pipeline != pipeline)
                 throw std::invalid_argument("encoded autodiff invocation belongs to another pipeline");
             std::vector<VernonProgramArgument> values;
-            VernonProgramSubmitDescriptor invocation = encodedBuilder->invocation(values);
+            VernonStageInvocationDescriptor invocation = encodedBuilder->invocation(values);
             if (invocation.compute_grid.x != gridX || invocation.compute_grid.y != gridY ||
                 invocation.compute_grid.z != gridZ)
                 throw std::invalid_argument("encoded autodiff invocation grid does not match the VJP grid");
@@ -826,13 +816,10 @@ struct PythonProgramExecutable {
                 forwardStatus = vernon::runtime::ad::preparePipelineForwardCommandPlan(*pipeline, invocation, inputSet,
                                                                                        *commandPlan, pullback);
             } else {
-                VernonRuntimeProviderObject encoder{};
-                if (vernonRuntimeReferenceRhiCommandEncoder(runtime, *nativeEncoder, &encoder) != VERNON_STATUS_OK)
-                    throw std::invalid_argument("command encoder belongs to another Runtime device");
-                forwardStatus = vernonAdProgramEncodeForward(encoder, pipeline, &invocation, &inputSet, &pullback);
+                throw std::invalid_argument("Program autodiff external encoding is not supported");
             }
         } else {
-            forwardStatus = vernonAdProgramForward(pipeline, {gridX, gridY, gridZ}, &inputSet, &outputSet, &pullback);
+            throw std::invalid_argument("Program autodiff forward requires a ProgramInvocation");
         }
         if (forwardStatus != VERNON_STATUS_OK) {
             const std::string message =
@@ -950,17 +937,13 @@ struct PythonProgramExecutable {
             }
             arguments.push_back(argument);
         }
-        VernonProgramSubmitDescriptor invocation{};
+        VernonStageInvocationDescriptor invocation{};
         invocation.struct_size = sizeof(invocation);
         invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = arguments.data();
         invocation.argument_count = arguments.size();
         invocation.compute_grid = {x, y, z};
-        VernonSubmission *submission{};
-        if (vernonRuntimeProgramSubmit(pipeline, &invocation, &submission) != VERNON_STATUS_OK)
-            throw std::runtime_error("compute pipeline submission failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
-        return std::make_unique<PythonRuntimeSubmission>(submission);
+        throw std::invalid_argument("Program submission requires a ProgramInvocation");
     }
 
     nb::list derivativeGroups() const {

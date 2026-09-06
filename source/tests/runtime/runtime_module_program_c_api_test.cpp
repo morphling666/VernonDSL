@@ -172,9 +172,6 @@ TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndV
 }
 
 TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
-    // A canonically cooked Program loads through the same entry point a stage-cooked one does, and resolves a variant
-    // the same way. Until this worked, moving an authored form to the canonical path changed its cooked type and every
-    // C++ consumer answered 'unsupported or invalid pipeline bundle', which is what stalled the tuple conversions.
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
@@ -195,7 +192,10 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
 
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
-    EXPECT_EQ(vernonRuntimeProgramExecutableIsManagedProgram(pipeline), 1u);
+    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    ASSERT_NE(second, nullptr) << lastError(context);
+    EXPECT_NE(second, pipeline);
+    vernonRuntimeProgramExecutableDestroy(second);
     EXPECT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
 
     const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
@@ -224,6 +224,52 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
+
+TEST(RuntimeModuleProgramCApi, RejectsLegacyEnvelopeBeforeArtifactIo) {
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const size_t typeField = manifest.find("\"type\"");
+    ASSERT_NE(typeField, std::string::npos);
+    const size_t type = manifest.find("\"program\"", typeField);
+    ASSERT_NE(type, std::string::npos);
+    manifest.replace(type, std::strlen("\"program\""), "\"pipeline\"");
+    manifest.insert(manifest.rfind('}'), R"(,"stage_artifacts":{"legacy":{"artifact":{"path":"../does-not-exist"}}})");
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr), nullptr);
+    EXPECT_EQ(lastError(context), "unsupported or invalid Program bundle");
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+class RuntimeProgramEnvelopeRejection : public testing::TestWithParam<const char *> {};
+
+TEST_P(RuntimeProgramEnvelopeRejection, RejectsEveryNonProgramTypeBeforeArtifactIo) {
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const size_t typeField = manifest.find("\"type\"");
+    ASSERT_NE(typeField, std::string::npos);
+    const size_t type = manifest.find("\"program\"", typeField);
+    ASSERT_NE(type, std::string::npos);
+    manifest.replace(type, std::strlen("\"program\""), std::string{"\""} + GetParam() + "\"");
+    manifest.insert(manifest.rfind('}'), R"(,"stage_artifacts":{"legacy":{"artifact":{"path":"../does-not-exist"}}})");
+
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr), nullptr);
+    EXPECT_EQ(lastError(context), "unsupported or invalid Program bundle");
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+INSTANTIATE_TEST_SUITE_P(RetiredAndUnknownTypes, RuntimeProgramEnvelopeRejection,
+                         testing::Values("pipeline", "program_bundle", "", "Program", "program-v1", "program_v1",
+                                         "bundle", "asset", "shader", "kernel", "module", "graph", "executable",
+                                         "deployment", "stage", "compute", "graphics", "autodiff", "vjp",
+                                         "pipeline_bundle", "cooked_pipeline", "cooked_program", "program_asset",
+                                         "program_manifest", "vernon_program", "native_program", "runtime_program",
+                                         "programs", "PROGRAM", " program", "program ", "null", "true", "unknown"));
 
 TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);

@@ -105,7 +105,7 @@ bool tapePayloadStride(const std::string &type, size_t &stride, std::string &err
     return true;
 }
 
-bool tapeLaneCount(const program::Program &execution, const VernonProgramTopology *topology,
+bool tapeLaneCount(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                    const std::vector<LogicalProgramValue> &hosts, uint32_t tapeValue, size_t &lanes,
                    std::string &error) {
     lanes = 1;
@@ -117,13 +117,15 @@ bool tapeLaneCount(const program::Program &execution, const VernonProgramTopolog
                 continue;
             uint32_t workgroup[3]{256, 1, 1};
             if (topology) {
-                const auto found = topology->nodes.find({graph.direction, node.id});
-                if (found != topology->nodes.end()) {
-                    const VernonProgramExecutable *pipeline = found->second.pipeline;
+                const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
+                if (direction) {
+                    const program::ResolvedNodePlan *resolvedNode = topology->node(*direction, node.id);
+                    const VernonStageExecutable *pipeline = resolvedNode ? resolvedNode->stage.get() : nullptr;
                     if (pipeline) {
-                        workgroup[0] = pipeline->workgroupSize.x ? pipeline->workgroupSize.x : 1;
-                        workgroup[1] = pipeline->workgroupSize.y ? pipeline->workgroupSize.y : 1;
-                        workgroup[2] = pipeline->workgroupSize.z ? pipeline->workgroupSize.z : 1;
+                        const VernonLaunchSize size = pipeline->workgroupSize;
+                        workgroup[0] = size.x ? size.x : 1;
+                        workgroup[1] = size.y ? size.y : 1;
+                        workgroup[2] = size.z ? size.z : 1;
                     }
                 }
             }
@@ -149,7 +151,7 @@ bool tapeLaneCount(const program::Program &execution, const VernonProgramTopolog
     return true;
 }
 
-bool attachTape(const program::Program &execution, const VernonProgramTopology *topology,
+bool attachTape(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                 const std::vector<LogicalProgramValue> &hosts, const program::Value &slot,
                 const std::vector<std::shared_ptr<HostStaticTapeBatch>> *captures,
                 const std::shared_ptr<AutodiffMemoryPolicy> &policy, LogicalProgramValue &value, std::string &error) {
@@ -222,7 +224,7 @@ bool fillProgramTapeHostValue(LogicalProgramValue &value, std::shared_ptr<HostSt
     return true;
 }
 
-bool materializeProgramOwnedStorages(const program::Program &execution, const VernonProgramTopology *topology,
+bool materializeProgramOwnedStorages(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                                      std::vector<LogicalProgramValue> &storage, const std::vector<char> &liveStorage,
                                      const std::vector<std::optional<ValueLayout>> &layouts,
                                      std::map<uint32_t, ProgramStorageState> &backings, std::string &error) {
@@ -333,13 +335,29 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const Ve
                 error = "staged Program Storage input exceeds its canonical backing";
                 return false;
             }
-            std::memcpy(storage[backing.owner].owned.data(), initial.host_data, initial.byte_size);
+            if (initial.storage == VERNON_TENSOR_HOST && initial.host_data) {
+                std::memcpy(storage[backing.owner].owned.data(), initial.host_data, initial.byte_size);
+            } else if (initial.storage == VERNON_TENSOR_RHI_RESOURCE) {
+                LogicalProgramValue::StagedDeviceInitial staged;
+                staged.source = initial.resource;
+                staged.byteOffset = initial.byte_offset;
+                staged.byteSize = initial.byte_size;
+                staged.elementLayout = initial.element_layout;
+                if (initial.rank) {
+                    staged.shape.assign(initial.shape, initial.shape + initial.rank);
+                    staged.strides.assign(initial.byte_strides, initial.byte_strides + initial.rank);
+                }
+                storage[backing.owner].stagedDeviceInitial = std::move(staged);
+            } else {
+                error = "staged Program Storage input has no physical transfer source";
+                return false;
+            }
         }
     }
     return true;
 }
 
-bool materializeProgramValues(const program::Program &execution, const VernonProgramTopology *topology,
+bool materializeProgramValues(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                               std::vector<LogicalProgramValue> &storage, const std::vector<char> &live,
                               const std::vector<std::optional<ValueLayout>> &layouts,
                               const std::map<uint32_t, ProgramStorageState> &backings,

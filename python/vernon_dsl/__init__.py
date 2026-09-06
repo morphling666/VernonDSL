@@ -51,7 +51,6 @@ from .intrinsics import (
 from .module import Module
 from .program_assets import (
     ProgramAssetDeclaration,
-    load_cooked_vjp_asset,
     load_program,
     program_asset,
 )
@@ -251,7 +250,6 @@ __all__ = [
     "init",
     "index_buffer",
     "lines",
-    "load_cooked_vjp_asset",
     "load",
     "load_program",
     "log",
