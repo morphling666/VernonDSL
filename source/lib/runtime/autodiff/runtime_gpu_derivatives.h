@@ -3,14 +3,14 @@
 
 #include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/autodiff/runtime_gpu_bindings.h"
-#include "runtime/autodiff/runtime_gpu_commands.h"
+#include "runtime/program_execution/device_commands.h"
 
 namespace vernon::runtime::ad::gpu {
 
 struct DeviceGradientOwner {
     VernonRhiBuffer destination{};
     size_t size{};
-    std::shared_ptr<DeviceBuffer> shadow;
+    std::shared_ptr<program_execution::DeviceBuffer> shadow;
 };
 
 struct PreparedDerivativeValues {
@@ -38,7 +38,7 @@ struct PreparedDerivativeValues {
                        size_t baseTemporaryBytes, size_t temporaryLimit, std::string &error);
     bool stageGradients(const Signature &signature, std::string &error);
     bool publishGradients() const;
-    bool devicePublicationCopies(std::vector<DeviceBufferCopy> &copies, std::string &error) const;
+    bool devicePublicationCopies(std::vector<program_execution::DeviceBufferCopy> &copies, std::string &error) const;
 };
 
 } // namespace vernon::runtime::ad::gpu

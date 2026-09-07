@@ -1,4 +1,5 @@
-#include "program_value_materializer.h"
+#include "program_invocation_values.h"
+#include "program_tape_scratch.h"
 
 #include "runtime/autodiff/program_shape_resolver.h"
 #include "runtime/runtime_state.h"
@@ -10,6 +11,9 @@
 #include <string_view>
 
 namespace vernon::runtime::ad {
+using program_execution::ProgramStorageBacking;
+using program_execution::ProgramValueOwnership;
+using program_execution::ProgramValueState;
 namespace {
 
 std::optional<size_t> parameterByteSize(const Parameter &parameter, const program::Value *slot) {
@@ -29,7 +33,7 @@ std::optional<size_t> parameterByteSize(const Parameter &parameter, const progra
     return result;
 }
 
-bool fillHostTensor(LogicalProgramValue &value, const program::Value &slot, const ValueLayout &layout, size_t byteSize,
+bool fillHostTensor(ProgramValueState &value, const program::Value &slot, const ValueLayout &layout, size_t byteSize,
                     void *hostData, std::string &error) {
     if (!value.concreteShape) {
         value.concreteShape = shape::concrete(shape::decodeRuntimeContractShape(slot.shape));
@@ -58,7 +62,7 @@ bool fillHostTensor(LogicalProgramValue &value, const program::Value &slot, cons
 }
 
 bool evaluateOwnedExtents(const program::Program &program, const program::Storage &storage,
-                          const std::vector<LogicalProgramValue> &hosts,
+                          const std::vector<ProgramValueState> &hosts,
                           const std::vector<std::optional<ValueLayout>> &layouts, size_t &bytes,
                           std::vector<uint64_t> &concreteShape, std::string &error) {
     bytes = 0;
@@ -106,8 +110,7 @@ bool tapePayloadStride(const std::string &type, size_t &stride, std::string &err
 }
 
 bool tapeLaneCount(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                   const std::vector<LogicalProgramValue> &hosts, uint32_t tapeValue, size_t &lanes,
-                   std::string &error) {
+                   const std::vector<ProgramValueState> &hosts, uint32_t tapeValue, size_t &lanes, std::string &error) {
     lanes = 1;
     for (const program::Graph &graph : execution.graphs) {
         for (const program::Node &node : graph.nodes) {
@@ -152,9 +155,10 @@ bool tapeLaneCount(const program::Program &execution, const program::ResolvedExe
 }
 
 bool attachTape(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                const std::vector<LogicalProgramValue> &hosts, const program::Value &slot,
+                const std::vector<ProgramValueState> &hosts, const program::Value &slot,
                 const std::vector<std::shared_ptr<HostStaticTapeBatch>> *captures,
-                const std::shared_ptr<AutodiffMemoryPolicy> &policy, LogicalProgramValue &value, std::string &error) {
+                const std::shared_ptr<AutodiffMemoryPolicy> &policy, ProgramTapeScratch &tapeScratch,
+                ProgramValueState &value, std::string &error) {
     std::shared_ptr<HostStaticTapeBatch> batch;
     if (captures && slot.id < captures->size())
         batch = (*captures)[slot.id];
@@ -168,7 +172,7 @@ bool attachTape(const program::Program &execution, const program::ResolvedExecut
             return false;
         batch = HostStaticTapeBatch::create(lanes, stride, policy->invocationLimit(), policy, nullptr);
     }
-    return fillProgramTapeHostValue(value, std::move(batch), error);
+    return fillProgramTapeHostValue(value, std::move(batch), tapeScratch, slot.id, error);
 }
 
 } // namespace
@@ -200,34 +204,34 @@ VernonValueLayoutView programValueLayoutView(const ValueLayout &layout) {
             layout.abiLeaves.size()};
 }
 
-bool fillProgramTapeHostValue(LogicalProgramValue &value, std::shared_ptr<HostStaticTapeBatch> batch,
-                              std::string &error) {
+bool fillProgramTapeHostValue(ProgramValueState &value, std::shared_ptr<HostStaticTapeBatch> batch,
+                              ProgramTapeScratch &tapeScratch, uint32_t valueId, std::string &error) {
     if (!batch)
         return error = "Program autodiff tape has no allocator batch", false;
     VernonAdTapeAllocator *descriptor = batch->descriptor(0);
     if (!descriptor)
         return error = "Program autodiff tape has no allocator descriptor", false;
-    value.tapeBatch = std::move(batch);
+    tapeScratch.setHostBatch(valueId, batch);
     value.ownership = ProgramValueOwnership::TapeCarrier;
-    const VernonAdRegionHandle root = value.tapeBatch->rootRegion(0);
+    const VernonAdRegionHandle root = batch->rootRegion(0);
     constexpr size_t descriptorBytes = sizeof(VernonAdTapeAllocator *);
-    value.owned.resize(descriptorBytes + sizeof(root));
-    std::memcpy(value.owned.data(), &descriptor, descriptorBytes);
-    std::memcpy(value.owned.data() + descriptorBytes, &root, sizeof(root));
+    value.ownedHostBytes.resize(descriptorBytes + sizeof(root));
+    std::memcpy(value.ownedHostBytes.data(), &descriptor, descriptorBytes);
+    std::memcpy(value.ownedHostBytes.data() + descriptorBytes, &root, sizeof(root));
     value.argument = {};
     value.argument.kind = VERNON_PROGRAM_TENSOR;
     value.argument.tensor.struct_size = sizeof(VernonTensorView);
     value.argument.tensor.storage = VERNON_TENSOR_HOST;
-    value.argument.tensor.host_data = value.owned.data();
+    value.argument.tensor.host_data = value.ownedHostBytes.data();
     value.argument.tensor.access = VERNON_ACCESS_READ_WRITE;
-    value.argument.tensor.byte_size = value.owned.size();
+    value.argument.tensor.byte_size = value.ownedHostBytes.size();
     return true;
 }
 
 bool materializeProgramOwnedStorages(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                                     std::vector<LogicalProgramValue> &storage, const std::vector<char> &liveStorage,
+                                     std::vector<ProgramValueState> &storage, const std::vector<char> &liveStorage,
                                      const std::vector<std::optional<ValueLayout>> &layouts,
-                                     std::map<uint32_t, ProgramStorageState> &backings, std::string &error) {
+                                     std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
     if (!resolveProgramShapes(execution, topology, storage, error))
         return false;
     for (const program::Storage &slot : execution.storages) {
@@ -235,7 +239,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
             (slot.initialValue < execution.values.size() &&
              program::isTapeValueType(execution.values[slot.initialValue].type)))
             continue;
-        ProgramStorageState &backing = backings[slot.id];
+        ProgramStorageBacking &backing = backings[slot.id];
         if (backing.external || backing.sized)
             continue;
         if (slot.buffer.byteLengthExtents.empty()) {
@@ -286,7 +290,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
         for (const program::Storage &slot : execution.storages) {
             if (slot.id >= liveStorage.size() || !liveStorage[slot.id] || slot.buffer.byteLengthExtents.empty())
                 continue;
-            ProgramStorageState &backing = backings[slot.id];
+            ProgramStorageBacking &backing = backings[slot.id];
             if (backing.external || backing.sized)
                 continue;
             pending = true;
@@ -323,12 +327,12 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
             (slot.initialValue < execution.values.size() &&
              program::isTapeValueType(execution.values[slot.initialValue].type)))
             continue;
-        ProgramStorageState &backing = backings[slot.id];
+        ProgramStorageBacking &backing = backings[slot.id];
         if (backing.external)
             continue;
         if (backing.owner >= storage.size() || !backing.sized)
             return error = "Program autodiff storage has no materializable backing", false;
-        storage[backing.owner].owned.resize(std::max<size_t>(backing.bytes, 1));
+        storage[backing.owner].ownedHostBytes.resize(std::max<size_t>(backing.bytes, 1));
         if (backing.initial) {
             const VernonTensorView &initial = backing.initial->tensor;
             if (initial.byte_size > backing.bytes) {
@@ -336,9 +340,9 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
                 return false;
             }
             if (initial.storage == VERNON_TENSOR_HOST && initial.host_data) {
-                std::memcpy(storage[backing.owner].owned.data(), initial.host_data, initial.byte_size);
+                std::memcpy(storage[backing.owner].ownedHostBytes.data(), initial.host_data, initial.byte_size);
             } else if (initial.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                LogicalProgramValue::StagedDeviceInitial staged;
+                ProgramValueState::StagedDeviceInitial staged;
                 staged.source = initial.resource;
                 staged.byteOffset = initial.byte_offset;
                 staged.byteSize = initial.byte_size;
@@ -358,25 +362,26 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
 }
 
 bool materializeProgramValues(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                              std::vector<LogicalProgramValue> &storage, const std::vector<char> &live,
+                              std::vector<ProgramValueState> &storage, const std::vector<char> &live,
                               const std::vector<std::optional<ValueLayout>> &layouts,
-                              const std::map<uint32_t, ProgramStorageState> &backings,
+                              const std::map<uint32_t, ProgramStorageBacking> &backings,
                               const std::map<uint32_t, VernonProgramArgument> &externalValues,
                               const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures,
-                              const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, std::string &error) {
+                              const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, ProgramTapeScratch &tapeScratch,
+                              std::string &error) {
     for (const program::Value &slot : execution.values) {
         if (!live[slot.id])
             continue;
-        LogicalProgramValue &value = storage[slot.id];
+        ProgramValueState &value = storage[slot.id];
         if (program::isTapeValueType(slot.type)) {
-            if (!attachTape(execution, topology, storage, slot, tapeCaptures, tapePolicy, value, error))
+            if (!attachTape(execution, topology, storage, slot, tapeCaptures, tapePolicy, tapeScratch, value, error))
                 return false;
             continue;
         }
         void *hostData = nullptr;
         size_t byteSize = 0;
         if (slot.storage) {
-            const ProgramStorageState &backing = backings.at(*slot.storage);
+            const ProgramStorageBacking &backing = backings.at(*slot.storage);
             if (backing.external) {
                 value.argument = *backing.external;
                 if (value.argument.kind == VERNON_PROGRAM_TENSOR) {
@@ -390,7 +395,7 @@ bool materializeProgramValues(const program::Program &execution, const program::
                 }
                 continue;
             }
-            hostData = storage[backing.owner].owned.data();
+            hostData = storage[backing.owner].ownedHostBytes.data();
             byteSize = backing.bytes;
             if (!value.concreteShape)
                 value.concreteShape = storage[backing.owner].concreteShape;
@@ -407,8 +412,8 @@ bool materializeProgramValues(const program::Program &execution, const program::
             const std::optional<size_t> bytes = programValueByteSize(slot);
             if (!bytes)
                 return error = "Program autodiff value has no materializable tensor parameter", false;
-            value.owned.resize(*bytes);
-            hostData = value.owned.data();
+            value.ownedHostBytes.resize(*bytes);
+            hostData = value.ownedHostBytes.data();
             byteSize = *bytes;
         } else {
             return error = "Program autodiff value has no storage", false;

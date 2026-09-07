@@ -1,13 +1,16 @@
 #include "runtime_autodiff_internal.h"
 
 #include "host_tape_allocator.h"
-#include "program_invocation_frame_builder.h"
+#include "program_invocation_builder.h"
 #include "program_invocation_spec.h"
-#include "program_publication.h"
+#include "program_invocation_values.h"
 #include "program_residual_planner.h"
 #include "program_tape_lifecycle.h"
-#include "program_value_arena.h"
-#include "program_value_materializer.h"
+#include "program_tape_scratch.h"
+#include "retained_pullback_state.h"
+#include "runtime/program_execution/program_invocation_state.h"
+#include "runtime/program_execution/publication_transaction.h"
+#include "runtime/program_execution/resolved_transfer_executor.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -27,14 +31,21 @@
 namespace vernon::runtime::ad {
 namespace {
 
-using HostProgramValue = LogicalProgramValue;
+using HostProgramValue = program_execution::ProgramValueState;
+using program_execution::ProgramInvocationState;
+using program_execution::ProgramStorageBacking;
+using program_execution::ProgramValueState;
+using program_execution::PublicationTransaction;
+using program_execution::ResolvedTransferExecutor;
 
-bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, std::string &error) {
-    for (const HostProgramValue &slot : storage) {
-        if (!slot.tapeBatch)
+bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, const ProgramTapeScratch &tapeScratch,
+                               std::string &error) {
+    for (size_t value = 0; value < storage.size(); ++value) {
+        const auto batch = tapeScratch.hostBatch(static_cast<uint32_t>(value));
+        if (!batch)
             continue;
-        for (size_t lane = 0; lane < slot.tapeBatch->size(); ++lane) {
-            const VernonAdTapeAllocator *allocator = slot.tapeBatch->descriptor(lane);
+        for (size_t lane = 0; lane < batch->size(); ++lane) {
+            const VernonAdTapeAllocator *allocator = batch->descriptor(lane);
             if (!allocator || allocator->status == VERNON_AD_TAPE_ALLOCATOR_OK)
                 continue;
             const char *reason = allocator->status == VERNON_AD_TAPE_ALLOCATOR_CAPACITY_EXHAUSTED ? "capacity exhausted"
@@ -50,26 +61,20 @@ bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, std
     return true;
 }
 
-void applyPlannedDeviceResidency(program::GraphDirection graph, const program::ResolvedExecutionPlan &plan,
-                                 std::vector<char> &required) {
-    for (size_t value = 0; value < required.size(); ++value)
-        if (plan.requiresDevice(graph, static_cast<uint32_t>(value)))
-            required[value] = 1;
-}
-
 bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<VernonProgramArgument> &values,
-                           std::string &error) {
+                           ProgramTapeScratch &tapeScratch, std::string &error) {
     if (values.size() < storage.size())
         return error = "Program autodiff tape value arena is incomplete", false;
-    if (!validateProgramTapeValues(storage, error))
+    if (!validateProgramTapeValues(storage, tapeScratch, error))
         return false;
     for (size_t value = 0; value < storage.size(); ++value) {
         HostProgramValue &slot = storage[value];
-        if (!slot.tapeBatch)
+        const auto batch = tapeScratch.hostBatch(static_cast<uint32_t>(value));
+        if (!batch)
             continue;
-        if (!slot.tapeBatch->compact(true))
+        if (!batch->compact(true))
             return error = "Program autodiff tape could not be compacted", false;
-        if (!fillProgramTapeHostValue(slot, slot.tapeBatch, error))
+        if (!fillProgramTapeHostValue(slot, batch, tapeScratch, static_cast<uint32_t>(value), error))
             return false;
         values[value] = slot.argument;
     }
@@ -78,14 +83,10 @@ bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<V
 
 bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi> &signature,
                     const std::vector<ProgramLeafBinding> &bindings, std::vector<HostProgramValue> &storage,
-                    bool publish, std::string &error) {
+                    PublicationTransaction *publication, std::string &error) {
     if (bindings.size() != signature.size() || supplied.value_count != signature.size())
         return error = "Program autodiff leaf set does not match its canonical boundary", false;
-    struct PendingPublication {
-        void *destination{};
-        std::vector<uint8_t> bytes;
-    };
-    std::vector<PendingPublication> pending;
+    const bool publish = publication != nullptr;
     for (size_t index = 0; index < bindings.size(); ++index) {
         const ValueAbi &abi = signature[index];
         const VernonAdValue *value = findValue(supplied, abi.path);
@@ -107,8 +108,8 @@ bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi
                 return error = "Program autodiff leaf footprint overflows", false;
             const size_t required = elementCount * binding.elementStride;
             if (host.argument.tensor.byte_size < required) {
-                host.owned.resize(required);
-                host.argument.tensor.host_data = host.owned.data();
+                host.ownedHostBytes.resize(required);
+                host.argument.tensor.host_data = host.ownedHostBytes.data();
                 host.argument.tensor.byte_size = required;
                 if (host.concreteShape &&
                     !shape::rowMajorByteStrides(*host.concreteShape, binding.elementStride, host.strides))
@@ -121,18 +122,12 @@ bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi
             uint8_t *packedElement = packed + element * binding.elementStride + binding.byteOffset;
             uint8_t *leafElement = leaf + element * binding.leafElementBytes;
             if (publish) {
-                PendingPublication copy;
-                copy.destination = leafElement;
-                copy.bytes.assign(packedElement, packedElement + binding.leafElementBytes);
-                pending.push_back(std::move(copy));
+                if (!publication->stageHostBytes(leafElement, packedElement, binding.leafElementBytes, error))
+                    return false;
             } else
                 std::memcpy(packedElement, leafElement, binding.leafElementBytes);
         }
     }
-    // Publication is a commit-after-success boundary: validate and stage every
-    // leaf before mutating any caller-owned destination.
-    for (const PendingPublication &copy : pending)
-        std::memcpy(copy.destination, copy.bytes.data(), copy.bytes.size());
     return true;
 }
 
@@ -141,19 +136,12 @@ VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
     return VERNON_STATUS_INVALID_ARGUMENT;
 }
 
-struct ProgramPullbackState {
-    ProgramPullbackState(ProgramResidualPlan plan, LogicalValueFrame values)
-        : plan(std::move(plan)), values(std::make_unique<const LogicalValueFrame>(std::move(values))) {}
-
-    const ProgramResidualPlan plan;
-    const std::unique_ptr<const LogicalValueFrame> values;
-};
-
 class ProgramPullback final : public PullbackExecution {
 public:
     ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<const program::ResolvedExecutionPlan> topology,
                     Variant variant, Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
-                    std::vector<ProgramLeafBinding> gradientBindings, std::shared_ptr<const ProgramPullbackState> state,
+                    std::vector<ProgramLeafBinding> gradientBindings,
+                    std::shared_ptr<const RetainedPullbackState> state,
                     std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
           signature_(std::move(signature)), cotangentBindings_(std::move(cotangentBindings)),
@@ -165,7 +153,7 @@ public:
     VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
                        const PullbackApplyOptions &options) override {
         const std::lock_guard lock(applyMutex_);
-        if (!topology_->resolvedProgram || !state_ || !state_->values)
+        if (!topology_->resolvedProgram || !state_)
             return fail(*context_, "Program pullback has no retained canonical state");
         const program::Program &execution = topology_->resolvedProgram->program;
         const program::Graph *backward = program::findGraph(execution, "backward");
@@ -179,25 +167,21 @@ public:
         std::vector<char> required(execution.values.size());
         program::markGraphValues(*backward, required);
         std::optional<program::Graph> replay;
-        if (state_->plan.replayEnd) {
+        if (state_->residualPlan().replayEnd) {
             const program::Graph *forward = program::findGraph(execution, "forward");
             if (!forward)
                 return fail(*context_, "Program pullback replay has no forward graph");
             replay = *forward;
-            replay->nodes.resize(state_->plan.replayEnd);
+            replay->nodes.resize(state_->residualPlan().replayEnd);
             program::markGraphValues(*replay, required);
         }
-        for (uint32_t value : state_->plan.retainedValues)
+        for (uint32_t value : state_->residualPlan().retainedValues)
             if (value < required.size())
                 required[value] = 1;
 
-        std::vector<std::vector<uint8_t>> captures(execution.values.size());
-        std::vector<std::vector<uint64_t>> captureShapes(execution.values.size());
-        for (uint32_t value : state_->plan.retainedValues)
-            if (value < captureShapes.size() && value < state_->values->hostValues().size() &&
-                state_->values->hostValues()[value].concreteShape)
-                captureShapes[value] = *state_->values->hostValues()[value].concreteShape;
-        std::vector<LogicalProgramValue> storage;
+        const std::vector<std::vector<uint8_t>> &captures = state_->residualCaptures();
+        const std::vector<std::vector<uint64_t>> &captureShapes = state_->captureShapes();
+        std::vector<ProgramValueState> storage;
         PullbackInvocationSpec frame{
             required,
             {cotangents, cotangents ? &signature_.cotangents : nullptr, cotangents ? &cotangentBindings_ : nullptr},
@@ -205,65 +189,73 @@ public:
             captures,
             captureShapes,
             nullptr,
-            state_->values.get(),
+            &state_->valueSnapshots(),
         };
         std::string error;
-        if (!buildLogicalValueFrame(*context_, execution, topology_.get(), storage, frame,
-                                    context_->autodiffMemoryPolicy, error) ||
+        std::map<uint32_t, ProgramStorageBacking> storageBackings;
+        ProgramTapeScratch tapeScratch(execution.values.size());
+        if (!buildProgramInvocationValues(*context_, execution, topology_.get(), storage, storageBackings, tapeScratch,
+                                          frame, context_->autodiffMemoryPolicy, error) ||
             (cotangents &&
-             !transferLeaves(*cotangents, signature_.cotangents, cotangentBindings_, storage, false, error)))
+             !transferLeaves(*cotangents, signature_.cotangents, cotangentBindings_, storage, nullptr, error)))
             return fail(*context_, error);
 
         size_t temporaryBytes = 0;
-        for (const LogicalProgramValue &value : storage) {
-            if (value.owned.size() > std::numeric_limits<size_t>::max() - temporaryBytes)
+        for (const ProgramValueState &value : storage) {
+            if (value.ownedHostBytes.size() > std::numeric_limits<size_t>::max() - temporaryBytes)
                 return fail(*context_, "Program pullback temporary memory accounting overflows");
-            temporaryBytes += value.owned.size();
+            temporaryBytes += value.ownedHostBytes.size();
         }
         if (temporaryBytes > options.maximumTemporaryBytes)
             return fail(*context_, "Program pullback exceeds its temporary memory limit");
 
-        LogicalValueFrame values(std::move(storage));
-        const bool device = context_->backend != VERNON_RUNTIME_CPU;
-        std::vector<char> deviceRequired(execution.values.size());
-        applyPlannedDeviceResidency(program::GraphDirection::Backward, *topology_, deviceRequired);
-        if (replay)
-            applyPlannedDeviceResidency(program::GraphDirection::Forward, *topology_, deviceRequired);
-        for (uint32_t value : state_->plan.retainedValues)
-            if (!values.adoptRetainedValue(value, *state_->values, error))
-                return fail(*context_, error);
-        if (device && !values.materializeDevice(*context_, deviceRequired, error))
+        ProgramInvocationState values(*topology_, std::move(storage), std::move(storageBackings));
+        if (!state_->importInto(values, tapeScratch, !replay, error))
             return fail(*context_, error);
+        const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
+            [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
+            if (binding.semantic == program::CarrierSemantic::Tape)
+                if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
+                    return argument;
+            return values.argument(value);
+        };
+        const bool device = context_->backend != VERNON_RUNTIME_CPU;
         VernonProgramExecutable proxy(*context_, topology_);
         if (replay) {
             if (device) {
                 std::vector<ProgramTapeState> tapeStates;
-                if (!prepareProgramTapeStates(values, *context_, execution, *topology_, *replay, tapeStates, error))
+                if (!prepareProgramTapeStates(values, tapeScratch, *context_, execution, *topology_, *replay,
+                                              tapeStates, error))
                     return fail(*context_, error);
                 for (;;) {
-                    const VernonStatus replayStatus = executePipelineProgramGraph(proxy, *replay, values);
+                    const VernonStatus replayStatus =
+                        executePipelineProgramGraph(proxy, *replay, values, resolvePhysicalEndpoint);
                     if (replayStatus != VERNON_STATUS_OK)
                         return replayStatus;
                     bool retry = false;
-                    if (!validateProgramTapeStates(values, tapeStates, retry, error))
+                    if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                         return fail(*context_, error);
                     if (!retry)
                         break;
-                    if (!values.restoreDeviceValuesFromHost(required, error))
+                    ResolvedTransferExecutor transfers(*context_, values);
+                    if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
+                        return fail(*context_, error);
+                    if (!state_->importInto(values, tapeScratch, false, error))
                         return fail(*context_, error);
                     for (ProgramTapeState &tape : tapeStates)
-                        if (!allocateProgramTapeState(values, *context_, tape, error))
+                        if (!allocateProgramTapeState(tapeScratch, *context_, tape, error))
                             return fail(*context_, error);
                 }
             } else {
-                const VernonStatus replayStatus = executePipelineProgramGraph(proxy, *replay, values);
+                const VernonStatus replayStatus =
+                    executePipelineProgramGraph(proxy, *replay, values, resolvePhysicalEndpoint);
                 if (replayStatus != VERNON_STATUS_OK)
                     return replayStatus;
-                if (!sealProgramTapeValues(values.hostValues(), values.logicalArguments(), error))
+                if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
                     return fail(*context_, error);
             }
         }
-        const VernonStatus status = executePipelineProgramGraph(proxy, *backward, values);
+        const VernonStatus status = executePipelineProgramGraph(proxy, *backward, values, resolvePhysicalEndpoint);
         if (status != VERNON_STATUS_OK)
             return status;
 
@@ -272,12 +264,17 @@ public:
             for (const ProgramLeafBinding &binding : gradientBindings_)
                 if (binding.value < downloads.size())
                     downloads[binding.value] = 1;
-            if (!values.downloadLogicalToHost(downloads, error))
+            ResolvedTransferExecutor transfers(*context_, values);
+            if (!transfers.readbackBoundaryValues(downloads, error))
                 return fail(*context_, error);
             ++usage_.readbacks;
         }
-        if (!transferLeaves(gradients, signature_.gradients, gradientBindings_, values.hostValues(), true, error))
+        PublicationTransaction publication(topology_->publications);
+        if (!transferLeaves(gradients, signature_.gradients, gradientBindings_, values.values(), &publication, error))
             return fail(*context_, error);
+        if (const VernonStatus publicationStatus = publication.commit(*context_, values, error);
+            publicationStatus != VERNON_STATUS_OK)
+            return error.empty() ? publicationStatus : fail(*context_, error);
         ++usage_.submissions;
         ++usage_.waits;
         ++usage_.atomicPublications;
@@ -287,30 +284,24 @@ public:
 
     PullbackMemoryUsage memoryUsage() const override {
         MemoryAccounting memory;
-        memory.logicalPayloadBytes = state_->plan.checkpoint.logicalResidualBytes;
+        memory.logicalPayloadBytes = state_->residualPlan().checkpoint.logicalResidualBytes;
         const auto add = [](size_t &total, size_t bytes) {
             if (bytes > std::numeric_limits<size_t>::max() - total)
                 total = std::numeric_limits<size_t>::max();
             else
                 total += bytes;
         };
-        for (const LogicalProgramValue &value : state_->values->hostValues()) {
-            const auto &batch = value.tapeBatch;
-            if (!batch) {
-                add(memory.residentBytes, value.owned.size());
-                add(memory.retainedAllocationBytes, value.owned.size());
-            } else {
-                add(memory.residentBytes, batch->isCompacted() ? batch->logicalBytes() : batch->residentBytes());
-                add(memory.allocatedBytes, batch->allocatedBytes());
-            }
-        }
-        memory.retainedAllocationBytes = std::max(memory.retainedAllocationBytes,
-                                                  static_cast<size_t>(state_->plan.checkpoint.retainedAllocationBytes));
+        add(memory.residentBytes, state_->residentBytes());
+        add(memory.retainedAllocationBytes, state_->residentBytes());
+        add(memory.allocatedBytes, state_->allocatedTapeBytes());
+        memory.retainedAllocationBytes =
+            std::max(memory.retainedAllocationBytes,
+                     static_cast<size_t>(state_->residualPlan().checkpoint.retainedAllocationBytes));
         add(memory.retainedAllocationBytes, memory.allocatedBytes);
         return pullbackMemoryUsage(memory);
     }
 
-    PullbackControlPlaneUsage controlPlaneUsage() const override {
+    program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const override {
         const std::lock_guard lock(applyMutex_);
         return usage_;
     }
@@ -318,18 +309,18 @@ public:
     AutodiffPullbackCheckpointPlan checkpointPlan() const override {
         AutodiffPullbackCheckpointPlan snapshot;
         snapshot.present = true;
-        snapshot.peakBytes = state_->plan.checkpoint.peakBytes;
-        snapshot.memoryBudget = state_->plan.checkpoint.memoryBudget;
-        snapshot.logicalResidualBytes = state_->plan.checkpoint.logicalResidualBytes;
-        snapshot.retainedAllocationBytes = state_->plan.checkpoint.retainedAllocationBytes;
-        snapshot.initialStateBytes = state_->plan.checkpoint.initialStateBytes;
-        snapshot.restorationBytes = state_->plan.checkpoint.restorationBytes;
-        snapshot.transactionBytes = state_->plan.checkpoint.transactionBytes;
-        snapshot.persistentCheckpointBytes = state_->plan.checkpoint.persistentCheckpointBytes;
-        snapshot.backwardValueBytes = state_->plan.checkpoint.backwardValueBytes;
-        snapshot.replayCost = state_->plan.checkpoint.replayCost;
-        snapshot.recomputationCost = state_->plan.checkpoint.recomputationCost;
-        snapshot.selectedPolicy = state_->plan.checkpoint.selectedPolicy;
+        snapshot.peakBytes = state_->residualPlan().checkpoint.peakBytes;
+        snapshot.memoryBudget = state_->residualPlan().checkpoint.memoryBudget;
+        snapshot.logicalResidualBytes = state_->residualPlan().checkpoint.logicalResidualBytes;
+        snapshot.retainedAllocationBytes = state_->residualPlan().checkpoint.retainedAllocationBytes;
+        snapshot.initialStateBytes = state_->residualPlan().checkpoint.initialStateBytes;
+        snapshot.restorationBytes = state_->residualPlan().checkpoint.restorationBytes;
+        snapshot.transactionBytes = state_->residualPlan().checkpoint.transactionBytes;
+        snapshot.persistentCheckpointBytes = state_->residualPlan().checkpoint.persistentCheckpointBytes;
+        snapshot.backwardValueBytes = state_->residualPlan().checkpoint.backwardValueBytes;
+        snapshot.replayCost = state_->residualPlan().checkpoint.replayCost;
+        snapshot.recomputationCost = state_->residualPlan().checkpoint.recomputationCost;
+        snapshot.selectedPolicy = state_->residualPlan().checkpoint.selectedPolicy;
         return snapshot;
     }
 
@@ -339,7 +330,7 @@ public:
         const PullbackMemoryUsage usage = memoryUsage();
         const uint64_t held =
             std::max(std::max(usage.retainedAllocationBytes, usage.allocatedBytes), usage.peakTemporaryBytes);
-        return std::max(held, state_->plan.checkpoint.peakBytes);
+        return std::max(held, state_->residualPlan().checkpoint.peakBytes);
     }
 
 private:
@@ -349,10 +340,10 @@ private:
     Signature signature_;
     std::vector<ProgramLeafBinding> cotangentBindings_;
     std::vector<ProgramLeafBinding> gradientBindings_;
-    std::shared_ptr<const ProgramPullbackState> state_;
+    std::shared_ptr<const RetainedPullbackState> state_;
     std::vector<AutodiffPullbackPassTelemetry> passTelemetry_;
     mutable std::mutex applyMutex_;
-    PullbackControlPlaneUsage usage_;
+    program_execution::ExecutionControlPlaneUsage usage_;
 };
 
 class ProgramExecutable final : public Executable {
@@ -495,22 +486,31 @@ public:
         for (uint32_t value : program::residualCaptures(*execution))
             if (value < required.size())
                 required[value] = 1;
-        std::vector<PendingProgramPublication> publications;
+        PublicationTransaction publication(topology->publications);
         ForwardInvocationSpec frame{
             required,
             canonicalInvocation ? std::variant<CanonicalForwardBindings, HostForwardBindings>(
-                                      CanonicalForwardBindings{*target.invocation, forwardBindings_, publications})
+                                      CanonicalForwardBindings{*target.invocation, forwardBindings_, publication})
                                 : std::variant<CanonicalForwardBindings, HostForwardBindings>(HostForwardBindings{
                                       {&inputs, &signature_.inputs, &inputBindings_},
                                       {outputs, &signature_.outputs, &outputBindings_},
                                   }),
         };
-        if (!buildLogicalValueFrame(*context_, *execution, topology.get(), hostStorage, frame,
-                                    context_->autodiffMemoryPolicy, error) ||
+        std::map<uint32_t, ProgramStorageBacking> storageBackings;
+        ProgramTapeScratch tapeScratch(execution->values.size());
+        if (!buildProgramInvocationValues(*context_, *execution, topology.get(), hostStorage, storageBackings,
+                                          tapeScratch, frame, context_->autodiffMemoryPolicy, error) ||
             (!canonicalInvocation &&
-             !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, false, error)))
+             !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, nullptr, error)))
             return fail(*context_, error);
-        LogicalValueFrame arena(std::move(hostStorage));
+        ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
+        const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
+            [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
+            if (binding.semantic == program::CarrierSemantic::Tape)
+                if (const VernonProgramArgument *argument = tapeScratch.argument(value, binding))
+                    return argument;
+            return arena.argument(value);
+        };
         arena.setInvocationContext(target.programContext);
         VernonProgramExecutable proxy(*context_, topology);
         for (const program::Node &node : forward->nodes)
@@ -522,58 +522,51 @@ public:
                 }
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (device) {
-            std::vector<char> deviceRequired(execution->values.size());
-            applyPlannedDeviceResidency(program::GraphDirection::Forward, *topology, deviceRequired);
-            if (!arena.materializeDevice(*context_, deviceRequired, error))
-                return fail(*context_, error);
             std::vector<ProgramTapeState> tapeStates;
-            if (!prepareProgramTapeStates(arena, *context_, *execution, *topology, *forward, tapeStates, error))
+            if (!prepareProgramTapeStates(arena, tapeScratch, *context_, *execution, *topology, *forward, tapeStates,
+                                          error))
                 return fail(*context_, error);
             for (;;) {
-                const VernonStatus status = executePipelineProgramGraph(proxy, *forward, arena);
+                const VernonStatus status =
+                    executePipelineProgramGraph(proxy, *forward, arena, resolvePhysicalEndpoint);
                 if (status != VERNON_STATUS_OK)
                     return status;
                 bool retry = false;
-                if (!validateProgramTapeStates(arena, tapeStates, retry, error))
+                if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                     return fail(*context_, error);
                 if (!retry)
                     break;
-                if (!arena.restoreDeviceValuesFromHost(required, error))
+                ResolvedTransferExecutor transfers(*context_, arena);
+                if (!transfers.restoreForRetry(program::GraphDirection::Forward, error))
                     return fail(*context_, error);
                 for (ProgramTapeState &state : tapeStates)
-                    if (!allocateProgramTapeState(arena, *context_, state, error))
+                    if (!allocateProgramTapeState(tapeScratch, *context_, state, error))
                         return fail(*context_, error);
             }
         } else {
-            const VernonStatus status = executePipelineProgramGraph(proxy, *forward, arena);
+            const VernonStatus status = executePipelineProgramGraph(proxy, *forward, arena, resolvePhysicalEndpoint);
             if (status != VERNON_STATUS_OK)
                 return status;
-            if (!validateProgramTapeValues(arena.hostValues(), error))
+            if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
                 return fail(*context_, error);
         }
 
         if (device) {
-            if (const VernonStatus publicationStatus =
-                    commitDeviceProgramPublications(*context_, arena, publications, error);
-                publicationStatus != VERNON_STATUS_OK)
-                return error.empty() ? publicationStatus : fail(*context_, error);
-            std::vector<char> downloads(execution->values.size());
-            for (const PendingProgramPublication &publication : publications)
-                if (!publication.destinationBuffer && publication.target &&
-                    publication.target->value < downloads.size())
-                    downloads[publication.target->value] = 1;
+            std::vector<char> downloads = publication.hostReadbackValues(execution->values.size());
             if (!canonicalInvocation)
                 for (const ProgramLeafBinding &binding : outputBindings_)
                     if (binding.value < downloads.size())
                         downloads[binding.value] = 1;
-            if (!arena.downloadLogicalToHost(downloads, error))
+            ResolvedTransferExecutor transfers(*context_, arena);
+            if (!transfers.readbackBoundaryValues(downloads, error))
                 return fail(*context_, error);
         }
-        if (!commitProgramPublications(arena.hostValues(), publications, error))
-            return fail(*context_, error);
         if (!canonicalInvocation &&
-            !transferLeaves(*outputs, signature_.outputs, outputBindings_, arena.hostValues(), true, error))
+            !transferLeaves(*outputs, signature_.outputs, outputBindings_, arena.values(), &publication, error))
             return fail(*context_, error);
+        if (const VernonStatus publicationStatus = publication.commit(*context_, arena, error);
+            publicationStatus != VERNON_STATUS_OK)
+            return error.empty() ? publicationStatus : fail(*context_, error);
         if (!hasBackward)
             return VERNON_STATUS_OK;
 
@@ -582,27 +575,28 @@ public:
         const bool rematerializeTapes = programAutodiff_->checkpointMemoryBudget.has_value();
         if (rematerializeTapes)
             memoryBudget = *programAutodiff_->checkpointMemoryBudget;
-        if (!planProgramResiduals(*execution, topology.get(), variant_, arena.hostValues(), memoryBudget,
+        if (!planProgramResiduals(*execution, topology.get(), variant_, arena.values(), tapeScratch, memoryBudget,
                                   programAutodiff_->checkpointPolicy, rematerializeTapes, plan, error))
             return fail(*context_, error);
         for (uint32_t value : plan.retainedValues) {
-            if (value >= arena.hostValues().size())
+            if (value >= arena.values().size())
                 return fail(*context_, "Program pullback residual plan references an unknown Value");
-            LogicalProgramValue &slot = arena.hostValues()[value];
-            if (slot.tapeBatch) {
-                if (!slot.tapeBatch->compact(true) || !fillProgramTapeHostValue(slot, slot.tapeBatch, error))
+            ProgramValueState &slot = arena.values()[value];
+            const auto batch = tapeScratch.hostBatch(value);
+            if (batch) {
+                if (!batch->compact(true) || !fillProgramTapeHostValue(slot, batch, tapeScratch, value, error))
                     return fail(*context_, error.empty() ? "Program autodiff tape could not be compacted" : error);
-                arena.logicalArguments()[value] = slot.argument;
+                arena.arguments()[value] = slot.argument;
             }
         }
         std::vector<AutodiffPullbackPassTelemetry> telemetry =
-            collectProgramPassTelemetry(*forward, *execution, arena.hostValues(), plan);
+            collectProgramPassTelemetry(*forward, *execution, arena.values(), tapeScratch, plan);
         std::vector<char> retained(execution->values.size());
         for (uint32_t value : plan.retainedValues)
             if (value < retained.size())
                 retained[value] = 1;
         arena.retainOnly(retained);
-        auto state = std::make_shared<const ProgramPullbackState>(std::move(plan), std::move(arena));
+        auto state = std::make_shared<const RetainedPullbackState>(std::move(plan), arena, std::move(tapeScratch));
         pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, cotangentBindings_,
                                                      gradientBindings_, std::move(state), std::move(telemetry));
         return VERNON_STATUS_OK;

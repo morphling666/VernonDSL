@@ -1,5 +1,7 @@
-#include "runtime/autodiff/program_publication.h"
+#include "runtime/autodiff/retained_pullback_state.h"
 #include "runtime/content_hash.h"
+#include "runtime/program_execution/program_invocation_state.h"
+#include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/runtime_pipeline_backend.h"
 #include "runtime/target_binding_plan.h"
@@ -69,11 +71,13 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     float secondSource = 4.0f;
     float firstDestination = -1.0f;
     float secondDestination = -2.0f;
-    std::vector<vernon::runtime::ad::LogicalProgramValue> storage(2);
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    std::vector<program_execution::ProgramValueState> storage(2);
     storage[0].argument = hostTensor(&firstSource, sizeof(firstSource));
     storage[1].argument = hostTensor(&secondSource, sizeof(secondSource));
 
-    std::vector<vernon::runtime::program::PublicationTarget> targets{
+    std::vector<PublicationTarget> targets{
         {0,
          0,
          vernon::runtime::program::BoundaryRole::Output,
@@ -83,31 +87,106 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
          vernon::runtime::program::BoundaryRole::Output,
          {vernon::runtime::program::ProgramOwnerKind::Storage, 1}},
     };
-    std::vector<vernon::runtime::ad::PendingProgramPublication> publications{
-        {&targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt},
-        {&targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2), std::nullopt},
+    ResolvedExecutionPlan plan;
+    plan.publications.transactions = {
+        {0, 0, {ProgramOwnerKind::Storage, 0}, PublicationCommitMode::CommitAfterSuccess},
+        {1, 1, {ProgramOwnerKind::Storage, 1}, PublicationCommitMode::CommitAfterSuccess},
     };
+    program_execution::ProgramInvocationState invocation(plan, std::move(storage), {});
+    program_execution::PublicationTransaction invalid(plan.publications);
     std::string error;
-    EXPECT_FALSE(vernon::runtime::ad::commitProgramPublications(storage, publications, error));
+    ASSERT_TRUE(
+        invalid.stage(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt, error));
+    ASSERT_TRUE(invalid.stage(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2),
+                              std::nullopt, error));
+    VernonRuntimeContext context{};
+    EXPECT_EQ(invalid.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::Poisoned);
     EXPECT_EQ(firstDestination, -1.0f);
     EXPECT_EQ(secondDestination, -2.0f);
 
-    publications[1].destination = hostTensor(&secondDestination, sizeof(secondDestination));
-    ASSERT_TRUE(vernon::runtime::ad::commitProgramPublications(storage, publications, error)) << error;
+    program_execution::PublicationTransaction valid(plan.publications);
+    ASSERT_TRUE(
+        valid.stage(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt, error));
+    ASSERT_TRUE(
+        valid.stage(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination)), std::nullopt, error));
+    ASSERT_EQ(valid.commit(context, invocation, error), VERNON_STATUS_OK) << error;
+    EXPECT_EQ(valid.status(), program_execution::PublicationTransaction::Status::Committed);
     EXPECT_EQ(firstDestination, firstSource);
     EXPECT_EQ(secondDestination, secondSource);
 }
 
-TEST(ProgramPublication, ProgramOwnerIdentityControlsBindingReuse) {
-    float first = 1.0f;
-    float second = 2.0f;
-    const vernon::runtime::program::ProgramOwnerId sharedOwner{vernon::runtime::program::ProgramOwnerKind::Storage, 7};
-    vernon::runtime::ad::ProgramOwnerBindings bindings;
+TEST(ProgramPublication, RollbackLeavesDestinationUnchanged) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    float destination = -1.0f;
+    PublicationTarget target{0, 0, BoundaryRole::Output, {ProgramOwnerKind::Storage, 7}};
+    ResolvedPublicationPlan plan{{
+        {0, 0, {ProgramOwnerKind::Storage, 7}, PublicationCommitMode::CommitAfterSuccess},
+    }};
+    program_execution::PublicationTransaction transaction(plan);
     std::string error;
-    ASSERT_TRUE(bindings.bind(sharedOwner, hostTensor(&first, sizeof(first)), error));
-    EXPECT_FALSE(bindings.bind(sharedOwner, hostTensor(&second, sizeof(second)), error));
-    EXPECT_TRUE(bindings.bind({vernon::runtime::program::ProgramOwnerKind::Storage, 8},
-                              hostTensor(&second, sizeof(second)), error));
+    ASSERT_TRUE(transaction.stage(0, target, hostTensor(&destination, sizeof(destination)), std::nullopt, error));
+    transaction.rollback();
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
+    EXPECT_EQ(destination, -1.0f);
+}
+
+TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    float source = 1.0f;
+    float destination = -1.0f;
+    PublicationTarget target{0, 0, BoundaryRole::Output, {ProgramOwnerKind::Storage, 0}};
+    ResolvedExecutionPlan plan;
+    plan.publications.transactions = {{
+        0,
+        0,
+        {ProgramOwnerKind::Storage, 0},
+        PublicationCommitMode::CommitAfterSuccess,
+    }};
+    std::vector<program_execution::ProgramValueState> values(1);
+    values[0].argument = hostTensor(&source, sizeof(source));
+    program_execution::ProgramInvocationState invocation(plan, std::move(values), {});
+    program_execution::PublicationTransaction transaction(plan.publications);
+    std::string error;
+    ASSERT_TRUE(
+        transaction.stage(0, target, hostTensor(&destination, sizeof(destination)), VernonRhiBuffer{1, 1}, error));
+    VernonRuntimeContext context{};
+    EXPECT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::Poisoned);
+    EXPECT_EQ(destination, -1.0f);
+}
+
+TEST(RetainedPullbackState, SnapshotsDoNotAliasInvocationOrRetryScratch) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    ResolvedExecutionPlan plan;
+    std::vector<program_execution::ProgramValueState> forwardValues(1);
+    forwardValues[0].ownedHostBytes = {7, 8, 9, 10};
+    forwardValues[0].argument =
+        hostTensor(forwardValues[0].ownedHostBytes.data(), forwardValues[0].ownedHostBytes.size());
+    program_execution::ProgramInvocationState forward(plan, std::move(forwardValues), {});
+    ad::ProgramResidualPlan residuals;
+    residuals.retainedValues = {0};
+    ad::RetainedPullbackState retained(std::move(residuals), forward, ad::ProgramTapeScratch(1));
+
+    forward.values()[0].ownedHostBytes[0] = 42;
+    std::vector<program_execution::ProgramValueState> applyValues(1);
+    program_execution::ProgramInvocationState apply(plan, std::move(applyValues), {});
+    ad::ProgramTapeScratch applyTape(1);
+    std::string error;
+    ASSERT_TRUE(retained.importInto(apply, applyTape, true, error)) << error;
+    ASSERT_EQ(apply.values()[0].ownedHostBytes[0], 7);
+    EXPECT_NE(retained.snapshotHostIdentity(0), apply.values()[0].ownedHostBytes.data());
+
+    apply.values()[0].ownedHostBytes[0] = 99;
+    std::vector<program_execution::ProgramValueState> retryValues(1);
+    program_execution::ProgramInvocationState retry(plan, std::move(retryValues), {});
+    ad::ProgramTapeScratch retryTape(1);
+    ASSERT_TRUE(retained.importInto(retry, retryTape, true, error)) << error;
+    EXPECT_EQ(retry.values()[0].ownedHostBytes[0], 7);
+    EXPECT_NE(apply.values()[0].ownedHostBytes.data(), retry.values()[0].ownedHostBytes.data());
 }
 
 TEST(ProgramTargetBinding, PreservesCanonicalNumericShapeAcrossComputeAndGraphics) {

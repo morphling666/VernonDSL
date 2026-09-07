@@ -1,6 +1,6 @@
 #include "program_residual_planner.h"
 
-#include "program_value_materializer.h"
+#include "program_invocation_values.h"
 #include "runtime/runtime_state.h"
 
 #include <algorithm>
@@ -10,6 +10,7 @@
 #include <string_view>
 
 namespace vernon::runtime::ad {
+using program_execution::ProgramValueState;
 namespace {
 
 const Parameter *findParameter(const Variant &variant, const std::string &name) {
@@ -47,7 +48,8 @@ std::string passName(const program::Node &node) {
 
 std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const program::Graph &forward,
                                                                        const program::Program &execution,
-                                                                       const std::vector<LogicalProgramValue> &storage,
+                                                                       const std::vector<ProgramValueState> &storage,
+                                                                       const ProgramTapeScratch &tapeScratch,
                                                                        const ProgramResidualPlan &plan) {
     std::vector<char> retained(execution.values.size());
     for (uint32_t value : plan.retainedValues)
@@ -76,19 +78,19 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
         for (uint32_t value : node.results) {
             if (value >= storage.size())
                 continue;
-            const LogicalProgramValue &slot = storage[value];
-            if (slot.tapeBatch) {
+            const ProgramValueState &slot = storage[value];
+            const auto batch = tapeScratch.hostBatch(value);
+            if (batch) {
                 hasTape = true;
-                estimated += slot.tapeBatch->logicalBytes();
-                dynamicTape |= slot.tapeBatch->hasDynamicLanes();
-                hasControlHistory |= slot.tapeBatch->hasControlHistory();
+                estimated += batch->logicalBytes();
+                dynamicTape |= batch->hasDynamicLanes();
+                hasControlHistory |= batch->hasControlHistory();
                 if (value < retained.size() && retained[value]) {
                     keptTape = true;
-                    logical += slot.tapeBatch->logicalBytes();
-                    resident += slot.tapeBatch->isCompacted() ? slot.tapeBatch->logicalBytes()
-                                                              : slot.tapeBatch->residentBytes();
-                    allocated += slot.tapeBatch->allocatedBytes();
-                    retainedBytes += slot.tapeBatch->allocatedBytes();
+                    logical += batch->logicalBytes();
+                    resident += batch->isCompacted() ? batch->logicalBytes() : batch->residentBytes();
+                    allocated += batch->allocatedBytes();
+                    retainedBytes += batch->allocatedBytes();
                 }
             } else if (value < captured.size() && captured[value] && value < retained.size() && retained[value]) {
                 hasTensorResidual = true;
@@ -117,9 +119,9 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
 }
 
 bool planProgramResiduals(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                          const Variant &variant, const std::vector<LogicalProgramValue> &materialized,
-                          uint64_t memoryBudget, const std::string &policy, bool rematerializeTapes,
-                          ProgramResidualPlan &result, std::string &error) {
+                          const Variant &variant, const std::vector<ProgramValueState> &materialized,
+                          const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, const std::string &policy,
+                          bool rematerializeTapes, ProgramResidualPlan &result, std::string &error) {
     const program::Graph *forward = program::findGraph(execution, "forward");
     if (!forward)
         return error = "Program autodiff topology has no forward graph", false;
@@ -142,8 +144,8 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
     }
     const auto materializedBytes = [&](uint32_t value, const program::Value &slot,
                                        const Parameter *parameter) -> std::optional<size_t> {
-        if (value < materialized.size() && materialized[value].tapeBatch)
-            return std::max<size_t>(materialized[value].tapeBatch->logicalBytes(), 1);
+        if (const auto batch = tapeScratch.hostBatch(value))
+            return std::max<size_t>(batch->logicalBytes(), 1);
         if (value < materialized.size() && materialized[value].argument.kind == VERNON_PROGRAM_TENSOR &&
             (materialized[value].argument.tensor.byte_size || materialized[value].concreteShape))
             return materialized[value].argument.tensor.byte_size;

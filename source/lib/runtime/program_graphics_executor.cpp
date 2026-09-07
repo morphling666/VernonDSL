@@ -60,7 +60,7 @@ bool checkAttachmentFormat(const program::GraphicsAttachmentSignature &signature
 
 bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
                                          const program::ResolvedExecutionPlan &resolved,
-                                         ad::LogicalValueFrame &invocation,
+                                         program_execution::ProgramInvocationState &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error) {
     const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
     if (!direction)

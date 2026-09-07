@@ -219,6 +219,40 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     EXPECT_EQ(fixture.plan.publications.transactions[1].mode, PublicationCommitMode::InPlace);
 }
 
+TEST(ResolvedExecutionPlan, OrdersDeviceResultTransferBeforeUniformConsumer) {
+    PlanFixture fixture;
+    fixture.plan.nodes.at({GraphDirection::Forward, 1}).projections[0].target.carrier = TargetCarrier::UniformBuffer;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+
+    const auto transfer = std::find_if(
+        fixture.plan.transfers.edges.begin(), fixture.plan.transfers.edges.end(), [](const ResolvedTransferEdge &edge) {
+            return edge.kind == TransferKind::DeviceCopy && edge.value == 1 &&
+                   edge.producer.kind == TransferEndpointKind::Node && edge.producer.id == 0 &&
+                   edge.consumer.kind == TransferEndpointKind::Node && edge.consumer.id == 1;
+        });
+    ASSERT_NE(transfer, fixture.plan.transfers.edges.end());
+    EXPECT_TRUE(fixture.plan.requiresDevice(GraphDirection::Forward, 1));
+    const std::vector<uint32_t> &predecessors = fixture.plan.predecessors(GraphDirection::Forward, 1);
+    EXPECT_NE(std::find(predecessors.begin(), predecessors.end(), 0), predecessors.end());
+}
+
+TEST(ResolvedExecutionPlan, CpuUsesSameLogicalUniformProjectionWithoutDeviceTransfer) {
+    PlanFixture fixture;
+    fixture.context.backend = VERNON_RUNTIME_CPU;
+    fixture.plan.nodes.at({GraphDirection::Forward, 1}).projections[0].target.carrier = TargetCarrier::UniformBuffer;
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
+
+    EXPECT_FALSE(fixture.plan.requiresDevice(GraphDirection::Forward, 1));
+    EXPECT_EQ(fixture.plan.node(GraphDirection::Forward, 1)->projections[0].target.projection.value, 1u);
+    EXPECT_TRUE(std::none_of(
+        fixture.plan.transfers.edges.begin(), fixture.plan.transfers.edges.end(),
+        [](const ResolvedTransferEdge &edge) { return edge.kind == TransferKind::DeviceCopy && edge.value == 1; }));
+}
+
 TEST(ResolvedExecutionPlan, RejectsPhysicalReadWithoutDominatingProducer) {
     PlanFixture fixture;
     fixture.resolved->program.values[1].origin.node = 99;

@@ -1,5 +1,5 @@
 #include "runtime/autodiff/runtime_gpu_derivatives.h"
-#include "runtime_gpu_failure_injection.h"
+#include "runtime/program_execution/failure_injection.h"
 
 #include <algorithm>
 #include <cstring>
@@ -7,6 +7,10 @@
 #include <utility>
 
 namespace vernon::runtime::ad::gpu {
+using program_execution::DeviceBuffer;
+using program_execution::DeviceBufferCopy;
+using program_execution::FailureBoundary;
+using program_execution::injectFailure;
 namespace {
 
 bool checkedAdd(size_t left, size_t right, size_t &result) {

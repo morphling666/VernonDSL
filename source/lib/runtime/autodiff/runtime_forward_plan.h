@@ -16,9 +16,6 @@ struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
 namespace vernon::runtime::ad {
-VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
-                                      const VernonStageInvocationDescriptor &invocation, VernonPullback *&pullback,
-                                      const ProgramInvocationContext *programContext = nullptr);
 VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline,
                                                const VernonStageInvocationDescriptor &invocation,
                                                const VernonAdValueSet &inputs,

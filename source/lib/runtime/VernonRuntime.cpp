@@ -2,9 +2,6 @@
 #include "VernonExecutionGraph.h"
 #include "execution_graph/execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
-#include "runtime/autodiff/program_value_arena.h"
-#include "runtime/autodiff/runtime_autodiff_internal.h"
-#include "runtime/autodiff/runtime_gpu_commands.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "runtime/backend_cpu.h"
 #include "runtime/compute_launch_planner.h"
@@ -13,6 +10,11 @@
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 #include "runtime/pipeline_metadata.h"
+#include "runtime/program_execution/device_commands.h"
+#include "runtime/program_execution/materialized_node_frame.h"
+#include "runtime/program_execution/program_forward.h"
+#include "runtime/program_execution/program_invocation_state.h"
+#include "runtime/program_execution/resolved_transfer_executor.h"
 #include "runtime/program_execution_backend.h"
 #include "runtime/program_graphics_executor.h"
 #include "runtime/program_instance.h"
@@ -1152,7 +1154,7 @@ bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const
 class PipelineComputePass final : public vernon::execution::ComputePass {
 public:
     PipelineComputePass(const program::Node &node, VernonStageExecutable &pipeline,
-                        vernon::runtime::ad::MaterializedNodeFrame materialized,
+                        vernon::runtime::program_execution::MaterializedNodeFrame materialized,
                         const std::vector<vernon::execution::GraphBuffer> &resources,
                         const std::vector<VernonProgramArgument> *arena, const program::Program *program,
                         VernonLaunchSize grid)
@@ -1243,7 +1245,7 @@ public:
 private:
     PipelineComputePassDescription description_;
     VernonStageExecutable &pipeline_;
-    vernon::runtime::ad::MaterializedNodeFrame materialized_;
+    vernon::runtime::program_execution::MaterializedNodeFrame materialized_;
     const std::vector<vernon::execution::GraphBuffer> &resources_;
     const std::vector<VernonProgramArgument> *arena_{};
     const program::Program *program_{};
@@ -1252,7 +1254,7 @@ private:
 
 struct ManagedGraphicsCommandContext {
     VernonStageExecutable &pipeline;
-    vernon::runtime::ad::MaterializedNodeFrame materialized;
+    vernon::runtime::program_execution::MaterializedNodeFrame materialized;
     std::shared_ptr<RuntimeProgramControl> renderPass;
     std::shared_ptr<RuntimeProgramControl> draw;
     std::shared_ptr<RuntimeProgramControl> dynamic;
@@ -1306,12 +1308,14 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
     return status == VERNON_RHI_STATUS_OK ? ended : status;
 }
 
-VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, const program::Graph &graph,
-                                             vernon::runtime::ad::LogicalValueFrame &arena) {
+VernonStatus executePipelineProgramGraphImpl(
+    VernonProgramExecutable &pipeline, const program::Graph &graph,
+    vernon::runtime::program_execution::ProgramInvocationState &arena,
+    const vernon::runtime::program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint) {
     const program::ResolvedExecutionPlan &execution = *pipeline.executionPlan;
     const program::ResolvedProgram &resolved = *execution.resolvedProgram;
     const program::Program &canonicalProgram = resolved.program;
-    const std::vector<VernonProgramArgument> &valueArguments = arena.logicalArguments();
+    const std::vector<VernonProgramArgument> &valueArguments = arena.arguments();
     if (valueArguments.size() != canonicalProgram.values.size())
         return fail(pipeline.context, "Program graph value set does not match its execution topology");
     const auto canonicalGraph =
@@ -1341,21 +1345,11 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
         return fail(pipeline.context, std::move(controlBindingError));
     if (pipeline.context->backend != VERNON_RUNTIME_CPU) {
         vernon::execution::detail::RhiCommandExecutionPlan commandPlan;
-        std::vector<vernon::runtime::ad::gpu::DeviceBufferUpload> storageUploads;
-        storageUploads.reserve(arena.deviceUploads().size());
-        for (const vernon::runtime::ad::ProgramDeviceUpload &upload : arena.deviceUploads())
-            storageUploads.push_back({upload.destination, 0, upload.source, upload.size});
-        vernon::execution::detail::RhiCommandExecutionPlan uploadPlan;
-        if (const VernonStatus status = vernon::runtime::ad::gpu::buildBufferTransferCommandPlan(
-                *pipeline.context, arena.deviceInitialCopies(), storageUploads, uploadPlan);
-            status != VERNON_STATUS_OK)
-            return status;
-        if (!uploadPlan.commands.nodes.empty()) {
-            std::string uploadError;
-            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commandPlan, std::move(uploadPlan), true,
-                                                                          uploadError))
-                return fail(pipeline.context, std::move(uploadError));
-        }
+        vernon::runtime::program_execution::ResolvedTransferExecutor transfers(*pipeline.context, arena);
+        const std::optional<program::GraphDirection> graphDirection = program::graphDirection(graph.direction);
+        std::string transferError;
+        if (!graphDirection || !transfers.prepareGraph(*graphDirection, transferError))
+            return fail(pipeline.context, std::move(transferError));
         std::shared_ptr<ManagedGraphicsCommandBatch> graphicsBatch;
         GraphicsScopePlanner graphicsScopes;
         const auto flushCommands = [&]() {
@@ -1363,11 +1357,11 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
                 return VERNON_STATUS_OK;
             graphicsBatch.reset();
             const VernonStatus status =
-                vernon::runtime::ad::gpu::executeCommandPlanAndWait(*pipeline.context, commandPlan);
+                vernon::runtime::program_execution::executeCommandPlanAndWait(*pipeline.context, commandPlan);
             commandPlan = {};
             return status;
         };
-        std::vector<vernon::runtime::ad::MaterializedNodeFrame> materializedNodes;
+        std::vector<vernon::runtime::program_execution::MaterializedNodeFrame> materializedNodes;
         materializedNodes.reserve(graph.nodes.size());
         for (const program::Node &node : graph.nodes) {
             const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
@@ -1391,9 +1385,14 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
                                 "managed graphics depth attachment does not match the canonical render pass");
                 materializedNodes.emplace_back();
                 std::string materializationError;
-                if (!arena.materializeNodeArguments(canonicalProgram, node, *resolvedNode, materializedNodes.back(),
-                                                    materializationError))
+                if (!vernon::runtime::program_execution::materializeNodeFrame(
+                        arena, canonicalProgram, node, *resolvedNode, resolvePhysicalEndpoint, materializedNodes.back(),
+                        materializationError))
                     return fail(pipeline.context, std::move(materializationError));
+                if (const VernonStatus status = transfers.appendBeforeConsumer(
+                        {*direction, node.id}, materializedNodes.back().deviceCopiesBefore, commandPlan, transferError);
+                    status != VERNON_STATUS_OK)
+                    return status;
                 if (draw)
                     draw->refresh();
                 auto graphicsContext = std::make_shared<ManagedGraphicsCommandContext>(
@@ -1451,9 +1450,14 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
             graphicsScopes.reset();
             materializedNodes.emplace_back();
             std::string materializationError;
-            if (!arena.materializeNodeArguments(canonicalProgram, node, *resolvedNode, materializedNodes.back(),
-                                                materializationError))
+            if (!vernon::runtime::program_execution::materializeNodeFrame(
+                    arena, canonicalProgram, node, *resolvedNode, resolvePhysicalEndpoint, materializedNodes.back(),
+                    materializationError))
                 return fail(pipeline.context, std::move(materializationError));
+            if (const VernonStatus status = transfers.appendBeforeConsumer(
+                    {*direction, node.id}, materializedNodes.back().deviceCopiesBefore, commandPlan, transferError);
+                status != VERNON_STATUS_OK)
+                return status;
             vernon::execution::detail::RhiCommandExecutionPlan nodePlan;
             VernonLaunchSize grid{};
             std::string gridError;
@@ -1468,10 +1472,10 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
                 return fail(pipeline.context, std::move(gridError));
             if (!grid.x || !grid.y || !grid.z)
                 continue;
-            const VernonStatus planned = vernon::runtime::ad::gpu::buildPipelineCommandPlan(
-                *pipeline.context, materializedNodes.back().deviceCopiesBefore, {}, *resolvedNode->stage,
-                materializedNodes.back().arguments, grid, materializedNodes.back().deviceCopiesAfter,
-                vernon::execution::detail::CommandNodeKind::Derivative, nodePlan);
+            const VernonStatus planned = vernon::runtime::program_execution::buildPipelineCommandPlan(
+                *pipeline.context, {}, {}, *resolvedNode->stage, materializedNodes.back().arguments, grid,
+                materializedNodes.back().deviceCopiesAfter, vernon::execution::detail::CommandNodeKind::Derivative,
+                nodePlan);
             if (planned != VERNON_STATUS_OK)
                 return planned;
             std::string compositionError;
@@ -1517,9 +1521,11 @@ VernonStatus executePipelineProgramGraphImpl(VernonProgramExecutable &pipeline, 
         if (!resolvedNode)
             return fail(pipeline.context, "pipeline node has no resolved kernel stage");
         VernonStageExecutable &stage = *resolvedNode->stage;
-        vernon::runtime::ad::MaterializedNodeFrame materialized;
+        vernon::runtime::program_execution::MaterializedNodeFrame materialized;
         std::string materializationError;
-        if (!arena.materializeNodeArguments(canonicalProgram, node, *resolvedNode, materialized, materializationError))
+        if (!vernon::runtime::program_execution::materializeNodeFrame(arena, canonicalProgram, node, *resolvedNode,
+                                                                      resolvePhysicalEndpoint, materialized,
+                                                                      materializationError))
             return fail(pipeline.context, std::move(materializationError));
         uint64_t controlGrid[3]{};
         for (size_t axis = 0; axis < 3; ++axis)
@@ -1896,7 +1902,7 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         const ProgramInvocationContext programContext{*invocation->controlSnapshot};
         VernonPullback *pullback = nullptr;
         const VernonStatus status =
-            vernon::runtime::ad::forwardProgramInvocation(*pipeline, frame, pullback, &programContext);
+            vernon::runtime::program_execution::forwardProgramInvocation(*pipeline, frame, pullback, &programContext);
         if (status != VERNON_STATUS_OK) {
             invocation->transaction->rollback();
             invocation->controlTransaction->rollback();
@@ -1907,7 +1913,7 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         invocation->controlSnapshot = invocation->controlTransaction->commit();
         invocation->finished = true;
         if (pullback)
-            pullback->programSnapshot = invocation->snapshot;
+            vernon::runtime::program_execution::attachProgramSnapshot(*pullback, invocation->snapshot);
         if (outputPullback)
             *outputPullback = pullback;
         else if (pullback)
@@ -2020,10 +2026,10 @@ VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *conte
 
 } // extern "C"
 
-VernonStatus vernon::runtime::executePipelineProgramGraph(VernonProgramExecutable &pipeline,
-                                                          const program::Graph &graph,
-                                                          vernon::runtime::ad::LogicalValueFrame &arena) {
-    return executePipelineProgramGraphImpl(pipeline, graph, arena);
+VernonStatus vernon::runtime::executePipelineProgramGraph(
+    VernonProgramExecutable &pipeline, const program::Graph &graph, program_execution::ProgramInvocationState &arena,
+    const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint) {
+    return executePipelineProgramGraphImpl(pipeline, graph, arena, resolvePhysicalEndpoint);
 }
 
 VernonStageExecutable::~VernonStageExecutable() {

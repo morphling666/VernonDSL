@@ -2,12 +2,12 @@
 
 #include "execution_graph/execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/program_execution/device_commands.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_state.h"
 #include "runtime_autodiff_memory_usage.h"
 #include "runtime_gpu_argument_binding.h"
-#include "runtime_gpu_commands.h"
 #include "runtime_gpu_derivatives.h"
-#include "runtime_gpu_failure_injection.h"
 #include "runtime_gpu_replay.h"
 #include "runtime_gpu_replay_execution.h"
 #include "runtime_gpu_telemetry.h"
@@ -17,6 +17,15 @@
 #include <utility>
 
 namespace vernon::runtime::ad::gpu {
+using program_execution::buildPipelineCommandPlan;
+using program_execution::DeviceBuffer;
+using program_execution::DeviceBufferCopy;
+using program_execution::DeviceBufferUpload;
+using program_execution::executeCommandPlanAndWait;
+using program_execution::executePipelineCommandDagAndWait;
+using program_execution::executePipelineStatusCommandDagAndWait;
+using program_execution::FailureBoundary;
+using program_execution::injectFailure;
 namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string message,
@@ -158,7 +167,7 @@ public:
     }
 
     PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
-    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
+    program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const override { return control_; }
 
 private:
     VernonStatus applyPrepared(PreparedDerivativeValues &derivatives, std::string &derivativeError,
@@ -176,7 +185,7 @@ private:
         arguments.reserve(bindings.size());
         const uint32_t launchData[3]{grid_.x, grid_.y, grid_.z};
         DeviceBuffer launchBuffer(context_, sizeof(launchData));
-        InternalBufferView launchView;
+        program_execution::PhysicalBufferView launchView;
         if (!launchBuffer.valid())
             return fail(context_, "cannot allocate GPU pullback launch metadata", VERNON_STATUS_INTERNAL_ERROR);
         for (const Binding &binding : bindings) {
@@ -231,7 +240,7 @@ private:
     HostValues retainedHosts_;
     std::shared_ptr<AutodiffMemoryReservation> retainedReservation_;
     MemoryAccounting memory_;
-    PullbackControlPlaneUsage control_;
+    program_execution::ExecutionControlPlaneUsage control_;
 };
 
 class TapePullback final : public DevicePullbackExecution {
@@ -331,7 +340,7 @@ public:
     }
 
     PullbackMemoryUsage memoryUsage() const override { return pullbackMemoryUsage(memory_); }
-    PullbackControlPlaneUsage controlPlaneUsage() const override { return control_; }
+    program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const override { return control_; }
 
 private:
     VernonStatus applyPrepared(PreparedDerivativeValues &derivatives, std::string &derivativeError,
@@ -664,7 +673,7 @@ private:
     std::shared_ptr<std::atomic<size_t>> learnedTapeStride_;
     PlanningPolicy planningPolicy_{};
     bool requiresTapeStatus_{true};
-    PullbackControlPlaneUsage control_;
+    program_execution::ExecutionControlPlaneUsage control_;
 };
 
 } // namespace

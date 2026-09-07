@@ -278,6 +278,10 @@ VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline
     return VERNON_STATUS_OK;
 }
 
+} // namespace vernon::runtime::ad
+
+namespace vernon::runtime::program_execution {
+
 VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
                                       const VernonStageInvocationDescriptor &invocation, VernonPullback *&pullback,
                                       const ProgramInvocationContext *programContext) {
@@ -291,8 +295,8 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
     }
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
-    std::unique_ptr<PullbackExecution> execution;
-    const ForwardExecutionTarget target{{}, &invocation, nullptr, programContext};
+    std::unique_ptr<ad::PullbackExecution> execution;
+    const ad::ForwardExecutionTarget target{{}, &invocation, nullptr, programContext};
     const VernonStatus status = executable->forward(target, {1, 1, 1}, inputs, &outputs, execution);
     if (status != VERNON_STATUS_OK)
         return status;
@@ -305,7 +309,11 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
     return VERNON_STATUS_OK;
 }
 
-} // namespace vernon::runtime::ad
+void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const program::InvocationSnapshot> snapshot) {
+    pullback.programSnapshot = std::move(snapshot);
+}
+
+} // namespace vernon::runtime::program_execution
 
 namespace {
 
@@ -433,7 +441,7 @@ vernon::runtime::AutodiffPullbackControlPlaneUsage
 vernon::runtime::autodiffPullbackControlPlaneUsage(const VernonPullback *pullback) {
     if (!pullback || !pullback->execution)
         return {};
-    const ad::PullbackControlPlaneUsage usage = pullback->execution->controlPlaneUsage();
+    const program_execution::ExecutionControlPlaneUsage usage = pullback->execution->controlPlaneUsage();
     return {usage.submissions,
             usage.waits,
             usage.readbacks,

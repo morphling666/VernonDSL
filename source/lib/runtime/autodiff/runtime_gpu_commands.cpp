@@ -1,15 +1,15 @@
-#include "runtime/autodiff/runtime_gpu_commands.h"
+#include "runtime/program_execution/device_commands.h"
 
 #include "execution_graph/execution_graph_internal.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
-#include "runtime_gpu_failure_injection.h"
 
 #include <algorithm>
 #include <memory>
 #include <string>
 
-namespace vernon::runtime::ad::gpu {
+namespace vernon::runtime::program_execution {
 namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string message,
@@ -241,7 +241,7 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
 
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
                                        const execution::detail::RhiCommandExecutionPlan &plan,
-                                       PullbackControlPlaneUsage *telemetry,
+                                       ExecutionControlPlaneUsage *telemetry,
                                        execution::detail::RhiCommandPlanSink *sink, bool flush) {
     if (sink) {
         execution::detail::RhiCommandExecutionPlan deferred = plan;
@@ -337,7 +337,7 @@ VernonStatus executePipelineCommandDagAndWait(VernonStageExecutable &pipeline, V
                                               std::vector<VernonProgramArgument> &arguments,
                                               const std::vector<DeviceBufferUpload> &uploadsBefore,
                                               execution::detail::CommandNodeKind kind,
-                                              PullbackControlPlaneUsage *telemetry,
+                                              ExecutionControlPlaneUsage *telemetry,
                                               execution::detail::RhiCommandPlanSink *sink) {
     return executePipelineCommandDagAndWait(*pipeline.context, {}, uploadsBefore, pipeline, arguments, grid, {}, kind,
                                             telemetry, sink);
@@ -415,7 +415,7 @@ executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vecto
                                  const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
                                  std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
                                  const std::vector<DeviceBufferCopy> &copiesAfter,
-                                 execution::detail::CommandNodeKind kind, PullbackControlPlaneUsage *telemetry,
+                                 execution::detail::CommandNodeKind kind, ExecutionControlPlaneUsage *telemetry,
                                  execution::detail::RhiCommandPlanSink *sink) {
     if (injectFailure(FailureBoundary::Submit))
         return fail(context, "injected GPU pipeline submission failure", VERNON_STATUS_INTERNAL_ERROR);
@@ -433,7 +433,7 @@ executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std:
                                        VernonLaunchSize grid, const std::vector<DeviceBufferUpload> &uploadsBefore,
                                        VernonRhiBuffer statusBuffer, size_t statusOffset, size_t statusSize,
                                        GpuCommandCompletionCallback complete, void *completionContext,
-                                       execution::detail::CommandNodeKind kind, PullbackControlPlaneUsage *telemetry,
+                                       execution::detail::CommandNodeKind kind, ExecutionControlPlaneUsage *telemetry,
                                        execution::detail::RhiCommandPlanSink *sink) {
     if (!complete || !statusSize)
         return fail(context, "GPU command DAG status callback is invalid");
@@ -455,4 +455,4 @@ executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std:
     return executeCommandPlanAndWait(context, plan, telemetry, sink, true);
 }
 
-} // namespace vernon::runtime::ad::gpu
+} // namespace vernon::runtime::program_execution

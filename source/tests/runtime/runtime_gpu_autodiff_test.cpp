@@ -1,7 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime/autodiff/runtime_gpu_failure_injection.h"
 #include "runtime/autodiff/runtime_gpu_replay.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
@@ -18,8 +18,8 @@
 namespace {
 
 using vernon::runtime::ad::gpu::BatchSummary;
-using vernon::runtime::ad::gpu::FailureBoundary;
 using vernon::runtime::ad::gpu::Segment;
+using vernon::runtime::program_execution::FailureBoundary;
 
 VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
     switch (backend) {
@@ -70,7 +70,7 @@ private:
 };
 
 TEST(RuntimeGpuAutodiff, FailureInjectionSelectsBoundaryAndOccurrence) {
-    using namespace vernon::runtime::ad::gpu;
+    using namespace vernon::runtime::program_execution;
     setFailureInjectionForTesting(FailureBoundary::Upload, 2);
     EXPECT_FALSE(injectFailure(FailureBoundary::Allocation));
     EXPECT_FALSE(injectFailure(FailureBoundary::Upload));
@@ -323,13 +323,14 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     VernonPullbackApplyOptions applyOptions{
         sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, 0, {}};
     gradient.fill(-23.0f);
-    vernon::runtime::ad::gpu::setFailureInjectionForTesting(vernon::runtime::ad::gpu::FailureBoundary::Allocation);
+    vernon::runtime::program_execution::setFailureInjectionForTesting(
+        vernon::runtime::program_execution::FailureBoundary::Allocation);
     EXPECT_NE(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK);
     EXPECT_EQ(gradient, (std::array<float, 4>{-23.0f, -23.0f, -23.0f, -23.0f}));
     applyOptions.maximum_temporary_bytes = std::numeric_limits<uint64_t>::max();
     EXPECT_NE(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
         << "the rejected under-budget apply must not consume the pending allocation failure";
-    vernon::runtime::ad::gpu::clearFailureInjectionForTesting();
+    vernon::runtime::program_execution::clearFailureInjectionForTesting();
     ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
@@ -356,6 +357,7 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
 
 void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
     using namespace vernon::runtime::ad::gpu;
+    using namespace vernon::runtime::program_execution;
     OwnedGpuRuntime owned(backend);
     VernonRuntimeContext *context = owned.get();
     if (!context)

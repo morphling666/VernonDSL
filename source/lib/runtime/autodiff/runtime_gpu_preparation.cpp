@@ -1,9 +1,9 @@
 #include "runtime_gpu_preparation.h"
 
 #include "execution_graph/execution_graph_internal.h"
+#include "runtime/program_execution/device_commands.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime_gpu_argument_binding.h"
-#include "runtime_gpu_commands.h"
-#include "runtime_gpu_failure_injection.h"
 
 #include "rhi/rhi_internal.h"
 #include "runtime/pipeline_metadata.h"
@@ -19,6 +19,13 @@
 #include <vector>
 
 namespace vernon::runtime::ad::gpu {
+using program_execution::buildPipelineCommandPlan;
+using program_execution::DeviceBuffer;
+using program_execution::DeviceBufferCopy;
+using program_execution::DeviceBufferUpload;
+using program_execution::executePipelineCommandDagAndWait;
+using program_execution::FailureBoundary;
+using program_execution::injectFailure;
 namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string message,
@@ -517,7 +524,7 @@ VernonStatus prepareForward(VernonRuntimeContext &context, OwnedPipeline &pipeli
     }
     const uint32_t launchData[3]{computeGrid.x, computeGrid.y, computeGrid.z};
     DeviceBuffer launchBuffer(context, sizeof(launchData));
-    InternalBufferView launchView;
+    program_execution::PhysicalBufferView launchView;
     for (const Parameter &parameter : bindingProjection.parameters) {
         if (parameter.autodiffRole != AutodiffResourceRole::LaunchMetadata)
             continue;

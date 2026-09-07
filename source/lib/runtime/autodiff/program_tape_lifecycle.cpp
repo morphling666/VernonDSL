@@ -19,8 +19,8 @@ bool multiplySize(size_t left, size_t right, size_t &result) {
 
 bool carrierShape(const program::TargetBinding &binding, size_t bytes, std::vector<uint64_t> &shape,
                   std::vector<int64_t> &strides, std::string &error) {
-    gpu::InternalBufferView view;
-    if (!gpu::materializeInternalBufferView(binding.shape, binding.elementLayout, bytes, view)) {
+    program_execution::PhysicalBufferView view;
+    if (!program_execution::materializePhysicalBufferView(binding.shape, binding.elementLayout, bytes, view)) {
         error = "Program tape carrier allocation does not match its element ABI";
         return false;
     }
@@ -31,7 +31,7 @@ bool carrierShape(const program::TargetBinding &binding, size_t bytes, std::vect
 
 } // namespace
 
-bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
+bool allocateProgramTapeState(ProgramTapeScratch &scratch, VernonRuntimeContext &context, ProgramTapeState &state,
                               std::string &error) {
     size_t groupCount = 1;
     size_t workgroupVolume = 1;
@@ -55,8 +55,8 @@ bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &co
         std::vector<uint64_t> shape;
         std::vector<int64_t> strides;
         return carrierShape(*binding, bytes, shape, strides, error) &&
-               frame.allocateCarrier(context, state.value, *binding, bytes, std::move(shape), std::move(strides),
-                                     error);
+               scratch.allocateCarrier(context, state.value, *binding, bytes, std::move(shape), std::move(strides),
+                                       error);
     };
     if (!allocate(state.tape, tapeBytes) || !allocate(state.segment, segmentBytes) ||
         !allocate(state.status, sizeof(gpu::BatchSummary)) || !allocate(state.launch, sizeof(uint32_t) * 3))
@@ -68,18 +68,18 @@ bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &co
             return error = "Program replay segment initialization overflows", false;
     const gpu::BatchSummary clear{};
     const uint32_t launch[3]{state.grid.x, state.grid.y, state.grid.z};
-    return (!state.segment || frame.uploadCarrier(state.value, program_plan::TapeCarrier::ReplaySegment,
-                                                  segments.data(), segmentBytes, error)) &&
-           (!state.status ||
-            frame.uploadCarrier(state.value, program_plan::TapeCarrier::ReplayStatus, &clear, sizeof(clear), error)) &&
-           (!state.launch ||
-            frame.uploadCarrier(state.value, program_plan::TapeCarrier::LaunchMetadata, launch, sizeof(launch), error));
+    return (!state.segment || scratch.uploadCarrier(state.value, program_plan::TapeCarrier::ReplaySegment,
+                                                    segments.data(), segmentBytes, error)) &&
+           (!state.status || scratch.uploadCarrier(state.value, program_plan::TapeCarrier::ReplayStatus, &clear,
+                                                   sizeof(clear), error)) &&
+           (!state.launch || scratch.uploadCarrier(state.value, program_plan::TapeCarrier::LaunchMetadata, launch,
+                                                   sizeof(launch), error));
 }
 
-bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &context,
-                              const program::Program &execution, const program::ResolvedExecutionPlan &topology,
-                              const program::Graph &forward, std::vector<ProgramTapeState> &states,
-                              std::string &error) {
+bool prepareProgramTapeStates(program_execution::ProgramInvocationState &frame, ProgramTapeScratch &scratch,
+                              VernonRuntimeContext &context, const program::Program &execution,
+                              const program::ResolvedExecutionPlan &topology, const program::Graph &forward,
+                              std::vector<ProgramTapeState> &states, std::string &error) {
     std::map<uint32_t, ProgramTapeState> byValue;
     const std::optional<program::GraphDirection> direction = program::graphDirection(forward.direction);
     if (!direction)
@@ -97,10 +97,12 @@ bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &co
                 return error = "graphics Program nodes cannot carry autodiff tape dispatch metadata", false;
             const program::ComputeOperation &compute = program::computeOperation(node);
             uint64_t grid[3]{};
-            for (size_t axis = 0; axis < 3; ++axis)
-                if (!frame.resolveControl(execution, compute.workgroups[axis], grid[axis], error) || !grid[axis] ||
-                    grid[axis] > std::numeric_limits<uint32_t>::max())
-                    return error = error.empty() ? "Program tape dispatch control is invalid" : error, false;
+            for (size_t axis = 0; axis < 3; ++axis) {
+                if (!frame.resolveControl(execution, compute.workgroups[axis], grid[axis], error))
+                    return false;
+                if (!grid[axis] || grid[axis] > std::numeric_limits<uint32_t>::max())
+                    return error = "Program tape dispatch control resolved outside the launch range", false;
+            }
             state.grid = {static_cast<uint32_t>(grid[0]), static_cast<uint32_t>(grid[1]),
                           static_cast<uint32_t>(grid[2])};
             state.workgroup = nodePlan->stage->workgroupSize;
@@ -137,22 +139,22 @@ bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &co
             if (missing)
                 return error = "Program tape producer is missing a required typed carrier", false;
         }
-        if (!allocateProgramTapeState(frame, context, state, error))
+        if (!allocateProgramTapeState(scratch, context, state, error))
             return false;
         states.push_back(state);
     }
     return true;
 }
 
-bool validateProgramTapeStates(LogicalValueFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
+bool validateProgramTapeStates(ProgramTapeScratch &scratch, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error) {
     retry = false;
     for (ProgramTapeState &state : states) {
         if (!state.status)
             continue;
         gpu::BatchSummary summary{};
-        if (!frame.downloadCarrier(state.value, program_plan::TapeCarrier::ReplayStatus, &summary, sizeof(summary),
-                                   error))
+        if (!scratch.downloadCarrier(state.value, program_plan::TapeCarrier::ReplayStatus, &summary, sizeof(summary),
+                                     error))
             return false;
         if (summary.status == 0)
             continue;

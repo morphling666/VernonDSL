@@ -1,21 +1,25 @@
-#include "program_invocation_frame_builder.h"
+#include "program_invocation_builder.h"
 
 #include "program_boundary_binder.h"
-#include "program_publication.h"
-#include "program_value_materializer.h"
+#include "program_invocation_values.h"
+#include "program_tape_scratch.h"
+#include "runtime/program_execution/publication_transaction.h"
 #include "runtime_autodiff_internal.h"
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 
 namespace vernon::runtime::ad {
+using program_execution::ProgramInvocationState;
+using program_execution::ProgramStorageBacking;
+using program_execution::ProgramValueOwnership;
+using program_execution::ProgramValueState;
 namespace {
 
-struct FrameRequest {
+struct InvocationBuildRequest {
     const std::vector<char> &required;
     const CanonicalForwardBindings *canonical{};
     ProgramLeafFrameSource bound;
@@ -23,10 +27,10 @@ struct FrameRequest {
     const std::vector<std::vector<uint8_t>> *captures{};
     const std::vector<std::vector<uint64_t>> *captureShapes{};
     const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures{};
-    const LogicalValueFrame *retainedValues{};
+    const std::vector<program_execution::CanonicalValueSnapshot> *retainedSnapshots{};
 };
 
-bool applyBoundShape(LogicalProgramValue &host, const VernonAdValue &value, const program::Value &slot,
+bool applyBoundShape(ProgramValueState &host, const VernonAdValue &value, const program::Value &slot,
                      std::string &error) {
     if (value.rank < slot.shape.size() || (value.rank && !value.shape))
         return error = "Program autodiff bound value rank does not match its Program type", false;
@@ -38,8 +42,8 @@ bool applyBoundShape(LogicalProgramValue &host, const VernonAdValue &value, cons
 }
 
 bool applyLeaves(const ProgramLeafFrameSource &source, const program::Program &execution,
-                 const std::vector<std::optional<ValueLayout>> &layouts, std::vector<LogicalProgramValue> &storage,
-                 std::map<uint32_t, ProgramStorageState> &backings, std::string &error) {
+                 const std::vector<std::optional<ValueLayout>> &layouts, std::vector<ProgramValueState> &values,
+                 std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
     if (!source.values && !source.signature && !source.bindings)
         return true;
     if (!source.values || !source.signature || !source.bindings ||
@@ -50,54 +54,51 @@ bool applyLeaves(const ProgramLeafFrameSource &source, const program::Program &e
         const ValueAbi &abi = (*source.signature)[index];
         const VernonAdValue *value = findValue(*source.values, abi.path);
         if (!value)
-            return error = "Program autodiff leaf '" + abi.path + "' is absent from the supplied frame", false;
-        if (binding.value >= storage.size())
-            return error = "Program autodiff leaf '" + abi.path + "' exceeds the graph value frame", false;
+            return error = "Program autodiff leaf '" + abi.path + "' is absent from the supplied invocation", false;
+        if (binding.value >= values.size())
+            return error = "Program autodiff leaf '" + abi.path + "' exceeds invocation Values", false;
         if (!matchesProgramValueAbi(*value, abi))
-            return error = "Program autodiff leaf '" + abi.path + "' does not match graph reflection (dtype " +
-                           std::to_string(value->dtype) + ", rank " + std::to_string(value->rank) + ", bytes " +
-                           std::to_string(value->size) + ")",
-                   false;
+            return error = "Program autodiff leaf '" + abi.path + "' does not match graph reflection", false;
         const program::Value &slot = execution.values[binding.value];
-        ProgramStorageState *backing = slot.storage ? &backings[*slot.storage] : nullptr;
-        if (!layouts[binding.value] || !applyBoundShape(storage[binding.value], *value, slot, error))
+        ProgramStorageBacking *backing = slot.storage ? &backings[*slot.storage] : nullptr;
+        if (!layouts[binding.value] || !applyBoundShape(values[binding.value], *value, slot, error))
             return false;
         if (backing && !backing->external) {
             size_t elements = 0;
             const size_t elementBytes = layouts[binding.value]->byteSize;
-            if (!storage[binding.value].concreteShape ||
-                !shape::checkedElementCount(*storage[binding.value].concreteShape, elements) || !elementBytes ||
+            if (!values[binding.value].concreteShape ||
+                !shape::checkedElementCount(*values[binding.value].concreteShape, elements) || !elementBytes ||
                 elements > std::numeric_limits<size_t>::max() / elementBytes)
                 return error = "Program autodiff leaf has an invalid canonical Storage extent", false;
             const size_t canonicalBytes = elements * elementBytes;
             if (backing->sized && backing->bytes != canonicalBytes)
-                return error = "Program autodiff leaves disagree on their canonical Storage extent", false;
+                return error = "Program autodiff leaves disagree on canonical Storage extent", false;
             backing->bytes = canonicalBytes;
             backing->sized = true;
         }
-        if (backing && backing->owner < storage.size() && !storage[backing->owner].concreteShape)
-            storage[backing->owner].concreteShape = storage[binding.value].concreteShape;
+        if (backing && backing->owner < values.size() && !values[backing->owner].concreteShape)
+            values[backing->owner].concreteShape = values[binding.value].concreteShape;
     }
     return true;
 }
 
-bool attachResiduals(const FrameRequest &request, const program::Program &execution,
-                     std::vector<LogicalProgramValue> &storage, std::map<uint32_t, ProgramStorageState> &backings,
+bool attachResiduals(const InvocationBuildRequest &request, const program::Program &execution,
+                     std::vector<ProgramValueState> &values, std::map<uint32_t, ProgramStorageBacking> &backings,
                      std::string &error) {
     if (!request.captures && !request.captureShapes)
         return true;
     if (!request.captures || !request.captureShapes || request.captures->size() != execution.values.size() ||
         request.captureShapes->size() != execution.values.size())
-        return error = "Program autodiff capture state is incomplete", false;
+        return error = "Program autodiff retained state is incomplete", false;
     for (size_t value = 0; value < request.captures->size(); ++value) {
         if (!(*request.captureShapes)[value].empty())
-            storage[value].concreteShape = (*request.captureShapes)[value];
+            values[value].concreteShape = (*request.captureShapes)[value];
         if ((*request.captures)[value].empty())
             continue;
-        storage[value].ownership = ProgramValueOwnership::RetainedResidual;
+        values[value].ownership = ProgramValueOwnership::RetainedResidual;
         const program::Value &slot = execution.values[value];
         if (!program::isTapeValueType(slot.type) && slot.storage) {
-            ProgramStorageState &backing = backings[*slot.storage];
+            ProgramStorageBacking &backing = backings[*slot.storage];
             backing.bytes = std::max(backing.bytes, (*request.captures)[value].size());
             backing.sized = true;
         }
@@ -105,10 +106,11 @@ bool attachResiduals(const FrameRequest &request, const program::Program &execut
     return true;
 }
 
-bool build(VernonRuntimeContext &context, const program::Program &execution,
-           const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
-           const FrameRequest &request, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
-    storage.assign(execution.values.size(), {});
+bool build(VernonRuntimeContext &context, const program::Program &execution, const program::ResolvedExecutionPlan *plan,
+           std::vector<ProgramValueState> &values, std::map<uint32_t, ProgramStorageBacking> &storageBackings,
+           ProgramTapeScratch &tapeScratch, const InvocationBuildRequest &request,
+           std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
+    values.assign(execution.values.size(), {});
     std::vector<char> typedControls(execution.values.size());
     std::set<uint32_t> typedControlStorages;
     for (const program::Graph &graph : execution.graphs)
@@ -118,6 +120,7 @@ bool build(VernonRuntimeContext &context, const program::Program &execution,
                 if (execution.values[input.value].storage)
                     typedControlStorages.insert(*execution.values[input.value].storage);
             }
+
     std::vector<char> live = request.required;
     live.resize(execution.values.size());
     const auto markBindings = [&](const ProgramLeafFrameSource &source) {
@@ -137,23 +140,31 @@ bool build(VernonRuntimeContext &context, const program::Program &execution,
     for (const program::Value &slot : execution.values)
         if (slot.storage && typedControlStorages.count(*slot.storage))
             live[slot.id] = 0;
+
     std::vector<char> liveStorage(execution.storages.size());
     for (const program::Value &slot : execution.values)
         if (live[slot.id] && slot.storage && *slot.storage < liveStorage.size() &&
             !typedControlStorages.count(*slot.storage))
             liveStorage[*slot.storage] = 1;
 
-    std::map<uint32_t, ProgramStorageState> backings;
+    std::map<uint32_t, ProgramStorageBacking> backings;
     for (const program::Storage &slot : execution.storages)
-        backings.emplace(slot.id, ProgramStorageState{slot.initialValue, static_cast<size_t>(slot.buffer.byteLength),
-                                                      slot.buffer.byteLength > 0, std::nullopt});
+        backings.emplace(slot.id, ProgramStorageBacking{
+                                      slot.initialValue,
+                                      static_cast<size_t>(slot.buffer.byteLength),
+                                      slot.buffer.byteLength > 0,
+                                      std::nullopt,
+                                  });
     std::map<uint32_t, VernonProgramArgument> externalValues;
     if (request.canonical) {
-        ProgramBoundaryBindingRequest binding{request.canonical->invocation, request.canonical->valueBySlot,
-                                              &request.canonical->publications};
-        if (!topology ||
-            !bindProgramBoundaries(context, execution, *topology, binding, externalValues, backings, live, error) ||
-            !applyProgramPublicationShapes(execution, request.canonical->publications, storage, error))
+        ProgramBoundaryBindingRequest binding{
+            request.canonical->invocation,
+            request.canonical->valueBySlot,
+            &request.canonical->publication,
+        };
+        if (!plan ||
+            !bindProgramBoundaries(context, execution, *plan, binding, externalValues, backings, live, error) ||
+            !request.canonical->publication.applyConcreteShapes(execution, values, error))
             return false;
         for (auto &[value, argument] : externalValues) {
             if (value >= execution.values.size() || execution.values[value].storage ||
@@ -161,20 +172,17 @@ bool build(VernonRuntimeContext &context, const program::Program &execution,
                 !argument.tensor.host_data || !argument.tensor.byte_size)
                 continue;
             const auto *data = static_cast<const uint8_t *>(argument.tensor.host_data) + argument.tensor.byte_offset;
-            storage[value].owned.assign(data, data + argument.tensor.byte_size);
-            argument.tensor.host_data = storage[value].owned.data();
+            values[value].ownedHostBytes.assign(data, data + argument.tensor.byte_size);
+            argument.tensor.host_data = values[value].ownedHostBytes.data();
             argument.tensor.byte_offset = 0;
         }
-    } else if (request.retainedValues) {
-        const std::vector<LogicalProgramValue> &retained = request.retainedValues->hostValues();
-        for (size_t value = 0; value < retained.size() && value < live.size(); ++value) {
-            const VernonProgramArgument &argument = retained[value].argument;
-            if (!live[value] || argument.kind != VERNON_PROGRAM_TENSOR ||
-                argument.tensor.storage != VERNON_TENSOR_HOST || !argument.tensor.host_data)
+    } else if (request.retainedSnapshots) {
+        for (const auto &snapshot : *request.retainedSnapshots) {
+            if (snapshot.value >= values.size() || snapshot.logical.argument.kind != VERNON_PROGRAM_TENSOR)
                 continue;
-            externalValues.emplace(static_cast<uint32_t>(value), argument);
-            storage[value].concreteShape = retained[value].concreteShape;
-            storage[value].strides = retained[value].strides;
+            externalValues.emplace(snapshot.value, snapshot.logical.argument);
+            values[snapshot.value].concreteShape = snapshot.logical.concreteShape;
+            values[snapshot.value].strides = snapshot.logical.strides;
         }
     }
 
@@ -190,28 +198,26 @@ bool build(VernonRuntimeContext &context, const program::Program &execution,
                                                     ? &*backings[*slot.storage].external
                                                     : nullptr;
         if (argument && argument->kind != VERNON_PROGRAM_TENSOR) {
-            storage[slot.id].argument = *argument;
+            values[slot.id].argument = *argument;
             continue;
         }
         const bool dynamic = programValueHasDynamicShape(slot);
         if (!layouts[slot.id] || !layouts[slot.id]->byteSize || (!dynamic && !programValueByteSize(slot)))
-            return error = "Program autodiff value '" + slot.name + "' (id " + std::to_string(slot.id) + ", type " +
-                           slot.type + ") has no materializable tensor layout",
-                   false;
+            return error = "Program Value '" + slot.name + "' has no materializable tensor layout", false;
         if (argument) {
             const VernonTensorView &tensor = argument->tensor;
             if (tensor.rank < slot.shape.size() || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
-                return error = "Program invocation Tensor binding has incomplete shape metadata", false;
-            storage[slot.id].concreteShape = shape::ConcreteShape();
-            storage[slot.id].strides.clear();
+                return error = "Program invocation Tensor has incomplete shape metadata", false;
+            values[slot.id].concreteShape = shape::ConcreteShape();
+            values[slot.id].strides.clear();
             if (!slot.shape.empty()) {
-                storage[slot.id].concreteShape->assign(tensor.shape, tensor.shape + slot.shape.size());
-                storage[slot.id].strides.assign(tensor.byte_strides, tensor.byte_strides + slot.shape.size());
+                values[slot.id].concreteShape->assign(tensor.shape, tensor.shape + slot.shape.size());
+                values[slot.id].strides.assign(tensor.byte_strides, tensor.byte_strides + slot.shape.size());
             }
         }
         if (!slot.storage)
             continue;
-        ProgramStorageState &backing = backings[*slot.storage];
+        ProgramStorageBacking &backing = backings[*slot.storage];
         if (backing.owner == UINT32_MAX || backing.owner >= execution.values.size())
             backing.owner = slot.id;
         if (!dynamic) {
@@ -220,13 +226,14 @@ bool build(VernonRuntimeContext &context, const program::Program &execution,
             backing.sized = true;
         }
     }
-    if (!applyLeaves(request.bound, execution, layouts, storage, backings, error) ||
-        !applyLeaves(request.results, execution, layouts, storage, backings, error) ||
-        !attachResiduals(request, execution, storage, backings, error) ||
-        !materializeProgramOwnedStorages(execution, topology, storage, liveStorage, layouts, backings, error) ||
-        !materializeProgramValues(execution, topology, storage, live, layouts, backings, externalValues,
-                                  request.tapeCaptures, tapePolicy, error))
+    if (!applyLeaves(request.bound, execution, layouts, values, backings, error) ||
+        !applyLeaves(request.results, execution, layouts, values, backings, error) ||
+        !attachResiduals(request, execution, values, backings, error) ||
+        !materializeProgramOwnedStorages(execution, plan, values, liveStorage, layouts, backings, error) ||
+        !materializeProgramValues(execution, plan, values, live, layouts, backings, externalValues,
+                                  request.tapeCaptures, tapePolicy, tapeScratch, error))
         return false;
+    storageBackings = std::move(backings);
     return true;
 }
 
@@ -249,25 +256,27 @@ bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi) {
     return dynamic ? (empty ? value.size == 0 : value.size > 0) : value.size == abi.byteSize;
 }
 
-bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
-                            const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
-                            const ForwardInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
-                            std::string &error) {
+bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
+                                  const program::ResolvedExecutionPlan *plan, std::vector<ProgramValueState> &values,
+                                  std::map<uint32_t, ProgramStorageBacking> &storageBackings,
+                                  ProgramTapeScratch &tapeScratch, const ForwardInvocationSpec &spec,
+                                  std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     if (const auto *canonical = std::get_if<CanonicalForwardBindings>(&spec.bindings))
-        return build(context, execution, topology, storage, {spec.requiredValues, canonical}, std::move(tapePolicy),
-                     error);
+        return build(context, execution, plan, values, storageBackings, tapeScratch, {spec.requiredValues, canonical},
+                     std::move(tapePolicy), error);
     const HostForwardBindings &host = std::get<HostForwardBindings>(spec.bindings);
-    return build(context, execution, topology, storage, {spec.requiredValues, nullptr, host.inputs, host.outputs},
-                 std::move(tapePolicy), error);
+    return build(context, execution, plan, values, storageBackings, tapeScratch,
+                 {spec.requiredValues, nullptr, host.inputs, host.outputs}, std::move(tapePolicy), error);
 }
 
-bool buildLogicalValueFrame(VernonRuntimeContext &context, const program::Program &execution,
-                            const program::ResolvedExecutionPlan *topology, std::vector<LogicalProgramValue> &storage,
-                            const PullbackInvocationSpec &spec, std::shared_ptr<AutodiffMemoryPolicy> tapePolicy,
-                            std::string &error) {
-    return build(context, execution, topology, storage,
+bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
+                                  const program::ResolvedExecutionPlan *plan, std::vector<ProgramValueState> &values,
+                                  std::map<uint32_t, ProgramStorageBacking> &storageBackings,
+                                  ProgramTapeScratch &tapeScratch, const PullbackInvocationSpec &spec,
+                                  std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
+    return build(context, execution, plan, values, storageBackings, tapeScratch,
                  {spec.requiredValues, nullptr, spec.cotangents, spec.gradients, &spec.captures, &spec.captureShapes,
-                  spec.tapeCaptures, spec.retainedValues},
+                  spec.tapeCaptures, spec.retainedSnapshots},
                  std::move(tapePolicy), error);
 }
 

@@ -273,15 +273,23 @@ function(vernon_add_runtime)
         ${VERNON_RUNTIME_LIBRARY_TYPE}
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graphics_executor.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_invocation_state.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/materialized_node_frame.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_tensor_copy.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_transaction.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/resolved_transfer_executor.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/device_buffer.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/failure_injection.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/physical_buffer_view.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/host_tape_allocator.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_scratch.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/retained_pullback_state.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_boundary_binder.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_invocation_frame_builder.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_publication.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_invocation_builder.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_residual_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_shape_resolver.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_lifecycle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_materializer.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_arena.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_backward.cpp
@@ -298,7 +306,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_commands.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_derivatives.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_executable.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_failure_injection.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_preparation.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_pullback.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_replay.cpp

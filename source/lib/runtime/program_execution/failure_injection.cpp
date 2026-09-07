@@ -1,6 +1,6 @@
-#include "runtime_gpu_failure_injection.h"
+#include "failure_injection.h"
 
-namespace vernon::runtime::ad::gpu {
+namespace vernon::runtime::program_execution {
 namespace {
 
 struct FailureInjection {
@@ -27,4 +27,4 @@ void setFailureInjectionForTesting(FailureBoundary boundary, size_t failOnOccurr
 
 void clearFailureInjectionForTesting() { injection = {}; }
 
-} // namespace vernon::runtime::ad::gpu
+} // namespace vernon::runtime::program_execution

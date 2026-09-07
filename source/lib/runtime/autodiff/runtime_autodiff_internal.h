@@ -6,6 +6,7 @@
 #include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
+#include "runtime/program_execution/execution_control_plane.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -72,15 +73,6 @@ struct PullbackMemoryUsage {
     size_t peakTemporaryBytes{};
 };
 
-struct PullbackControlPlaneUsage {
-    uint64_t submissions{};
-    uint64_t waits{};
-    uint64_t readbacks{};
-    uint64_t atomicPublications{};
-    uint64_t temporaryAllocationBytes{};
-    uint64_t deviceWaitNanoseconds{};
-};
-
 struct PullbackApplyOptions {
     size_t maximumTemporaryBytes{std::numeric_limits<size_t>::max()};
     size_t maximumReusableConstructionBytes{};
@@ -103,7 +95,7 @@ public:
     virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
                                const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
-    virtual PullbackControlPlaneUsage controlPlaneUsage() const { return {}; }
+    virtual program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const { return {}; }
     virtual AutodiffPullbackCheckpointPlan checkpointPlan() const { return {}; }
     virtual std::vector<AutodiffPullbackPassTelemetry> passTelemetry() const { return {}; }
     virtual uint64_t peakRuntimeManagedBytes() const;

@@ -4,6 +4,8 @@
 #include <limits>
 
 namespace vernon::runtime::ad::gpu {
+using program_execution::DeviceBuffer;
+using program_execution::DeviceBufferCopy;
 namespace {
 
 bool checkedMultiply(size_t left, size_t right, size_t &result) {

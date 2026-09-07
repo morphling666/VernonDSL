@@ -18,6 +18,7 @@ ResidencyRequirement bindingResidency(const ResolvedNodePlan &node, const Target
         return ResidencyRequirement::Host;
     switch (binding.carrier) {
     case TargetCarrier::StorageBuffer:
+    case TargetCarrier::UniformBuffer:
     case TargetCarrier::VertexBuffer:
     case TargetCarrier::IndexBuffer:
     case TargetCarrier::Image:
@@ -25,7 +26,6 @@ ResidencyRequirement bindingResidency(const ResolvedNodePlan &node, const Target
     case TargetCarrier::Attachment:
         return ResidencyRequirement::Device;
     case TargetCarrier::InlineValue:
-    case TargetCarrier::UniformBuffer:
         return ResidencyRequirement::Host;
     }
     return ResidencyRequirement::Host;
@@ -179,9 +179,14 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
                     continue;
                 }
                 const ResidencyRequirement current = currentResidency[projection.value];
-                if (current != required) {
-                    const TransferKind kind =
-                        current == ResidencyRequirement::Host ? TransferKind::HostUpload : TransferKind::Readback;
+                const bool projectedDeviceCopy = current == ResidencyRequirement::Device &&
+                                                 required == ResidencyRequirement::Device &&
+                                                 projection.target.carrier == TargetCarrier::UniformBuffer &&
+                                                 program.values[projection.value].origin.kind == OriginKind::NodeResult;
+                if (current != required || projectedDeviceCopy) {
+                    const TransferKind kind = projectedDeviceCopy                     ? TransferKind::DeviceCopy
+                                              : current == ResidencyRequirement::Host ? TransferKind::HostUpload
+                                                                                      : TransferKind::Readback;
                     plan.transfers.edges.push_back({kind,
                                                     valueProducer(program.values[projection.value], *direction),
                                                     {TransferEndpointKind::Node, *direction, canonicalNode.id},

@@ -3,18 +3,11 @@
 #include "runtime/shape_layout.h"
 #include "runtime_autodiff_internal.h"
 
-#include <limits>
 #include <optional>
 
 namespace vernon::runtime::ad::gpu {
+using program_execution::DeviceBuffer;
 namespace {
-
-bool checkedMultiply(size_t left, size_t right, size_t &result) {
-    if (left && right > std::numeric_limits<size_t>::max() / left)
-        return false;
-    result = left * right;
-    return true;
-}
 
 bool singleLeafParameter(const Parameter &parameter) {
     const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
@@ -69,30 +62,13 @@ bool fillHostTensor(const Parameter &parameter, const HostValue &host, const std
 
 } // namespace
 
-bool materializeInternalBufferView(const shape::DeclaredShape &declaredShape, const ValueLayout &layout,
-                                   size_t logicalBytes, InternalBufferView &view) {
-    if (layout.leaves.size() != 1 || !logicalBytes)
-        return false;
-    const ValueLeaf &leaf = layout.leaves.front();
-    const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
-    const size_t scalarBytes = dtype ? dtypeSize(*dtype) : 0;
-    size_t elementBytes = 0;
-    if (!scalarBytes || !leaf.scalarCount ||
-        !checkedMultiply(scalarBytes, static_cast<size_t>(leaf.scalarCount), elementBytes) || !elementBytes)
-        return false;
-    size_t elements = 0;
-    return shape::resolveSingleDynamicExtent(declaredShape, elementBytes, logicalBytes, view.shape) &&
-           shape::rowMajorByteStrides(view.shape, elementBytes, view.strides) &&
-           shape::checkedElementCount(view.shape, elements) && elements <= logicalBytes / elementBytes;
-}
-
 bool appendInternalBufferArgument(VernonRuntimeContext &context, const Parameter &parameter, const DeviceBuffer &buffer,
-                                  size_t logicalBytes, InternalBufferView &view,
+                                  size_t logicalBytes, program_execution::PhysicalBufferView &view,
                                   std::vector<VernonProgramArgument> &arguments) {
     (void)context;
     const ValueLayout *layout = parameter.valueLayout ? &*parameter.valueLayout : &parameter.elementLayout;
-    if (!layout ||
-        !materializeInternalBufferView(shape::decodeRuntimeContractShape(parameter.shape), *layout, logicalBytes, view))
+    if (!layout || !program_execution::materializePhysicalBufferView(shape::decodeRuntimeContractShape(parameter.shape),
+                                                                     *layout, logicalBytes, view))
         return false;
     VernonRuntimeProviderResourceReference resource{};
     if (!buffer.reference(resource))

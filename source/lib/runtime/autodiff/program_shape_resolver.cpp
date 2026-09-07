@@ -1,15 +1,15 @@
 #include "program_shape_resolver.h"
 
-#include "program_value_arena.h"
 #include "runtime/runtime_state.h"
 
 namespace vernon::runtime::ad {
+using program_execution::ProgramValueState;
 namespace {
 
 class Resolver {
 public:
     Resolver(const program::Program &program, const program::ResolvedExecutionPlan *topology,
-             std::vector<LogicalProgramValue> &values)
+             std::vector<ProgramValueState> &values)
         : program_(program), topology_(topology), values_(values) {}
 
     bool resolve(std::string &error) {
@@ -111,13 +111,13 @@ private:
 
     const program::Program &program_;
     const program::ResolvedExecutionPlan *topology_;
-    std::vector<LogicalProgramValue> &values_;
+    std::vector<ProgramValueState> &values_;
 };
 
 } // namespace
 
 bool resolveProgramShapes(const program::Program &program, const program::ResolvedExecutionPlan *topology,
-                          std::vector<LogicalProgramValue> &values, std::string &error) {
+                          std::vector<ProgramValueState> &values, std::string &error) {
     return Resolver(program, topology, values).resolve(error);
 }
 

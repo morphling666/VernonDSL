@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -286,6 +287,22 @@ def objective(
             repeated["values"].to_numpy(),
             np.array([6.0, 1.0], dtype=np.float32),
         )
+
+    def test_pullback_concurrent_apply_uses_fresh_invocation_state(self) -> None:
+        vd.init(arch=vd.cpu)
+        values = vd.storage.from_numpy(np.array([3.0, 4.0], dtype=np.float32))
+        loss = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        _, pullback = storage_objective_vjp(values, loss, grid=(1, 1, 1))
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            gradients = list(executor.map(lambda _: pullback(None), range(2)))
+
+        self.assertIsNot(gradients[0]["values"], gradients[1]["values"])
+        for gradient in gradients:
+            np.testing.assert_array_equal(
+                gradient["values"].to_numpy(),
+                np.array([6.0, 1.0], dtype=np.float32),
+            )
 
     def test_aggregate_storage_gradient_uses_one_packed_tangent_owner(self) -> None:
         vd.init(arch=vd.cpu)

@@ -1,7 +1,8 @@
 #ifndef VERNON_RUNTIME_AUTODIFF_PROGRAM_TAPE_LIFECYCLE_H
 #define VERNON_RUNTIME_AUTODIFF_PROGRAM_TAPE_LIFECYCLE_H
 
-#include "runtime/autodiff/program_value_arena.h"
+#include "program_tape_scratch.h"
+#include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/runtime_state.h"
 
 namespace vernon::runtime::ad {
@@ -17,12 +18,13 @@ struct ProgramTapeState {
     size_t stride{16};
 };
 
-bool allocateProgramTapeState(LogicalValueFrame &frame, VernonRuntimeContext &context, ProgramTapeState &state,
+bool allocateProgramTapeState(ProgramTapeScratch &scratch, VernonRuntimeContext &context, ProgramTapeState &state,
                               std::string &error);
-bool prepareProgramTapeStates(LogicalValueFrame &frame, VernonRuntimeContext &context,
-                              const program::Program &execution, const program::ResolvedExecutionPlan &topology,
-                              const program::Graph &forward, std::vector<ProgramTapeState> &states, std::string &error);
-bool validateProgramTapeStates(LogicalValueFrame &frame, std::vector<ProgramTapeState> &states, bool &retry,
+bool prepareProgramTapeStates(program_execution::ProgramInvocationState &frame, ProgramTapeScratch &scratch,
+                              VernonRuntimeContext &context, const program::Program &execution,
+                              const program::ResolvedExecutionPlan &topology, const program::Graph &forward,
+                              std::vector<ProgramTapeState> &states, std::string &error);
+bool validateProgramTapeStates(ProgramTapeScratch &scratch, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error);
 
 } // namespace vernon::runtime::ad

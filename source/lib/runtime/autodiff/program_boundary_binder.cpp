@@ -9,6 +9,7 @@
 #include <set>
 
 namespace vernon::runtime::ad {
+using program_execution::ProgramStorageBacking;
 namespace {
 
 bool boundaryKindMatches(program::BoundaryCategory category, VernonProgramArgumentKind kind) {
@@ -29,12 +30,45 @@ bool boundaryAccessMatches(program::BoundaryAccess access, VernonValueAccess sup
     return supplied == VERNON_ACCESS_READ_WRITE;
 }
 
+bool sameResourceReference(const VernonRuntimeProviderResourceReference &lhs,
+                           const VernonRuntimeProviderResourceReference &rhs) {
+    return lhs.identity == rhs.identity && lhs.resource.value == rhs.resource.value && lhs.offset == rhs.offset &&
+           lhs.size == rhs.size;
+}
+
+bool sameBoundaryBinding(const VernonProgramArgument &lhs, const VernonProgramArgument &rhs) {
+    if (lhs.kind != rhs.kind)
+        return false;
+    if (lhs.kind == VERNON_PROGRAM_TENSOR)
+        return lhs.tensor.storage == rhs.tensor.storage && lhs.tensor.byte_offset == rhs.tensor.byte_offset &&
+               lhs.tensor.byte_size == rhs.tensor.byte_size &&
+               (lhs.tensor.storage == VERNON_TENSOR_HOST
+                    ? lhs.tensor.host_data == rhs.tensor.host_data
+                    : sameResourceReference(lhs.tensor.resource, rhs.tensor.resource));
+    if (lhs.kind == VERNON_PROGRAM_IMAGE)
+        return sameResourceReference(lhs.image.view, rhs.image.view);
+    return sameResourceReference(lhs.resource, rhs.resource);
+}
+
+class ProgramOwnerBindings {
+public:
+    bool bind(program::ProgramOwnerId owner, const VernonProgramArgument &argument, std::string &error) {
+        const auto [binding, inserted] = bindings_.emplace(std::make_pair(owner.kind, owner.id), argument);
+        if (!inserted && !sameBoundaryBinding(binding->second, argument))
+            return error = "Program invocation binds one owner to different resources", false;
+        return true;
+    }
+
+private:
+    std::map<std::pair<program::ProgramOwnerKind, uint32_t>, VernonProgramArgument> bindings_;
+};
+
 } // namespace
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
                            const program::ResolvedExecutionPlan &plan, const ProgramBoundaryBindingRequest &request,
                            std::map<uint32_t, VernonProgramArgument> &externalValues,
-                           std::map<uint32_t, ProgramStorageState> &backings, std::vector<char> &live,
+                           std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
                            std::string &error) {
     const VernonStageInvocationDescriptor &invocation = request.invocation;
     if (invocation.argument_count != request.valueBySlot.size() ||
@@ -54,7 +88,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
     std::vector<std::pair<program::ProgramOwnerId, const VernonTensorView *>> tensorOwners;
     std::map<std::pair<program::ProgramOwnerKind, uint32_t>, size_t> stagedOwners;
     std::set<std::pair<program::ProgramOwnerKind, uint32_t>> inPlaceOwners;
-    if (request.publications) {
+    if (request.publication) {
         for (const program::ResolvedPublicationTransaction &transaction : plan.publications.transactions) {
             const uint32_t slot = transaction.slot;
             if (slot >= execution.abi.boundarySlots.size())
@@ -95,17 +129,18 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 error = "Program output boundary references an unknown Storage";
                 return false;
             }
-            PendingProgramPublication publication{target, *supplied->second};
+            std::optional<VernonRhiBuffer> destinationBuffer;
             if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
                 VernonRhiBuffer destination{};
                 if (!resolveBackendRhiBufferReference(context, supplied->second->tensor.resource, destination)) {
                     error = "PublicationPlan device output is not backed by a referenced Vernon RHI buffer";
                     return false;
                 }
-                publication.destinationBuffer = destination;
+                destinationBuffer = destination;
             }
-            request.publications->push_back(std::move(publication));
-            stagedOwners.emplace(key, request.publications->size() - 1);
+            if (!request.publication->stage(slot, *target, *supplied->second, destinationBuffer, error))
+                return false;
+            stagedOwners.emplace(key, slot);
         }
     }
     for (const auto &[slot, value] : request.valueBySlot) {
@@ -140,7 +175,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 error = "in-place Program output owner is not Tensor Storage";
                 return false;
             }
-            ProgramStorageState &backing = backings[owner.id];
+            ProgramStorageBacking &backing = backings[owner.id];
             backing.external = *supplied->second;
             backing.bytes = supplied->second->tensor.byte_size;
             backing.sized = backing.bytes != 0;
@@ -156,7 +191,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                     error = "staged Program Storage input requires Tensor data";
                     return false;
                 }
-                ProgramStorageState &backing = backings[owner.id];
+                ProgramStorageBacking &backing = backings[owner.id];
                 backing.initial = *supplied->second;
                 backing.bytes = supplied->second->tensor.byte_size;
                 backing.sized = true;
@@ -168,7 +203,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
         live[value] = 1;
         if (owner.kind != program::ProgramOwnerKind::Storage)
             continue;
-        ProgramStorageState &backing = backings[owner.id];
+        ProgramStorageBacking &backing = backings[owner.id];
         backing.external = *supplied->second;
         if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
             backing.bytes = supplied->second->tensor.byte_size;

@@ -1,5 +1,5 @@
 #include "VernonRuntime.h"
-#include "runtime/autodiff/runtime_gpu_failure_injection.h"
+#include "runtime/program_execution/failure_injection.h"
 
 #include <gtest/gtest.h>
 
@@ -147,9 +147,10 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
     VernonPullback *pullback = nullptr;
-    vernon::runtime::ad::gpu::setFailureInjectionForTesting(vernon::runtime::ad::gpu::FailureBoundary::Encode);
+    vernon::runtime::program_execution::setFailureInjectionForTesting(
+        vernon::runtime::program_execution::FailureBoundary::Encode);
     EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK);
-    vernon::runtime::ad::gpu::clearFailureInjectionForTesting();
+    vernon::runtime::program_execution::clearFailureInjectionForTesting();
     vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
     float unpublished = -1.0f;

@@ -1,5 +1,5 @@
 #include "runtime/autodiff/program_shape_resolver.h"
-#include "runtime/autodiff/program_value_arena.h"
+#include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/shape_layout.h"
 
@@ -73,7 +73,7 @@ TEST(ProgramShapeResolver, PropagatesOnlyAcrossExplicitStorageAliases) {
     execution.storages.resize(1);
     execution.storages[0].id = 0;
     execution.storages[0].initialValue = 0;
-    std::vector<ad::LogicalProgramValue> values(execution.values.size());
+    std::vector<program_execution::ProgramValueState> values(execution.values.size());
     values[0].concreteShape = ConcreteShape{2, 3};
 
     std::string error;
@@ -88,7 +88,7 @@ TEST(ProgramShapeResolver, RejectsConflictingConcreteBindings) {
     execution.values[0].id = 0;
     execution.values[0].name = "value";
     execution.values[0].shape = {2, 0};
-    std::vector<ad::LogicalProgramValue> values(1);
+    std::vector<program_execution::ProgramValueState> values(1);
     values[0].concreteShape = ConcreteShape{3, 4};
 
     std::string error;
