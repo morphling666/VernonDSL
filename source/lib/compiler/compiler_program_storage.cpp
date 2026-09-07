@@ -115,7 +115,7 @@ controlValueReference(int64_t like, llvm::StringRef allocationGraph, bool captur
     if (isCurrentGraphArgument(like, allocationGraph, argumentSlots))
         return llvm::json::Object{{"value", like}};
     if (captureLegal && captures.count(like))
-        return llvm::json::Object{{"capture", like}};
+        return llvm::json::Object{{"value", like}};
     error = producerByValue.count(like) ? "owned Program Storage like-source has NodeResultOrigin"
                                         : "owned Program Storage like-source is not a ControlValueRef";
     return std::nullopt;

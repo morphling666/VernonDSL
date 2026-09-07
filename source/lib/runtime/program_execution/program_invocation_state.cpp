@@ -164,18 +164,7 @@ bool resolveProgramControl(const program::Program &program, const std::vector<Pr
         value = control.value;
         return true;
     }
-    uint32_t valueId = UINT32_MAX;
-    if (control.kind == program::ControlKind::Parameter) {
-        if (control.reference < program.parameters.size())
-            valueId = program.parameters[control.reference].value;
-    } else {
-        const auto argument =
-            std::find_if(program.values.begin(), program.values.end(), [&](const program::Value &row) {
-                return row.origin.kind == program::OriginKind::Argument && row.origin.slot == control.reference;
-            });
-        if (argument != program.values.end())
-            valueId = argument->id;
-    }
+    const uint32_t valueId = control.reference;
     if (valueId >= values.size())
         return error = "Program dispatch control references an unavailable Value", false;
     const VernonProgramArgument &argument = values[valueId].argument;

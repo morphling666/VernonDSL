@@ -98,6 +98,80 @@ function(
 endfunction()
 
 function(
+    vernon_add_module_architecture_test_bundles
+    architecture
+    output_stem
+    reused_manifest_variable
+    tensor_view_manifest_variable
+    dynamic_manifest_variable
+    targets_variable)
+    vernon_add_program_asset_test_bundle(
+        "reused-stage-${architecture}"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset"
+        "reused_stage_${output_stem}_fixture"
+        _vernon_reused_manifest)
+    vernon_add_program_asset_test_bundle(
+        "tensor-view-chain-${architecture}"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset"
+        "tensor_view_chain_${output_stem}_fixture"
+        _vernon_tensor_view_manifest)
+    vernon_add_program_asset_test_bundle(
+        "dynamic-shape-grid-${architecture}"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset"
+        "dynamic_shape_grid_${output_stem}_fixture"
+        _vernon_dynamic_manifest)
+    set(${reused_manifest_variable}
+        "${_vernon_reused_manifest}"
+        PARENT_SCOPE)
+    set(${tensor_view_manifest_variable}
+        "${_vernon_tensor_view_manifest}"
+        PARENT_SCOPE)
+    set(${dynamic_manifest_variable}
+        "${_vernon_dynamic_manifest}"
+        PARENT_SCOPE)
+    set(${targets_variable}
+        ${${targets_variable}}
+        "vernon-reused-stage-${architecture}-test-bundle"
+        "vernon-tensor-view-chain-${architecture}-test-bundle"
+        "vernon-dynamic-shape-grid-${architecture}-test-bundle"
+        PARENT_SCOPE)
+endfunction()
+
+function(
+    vernon_add_module_graphics_test_bundles
+    architecture
+    output_stem
+    graphics_manifest_variable
+    mixed_manifest_variable
+    targets_variable)
+    vernon_add_program_asset_test_bundle(
+        "module-graphics-${architecture}"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:graphics_asset"
+        "module_graphics_${output_stem}_fixture"
+        _vernon_graphics_manifest)
+    vernon_add_program_asset_test_bundle(
+        "module-mixed-${architecture}"
+        "${architecture}"
+        "${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:mixed_asset"
+        "module_mixed_${output_stem}_fixture"
+        _vernon_mixed_manifest)
+    set(${graphics_manifest_variable}
+        "${_vernon_graphics_manifest}"
+        PARENT_SCOPE)
+    set(${mixed_manifest_variable}
+        "${_vernon_mixed_manifest}"
+        PARENT_SCOPE)
+    set(${targets_variable}
+        ${${targets_variable}} "vernon-module-graphics-${architecture}-test-bundle"
+        "vernon-module-mixed-${architecture}-test-bundle"
+        PARENT_SCOPE)
+endfunction()
+
+function(
     vernon_add_cpu_autodiff_fixture
     name
     directory_stem
@@ -290,6 +364,7 @@ if(TARGET VernonRuntime)
     if(TARGET vernon-dsl-native AND Python_FOUND)
         set(gpu_autodiff_fixture_targets)
         set(module_program_gpu_fixture_targets)
+        set(module_graphics_fixture_targets)
         if(VERNON_ENABLE_VULKAN_RUNTIME)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-vulkan
@@ -305,6 +380,19 @@ if(TARGET VernonRuntime)
                 module_program_vulkan_fixture
                 module_program_vulkan_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-vulkan-test-bundle)
+            vernon_add_module_architecture_test_bundles(
+                vulkan
+                vulkan
+                reused_stage_vulkan_manifest
+                tensor_view_chain_vulkan_manifest
+                dynamic_shape_grid_vulkan_manifest
+                module_program_gpu_fixture_targets)
+            vernon_add_module_graphics_test_bundles(
+                vulkan
+                vulkan
+                module_graphics_vulkan_manifest
+                module_mixed_vulkan_manifest
+                module_graphics_fixture_targets)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-vulkan-non-power-of-two
                 vulkan
@@ -334,6 +422,13 @@ if(TARGET VernonRuntime)
                 module_program_cuda_fixture
                 module_program_cuda_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-cuda-test-bundle)
+            vernon_add_module_architecture_test_bundles(
+                cuda
+                cuda
+                reused_stage_cuda_manifest
+                tensor_view_chain_cuda_manifest
+                dynamic_shape_grid_cuda_manifest
+                module_program_gpu_fixture_targets)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-cuda-non-power-of-two
                 cuda
@@ -363,6 +458,19 @@ if(TARGET VernonRuntime)
                 module_program_directx_fixture
                 module_program_directx_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-directx-test-bundle)
+            vernon_add_module_architecture_test_bundles(
+                directx
+                directx
+                reused_stage_directx_manifest
+                tensor_view_chain_directx_manifest
+                dynamic_shape_grid_directx_manifest
+                module_program_gpu_fixture_targets)
+            vernon_add_module_graphics_test_bundles(
+                directx
+                directx
+                module_graphics_directx_manifest
+                module_mixed_directx_manifest
+                module_graphics_fixture_targets)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-directx-non-power-of-two
                 directx
@@ -392,6 +500,19 @@ if(TARGET VernonRuntime)
                 module_program_metal_fixture
                 module_program_metal_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-metal-test-bundle)
+            vernon_add_module_architecture_test_bundles(
+                metal
+                metal
+                reused_stage_metal_manifest
+                tensor_view_chain_metal_manifest
+                dynamic_shape_grid_metal_manifest
+                module_program_gpu_fixture_targets)
+            vernon_add_module_graphics_test_bundles(
+                metal
+                metal
+                module_graphics_metal_manifest
+                module_mixed_metal_manifest
+                module_graphics_fixture_targets)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-metal-non-power-of-two
                 metal
@@ -420,6 +541,19 @@ if(TARGET VernonRuntime)
             module_program_opengl_fixture
             module_program_opengl_manifest)
         list(APPEND module_program_gpu_fixture_targets vernon-module-program-opengl-test-bundle)
+        vernon_add_module_architecture_test_bundles(
+            opengl
+            opengl
+            reused_stage_opengl_manifest
+            tensor_view_chain_opengl_manifest
+            dynamic_shape_grid_opengl_manifest
+            module_program_gpu_fixture_targets)
+        vernon_add_module_graphics_test_bundles(
+            opengl
+            opengl
+            module_graphics_opengl_manifest
+            module_mixed_opengl_manifest
+            module_graphics_fixture_targets)
         vernon_add_program_asset_test_bundle(
             gpu-autodiff-opengl-non-power-of-two
             opengl
@@ -655,38 +789,91 @@ if(TARGET VernonRuntime)
         endif()
         if(module_program_gpu_fixture_targets)
             add_executable(VernonModuleProgramGpuRuntimeTests runtime/runtime_module_program_gpu_c_api_test.cpp)
-            target_link_libraries(VernonModuleProgramGpuRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
-                                                                             Vernon::RHI)
+            target_link_libraries(
+                VernonModuleProgramGpuRuntimeTests
+                PRIVATE GTest::gtest_main
+                        Vernon::Runtime
+                        Vernon::RHI
+                        nlohmann_json::nlohmann_json)
             target_include_directories(VernonModuleProgramGpuRuntimeTests
                                        PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
             add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
             if(VERNON_ENABLE_VULKAN_RUNTIME)
                 target_compile_definitions(
                     VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_VULKAN_MANIFEST="${module_program_vulkan_manifest}")
+                    PRIVATE VERNON_MODULE_PROGRAM_VULKAN_MANIFEST="${module_program_vulkan_manifest}"
+                            VERNON_REUSED_STAGE_VULKAN_MANIFEST="${reused_stage_vulkan_manifest}"
+                            VERNON_TENSOR_VIEW_CHAIN_VULKAN_MANIFEST="${tensor_view_chain_vulkan_manifest}"
+                            VERNON_DYNAMIC_SHAPE_GRID_VULKAN_MANIFEST="${dynamic_shape_grid_vulkan_manifest}")
             endif()
             if(VERNON_ENABLE_CUDA_RUNTIME)
                 target_compile_definitions(
                     VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_CUDA_MANIFEST="${module_program_cuda_manifest}")
+                    PRIVATE VERNON_MODULE_PROGRAM_CUDA_MANIFEST="${module_program_cuda_manifest}"
+                            VERNON_REUSED_STAGE_CUDA_MANIFEST="${reused_stage_cuda_manifest}"
+                            VERNON_TENSOR_VIEW_CHAIN_CUDA_MANIFEST="${tensor_view_chain_cuda_manifest}"
+                            VERNON_DYNAMIC_SHAPE_GRID_CUDA_MANIFEST="${dynamic_shape_grid_cuda_manifest}")
             endif()
             if(VERNON_ENABLE_DIRECTX12_RUNTIME)
                 target_compile_definitions(
                     VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST="${module_program_directx_manifest}")
+                    PRIVATE VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST="${module_program_directx_manifest}"
+                            VERNON_REUSED_STAGE_DIRECTX_MANIFEST="${reused_stage_directx_manifest}"
+                            VERNON_TENSOR_VIEW_CHAIN_DIRECTX_MANIFEST="${tensor_view_chain_directx_manifest}"
+                            VERNON_DYNAMIC_SHAPE_GRID_DIRECTX_MANIFEST="${dynamic_shape_grid_directx_manifest}")
             endif()
             if(VERNON_ENABLE_METAL_RUNTIME)
                 target_compile_definitions(
                     VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_METAL_MANIFEST="${module_program_metal_manifest}")
+                    PRIVATE VERNON_MODULE_PROGRAM_METAL_MANIFEST="${module_program_metal_manifest}"
+                            VERNON_REUSED_STAGE_METAL_MANIFEST="${reused_stage_metal_manifest}"
+                            VERNON_TENSOR_VIEW_CHAIN_METAL_MANIFEST="${tensor_view_chain_metal_manifest}"
+                            VERNON_DYNAMIC_SHAPE_GRID_METAL_MANIFEST="${dynamic_shape_grid_metal_manifest}")
             endif()
             target_compile_definitions(
                 VernonModuleProgramGpuRuntimeTests
-                PRIVATE VERNON_MODULE_PROGRAM_OPENGL_MANIFEST="${module_program_opengl_manifest}")
+                PRIVATE VERNON_MODULE_PROGRAM_OPENGL_MANIFEST="${module_program_opengl_manifest}"
+                        VERNON_REUSED_STAGE_OPENGL_MANIFEST="${reused_stage_opengl_manifest}"
+                        VERNON_TENSOR_VIEW_CHAIN_OPENGL_MANIFEST="${tensor_view_chain_opengl_manifest}"
+                        VERNON_DYNAMIC_SHAPE_GRID_OPENGL_MANIFEST="${dynamic_shape_grid_opengl_manifest}")
             set_target_properties(VernonModuleProgramGpuRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                 "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonModuleProgramGpuRuntimeTests VernonRuntime VernonRHI)
             vernon_discover_gtests(VernonModuleProgramGpuRuntimeTests)
+        endif()
+        if(module_graphics_fixture_targets)
+            add_executable(VernonModuleGraphicsProgramRuntimeTests
+                           runtime/runtime_module_graphics_program_c_api_test.cpp)
+            target_link_libraries(VernonModuleGraphicsProgramRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
+                                                                                  Vernon::RHI)
+            target_include_directories(VernonModuleGraphicsProgramRuntimeTests PRIVATE "${VERNON_TEST_ROOT}/support")
+            add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
+            if(VERNON_ENABLE_VULKAN_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleGraphicsProgramRuntimeTests
+                    PRIVATE VERNON_MODULE_GRAPHICS_VULKAN_MANIFEST="${module_graphics_vulkan_manifest}"
+                            VERNON_MODULE_MIXED_VULKAN_MANIFEST="${module_mixed_vulkan_manifest}")
+            endif()
+            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleGraphicsProgramRuntimeTests
+                    PRIVATE VERNON_MODULE_GRAPHICS_DIRECTX_MANIFEST="${module_graphics_directx_manifest}"
+                            VERNON_MODULE_MIXED_DIRECTX_MANIFEST="${module_mixed_directx_manifest}")
+            endif()
+            if(VERNON_ENABLE_METAL_RUNTIME)
+                target_compile_definitions(
+                    VernonModuleGraphicsProgramRuntimeTests
+                    PRIVATE VERNON_MODULE_GRAPHICS_METAL_MANIFEST="${module_graphics_metal_manifest}"
+                            VERNON_MODULE_MIXED_METAL_MANIFEST="${module_mixed_metal_manifest}")
+            endif()
+            target_compile_definitions(
+                VernonModuleGraphicsProgramRuntimeTests
+                PRIVATE VERNON_MODULE_GRAPHICS_OPENGL_MANIFEST="${module_graphics_opengl_manifest}"
+                        VERNON_MODULE_MIXED_OPENGL_MANIFEST="${module_mixed_opengl_manifest}")
+            set_target_properties(VernonModuleGraphicsProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                                     "${CMAKE_BINARY_DIR}/source")
+            vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRuntime VernonRHI)
+            vernon_discover_gtests(VernonModuleGraphicsProgramRuntimeTests)
         endif()
 
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)

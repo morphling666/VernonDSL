@@ -48,7 +48,7 @@ VernonProgramBindingToken bindingToken(const char *value) {
 
 } // namespace
 
-TEST(RuntimeModuleProgramCApi, LoadsLinkedBundleAndExecutesPersistentForwardAndVjp) {
+TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublicLifecycle) {
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_MODULE_PROGRAM_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);

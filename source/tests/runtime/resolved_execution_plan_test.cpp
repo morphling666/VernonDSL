@@ -188,14 +188,40 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
     ASSERT_TRUE(validateResolvedExecutionPlan(fixture.plan, diagnostic)) << diagnostic.message;
 
-    ASSERT_EQ(fixture.plan.aliasDomains.at(0).values, std::vector<uint32_t>({0, 1}));
-    EXPECT_TRUE(fixture.plan.requiresDevice(GraphDirection::Forward, 0));
-    EXPECT_TRUE(fixture.plan.requiresDevice(GraphDirection::Forward, 1));
-    const auto transfer = std::find_if(
-        fixture.plan.transfers.edges.begin(), fixture.plan.transfers.edges.end(), [](const ResolvedTransferEdge &edge) {
-            return edge.kind == TransferKind::Readback && edge.value == 1 && edge.consumer.id == 1;
-        });
-    EXPECT_NE(transfer, fixture.plan.transfers.edges.end());
+    ASSERT_EQ(fixture.plan.aliasDomains.size(), 2u);
+    const AliasDomainPlan &firstDomain = fixture.plan.aliasDomains.at(0);
+    EXPECT_EQ(firstDomain.storage, 0u);
+    EXPECT_EQ(firstDomain.values, std::vector<uint32_t>({0, 1}));
+    EXPECT_EQ(firstDomain.residency, (std::map<GraphDirection, ResidencyRequirement>{
+                                         {GraphDirection::Forward, ResidencyRequirement::Device}}));
+    const AliasDomainPlan &secondDomain = fixture.plan.aliasDomains.at(1);
+    EXPECT_EQ(secondDomain.storage, 1u);
+    EXPECT_EQ(secondDomain.values, std::vector<uint32_t>({2}));
+    EXPECT_EQ(secondDomain.residency, (std::map<GraphDirection, ResidencyRequirement>{
+                                          {GraphDirection::Forward, ResidencyRequirement::Device}}));
+    EXPECT_EQ(fixture.plan.residency.size(), 3u);
+    for (uint32_t valueId : {0u, 1u, 2u})
+        EXPECT_EQ(fixture.plan.residency.at({GraphDirection::Forward, valueId}), ResidencyRequirement::Device);
+
+    ASSERT_EQ(fixture.plan.transfers.edges.size(), 2u);
+    const ResolvedTransferEdge &upload = fixture.plan.transfers.edges[0];
+    EXPECT_EQ(upload.kind, TransferKind::HostUpload);
+    EXPECT_EQ(upload.producer.kind, TransferEndpointKind::Boundary);
+    EXPECT_EQ(upload.producer.id, 0u);
+    EXPECT_EQ(upload.consumer.kind, TransferEndpointKind::Node);
+    EXPECT_EQ(upload.consumer.id, 0u);
+    EXPECT_EQ(upload.value, 0u);
+    EXPECT_EQ(upload.storage, 0u);
+    EXPECT_EQ(upload.order, 0u);
+    const ResolvedTransferEdge &readback = fixture.plan.transfers.edges[1];
+    EXPECT_EQ(readback.kind, TransferKind::Readback);
+    EXPECT_EQ(readback.producer.kind, TransferEndpointKind::Node);
+    EXPECT_EQ(readback.producer.id, 0u);
+    EXPECT_EQ(readback.consumer.kind, TransferEndpointKind::Node);
+    EXPECT_EQ(readback.consumer.id, 1u);
+    EXPECT_EQ(readback.value, 1u);
+    EXPECT_EQ(readback.storage, 0u);
+    EXPECT_EQ(readback.order, 1u);
 
     const auto hasHazard = [&](HazardKind kind, uint32_t predecessor, uint32_t successor) {
         return std::any_of(fixture.plan.hazards.edges.begin(), fixture.plan.hazards.edges.end(),
@@ -205,8 +231,18 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
                            });
     };
     EXPECT_TRUE(hasHazard(HazardKind::ReadAfterWrite, 0, 1));
+    EXPECT_TRUE(hasHazard(HazardKind::ReadAfterWrite, 1, 2));
     EXPECT_TRUE(hasHazard(HazardKind::WriteAfterRead, 2, 3));
     EXPECT_TRUE(hasHazard(HazardKind::WriteAfterWrite, 1, 3));
+    EXPECT_TRUE(hasHazard(HazardKind::ReadAfterWrite, 3, 4));
+    EXPECT_TRUE(hasHazard(HazardKind::WriteAfterWrite, 3, 4));
+    const auto memoryHazard = std::find_if(
+        fixture.plan.hazards.edges.begin(), fixture.plan.hazards.edges.end(), [](const ResolvedDependencyEdge &edge) {
+            return edge.hazard == HazardKind::ReadAfterWrite && edge.predecessor.node == 0 && edge.successor.node == 1;
+        });
+    ASSERT_NE(memoryHazard, fixture.plan.hazards.edges.end());
+    EXPECT_EQ(memoryHazard->storage, 0u);
+    EXPECT_EQ(memoryHazard->barrier, BarrierRequirement::Memory);
 
     ASSERT_EQ(fixture.plan.graphicsScopes.size(), 1u);
     EXPECT_EQ(fixture.plan.graphicsScopes[0].attachments[0].transition, AttachmentTransition::ReadWrite);

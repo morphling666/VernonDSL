@@ -297,6 +297,24 @@ TEST(CompilerProgramStorageAliasPlanner, ProducesTypedOwnerGroupsAndRejectsCycle
     EXPECT_NE(error.find("cycle"), std::string::npos);
 }
 
+TEST(CompilerProgramStoragePlanner, CapturedDynamicExtentUsesCanonicalValueIdentity) {
+    using namespace vernon::compiler;
+    llvm::json::Value values = parse(R"([
+      {"id": 6, "shape": [-1]},
+      {"id": 9, "shape": [-1], "like": 6}
+    ])");
+    llvm::json::Value shape = parse(R"([-1])");
+    llvm::json::Array extents;
+    std::string error;
+    ASSERT_TRUE(planOwnedDynamicExtents(*values.getAsArray(), 9, "backward", true, *shape.getAsArray(), {}, {6}, {}, {},
+                                        extents, error))
+        << error;
+    EXPECT_EQ(extents, *parse(R"([
+                {"dimension": {"control": {"value": 6}, "axis": 0}}
+              ])")
+                            .getAsArray());
+}
+
 TEST(CompilerProgramFinalization, OmitsInactiveNestedVjpCotangents) {
     llvm::json::Value execution = executionWithBindings(kBindings);
     llvm::json::Value request = requestWithBindings(kBindings);

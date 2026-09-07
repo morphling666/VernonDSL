@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import unittest
 from importlib import import_module
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Annotated, Any, cast
 
 import numpy as np
 import vernon_dsl as vd
-from vernon_dsl._program_assets.capture import capture_program
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.frontend.module_ast import interpret_module_forward
 from vernon_dsl.frontend.runtime_types import RuntimeParameterDescriptor, runtime_parameter_descriptor
 from vernon_dsl.operation_graph import GraphicsCallOp, ProgramControlDescriptor
 from vernon_dsl.program import ProgramTemplate
+from vernon_dsl.program_assets import ProgramCompileError, cook_program_asset
 from vernon_dsl.program_frontend import parse_program
 
 
@@ -355,11 +357,16 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             ("vertex", "fragment"),
         )
 
-    def test_graphics_module_autodiff_is_diagnosed(self) -> None:
-        expression = vd.ad.vjp(ManagedGraphics(), wrt=("vertices",))
-        declaration = vd.program_asset(id="graphics/module_vjp", program=expression)
-        with self.assertRaisesRegex(ValueError, "PROGRAM_GRAPHICS_VJP_UNSUPPORTED"):
-            capture_program(declaration)
+    def test_graphics_module_vjp_cook_is_rejected_before_deployment(self) -> None:
+        fixture = Path(__file__).parents[2] / "source/tests/fixtures/module_graphics_program_asset.py"
+        with TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ProgramCompileError, "PROGRAM_GRAPHICS_VJP_UNSUPPORTED"):
+                cook_program_asset(
+                    program_asset=f"{fixture}:graphics_vjp_asset",
+                    output=Path(directory) / "bundle",
+                    target="metal",
+                )
+            self.assertFalse((Path(directory) / "bundle").exists())
 
     def test_two_graphics_nodes_keep_distinct_control_slots(self) -> None:
         render_pass = vd.RenderPass(cast(vd.RenderTarget, _Target()), ((0, vd.preserve()),))

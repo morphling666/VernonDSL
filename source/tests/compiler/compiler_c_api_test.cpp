@@ -1079,9 +1079,9 @@ module {
             EXPECT_FALSE(json_contains_capture(byteLength));
         } else {
             foundBackwardCapture = true;
-            EXPECT_EQ(byteLength,
-                      nlohmann::json::array({{{"dimension", {{"control", {{"capture", 2}}}, {"axis", 0}}}},
-                                             {{"dimension", {{"control", {{"capture", 2}}}, {"axis", 1}}}}}));
+            EXPECT_EQ(byteLength, nlohmann::json::array({{{"dimension", {{"control", {{"value", 2}}}, {"axis", 0}}}},
+                                                         {{"dimension", {{"control", {{"value", 2}}}, {"axis", 1}}}}}));
+            EXPECT_FALSE(json_contains_capture(byteLength));
         }
     }
     EXPECT_TRUE(foundForwardArgument);

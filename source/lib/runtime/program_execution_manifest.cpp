@@ -487,15 +487,10 @@ bool parseControl(const nlohmann::json &value, ControlComponent &control, Diagno
     if (reference.size() != 1)
         return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", path + "/control",
                     "control reference must have one source");
-    if (reference.contains("value") && uint32Value(reference["value"], control.reference))
-        control.kind = ControlKind::Value;
-    else if (reference.contains("parameter") && uint32Value(reference["parameter"], control.reference))
-        control.kind = ControlKind::Parameter;
-    else if (reference.contains("capture") && uint32Value(reference["capture"], control.reference))
-        control.kind = ControlKind::Capture;
-    else
+    if (!reference.contains("value") || !uint32Value(reference["value"], control.reference))
         return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "parse", path + "/control",
-                    "control supports value, parameter, and capture");
+                    "control must reference a Program Value");
+    control.kind = ControlKind::Value;
     return true;
 }
 
@@ -2352,12 +2347,7 @@ bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &
             }
             if (executionKind(node) == ExecutionKind::Compute) {
                 for (const ControlComponent &control : computeOperation(node).workgroups) {
-                    if (control.kind == ControlKind::Parameter) {
-                        if (control.reference >= program.parameters.size())
-                            return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
-                                        "dispatch parameter is unavailable");
-                        expectedOperands.insert(program.parameters[control.reference].value);
-                    } else if (control.kind == ControlKind::Value) {
+                    if (control.kind == ControlKind::Value) {
                         if (control.reference >= program.values.size())
                             return fail(diagnostic, "PROGRAM_CONTROL_UNAVAILABLE", "resolve", nodePath + "/operation",
                                         "dispatch Value is unavailable");
@@ -2508,16 +2498,6 @@ bool resolve(Program program, const ArtifactSystem &artifacts, ResolvedProgram &
 
 bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
                          uint32_t &valueId) {
-    if (control.kind == ControlKind::Capture) {
-        valueId = control.reference;
-        return valueId < program.values.size();
-    }
-    if (control.kind == ControlKind::Parameter) {
-        if (control.reference >= program.parameters.size())
-            return false;
-        valueId = program.parameters[control.reference].value;
-        return valueId < program.values.size();
-    }
     if (control.kind != ControlKind::Value || control.reference >= program.values.size())
         return false;
     valueId = control.reference;

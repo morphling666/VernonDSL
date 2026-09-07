@@ -29,16 +29,10 @@ def _is_control_component(value: object) -> bool:
 def _is_control_reference(control: object) -> bool:
     return (
         isinstance(control, Mapping)
-        and len(control) == 1
-        and next(iter(control))
-        in {
-            "value",
-            "parameter",
-            "capture",
-        }
-        and isinstance(next(iter(control.values())), int)
-        and not isinstance(next(iter(control.values())), bool)
-        and next(iter(control.values())) >= 0
+        and set(control) == {"value"}
+        and isinstance(control["value"], int)
+        and not isinstance(control["value"], bool)
+        and control["value"] >= 0
     )
 
 

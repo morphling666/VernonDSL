@@ -6,6 +6,7 @@
 #include "runtime/program_execution_manifest.h"
 #include "runtime/runtime_pipeline_backend.h"
 #include "runtime/target_binding_plan.h"
+#include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -216,6 +217,40 @@ TEST(ProgramPublication, InPlaceBindingIsExplicitAndNotRollbackStaged) {
     transaction.rollback();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, 11.0f);
+}
+
+TEST(ProgramPublication, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    auto runtime = vernon::tests::createRhiRuntime(VERNON_RUNTIME_METAL);
+    if (!runtime.runtime)
+        GTEST_SKIP() << "Metal runtime backend is unavailable";
+    const float initial = 2.0f;
+    auto buffer =
+        vernon::tests::createBuffer(runtime, sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE, &initial);
+    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonProgramArgument argument = deviceTensor(sizeof(float));
+    argument.tensor.resource = buffer.reference;
+    argument.tensor.access = VERNON_ACCESS_WRITE;
+    ResolvedPublicationPlan plan{{
+        {3, 0, {ProgramOwnerKind::Storage, 4}, PublicationCommitMode::InPlace},
+    }};
+    program_execution::PublicationTransaction transaction(plan);
+    std::string error;
+    ASSERT_TRUE(transaction.bindInPlace(3, argument, error)) << error;
+
+    const float written = 11.0f; // Graph execution writes the explicitly mutable device backing directly.
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(runtime.device, buffer.handle, 0, &written, sizeof(written)),
+              VERNON_RHI_STATUS_OK);
+    transaction.rollback();
+    float observed = 0.0f;
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(runtime.device, buffer.handle, 0, &observed, sizeof(observed)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
+    EXPECT_FLOAT_EQ(observed, written);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, buffer.handle), VERNON_RHI_STATUS_OK);
+    vernon::tests::destroyRhiRuntime(runtime);
 }
 
 TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
@@ -494,7 +529,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
                                                           {{"tag", "initialize"}, {"storage", 1}, {"after", 1}}})},
                       {"operation",
                        {{"tag", "compute"},
-                        {"workgroups", nlohmann::json::array({{{"control", {{"parameter", 0}}}}, 1, 1})}}}}})}}})}};
+                        {"workgroups", nlohmann::json::array({{{"control", {{"value", 2}}}}, 1, 1})}}}}})}}})}};
     setProgramAbi(manifest, {{"x", 0, "input", "input"}, {"y", 1, "output", "output"}});
 
     nlohmann::json reflection{
@@ -612,6 +647,13 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     EXPECT_EQ(program.values[0].canonicalType.innerShape, std::vector<uint64_t>({256}));
     EXPECT_FALSE(program.values[2].canonicalType.rankedValue);
     EXPECT_EQ(program.values[2].canonicalType.dtype, "u32");
+    for (const char *retiredSource : {"parameter", "capture"}) {
+        nlohmann::json rejected = manifest;
+        rejected["graphs"][0]["nodes"][0]["operation"]["workgroups"][0]["control"] = {{retiredSource, 0}};
+        vernon::runtime::program::Program rejectedProgram;
+        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_EQ(diagnostic.code, "PROGRAM_CONTROL_UNAVAILABLE") << diagnostic.message;
+    }
     ASSERT_EQ(program.abi.boundarySlots.size(), 2u);
     EXPECT_EQ(program.abi.boundarySlots[0].path, "x");
     EXPECT_EQ(program.abi.boundarySlots[0].category, vernon::runtime::program::BoundaryCategory::StorageView);
@@ -745,7 +787,7 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
          {"accesses", nlohmann::json::array({{{"tag", "read"}, {"storage", 1}, {"value", 1}},
                                              {{"tag", "initialize"}, {"storage", 2}, {"after", 3}}})},
          {"operation",
-          {{"tag", "compute"}, {"workgroups", nlohmann::json::array({{{"control", {{"parameter", 0}}}}, 1, 1})}}}});
+          {{"tag", "compute"}, {"workgroups", nlohmann::json::array({{{"control", {{"value", 2}}}}, 1, 1})}}}});
     multiManifest["graphs"][0]["outputs"][0]["value"] = 3;
     setProgramAbi(multiManifest, {{"x", 0, "input", "input"}, {"y", 3, "output", "output"}});
 

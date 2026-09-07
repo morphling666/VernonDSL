@@ -159,8 +159,6 @@ enum class StorageMutability {
 enum class ControlKind {
     Static,
     Value,
-    Parameter,
-    Capture,
 };
 
 struct ControlComponent {

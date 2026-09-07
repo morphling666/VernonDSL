@@ -1629,12 +1629,9 @@ VernonStatus executePipelineProgramGraphImpl(
         constexpr const char *axisNames[] = {"x", "y", "z"};
         for (size_t axis = 0; axis < 3; ++axis) {
             const program::ControlComponent &component = program::computeOperation(node).workgroups[axis];
-            const std::string source = component.kind == program::ControlKind::Static ? "static declaration"
-                                       : component.kind == program::ControlKind::Value
-                                           ? "Value " + std::to_string(component.reference)
-                                       : component.kind == program::ControlKind::Capture
-                                           ? "captured Value " + std::to_string(component.reference)
-                                           : "parameter " + std::to_string(component.reference);
+            const std::string source = component.kind == program::ControlKind::Static
+                                           ? "static declaration"
+                                           : "Value " + std::to_string(component.reference);
             if (!arena.resolveControl(canonicalProgram, component, controlGrid[axis], materializationError))
                 return fail(pipeline.context, "Program compute grid axis " + std::string(axisNames[axis]) + " from " +
                                                   source + " failed: " + materializationError);
