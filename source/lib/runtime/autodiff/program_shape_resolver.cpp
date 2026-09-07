@@ -6,6 +6,16 @@ namespace vernon::runtime::ad {
 using program_execution::ProgramValueState;
 namespace {
 
+template <typename Shape> std::string formatShape(const Shape &shape) {
+    std::string result = "[";
+    for (size_t index = 0; index < shape.size(); ++index) {
+        if (index)
+            result += ", ";
+        result += std::to_string(shape[index]);
+    }
+    return result + "]";
+}
+
 class Resolver {
 public:
     Resolver(const program::Program &program, const program::ResolvedExecutionPlan *topology,
@@ -18,7 +28,8 @@ public:
             if (value.id < values_.size() && values_[value.id].concreteShape &&
                 !shape::matches(declared, *values_[value.id].concreteShape))
                 return error = "bound shape for Program value " + std::to_string(value.id) +
-                               " conflicts with the declared Program shape",
+                               " conflicts with the declared Program shape: value '" + value.name + "' bound " +
+                               formatShape(*values_[value.id].concreteShape) + ", declared " + formatShape(value.shape),
                        false;
             if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared);
                 concrete && !bind(value.id, *concrete, "Program declaration", error))
@@ -87,20 +98,11 @@ private:
         if (value >= program_.values.size() || value >= values_.size())
             return error = std::string(source) + " refers to an invalid Program value", false;
         if (!shape::matches(shape::decodeRuntimeContractShape(program_.values[value].shape), concrete)) {
-            const auto format = [](const auto &values) {
-                std::string result = "[";
-                for (size_t index = 0; index < values.size(); ++index) {
-                    if (index)
-                        result += ", ";
-                    result += std::to_string(values[index]);
-                }
-                return result + "]";
-            };
             return error = std::string(source) + " for value '" + program_.values[value].name + "' (" +
                            program_.values[value].type +
                            (program_.values[value].layout ? ", canonical layout" : ", no canonical layout") +
-                           ") has shape " + format(concrete) + " but the Program declares " +
-                           format(program_.values[value].shape),
+                           ") has shape " + formatShape(concrete) + " but the Program declares " +
+                           formatShape(program_.values[value].shape),
                    false;
         }
         if (values_[value].concreteShape && *values_[value].concreteShape != concrete)

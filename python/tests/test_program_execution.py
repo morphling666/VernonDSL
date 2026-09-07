@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated
 
 import numpy as np
 import vernon_dsl as vd
 from vernon_dsl._program_assets.capture import capture_program
 from vernon_dsl._runtime.session import RuntimeUnavailableError
+from vernon_dsl.program_assets import cook_program_asset
 
 from python.tests.storage_vjp_direct_fixture import (
     Particle,
@@ -687,6 +690,56 @@ class ProgramGpuExecutionTests(unittest.TestCase):
             np.array([[4.0, -6.0]], dtype=np.float32),
         )
         np.testing.assert_array_equal(gradient["mass"].to_numpy(), np.array([8.0], dtype=np.float32))
+
+
+class CookedProgramGpuVjpTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._artifacts = tempfile.TemporaryDirectory(prefix="vernon-cooked-vjp-")
+        for architecture, target, options in (
+            (vd.metal, "metal", {}),
+            (vd.vulkan, "vulkan", {}),
+            (vd.opengl, "opengl", {"api_version": (4, 3)}),
+        ):
+            try:
+                vd.init(arch=architecture, **options)
+            except RuntimeUnavailableError:
+                continue
+            cls._architecture = architecture
+            try:
+                cls._manifest = cook_program_asset(
+                    program_asset=f"{Path(__file__).with_name('cooked_vjp_program_asset_fixture.py')}:square_vjp_asset",
+                    output=Path(cls._artifacts.name) / "bundle",
+                    target=target,
+                )
+            except Exception:
+                vd.init(arch=vd.cpu)
+                cls._artifacts.cleanup()
+                raise
+            return
+        cls._artifacts.cleanup()
+        raise unittest.SkipTest("no GPU compute runtime is available")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        vd.init(arch=vd.cpu)
+        cls._artifacts.cleanup()
+
+    def test_cooked_square_vjp_loads_and_reuses_pullback(self) -> None:
+        program = vd.load_program(self._manifest)
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+
+        _, pullback = program.vjp({"source": source, "output": output}, (1, 1, 1))
+
+        np.testing.assert_array_equal(output.to_numpy(), np.array([9.0], dtype=np.float32))
+        first = pullback({"output": np.array([1.0], dtype=np.float32)})["source"]
+        first_values = first.to_numpy().copy()
+        second = pullback({"output": np.array([2.0], dtype=np.float32)})["source"]
+        self.assertIsNot(first, second)
+        np.testing.assert_array_equal(first_values, np.array([6.0], dtype=np.float32))
+        np.testing.assert_array_equal(first.to_numpy(), np.array([6.0], dtype=np.float32))
+        np.testing.assert_array_equal(second.to_numpy(), np.array([12.0], dtype=np.float32))
 
 
 if __name__ == "__main__":

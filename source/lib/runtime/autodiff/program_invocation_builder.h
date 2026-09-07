@@ -11,8 +11,6 @@ namespace vernon::runtime::ad {
 class ProgramTapeScratch;
 class AutodiffMemoryPolicy;
 
-bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi);
-
 bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
                                   const program::ResolvedExecutionPlan *plan,
                                   std::vector<program_execution::ProgramValueState> &values,

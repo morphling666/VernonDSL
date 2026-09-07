@@ -38,22 +38,32 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputCount(pipeline), 1u);
-    VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
-    EXPECT_EQ(std::string_view(outputMetadata.path.data, outputMetadata.path.size), "output");
-    EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F32);
-    ASSERT_EQ(outputMetadata.rank, 1u);
-    EXPECT_EQ(outputMetadata.shape[0], 2u);
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetAdCotangentCount(pipeline), 1u);
-    VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
-    EXPECT_EQ(std::string_view(cotangentMetadata.path.data, cotangentMetadata.path.size), "output");
-    EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F32);
-    EXPECT_EQ(vernonRuntimeProgramExecutableGetAdGradientCount(pipeline), 3u);
-    VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
-    EXPECT_FALSE(std::string_view(gradientMetadata.path.data, gradientMetadata.path.size).empty());
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, VERNON_PROGRAM_BOUNDARY_OUTPUT), 1u);
+    VernonProgramParameterView outputBoundary{};
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_OUTPUT, 0, &outputBoundary),
+        VERNON_STATUS_OK);
+    EXPECT_EQ(std::string_view(outputBoundary.name.data, outputBoundary.name.size), "output");
+    VernonProgramValueLeafView outputLeaf{sizeof(VernonProgramValueLeafView)};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryValueLeaf(pipeline, VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                                 outputBoundary.slot, 0, &outputLeaf),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(outputLeaf.value.dtype, VERNON_DATA_F32);
+    ASSERT_EQ(outputBoundary.rank, 1u);
+    EXPECT_EQ(outputBoundary.static_shape[0], 2u);
+    EXPECT_EQ(outputLeaf.static_rank, 0u);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT), 1u);
+    VernonProgramParameterView cotangentBoundary{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0,
+                                                               &cotangentBoundary),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(std::string_view(cotangentBoundary.name.data, cotangentBoundary.name.size), "output");
+    VernonProgramValueLeafView cotangentLeaf{sizeof(VernonProgramValueLeafView)};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryValueLeaf(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT,
+                                                                 cotangentBoundary.slot, 0, &cotangentLeaf),
+              VERNON_STATUS_OK);
+    EXPECT_EQ(cotangentLeaf.value.dtype, VERNON_DATA_F32);
+    EXPECT_GE(vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT), 1u);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline), 3u);
     VernonAdDerivativeGroupView group{sizeof(VernonAdDerivativeGroupView)};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, 0, &group), VERNON_STATUS_OK);
@@ -155,35 +165,34 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
     EXPECT_FLOAT_EQ(outputValues[1], 13.0f);
 
     float valueSeeds[]{5.0f, 7.0f};
-    VernonAdValue seed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, valueSeeds, sizeof(valueSeeds), 1, tensorShape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
-    float biasGradient{};
-    float scaleGradient{};
+    VernonProgramParameterView cotangentParameter{};
+    VernonProgramParameterView parametersGradientParameter{};
+    VernonProgramParameterView valueGradientParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0,
+                                                               &cotangentParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, {"parameters", 10},
+                                                         &parametersGradientParameter),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindBoundary(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, {"value", 5},
+                                                         &valueGradientParameter),
+              VERNON_STATUS_OK);
+    Parameters parametersGradient{};
     float valueGradient[2]{};
-    VernonAdValue gradientLeaves[]{
-        {sizeof(VernonAdValue),
-         {"parameters.inner.bias", 21},
-         VERNON_DATA_F32,
-         &biasGradient,
-         sizeof(biasGradient),
-         {}},
-        {sizeof(VernonAdValue),
-         {"parameters.inner.scale", 22},
-         VERNON_DATA_F32,
-         &scaleGradient,
-         sizeof(scaleGradient),
-         {}},
-        {sizeof(VernonAdValue), {"value", 5}, VERNON_DATA_F32, valueGradient, sizeof(valueGradient), 1, tensorShape},
+    VernonProgramArgument derivativeArguments[]{
+        argument(cotangentParameter, valueSeeds, sizeof(valueSeeds), 1, tensorShape, tensorStrides),
+        argument(parametersGradientParameter, &parametersGradient, sizeof(parametersGradient), 0, nullptr, nullptr),
+        argument(valueGradientParameter, valueGradient, sizeof(valueGradient), 0, nullptr, nullptr),
     };
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientLeaves, 3, {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
-    EXPECT_FLOAT_EQ(biasGradient, 12.0f);
-    EXPECT_FLOAT_EQ(scaleGradient, 31.0f);
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_FLOAT_EQ(parametersGradient.bias, 12.0f);
+    EXPECT_FLOAT_EQ(parametersGradient.scale, 31.0f);
     EXPECT_FLOAT_EQ(valueGradient[0], 20.0f);
     EXPECT_FLOAT_EQ(valueGradient[1], 28.0f);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

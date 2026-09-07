@@ -273,6 +273,28 @@ const program::BoundarySlot *findPublicBoundary(const program::Program &program,
     return found == program.abi.boundarySlots.end() ? nullptr : &*found;
 }
 
+std::optional<program::BoundaryRole> reflectedBoundaryRole(VernonProgramBoundaryRole boundary) {
+    switch (boundary) {
+    case VERNON_PROGRAM_BOUNDARY_INPUT:
+        return program::BoundaryRole::Input;
+    case VERNON_PROGRAM_BOUNDARY_OUTPUT:
+        return program::BoundaryRole::Output;
+    case VERNON_PROGRAM_BOUNDARY_COTANGENT:
+        return program::BoundaryRole::Cotangent;
+    case VERNON_PROGRAM_BOUNDARY_GRADIENT:
+        return program::BoundaryRole::Gradient;
+    default:
+        return std::nullopt;
+    }
+}
+
+const program::BoundarySlot *boundaryAt(const program::Program &program, program::BoundaryRole role, size_t index) {
+    for (const program::BoundarySlot &slot : program.abi.boundarySlots)
+        if (slot.role == role && index-- == 0)
+            return &slot;
+    return nullptr;
+}
+
 const ValueLayout *boundaryLayoutView(const VernonProgramExecutable &pipeline, const program::BoundarySlot &slot) {
     const program::Program *program = executableProgram(pipeline);
     if (!program)
@@ -878,6 +900,69 @@ VernonStatus vernonRuntimeProgramExecutableGetParameterValueLeaf(const VernonPro
         (slot->category != program::BoundaryCategory::Value &&
          slot->category != program::BoundaryCategory::StorageView) ||
         leafIndex >= layout->leaves.size())
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const ValueLeaf &source = layout->leaves[leafIndex];
+    leaf->value = layout->abiLeaves[leafIndex];
+    leaf->path = source.abiPath.empty() ? nullptr : source.abiPath.data();
+    leaf->path_count = source.abiPath.size();
+    leaf->static_shape = source.shape.empty() ? nullptr : source.shape.data();
+    leaf->static_rank = static_cast<uint32_t>(source.shape.size());
+    return VERNON_STATUS_OK;
+}
+
+size_t vernonRuntimeProgramExecutableGetBoundaryCount(const VernonProgramExecutable *pipeline,
+                                                      VernonProgramBoundaryRole boundary) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto role = reflectedBoundaryRole(boundary);
+    if (!pipeline || !role)
+        return 0;
+    const program::Program &program = *executableProgram(*pipeline);
+    return static_cast<size_t>(std::count_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
+                                             [&](const program::BoundarySlot &slot) { return slot.role == *role; }));
+}
+
+VernonStatus vernonRuntimeProgramExecutableGetBoundaryByIndex(const VernonProgramExecutable *pipeline,
+                                                              VernonProgramBoundaryRole boundary, size_t index,
+                                                              VernonProgramParameterView *parameter) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto role = reflectedBoundaryRole(boundary);
+    if (!pipeline || !role || !parameter)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const program::BoundarySlot *slot = boundaryAt(*executableProgram(*pipeline), *role, index);
+    if (!slot)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return fillBoundaryParameterView(*pipeline, *slot, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
+}
+
+VernonStatus vernonRuntimeProgramExecutableFindBoundary(const VernonProgramExecutable *pipeline,
+                                                        VernonProgramBoundaryRole boundary, VernonStringView name,
+                                                        VernonProgramParameterView *parameter) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto role = reflectedBoundaryRole(boundary);
+    if (!pipeline || !role || !parameter || (name.size && !name.data))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const program::Program &program = *executableProgram(*pipeline);
+    const auto found = std::find_if(
+        program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
+        [&](const program::BoundarySlot &slot) { return slot.role == *role && stringViewEquals(name, slot.path); });
+    if (found == program.abi.boundarySlots.end())
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return fillBoundaryParameterView(*pipeline, *found, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
+}
+
+VernonStatus vernonRuntimeProgramExecutableGetBoundaryValueLeaf(const VernonProgramExecutable *pipeline,
+                                                                VernonProgramBoundaryRole boundary, uint32_t slotId,
+                                                                size_t leafIndex, VernonProgramValueLeafView *leaf) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    const auto role = reflectedBoundaryRole(boundary);
+    if (!pipeline || !role || !leaf || leaf->struct_size < sizeof(*leaf))
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const program::Program &program = *executableProgram(*pipeline);
+    if (slotId >= program.abi.boundarySlots.size())
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    const program::BoundarySlot &slot = program.abi.boundarySlots[slotId];
+    const ValueLayout *layout = boundaryLayoutView(*pipeline, slot);
+    if (slot.id != slotId || slot.role != *role || !layout || leafIndex >= layout->leaves.size())
         return VERNON_STATUS_INVALID_ARGUMENT;
     const ValueLeaf &source = layout->leaves[leafIndex];
     leaf->value = layout->abiLeaves[leafIndex];
@@ -1929,15 +2014,10 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
             binding->refresh();
             arguments.push_back(binding->argument);
         }
-        VernonStageInvocationDescriptor frame{};
-        frame.struct_size = sizeof(frame);
-        frame.abi_version = VERNON_PROGRAM_VERSION;
-        frame.arguments = arguments.data();
-        frame.argument_count = arguments.size();
         const ProgramInvocationContext programContext{*invocation->controlSnapshot};
         VernonPullback *pullback = nullptr;
-        const VernonStatus status =
-            vernon::runtime::program_execution::forwardProgramInvocation(*pipeline, frame, pullback, &programContext);
+        const VernonStatus status = vernon::runtime::program_execution::forwardProgramInvocation(
+            *pipeline, arguments.data(), arguments.size(), pullback, &programContext);
         if (status != VERNON_STATUS_OK) {
             invocation->transaction->rollback();
             invocation->controlTransaction->rollback();
@@ -1952,7 +2032,7 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         if (outputPullback)
             *outputPullback = pullback;
         else if (pullback)
-            vernonPullbackDestroy(pullback);
+            vernonProgramPullbackDestroy(pullback);
         return VERNON_STATUS_OK;
     } catch (const std::exception &exception) {
         if (invocation && !invocation->finished) {

@@ -239,18 +239,17 @@ and unique group ownership once and stores the executable projection in
 ResolvedProgram. Interactive and cooked APIs read groups from ResolvedProgram;
 neither has a second signature, grouping, or execution model.
 
-The public C Runtime exposes indexed reflection rather than a scalar-output
-special case:
-
-- `vernonRuntimeProgramExecutableGetAdOutputCount` and
-  `vernonRuntimeProgramExecutableGetAdOutputByIndex`;
-- the equivalent cotangent and gradient count/index pairs;
-- derivative-group count/index queries and indexed leaf-path queries.
-
-Each value query returns one `VernonAdValueMetadataView` containing the
-canonical path, tangent dtype, rank, and logical shape. This is the only public
-output/cotangent/gradient reflection API and supports aggregate and independent
-multi-output objectives without reinterpretation.
+The public C Runtime exposes generic indexed Program boundary reflection through
+`vernonRuntimeProgramExecutableGetBoundaryCount`,
+`vernonRuntimeProgramExecutableGetBoundaryByIndex`, and
+`vernonRuntimeProgramExecutableFindBoundary`. The
+`VernonProgramBoundaryRole` distinguishes Input, Output, Cotangent, and
+Gradient slots; every invocation argument uses the exact reflected slot.
+`vernonRuntimeProgramExecutableGetBoundaryValueLeaf` exposes each boundary's
+canonical payload layout. Derivative-group count/index queries and indexed
+leaf-path queries preserve Python grouping semantics but are not an execution
+transport. Residual captures are internal pullback state and are not reflected
+as callable boundaries.
 
 For launches larger than one invocation, packed aggregate cotangents prepend the
 physical `(grid.z*workgroup.z, grid.y*workgroup.y, grid.x*workgroup.x)` carrier
@@ -381,9 +380,11 @@ pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured implementatio
 complete-workgroup bounded replay with original virtual IDs, device-local Tape,
 fixed lane-status readback, transactional gradient publication, and no
 GPU-to-host Tape payload readback. RHI graph resources provide checkpoint
-snapshots for graph replay. Inputs and final gradients cross the host API
-boundary; derivative execution and temporary Tape/gradient storage remain
-backend-local. Graphics autodiff remains unsupported. Graphics support must
+snapshots for graph replay. Cotangents and gradients use the same canonical
+`VernonProgramArgument` boundary binding as primal Values and may remain
+device-resident; there is no device-specific pullback ABI. Derivative execution
+and temporary Tape/gradient storage remain backend-local. Graphics autodiff
+remains unsupported. Graphics support must
 account for the fact that
 differentiating vertex and fragment functions independently does not define a
 differentiable graphics pipeline. The Pipeline ProgramGraph would model varying
@@ -426,14 +427,18 @@ auto [image, pullback] = program.vjp(bindings, {gridX, gridY, gridZ});
 auto gradients = pullback({{"color", dImage}});
 ```
 
-The application-facing C ABI uses an opaque pullback handle:
+The application-facing C ABI uses the ordinary persistent Program invocation
+for forward and an opaque retained pullback handle. Pullback arguments bind
+exact Cotangent and Gradient boundary slots:
 
 ```c
 VernonPullback *pullback = NULL;
-VernonLaunchSize grid = {grid_x, grid_y, grid_z};
-vernonProgramVjpForward(program, grid, &inputs, &outputs, &pullback);
-vernonPullbackApply(pullback, &cotangents, &gradients);
-vernonPullbackDestroy(pullback);
+VernonProgramInvocation *invocation =
+    vernonRuntimeProgramInstanceBeginInvocation(instance);
+/* Bind each exact primal boundary slot with vernonRuntimeProgramInvocationBind. */
+vernonRuntimeProgramInvocationForward(invocation, &pullback);
+vernonProgramPullbackApply(pullback, derivative_arguments, derivative_argument_count);
+vernonProgramPullbackDestroy(pullback);
 ```
 
 The C structures use `struct_size` and reserved fields. C++ provides RAII over

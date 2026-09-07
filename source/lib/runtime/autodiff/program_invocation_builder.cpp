@@ -22,66 +22,12 @@ namespace {
 
 struct InvocationBuildRequest {
     const std::vector<char> &required;
-    const CanonicalForwardBindings *canonical{};
-    ProgramLeafFrameSource bound;
-    ProgramLeafFrameSource results;
+    const CanonicalBoundaryBindings *boundaries{};
     const std::vector<std::vector<uint8_t>> *captures{};
     const std::vector<std::vector<uint64_t>> *captureShapes{};
     const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures{};
     const std::vector<program_execution::CanonicalValueSnapshot> *retainedSnapshots{};
 };
-
-bool applyBoundShape(ProgramValueState &host, const VernonAdValue &value, const program::Value &slot,
-                     std::string &error) {
-    if (value.rank < slot.shape.size() || (value.rank && !value.shape))
-        return error = "Program autodiff bound value rank does not match its Program type", false;
-    shape::ConcreteShape concrete(value.shape, value.shape + slot.shape.size());
-    if (!shape::matches(shape::decodeRuntimeContractShape(slot.shape), concrete))
-        return error = "Program autodiff bound value shape does not match its Program type", false;
-    host.concreteShape = std::move(concrete);
-    return true;
-}
-
-bool applyLeaves(const ProgramLeafFrameSource &source, const program::Program &execution,
-                 const std::vector<std::optional<ValueLayout>> &layouts, std::vector<ProgramValueState> &values,
-                 std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
-    if (!source.values && !source.signature && !source.bindings)
-        return true;
-    if (!source.values || !source.signature || !source.bindings ||
-        source.bindings->size() != source.signature->size() || source.values->value_count != source.signature->size())
-        return error = "Program autodiff leaf set does not match its canonical boundary", false;
-    for (size_t index = 0; index < source.bindings->size(); ++index) {
-        const ProgramLeafBinding &binding = (*source.bindings)[index];
-        const ValueAbi &abi = (*source.signature)[index];
-        const VernonAdValue *value = findValue(*source.values, abi.path);
-        if (!value)
-            return error = "Program autodiff leaf '" + abi.path + "' is absent from the supplied invocation", false;
-        if (binding.value >= values.size())
-            return error = "Program autodiff leaf '" + abi.path + "' exceeds invocation Values", false;
-        if (!matchesProgramValueAbi(*value, abi))
-            return error = "Program autodiff leaf '" + abi.path + "' does not match graph reflection", false;
-        const program::Value &slot = execution.values[binding.value];
-        ProgramStorageBacking *backing = slot.storage ? &backings[*slot.storage] : nullptr;
-        if (!layouts[binding.value] || !applyBoundShape(values[binding.value], *value, slot, error))
-            return false;
-        if (backing && !backing->external) {
-            size_t elements = 0;
-            const size_t elementBytes = layouts[binding.value]->byteSize;
-            if (!values[binding.value].concreteShape ||
-                !shape::checkedElementCount(*values[binding.value].concreteShape, elements) || !elementBytes ||
-                elements > std::numeric_limits<size_t>::max() / elementBytes)
-                return error = "Program autodiff leaf has an invalid canonical Storage extent", false;
-            const size_t canonicalBytes = elements * elementBytes;
-            if (backing->sized && backing->bytes != canonicalBytes)
-                return error = "Program autodiff leaves disagree on canonical Storage extent", false;
-            backing->bytes = canonicalBytes;
-            backing->sized = true;
-        }
-        if (backing && backing->owner < values.size() && !values[backing->owner].concreteShape)
-            values[backing->owner].concreteShape = values[binding.value].concreteShape;
-    }
-    return true;
-}
 
 bool attachResiduals(const InvocationBuildRequest &request, const program::Program &execution,
                      std::vector<ProgramValueState> &values, std::map<uint32_t, ProgramStorageBacking> &backings,
@@ -124,14 +70,12 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
 
     std::vector<char> live = request.required;
     live.resize(execution.values.size());
-    const auto markBindings = [&](const ProgramLeafFrameSource &source) {
-        if (source.bindings)
-            for (const ProgramLeafBinding &binding : *source.bindings)
-                if (binding.value < live.size())
-                    live[binding.value] = 1;
-    };
-    markBindings(request.bound);
-    markBindings(request.results);
+    if (request.boundaries)
+        for (const auto &[slot, value] : request.boundaries->valueBySlot) {
+            (void)slot;
+            if (value < live.size())
+                live[value] = 1;
+        }
     if (request.captures)
         for (size_t value = 0; value < request.captures->size() && value < live.size(); ++value)
             live[value] |= !(*request.captures)[value].empty();
@@ -157,15 +101,16 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
                                       std::nullopt,
                                   });
     std::map<uint32_t, VernonProgramArgument> externalValues;
-    if (request.canonical) {
+    if (request.boundaries) {
         ProgramBoundaryBindingRequest binding{
-            request.canonical->invocation,
-            request.canonical->valueBySlot,
-            &request.canonical->publication,
+            request.boundaries->arguments,
+            request.boundaries->argumentCount,
+            request.boundaries->valueBySlot,
+            &request.boundaries->publication,
         };
         if (!plan ||
             !bindProgramBoundaries(context, execution, *plan, binding, externalValues, backings, live, error) ||
-            !request.canonical->publication.applyConcreteShapes(execution, values, error))
+            !request.boundaries->publication.applyConcreteShapes(execution, values, error))
             return false;
         for (auto &[value, argument] : externalValues) {
             if (value >= execution.values.size() || execution.values[value].storage ||
@@ -177,7 +122,8 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             argument.tensor.host_data = values[value].ownedHostBytes.data();
             argument.tensor.byte_offset = 0;
         }
-    } else if (request.retainedSnapshots) {
+    }
+    if (request.retainedSnapshots) {
         for (const auto &snapshot : *request.retainedSnapshots) {
             if (snapshot.value >= values.size() || snapshot.logical.argument.kind != VERNON_PROGRAM_TENSOR)
                 continue;
@@ -227,9 +173,7 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             backing.sized = true;
         }
     }
-    if (!applyLeaves(request.bound, execution, layouts, values, backings, error) ||
-        !applyLeaves(request.results, execution, layouts, values, backings, error) ||
-        !attachResiduals(request, execution, values, backings, error) ||
+    if (!attachResiduals(request, execution, values, backings, error) ||
         !materializeProgramOwnedStorages(execution, plan, values, liveStorage, layouts, backings, error) ||
         !materializeProgramValues(execution, plan, values, live, layouts, backings, externalValues,
                                   request.tapeCaptures, tapePolicy, tapeScratch, error))
@@ -240,23 +184,6 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
 
 } // namespace
 
-bool matchesProgramValueAbi(const VernonAdValue &value, const ValueAbi &abi) {
-    if (value.dtype != abi.dtype || value.rank != abi.logicalShape.size() || (value.rank && !value.shape))
-        return false;
-    bool dynamic = false;
-    bool empty = false;
-    for (size_t index = 0; index < abi.logicalShape.size(); ++index) {
-        empty |= value.shape[index] == 0;
-        if (!abi.logicalShape[index])
-            dynamic = true;
-        else if (value.shape[index] != abi.logicalShape[index])
-            return false;
-    }
-    if (!value.data && !empty)
-        return false;
-    return dynamic ? (empty ? value.size == 0 : value.size > 0) : value.size == abi.byteSize;
-}
-
 bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
                                   const program::ResolvedExecutionPlan *plan, std::vector<ProgramValueState> &values,
                                   std::map<uint32_t, ProgramStorageBacking> &storageBackings,
@@ -264,12 +191,8 @@ bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::
                                   std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     if (program_execution::injectFailure(program_execution::FailureBoundary::Allocation))
         return error = "injected Program invocation allocation failure", false;
-    if (const auto *canonical = std::get_if<CanonicalForwardBindings>(&spec.bindings))
-        return build(context, execution, plan, values, storageBackings, tapeScratch, {spec.requiredValues, canonical},
-                     std::move(tapePolicy), error);
-    const HostForwardBindings &host = std::get<HostForwardBindings>(spec.bindings);
-    return build(context, execution, plan, values, storageBackings, tapeScratch,
-                 {spec.requiredValues, nullptr, host.inputs, host.outputs}, std::move(tapePolicy), error);
+    return build(context, execution, plan, values, storageBackings, tapeScratch, {spec.requiredValues, &spec.bindings},
+                 std::move(tapePolicy), error);
 }
 
 bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
@@ -278,8 +201,8 @@ bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::
                                   ProgramTapeScratch &tapeScratch, const PullbackInvocationSpec &spec,
                                   std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     return build(context, execution, plan, values, storageBackings, tapeScratch,
-                 {spec.requiredValues, nullptr, spec.cotangents, spec.gradients, &spec.captures, &spec.captureShapes,
-                  spec.tapeCaptures, spec.retainedSnapshots},
+                 {spec.requiredValues, &spec.bindings, &spec.captures, &spec.captureShapes, spec.tapeCaptures,
+                  spec.retainedSnapshots},
                  std::move(tapePolicy), error);
 }
 

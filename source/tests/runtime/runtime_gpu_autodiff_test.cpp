@@ -246,11 +246,11 @@ std::string lastError(VernonRuntimeContext *context) {
 }
 
 VernonStatus canonicalProgramForward(VernonProgramExecutable *pipeline, VernonLaunchSize grid,
-                                     const VernonAdValueSet &inputs, VernonPullback **pullback) {
+                                     const vernon::tests::DerivativeLeafSetFixture &inputs, VernonPullback **pullback) {
     std::vector<VernonProgramArgument> arguments(inputs.value_count);
     std::vector<std::vector<int64_t>> strides(inputs.value_count);
     for (size_t index = 0; index < inputs.value_count; ++index) {
-        const VernonAdValue &input = inputs.values[index];
+        const vernon::tests::DerivativeLeafFixture &input = inputs.values[index];
         VernonProgramParameterView parameter{};
         if (vernonRuntimeProgramExecutableFindParameter(pipeline, input.path, &parameter) != VERNON_STATUS_OK)
             return VERNON_STATUS_INVALID_ARGUMENT;
@@ -299,11 +299,24 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     constexpr uint64_t shape[]{2, 2};
     std::array<float, 4> values{2.0f, 3.0f, 5.0f, 7.0f};
     std::array<float, 4> loss{};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), 2, shape},
-        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, loss.data(), sizeof(loss), 2, shape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"values", 6},
+         VERNON_DATA_F32,
+         values.data(),
+         sizeof(values),
+         2,
+         shape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"loss", 4},
+         VERNON_DATA_F32,
+         loss.data(),
+         sizeof(loss),
+         2,
+         shape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
 
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(canonicalProgramForward(pipeline, {1, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
@@ -313,30 +326,46 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     values.fill(100.0f);
     std::array<float, 4> cotangent{1.0f, 1.0f, 1.0f, 1.0f};
     std::array<float, 4> gradient{};
-    VernonAdValue cotangentValue{
-        sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, cotangent.data(), sizeof(cotangent), 2, shape};
-    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &cotangentValue, 1, {}};
-    VernonAdValue gradientValue{
-        sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, gradient.data(), sizeof(gradient), 2, shape};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
+    vernon::tests::DerivativeLeafFixture cotangentValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                        {"loss", 4},
+                                                        VERNON_DATA_F32,
+                                                        cotangent.data(),
+                                                        sizeof(cotangent),
+                                                        2,
+                                                        shape};
+    vernon::tests::DerivativeLeafSetFixture cotangents{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &cotangentValue, 1, {}};
+    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                       {"values", 6},
+                                                       VERNON_DATA_F32,
+                                                       gradient.data(),
+                                                       sizeof(gradient),
+                                                       2,
+                                                       shape};
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
 
     VernonPullbackApplyOptions applyOptions{
-        sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, 0, {}};
+        sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, 0, {}};
     gradient.fill(-23.0f);
     vernon::runtime::program_execution::setFailureInjectionForTesting(
         vernon::runtime::program_execution::FailureBoundary::Allocation);
-    EXPECT_NE(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK);
+    EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
+              VERNON_STATUS_OK);
     EXPECT_EQ(gradient, (std::array<float, 4>{-23.0f, -23.0f, -23.0f, -23.0f}));
     applyOptions.maximum_temporary_bytes = std::numeric_limits<uint64_t>::max();
-    EXPECT_NE(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
+    EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
+              VERNON_STATUS_OK)
         << "the rejected under-budget apply must not consume the pending allocation failure";
     vernon::runtime::program_execution::clearFailureInjectionForTesting();
-    ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
+              VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
 
     gradient.fill(0.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
     const vernon::runtime::AutodiffPullbackControlPlaneUsage control =
         vernon::runtime::autodiffPullbackControlPlaneUsage(pullback);
@@ -347,10 +376,11 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     EXPECT_GT(control.temporaryAllocationBytes, 0u);
 
     gradient.fill(0.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
 }
@@ -380,11 +410,24 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     const std::array<float, 4> original{2.0f, 3.0f, 5.0f, 7.0f};
     std::array<float, 4> values = original;
     std::array<float, 4> loss{};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), 2, shape},
-        {sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, loss.data(), sizeof(loss), 2, shape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"values", 6},
+         VERNON_DATA_F32,
+         values.data(),
+         sizeof(values),
+         2,
+         shape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"loss", 4},
+         VERNON_DATA_F32,
+         loss.data(),
+         sizeof(loss),
+         2,
+         shape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
 
     constexpr std::array forwardBoundaries{
         FailureBoundary::Allocation,
@@ -413,25 +456,38 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
 
     std::array<float, 4> cotangent{1.0f, 1.0f, 1.0f, 1.0f};
     std::array<float, 4> gradient{};
-    VernonAdValue cotangentValue{
-        sizeof(VernonAdValue), {"loss", 4}, VERNON_DATA_F32, cotangent.data(), sizeof(cotangent), 2, shape};
-    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &cotangentValue, 1, {}};
-    VernonAdValue gradientValue{
-        sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, gradient.data(), sizeof(gradient), 2, shape};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
+    vernon::tests::DerivativeLeafFixture cotangentValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                        {"loss", 4},
+                                                        VERNON_DATA_F32,
+                                                        cotangent.data(),
+                                                        sizeof(cotangent),
+                                                        2,
+                                                        shape};
+    vernon::tests::DerivativeLeafSetFixture cotangents{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &cotangentValue, 1, {}};
+    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                       {"values", 6},
+                                                       VERNON_DATA_F32,
+                                                       gradient.data(),
+                                                       sizeof(gradient),
+                                                       2,
+                                                       shape};
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
     for (FailureBoundary boundary : forwardBoundaries) {
         gradient.fill(-37.0f);
         setFailureInjectionForTesting(boundary);
-        EXPECT_NE(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
             << static_cast<int>(boundary);
         clearFailureInjectionForTesting();
         EXPECT_EQ(gradient, (std::array<float, 4>{-37.0f, -37.0f, -37.0f, -37.0f}));
     }
     gradient.fill(0.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
 }
@@ -461,18 +517,25 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     float y = 2.0f;
     int32_t count = 2;
     std::array<float, laneCount> output{};
-    VernonAdValue inputValues[3]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
-        {sizeof(VernonAdValue),
+    vernon::tests::DerivativeLeafFixture inputValues[3]{
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
          {dynamic ? "count" : "y", dynamic ? 5u : 1u},
          dynamic ? VERNON_DATA_I32 : VERNON_DATA_F32,
          dynamic ? static_cast<void *>(&count) : static_cast<void *>(&y),
          dynamic ? sizeof(count) : sizeof(y),
          0,
          nullptr},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 1, outputShape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F32,
+         output.data(),
+         sizeof(output),
+         1,
+         outputShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(canonicalProgramForward(pipeline, {2, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
     ASSERT_NE(pullback, nullptr);
@@ -482,34 +545,53 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     x = 100.0f;
     std::array<float, laneCount> seeds{};
     seeds.fill(1.0f);
-    VernonAdValue seed{sizeof(VernonAdValue),
-                       {"output", 6},
-                       VERNON_DATA_F32,
-                       seeds.data(),
-                       sizeof(seeds),
-                       static_cast<uint32_t>(std::size(outputShape)),
-                       outputShape};
-    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &seed, 1, {}};
+    vernon::tests::DerivativeLeafFixture seed{
+        sizeof(vernon::tests::DerivativeLeafFixture),  {"output", 6}, VERNON_DATA_F32, seeds.data(), sizeof(seeds),
+        static_cast<uint32_t>(std::size(outputShape)), outputShape};
+    vernon::tests::DerivativeLeafSetFixture cotangents{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
     std::array<float, 2> gradientStorage{};
-    VernonAdValue gradientValues[2]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), 0, nullptr},
-        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), 0, nullptr},
+    vernon::tests::DerivativeLeafFixture gradientValues[2]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"x", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[0],
+         sizeof(float),
+         0,
+         nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"y", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[1],
+         sizeof(float),
+         0,
+         nullptr},
     };
     if (!dynamic)
         std::swap(gradientValues[0], gradientValues[1]);
-    VernonAdValueSet gradients{
-        sizeof(VernonAdValueSet), gradientValues, dynamic ? size_t{1} : std::size(gradientValues), {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    vernon::tests::DerivativeLeafSetFixture gradients{sizeof(vernon::tests::DerivativeLeafSetFixture),
+                                                      gradientValues,
+                                                      dynamic ? size_t{1} : std::size(gradientValues),
+                                                      {}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
     if (!dynamic)
         EXPECT_NEAR(gradientStorage[1], -26.0f, 1e-4f);
     std::array<float, laneCount> sharedSeeds{};
     sharedSeeds.fill(1.0f);
-    VernonAdValue sharedSeed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, sharedSeeds.data(), sizeof(sharedSeeds), 1, outputShape};
-    VernonAdValueSet sharedCotangents{sizeof(VernonAdValueSet), &sharedSeed, 1, {}};
+    vernon::tests::DerivativeLeafFixture sharedSeed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                    {"output", 6},
+                                                    VERNON_DATA_F32,
+                                                    sharedSeeds.data(),
+                                                    sizeof(sharedSeeds),
+                                                    1,
+                                                    outputShape};
+    vernon::tests::DerivativeLeafSetFixture sharedCotangents{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &sharedSeed, 1, {}};
     gradientStorage.fill(-19.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, &sharedCotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &sharedCotangents, &gradients),
+              VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
     if (!dynamic)
         EXPECT_NEAR(gradientStorage[1], -26.0f, 1e-4f);
@@ -520,10 +602,11 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     EXPECT_EQ(memory.peakTemporaryBytes, 0u);
 
     gradientStorage.fill(0.0f);
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
 }
@@ -555,19 +638,38 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     std::array<float, laneCount> sharedLoss{};
     for (size_t lane = 0; lane < laneCount; ++lane)
         values[lane] = static_cast<float>(lane + 1);
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), 0, nullptr},
-        {sizeof(VernonAdValue), {"values", 6}, VERNON_DATA_F32, values.data(), sizeof(values), 1, shape},
-        {sizeof(VernonAdValue),
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"scale", 5},
+         VERNON_DATA_F32,
+         &scale,
+         sizeof(scale),
+         0,
+         nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"values", 6},
+         VERNON_DATA_F32,
+         values.data(),
+         sizeof(values),
+         1,
+         shape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
          {"carried_loss", 12},
          VERNON_DATA_F32,
          carriedLoss.data(),
          sizeof(carriedLoss),
          1,
          shape},
-        {sizeof(VernonAdValue), {"shared_loss", 11}, VERNON_DATA_F32, sharedLoss.data(), sizeof(sharedLoss), 1, shape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"shared_loss", 11},
+         VERNON_DATA_F32,
+         sharedLoss.data(),
+         sizeof(sharedLoss),
+         1,
+         shape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(canonicalProgramForward(pipeline, {2, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
     ASSERT_NE(pullback, nullptr);
@@ -580,15 +682,15 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     carriedSeeds.fill(1.0f);
     std::array<float, laneCount> sharedSeeds{};
     sharedSeeds.fill(1.0f);
-    VernonAdValue seeds[]{
-        {sizeof(VernonAdValue),
+    vernon::tests::DerivativeLeafFixture seeds[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
          {"carried_loss", 12},
          VERNON_DATA_F32,
          carriedSeeds.data(),
          sizeof(carriedSeeds),
          1,
          shape},
-        {sizeof(VernonAdValue),
+        {sizeof(vernon::tests::DerivativeLeafFixture),
          {"shared_loss", 11},
          VERNON_DATA_F32,
          sharedSeeds.data(),
@@ -596,18 +698,26 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
          1,
          shape},
     };
-    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), seeds, std::size(seeds), {}};
+    vernon::tests::DerivativeLeafSetFixture cotangents{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), seeds, std::size(seeds), {}};
     float gradient = 0.0f;
-    VernonAdValue gradientValue{
-        sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &gradient, sizeof(gradient), 0, nullptr};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    vernon::tests::DerivativeLeafFixture gradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                       {"scale", 5},
+                                                       VERNON_DATA_F32,
+                                                       &gradient,
+                                                       sizeof(gradient),
+                                                       0,
+                                                       nullptr};
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     float expected = 0.0f;
     for (float value : values)
         expected += value + value * value;
     EXPECT_NEAR(gradient, expected, 0.5f);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
 }

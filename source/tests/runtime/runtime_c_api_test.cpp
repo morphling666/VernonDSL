@@ -30,8 +30,8 @@ static VernonStatus fill_grid(const VernonCpuInvocation *invocation) {
 }
 
 TEST(RuntimeCApi, PullbackOpaqueHandleRejectsInvalidCalls) {
-    EXPECT_EQ(vernonPullbackApply(nullptr, nullptr, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
-    vernonPullbackDestroy(nullptr);
+    EXPECT_EQ(vernonProgramPullbackApply(nullptr, nullptr, 0), VERNON_STATUS_INVALID_ARGUMENT);
+    vernonProgramPullbackDestroy(nullptr);
 }
 
 TEST(RuntimeCApi, CpuComputePipelineAndBundleBehavior) {

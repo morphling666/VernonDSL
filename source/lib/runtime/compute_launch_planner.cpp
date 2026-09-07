@@ -181,12 +181,15 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
     switch (source.kind) {
     case ComputeBindingSourceKind::Argument:
         return std::nullopt;
-    case ComputeBindingSourceKind::TensorOffset:
-        if (tensor->byte_offset % tensor->element_layout.byte_size ||
-            tensor->byte_offset / tensor->element_layout.byte_size >
-                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    case ComputeBindingSourceKind::TensorOffset: {
+        if (tensor->byte_offset % tensor->element_layout.byte_size)
             return std::nullopt;
-        return static_cast<int64_t>(tensor->byte_offset / tensor->element_layout.byte_size);
+        const size_t offset = tensor->byte_offset / tensor->element_layout.byte_size;
+        if constexpr (sizeof(size_t) >= sizeof(int64_t))
+            if (offset > static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+                return std::nullopt;
+        return static_cast<int64_t>(offset);
+    }
     case ComputeBindingSourceKind::TensorExtent:
         if (source.dimension >= tensor->rank || !tensor->shape ||
             tensor->shape[source.dimension] > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))

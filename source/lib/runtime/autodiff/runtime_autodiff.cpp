@@ -144,38 +144,6 @@ bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize extent) {
     return true;
 }
 
-bool validSet(const VernonAdValueSet *set, bool required) {
-    return (!required && !set) ||
-           (set && set->struct_size >= sizeof(VernonAdValueSet) && (!set->value_count || set->values));
-}
-
-VernonAdValue *findValue(VernonAdValueSet &set, const std::string &path) {
-    for (size_t index = 0; index < set.value_count; ++index) {
-        VernonAdValue &value = set.values[index];
-        if (value.struct_size >= sizeof(VernonAdValue) && value.path.data && value.path.size == path.size() &&
-            std::memcmp(value.path.data, path.data(), path.size()) == 0)
-            return &value;
-    }
-    return nullptr;
-}
-
-const VernonAdValue *findValue(const VernonAdValueSet &set, const std::string &path) {
-    for (size_t index = 0; index < set.value_count; ++index) {
-        const VernonAdValue &value = set.values[index];
-        if (value.struct_size >= sizeof(VernonAdValue) && value.path.data && value.path.size == path.size() &&
-            std::memcmp(value.path.data, path.data(), path.size()) == 0)
-            return &value;
-    }
-    return nullptr;
-}
-
-bool valueMatches(const VernonAdValue &value, const ValueAbi &abi) {
-    if (value.dtype != abi.dtype || !value.data || value.size != abi.byteSize ||
-        value.rank != abi.logicalShape.size() || (value.rank && !value.shape))
-        return false;
-    return value.rank == 0 || std::equal(abi.logicalShape.begin(), abi.logicalShape.end(), value.shape);
-}
-
 bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative) {
     if (primal.dtype != VERNON_DATA_F16 && primal.dtype != VERNON_DATA_F32 && primal.dtype != VERNON_DATA_F64)
         return false;
@@ -186,40 +154,6 @@ bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative) {
     const size_t derivativeScalarSize = dtypeSize(derivative.dtype);
     return primalScalarSize && derivativeScalarSize && primal.byteSize % primalScalarSize == 0 &&
            derivative.byteSize == primal.byteSize / primalScalarSize * derivativeScalarSize;
-}
-
-bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi, std::vector<uint8_t> &bytes,
-                        std::string &error) {
-    bytes.resize(abi.byteSize);
-    if (cotangents) {
-        if (cotangents->value_count != 1) {
-            error = "pullback requires one output cotangent";
-            return false;
-        }
-        const VernonAdValue *cotangent = findValue(*cotangents, abi.path);
-        if (!cotangent || !valueMatches(*cotangent, abi)) {
-            error = "output cotangent does not match backward reflection";
-            return false;
-        }
-        std::memcpy(bytes.data(), cotangent->data, abi.byteSize);
-        return true;
-    }
-    if (abi.byteSize != dtypeSize(abi.dtype)) {
-        error = "a non-scalar output requires an explicit cotangent";
-        return false;
-    }
-    if (abi.dtype == VERNON_DATA_F32) {
-        const float one = 1.0f;
-        std::memcpy(bytes.data(), &one, sizeof(one));
-        return true;
-    }
-    if (abi.dtype == VERNON_DATA_F64) {
-        const double one = 1.0;
-        std::memcpy(bytes.data(), &one, sizeof(one));
-        return true;
-    }
-    error = "implicit cotangents require an f32 or f64 scalar output";
-    return false;
 }
 
 bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
@@ -252,22 +186,19 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 namespace vernon::runtime::program_execution {
 
-VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
-                                      const VernonStageInvocationDescriptor &invocation, VernonPullback *&pullback,
+VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
+                                      size_t argumentCount, VernonPullback *&pullback,
                                       const ProgramInvocationContext *programContext) {
     pullback = nullptr;
     const auto *autodiff = canonicalProgramAutodiff(&pipeline);
     auto *executable = autodiff ? autodiff->canonicalExecution.get() : nullptr;
-    if (!executable || invocation.struct_size < sizeof(VernonStageInvocationDescriptor) ||
-        invocation.abi_version != VERNON_PROGRAM_VERSION || (invocation.argument_count && !invocation.arguments)) {
+    if (!executable || (argumentCount && !arguments)) {
         invocationDiagnostic(*pipeline.context) = "invalid canonical Program invocation";
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     std::unique_ptr<ad::PullbackExecution> execution;
-    const ad::ForwardExecutionTarget target{&invocation, programContext};
-    const VernonStatus status = executable->forward(target, inputs, &outputs, execution);
+    const ad::ForwardExecutionTarget target{arguments, argumentCount, programContext};
+    const VernonStatus status = executable->forward(target, execution);
     if (status != VERNON_STATUS_OK)
         return status;
     if (!execution)
@@ -297,103 +228,15 @@ VernonStatus fail(VernonRuntimeContext *context, std::string_view message,
     return status;
 }
 
-const vernon::runtime::ad::Signature *canonicalProgramSignature(const VernonProgramExecutable *pipeline) {
-    const auto *autodiff = canonicalProgramAutodiff(pipeline);
-    return autodiff && autodiff->canonicalExecution ? &autodiff->canonicalExecution->signature() : nullptr;
-}
-
-bool validDeviceFootprint(const VernonAdDeviceValue &value) {
-    const size_t scalarBytes = vernon::runtime::ad::dtypeSize(value.dtype);
-    if (!scalarBytes || !value.buffer_size || value.buffer_size > std::numeric_limits<size_t>::max() ||
-        value.offset > value.buffer_size || value.size > value.buffer_size || (value.rank && !value.byte_strides))
-        return false;
-    uint64_t before = 0;
-    uint64_t after = 0;
-    for (uint32_t dimension = 0; dimension < value.rank; ++dimension) {
-        if (!value.shape[dimension])
-            return false;
-        const int64_t stride = value.byte_strides[dimension];
-        const uint64_t magnitude =
-            stride < 0 ? static_cast<uint64_t>(-(stride + 1)) + 1 : static_cast<uint64_t>(stride);
-        const uint64_t count = value.shape[dimension] - 1;
-        if (count && magnitude > std::numeric_limits<uint64_t>::max() / count)
-            return false;
-        const uint64_t span = magnitude * count;
-        uint64_t &side = stride < 0 ? before : after;
-        if (span > std::numeric_limits<uint64_t>::max() - side)
-            return false;
-        side += span;
-    }
-    return before <= value.offset && after <= value.buffer_size - value.offset &&
-           scalarBytes <= value.buffer_size - value.offset - after;
-}
-
-bool validDeviceSet(const VernonAdDeviceValueSet *set, bool required) {
-    if (!set)
-        return !required;
-    if (set->struct_size < sizeof(*set) || (set->value_count && !set->values) ||
-        std::any_of(std::begin(set->reserved), std::end(set->reserved), [](uint32_t value) { return value != 0; }))
-        return false;
-    for (size_t index = 0; index < set->value_count; ++index) {
-        const VernonAdDeviceValue &value = set->values[index];
-        if (value.struct_size < sizeof(value) || !value.path.data || !value.path.size || !value.size ||
-            value.buffer.index == VERNON_RHI_INVALID_HANDLE_INDEX || (value.rank && !value.shape) ||
-            !validDeviceFootprint(value) ||
-            std::any_of(
-                std::begin(value.reserved), std::end(value.reserved), [](uint32_t reserved) { return reserved != 0; }))
-            return false;
-    }
-    return true;
-}
-
 } // namespace
 
 namespace {
-
-bool copyMetadata(const std::vector<vernon::runtime::ad::ValueAbi> &values, size_t index,
-                  VernonAdValueMetadataView *metadata) {
-    if (!metadata || metadata->struct_size < sizeof(*metadata) || index >= values.size())
-        return false;
-    const vernon::runtime::ad::ValueAbi &value = values[index];
-    *metadata = {sizeof(*metadata),
-                 {value.path.data(), value.path.size()},
-                 value.dtype,
-                 static_cast<uint32_t>(value.logicalShape.size()),
-                 value.logicalShape.empty() ? nullptr : value.logicalShape.data(),
-                 {}};
-    return true;
-}
 
 const vernon::runtime::program::Program *programExecution(const VernonProgramExecutable *pipeline) {
     if (!pipeline)
         return nullptr;
     const vernon::runtime::program::Program &program = pipeline->executionPlan->resolvedProgram->program;
     return vernon::runtime::program::findGraph(program, "backward") ? &program : nullptr;
-}
-
-std::optional<vernon::runtime::program::BoundaryRole> programBoundaryRole(VernonProgramAdBoundary boundary) {
-    using vernon::runtime::program::BoundaryRole;
-    switch (boundary) {
-    case VERNON_PROGRAM_AD_INPUT:
-        return BoundaryRole::Input;
-    case VERNON_PROGRAM_AD_OUTPUT:
-        return BoundaryRole::Output;
-    case VERNON_PROGRAM_AD_COTANGENT:
-        return BoundaryRole::Cotangent;
-    case VERNON_PROGRAM_AD_GRADIENT:
-        return BoundaryRole::Gradient;
-    default:
-        return std::nullopt;
-    }
-}
-
-const vernon::runtime::program::BoundarySlot *programBoundaryAt(const vernon::runtime::program::Program &program,
-                                                                vernon::runtime::program::BoundaryRole role,
-                                                                size_t index) {
-    for (const vernon::runtime::program::BoundarySlot &slot : program.abi.boundarySlots)
-        if (slot.role == role && index-- == 0)
-            return &slot;
-    return nullptr;
 }
 
 } // namespace
@@ -471,125 +314,6 @@ uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExec
     return programExecution(pipeline) ? 1 : 0;
 }
 
-size_t vernonRuntimeProgramExecutableGetProgramAdValueCount(const VernonProgramExecutable *pipeline,
-                                                            VernonProgramAdBoundary boundary) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const vernon::runtime::program::Program *execution = programExecution(pipeline);
-    if (!execution)
-        return 0;
-    if (boundary == VERNON_PROGRAM_AD_CAPTURE)
-        return execution->residualContract ? execution->residualContract->captures.size() : 0;
-    const std::optional<vernon::runtime::program::BoundaryRole> role = programBoundaryRole(boundary);
-    if (!role)
-        return 0;
-    return static_cast<size_t>(
-        std::count_if(execution->abi.boundarySlots.begin(), execution->abi.boundarySlots.end(),
-                      [&](const vernon::runtime::program::BoundarySlot &slot) { return slot.role == *role; }));
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetProgramAdValueByIndex(const VernonProgramExecutable *pipeline,
-                                                                    VernonProgramAdBoundary boundary, size_t index,
-                                                                    VernonProgramAdValueView *view) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const vernon::runtime::program::Program *execution = programExecution(pipeline);
-    if (!execution || !view || view->struct_size < sizeof(*view))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
-    const vernon::runtime::program::BoundarySlot *binding = nullptr;
-    uint32_t capture = UINT32_MAX;
-    if (boundary == VERNON_PROGRAM_AD_CAPTURE) {
-        if (execution->residualContract && index < execution->residualContract->captures.size())
-            capture = execution->residualContract->captures[index].value;
-    } else if (const std::optional<vernon::runtime::program::BoundaryRole> role = programBoundaryRole(boundary)) {
-        binding = programBoundaryAt(*execution, *role, index);
-    }
-    const uint32_t valueId = binding ? binding->value : capture;
-    if (valueId >= execution->values.size())
-        return fail(pipeline ? pipeline->context : nullptr, "invalid Program autodiff value query");
-    const vernon::runtime::program::Value &slot = execution->values[valueId];
-    const std::string &path = binding ? binding->path : slot.name;
-    const bool external = std::any_of(
-        execution->graphs.begin(), execution->graphs.end(), [&](const vernon::runtime::program::Graph &graph) {
-            return std::any_of(
-                graph.inputs.begin(), graph.inputs.end(), [&](const vernon::runtime::program::GraphInput &input) {
-                    return input.kind == vernon::runtime::program::GraphInputKind::UserInput && input.value == valueId;
-                });
-        });
-    const bool output = std::any_of(execution->graphs.begin(), execution->graphs.end(),
-                                    [&](const vernon::runtime::program::Graph &graph) {
-                                        return std::any_of(graph.outputs.begin(), graph.outputs.end(),
-                                                           [&](const vernon::runtime::program::GraphOutput &candidate) {
-                                                               return candidate.value == valueId;
-                                                           });
-                                    });
-    *view = {sizeof(*view),
-             {path.data(), path.size()},
-             valueId,
-             static_cast<uint8_t>(external),
-             static_cast<uint8_t>(output),
-             {}};
-    return VERNON_STATUS_OK;
-}
-
-size_t vernonRuntimeProgramExecutableGetAdInputCount(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    return signature ? signature->inputs.size() : 0;
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetAdInputByIndex(const VernonProgramExecutable *pipeline, size_t index,
-                                                             VernonAdValueMetadataView *metadata) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    if (!signature || !copyMetadata(signature->inputs, index, metadata))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff input query");
-    return VERNON_STATUS_OK;
-}
-
-size_t vernonRuntimeProgramExecutableGetAdOutputCount(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    return signature ? signature->outputs.size() : 0;
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetAdOutputByIndex(const VernonProgramExecutable *pipeline, size_t index,
-                                                              VernonAdValueMetadataView *metadata) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    if (!signature || !copyMetadata(signature->outputs, index, metadata))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff output query");
-    return VERNON_STATUS_OK;
-}
-
-size_t vernonRuntimeProgramExecutableGetAdCotangentCount(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    return signature ? signature->cotangents.size() : 0;
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetAdCotangentByIndex(const VernonProgramExecutable *pipeline, size_t index,
-                                                                 VernonAdValueMetadataView *metadata) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    if (!signature || !copyMetadata(signature->cotangents, index, metadata))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff cotangent query");
-    return VERNON_STATUS_OK;
-}
-
-size_t vernonRuntimeProgramExecutableGetAdGradientCount(const VernonProgramExecutable *pipeline) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    return signature ? signature->gradients.size() : 0;
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetAdGradientByIndex(const VernonProgramExecutable *pipeline, size_t index,
-                                                                VernonAdValueMetadataView *metadata) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    const auto *signature = canonicalProgramSignature(pipeline);
-    if (!signature || !copyMetadata(signature->gradients, index, metadata))
-        return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff gradient query");
-    return VERNON_STATUS_OK;
-}
-
 size_t vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     const auto *autodiff = canonicalProgramAutodiff(pipeline);
@@ -629,14 +353,14 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const VernonAdValueSet *cotangents,
-                                            VernonAdValueSet *gradients, const VernonPullbackApplyOptions *options) {
+VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, const VernonProgramArgument *arguments,
+                                                   size_t argumentCount, const VernonPullbackApplyOptions *options) {
     VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
     try {
         using namespace vernon::runtime::ad;
         vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        if (!pullback || !pullback->execution || !validSet(cotangents, false) || !validSet(gradients, true) ||
-            !options || options->struct_size != sizeof(VernonPullbackApplyOptions) ||
+        if (!pullback || !pullback->execution || (argumentCount && !arguments) || !options ||
+            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
             options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
             std::any_of(std::begin(options->reserved), std::end(options->reserved),
                         [](uint32_t value) { return value != 0; }))
@@ -645,9 +369,8 @@ VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const Vern
             return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
                                                               : static_cast<size_t>(value);
         };
-        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
-                                                  boundedSize(options->maximum_reusable_construction_bytes)};
-        return pullback->execution->apply(cotangents, *gradients, runtimeOptions);
+        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes)};
+        return pullback->execution->apply(arguments, argumentCount, runtimeOptions);
     } catch (const std::bad_alloc &) {
         return fail(context, "cannot allocate pullback state", VERNON_STATUS_INTERNAL_ERROR);
     } catch (const std::length_error &) {
@@ -657,52 +380,19 @@ VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback, const Vern
     }
 }
 
-VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
-                                 VernonAdValueSet *gradients) {
+VernonStatus vernonProgramPullbackApply(VernonPullback *pullback, const VernonProgramArgument *arguments,
+                                        size_t argumentCount) {
     const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
                                              VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
                                              std::numeric_limits<uint64_t>::max(),
-                                             0,
                                              {}};
-    return vernonPullbackApplyWithOptions(pullback, cotangents, gradients, &options);
+    return vernonProgramPullbackApplyWithOptions(pullback, arguments, argumentCount, &options);
 }
 
-void vernonPullbackDestroy(VernonPullback *pullback) {
+void vernonProgramPullbackDestroy(VernonPullback *pullback) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(
         pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr);
     delete pullback;
 }
 
 } // extern "C"
-
-VernonStatus vernon::runtime::ad::applyPullbackDeviceWithPlanSink(VernonPullback &pullback,
-                                                                  const VernonAdDeviceValueSet *cotangents,
-                                                                  VernonAdDeviceValueSet &gradients,
-                                                                  const VernonPullbackApplyOptions *options,
-                                                                  execution::detail::RhiCommandPlanSink &sink) {
-    VernonRuntimeContext *context = pullback.contextLease ? &pullback.contextLease->get() : nullptr;
-    try {
-        vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        auto *deviceExecution =
-            pullback.execution ? dynamic_cast<DevicePullbackExecution *>(pullback.execution.get()) : nullptr;
-        if (!deviceExecution || !validDeviceSet(cotangents, false) || !validDeviceSet(&gradients, true) || !options ||
-            options->struct_size != sizeof(VernonPullbackApplyOptions) ||
-            options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
-            std::any_of(std::begin(options->reserved), std::end(options->reserved),
-                        [](uint32_t value) { return value != 0; }))
-            return fail(context, "invalid planned device pullback invocation");
-        const auto boundedSize = [](uint64_t value) {
-            return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
-                                                              : static_cast<size_t>(value);
-        };
-        const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes),
-                                                  boundedSize(options->maximum_reusable_construction_bytes)};
-        return deviceExecution->applyDevice(cotangents, gradients, runtimeOptions, &sink);
-    } catch (const std::bad_alloc &) {
-        return fail(context, "cannot allocate planned device pullback state", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (const std::length_error &) {
-        return fail(context, "planned device pullback allocation is too large", VERNON_STATUS_INTERNAL_ERROR);
-    } catch (...) {
-        return fail(context, "unexpected planned device pullback failure", VERNON_STATUS_INTERNAL_ERROR);
-    }
-}

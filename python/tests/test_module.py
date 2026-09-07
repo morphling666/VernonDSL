@@ -293,7 +293,7 @@ class ModuleTests(unittest.TestCase):
         self.assertEqual([value["path"] for value in signature["outputs"]], ["square", "cube"])
         self.assertEqual([value["path"] for value in signature["cotangents"]], ["square", "cube"])
         self.assertEqual([value["path"] for value in signature["gradients"]], ["source"])
-        self.assertEqual([value["value_id"] for value in signature["captures"]], [0])
+        self.assertNotIn("captures", signature)
 
         gradients = pullback(
             {

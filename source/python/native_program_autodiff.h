@@ -4,100 +4,15 @@
 #include "native_command_retention.h"
 #include "native_program.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/program_boundary_view.h"
 
 #include <deque>
 #include <limits>
 #include <unordered_map>
 
-struct PythonAdViewDescriptor {
-    uintptr_t allocationBegin{};
-    size_t allocationSize{};
-    size_t byteOffset{};
-    VernonDataType dtype{};
-    bool writable{};
-    std::vector<uint64_t> shape;
-    std::vector<int64_t> strides;
-
-    VernonTensorView tensorView() const {
-        VernonTensorView tensor{};
-        tensor.struct_size = sizeof(VernonTensorView);
-        tensor.storage = VERNON_TENSOR_HOST;
-        tensor.host_data = reinterpret_cast<const void *>(allocationBegin);
-        tensor.element_layout = vernonRuntimeGetScalarValueLayout(dtype);
-        tensor.access = writable ? VERNON_ACCESS_READ_WRITE : VERNON_ACCESS_READ;
-        tensor.rank = static_cast<uint32_t>(shape.size());
-        tensor.shape = shape.data();
-        tensor.byte_strides = strides.data();
-        tensor.byte_offset = byteOffset;
-        tensor.byte_size = allocationSize;
-        return tensor;
-    }
-};
-
-PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, VernonDataType dtype,
-                                                    const std::vector<uint64_t> &expectedShape, const nb::object &array,
-                                                    bool writable);
-
 inline nb::object pythonAdArraySource(const nb::object &source) {
     return nb::hasattr(source, "_native_host_array") ? source.attr("_native_host_array")() : source;
 }
-
-struct PythonAdValue {
-    std::string path;
-    nb::object source;
-    nb::object array;
-    std::vector<uint64_t> shape;
-    bool writable{};
-    PythonAdViewDescriptor originalView;
-    VernonAdValue value{};
-
-    PythonAdValue(std::string path, VernonDataType dtype, std::vector<uint64_t> shape, const nb::object &source,
-                  uint32_t access = VERNON_ACCESS_READ)
-        : path(std::move(path)), source(nb::module_::import_("numpy").attr("asarray")(pythonAdArraySource(source))),
-          array(this->source), writable(access != VERNON_ACCESS_READ) {
-        originalView = validatePythonAdOriginalView(this->path, dtype, shape, this->source, writable);
-        this->shape = originalView.shape;
-        if (!nb::cast<bool>(array.attr("flags").attr("c_contiguous"))) {
-            nb::object numpy = nb::module_::import_("numpy");
-            array = access == VERNON_ACCESS_WRITE ? numpy.attr("empty_like")(this->source)
-                                                  : numpy.attr("ascontiguousarray")(array);
-        }
-        const size_t itemSize = nb::cast<size_t>(array.attr("dtype").attr("itemsize"));
-        size_t bytes = itemSize;
-        for (uint64_t extent : this->shape) {
-            if (extent && bytes > std::numeric_limits<size_t>::max() / static_cast<size_t>(extent))
-                throw std::invalid_argument("Python autodiff Value byte size overflows");
-            bytes *= static_cast<size_t>(extent);
-        }
-        if (!itemSize)
-            throw std::invalid_argument("Python autodiff Value byte size overflows");
-        if (this->shape.size() > std::numeric_limits<uint32_t>::max())
-            throw std::invalid_argument("Python autodiff Value rank overflows");
-        value.struct_size = sizeof(value);
-        value.path = {this->path.data(), this->path.size()};
-        value.dtype = dtype;
-        value.data = reinterpret_cast<void *>(nb::cast<uintptr_t>(array.attr("ctypes").attr("data")));
-        value.size = bytes;
-        value.rank = static_cast<uint32_t>(this->shape.size());
-        value.shape = this->shape.empty() ? nullptr : this->shape.data();
-    }
-
-    PythonAdValue(PythonAdValue &&other) noexcept
-        : path(std::move(other.path)), source(std::move(other.source)), array(std::move(other.array)),
-          shape(std::move(other.shape)), writable(other.writable), originalView(std::move(other.originalView)),
-          value(other.value) {
-        value.path = {path.data(), path.size()};
-        value.shape = shape.empty() ? nullptr : shape.data();
-    }
-    void commit() {
-        if (writable && source.ptr() != array.ptr())
-            nb::module_::import_("numpy").attr("copyto")(source, array);
-    }
-    PythonAdValue(const PythonAdValue &) = delete;
-    PythonAdValue &operator=(const PythonAdValue &) = delete;
-};
 
 struct PythonAdMetadata {
     std::string path;
@@ -139,28 +54,20 @@ inline nb::object pythonAdGradientBuffer(const PythonAdMetadata &gradient, const
     return numpy.attr("zeros")(gradient.shape, numpy.attr(numpyDtypeName(gradient.dtype)));
 }
 
-inline void instantiatePythonAdMetadata(PythonAdMetadata &leaf, const std::deque<PythonAdValue> &bound) {
-    for (const PythonAdValue &value : bound) {
-        if (value.path == leaf.path) {
-            leaf.shape = value.shape;
-            return;
-        }
-    }
-}
-
 PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *pipeline, const ProgramParameterMetadata &parameter,
                                      size_t leafIndex, VernonProgramValueLeafView *reflected = nullptr);
 
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
 struct PythonPullback {
-    PythonPullback(VernonRuntimeContext *runtime, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
+    PythonPullback(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline,
+                   VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
                    std::vector<PythonAdMetadata> cotangents, bool hasCarrierDimensions, nb::object pipelineOwner,
                    nb::dict bindings)
-        : runtime(runtime), handle(handle), gradients(std::move(gradients)), cotangents(std::move(cotangents)),
-          hasCarrierDimensions(hasCarrierDimensions), pipelineOwner(std::move(pipelineOwner)),
-          bindings(std::move(bindings)) {}
-    ~PythonPullback() { vernonPullbackDestroy(handle); }
+        : owner(owner), runtime(runtime), pipeline(pipeline), handle(handle), gradients(std::move(gradients)),
+          cotangents(std::move(cotangents)), hasCarrierDimensions(hasCarrierDimensions),
+          pipelineOwner(std::move(pipelineOwner)), bindings(std::move(bindings)) {}
+    ~PythonPullback() { vernonProgramPullbackDestroy(handle); }
 
     nb::dict apply(const nb::object &cotangent) { return applyImpl(cotangent, false); }
     nb::dict applyLogical(const nb::object &cotangent) { return applyImpl(cotangent, true); }
@@ -171,17 +78,6 @@ struct PythonPullback {
     nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
                                      const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
                                      const VernonPullbackApplyOptions *options);
-    bool applyGroupedDeviceWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
-                                       const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                                       const VernonPullbackApplyOptions *options, nb::dict &result,
-                                       vernon::execution::detail::RhiCommandPlanSink *sink = nullptr);
-    bool applyGroupedDevicePlanned(const nb::object &cotangent, const nb::object &gradientGroups,
-                                   const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                                   const VernonPullbackApplyOptions *options,
-                                   vernon::execution::detail::RhiCommandPlanSink &sink, nb::dict &result) {
-        return applyGroupedDeviceWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, options,
-                                             result, &sink);
-    }
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
@@ -249,253 +145,338 @@ private:
         return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
     }
 
-    bool applyDeviceImpl(const nb::object &cotangent, bool logicalCotangent, const VernonPullbackApplyOptions *options,
-                         nb::dict &result, vernon::execution::detail::RhiCommandPlanSink *sink = nullptr) {
-        std::vector<nb::object> retainedBuffers;
-        std::vector<nb::object> retainedViews;
-        std::vector<std::vector<uint64_t>> retainedShapes;
-        std::vector<std::vector<int64_t>> retainedStrides;
-        retainedShapes.reserve(cotangents.size());
-        retainedStrides.reserve(cotangents.size() + gradients.size());
-        std::vector<VernonAdDeviceValue> seeds;
-        seeds.reserve(cotangents.size());
-        VernonAdDeviceValueSet seedSet{};
-        const VernonAdDeviceValueSet *seedView = nullptr;
-        if (!cotangent.is_none()) {
-            nb::dict supplied;
-            if (cotangents.size() == 1 && !nb::isinstance<nb::dict>(cotangent))
-                supplied[nb::str(cotangents.front().path.c_str())] = cotangent;
-            else if (nb::isinstance<nb::dict>(cotangent))
-                supplied = nb::cast<nb::dict>(cotangent);
-            else
-                return false;
-            if (supplied.size() != cotangents.size())
-                return false;
-            for (const PythonAdMetadata &sourceMetadata : cotangents) {
-                PythonAdMetadata metadata = sourceMetadata;
-                if (logicalCotangent && hasCarrierDimensions) {
-                    if (metadata.shape.size() < 3)
-                        throw std::runtime_error("autodiff cotangent has no invocation carrier dimensions");
-                    metadata.shape.erase(metadata.shape.begin(), metadata.shape.begin() + 3);
-                }
-                nb::str path(sourceMetadata.path.c_str());
-                if (!supplied.contains(path))
-                    return false;
-                nb::object value = nb::borrow<nb::object>(supplied[path]);
-                if (!nb::hasattr(value, "_resident_buffer") || !nb::hasattr(value, "layout") ||
-                    nb::cast<std::vector<uint64_t>>(value.attr("shape")) != metadata.shape)
-                    return false;
-                nb::object bufferObject = sink ? value.attr("_planned_buffer")() : value.attr("_resident_buffer")();
-                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
-                nb::object layout = value.attr("layout");
-                std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
-                const size_t offset = nb::cast<size_t>(layout.attr("byte_offset"));
-                const size_t bytes = pythonAdMetadataBytes(metadata);
-                if (!buffer || strides.size() != metadata.shape.size() || offset > buffer->size)
-                    return false;
-                retainedBuffers.push_back(std::move(bufferObject));
-                retainedViews.push_back(std::move(value));
-                retainedStrides.push_back(std::move(strides));
-                retainedShapes.push_back(std::move(metadata.shape));
-                seeds.push_back({sizeof(VernonAdDeviceValue),
-                                 {sourceMetadata.path.data(), sourceMetadata.path.size()},
-                                 metadata.dtype,
-                                 buffer->handle,
-                                 offset,
-                                 buffer->size,
-                                 bytes,
-                                 static_cast<uint32_t>(retainedShapes.back().size()),
-                                 retainedShapes.back().data(),
-                                 retainedStrides.back().data(),
-                                 {}});
-            }
-            seedSet = {sizeof(VernonAdDeviceValueSet), seeds.data(), seeds.size(), {}};
-            seedView = &seedSet;
-        }
-
-        std::unordered_map<PyObject *, nb::object> gradientsByOwner;
-        std::unordered_map<PyObject *, nb::object> plannedWritesByOwner;
-        std::vector<nb::object> plannedWrites;
-        struct PlannedWriteRollback {
-            std::vector<nb::object> &transactions;
-            bool released{};
-            ~PlannedWriteRollback() {
-                if (released)
-                    return;
-                for (nb::object &transaction : transactions)
-                    try {
-                        transaction.attr("_rollback_planned_state")();
-                    } catch (...) {
-                    }
-            }
-        } plannedWriteRollback{plannedWrites};
-        std::vector<nb::object> materializedGradients;
-        std::vector<VernonAdDeviceValue> gradientViews;
-        materializedGradients.reserve(gradients.size());
-        gradientViews.reserve(gradients.size());
-        for (const PythonAdMetadata &gradient : gradients) {
-            nb::str bindingPath(gradient.binding.c_str());
-            nb::object binding =
-                bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
-            if (binding.is_none() || !nb::hasattr(binding, "_materialize_gradient") ||
-                !nb::hasattr(binding, "_gradient_device_view"))
-                return false;
-            nb::object owner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
-            auto existing = gradientsByOwner.find(owner.ptr());
-            nb::object zeros = pythonAdGradientBuffer(gradient, binding);
-            nb::object materialized =
-                existing == gradientsByOwner.end()
-                    ? binding.attr("_materialize_gradient")(zeros, gradient.path)
-                    : binding.attr("_materialize_gradient")(zeros, gradient.path, existing->second);
-            if (existing == gradientsByOwner.end())
-                gradientsByOwner.emplace(owner.ptr(), materialized);
-            nb::object deviceView = binding.attr("_gradient_device_view")(gradient.path, materialized, gradient.shape);
-            if (sink && plannedWritesByOwner.find(owner.ptr()) == plannedWritesByOwner.end()) {
-                nb::object transaction = materialized.attr("_begin_planned_device_write")();
-                plannedWritesByOwner.emplace(owner.ptr(), transaction);
-                plannedWrites.push_back(std::move(transaction));
-            }
-            nb::object bufferObject =
-                sink ? deviceView.attr("_planned_buffer")() : deviceView.attr("_resident_buffer")();
-            auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
-            nb::object layout = deviceView.attr("layout");
-            std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
-            const size_t offset = nb::cast<size_t>(layout.attr("byte_offset"));
-            const size_t bytes = pythonAdMetadataBytes(gradient);
-            if (!buffer || strides.size() != gradient.shape.size() || offset > buffer->size)
-                return false;
-            retainedBuffers.push_back(std::move(bufferObject));
-            retainedViews.push_back(std::move(deviceView));
-            materializedGradients.push_back(materialized);
-            retainedStrides.push_back(std::move(strides));
-            gradientViews.push_back({sizeof(VernonAdDeviceValue),
-                                     {gradient.path.data(), gradient.path.size()},
-                                     gradient.dtype,
-                                     buffer->handle,
-                                     offset,
-                                     buffer->size,
-                                     bytes,
-                                     static_cast<uint32_t>(gradient.shape.size()),
-                                     gradient.shape.data(),
-                                     retainedStrides.back().data(),
-                                     {}});
-        }
-        VernonAdDeviceValueSet gradientSet{
-            sizeof(VernonAdDeviceValueSet), gradientViews.data(), gradientViews.size(), {}};
-        if (!sink)
-            throw std::invalid_argument("device pullback requires canonical command-plan execution");
-        const VernonStatus status =
-            vernon::runtime::ad::applyPullbackDeviceWithPlanSink(*handle, seedView, gradientSet, options, *sink);
-        if (status != VERNON_STATUS_OK) {
-            throw std::runtime_error("device pullback application failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(runtime)));
-        }
-        if (sink) {
-            for (const nb::object &buffer : retainedBuffers)
-                retainPythonObject(*sink, buffer);
-            for (const nb::object &view : retainedViews)
-                retainPythonObject(*sink, view);
-            for (nb::object &transaction : plannedWrites)
-                retainPythonCommandCompletion(*sink, transaction);
-            plannedWriteRollback.released = true;
-        }
-        for (size_t index = 0; index < gradients.size(); ++index) {
-            if (!sink)
-                materializedGradients[index].attr("_mark_device_dirty")();
-            result[nb::str(gradients[index].path.c_str())] = materializedGradients[index];
-        }
-        return true;
-    }
-
     nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent,
                        const VernonPullbackApplyOptions *options = nullptr) {
-        std::deque<PythonAdValue> gradientValues;
-        std::vector<VernonAdValue> gradientViews;
+        (void)logicalCotangent;
+        ProgramInvocationBuilder builder(owner, runtime, pipeline);
         nb::dict result;
+        std::unordered_map<PyObject *, nb::object> gradientsByOwner;
         for (const PythonAdMetadata &gradient : gradients) {
             nb::str bindingPath(gradient.binding.c_str());
             nb::object binding =
                 bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
             nb::object zeros = pythonAdGradientBuffer(gradient, binding);
-            gradientValues.emplace_back(gradient.path, gradient.dtype, gradient.shape, zeros);
-            gradientViews.push_back(gradientValues.back().value);
-        }
-        VernonAdValueSet gradientSet{sizeof(VernonAdValueSet), gradientViews.data(), gradientViews.size(), {}};
-
-        std::deque<PythonAdValue> seeds;
-        std::vector<VernonAdValue> seedViews;
-        VernonAdValueSet seedSet{};
-        const VernonAdValueSet *seedView = nullptr;
-        const auto seedMetadata = [&](const PythonAdMetadata &metadata) {
-            PythonAdMetadata logical = metadata;
-            if (logicalCotangent && hasCarrierDimensions) {
-                if (logical.shape.size() < 3)
-                    throw std::runtime_error("autodiff cotangent has no invocation carrier dimensions");
-                logical.shape.erase(logical.shape.begin(), logical.shape.begin() + 3);
+            nb::object materialized = zeros;
+            if (!binding.is_none() && nb::hasattr(binding, "_materialize_gradient")) {
+                nb::object resourceOwner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
+                auto existing = gradientsByOwner.find(resourceOwner.ptr());
+                materialized = existing == gradientsByOwner.end()
+                                   ? binding.attr("_materialize_gradient")(zeros, gradient.path)
+                                   : binding.attr("_materialize_gradient")(zeros, gradient.path, existing->second);
+                if (existing == gradientsByOwner.end())
+                    gradientsByOwner.emplace(resourceOwner.ptr(), materialized);
             }
-            return logical;
-        };
-        nb::object suppliedCotangent = cotangent;
-        if (suppliedCotangent.is_none() && cotangents.size() == 1) {
-            const PythonAdMetadata metadata = seedMetadata(cotangents.front());
-            suppliedCotangent = nb::module_::import_("numpy").attr("ones")(
-                metadata.shape, nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(metadata.dtype)));
+            result[nb::str(gradient.path.c_str())] = std::move(materialized);
         }
-        if (!suppliedCotangent.is_none()) {
-            if (cotangents.size() == 1) {
-                const PythonAdMetadata metadata = seedMetadata(cotangents.front());
-                seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape, suppliedCotangent);
-            } else {
-                if (!nb::isinstance<nb::dict>(suppliedCotangent))
-                    throw std::invalid_argument("aggregate pullback cotangent must be a leaf-path dictionary");
-                nb::dict values = nb::cast<nb::dict>(suppliedCotangent);
-                if (values.size() != cotangents.size())
-                    throw std::invalid_argument("aggregate pullback requires every output cotangent leaf");
-                for (const PythonAdMetadata &carriedMetadata : cotangents) {
-                    const PythonAdMetadata metadata = seedMetadata(carriedMetadata);
-                    nb::str path(metadata.path.c_str());
-                    if (!values.contains(path))
-                        throw std::invalid_argument("missing output cotangent leaf '" + metadata.path + "'");
-                    seeds.emplace_back(metadata.path, metadata.dtype, metadata.shape,
-                                       nb::borrow<nb::object>(values[path]));
+
+        const auto boundaryMetadata = [&](VernonProgramBoundaryRole role) {
+            std::vector<ProgramParameterMetadata> reflected;
+            const size_t count = vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, role);
+            for (size_t index = 0; index < count; ++index) {
+                VernonProgramParameterView view{};
+                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, role, index, &view) != VERNON_STATUS_OK)
+                    throw std::runtime_error("cannot reflect canonical derivative boundary");
+                ProgramParameterMetadata parameter = parameterMetadata(view);
+                for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+                    VernonProgramValueLeafView leaf{};
+                    leaf.struct_size = sizeof(leaf);
+                    if (vernonRuntimeProgramExecutableGetBoundaryValueLeaf(pipeline, role, parameter.slot, leafIndex,
+                                                                           &leaf) != VERNON_STATUS_OK)
+                        throw std::runtime_error("cannot reflect canonical derivative boundary leaf");
+                    std::vector<ProgramParameterMetadata::PathComponent> path;
+                    for (size_t component = 0; component < leaf.path_count; ++component)
+                        path.push_back({leaf.path[component].kind == VERNON_VALUE_PATH_FIELD,
+                                        leaf.path[component].kind == VERNON_VALUE_PATH_FIELD
+                                            ? nativeStringView(leaf.path[component].field)
+                                            : "",
+                                        leaf.path[component].index});
+                    parameter.elementLeafPaths.push_back(std::move(path));
+                    parameter.elementLeafShapes.emplace_back();
+                    if (leaf.static_rank)
+                        parameter.elementLeafShapes.back().assign(leaf.static_shape,
+                                                                  leaf.static_shape + leaf.static_rank);
+                }
+                reflected.push_back(std::move(parameter));
+            }
+            return reflected;
+        };
+        const auto firstGroupLeaf = [&](VernonAdDerivativeRole role, const std::string &declaredPath) {
+            const size_t count = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline);
+            for (size_t groupIndex = 0; groupIndex < count; ++groupIndex) {
+                VernonAdDerivativeGroupView group{};
+                group.struct_size = sizeof(group);
+                if (vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
+                        VERNON_STATUS_OK ||
+                    group.role != role || nativeStringView(group.declared_path) != declaredPath || !group.leaf_count)
+                    continue;
+                VernonStringView leaf{};
+                if (vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(pipeline, groupIndex, 0, &leaf) ==
+                    VERNON_STATUS_OK)
+                    return nativeStringView(leaf);
+            }
+            throw std::runtime_error("canonical derivative boundary has no derivative group");
+        };
+        struct PackedPublication {
+            nb::object bytes;
+            size_t elementByteSize{};
+            std::vector<std::tuple<nb::object, size_t, size_t>> destinations;
+        };
+        std::vector<PackedPublication> packedPublications;
+        const auto leafPath = [](const ProgramParameterMetadata &parameter, size_t leafIndex) {
+            std::string leaf;
+            for (const auto &component : parameter.elementLeafPaths[leafIndex]) {
+                if (!leaf.empty())
+                    leaf.push_back('.');
+                leaf += component.field ? component.name : std::to_string(component.index);
+            }
+            if (leaf.empty() || parameter.name == leaf ||
+                (parameter.name.size() > leaf.size() &&
+                 parameter.name.compare(parameter.name.size() - leaf.size(), leaf.size(), leaf) == 0 &&
+                 parameter.name[parameter.name.size() - leaf.size() - 1] == '.'))
+                return parameter.name;
+            return parameter.name + "." + leaf;
+        };
+        const auto packBoundary = [&](const ProgramParameterMetadata &parameter, const nb::dict &values, bool publish) {
+            if (parameter.elementLeaves.size() != parameter.elementLeafPaths.size())
+                throw std::runtime_error("canonical aggregate boundary reflection is incomplete");
+            nb::object numpy = nb::module_::import_("numpy");
+            std::vector<uint64_t> outerShape = parameter.shape;
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+                const std::string firstPath = leafPath(parameter, leafIndex);
+                nb::str firstKey(firstPath.c_str());
+                if (!values.contains(firstKey))
+                    continue;
+                nb::object first = numpy.attr("asarray")(pythonAdArraySource(nb::borrow<nb::object>(values[firstKey])));
+                const std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(first.attr("shape"));
+                if (shape.size() < parameter.elementLeafShapes[leafIndex].size())
+                    throw std::invalid_argument("aggregate derivative leaf rank is too small");
+                outerShape.assign(shape.begin(),
+                                  shape.end() - static_cast<ptrdiff_t>(parameter.elementLeafShapes[leafIndex].size()));
+                break;
+            }
+            std::vector<uint64_t> packedShape = outerShape;
+            packedShape.push_back(parameter.elementByteSize);
+            nb::object packed = numpy.attr("zeros")(packedShape, numpy.attr("uint8"));
+            nb::object packedBytes = packed.attr("reshape")(-1, parameter.elementByteSize);
+            PackedPublication publication{packed, parameter.elementByteSize, {}};
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeaves.size(); ++leafIndex) {
+                const std::string path = leafPath(parameter, leafIndex);
+                nb::str key(path.c_str());
+                if (!values.contains(key))
+                    continue;
+                nb::object destination =
+                    numpy.attr("asarray")(pythonAdArraySource(nb::borrow<nb::object>(values[key])));
+                const size_t bytes =
+                    autodiffDtypeSize(static_cast<VernonDataType>(parameter.elementLeaves[leafIndex].dtype)) *
+                    parameter.elementLeaves[leafIndex].scalar_count;
+                nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
+                    nb::slice(nb::none(), nb::none(), nb::none()),
+                    nb::slice(static_cast<size_t>(parameter.elementLeaves[leafIndex].byte_offset),
+                              static_cast<size_t>(parameter.elementLeaves[leafIndex].byte_offset) + bytes, size_t{1})));
+                if (publish)
+                    publication.destinations.emplace_back(destination, parameter.elementLeaves[leafIndex].byte_offset,
+                                                          bytes);
+                else {
+                    nb::object leafBytes = numpy.attr("ascontiguousarray")(destination)
+                                               .attr("reshape")(-1)
+                                               .attr("view")(numpy.attr("uint8"))
+                                               .attr("reshape")(-1, bytes);
+                    numpy.attr("copyto")(region, leafBytes);
                 }
             }
-            for (PythonAdValue &seed : seeds)
-                seedViews.push_back(seed.value);
-            seedSet = {sizeof(VernonAdValueSet), seedViews.data(), seedViews.size(), {}};
-            seedView = &seedSet;
+            if (publish)
+                packedPublications.push_back(std::move(publication));
+            return packed;
+        };
+        const auto addBoundary = [&](const ProgramParameterMetadata &parameter, const nb::object &source,
+                                     VernonValueAccess access) {
+            if (parameter.kind != VERNON_PROGRAM_TENSOR)
+                throw std::invalid_argument("Program derivative boundary must be a Tensor");
+            if (nb::hasattr(source, "_resident_buffer") && nb::hasattr(source, "layout") &&
+                vernon::runtime::autodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+                nb::object bufferObject = source.attr("_resident_buffer")();
+                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+                nb::object layout = source.attr("layout");
+                builder.ownedArgument(builder.prepareRhiTensor(
+                    nb::int_(parameter.slot), buffer, access, nb::cast<std::vector<uint64_t>>(source.attr("shape")),
+                    nb::cast<std::vector<int64_t>>(layout.attr("byte_strides")),
+                    nb::cast<size_t>(layout.attr("byte_offset"))));
+            } else {
+                nb::object array = nb::module_::import_("numpy").attr("asarray")(pythonAdArraySource(source));
+                builder.ownedArgument(builder.prepareHostTensor(nb::int_(parameter.slot), array));
+            }
+        };
+        const auto derivativeMetadata = [&](VernonAdDerivativeRole role,
+                                            const ProgramParameterMetadata &parameter) -> const PythonAdMetadata & {
+            const std::string leaf = firstGroupLeaf(role, parameter.name);
+            const std::vector<PythonAdMetadata> &metadata =
+                role == VERNON_AD_DERIVATIVE_COTANGENT ? cotangents : gradients;
+            const auto found = std::find_if(metadata.begin(), metadata.end(),
+                                            [&](const PythonAdMetadata &candidate) { return candidate.path == leaf; });
+            if (found == metadata.end())
+                throw std::runtime_error("canonical derivative boundary has no Python metadata");
+            return *found;
+        };
+        const auto derivativeBinding = [&](const PythonAdMetadata &metadata) {
+            nb::str path(metadata.binding.c_str());
+            return bindings.contains(path) ? nb::borrow<nb::object>(bindings[path]) : nb::none();
+        };
+        std::vector<PyObject *> gradientSources;
+        std::vector<PyObject *> deviceGradientBuffers;
+        const auto injectiveLayout = [](const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
+                                        size_t elementBytes) {
+            std::vector<std::pair<uint64_t, uint64_t>> axes;
+            for (size_t index = 0; index < shape.size(); ++index)
+                if (shape[index] > 1)
+                    axes.emplace_back(static_cast<uint64_t>(std::abs(strides[index])), shape[index]);
+            std::sort(axes.begin(), axes.end());
+            uint64_t span = elementBytes;
+            for (const auto &[stride, extent] : axes) {
+                if (stride < span)
+                    return false;
+                if (extent - 1 > (std::numeric_limits<uint64_t>::max() - span) / stride)
+                    return false;
+                span += (extent - 1) * stride;
+            }
+            return true;
+        };
+        const auto addDerivativeBoundary = [&](const ProgramParameterMetadata &parameter, nb::object source,
+                                               VernonValueAccess access, VernonAdDerivativeRole role) {
+            const PythonAdMetadata &metadata = derivativeMetadata(role, parameter);
+            if (!nb::hasattr(source, "_resident_buffer"))
+                return addBoundary(parameter, source, access);
+            nb::object binding = derivativeBinding(metadata);
+            if (binding.is_none())
+                return addBoundary(parameter, source, access);
+            nb::object destination = source;
+            bool sharedGradient = false;
+            if (role == VERNON_AD_DERIVATIVE_GRADIENT) {
+                sharedGradient =
+                    std::find(gradientSources.begin(), gradientSources.end(), source.ptr()) != gradientSources.end();
+                if (!sharedGradient)
+                    gradientSources.push_back(source.ptr());
+            }
+            bool directDevice = vernon::runtime::autodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX;
+            nb::object bufferObject = nb::none();
+            nb::tuple boundaryLayout;
+            if (nb::hasattr(binding, "_gradient_boundary_layout") && directDevice) {
+                boundaryLayout =
+                    nb::cast<nb::tuple>(binding.attr("_gradient_boundary_layout")(source, parameter.elementByteSize));
+                const std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(boundaryLayout[0]);
+                const std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(boundaryLayout[1]);
+                directDevice &= injectiveLayout(shape, strides, parameter.elementByteSize);
+                bufferObject = source.attr("_resident_buffer")();
+                if (role == VERNON_AD_DERIVATIVE_GRADIENT) {
+                    if (std::find(deviceGradientBuffers.begin(), deviceGradientBuffers.end(), bufferObject.ptr()) !=
+                        deviceGradientBuffers.end())
+                        directDevice = false;
+                    else if (directDevice)
+                        deviceGradientBuffers.push_back(bufferObject.ptr());
+                }
+            }
+            if (!sharedGradient && parameter.elementLeaves.size() == 1 &&
+                parameter.elementLeaves.front().scalar_count == 1 &&
+                (parameter.elementLeafShapes.empty() || parameter.elementLeafShapes.front().empty()) &&
+                nb::hasattr(binding, "_gradient_device_view")) {
+                source = binding.attr("_gradient_device_view")(metadata.path, source, metadata.shape);
+                nb::object layout = source.attr("layout");
+                const std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(source.attr("shape"));
+                const std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(layout.attr("byte_strides"));
+                const bool injective =
+                    injectiveLayout(shape, strides, nb::cast<size_t>(source.attr("dtype").attr("itemsize")));
+                if (injective)
+                    return addBoundary(parameter, source, access);
+                source = destination;
+            }
+            if (directDevice && !boundaryLayout.is_none()) {
+                auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
+                builder.ownedArgument(builder.prepareRhiTensor(
+                    nb::int_(parameter.slot), buffer, access, nb::cast<std::vector<uint64_t>>(boundaryLayout[0]),
+                    nb::cast<std::vector<int64_t>>(boundaryLayout[1]), nb::cast<size_t>(boundaryLayout[2])));
+                return;
+            }
+            nb::dict leaves;
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeafPaths.size(); ++leafIndex) {
+                const std::string path = leafPath(parameter, leafIndex);
+                const auto found =
+                    std::find_if((role == VERNON_AD_DERIVATIVE_COTANGENT ? cotangents : gradients).begin(),
+                                 (role == VERNON_AD_DERIVATIVE_COTANGENT ? cotangents : gradients).end(),
+                                 [&](const PythonAdMetadata &candidate) { return candidate.path == path; });
+                if (found == (role == VERNON_AD_DERIVATIVE_COTANGENT ? cotangents : gradients).end())
+                    continue;
+                leaves[nb::str(path.c_str())] = binding.attr("_gradient_device_view")(path, source, found->shape);
+            }
+            addBoundary(parameter, packBoundary(parameter, leaves, access == VERNON_ACCESS_WRITE), access);
+        };
+
+        nb::dict supplied;
+        const auto cotangentBoundaries = boundaryMetadata(VERNON_PROGRAM_BOUNDARY_COTANGENT);
+        if (cotangent.is_none()) {
+            if (cotangentBoundaries.size() != 1 || cotangents.size() != 1)
+                throw std::invalid_argument("implicit Program cotangent requires exactly one boundary");
+            const PythonAdMetadata &metadata = cotangents.front();
+            supplied[nb::str(cotangentBoundaries.front().name.c_str())] = nb::module_::import_("numpy").attr("ones")(
+                metadata.shape, nb::module_::import_("numpy").attr("dtype")(numpyDtypeName(metadata.dtype)));
+        } else if (nb::isinstance<nb::dict>(cotangent)) {
+            supplied = nb::cast<nb::dict>(cotangent);
+        } else {
+            if (cotangentBoundaries.size() != 1)
+                throw std::invalid_argument("pullback requires one cotangent per canonical boundary");
+            supplied[nb::str(cotangentBoundaries.front().name.c_str())] = cotangent;
         }
-        const VernonStatus status = options ? vernonPullbackApplyWithOptions(handle, seedView, &gradientSet, options)
-                                            : vernonPullbackApply(handle, seedView, &gradientSet);
+        for (const ProgramParameterMetadata &parameter : cotangentBoundaries) {
+            nb::str path(parameter.name.c_str());
+            if (!supplied.contains(path))
+                throw std::invalid_argument("missing canonical cotangent boundary '" + parameter.name + "'");
+            nb::object source = nb::borrow<nb::object>(supplied[path]);
+            if (nb::isinstance<nb::dict>(source))
+                source = packBoundary(parameter, nb::cast<nb::dict>(source), false);
+            addDerivativeBoundary(parameter, source, VERNON_ACCESS_READ, VERNON_AD_DERIVATIVE_COTANGENT);
+        }
+        std::vector<nb::object> devicePublishedGradients;
+        for (const ProgramParameterMetadata &parameter : boundaryMetadata(VERNON_PROGRAM_BOUNDARY_GRADIENT)) {
+            const std::string leaf = firstGroupLeaf(VERNON_AD_DERIVATIVE_GRADIENT, parameter.name);
+            nb::str path(leaf.c_str());
+            if (!result.contains(path))
+                throw std::runtime_error("missing canonical gradient publication owner");
+            nb::object source = nb::borrow<nb::object>(result[path]);
+            if (parameter.elementLeaves.size() > 1 && !nb::hasattr(source, "_native_host_array"))
+                source = packBoundary(parameter, result, true);
+            if (nb::hasattr(source, "_resident_buffer")) {
+                devicePublishedGradients.push_back(nb::borrow<nb::object>(result[path]));
+            }
+            addDerivativeBoundary(parameter, source, VERNON_ACCESS_WRITE, VERNON_AD_DERIVATIVE_GRADIENT);
+        }
+        std::vector<VernonProgramArgument> arguments;
+        builder.collectArguments(arguments);
+        const VernonStatus status =
+            options ? vernonProgramPullbackApplyWithOptions(handle, arguments.data(), arguments.size(), options)
+                    : vernonProgramPullbackApply(handle, arguments.data(), arguments.size());
         if (status != VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
-        std::unordered_map<PyObject *, nb::object> gradientsByOwner;
-        for (size_t index = 0; index < gradientValues.size(); ++index) {
-            PythonAdValue &gradient = gradientValues[index];
-            const PythonAdMetadata &metadata = gradients[index];
-            nb::str path(gradient.path.c_str());
-            nb::str bindingPath(metadata.binding.c_str());
-            nb::object binding =
-                bindings.contains(bindingPath) ? nb::borrow<nb::object>(bindings[bindingPath]) : nb::none();
-            if (binding.is_none() || !nb::hasattr(binding, "_materialize_gradient")) {
-                result[path] = gradient.array;
-                continue;
+        nb::object numpy = nb::module_::import_("numpy");
+        for (nb::object &gradient : devicePublishedGradients)
+            if (nb::hasattr(gradient, "_mark_device_dirty"))
+                gradient.attr("_mark_device_dirty")();
+        for (PackedPublication &publication : packedPublications) {
+            nb::object packedBytes = publication.bytes.attr("reshape")(-1, publication.elementByteSize);
+            for (auto &[destination, offset, bytes] : publication.destinations) {
+                nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
+                    nb::slice(nb::none(), nb::none(), nb::none()), nb::slice(offset, offset + bytes, size_t{1})));
+                nb::object typed = region.attr("copy")()
+                                       .attr("reshape")(-1)
+                                       .attr("view")(destination.attr("dtype"))
+                                       .attr("reshape")(destination.attr("shape"));
+                numpy.attr("add")(destination, typed, nb::arg("out") = destination);
             }
-            nb::object owner = nb::hasattr(binding, "owner") ? binding.attr("owner") : binding;
-            auto existing = gradientsByOwner.find(owner.ptr());
-            nb::object materialized =
-                existing == gradientsByOwner.end()
-                    ? binding.attr("_materialize_gradient")(gradient.array, path)
-                    : binding.attr("_materialize_gradient")(gradient.array, path, existing->second);
-            if (existing == gradientsByOwner.end())
-                gradientsByOwner.emplace(owner.ptr(), materialized);
-            result[path] = std::move(materialized);
         }
         return result;
     }
 
+    Runtime *owner{};
     VernonRuntimeContext *runtime{};
+    VernonProgramExecutable *pipeline{};
     VernonPullback *handle{};
     std::vector<PythonAdMetadata> gradients;
     std::vector<PythonAdMetadata> cotangents;
@@ -527,25 +508,23 @@ struct PythonProgramExecutable {
         if (!vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline))
             throw std::runtime_error("pipeline has no Program autodiff signature");
         nb::dict signature;
-        const std::pair<const char *, VernonProgramAdBoundary> boundaries[] = {
-            {"inputs", VERNON_PROGRAM_AD_INPUT},         {"outputs", VERNON_PROGRAM_AD_OUTPUT},
-            {"cotangents", VERNON_PROGRAM_AD_COTANGENT}, {"gradients", VERNON_PROGRAM_AD_GRADIENT},
-            {"captures", VERNON_PROGRAM_AD_CAPTURE},
+        const std::pair<const char *, VernonProgramBoundaryRole> boundaries[] = {
+            {"inputs", VERNON_PROGRAM_BOUNDARY_INPUT},
+            {"outputs", VERNON_PROGRAM_BOUNDARY_OUTPUT},
+            {"cotangents", VERNON_PROGRAM_BOUNDARY_COTANGENT},
+            {"gradients", VERNON_PROGRAM_BOUNDARY_GRADIENT},
         };
         for (const auto &[name, boundary] : boundaries) {
             nb::list rows;
-            const size_t count = vernonRuntimeProgramExecutableGetProgramAdValueCount(pipeline, boundary);
+            const size_t count = vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, boundary);
             for (size_t index = 0; index < count; ++index) {
-                VernonProgramAdValueView value{};
-                value.struct_size = sizeof(value);
-                if (vernonRuntimeProgramExecutableGetProgramAdValueByIndex(pipeline, boundary, index, &value) !=
+                VernonProgramParameterView value{};
+                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, boundary, index, &value) !=
                     VERNON_STATUS_OK)
                     throw std::runtime_error("cannot read Program autodiff signature");
                 nb::dict row;
-                row["path"] = nativeStringView(value.path);
-                row["value_id"] = value.value_id;
-                row["external"] = value.external != 0;
-                row["output"] = value.output != 0;
+                row["path"] = nativeStringView(value.name);
+                row["slot"] = value.slot;
                 rows.append(std::move(row));
             }
             signature[name] = std::move(rows);
@@ -575,7 +554,7 @@ struct PythonProgramExecutable {
         VernonPullback *pullback = nullptr;
         const VernonStatus status = builder.forwardProgram(&pullback);
         if (pullback)
-            vernonPullbackDestroy(pullback);
+            vernonProgramPullbackDestroy(pullback);
         if (status != VERNON_STATUS_OK)
             throw std::runtime_error("Program forward failed: " + nativeStringView(vernonRuntimeGetLastError(runtime)));
     }
@@ -591,28 +570,6 @@ struct PythonProgramExecutable {
             const uint64_t budget = nb::cast<uint64_t>(checkpointMemoryBudget);
             vernon::runtime::autodiffSetProgramCheckpointPlan(pipeline, &budget, checkpointPolicy);
         }
-        const auto leafMetadata = [&](const char *kind, size_t index) {
-            VernonAdValueMetadataView value{};
-            value.struct_size = sizeof(value);
-            VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT;
-            if (std::string_view(kind) == "input")
-                status = vernonRuntimeProgramExecutableGetAdInputByIndex(pipeline, index, &value);
-            else if (std::string_view(kind) == "output")
-                status = vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, index, &value);
-            else if (std::string_view(kind) == "cotangent")
-                status = vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, index, &value);
-            else if (std::string_view(kind) == "gradient")
-                status = vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, index, &value);
-            if (status != VERNON_STATUS_OK)
-                throw std::runtime_error("cannot read Program autodiff leaf metadata");
-            PythonAdMetadata result;
-            result.path = nativeStringView(value.path);
-            result.binding = result.path;
-            result.dtype = value.dtype;
-            if (value.rank)
-                result.shape.assign(value.shape, value.shape + value.rank);
-            return result;
-        };
         const auto declaredDerivativePath = [&](VernonAdDerivativeRole role, const std::string &leafPath) {
             const size_t count = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline);
             for (size_t groupIndex = 0; groupIndex < count; ++groupIndex) {
@@ -632,6 +589,76 @@ struct PythonProgramExecutable {
             }
             throw std::runtime_error("Program derivative leaf has no declared group");
         };
+        const auto reflectedDerivativeLeaves = [&](VernonProgramBoundaryRole boundaryRole,
+                                                   VernonAdDerivativeRole derivativeRole) {
+            std::vector<PythonAdMetadata> result;
+            const size_t groupCount = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(pipeline);
+            for (size_t groupIndex = 0; groupIndex < groupCount; ++groupIndex) {
+                VernonAdDerivativeGroupView group{};
+                group.struct_size = sizeof(group);
+                if (vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(pipeline, groupIndex, &group) !=
+                        VERNON_STATUS_OK ||
+                    group.role != derivativeRole)
+                    continue;
+                const std::string declaredPath = nativeStringView(group.declared_path);
+                VernonProgramParameterView boundary{};
+                if (vernonRuntimeProgramExecutableFindBoundary(pipeline, boundaryRole,
+                                                               {declaredPath.data(), declaredPath.size()},
+                                                               &boundary) != VERNON_STATUS_OK)
+                    throw std::runtime_error("Program derivative group has no canonical boundary");
+                for (size_t groupLeafIndex = 0; groupLeafIndex < group.leaf_count; ++groupLeafIndex) {
+                    VernonStringView groupLeaf{};
+                    if (vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(pipeline, groupIndex, groupLeafIndex,
+                                                                               &groupLeaf) != VERNON_STATUS_OK)
+                        throw std::runtime_error("cannot read Program derivative group leaf");
+                    const std::string expectedPath = nativeStringView(groupLeaf);
+                    bool matched = false;
+                    for (size_t boundaryLeafIndex = 0; boundaryLeafIndex < boundary.element_layout.leaf_count;
+                         ++boundaryLeafIndex) {
+                        VernonProgramValueLeafView leaf{};
+                        leaf.struct_size = sizeof(leaf);
+                        if (vernonRuntimeProgramExecutableGetBoundaryValueLeaf(
+                                pipeline, boundaryRole, boundary.slot, boundaryLeafIndex, &leaf) != VERNON_STATUS_OK)
+                            throw std::runtime_error("cannot read canonical Program boundary leaf");
+                        std::string relativePath;
+                        for (size_t component = 0; component < leaf.path_count; ++component) {
+                            if (!relativePath.empty())
+                                relativePath.push_back('.');
+                            relativePath += leaf.path[component].kind == VERNON_VALUE_PATH_FIELD
+                                                ? nativeStringView(leaf.path[component].field)
+                                                : std::to_string(leaf.path[component].index);
+                        }
+                        std::string reflectedPath = declaredPath;
+                        const bool alreadyQualified =
+                            !relativePath.empty() &&
+                            (declaredPath == relativePath ||
+                             (declaredPath.size() > relativePath.size() &&
+                              declaredPath.compare(declaredPath.size() - relativePath.size(), relativePath.size(),
+                                                   relativePath) == 0 &&
+                              declaredPath[declaredPath.size() - relativePath.size() - 1] == '.'));
+                        if (!relativePath.empty() && !alreadyQualified)
+                            reflectedPath += "." + relativePath;
+                        if (reflectedPath != expectedPath)
+                            continue;
+                        PythonAdMetadata metadata;
+                        metadata.path = expectedPath;
+                        metadata.binding = declaredPath;
+                        metadata.dtype = static_cast<VernonDataType>(leaf.value.dtype);
+                        if (boundary.rank)
+                            metadata.shape.assign(boundary.static_shape, boundary.static_shape + boundary.rank);
+                        if (leaf.static_rank)
+                            metadata.shape.insert(metadata.shape.end(), leaf.static_shape,
+                                                  leaf.static_shape + leaf.static_rank);
+                        result.push_back(std::move(metadata));
+                        matched = true;
+                        break;
+                    }
+                    if (!matched)
+                        throw std::runtime_error("Program derivative group leaf is absent from its canonical boundary");
+                }
+            }
+            return result;
+        };
         nb::dict outputs;
         if (builder.pipeline != pipeline)
             throw std::invalid_argument("Program invocation builder belongs to another pipeline");
@@ -643,10 +670,11 @@ struct PythonProgramExecutable {
                 throw std::invalid_argument(error);
             throw std::runtime_error("Program autodiff forward failed: " + error);
         }
-        std::unique_ptr<VernonPullback, decltype(&vernonPullbackDestroy)> pullbackOwner(pullback,
-                                                                                        &vernonPullbackDestroy);
+        std::unique_ptr<VernonPullback, decltype(&vernonProgramPullbackDestroy)> pullbackOwner(
+            pullback, &vernonProgramPullbackDestroy);
 
-        std::vector<PythonAdMetadata> cotangents;
+        std::vector<PythonAdMetadata> cotangents =
+            reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_AD_DERIVATIVE_COTANGENT);
         const auto instantiateBoundMetadata = [&](PythonAdMetadata &leaf) {
             nb::object value = resolveProgramInputLeaf(programBindings, leaf.path);
             if (nb::hasattr(value, "_native_host_array"))
@@ -654,29 +682,24 @@ struct PythonProgramExecutable {
             nb::object array = nb::module_::import_("numpy").attr("asarray")(value);
             leaf.shape = nb::cast<std::vector<uint64_t>>(array.attr("shape"));
         };
-        const size_t cotangentCount = vernonRuntimeProgramExecutableGetAdCotangentCount(pipeline);
-        for (size_t index = 0; index < cotangentCount; ++index) {
-            PythonAdMetadata leaf = leafMetadata("cotangent", index);
+        for (PythonAdMetadata &leaf : cotangents) {
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_COTANGENT, leaf.path);
             if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
                 leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
-            cotangents.push_back(std::move(leaf));
         }
-        std::vector<PythonAdMetadata> gradients;
-        const size_t gradientCount = vernonRuntimeProgramExecutableGetAdGradientCount(pipeline);
-        for (size_t index = 0; index < gradientCount; ++index) {
-            PythonAdMetadata leaf = leafMetadata("gradient", index);
+        std::vector<PythonAdMetadata> gradients =
+            reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_GRADIENT, VERNON_AD_DERIVATIVE_GRADIENT);
+        for (PythonAdMetadata &leaf : gradients) {
             leaf.binding = declaredDerivativePath(VERNON_AD_DERIVATIVE_GRADIENT, leaf.path);
             if (const size_t separator = leaf.binding.find('.'); separator != std::string::npos)
                 leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
-            gradients.push_back(std::move(leaf));
         }
         return nb::make_tuple(outputs,
-                              std::make_unique<PythonPullback>(runtime, pullbackOwner.release(), std::move(gradients),
-                                                               std::move(cotangents), false, std::move(pipelineOwner),
-                                                               nb::dict(programBindings)));
+                              std::make_unique<PythonPullback>(owner, runtime, pipeline, pullbackOwner.release(),
+                                                               std::move(gradients), std::move(cotangents), false,
+                                                               std::move(pipelineOwner), nb::dict(programBindings)));
     }
 
     nb::list writeFootprints() const {

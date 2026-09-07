@@ -10,7 +10,11 @@ bool planProgramTensorCopy(const VernonTensorView &source, const VernonTensorVie
     if (source.rank != destination.rank ||
         (source.rank && (!source.shape || !source.byte_strides || !destination.shape || !destination.byte_strides)) ||
         !source.element_layout.byte_size || source.element_layout.byte_size != destination.element_layout.byte_size)
-        return error = "Program tensor copy has incompatible layouts", false;
+        return error = "Program tensor copy has incompatible layouts (source rank " + std::to_string(source.rank) +
+                       ", destination rank " + std::to_string(destination.rank) + ", source element bytes " +
+                       std::to_string(source.element_layout.byte_size) + ", destination element bytes " +
+                       std::to_string(destination.element_layout.byte_size) + ")",
+               false;
     for (uint32_t axis = 0; axis < source.rank; ++axis)
         if (source.shape[axis] != destination.shape[axis])
             return error = "Program tensor copy has incompatible shapes", false;

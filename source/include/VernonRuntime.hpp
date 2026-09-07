@@ -529,28 +529,24 @@ public:
     Pullback(Pullback &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
     Pullback &operator=(Pullback &&other) noexcept {
         if (this != &other) {
-            vernonPullbackDestroy(handle_);
+            vernonProgramPullbackDestroy(handle_);
             handle_ = std::exchange(other.handle_, nullptr);
         }
         return *this;
     }
-    ~Pullback() { vernonPullbackDestroy(handle_); }
+    ~Pullback() { vernonProgramPullbackDestroy(handle_); }
 
-    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients, uint64_t maximumTemporaryBytes,
-               uint64_t maximumReusableConstructionBytes = 0) const {
+    void apply(const VernonProgramArgument *arguments, size_t argumentCount, uint64_t maximumTemporaryBytes) const {
         if (!handle_)
             throw std::logic_error("pullback is empty");
-        const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
-                                                 VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
-                                                 maximumTemporaryBytes,
-                                                 maximumReusableConstructionBytes,
-                                                 {}};
-        if (vernonPullbackApplyWithOptions(handle_, cotangents, &gradients, &options) != VERNON_STATUS_OK)
+        const VernonPullbackApplyOptions options{
+            sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, maximumTemporaryBytes, {}};
+        if (vernonProgramPullbackApplyWithOptions(handle_, arguments, argumentCount, &options) != VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed");
     }
 
-    void apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients) const {
-        apply(cotangents, gradients, std::numeric_limits<uint64_t>::max());
+    void apply(const VernonProgramArgument *arguments, size_t argumentCount) const {
+        apply(arguments, argumentCount, std::numeric_limits<uint64_t>::max());
     }
 
     explicit operator bool() const noexcept { return handle_ != nullptr; }

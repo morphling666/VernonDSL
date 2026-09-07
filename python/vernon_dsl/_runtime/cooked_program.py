@@ -191,6 +191,13 @@ class CookedProgram:
                 value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
                 self._binding_cache.bind_argument(builder, self._native, parameter, value)
             output, native_pullback = self._native.program_vjp_bound(builder, bindings)
+        if state._architecture != state.cpu:
+            for parameter in parameters:
+                if parameter.name in grid_values:
+                    continue
+                value = bindings[parameter.name]
+                if parameter.access != state._native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
+                    value._mark_device_dirty()
         groups = tuple(
             DerivativeGroup(str(role), str(path), tuple(str(leaf) for leaf in leaves))
             for role, path, leaves in self._native.derivative_groups

@@ -421,6 +421,17 @@ Pullback application:
 3. materializes and executes the resolved backward schedule;
 4. publishes fresh public gradients transactionally.
 
+The C ABI performs this application only through
+`vernonProgramPullbackApply` or `vernonProgramPullbackApplyWithOptions`.
+Their argument array contains `VernonProgramArgument` records whose slots are
+the exact reflected Cotangent and Gradient Program boundary slots. Generic
+boundary reflection uses
+`vernonRuntimeProgramExecutableGetBoundaryCount`,
+`vernonRuntimeProgramExecutableGetBoundaryByIndex`, and
+`vernonRuntimeProgramExecutableFindBoundary`; derivative leaf/group reflection
+is metadata and is not an execution transport. The retained handle is released
+with `vernonProgramPullbackDestroy`.
+
 The internal ExecutionGraph checkpoint planner receives the complete
 primal/reverse DAG. Runtime owns command recording, submission, synchronization,
 and readback. Runtime AD emits replay, checkpoint and derivative command nodes;

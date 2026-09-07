@@ -124,13 +124,20 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
     VernonRhiBuffer sourceBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     VernonRhiBuffer outputBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer seedBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer gradientBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &sourceBuffer), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &outputBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &seedBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &gradientBuffer), VERNON_RHI_STATUS_OK);
     const float source = 3.0f;
     const float zero = 0.0f;
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), sourceBuffer, 0, &source, sizeof(source)),
               VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), outputBuffer, 0, &zero, sizeof(zero)), VERNON_RHI_STATUS_OK);
+    const float seedValue = 1.0f;
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), seedBuffer, 0, &seedValue, sizeof(seedValue)),
+              VERNON_RHI_STATUS_OK);
 
     const VernonProgramParameterView sourceParameter = parameter(pipeline, "source");
     const VernonProgramParameterView outputParameter = parameter(pipeline, "output");
@@ -190,25 +197,19 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
               VERNON_RHI_STATUS_OK);
     EXPECT_FLOAT_EQ(output, 9.0f);
 
-    const uint64_t shape[]{1};
-    float seedValue = 1.0f;
     float gradientValue = 0.0f;
-    VernonAdValue seed{sizeof(VernonAdValue),
-                       {"output", std::strlen("output")},
-                       VERNON_DATA_F32,
-                       &seedValue,
-                       sizeof(seedValue),
-                       1,
-                       shape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
-    VernonAdValue gradient{sizeof(VernonAdValue),
-                           {"source", std::strlen("source")},
-                           VERNON_DATA_F32,
-                           &gradientValue,
-                           sizeof(gradientValue),
-                           1,
-                           shape};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
+    VernonProgramParameterView cotangent{};
+    VernonProgramParameterView gradient{};
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0, &cotangent),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0, &gradient),
+        VERNON_STATUS_OK);
+    VernonProgramArgument derivativeArguments[]{
+        tensorArgument(context, seedBuffer, cotangent),
+        tensorArgument(context, gradientBuffer, gradient),
+    };
     constexpr std::array failureBoundaries{
         vernon::runtime::program_execution::FailureBoundary::Planning,
         vernon::runtime::program_execution::FailureBoundary::Allocation,
@@ -219,21 +220,36 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     };
     for (const auto boundary : failureBoundaries) {
         gradientValue = -31.0f;
+        ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), gradientBuffer, 0, &gradientValue, sizeof(gradientValue)),
+                  VERNON_RHI_STATUS_OK);
         vernon::runtime::program_execution::setFailureInjectionForTesting(boundary);
-        EXPECT_NE(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << static_cast<int>(boundary);
+        EXPECT_NE(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+                  VERNON_STATUS_OK)
+            << static_cast<int>(boundary);
         vernon::runtime::program_execution::clearFailureInjectionForTesting();
+        ASSERT_EQ(
+            vernonRhiDeviceDownloadBuffer(owned.device(), gradientBuffer, 0, &gradientValue, sizeof(gradientValue)),
+            VERNON_RHI_STATUS_OK);
         EXPECT_FLOAT_EQ(gradientValue, -31.0f);
     }
     gradientValue = 0.0f;
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), gradientBuffer, 0, &gradientValue, sizeof(gradientValue)),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), gradientBuffer, 0, &gradientValue, sizeof(gradientValue)),
+              VERNON_RHI_STATUS_OK);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramInstanceDestroy(instance);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), gradientBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), seedBuffer), VERNON_RHI_STATUS_OK);
 }
 
 } // namespace

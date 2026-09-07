@@ -71,15 +71,13 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                            std::map<uint32_t, VernonProgramArgument> &externalValues,
                            std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
                            std::string &error) {
-    const VernonStageInvocationDescriptor &invocation = request.invocation;
-    if (invocation.argument_count != request.valueBySlot.size() ||
-        (invocation.argument_count && !invocation.arguments)) {
+    if (request.argumentCount != request.valueBySlot.size() || (request.argumentCount && !request.arguments)) {
         error = "Program invocation does not match its canonical boundary slots";
         return false;
     }
     std::map<uint32_t, const VernonProgramArgument *> bySlot;
-    for (size_t index = 0; index < invocation.argument_count; ++index) {
-        const VernonProgramArgument &argument = invocation.arguments[index];
+    for (size_t index = 0; index < request.argumentCount; ++index) {
+        const VernonProgramArgument &argument = request.arguments[index];
         if (!bySlot.emplace(argument.slot, &argument).second) {
             error = "Program invocation binds one canonical slot more than once";
             return false;
@@ -118,16 +116,9 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 error = "resolved commit-after-success publication has no canonical target";
                 return false;
             }
-            if (target->role != program::BoundaryRole::Output ||
-                boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage) {
-                error = "commit-after-success publication requires its exact Storage output slot";
-                return false;
-            }
-            const auto storage =
-                std::find_if(execution.storages.begin(), execution.storages.end(),
-                             [&](const program::Storage &candidate) { return candidate.id == boundary.aliasOwner.id; });
-            if (storage == execution.storages.end()) {
-                error = "Program output boundary references an unknown Storage";
+            if (target->role != boundary.role ||
+                (boundary.role != program::BoundaryRole::Output && boundary.role != program::BoundaryRole::Gradient)) {
+                error = "commit-after-success publication requires its exact publication slot";
                 return false;
             }
             if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
@@ -179,7 +170,8 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 if (!program_execution::resolveBorrowedProgramImage(context, storage, supplied->second->image.view,
                                                                     resolvedImage, error))
                     return false;
-            } else if (boundary.role != program::BoundaryRole::Output) {
+            } else if (boundary.role != program::BoundaryRole::Output &&
+                       boundary.role != program::BoundaryRole::Gradient) {
                 error = "owned Program image Storage cannot be supplied as an input boundary";
                 return false;
             }

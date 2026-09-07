@@ -21,7 +21,8 @@ struct ResolvedExecutionPlan;
 namespace vernon::runtime::ad {
 
 struct ProgramBoundaryBindingRequest {
-    const VernonStageInvocationDescriptor &invocation;
+    const VernonProgramArgument *arguments{};
+    size_t argumentCount{};
     const std::vector<std::pair<uint32_t, uint32_t>> &valueBySlot;
     program_execution::PublicationTransaction *publication{};
 };

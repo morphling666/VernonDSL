@@ -44,13 +44,32 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     float output[laneCount]{};
     const uint64_t vectorShape[]{laneCount};
     const uint64_t outputShape[]{1, 1, laneCount};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"carriers", 8}, VERNON_DATA_F32, carriers, sizeof(carriers), 1, vectorShape},
-        {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scale, sizeof(scale), 0, nullptr},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output, sizeof(output), 3, outputShape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"carriers", 8},
+         VERNON_DATA_F32,
+         carriers,
+         sizeof(carriers),
+         1,
+         vectorShape},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"scale", 5},
+         VERNON_DATA_F32,
+         &scale,
+         sizeof(scale),
+         0,
+         nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F32,
+         output,
+         sizeof(output),
+         3,
+         outputShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
               VERNON_STATUS_OK)
@@ -70,23 +89,36 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     const float weights[laneCount]{1.0f, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f, 13.0f, 17.0f};
     for (size_t lane = 0; lane < laneCount; ++lane)
         seedValues[lane] = weights[lane];
-    VernonAdValue seed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 3, outputShape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                              {"output", 6},
+                                              VERNON_DATA_F32,
+                                              seedValues,
+                                              sizeof(seedValues),
+                                              3,
+                                              outputShape};
+    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
     float carrierGradients[laneCount]{};
     float scaleGradient{};
-    VernonAdValue gradientValues[]{
-        {sizeof(VernonAdValue),
+    vernon::tests::DerivativeLeafFixture gradientValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
          {"carriers", 8},
          VERNON_DATA_F32,
          carrierGradients,
          sizeof(carrierGradients),
          1,
          vectorShape},
-        {sizeof(VernonAdValue), {"scale", 5}, VERNON_DATA_F32, &scaleGradient, sizeof(scaleGradient), 0, nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"scale", 5},
+         VERNON_DATA_F32,
+         &scaleGradient,
+         sizeof(scaleGradient),
+         0,
+         nullptr},
     };
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, std::size(gradientValues), {}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
 
     float expectedScaleGradient = 0.0f;
     for (size_t lane = 0; lane < laneCount; ++lane) {
@@ -99,7 +131,8 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
     std::fill(std::begin(carrierGradients), std::end(carrierGradients), 0.0f);
     scaleGradient = 0.0f;
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     for (size_t lane = 0; lane < laneCount; ++lane) {
         const size_t groupBase = lane / 4 * 4;
         const size_t consumer = groupBase + (lane + 3) % 4;
@@ -107,7 +140,7 @@ TEST(RuntimeWorkgroupAutodiff, ReplaysBarriersInReverseForEveryLaneGradient) {
     }
     EXPECT_FLOAT_EQ(scaleGradient, expectedScaleGradient);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

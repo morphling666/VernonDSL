@@ -72,14 +72,22 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         constexpr size_t laneCount = 6;
         const uint64_t outputShape[]{1, 3, 2};
         float outputValues[laneCount]{};
-        VernonAdValue inputValues[] = {
-            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
-            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
-            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
-            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 3, outputShape},
+        vernon::tests::DerivativeLeafFixture inputValues[] = {
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"output", 6},
+             VERNON_DATA_F32,
+             outputValues,
+             sizeof(outputValues),
+             3,
+             outputShape},
         };
-        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {}};
-        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+        vernon::tests::DerivativeLeafSetFixture inputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, 4, {}};
+        vernon::tests::DerivativeLeafSetFixture outputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
         ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
                   VERNON_STATUS_OK)
@@ -91,23 +99,46 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
         float seedValue = 1.75f;
         float seedValues[laneCount];
         std::fill(std::begin(seedValues), std::end(seedValues), seedValue);
-        VernonAdValue seed{
-            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 3, outputShape};
-        VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+        vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                  {"output", 6},
+                                                  VERNON_DATA_F32,
+                                                  seedValues,
+                                                  sizeof(seedValues),
+                                                  3,
+                                                  outputShape};
+        vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
         float gradientValuesStorage[3]{};
-        VernonAdValue gradientValues[] = {
-            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientValuesStorage[0], sizeof(float), {}},
-            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientValuesStorage[1], sizeof(float), {}},
-            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientValuesStorage[2], sizeof(float), {}},
+        vernon::tests::DerivativeLeafFixture gradientValues[] = {
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"x", 1},
+             VERNON_DATA_F32,
+             &gradientValuesStorage[0],
+             sizeof(float),
+             {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"y", 1},
+             VERNON_DATA_F32,
+             &gradientValuesStorage[1],
+             sizeof(float),
+             {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"z", 1},
+             VERNON_DATA_F32,
+             &gradientValuesStorage[2],
+             sizeof(float),
+             {}},
         };
-        VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {}};
-        ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+        vernon::tests::DerivativeLeafSetFixture gradients{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, 3, {}};
+        ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+            << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
             EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
 
         seedValue = 0.5f;
         std::fill(std::begin(seedValues), std::end(seedValues), seedValue);
-        ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+        ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+            << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
             EXPECT_NEAR(gradientValuesStorage[index], 6.0 * seedValue * finiteDifference(x, y, z, index), 3e-3);
 
@@ -119,36 +150,39 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
                 const float concurrentSeedValue = static_cast<float>(worker + 1);
                 float concurrentSeedValues[laneCount];
                 std::fill(std::begin(concurrentSeedValues), std::end(concurrentSeedValues), concurrentSeedValue);
-                VernonAdValue concurrentSeed{sizeof(VernonAdValue),
-                                             {"output", 6},
-                                             VERNON_DATA_F32,
-                                             concurrentSeedValues,
-                                             sizeof(concurrentSeedValues),
-                                             3,
-                                             outputShape};
-                VernonAdValueSet concurrentSeeds{sizeof(VernonAdValueSet), &concurrentSeed, 1, {}};
-                VernonAdValue concurrentGradientValues[] = {
-                    {sizeof(VernonAdValue),
+                vernon::tests::DerivativeLeafFixture concurrentSeed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                                    {"output", 6},
+                                                                    VERNON_DATA_F32,
+                                                                    concurrentSeedValues,
+                                                                    sizeof(concurrentSeedValues),
+                                                                    3,
+                                                                    outputShape};
+                vernon::tests::DerivativeLeafSetFixture concurrentSeeds{
+                    sizeof(vernon::tests::DerivativeLeafSetFixture), &concurrentSeed, 1, {}};
+                vernon::tests::DerivativeLeafFixture concurrentGradientValues[] = {
+                    {sizeof(vernon::tests::DerivativeLeafFixture),
                      {"x", 1},
                      VERNON_DATA_F32,
                      &concurrentGradientStorage[worker][0],
                      sizeof(float),
                      {}},
-                    {sizeof(VernonAdValue),
+                    {sizeof(vernon::tests::DerivativeLeafFixture),
                      {"y", 1},
                      VERNON_DATA_F32,
                      &concurrentGradientStorage[worker][1],
                      sizeof(float),
                      {}},
-                    {sizeof(VernonAdValue),
+                    {sizeof(vernon::tests::DerivativeLeafFixture),
                      {"z", 1},
                      VERNON_DATA_F32,
                      &concurrentGradientStorage[worker][2],
                      sizeof(float),
                      {}},
                 };
-                VernonAdValueSet concurrentGradients{sizeof(VernonAdValueSet), concurrentGradientValues, 3, {}};
-                concurrentStatuses[worker] = vernonPullbackApply(pullback, &concurrentSeeds, &concurrentGradients);
+                vernon::tests::DerivativeLeafSetFixture concurrentGradients{
+                    sizeof(vernon::tests::DerivativeLeafSetFixture), concurrentGradientValues, 3, {}};
+                concurrentStatuses[worker] =
+                    vernon::tests::applyCanonicalPullback(pipeline, pullback, &concurrentSeeds, &concurrentGradients);
             });
         }
         for (std::thread &worker : workers)
@@ -159,7 +193,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
                 EXPECT_NEAR(concurrentGradientStorage[worker][index],
                             6.0 * static_cast<double>(worker + 1) * finiteDifference(x, y, z, index), 3e-3);
         }
-        vernonPullbackDestroy(pullback);
+        vernonProgramPullbackDestroy(pullback);
     };
     runCase(1.2f, 0.7f, 0.2f);
     runCase(0.8f, 0.3f, 0.6f);
@@ -170,14 +204,22 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     constexpr size_t laneCount = 12;
     float outputValues[laneCount]{};
     const uint64_t outputShape[]{1, 3, 4};
-    VernonAdValue inputValues[] = {
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
-        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), 0, nullptr},
-        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), 0, nullptr},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, outputValues, sizeof(outputValues), 3, outputShape},
+    vernon::tests::DerivativeLeafFixture inputValues[] = {
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), 0, nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), 0, nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), 0, nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F32,
+         outputValues,
+         sizeof(outputValues),
+         3,
+         outputShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, 4, {0, 0, 0, 0}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {0, 0, 0, 0}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, 4, {0, 0, 0, 0}};
+    vernon::tests::DerivativeLeafSetFixture outputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {0, 0, 0, 0}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {2, 1, 1}, inputs, outputs, &pullback),
               VERNON_STATUS_OK)
@@ -189,20 +231,46 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     float seedValues[laneCount];
     for (size_t lane = 0; lane < laneCount; ++lane)
         seedValues[lane] = static_cast<float>(lane + 1);
-    VernonAdValue seed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues, sizeof(seedValues), 3, outputShape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {0, 0, 0, 0}};
+    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                              {"output", 6},
+                                              VERNON_DATA_F32,
+                                              seedValues,
+                                              sizeof(seedValues),
+                                              3,
+                                              outputShape};
+    vernon::tests::DerivativeLeafSetFixture seeds{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {0, 0, 0, 0}};
     float gradientStorage[3]{};
-    VernonAdValue gradientValues[] = {
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), 0, nullptr},
-        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), 0, nullptr},
-        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientStorage[2], sizeof(float), 0, nullptr},
+    vernon::tests::DerivativeLeafFixture gradientValues[] = {
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"x", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[0],
+         sizeof(float),
+         0,
+         nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"y", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[1],
+         sizeof(float),
+         0,
+         nullptr},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"z", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[2],
+         sizeof(float),
+         0,
+         nullptr},
     };
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, 3, {0, 0, 0, 0}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, 3, {0, 0, 0, 0}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     for (unsigned index = 0; index < 3; ++index)
         EXPECT_NEAR(gradientStorage[index], 78.0 * finiteDifference(x, y, z, index), 3e-3);
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
 
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
@@ -234,14 +302,21 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
     constexpr size_t laneCount = 6;
     const uint64_t outputShape[]{1, 3, 2};
     std::array<float, laneCount> output{};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
-        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
-        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 3, outputShape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F32,
+         output.data(),
+         sizeof(output),
+         3,
+         outputShape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
     constexpr std::array forwardFailures{
         FailureBoundary::Planning,       FailureBoundary::Allocation, FailureBoundary::Submission,
         FailureBoundary::TapeValidation, FailureBoundary::Commit,
@@ -266,25 +341,47 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
     ASSERT_NE(pullback, nullptr);
     std::array<float, laneCount> seedValues{};
     seedValues.fill(1.0f);
-    VernonAdValue seed{
-        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues.data(), sizeof(seedValues), 3, outputShape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                              {"output", 6},
+                                              VERNON_DATA_F32,
+                                              seedValues.data(),
+                                              sizeof(seedValues),
+                                              3,
+                                              outputShape};
+    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
     std::array<float, 3> gradientStorage{};
-    VernonAdValue gradientValues[]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), {}},
-        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), {}},
-        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientStorage[2], sizeof(float), {}},
+    vernon::tests::DerivativeLeafFixture gradientValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"x", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[0],
+         sizeof(float),
+         {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"y", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[1],
+         sizeof(float),
+         {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"z", 1},
+         VERNON_DATA_F32,
+         &gradientStorage[2],
+         sizeof(float),
+         {}},
     };
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, std::size(gradientValues), {}};
     for (FailureBoundary boundary : forwardFailures) {
         gradientStorage.fill(-23.0f);
         setFailureInjectionForTesting(boundary);
-        EXPECT_NE(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << static_cast<int>(boundary);
+        EXPECT_NE(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+            << static_cast<int>(boundary);
         clearFailureInjectionForTesting();
         EXPECT_EQ(gradientStorage, (std::array<float, 3>{-23, -23, -23}));
     }
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     vernonRuntimeDestroy(context);
@@ -334,11 +431,11 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
         std::vector<float> output(workgroupCount * 6);
         const uint64_t outputShape[]{static_cast<uint64_t>(grid.z), static_cast<uint64_t>(grid.y) * 3,
                                      static_cast<uint64_t>(grid.x) * 2};
-        VernonAdValue inputValues[]{
-            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
-            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
-            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
-            {sizeof(VernonAdValue),
+        vernon::tests::DerivativeLeafFixture inputValues[]{
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
              {"output", 6},
              VERNON_DATA_F32,
              output.data(),
@@ -346,8 +443,10 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
              3,
              outputShape},
         };
-        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+        vernon::tests::DerivativeLeafSetFixture inputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+        vernon::tests::DerivativeLeafSetFixture outputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
         ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, grid, inputs, outputs, &pullback),
                   VERNON_STATUS_OK)
@@ -358,33 +457,50 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
         verifyAfterForward(pullback);
 
         std::vector<float> seeds(output.size(), 1.0f);
-        VernonAdValue seed{sizeof(VernonAdValue),
-                           {"output", 6},
-                           VERNON_DATA_F32,
-                           seeds.data(),
-                           seeds.size() * sizeof(float),
-                           3,
-                           outputShape};
-        VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &seed, 1, {}};
+        vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                  {"output", 6},
+                                                  VERNON_DATA_F32,
+                                                  seeds.data(),
+                                                  seeds.size() * sizeof(float),
+                                                  3,
+                                                  outputShape};
+        vernon::tests::DerivativeLeafSetFixture cotangents{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
         float gradientStorage[3]{};
-        VernonAdValue gradientValues[]{
-            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), {}},
-            {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), {}},
-            {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientStorage[2], sizeof(float), {}},
+        vernon::tests::DerivativeLeafFixture gradientValues[]{
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"x", 1},
+             VERNON_DATA_F32,
+             &gradientStorage[0],
+             sizeof(float),
+             {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"y", 1},
+             VERNON_DATA_F32,
+             &gradientStorage[1],
+             sizeof(float),
+             {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"z", 1},
+             VERNON_DATA_F32,
+             &gradientStorage[2],
+             sizeof(float),
+             {}},
         };
-        VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
+        vernon::tests::DerivativeLeafSetFixture gradients{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), gradientValues, std::size(gradientValues), {}};
         const VernonPullbackApplyOptions applyOptions{sizeof(VernonPullbackApplyOptions),
                                                       VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
                                                       std::numeric_limits<uint64_t>::max(),
-                                                      std::numeric_limits<uint64_t>::max(),
                                                       {}};
-        ASSERT_EQ(vernonPullbackApplyWithOptions(pullback, &cotangents, &gradients, &applyOptions), VERNON_STATUS_OK)
+        ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
+                  VERNON_STATUS_OK)
             << lastError(context);
         for (unsigned index = 0; index < 3; ++index)
             EXPECT_NEAR(gradientStorage[index], static_cast<double>(output.size()) * finiteDifference(x, y, z, index),
                         0.004 * output.size());
         verifyAfterBackward(pullback);
-        vernonPullbackDestroy(pullback);
+        vernonProgramPullbackDestroy(pullback);
     };
 
     VernonProgramExecutable *pipeline = nullptr;
@@ -448,13 +564,21 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
         float x = 1.25f;
         float output = 0.0f;
         const uint64_t shape[]{1};
-        VernonAdValue inputValues[]{
-            {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
-            {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
-            {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &output, sizeof(output), 1, shape},
+        vernon::tests::DerivativeLeafFixture inputValues[]{
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
+            {sizeof(vernon::tests::DerivativeLeafFixture),
+             {"output", 6},
+             VERNON_DATA_F32,
+             &output,
+             sizeof(output),
+             1,
+             shape},
         };
-        VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-        VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+        vernon::tests::DerivativeLeafSetFixture inputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+        vernon::tests::DerivativeLeafSetFixture outputs{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
         VernonPullback *pullback = nullptr;
         EXPECT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
                   VERNON_STATUS_OK)
@@ -466,15 +590,23 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
 
         metrics.reset();
         float seedValue = 1.0f;
-        VernonAdValue seed{
-            sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), 1, shape};
-        VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+        vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                  {"output", 6},
+                                                  VERNON_DATA_F32,
+                                                  &seedValue,
+                                                  sizeof(seedValue),
+                                                  1,
+                                                  shape};
+        vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
         float gradient = 0.0f;
-        VernonAdValue gradientValue{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradient, sizeof(gradient), {}};
-        VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
-        EXPECT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
+        vernon::tests::DerivativeLeafFixture gradientValue{
+            sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &gradient, sizeof(gradient), {}};
+        vernon::tests::DerivativeLeafSetFixture gradients{
+            sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
+        EXPECT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &seeds, &gradients), VERNON_STATUS_OK)
+            << lastError(context);
         EXPECT_FLOAT_EQ(gradient, 1.0f + 2.0f * count);
-        vernonPullbackDestroy(pullback);
+        vernonProgramPullbackDestroy(pullback);
         return metrics;
     };
 
@@ -525,13 +657,20 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     int32_t count = 1;
     float output = -17.0f;
     const uint64_t shape[]{1};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
-        {sizeof(VernonAdValue), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &output, sizeof(output), 1, shape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"count", 5}, VERNON_DATA_I32, &count, sizeof(count), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F32,
+         &output,
+         sizeof(output),
+         1,
+         shape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
     VernonPullback *calibrationPullback = nullptr;
     ASSERT_EQ(
         vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &calibrationPullback),
@@ -540,16 +679,28 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     ASSERT_NE(calibrationPullback, nullptr);
     float calibrationGradient = 0.0f;
     float seedValue = 1.0f;
-    VernonAdValue seed{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, &seedValue, sizeof(seedValue), 1, shape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
-    VernonAdValue calibrationGradientValue{sizeof(VernonAdValue),       {"x", 1}, VERNON_DATA_F32, &calibrationGradient,
-                                           sizeof(calibrationGradient), {}};
-    VernonAdValueSet calibrationGradients{sizeof(VernonAdValueSet), &calibrationGradientValue, 1, {}};
-    ASSERT_EQ(vernonPullbackApply(calibrationPullback, &seeds, &calibrationGradients), VERNON_STATUS_OK)
+    vernon::tests::DerivativeLeafFixture seed{sizeof(vernon::tests::DerivativeLeafFixture),
+                                              {"output", 6},
+                                              VERNON_DATA_F32,
+                                              &seedValue,
+                                              sizeof(seedValue),
+                                              1,
+                                              shape};
+    vernon::tests::DerivativeLeafSetFixture seeds{sizeof(vernon::tests::DerivativeLeafSetFixture), &seed, 1, {}};
+    vernon::tests::DerivativeLeafFixture calibrationGradientValue{sizeof(vernon::tests::DerivativeLeafFixture),
+                                                                  {"x", 1},
+                                                                  VERNON_DATA_F32,
+                                                                  &calibrationGradient,
+                                                                  sizeof(calibrationGradient),
+                                                                  {}};
+    vernon::tests::DerivativeLeafSetFixture calibrationGradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &calibrationGradientValue, 1, {}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, calibrationPullback, &seeds, &calibrationGradients),
+              VERNON_STATUS_OK)
         << lastError(context);
     const size_t oneInvocationBytes = calibrationPolicy->usage().peakBytes;
     ASSERT_GT(oneInvocationBytes, 0u);
-    vernonPullbackDestroy(calibrationPullback);
+    vernonProgramPullbackDestroy(calibrationPullback);
     EXPECT_EQ(vernon::runtime::ad::hostTapeMemoryPolicyChargedBytesForTesting(*calibrationPolicy), 0u);
     vernonRuntimeProgramExecutableDestroy(pipeline);
 
@@ -596,25 +747,34 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
     VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
-    VernonAdValueMetadataView outputMetadata{sizeof(VernonAdValueMetadataView)};
-    VernonAdValueMetadataView cotangentMetadata{sizeof(VernonAdValueMetadataView)};
-    VernonAdValueMetadataView gradientMetadata{sizeof(VernonAdValueMetadataView)};
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdOutputByIndex(pipeline, 0, &outputMetadata), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdCotangentByIndex(pipeline, 0, &cotangentMetadata), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramExecutableGetAdGradientByIndex(pipeline, 0, &gradientMetadata), VERNON_STATUS_OK);
-    EXPECT_EQ(outputMetadata.dtype, VERNON_DATA_F64);
-    EXPECT_EQ(cotangentMetadata.dtype, VERNON_DATA_F64);
-    EXPECT_EQ(gradientMetadata.dtype, VERNON_DATA_F64);
+    const auto expectBoundaryF64 = [&](VernonProgramBoundaryRole role) {
+        VernonProgramParameterView boundary{};
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, role, 0, &boundary), VERNON_STATUS_OK);
+        VernonProgramValueLeafView leaf{sizeof(VernonProgramValueLeafView)};
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryValueLeaf(pipeline, role, boundary.slot, 0, &leaf),
+                  VERNON_STATUS_OK);
+        EXPECT_EQ(leaf.value.dtype, VERNON_DATA_F64);
+    };
+    expectBoundaryF64(VERNON_PROGRAM_BOUNDARY_OUTPUT);
+    expectBoundaryF64(VERNON_PROGRAM_BOUNDARY_COTANGENT);
+    expectBoundaryF64(VERNON_PROGRAM_BOUNDARY_GRADIENT);
 
     double x = 1.5;
     double output = 0.0;
     const uint64_t shape[]{1};
-    VernonAdValue inputValues[]{
-        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F64, &x, sizeof(x), {}},
-        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F64, &output, sizeof(output), 1, shape},
+    vernon::tests::DerivativeLeafFixture inputValues[]{
+        {sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F64, &x, sizeof(x), {}},
+        {sizeof(vernon::tests::DerivativeLeafFixture),
+         {"output", 6},
+         VERNON_DATA_F64,
+         &output,
+         sizeof(output),
+         1,
+         shape},
     };
-    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
-    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    vernon::tests::DerivativeLeafSetFixture inputs{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), inputValues, std::size(inputValues), {}};
+    vernon::tests::DerivativeLeafSetFixture outputs{sizeof(vernon::tests::DerivativeLeafSetFixture), nullptr, 0, {}};
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
               VERNON_STATUS_OK)
@@ -624,17 +784,23 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
 
     double gradient = 0.0;
     double seed = 1.0;
-    VernonAdValue cotangent{sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F64, &seed, sizeof(seed), 1, shape};
-    VernonAdValueSet cotangents{sizeof(VernonAdValueSet), &cotangent, 1, {}};
-    VernonAdValue gradientValue{sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F64, &gradient, sizeof(gradient), {}};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradientValue, 1, {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    vernon::tests::DerivativeLeafFixture cotangent{
+        sizeof(vernon::tests::DerivativeLeafFixture), {"output", 6}, VERNON_DATA_F64, &seed, sizeof(seed), 1, shape};
+    vernon::tests::DerivativeLeafSetFixture cotangents{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &cotangent, 1, {}};
+    vernon::tests::DerivativeLeafFixture gradientValue{
+        sizeof(vernon::tests::DerivativeLeafFixture), {"x", 1}, VERNON_DATA_F64, &gradient, sizeof(gradient), {}};
+    vernon::tests::DerivativeLeafSetFixture gradients{
+        sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_DOUBLE_EQ(gradient, 4.0);
     seed = 2.0;
-    ASSERT_EQ(vernonPullbackApply(pullback, &cotangents, &gradients), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
+        << lastError(context);
     EXPECT_DOUBLE_EQ(gradient, 8.0);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);

@@ -3,7 +3,6 @@
 
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime/autodiff/runtime_forward_plan.h"
 #include "runtime/pipeline_bundle.h"
 #include "runtime/pipeline_manifest.h"
 #include "runtime/program_execution/execution_control_plane.h"
@@ -17,10 +16,6 @@
 #include <vector>
 
 struct VernonRuntimeContext;
-
-namespace vernon::execution::detail {
-class RhiCommandPlanSink;
-} // namespace vernon::execution::detail
 
 namespace vernon::runtime {
 class ContextLease;
@@ -74,18 +69,18 @@ struct PullbackMemoryUsage {
 
 struct PullbackApplyOptions {
     size_t maximumTemporaryBytes{std::numeric_limits<size_t>::max()};
-    size_t maximumReusableConstructionBytes{};
 };
 
 struct ForwardExecutionTarget {
-    const VernonStageInvocationDescriptor *invocation{};
+    const VernonProgramArgument *arguments{};
+    size_t argumentCount{};
     const ProgramInvocationContext *programContext{};
 };
 
 class PullbackExecution {
 public:
     virtual ~PullbackExecution() = default;
-    virtual VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
+    virtual VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
                                const PullbackApplyOptions &options) = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
     virtual program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const { return {}; }
@@ -94,19 +89,12 @@ public:
     virtual uint64_t peakRuntimeManagedBytes() const;
 };
 
-class DevicePullbackExecution : public PullbackExecution {
-public:
-    virtual VernonStatus applyDevice(const VernonAdDeviceValueSet *cotangents, VernonAdDeviceValueSet &gradients,
-                                     const PullbackApplyOptions &options,
-                                     execution::detail::RhiCommandPlanSink *sink = nullptr) = 0;
-};
-
 class CanonicalProgramExecution {
 public:
     virtual ~CanonicalProgramExecution() = default;
     virtual const Signature &signature() const = 0;
-    virtual VernonStatus forward(const ForwardExecutionTarget &target, const VernonAdValueSet &inputs,
-                                 VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) = 0;
+    virtual VernonStatus forward(const ForwardExecutionTarget &target,
+                                 std::unique_ptr<PullbackExecution> &pullback) = 0;
 };
 
 size_t dtypeSize(VernonDataType dtype);
@@ -119,13 +107,7 @@ bool validLaunchSize(VernonLaunchSize grid);
 bool invocationExtent(VernonLaunchSize grid, VernonLaunchSize workgroup, VernonLaunchSize &extent);
 bool carrierCount(VernonLaunchSize extent, size_t &count);
 bool materializeCarrierValue(ValueAbi &abi, VernonLaunchSize extent);
-bool validSet(const VernonAdValueSet *set, bool required);
-VernonAdValue *findValue(VernonAdValueSet &set, const std::string &path);
-const VernonAdValue *findValue(const VernonAdValueSet &set, const std::string &path);
-bool valueMatches(const VernonAdValue &value, const ValueAbi &abi);
 bool derivativeAbiMatches(const ValueAbi &primal, const ValueAbi &derivative);
-bool makeCotangentBytes(const VernonAdValueSet *cotangents, const ValueAbi &abi, std::vector<uint8_t> &bytes,
-                        std::string &error);
 bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature);

@@ -317,6 +317,20 @@ struct ProgramInvocationBuilder {
         if (!nb::isinstance<nb::int_>(identifier))
             throw std::invalid_argument("pipeline parameter must be a name or slot");
         const uint32_t slot = nb::cast<uint32_t>(identifier);
+        const VernonProgramBoundaryRole roles[] = {
+            VERNON_PROGRAM_BOUNDARY_INPUT,
+            VERNON_PROGRAM_BOUNDARY_OUTPUT,
+            VERNON_PROGRAM_BOUNDARY_COTANGENT,
+            VERNON_PROGRAM_BOUNDARY_GRADIENT,
+        };
+        for (VernonProgramBoundaryRole role : roles) {
+            const size_t boundaryCount = vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, role);
+            for (size_t index = 0; index < boundaryCount; ++index)
+                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, role, index, &view) ==
+                        VERNON_STATUS_OK &&
+                    view.slot == slot && view.kind != VERNON_PROGRAM_IMAGE)
+                    return parameterMetadata(view);
+        }
         const size_t count = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
         for (size_t index = 0; index < count; ++index) {
             if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
@@ -403,7 +417,7 @@ struct ProgramInvocationBuilder {
         size_t rank = arrayShape.size();
         if (elementSize != parameter.elementByteSize) {
             size_t trailingSize = elementSize;
-            while (rank && trailingSize < parameter.elementByteSize) {
+            while (rank > parameter.shape.size()) {
                 const size_t dimension = --rank;
                 if (arrayStrides[dimension] != static_cast<int64_t>(trailingSize) ||
                     arrayShape[dimension] > std::numeric_limits<size_t>::max() / trailingSize)
@@ -426,8 +440,9 @@ struct ProgramInvocationBuilder {
         if (!vernon::runtime::tensorRelativeByteBounds(layoutProbe, before, after) ||
             !vernon::runtime::tensorRequiredSpan(layoutProbe, span))
             throw std::invalid_argument("NumPy Tensor byte span overflows");
-        if (array.attr("dtype").attr("fields").is_none() && parameter.elementLeaves.size() == 1 &&
-            parameter.elementLeaves[0].scalar_count == 1 && parameter.elementLeaves[0].byte_offset == 0 &&
+        if (elementSize == parameter.elementByteSize && array.attr("dtype").attr("fields").is_none() &&
+            parameter.elementLeaves.size() == 1 && parameter.elementLeaves[0].scalar_count == 1 &&
+            parameter.elementLeaves[0].byte_offset == 0 &&
             numpyDataType(array) != static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
             throw std::invalid_argument("host tensor dtype does not match pipeline reflection");
         argument.owner = array;
@@ -676,17 +691,11 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
-    VernonStageInvocationDescriptor invocation(std::vector<VernonProgramArgument> &values) const {
+    void collectArguments(std::vector<VernonProgramArgument> &values) const {
         values.clear();
         values.reserve(arguments.size());
         for (const PreparedProgramArgument *argument : arguments)
             values.push_back(argument->value);
-        VernonStageInvocationDescriptor invocation{};
-        invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PROGRAM_VERSION;
-        invocation.arguments = values.empty() ? nullptr : values.data();
-        invocation.argument_count = values.size();
-        invocation.graphics_state = hasGraphicsState ? &graphicsState : nullptr;
         if (hasGraphicsState) {
             renderPass = {};
             renderPass.struct_size = sizeof(renderPass);
@@ -703,18 +712,14 @@ struct ProgramInvocationBuilder {
             std::memcpy(dynamicState.viewport, viewport, sizeof(viewport));
             std::memcpy(dynamicState.scissor, scissor, sizeof(scissor));
             dynamicState.stencil_reference = stencilReference;
-            invocation.render_pass = &renderPass;
-            invocation.draw_command = &drawCommand;
-            invocation.dynamic_state = &dynamicState;
         }
-        return invocation;
     }
 
     VernonStatus forwardProgram(VernonPullback **pullback) const {
         if (pullback)
             *pullback = nullptr;
         std::vector<VernonProgramArgument> values;
-        const VernonStageInvocationDescriptor descriptor = invocation(values);
+        collectArguments(values);
 
         VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
         if (!instance)
@@ -737,15 +742,15 @@ struct ProgramInvocationBuilder {
             status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline, index, &controls);
             const std::string text = "python-graphics-" + std::to_string(index);
             const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
-            if (status == VERNON_STATUS_OK && descriptor.render_pass)
+            if (status == VERNON_STATUS_OK && hasGraphicsState)
                 status = vernonRuntimeProgramInvocationBindRenderPass(programInvocation, controls.render_pass_control,
-                                                                      &token, descriptor.render_pass, nullptr, 0);
-            if (status == VERNON_STATUS_OK && descriptor.draw_command)
+                                                                      &token, &renderPass, nullptr, 0);
+            if (status == VERNON_STATUS_OK && hasGraphicsState)
                 status = vernonRuntimeProgramInvocationBindDrawCommand(programInvocation, controls.draw_command_control,
-                                                                       &token, descriptor.draw_command, nullptr);
-            if (status == VERNON_STATUS_OK && descriptor.dynamic_state)
+                                                                       &token, &drawCommand, nullptr);
+            if (status == VERNON_STATUS_OK && hasGraphicsState)
                 status = vernonRuntimeProgramInvocationBindDynamicState(
-                    programInvocation, controls.dynamic_state_control, &token, descriptor.dynamic_state);
+                    programInvocation, controls.dynamic_state_control, &token, &dynamicState);
         }
         if (status == VERNON_STATUS_OK)
             status = vernonRuntimeProgramInvocationForward(programInvocation, pullback);
@@ -889,37 +894,37 @@ struct PythonProgramInvocationAdapter {
 
     void bindRenderPass(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonStageInvocationDescriptor frame = control.invocation(values);
-        if (!frame.render_pass)
+        control.collectArguments(values);
+        if (!control.hasGraphicsState)
             throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        if (vernonRuntimeProgramInvocationBindRenderPass(nativeInvocation, slot, &bindingToken, frame.render_pass,
+        if (vernonRuntimeProgramInvocationBindRenderPass(nativeInvocation, slot, &bindingToken, &control.renderPass,
                                                          nullptr, 0) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program RenderPass control");
     }
 
     void bindDrawCommand(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonStageInvocationDescriptor frame = control.invocation(values);
-        if (!frame.draw_command)
+        control.collectArguments(values);
+        if (!control.hasGraphicsState)
             throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        if (vernonRuntimeProgramInvocationBindDrawCommand(nativeInvocation, slot, &bindingToken, frame.draw_command,
+        if (vernonRuntimeProgramInvocationBindDrawCommand(nativeInvocation, slot, &bindingToken, &control.drawCommand,
                                                           nullptr) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program DrawCommand control");
     }
 
     void bindDynamicState(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
         std::vector<VernonProgramArgument> values;
-        VernonStageInvocationDescriptor frame = control.invocation(values);
-        if (!frame.dynamic_state)
+        control.collectArguments(values);
+        if (!control.hasGraphicsState)
             throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
         if (vernonRuntimeProgramInvocationBindDynamicState(nativeInvocation, slot, &bindingToken,
-                                                           frame.dynamic_state) != VERNON_STATUS_OK)
+                                                           &control.dynamicState) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program DynamicState control");
     }
 

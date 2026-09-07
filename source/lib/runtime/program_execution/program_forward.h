@@ -14,8 +14,8 @@ struct InvocationSnapshot;
 
 namespace vernon::runtime::program_execution {
 
-VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
-                                      const VernonStageInvocationDescriptor &invocation, VernonPullback *&pullback,
+VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
+                                      size_t argumentCount, VernonPullback *&pullback,
                                       const ProgramInvocationContext *programContext = nullptr);
 void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const program::InvocationSnapshot> snapshot);
 

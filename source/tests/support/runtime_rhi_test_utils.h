@@ -14,6 +14,23 @@
 
 namespace vernon::tests {
 
+struct DerivativeLeafFixture {
+    uint32_t struct_size{};
+    VernonStringView path{};
+    VernonDataType dtype{};
+    void *data{};
+    size_t size{};
+    uint32_t rank{};
+    const uint64_t *shape{};
+};
+
+struct DerivativeLeafSetFixture {
+    uint32_t struct_size{};
+    DerivativeLeafFixture *values{};
+    size_t value_count{};
+    uint32_t reserved[4]{};
+};
+
 struct RhiRuntime {
     VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeContext *runtime{};
@@ -226,7 +243,8 @@ inline VernonStatus completeCanonicalComputeInvocation(VernonProgramExecutable *
 }
 
 inline VernonStatus completeCanonicalAutodiffInvocation(VernonProgramExecutable *pipeline, VernonLaunchSize grid,
-                                                        const VernonAdValueSet &inputs, const VernonAdValueSet &outputs,
+                                                        const DerivativeLeafSetFixture &inputs,
+                                                        const DerivativeLeafSetFixture &outputs,
                                                         VernonPullback **pullback) {
     const size_t valueCount = inputs.value_count + outputs.value_count;
     std::vector<VernonProgramArgument> arguments;
@@ -234,9 +252,9 @@ inline VernonStatus completeCanonicalAutodiffInvocation(VernonProgramExecutable 
     arguments.reserve(valueCount);
     strides.reserve(valueCount);
 
-    auto appendValues = [&](const VernonAdValueSet &values) -> VernonStatus {
+    auto appendValues = [&](const DerivativeLeafSetFixture &values) -> VernonStatus {
         for (size_t index = 0; index < values.value_count; ++index) {
-            const VernonAdValue &value = values.values[index];
+            const DerivativeLeafFixture &value = values.values[index];
             VernonProgramParameterView parameter{};
             if (vernonRuntimeProgramExecutableFindParameter(pipeline, value.path, &parameter) != VERNON_STATUS_OK ||
                 parameter.kind != VERNON_PROGRAM_TENSOR)
@@ -272,6 +290,52 @@ inline VernonStatus completeCanonicalAutodiffInvocation(VernonProgramExecutable 
     if (status != VERNON_STATUS_OK)
         return status;
     return completeCanonicalComputeInvocation(pipeline, arguments.data(), arguments.size(), grid, pullback);
+}
+
+inline VernonStatus applyCanonicalPullback(VernonProgramExecutable *pipeline, VernonPullback *pullback,
+                                           const DerivativeLeafSetFixture *cotangents,
+                                           DerivativeLeafSetFixture *gradients,
+                                           const VernonPullbackApplyOptions *options = nullptr) {
+    if (!pipeline || !pullback || !gradients)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    std::vector<VernonProgramArgument> arguments;
+    std::vector<std::vector<int64_t>> strides;
+    const auto append = [&](const DerivativeLeafSetFixture &values, VernonProgramBoundaryRole role,
+                            VernonValueAccess access) -> VernonStatus {
+        for (size_t index = 0; index < values.value_count; ++index) {
+            const DerivativeLeafFixture &value = values.values[index];
+            VernonProgramParameterView boundary{};
+            if (vernonRuntimeProgramExecutableFindBoundary(pipeline, role, value.path, &boundary) != VERNON_STATUS_OK ||
+                boundary.kind != VERNON_PROGRAM_TENSOR)
+                return VERNON_STATUS_INVALID_ARGUMENT;
+            strides.emplace_back(value.rank);
+            int64_t stride = static_cast<int64_t>(boundary.element_layout.byte_size);
+            for (size_t axis = value.rank; axis-- > 0;) {
+                strides.back()[axis] = stride;
+                stride *= static_cast<int64_t>(value.shape[axis]);
+            }
+            VernonProgramArgument argument{};
+            argument.slot = boundary.slot;
+            argument.kind = VERNON_PROGRAM_TENSOR;
+            argument.tensor.struct_size = sizeof(VernonTensorView);
+            argument.tensor.storage = VERNON_TENSOR_HOST;
+            argument.tensor.host_data = value.data;
+            argument.tensor.element_layout = boundary.element_layout;
+            argument.tensor.access = access;
+            argument.tensor.rank = value.rank;
+            argument.tensor.shape = value.shape;
+            argument.tensor.byte_strides = strides.back().empty() ? nullptr : strides.back().data();
+            argument.tensor.byte_size = value.size;
+            arguments.push_back(argument);
+        }
+        return VERNON_STATUS_OK;
+    };
+    if ((cotangents &&
+         append(*cotangents, VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_ACCESS_READ) != VERNON_STATUS_OK) ||
+        append(*gradients, VERNON_PROGRAM_BOUNDARY_GRADIENT, VERNON_ACCESS_WRITE) != VERNON_STATUS_OK)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    return options ? vernonProgramPullbackApplyWithOptions(pullback, arguments.data(), arguments.size(), options)
+                   : vernonProgramPullbackApply(pullback, arguments.data(), arguments.size());
 }
 
 inline VernonStatus completeSubmission(VernonStageExecutable *pipeline,

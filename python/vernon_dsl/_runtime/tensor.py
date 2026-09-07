@@ -604,6 +604,13 @@ class TensorStorage:
         gradient_shape = tuple(gradient_shape)
         return self._full_view("read")._gradient_device_view(path, destination, gradient_shape)
 
+    def _gradient_boundary_layout(
+        self,
+        destination: TensorStorage,
+        element_byte_size: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+        return self._full_view("read")._gradient_boundary_layout(destination, element_byte_size)
+
     def copy_from_numpy(self, array: np.ndarray) -> None:
         self._ensure_host_mutation_allowed()
         target = self._native_host_array()
@@ -1258,6 +1265,21 @@ class TensorView:
             ),
             offset=self._offset * scalar_count,
             access="read_write",
+        )
+
+    def _gradient_boundary_layout(
+        self,
+        destination: TensorStorage,
+        element_byte_size: int,
+    ) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+        if not isinstance(destination, TensorStorage):
+            raise TypeError("canonical derivative publication requires TensorStorage backing")
+        if element_byte_size <= 0:
+            raise ValueError("canonical derivative element size must be positive")
+        return (
+            self.shape,
+            tuple(stride * element_byte_size for stride in self._strides),
+            self._offset * element_byte_size,
         )
 
     def copy_from_numpy(self, array: np.ndarray) -> None:

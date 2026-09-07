@@ -85,57 +85,6 @@ bool sealProgramTapeValues(std::vector<HostProgramValue> &storage, std::vector<V
     return true;
 }
 
-bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi> &signature,
-                    const std::vector<ProgramLeafBinding> &bindings, std::vector<HostProgramValue> &storage,
-                    PublicationTransaction *publication, std::string &error) {
-    if (bindings.size() != signature.size() || supplied.value_count != signature.size())
-        return error = "Program autodiff leaf set does not match its canonical boundary", false;
-    const bool publish = publication != nullptr;
-    for (size_t index = 0; index < bindings.size(); ++index) {
-        const ValueAbi &abi = signature[index];
-        const VernonAdValue *value = findValue(supplied, abi.path);
-        const ProgramLeafBinding &binding = bindings[index];
-        if (!value || !matchesProgramValueAbi(*value, abi) || binding.value >= storage.size())
-            return error = "Program autodiff leaf does not match graph reflection", false;
-        auto *leaf = static_cast<uint8_t *>(const_cast<void *>(value->data));
-        size_t elementCount = binding.elementCount;
-        if (!elementCount) {
-            const size_t bytes = publish ? storage[binding.value].argument.tensor.byte_size : value->size;
-            const size_t stride = publish ? binding.elementStride : binding.leafElementBytes;
-            if (!stride || bytes % stride)
-                return error = "Program autodiff leaf does not match its dynamic footprint", false;
-            elementCount = bytes / stride;
-        }
-        HostProgramValue &host = storage[binding.value];
-        if (!publish) {
-            if (binding.elementStride && elementCount > std::numeric_limits<size_t>::max() / binding.elementStride)
-                return error = "Program autodiff leaf footprint overflows", false;
-            const size_t required = elementCount * binding.elementStride;
-            if (host.argument.tensor.byte_size < required) {
-                host.ownedHostBytes.resize(required);
-                host.argument.tensor.host_data = host.ownedHostBytes.data();
-                host.argument.tensor.byte_size = required;
-                if (host.concreteShape &&
-                    !shape::rowMajorByteStrides(*host.concreteShape, binding.elementStride, host.strides))
-                    return error = "Program autodiff aggregate stride overflows", false;
-                host.argument.tensor.byte_strides = host.strides.empty() ? nullptr : host.strides.data();
-            }
-        }
-        auto *packed = static_cast<uint8_t *>(const_cast<void *>(host.argument.tensor.host_data));
-        for (size_t element = 0; element < elementCount; ++element) {
-            uint8_t *packedElement = packed + element * binding.elementStride + binding.byteOffset;
-            uint8_t *leafElement = leaf + element * binding.leafElementBytes;
-            if (publish) {
-                if (!publication->stageHostRegion(binding.slot, leafElement, packedElement, binding.leafElementBytes,
-                                                  error))
-                    return false;
-            } else
-                std::memcpy(packedElement, leafElement, binding.leafElementBytes);
-        }
-    }
-    return true;
-}
-
 VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
     invocationDiagnostic(context) = error;
     return VERNON_STATUS_INVALID_ARGUMENT;
@@ -144,31 +93,24 @@ VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
 class ProgramPullback final : public PullbackExecution {
 public:
     ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<const program::ResolvedExecutionPlan> topology,
-                    Variant variant, Signature signature, std::vector<ProgramLeafBinding> cotangentBindings,
-                    std::vector<ProgramLeafBinding> gradientBindings,
+                    Variant variant, Signature signature, std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings,
                     std::shared_ptr<const RetainedPullbackState> state,
                     std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
         : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
-          signature_(std::move(signature)), cotangentBindings_(std::move(cotangentBindings)),
-          gradientBindings_(std::move(gradientBindings)), state_(std::move(state)),
-          passTelemetry_(std::move(passTelemetry)) {
+          signature_(std::move(signature)), derivativeBindings_(std::move(derivativeBindings)),
+          state_(std::move(state)), passTelemetry_(std::move(passTelemetry)) {
         rebuildVariantLayoutViews(variant_);
     }
 
-    VernonStatus apply(const VernonAdValueSet *cotangents, VernonAdValueSet &gradients,
+    VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
                        const PullbackApplyOptions &options) override {
         const std::lock_guard lock(applyMutex_);
         if (!topology_->resolvedProgram || !state_)
             return fail(*context_, "Program pullback has no retained canonical state");
         const program::Program &execution = topology_->resolvedProgram->program;
         const program::Graph *backward = program::findGraph(execution, "backward");
-        const bool requiresCotangents =
-            backward &&
-            std::any_of(backward->inputs.begin(), backward->inputs.end(), [](const program::GraphInput &input) {
-                return input.kind == program::GraphInputKind::UserInput;
-            });
-        if (!backward || (requiresCotangents && !cotangents))
-            return fail(*context_, "Program pullback has no backward graph or required cotangents");
+        if (!backward)
+            return fail(*context_, "Program pullback has no backward graph");
         std::vector<char> required(execution.values.size());
         program::markGraphValues(*backward, required);
         std::optional<program::Graph> replay;
@@ -187,22 +129,17 @@ public:
         const std::vector<std::vector<uint8_t>> &captures = state_->residualCaptures();
         const std::vector<std::vector<uint64_t>> &captureShapes = state_->captureShapes();
         std::vector<ProgramValueState> storage;
+        PublicationTransaction publication(topology_->publications);
         PullbackInvocationSpec frame{
-            required,
-            {cotangents, cotangents ? &signature_.cotangents : nullptr, cotangents ? &cotangentBindings_ : nullptr},
-            {&gradients, &signature_.gradients, &gradientBindings_},
-            captures,
-            captureShapes,
-            nullptr,
-            &state_->valueSnapshots(),
+            required, {arguments, argumentCount, derivativeBindings_, publication},
+            captures, captureShapes,
+            nullptr,  &state_->valueSnapshots(),
         };
         std::string error;
         std::map<uint32_t, ProgramStorageBacking> storageBackings;
         ProgramTapeScratch tapeScratch(execution.values.size());
         if (!buildProgramInvocationValues(*context_, execution, topology_.get(), storage, storageBackings, tapeScratch,
-                                          frame, context_->autodiffMemoryPolicy, error) ||
-            (cotangents &&
-             !transferLeaves(*cotangents, signature_.cotangents, cotangentBindings_, storage, nullptr, error)))
+                                          frame, context_->autodiffMemoryPolicy, error))
             return fail(*context_, error);
 
         size_t temporaryBytes = 0;
@@ -272,18 +209,12 @@ public:
             return status;
 
         if (device) {
-            std::vector<char> downloads(execution.values.size());
-            for (const ProgramLeafBinding &binding : gradientBindings_)
-                if (binding.value < downloads.size())
-                    downloads[binding.value] = 1;
+            std::vector<char> downloads = publication.hostReadbackValues(execution.values.size());
             ResolvedTransferExecutor transfers(*context_, values);
             if (!transfers.readbackBoundaryValues(downloads, error))
                 return fail(*context_, error);
             ++usage_.readbacks;
         }
-        PublicationTransaction publication(topology_->publications);
-        if (!transferLeaves(gradients, signature_.gradients, gradientBindings_, values.values(), &publication, error))
-            return fail(*context_, error);
         if (const VernonStatus publicationStatus =
                 program_execution::executePublicationCommit(*context_, publication, values, error);
             publicationStatus != VERNON_STATUS_OK)
@@ -351,8 +282,7 @@ private:
     std::shared_ptr<const program::ResolvedExecutionPlan> topology_;
     Variant variant_;
     Signature signature_;
-    std::vector<ProgramLeafBinding> cotangentBindings_;
-    std::vector<ProgramLeafBinding> gradientBindings_;
+    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::shared_ptr<const RetainedPullbackState> state_;
     std::vector<AutodiffPullbackPassTelemetry> passTelemetry_;
     mutable std::mutex applyMutex_;
@@ -382,13 +312,15 @@ public:
             if (slot.role == program::BoundaryRole::Input ||
                 (slot.role == program::BoundaryRole::Output && slot.publication != program::BoundaryPublication::None))
                 forwardBindings_.emplace_back(slot.id, slot.value);
+            else if (slot.role == program::BoundaryRole::Cotangent || slot.role == program::BoundaryRole::Gradient)
+                derivativeBindings_.emplace_back(slot.id, slot.value);
         }
         // ProgramABI is the execution authority. Signature is validated against
         // it while parsing, but runtime binding and leaf materialization must
         // not join the two representations again.
         const auto append = [&](const program::BoundarySlot &publicSlot,
                                 const std::vector<program::LayoutPathComponent> *projectionPath,
-                                std::vector<ValueAbi> &values, std::vector<ProgramLeafBinding> &leafBindings) {
+                                std::vector<ValueAbi> &values) {
             if (publicSlot.category == program::BoundaryCategory::Texture ||
                 publicSlot.category == program::BoundaryCategory::Sampler)
                 return;
@@ -435,34 +367,24 @@ public:
                 signatureError_ = std::move(error);
                 return;
             }
-            size_t elementCount = 1;
-            for (uint64_t extent : publicSlot.outerShape)
-                elementCount *= static_cast<size_t>(extent);
             if (values.size() - begin != selectedLeaves.size()) {
                 signatureError_ = "Program aggregate ABI contains duplicate leaf paths";
                 return;
             }
-            for (const ValueLeaf *selected : selectedLeaves) {
-                const ValueLeaf &leaf = *selected;
-                const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
-                leafBindings.push_back({publicSlot.value, publicSlot.id, leaf.byteOffset, layout.byteSize,
-                                        dtype ? dtypeSize(*dtype) * static_cast<size_t>(leaf.scalarCount) : 0,
-                                        elementCount});
-            }
         };
         for (const program::BoundarySlot &slot : canonicalProgram.abi.boundarySlots) {
             if (slot.role == program::BoundaryRole::Input)
-                append(slot, nullptr, signature_.inputs, inputBindings_);
+                append(slot, nullptr, signature_.inputs);
             else if (slot.role == program::BoundaryRole::Output &&
                      slot.publication != program::BoundaryPublication::None)
-                append(slot, nullptr, signature_.outputs, outputBindings_);
+                append(slot, nullptr, signature_.outputs);
         }
         for (const program::DerivativeProjection &projection : canonicalProgram.abi.derivativeProjections) {
             const program::BoundarySlot &derivative = canonicalProgram.abi.boundarySlots[projection.derivative.slot];
             if (derivative.role == program::BoundaryRole::Cotangent)
-                append(derivative, &projection.valuePath, signature_.cotangents, cotangentBindings_);
+                append(derivative, &projection.valuePath, signature_.cotangents);
             else if (derivative.role == program::BoundaryRole::Gradient)
-                append(derivative, &projection.valuePath, signature_.gradients, gradientBindings_);
+                append(derivative, &projection.valuePath, signature_.gradients);
             else {
                 signatureError_ = "DerivativeProjection does not reference a derivative boundary";
                 return;
@@ -472,18 +394,16 @@ public:
 
     const Signature &signature() const override { return signature_; }
 
-    VernonStatus forward(const ForwardExecutionTarget &target, const VernonAdValueSet &inputs,
-                         VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) override {
+    VernonStatus forward(const ForwardExecutionTarget &target, std::unique_ptr<PullbackExecution> &pullback) override {
         const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
         const program::Program *execution =
             topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
         const program::Graph *forward = execution ? program::findGraph(*execution, "forward") : nullptr;
         const bool hasBackward = execution && program::findGraph(*execution, "backward");
-        const bool canonicalInvocation = target.invocation != nullptr;
         if (!signatureError_.empty())
             return fail(*context_, signatureError_);
-        if (!topology || !forward || (!canonicalInvocation && !outputs))
-            return fail(*context_, "Program autodiff forward requires a live pipeline and host API values");
+        if (!topology || !forward)
+            return fail(*context_, "Program autodiff forward requires a live Program");
         std::vector<HostProgramValue> hostStorage;
         std::string error;
         std::vector<char> required(execution->values.size());
@@ -494,19 +414,12 @@ public:
         PublicationTransaction publication(topology->publications);
         ForwardInvocationSpec frame{
             required,
-            canonicalInvocation ? std::variant<CanonicalForwardBindings, HostForwardBindings>(
-                                      CanonicalForwardBindings{*target.invocation, forwardBindings_, publication})
-                                : std::variant<CanonicalForwardBindings, HostForwardBindings>(HostForwardBindings{
-                                      {&inputs, &signature_.inputs, &inputBindings_},
-                                      {outputs, &signature_.outputs, &outputBindings_},
-                                  }),
+            {target.arguments, target.argumentCount, forwardBindings_, publication},
         };
         std::map<uint32_t, ProgramStorageBacking> storageBackings;
         ProgramTapeScratch tapeScratch(execution->values.size());
         if (!buildProgramInvocationValues(*context_, *execution, topology.get(), hostStorage, storageBackings,
-                                          tapeScratch, frame, context_->autodiffMemoryPolicy, error) ||
-            (!canonicalInvocation &&
-             !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, nullptr, error)))
+                                          tapeScratch, frame, context_->autodiffMemoryPolicy, error))
             return fail(*context_, error);
         ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
         if (!arena.allocateOwnedImageStorages(*context_, *execution, error))
@@ -566,17 +479,10 @@ public:
 
         if (device) {
             std::vector<char> downloads = publication.hostReadbackValues(execution->values.size());
-            if (!canonicalInvocation)
-                for (const ProgramLeafBinding &binding : outputBindings_)
-                    if (binding.value < downloads.size())
-                        downloads[binding.value] = 1;
             ResolvedTransferExecutor transfers(*context_, arena);
             if (!transfers.readbackBoundaryValues(downloads, error))
                 return fail(*context_, error);
         }
-        if (!canonicalInvocation &&
-            !transferLeaves(*outputs, signature_.outputs, outputBindings_, arena.values(), &publication, error))
-            return fail(*context_, error);
         if (const VernonStatus publicationStatus =
                 program_execution::executePublicationCommit(*context_, publication, arena, error);
             publicationStatus != VERNON_STATUS_OK)
@@ -611,8 +517,8 @@ public:
                 retained[value] = 1;
         arena.retainOnly(retained);
         auto state = std::make_shared<const RetainedPullbackState>(std::move(plan), arena, std::move(tapeScratch));
-        pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, cotangentBindings_,
-                                                     gradientBindings_, std::move(state), std::move(telemetry));
+        pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, derivativeBindings_,
+                                                     std::move(state), std::move(telemetry));
         return VERNON_STATUS_OK;
     }
 
@@ -622,10 +528,7 @@ private:
     const CanonicalProgramAutodiffState *programAutodiff_{};
     Variant variant_;
     Signature signature_;
-    std::vector<ProgramLeafBinding> inputBindings_;
-    std::vector<ProgramLeafBinding> outputBindings_;
-    std::vector<ProgramLeafBinding> cotangentBindings_;
-    std::vector<ProgramLeafBinding> gradientBindings_;
+    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::vector<std::pair<uint32_t, uint32_t>> forwardBindings_;
     std::string signatureError_;
 };

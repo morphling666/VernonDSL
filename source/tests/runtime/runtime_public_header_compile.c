@@ -7,9 +7,7 @@ void vernon_runtime_public_c_header_compile_check(void) {
     VernonOpenGLContextCallbacks callbacks = {0};
     VernonProgramBundleLoadOptions bundle_options = {0};
     VernonCpuInvocation invocation = {0};
-    VernonAdValue ad_value = {0};
-    VernonAdValueSet ad_values = {0};
-    VernonAdValueMetadataView ad_metadata = {0};
+    VernonProgramArgument derivative_argument = {0};
     VernonAdDerivativeGroupView ad_group = {0};
     VernonProgramBindingToken binding_token = {0};
     VernonProgramResourceLease resource_lease = {0};
@@ -18,9 +16,6 @@ void vernon_runtime_public_c_header_compile_check(void) {
     options.struct_size = sizeof(options);
     callbacks.struct_size = sizeof(callbacks);
     bundle_options.struct_size = sizeof(bundle_options);
-    ad_value.struct_size = sizeof(ad_value);
-    ad_values.struct_size = sizeof(ad_values);
-    ad_metadata.struct_size = sizeof(ad_metadata);
     ad_group.struct_size = sizeof(ad_group);
     binding_token.struct_size = sizeof(binding_token);
     resource_lease.struct_size = sizeof(resource_lease);
@@ -29,9 +24,7 @@ void vernon_runtime_public_c_header_compile_check(void) {
     (void)callbacks;
     (void)bundle_options;
     (void)invocation;
-    (void)ad_value;
-    (void)ad_values;
-    (void)ad_metadata;
+    (void)derivative_argument;
     (void)ad_group;
     (void)binding_token;
     (void)resource_lease;

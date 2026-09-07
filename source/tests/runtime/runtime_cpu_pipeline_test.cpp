@@ -269,29 +269,26 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(outputValue, 9.0f);
 
-    const uint64_t shape[]{1};
     float seedValue = 1.0f;
     float gradientValue = 0.0f;
-    VernonAdValue seed{sizeof(VernonAdValue),
-                       {"output", std::strlen("output")},
-                       VERNON_DATA_F32,
-                       &seedValue,
-                       sizeof(seedValue),
-                       1,
-                       shape};
-    VernonAdValue gradient{sizeof(VernonAdValue),
-                           {"source", std::strlen("source")},
-                           VERNON_DATA_F32,
-                           &gradientValue,
-                           sizeof(gradientValue),
-                           1,
-                           shape};
-    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
-    VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
-    ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(program.context);
+    VernonProgramParameterView cotangent{};
+    VernonProgramParameterView gradient{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(program.pipeline, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0,
+                                                               &cotangent),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(program.pipeline, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0,
+                                                               &gradient),
+              VERNON_STATUS_OK);
+    VernonProgramArgument derivativeArguments[]{
+        tensorArgument(cotangent, seedValue),
+        tensorArgument(gradient, gradientValue),
+    };
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+              VERNON_STATUS_OK)
+        << lastError(program.context);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 
-    vernonPullbackDestroy(pullback);
+    vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
     destroy(program);

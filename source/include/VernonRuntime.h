@@ -344,74 +344,12 @@ typedef struct VernonProgramOutputView {
     uint32_t location;
 } VernonProgramOutputView;
 
-typedef struct VernonAdValue {
-    uint32_t struct_size;
-    VernonStringView path;
-    VernonDataType dtype;
-    void *data;
-    size_t size;
-    /* Logical Value shape. Scalars use rank 0 and shape NULL. */
-    uint32_t rank;
-    /* Must remain valid for the duration of the API call that consumes this Value. */
-    const uint64_t *shape;
-} VernonAdValue;
-
-typedef struct VernonAdValueSet {
-    uint32_t struct_size;
-    VernonAdValue *values;
-    size_t value_count;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
-} VernonAdValueSet;
-
-typedef struct VernonAdDeviceValue {
-    uint32_t struct_size;
-    VernonStringView path;
-    VernonDataType dtype;
-    VernonRhiBuffer buffer;
-    uint64_t offset;
-    uint64_t buffer_size;
-    uint64_t size;
-    uint32_t rank;
-    const uint64_t *shape;
-    const int64_t *byte_strides;
-    uint32_t reserved[4];
-} VernonAdDeviceValue;
-
-typedef struct VernonAdDeviceValueSet {
-    uint32_t struct_size;
-    VernonAdDeviceValue *values;
-    size_t value_count;
-    uint32_t reserved[4];
-} VernonAdDeviceValueSet;
-
-typedef struct VernonAdValueMetadataView {
-    uint32_t struct_size;
-    VernonStringView path;
-    VernonDataType dtype;
-    uint32_t rank;
-    const uint64_t *shape;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
-} VernonAdValueMetadataView;
-
-typedef enum VernonProgramAdBoundary {
-    VERNON_PROGRAM_AD_INPUT = 0,
-    VERNON_PROGRAM_AD_OUTPUT = 1,
-    VERNON_PROGRAM_AD_COTANGENT = 2,
-    VERNON_PROGRAM_AD_GRADIENT = 3,
-    VERNON_PROGRAM_AD_CAPTURE = 4
-} VernonProgramAdBoundary;
-
-typedef struct VernonProgramAdValueView {
-    uint32_t struct_size;
-    VernonStringView path;
-    uint32_t value_id;
-    uint8_t external;
-    uint8_t output;
-    /* Reserved for future use; initialize all elements to zero. */
-    uint32_t reserved[4];
-} VernonProgramAdValueView;
+typedef enum VernonProgramBoundaryRole {
+    VERNON_PROGRAM_BOUNDARY_INPUT = 0,
+    VERNON_PROGRAM_BOUNDARY_OUTPUT = 1,
+    VERNON_PROGRAM_BOUNDARY_COTANGENT = 2,
+    VERNON_PROGRAM_BOUNDARY_GRADIENT = 3
+} VernonProgramBoundaryRole;
 
 typedef enum VernonAdDerivativeRole {
     VERNON_AD_DERIVATIVE_GRADIENT = 0,
@@ -433,7 +371,6 @@ typedef struct VernonPullbackApplyOptions {
     uint32_t struct_size;
     uint32_t abi_version;
     uint64_t maximum_temporary_bytes;
-    uint64_t maximum_reusable_construction_bytes;
     /* Reserved for future use; initialize all elements to zero. */
     uint32_t reserved[4];
 } VernonPullbackApplyOptions;
@@ -575,37 +512,33 @@ VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionGetState(const VernonSubmission
                                                           VernonSubmissionState *output);
 VERNON_RUNTIME_CAPI VernonStatus vernonSubmissionWait(VernonSubmission *submission);
 VERNON_RUNTIME_CAPI void vernonSubmissionDestroy(VernonSubmission *submission);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdInputCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdInputByIndex(
-    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdOutputCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdOutputByIndex(
-    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdCotangentCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdCotangentByIndex(
-    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetAdGradientCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdGradientByIndex(
-    const VernonProgramExecutable *pipeline, size_t index, VernonAdValueMetadataView *metadata);
 VERNON_RUNTIME_CAPI uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetProgramAdValueCount(const VernonProgramExecutable *pipeline,
-                                                                                VernonProgramAdBoundary boundary);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetProgramAdValueByIndex(
-    const VernonProgramExecutable *pipeline, VernonProgramAdBoundary boundary, size_t index,
-    VernonProgramAdValueView *value);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetBoundaryCount(const VernonProgramExecutable *pipeline,
+                                                                          VernonProgramBoundaryRole boundary);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetBoundaryByIndex(
+    const VernonProgramExecutable *pipeline, VernonProgramBoundaryRole boundary, size_t index,
+    VernonProgramParameterView *parameter);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindBoundary(const VernonProgramExecutable *pipeline,
+                                                                            VernonProgramBoundaryRole boundary,
+                                                                            VernonStringView name,
+                                                                            VernonProgramParameterView *parameter);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetBoundaryValueLeaf(
+    const VernonProgramExecutable *pipeline, VernonProgramBoundaryRole boundary, uint32_t slot, size_t leaf_index,
+    VernonProgramValueLeafView *leaf);
 VERNON_RUNTIME_CAPI size_t
 vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(
     const VernonProgramExecutable *pipeline, size_t group_index, VernonAdDerivativeGroupView *group);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(
     const VernonProgramExecutable *pipeline, size_t group_index, size_t leaf_index, VernonStringView *leaf_path);
-VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApplyWithOptions(VernonPullback *pullback,
-                                                                const VernonAdValueSet *cotangents,
-                                                                VernonAdValueSet *gradients,
-                                                                const VernonPullbackApplyOptions *options);
-VERNON_RUNTIME_CAPI VernonStatus vernonPullbackApply(VernonPullback *pullback, const VernonAdValueSet *cotangents,
-                                                     VernonAdValueSet *gradients);
-VERNON_RUNTIME_CAPI void vernonPullbackDestroy(VernonPullback *pullback);
+VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback,
+                                                                       const VernonProgramArgument *arguments,
+                                                                       size_t argument_count,
+                                                                       const VernonPullbackApplyOptions *options);
+VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApply(VernonPullback *pullback,
+                                                            const VernonProgramArgument *arguments,
+                                                            size_t argument_count);
+VERNON_RUNTIME_CAPI void vernonProgramPullbackDestroy(VernonPullback *pullback);
 
 #ifdef __cplusplus
 }
