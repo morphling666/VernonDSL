@@ -1,7 +1,7 @@
 #ifndef VERNON_RUNTIME_TARGET_IMPLEMENTATION_METADATA_H
 #define VERNON_RUNTIME_TARGET_IMPLEMENTATION_METADATA_H
 
-#include "pipeline_bundle.h"
+#include "stage_artifact.h"
 
 #include <nlohmann/json_fwd.hpp>
 

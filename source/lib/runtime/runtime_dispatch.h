@@ -33,19 +33,20 @@ VernonStageExecutable *loadBackendCpuEntryPipeline(VernonRuntimeContext &context
 VernonStageExecutable *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
                                                    size_t artifactSize, const char *reflection, size_t reflectionSize,
                                                    const char *entry, size_t entrySize);
-VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, Variant variant,
+VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,
                                                        size_t artifactSize, const std::string &entry,
                                                        VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots);
 bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
                              const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
-                             Stage &stage, Variant &variant, ReflectedEntry &reflectedEntry);
-bool buildReflectedComputeVariant(const Stage &stage, VernonRuntimeBackend backend, Variant &variant,
-                                  std::string &error);
-bool isDirectPipelineTopology(const Variant &variant);
+                             LoadedStageArtifact &stage, StageBindingPlan &stagePlan, ReflectedEntry &reflectedEntry);
+bool buildReflectedComputeStageBindingPlan(const LoadedStageArtifact &stage, VernonRuntimeBackend backend,
+                                           StageBindingPlan &stagePlan, std::string &error);
+bool isDirectStagePipelinePlan(const StageBindingPlan &plan);
 
-bool resolveBackendPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline);
+bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                            VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);
 VernonStatus invokeBackendPipeline(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan);

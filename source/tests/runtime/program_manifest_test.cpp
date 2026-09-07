@@ -313,17 +313,17 @@ TEST(ProgramTargetBinding, PreservesCanonicalNumericShapeAcrossComputeAndGraphic
     plan.operation = "graphics";
     plan.bindings.push_back(std::move(binding));
 
-    ExecutableBindingView variant;
+    StageBindingPlan variant;
     ReflectedEntry reflection;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildExecutableBindingView(plan, variant, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildStageBindingPlan(plan, variant, reflection, diagnostic)) << diagnostic.message;
     ASSERT_EQ(variant.parameters.size(), 1u);
     EXPECT_TRUE(variant.parameters[0].shape.empty());
     ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
     EXPECT_EQ(variant.parameters[0].uses[0].shape, std::vector<uint64_t>({2, 3}));
 
     plan.operation = "compute";
-    ASSERT_TRUE(buildExecutableBindingView(plan, variant, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildStageBindingPlan(plan, variant, reflection, diagnostic)) << diagnostic.message;
     ASSERT_EQ(variant.parameters.size(), 1u);
     EXPECT_TRUE(variant.parameters[0].shape.empty());
     ASSERT_EQ(variant.parameters[0].uses.size(), 1u);
@@ -390,10 +390,10 @@ TEST(ProgramTargetBinding, PreservesCompilerSelectedBufferCarrierForLargeMatrice
     plan.backend = VERNON_RUNTIME_OPENGL;
     plan.operation = "graphics";
     plan.bindings.push_back(std::move(binding));
-    ExecutableBindingView view;
+    StageBindingPlan view;
     ReflectedEntry reflection;
     Diagnostic diagnostic;
-    ASSERT_TRUE(buildExecutableBindingView(plan, view, reflection, diagnostic)) << diagnostic.message;
+    ASSERT_TRUE(buildStageBindingPlan(plan, view, reflection, diagnostic)) << diagnostic.message;
     ASSERT_EQ(view.parameters.size(), 1u);
     ASSERT_EQ(view.parameters[0].uses.size(), 1u);
     EXPECT_TRUE(view.parameters[0].shape.empty());

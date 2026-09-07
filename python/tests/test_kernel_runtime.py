@@ -1285,7 +1285,7 @@ class KernelTests(unittest.TestCase):
 
     def test_kernel_uses_program_control_boundaries_and_access(self) -> None:
         compiled = fill.specialize()
-        parameters = {parameter.name: parameter for parameter in compiled.specialization.pipeline.parameters}
+        parameters = {parameter.name: parameter for parameter in compiled.specialization.executable.parameters}
         self.assertEqual(
             set(parameters),
             {"output", "scale", "__grid_x", "__grid_y", "__grid_z"},

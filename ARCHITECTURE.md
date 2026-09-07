@@ -499,41 +499,42 @@ mesh_asset = vd.program_asset(
 
 `program=` 只能是：
 
-- 一个 compute `@kernel`；或
-- 一个非空 graphics stage tuple。
+- 一个 compute `@kernel`；
+- 一个 graphics `pipeline(...)`；
+- Kernel VJP、Module 或 Module VJP。
 
-Compute 和 graphics 不能混在同一个 asset。`variants=` 显式枚举允许的 canonical
-feature combinations，不自动生成 feature powerset；`()` 是明确的空 feature
-variant，不是隐式 fallback。当前一个 asset 最多包含 16 个 variant。Runtime
-resolve 时要求 feature set 精确匹配，不会自动回退到空集或某个子集。
+所有 authored form 都 capture 为同一个 canonical Program。Module 可以组合 compute
+和 graphics Node。`variants=` 显式枚举允许的 canonical feature combinations，不自动
+生成 feature powerset；`()` 是明确的空 feature variant，不是隐式 fallback。当前一个
+asset 最多包含 16 个 variant。Runtime resolve 时要求 feature set 精确匹配，不会自动
+回退到空集或某个子集。
 
 ### 9.2 Cooker pipeline
 
 ```mermaid
 flowchart TD
     Ref["module.py:asset_name"]
-    Parse["AST parse only<br/>no import · no execution"]
-    Variants["Validate topology and explicit variants"]
-    Compile["Compile each unique stage specialization"]
-    Plan["Merge reflection<br/>assign stable slots · validate interfaces"]
+    Evaluate["Evaluate typed ProgramAsset declaration"]
+    Capture["Capture one canonical Program"]
+    Compile["Compile requested Stage implementations"]
+    Deploy["Build one multi-variant deployment"]
     Artifacts["Write content-addressed artifacts"]
-    Manifest["Materialize versioned pipeline manifest"]
+    Manifest["Materialize versioned Program manifest"]
 
-    Ref --> Parse --> Variants --> Compile --> Plan --> Artifacts --> Manifest
+    Ref --> Evaluate --> Capture --> Compile --> Deploy --> Artifacts --> Manifest
 ```
 
 Cook 的具体步骤：
 
-1. 解析 `source.py:asset_name`；
-2. 从 AST 提取 ProgramAsset 和 feature declaration；
-3. 验证 stage topology、target compatibility 和 variant canonical form；
-4. 为每个 variant/entry 生成 specialized MLIR；
-5. 按 module、entry、MLIR digest、canonical target spec 缓存重复 stage compilation；
-6. 将 compiler reflection 归一化为 CompiledStage；
-7. 跨 stage 合并参数，分配所有 variant 共用的 stable slots；
-8. 验证 vertex/fragment interface 和 fragment outputs；
-9. 以 artifact digest 去重 stage records；
-10. 写 `artifacts/{sha256}{extension}` 并生成
+1. 求值 `source.py:asset_name` 并读取 typed `ProgramAssetDeclaration`；
+2. 将 authored form capture 为非空 `CapturedProgram`；
+3. 验证 Program、variant canonical form 和 target compatibility；
+4. 为每个 variant 的 Stage implementation request 生成 specialized MLIR；
+5. 按 module、entry、MLIR digest、canonical target spec 缓存重复 Stage compilation；
+6. 将 compiler reflection 归一化为 `CompiledStage`；
+7. 一次构造包含所有 variants 的 canonical Program deployment；
+8. 以 Blob digest 去重 target-native code ranges；
+9. 写 `artifacts/{sha256}{extension}` 并生成
     `{output-directory-name}.program.json`。
 
 Target 是 cooker 输入而不是 source declaration。一个 backend-independent
@@ -547,15 +548,11 @@ Cooked output 包含：
 
 - 当前 `PROGRAM_VERSION` 19，所有 target 共用 canonical Program；variant
   artifact system 以 logical Stage ID 直接索引 target artifact；
-- pipeline id 和按 backend 标记的 canonical `target.kind` / `target.options`；
-- feature universe 和显式 variant keys；
-- 每个 variant 的 stage map、parameter slots、internal parameters 和 outputs；
-- 去重后的 stage reflection；
-- artifact relative path、format、byte size 和 SHA-256；
-- runtime requirements；
-- differentiated asset 可选的 root `autodiff` object；普通 primal-only asset
-  不含该字段，pipeline 13 的 transform/profile 字段不是当前 schema alias；
-- 对整个 canonical manifest 的 `content_hash`。
+- Program id 和按 backend 标记的 canonical `target.kind` / `target.options`；
+- root content-addressed `blobs`；
+- 每个 variant 的 canonical feature key、完整 `program` 和 `artifact_system`；
+- `artifact_system.runtime_requirements` 与按 logical Stage ID 索引的 artifacts；
+- 对整个 canonical Program manifest 的 `content_hash`。
 
 Artifact descriptor 与 stage digest 必须一致。Runtime 在把 bytes 交给 backend
 之前验证：
@@ -620,7 +617,7 @@ cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期
   RHI ABI。
 
 修改 `PROGRAM_VERSION` 意味着 Runtime、Provider 和 RHI 必须一起重建。当前不
-承诺第三方预编译 Provider/RHI 插件跨 pipeline version 兼容。
+承诺第三方预编译 Provider/RHI 插件跨 Program version 兼容。
 
 ## 11. 典型端到端路径
 
@@ -631,7 +628,7 @@ cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期
   -> typed Tensor/TensorView semantics
   -> Vernon MLIR
   -> CPU object / CUDA PTX / Vulkan SPIR-V
-  -> canonical pipeline manifest + external artifacts
+  -> canonical Program manifest + Stage artifacts
   -> RuntimeCore binding plan
   -> CPU entry or RHI compute command
 ```
@@ -644,7 +641,7 @@ cache 与 read-write dirty-range restore 仍需要显式的预算和生命周期
   -> Vernon graphics IR
   -> SPIR-V
   -> Vulkan SPIR-V / GLSL / MSL / HLSL+DXIL
-  -> graphics bundle
+  -> Program bundle
   -> Runtime prepared pipeline
   -> RHI render commands
 ```

@@ -25,8 +25,9 @@ These provisional adapters are **already gone** from the tree:
 - `graphicsValueInterfacePlan` and `makeReflection`
 - Python-generated graphics Program MLIR and `_compile_legacy_pipeline_bundle`
 
-Keep `pipeline_manifest` legacy parse until the coordinated contract release.
-Do not reopen those adapters to fix AD.
+The coordinated Program Asset release removed the legacy manifest parser.
+Physical endpoint projection now lives in `stage_binding_plan`; do not reopen
+the deleted adapters to fix AD.
 
 ## Scope and invariants
 
@@ -36,8 +37,7 @@ Do not reopen those adapters to fix AD.
   layouts must not enter Program, StageContract, or endpoint ABI.
 - Do not update `COMPILER_CONTRACT_VERSION` or `PROGRAM_VERSION` before the
   coordinated release.
-- Legacy cooked loading may remain isolated until release, but canonical
-  cooking, examples, and new tests must not call it.
+- Cooked loading uses only the canonical Program bundle path.
 - Prove compute behavior unchanged before each graphics cutover.
 - Never fix failures by weakening ABI, layout hash, portable slot, resource
   access, or StageContract validation.
@@ -255,13 +255,9 @@ Canonical path already dropped:
 - `makeReflection` and `graphicsValueInterfacePlan`;
 - boolean `compileTensorCopyPlan` / `wholeValueTransport`.
 
-Still on the **legacy cooked** path until contract release (do not delete yet):
-
-- `reflected_parameters` / `merge_parameter_uses` in `bundle/parameters.py`
-  (used by `cook_program_asset`);
-- `materializeComputeEndpoint` for resolved one-node stage ABI;
-- `pipeline_manifest` parse;
-- duplicate Program vs Pipeline layout converters.
+The release cutover deleted the legacy cooked schema and manifest parser.
+`materializeComputeEndpoint` remains only for direct Stage artifact loading;
+Program resolve builds a `StageBindingPlan` from each Node's target projection.
 
 `variant_mesh` and external-engine assets still need Program plus
 ArtifactSystem cooking. No example, canonical test, or new asset may depend

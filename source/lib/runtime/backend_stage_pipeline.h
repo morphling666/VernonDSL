@@ -2,9 +2,9 @@
 #define VERNON_RUNTIME_BACKEND_STAGE_PIPELINE_H
 
 #include "VernonRuntime.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
 #include "pipeline_metadata.h"
+#include "stage_artifact.h"
+#include "stage_binding_plan.h"
 
 #include <string>
 #include <unordered_map>
@@ -16,9 +16,9 @@ namespace vernon::runtime {
 
 // Construction-only backend input. It is not a deployment identity and never
 // owns canonical Program or Node state.
-struct BackendPipelineBundle {
+struct BackendStageBuildInputs {
     VernonRuntimeContext *context{};
-    std::unordered_map<std::string, Stage> stages;
+    std::unordered_map<std::string, LoadedStageArtifact> artifacts;
 };
 
 } // namespace vernon::runtime
@@ -35,7 +35,7 @@ struct VernonStageExecutable {
     ~VernonStageExecutable();
 
     VernonRuntimeContext *context{};
-    vernon::runtime::Variant bindingProjection;
+    vernon::runtime::StageBindingPlan bindingProjection;
     VernonLaunchSize workgroupSize{1, 1, 1};
     vernon::runtime::DispatchContract dispatchContract;
     std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;

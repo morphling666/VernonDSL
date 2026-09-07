@@ -19,10 +19,10 @@ def _validate_grid(grid: tuple[int, int, int]) -> None:
         raise ValueError("grid must contain three positive integers")
 
 
-def _pipeline_derivative_groups(pipeline: Any) -> tuple[DerivativeGroup, ...]:
+def _program_derivative_groups(executable: Any) -> tuple[DerivativeGroup, ...]:
     groups = tuple(
         DerivativeGroup(str(role), str(path), tuple(str(leaf) for leaf in leaves))
-        for role, path, leaves in pipeline.derivative_groups
+        for role, path, leaves in executable.derivative_groups
     )
     if not groups or {group.role for group in groups} != {"gradient", "cotangent"}:
         raise RuntimeError("structured VJP Program has no validated derivative groups")

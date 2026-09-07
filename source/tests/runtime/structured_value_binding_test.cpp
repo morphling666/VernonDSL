@@ -1,7 +1,7 @@
 #include "VernonRuntime.hpp"
 #include "runtime/backend_stage_pipeline.h"
-#include "runtime/pipeline_manifest.h"
 #include "runtime/runtime_state.h"
+#include "runtime/stage_binding_plan.h"
 
 #include <gtest/gtest.h>
 

@@ -288,7 +288,7 @@ class ModuleTests(unittest.TestCase):
         np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
         specialization = next(iter(module._program_cache.values()))
-        signature = specialization.pipeline.program_ad_signature
+        signature = specialization.executable.program_ad_signature
         self.assertEqual([value["path"] for value in signature["inputs"]], ["source"])
         self.assertEqual([value["path"] for value in signature["outputs"]], ["square", "cube"])
         self.assertEqual([value["path"] for value in signature["cotangents"]], ["square", "cube"])
@@ -437,7 +437,7 @@ class ModuleTests(unittest.TestCase):
         finally:
             vd.init(arch=vd.cpu)
 
-    def test_pipeline_asset_retains_initialized_module(self) -> None:
+    def test_program_asset_retains_initialized_module(self) -> None:
         module = AnnotatedSquare()
         asset = vd.program_asset(id="modules/annotated-square", program=module)
         self.assertIs(asset.program, module)

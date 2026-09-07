@@ -5,10 +5,10 @@
 #include "VernonRuntimeCore.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
-#include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
 #include "rhi/opengl_backend.h"
 #include "runtime_state.h"
+#include "stage_artifact.h"
 #include "tensor_bridge.h"
 
 #include <string>

@@ -126,19 +126,18 @@ VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context
     TargetBindingPlan bindingPlan;
     if (!buildTargetBindingPlan(program, node, resolvedStage, context.backend, bindingPlan, diagnostic))
         return nullptr;
-    ExecutableBindingView variant;
+    StageBindingPlan stagePlan;
     ReflectedEntry reflection;
-    if (!buildExecutableBindingView(bindingPlan, variant, reflection, diagnostic))
+    if (!buildStageBindingPlan(bindingPlan, stagePlan, reflection, diagnostic))
         return nullptr;
 
-    BackendPipelineBundle bundle;
-    bundle.context = &context;
+    BackendStageBuildInputs inputs;
+    inputs.context = &context;
     for (const CodeModule &module : artifact.modules) {
         std::vector<uint8_t> bytes;
         if (!loadCodeModuleBytes(artifacts, resolvedStage.artifact, bundleRoot, module, bytes, diagnostic))
             return nullptr;
-        Stage stage;
-        stage.stage = module.role;
+        LoadedStageArtifact stage;
         stage.entry = module.entryPoint;
         for (const vernon::runtime::NativeResourceSlot &slot : artifact.nativeSlots)
             if (slot.stage == module.role)
@@ -148,18 +147,18 @@ VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context
         else
             stage.binary = std::move(bytes);
         const std::string key = resolvedStage.artifact + "/" + module.role;
-        bundle.stages.emplace(key, std::move(stage));
-        variant.program[module.role] = key;
+        inputs.artifacts.emplace(key, std::move(stage));
+        stagePlan.artifactKeys[module.role] = key;
         if (module.role == "vertex")
-            variant.vertex = key;
+            stagePlan.vertex = key;
         else if (module.role == "fragment")
-            variant.fragment = key;
+            stagePlan.fragment = key;
     }
     auto pipeline = std::make_unique<VernonStageExecutable>();
     pipeline->context = &context;
-    pipeline->bindingProjection = std::move(variant);
-    rebuildVariantLayoutViews(pipeline->bindingProjection);
-    if (!resolveBackendPipeline(bundle, pipeline->bindingProjection, *pipeline))
+    pipeline->bindingProjection = std::move(stagePlan);
+    rebuildStageBindingLayoutViews(pipeline->bindingProjection);
+    if (!resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline))
         return reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
                       invocationDiagnostic(context)),
                nullptr;
@@ -174,9 +173,9 @@ VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, co
         return reject(diagnostic, "PROGRAM_STAGE_BINDING", "/nodes/" + node.node->name,
                       "compute node has no resolved code module"),
                nullptr;
-    ExecutableBindingView variant;
+    StageBindingPlan stagePlan;
     ReflectedEntry reflection;
-    if (!buildExecutableBindingView(node.plan, variant, reflection, diagnostic))
+    if (!buildStageBindingPlan(node.plan, stagePlan, reflection, diagnostic))
         return nullptr;
     std::vector<uint8_t> moduleBytes;
     // CPU code modules are relocatable objects linked by the embedding
@@ -197,7 +196,7 @@ VernonStageExecutable *loadComputeNodePipeline(VernonRuntimeContext &context, co
         }
     }
     VernonStageExecutable *pipeline = loadBackendTypedComputePipeline(
-        context, std::move(variant), std::move(reflection), moduleBytes.empty() ? nullptr : moduleBytes.data(),
+        context, std::move(stagePlan), std::move(reflection), moduleBytes.empty() ? nullptr : moduleBytes.data(),
         moduleBytes.size(), entryName, cpuEntry, node.plan.nativeSlots);
     if (!pipeline)
         reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + stage.artifact,

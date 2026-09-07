@@ -32,7 +32,7 @@ VernonStatus describeTestImage(void *, VernonRuntimeProviderResourceReference re
     return VERNON_STATUS_OK;
 }
 
-bool planForTest(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
+bool planForTest(const StageBindingPlan &variant, const VernonStageInvocationDescriptor &invocation,
                  PlannedGraphicsInvocation &plan, std::string &error) {
     return planGraphicsInvocation(variant, invocation, describeTestImage, nullptr, plan, error);
 }
@@ -41,7 +41,7 @@ bool planVertexTensor(const char *dtype, VernonDataType dataType, const std::vec
                       const std::vector<AttributeLeaf> &leaves, const std::vector<uint64_t> &tensorShape,
                       const std::vector<int64_t> &tensorStrides, uint32_t divisor, uint32_t instanceCount,
                       PlannedGraphicsInvocation &plan, std::string &error) {
-    Variant variant;
+    StageBindingPlan variant;
     variant.vertex = "vertex";
     Parameter parameter;
     parameter.name = "value";
@@ -112,7 +112,7 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     const VernonRuntimeProviderResourceReference firstTarget{4, {14}, 0, 0};
     const VernonRuntimeProviderResourceReference secondTarget{5, {15}, 0, 0};
 
-    Variant variant;
+    StageBindingPlan variant;
     variant.vertex = "vertex";
     variant.fragment = "fragment";
     Parameter vertices;
@@ -140,9 +140,9 @@ TEST(GraphicsInvocationPlanner, PlansSortedTargetsPairingResolutionCountsAndInde
     Parameter implicitSampler;
     implicitSampler.name = "__sampler";
     implicitSampler.kind = "sampler";
-    implicitSampler.source = "implicit_sampler";
+    implicitSampler.source = StageParameterSource::ImplicitSampler;
     implicitSampler.uses.push_back({"fragment", "uniform", "", "", {}, 1, UINT32_MAX, 0, 0, UINT32_MAX, {{0, 5}}});
-    variant.internalParameters.push_back(implicitSampler);
+    variant.runtimeParameters.push_back(implicitSampler);
 
     const std::array<uint64_t, 2> vertexShape{4, 3};
     std::array<int64_t, 2> vertexStrides{12, 4};
@@ -385,7 +385,7 @@ TEST(GraphicsInvocationPlanner, RejectsNonFiniteAndOutOfRangeState) {
     EXPECT_FALSE(planGraphicsState(invocation, 0, false, false, planned, error));
 }
 
-TEST(GraphicsInvocationPlanner, VariantKeyUsesOnlyCanonicalStaticFields) {
+TEST(GraphicsInvocationPlanner, StageBindingPlanKeyUsesOnlyCanonicalStaticFields) {
     GraphicsVariantKey first{};
     first.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
     first.colorFormats = {3};
@@ -449,7 +449,7 @@ TEST(GraphicsScopePlanner, SamplingPreviousDepthAttachmentEndsScope) {
 }
 
 TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {
-    Variant variant;
+    StageBindingPlan variant;
     variant.vertex = "vertex";
     variant.fragment = "fragment";
     VernonColorAttachment attachment{};

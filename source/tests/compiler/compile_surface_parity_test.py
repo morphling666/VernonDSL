@@ -285,7 +285,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     def __init__(self) -> None:
                         self.loads: list[bytes] = []
 
-                    def load_canonical_program(
+                    def load_in_memory_program(
                         self,
                         manifest: bytes,
                         directory: str,

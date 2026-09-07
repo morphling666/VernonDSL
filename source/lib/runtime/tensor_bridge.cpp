@@ -1,5 +1,5 @@
 #include "tensor_bridge.h"
-#include "pipeline_manifest.h"
+#include "stage_binding_plan.h"
 
 #include <algorithm>
 #include <cstring>

@@ -34,7 +34,7 @@ function(vernon_discover_gtests target)
 endfunction()
 
 function(
-    vernon_add_pipeline_test_bundle
+    vernon_add_program_asset_test_bundle
     name
     architecture
     asset_reference
@@ -73,13 +73,13 @@ function(
     static_manifest_variable
     dynamic_manifest_variable
     targets_variable)
-    vernon_add_pipeline_test_bundle(
+    vernon_add_program_asset_test_bundle(
         "gpu-autodiff-${architecture}-static"
         "${architecture}"
         "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset"
         "autodiff_gpu_${output_stem}_static_fixture"
         _vernon_static_manifest)
-    vernon_add_pipeline_test_bundle(
+    vernon_add_program_asset_test_bundle(
         "gpu-autodiff-${architecture}-dynamic"
         "${architecture}"
         "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset"
@@ -229,7 +229,6 @@ if(TARGET VernonRuntime)
         runtime/execution_command_model_test.cpp
         runtime/execution_graph_test.cpp
         runtime/graphics_invocation_planner_test.cpp
-        runtime/pipeline_manifest_requirements_test.cpp
         runtime/program_instance_test.cpp
         runtime/program_manifest_test.cpp
         runtime/resolved_execution_plan_test.cpp
@@ -242,6 +241,7 @@ if(TARGET VernonRuntime)
         runtime/runtime_cpu_pipeline_test.cpp
         runtime/runtime_external_gl_test.cpp
         runtime/shape_layout_test.cpp
+        runtime/stage_artifact_contract_test.cpp
         runtime/structured_value_binding_test.cpp
         runtime/tensor_bridge_test.cpp
         runtime/vertex_attribute_capabilities_test.cpp)
@@ -291,21 +291,21 @@ if(TARGET VernonRuntime)
         set(gpu_autodiff_fixture_targets)
         set(module_program_gpu_fixture_targets)
         if(VERNON_ENABLE_VULKAN_RUNTIME)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-vulkan
                 vulkan
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
                 autodiff_gpu_vulkan_fixture
                 gpu_autodiff_vulkan_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 module-program-vulkan
                 vulkan
                 "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
                 module_program_vulkan_fixture
                 module_program_vulkan_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-vulkan-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-vulkan-non-power-of-two
                 vulkan
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -320,21 +320,21 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_fixture_targets)
         endif()
         if(VERNON_ENABLE_CUDA_RUNTIME)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-cuda
                 cuda
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
                 autodiff_gpu_cuda_fixture
                 gpu_autodiff_cuda_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 module-program-cuda
                 cuda
                 "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
                 module_program_cuda_fixture
                 module_program_cuda_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-cuda-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-cuda-non-power-of-two
                 cuda
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -349,21 +349,21 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_fixture_targets)
         endif()
         if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-directx
                 directx
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
                 autodiff_gpu_directx_fixture
                 gpu_autodiff_directx_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 module-program-directx
                 directx
                 "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
                 module_program_directx_fixture
                 module_program_directx_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-directx-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-directx-non-power-of-two
                 directx
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -378,21 +378,21 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_fixture_targets)
         endif()
         if(VERNON_ENABLE_METAL_RUNTIME)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-metal
                 metal
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
                 autodiff_gpu_metal_fixture
                 gpu_autodiff_metal_manifest)
             list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 module-program-metal
                 metal
                 "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
                 module_program_metal_fixture
                 module_program_metal_manifest)
             list(APPEND module_program_gpu_fixture_targets vernon-module-program-metal-test-bundle)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 gpu-autodiff-metal-non-power-of-two
                 metal
                 "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -406,21 +406,21 @@ if(TARGET VernonRuntime)
                 gpu_autodiff_metal_dynamic_manifest
                 gpu_autodiff_fixture_targets)
         endif()
-        vernon_add_pipeline_test_bundle(
+        vernon_add_program_asset_test_bundle(
             gpu-autodiff-opengl
             opengl
             "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
             autodiff_gpu_opengl_fixture
             gpu_autodiff_opengl_manifest)
         list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-test-bundle)
-        vernon_add_pipeline_test_bundle(
+        vernon_add_program_asset_test_bundle(
             module-program-opengl
             opengl
             "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
             module_program_opengl_fixture
             module_program_opengl_manifest)
         list(APPEND module_program_gpu_fixture_targets vernon-module-program-opengl-test-bundle)
-        vernon_add_pipeline_test_bundle(
+        vernon_add_program_asset_test_bundle(
             gpu-autodiff-opengl-non-power-of-two
             opengl
             "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
@@ -876,29 +876,29 @@ if(TARGET VernonRuntime)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_metal_test.cpp)
         set_source_files_properties(runtime/runtime_metal_test.cpp PROPERTIES LANGUAGE OBJCXX)
         if(TARGET vernon-dsl-native AND Python_FOUND)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 metal-compute-pipeline
                 metal
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
-                metal_compute_pipeline_bundle
-                metal_compute_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
+                metal_compute_program_bundle
+                metal_compute_program_test_manifest)
+            vernon_add_program_asset_test_bundle(
                 metal-graphics-pipeline
                 metal
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_asset"
-                metal_graphics_pipeline_bundle
-                metal_graphics_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
+                metal_graphics_program_bundle
+                metal_graphics_program_test_manifest)
+            vernon_add_program_asset_test_bundle(
                 metal-resolution-pipeline
                 metal
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
-                metal_resolution_pipeline_bundle
-                metal_resolution_pipeline_test_manifest)
+                metal_resolution_program_bundle
+                metal_resolution_program_test_manifest)
             target_compile_definitions(
                 VernonRuntimeTests
-                PRIVATE VERNON_METAL_COMPUTE_PIPELINE_BUNDLE="${metal_compute_pipeline_test_manifest}"
-                        VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE="${metal_graphics_pipeline_test_manifest}"
-                        VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE="${metal_resolution_pipeline_test_manifest}")
+                PRIVATE VERNON_METAL_COMPUTE_PROGRAM_BUNDLE="${metal_compute_program_test_manifest}"
+                        VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE="${metal_graphics_program_test_manifest}"
+                        VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE="${metal_resolution_program_test_manifest}")
             add_dependencies(
                 VernonRuntimeTests
                 vernon-metal-compute-pipeline-test-bundle
@@ -952,30 +952,30 @@ if(TARGET VernonRuntime)
                                                   rhi/directx12_native_interop_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE Vernon::RHI d3d12 dxgi)
         if(TARGET vernon-dsl-native AND Python_FOUND)
-            vernon_add_pipeline_test_bundle(
+            vernon_add_program_asset_test_bundle(
                 directx-pipeline
                 directx
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_depth_asset"
-                directx_pipeline_bundle
-                directx_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
+                directx_program_bundle
+                directx_program_test_manifest)
+            vernon_add_program_asset_test_bundle(
                 directx-compute-pipeline
                 directx
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
-                directx_compute_pipeline_bundle
-                directx_compute_pipeline_test_manifest)
-            vernon_add_pipeline_test_bundle(
+                directx_compute_program_bundle
+                directx_compute_program_test_manifest)
+            vernon_add_program_asset_test_bundle(
                 directx-resolution-pipeline
                 directx
                 "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:resolution_asset"
-                directx_resolution_pipeline_bundle
-                directx_resolution_pipeline_test_manifest)
+                directx_resolution_program_bundle
+                directx_resolution_program_test_manifest)
             target_sources(VernonRuntimeTests PRIVATE runtime/runtime_directx12_pipeline_test.cpp)
             target_compile_definitions(
                 VernonRuntimeTests
-                PRIVATE VERNON_DIRECTX_PIPELINE_BUNDLE="${directx_pipeline_test_manifest}"
-                        VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE="${directx_compute_pipeline_test_manifest}"
-                        VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE="${directx_resolution_pipeline_test_manifest}")
+                PRIVATE VERNON_DIRECTX_PROGRAM_BUNDLE="${directx_program_test_manifest}"
+                        VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE="${directx_compute_program_test_manifest}"
+                        VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE="${directx_resolution_program_test_manifest}")
             target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
             add_dependencies(
                 VernonRuntimeTests
@@ -988,19 +988,19 @@ if(TARGET VernonRuntime)
     if(VERNON_ENABLE_VULKAN_RUNTIME
        AND TARGET vernon-dsl-native
        AND Python_FOUND)
-        vernon_add_pipeline_test_bundle(
+        vernon_add_program_asset_test_bundle(
             vulkan-pipeline
             vulkan
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:sampled_depth_asset"
-            vulkan_pipeline_bundle
-            vulkan_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
+            vulkan_program_bundle
+            vulkan_program_test_manifest)
+        vernon_add_program_asset_test_bundle(
             vulkan-compute-pipeline
             vulkan
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:scale_asset"
-            vulkan_compute_pipeline_bundle
-            vulkan_compute_pipeline_test_manifest)
-        vernon_add_pipeline_test_bundle(
+            vulkan_compute_program_bundle
+            vulkan_compute_program_test_manifest)
+        vernon_add_program_asset_test_bundle(
             vulkan-cube-map
             vulkan
             "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
@@ -1010,9 +1010,9 @@ if(TARGET VernonRuntime)
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(
             VernonRuntimeTests
-            PRIVATE VERNON_VULKAN_PIPELINE_BUNDLE="${vulkan_pipeline_test_manifest}"
+            PRIVATE VERNON_VULKAN_PROGRAM_BUNDLE="${vulkan_program_test_manifest}"
                     VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}"
-                    VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE="${vulkan_compute_pipeline_test_manifest}")
+                    VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE="${vulkan_compute_program_test_manifest}")
         add_dependencies(
             VernonRuntimeTests
             vernon-vulkan-pipeline-test-bundle
@@ -1021,7 +1021,7 @@ if(TARGET VernonRuntime)
     endif()
 
     if(TARGET vernon-dsl-native AND Python_FOUND)
-        vernon_add_pipeline_test_bundle(
+        vernon_add_program_asset_test_bundle(
             opengl-runtime-acceptance
             opengl
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:opengl_runtime_acceptance_asset"

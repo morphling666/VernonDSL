@@ -191,7 +191,7 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::arg("program"), nb::arg("entry"), nb::keep_alive<0, 1>())
         .def("load_program", &Runtime::loadProgramAsset, nb::keep_alive<0, 1>())
-        .def("load_canonical_program", &Runtime::loadCanonicalProgram, nb::arg("manifest"), nb::arg("directory"),
+        .def("load_in_memory_program", &Runtime::loadInMemoryProgram, nb::arg("manifest"), nb::arg("directory"),
              nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
     nb::class_<ProgramParameterMetadata>(module, "ProgramParameter")
         .def_ro("slot", &ProgramParameterMetadata::slot)
@@ -254,7 +254,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("mark_all", &vernon::runtime::DirtyIndexSet::markAll)
         .def("clear", &vernon::runtime::DirtyIndexSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
-    nb::class_<PreparedProgramArgument>(module, "_PreparedPipelineArgument");
+    nb::class_<PreparedProgramArgument>(module, "_PreparedProgramArgument");
     nb::class_<StageInvocationBuilder>(module, "StageInvocationBuilder")
         .def("host_tensor", &StageInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
              nb::rv_policy::reference_internal)
@@ -346,19 +346,19 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("invocation_builder", &PythonProgramExecutable::invocationBuilder, nb::keep_alive<0, 1>())
         .def(
             "program_instance",
-            [](PythonProgramExecutable &pipeline) {
-                return std::make_unique<PythonProgramInstanceAdapter>(pipeline.owner, pipeline.runtime,
-                                                                      pipeline.pipeline);
+            [](PythonProgramExecutable &executable) {
+                return std::make_unique<PythonProgramInstanceAdapter>(executable.owner, executable.runtime,
+                                                                      executable.executable);
             },
             nb::keep_alive<0, 1>())
         .def("program_forward_bound", &PythonProgramExecutable::programForwardBound, nb::arg("builder"),
              nb::call_guard<nb::gil_scoped_release>())
         .def(
             "program_vjp_bound",
-            [](PythonProgramExecutable &pipeline, ProgramInvocationBuilder &builder, const nb::dict &bindings,
+            [](PythonProgramExecutable &executable, ProgramInvocationBuilder &builder, const nb::dict &bindings,
                nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
-                return pipeline.programVjpBound(builder, bindings, nb::cast(&pipeline, nb::rv_policy::reference),
-                                                checkpoint_memory_budget, checkpoint_policy);
+                return executable.programVjpBound(builder, bindings, nb::cast(&executable, nb::rv_policy::reference),
+                                                  checkpoint_memory_budget, checkpoint_policy);
             },
             nb::arg("builder"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
             nb::arg("checkpoint_policy") = std::string())

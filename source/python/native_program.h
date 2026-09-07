@@ -250,13 +250,13 @@ struct PythonRuntimeSubmission {
 
     void wait() {
         if (vernonSubmissionWait(handle) != VERNON_STATUS_OK)
-            throw std::runtime_error("pipeline submission failed");
+            throw std::runtime_error("executable submission failed");
     }
 
     uint32_t state() const {
         VernonSubmissionState value{};
         if (vernonSubmissionGetState(handle, &value) != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query pipeline submission");
+            throw std::runtime_error("cannot query executable submission");
         return static_cast<uint32_t>(value);
     }
 
@@ -290,8 +290,8 @@ struct PreparedProgramArgument {
 };
 
 struct ProgramInvocationBuilder {
-    ProgramInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline)
-        : owner(owner), runtime(runtime), pipeline(pipeline) {}
+    ProgramInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable)
+        : owner(owner), runtime(runtime), executable(executable) {}
     ProgramInvocationBuilder(const ProgramInvocationBuilder &) = delete;
     ProgramInvocationBuilder &operator=(const ProgramInvocationBuilder &) = delete;
 
@@ -299,23 +299,23 @@ struct ProgramInvocationBuilder {
         VernonProgramParameterView view{};
         if (nb::isinstance<nb::str>(identifier)) {
             const std::string name = nb::cast<std::string>(identifier);
-            if (vernonRuntimeProgramExecutableFindParameter(pipeline, {name.data(), name.size()}, &view) !=
+            if (vernonRuntimeProgramExecutableFindParameter(executable, {name.data(), name.size()}, &view) !=
                 VERNON_STATUS_OK)
-                throw std::invalid_argument("unknown pipeline parameter '" + name + "'");
+                throw std::invalid_argument("unknown executable parameter '" + name + "'");
             ProgramParameterMetadata metadata = parameterMetadata(view);
             if (view.kind == VERNON_PROGRAM_IMAGE) {
                 VernonProgramImageConstraintView constraint{};
                 constraint.struct_size = sizeof(constraint);
-                if (vernonRuntimeProgramExecutableFindImageConstraint(pipeline, {name.data(), name.size()},
+                if (vernonRuntimeProgramExecutableFindImageConstraint(executable, {name.data(), name.size()},
                                                                       &constraint) != VERNON_STATUS_OK)
-                    throw std::runtime_error("cannot query pipeline image constraint");
+                    throw std::runtime_error("cannot query executable image constraint");
                 metadata.imageBindingRole = constraint.binding_role;
                 metadata.storageImageFormat = constraint.storage_format;
             }
             return metadata;
         }
         if (!nb::isinstance<nb::int_>(identifier))
-            throw std::invalid_argument("pipeline parameter must be a name or slot");
+            throw std::invalid_argument("executable parameter must be a name or slot");
         const uint32_t slot = nb::cast<uint32_t>(identifier);
         const VernonProgramBoundaryRole roles[] = {
             VERNON_PROGRAM_BOUNDARY_INPUT,
@@ -324,37 +324,37 @@ struct ProgramInvocationBuilder {
             VERNON_PROGRAM_BOUNDARY_GRADIENT,
         };
         for (VernonProgramBoundaryRole role : roles) {
-            const size_t boundaryCount = vernonRuntimeProgramExecutableGetBoundaryCount(pipeline, role);
+            const size_t boundaryCount = vernonRuntimeProgramExecutableGetBoundaryCount(executable, role);
             for (size_t index = 0; index < boundaryCount; ++index)
-                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(pipeline, role, index, &view) ==
+                if (vernonRuntimeProgramExecutableGetBoundaryByIndex(executable, role, index, &view) ==
                         VERNON_STATUS_OK &&
                     view.slot == slot && view.kind != VERNON_PROGRAM_IMAGE)
                     return parameterMetadata(view);
         }
-        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
+        const size_t count = vernonRuntimeProgramExecutableGetParameterCount(executable);
         for (size_t index = 0; index < count; ++index) {
-            if (vernonRuntimeProgramExecutableGetParameterByIndex(pipeline, index, &view) == VERNON_STATUS_OK &&
+            if (vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &view) == VERNON_STATUS_OK &&
                 view.slot == slot) {
                 ProgramParameterMetadata metadata = parameterMetadata(view);
                 if (view.kind == VERNON_PROGRAM_IMAGE) {
                     VernonProgramImageConstraintView constraint{};
                     constraint.struct_size = sizeof(constraint);
                     if (vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
-                            pipeline, index, &constraint) != VERNON_STATUS_OK)
-                        throw std::runtime_error("cannot query pipeline image constraint");
+                            executable, index, &constraint) != VERNON_STATUS_OK)
+                        throw std::runtime_error("cannot query executable image constraint");
                     metadata.imageBindingRole = constraint.binding_role;
                     metadata.storageImageFormat = constraint.storage_format;
                 }
                 return metadata;
             }
         }
-        throw std::invalid_argument("unknown pipeline parameter slot " + std::to_string(slot));
+        throw std::invalid_argument("unknown executable parameter slot " + std::to_string(slot));
     }
 
     std::unique_ptr<PreparedProgramArgument> createArgument(const ProgramParameterMetadata &parameter,
                                                             VernonProgramArgumentKind kind) {
         if (parameter.kind != kind)
-            throw std::invalid_argument("pipeline parameter '" + parameter.name + "' has a different reflected kind");
+            throw std::invalid_argument("executable parameter '" + parameter.name + "' has a different reflected kind");
         auto prepared = std::make_unique<PreparedProgramArgument>();
         PreparedProgramArgument &result = *prepared;
         result.value.slot = parameter.slot;
@@ -373,7 +373,7 @@ struct ProgramInvocationBuilder {
 
     ProgramInvocationBuilder &preparedArgument(PreparedProgramArgument &prepared) {
         if (!slots.insert(prepared.value.slot).second)
-            throw std::invalid_argument("pipeline parameter was already bound");
+            throw std::invalid_argument("executable parameter was already bound");
         arguments.push_back(&prepared);
         return *this;
     }
@@ -400,7 +400,7 @@ struct ProgramInvocationBuilder {
             return VERNON_DATA_F32;
         if (name == "float64")
             return VERNON_DATA_F64;
-        throw std::invalid_argument("unsupported NumPy pipeline dtype '" + name + "'");
+        throw std::invalid_argument("unsupported NumPy executable dtype '" + name + "'");
     }
 
     std::unique_ptr<PreparedProgramArgument> prepareHostTensor(const nb::object &identifier, const nb::object &array) {
@@ -425,7 +425,7 @@ struct ProgramInvocationBuilder {
                 trailingSize *= static_cast<size_t>(arrayShape[dimension]);
             }
             if (trailingSize != parameter.elementByteSize)
-                throw std::invalid_argument("host tensor element size does not match pipeline reflection");
+                throw std::invalid_argument("host tensor element size does not match executable reflection");
         }
         argument.shape.assign(arrayShape.begin(), arrayShape.begin() + static_cast<std::ptrdiff_t>(rank));
         argument.strides.assign(arrayStrides.begin(), arrayStrides.begin() + static_cast<std::ptrdiff_t>(rank));
@@ -444,7 +444,7 @@ struct ProgramInvocationBuilder {
             parameter.elementLeaves.size() == 1 && parameter.elementLeaves[0].scalar_count == 1 &&
             parameter.elementLeaves[0].byte_offset == 0 &&
             numpyDataType(array) != static_cast<VernonDataType>(parameter.elementLeaves[0].dtype))
-            throw std::invalid_argument("host tensor dtype does not match pipeline reflection");
+            throw std::invalid_argument("host tensor dtype does not match executable reflection");
         argument.owner = array;
         const uintptr_t data = nb::cast<uintptr_t>(array.attr("ctypes").attr("data"));
         uintptr_t allocation = data - before;
@@ -523,7 +523,7 @@ struct ProgramInvocationBuilder {
                                            ? VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT
                                            : VERNON_RHI_IMAGE_SAMPLED;
         if (!view || !(view->image->usage & requiredUsage))
-            throw std::invalid_argument("RHI texture usage does not match the pipeline parameter");
+            throw std::invalid_argument("RHI texture usage does not match the executable parameter");
         if (storage && view->format != parameter.storageImageFormat)
             throw std::invalid_argument("RHI texture format does not match the storage texture parameter");
         auto prepared = createArgument(parameter, VERNON_PROGRAM_IMAGE);
@@ -721,7 +721,7 @@ struct ProgramInvocationBuilder {
         std::vector<VernonProgramArgument> values;
         collectArguments(values);
 
-        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline);
+        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
         if (!instance)
             return VERNON_STATUS_INVALID_ARGUMENT;
         VernonProgramInvocation *programInvocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
@@ -735,11 +735,11 @@ struct ProgramInvocationBuilder {
             const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
             status = vernonRuntimeProgramInvocationBind(programInvocation, &token, &values[index], nullptr, 0, 0);
         }
-        const size_t graphicsCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(pipeline);
+        const size_t graphicsCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable);
         for (size_t index = 0; index < graphicsCount && status == VERNON_STATUS_OK; ++index) {
             VernonProgramGraphicsControlsView controls{};
             controls.struct_size = sizeof(controls);
-            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline, index, &controls);
+            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, index, &controls);
             const std::string text = "python-graphics-" + std::to_string(index);
             const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
             if (status == VERNON_STATUS_OK && hasGraphicsState)
@@ -763,7 +763,7 @@ struct ProgramInvocationBuilder {
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
-    VernonProgramExecutable *pipeline{};
+    VernonProgramExecutable *executable{};
     std::vector<PreparedProgramArgument *> arguments;
     std::vector<std::unique_ptr<PreparedProgramArgument>> ownedArguments;
     std::unordered_set<uint32_t> slots;
@@ -848,10 +848,10 @@ struct PythonPreparedBindingLease {
 // token comparison, snapshots, telemetry, and payload leases live in the
 // runtime ProgramInstance referenced by this adapter.
 struct PythonProgramInvocationAdapter {
-    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline,
+    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable,
                                    vernon::runtime::program::ProgramInstance &instance,
                                    VernonProgramInstance *nativeInstance)
-        : builder(std::make_unique<ProgramInvocationBuilder>(owner, runtime, pipeline)),
+        : builder(std::make_unique<ProgramInvocationBuilder>(owner, runtime, executable)),
           transaction(instance.beginInvocation()),
           nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
         if (!nativeInvocation)
@@ -947,9 +947,9 @@ struct PythonProgramInvocationAdapter {
 };
 
 struct PythonProgramInstanceAdapter {
-    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *pipeline)
-        : owner(owner), runtime(runtime), pipeline(pipeline), nativeInstance(pipeline),
-          nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(pipeline)) {
+    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable)
+        : owner(owner), runtime(runtime), executable(executable), nativeInstance(executable),
+          nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(executable)) {
         if (!nativeInvocationInstance)
             throw std::runtime_error("failed to create native Program instance");
     }
@@ -958,7 +958,7 @@ struct PythonProgramInstanceAdapter {
     ~PythonProgramInstanceAdapter() { vernonRuntimeProgramInstanceDestroy(nativeInvocationInstance); }
 
     std::unique_ptr<PythonProgramInvocationAdapter> beginInvocation() {
-        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, pipeline, nativeInstance,
+        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, executable, nativeInstance,
                                                                 nativeInvocationInstance);
     }
 
@@ -975,7 +975,7 @@ struct PythonProgramInstanceAdapter {
 
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
-    VernonProgramExecutable *pipeline{};
+    VernonProgramExecutable *executable{};
     vernon::runtime::program::ProgramInstance nativeInstance;
     VernonProgramInstance *nativeInvocationInstance{};
 };

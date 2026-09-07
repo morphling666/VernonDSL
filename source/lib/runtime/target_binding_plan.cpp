@@ -930,10 +930,10 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     return true;
 }
 
-static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &variant,
-                                              ReflectedEntry &reflection, Diagnostic &diagnostic) {
+static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBindingPlan &stagePlan,
+                                         ReflectedEntry &reflection, Diagnostic &diagnostic) {
     diagnostic = {};
-    variant = {};
+    stagePlan = {};
     reflection = {};
     std::copy(std::begin(plan.workgroupSize), std::end(plan.workgroupSize), reflection.workgroup);
     reflection.dispatchContract = plan.dispatch;
@@ -942,8 +942,8 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
     if (plan.backend == VERNON_RUNTIME_CPU && plan.packedResultsSize)
         reflection.packedResults = PackedArgumentsLayout{static_cast<size_t>(plan.packedResultsSize)};
     if (!plan.modules.empty()) {
-        variant.compute = plan.modules.front().entryPoint;
-        variant.program.emplace("compute", variant.compute);
+        stagePlan.compute = plan.modules.front().entryPoint;
+        stagePlan.artifactKeys.emplace("compute", stagePlan.compute);
     }
     for (const TargetBinding &binding : plan.bindings) {
         const uint32_t runtimeArgumentIndex = static_cast<uint32_t>(reflection.arguments.size());
@@ -991,9 +991,9 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
             continue;
 
         vernon::runtime::Parameter parameter;
-        parameter.slot = static_cast<uint32_t>(variant.parameters.size());
+        parameter.slot = static_cast<uint32_t>(stagePlan.parameters.size());
         parameter.name = binding.name;
-        parameter.source = "direct";
+        parameter.source = StageParameterSource::Direct;
         parameter.kind = binding.kind;
         parameter.access = binding.access.empty() ? "read" : binding.access;
         parameter.elementLayout = binding.elementLayout;
@@ -1035,7 +1035,7 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
         use.descriptorSet = 0;
         use.binding = binding.endpoint.portableSlot;
         parameter.uses.push_back(std::move(use));
-        variant.parameters.push_back(std::move(parameter));
+        stagePlan.parameters.push_back(std::move(parameter));
     }
 
     const auto argumentIndex = [&](const std::string &owner) -> std::optional<uint32_t> {
@@ -1070,7 +1070,7 @@ static bool buildComputeExecutableBindingView(const TargetBindingPlan &plan, Exe
             reflection.writeFootprints.push_back(std::move(footprint));
         }
     }
-    rebuildVariantLayoutViews(variant);
+    rebuildStageBindingLayoutViews(stagePlan);
     return true;
 }
 
@@ -1147,10 +1147,10 @@ bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBa
     return true;
 }
 
-static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &variant,
-                                               Diagnostic &diagnostic) {
+static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBindingPlan &stagePlan,
+                                          Diagnostic &diagnostic) {
     diagnostic = {};
-    variant = {};
+    stagePlan = {};
     std::map<uint32_t, size_t> parameterByValue;
     for (const TargetBinding &binding : plan.bindings) {
         if (binding.source == SourceRepresentation::ImplicitSampler) {
@@ -1158,7 +1158,7 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
             parameter.name =
                 "__vernon_implicit_sampler_" + binding.endpoint.module + "_" + std::to_string(binding.endpoint.index);
             parameter.kind = "sampler";
-            parameter.source = "implicit_sampler";
+            parameter.source = StageParameterSource::ImplicitSampler;
             parameter.access = "read";
             ParameterUse use;
             use.stage = binding.endpoint.module;
@@ -1168,7 +1168,7 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
             use.binding = binding.native.binding;
             use.sampledImageBindings = binding.sampledImageBindings;
             parameter.uses.push_back(std::move(use));
-            variant.internalParameters.push_back(std::move(parameter));
+            stagePlan.runtimeParameters.push_back(std::move(parameter));
             continue;
         }
         if (binding.source == SourceRepresentation::SystemValue) {
@@ -1177,8 +1177,7 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
                                                         std::to_string(binding.endpoint.index)
                                                   : binding.name;
             parameter.kind = "tensor";
-            parameter.source = "system_value";
-            parameter.systemValue = "resolution";
+            parameter.source = StageParameterSource::Resolution;
             parameter.elementLayout = binding.elementLayout;
             parameter.valueLayout = binding.wholeValueLayout;
             parameter.access = binding.access.empty() ? "read" : binding.access;
@@ -1200,13 +1199,13 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
                 use.valueLayout = binding.wholeValueLayout;
             }
             parameter.uses.push_back(std::move(use));
-            variant.internalParameters.push_back(std::move(parameter));
+            stagePlan.runtimeParameters.push_back(std::move(parameter));
             continue;
         }
         auto found = parameterByValue.find(binding.projection.value);
         if (found == parameterByValue.end()) {
             vernon::runtime::Parameter parameter;
-            parameter.slot = static_cast<uint32_t>(variant.parameters.size());
+            parameter.slot = static_cast<uint32_t>(stagePlan.parameters.size());
             parameter.name = binding.name;
             parameter.access = binding.access;
             parameter.kind = binding.kind;
@@ -1218,10 +1217,10 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
             if (binding.kind == "image" && binding.role == "sampled")
                 parameter.sampleResultClass = "float";
             parameter.shape = shape::encodeRuntimeContractShape(binding.shape);
-            variant.parameters.push_back(std::move(parameter));
-            found = parameterByValue.emplace(binding.projection.value, variant.parameters.size() - 1).first;
+            stagePlan.parameters.push_back(std::move(parameter));
+            found = parameterByValue.emplace(binding.projection.value, stagePlan.parameters.size() - 1).first;
         }
-        vernon::runtime::Parameter &parameter = variant.parameters[found->second];
+        vernon::runtime::Parameter &parameter = stagePlan.parameters[found->second];
         ParameterUse use;
         use.stage = binding.endpoint.module;
         use.interfaceKind = binding.carrier == TargetCarrier::VertexBuffer           ? "input"
@@ -1271,24 +1270,24 @@ static bool buildGraphicsExecutableBindingView(const TargetBindingPlan &plan, Ex
         }
         reflected.access = "write";
         reflected.location = output.location;
-        variant.outputs.push_back(std::move(reflected));
+        stagePlan.outputs.push_back(std::move(reflected));
     }
-    std::sort(variant.internalParameters.begin(), variant.internalParameters.end(),
+    std::sort(stagePlan.runtimeParameters.begin(), stagePlan.runtimeParameters.end(),
               [](const vernon::runtime::Parameter &left, const vernon::runtime::Parameter &right) {
                   return left.name < right.name;
               });
-    rebuildVariantLayoutViews(variant);
+    rebuildStageBindingLayoutViews(stagePlan);
     return true;
 }
 
-bool buildExecutableBindingView(const TargetBindingPlan &plan, ExecutableBindingView &view, ReflectedEntry &reflection,
-                                Diagnostic &diagnostic) {
+bool buildStageBindingPlan(const TargetBindingPlan &plan, StageBindingPlan &view, ReflectedEntry &reflection,
+                           Diagnostic &diagnostic) {
     if (plan.operation == "graphics") {
         reflection = {};
-        return buildGraphicsExecutableBindingView(plan, view, diagnostic);
+        return buildGraphicsStageBindingPlan(plan, view, diagnostic);
     }
     if (plan.operation == "compute")
-        return buildComputeExecutableBindingView(plan, view, reflection, diagnostic);
+        return buildComputeStageBindingPlan(plan, view, reflection, diagnostic);
     return reject(diagnostic, "PROGRAM_OPERATION_UNSUPPORTED", "/graphs",
                   "TargetBindingPlan has an unsupported operation");
 }

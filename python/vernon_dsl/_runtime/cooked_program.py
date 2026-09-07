@@ -1,4 +1,4 @@
-"""Loading and invocation for existing cooked pipeline artifacts."""
+"""Loading and invocation for cooked Program assets."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ class _CookedProgramPullback:
 
 @dataclass
 class CookedProgram:
-    """Callable compute pipeline loaded through the native asset loader."""
+    """Callable Program executable loaded through the canonical asset loader."""
 
     _bundle: bytes
     _directory: str
@@ -78,7 +78,7 @@ class CookedProgram:
     def _load(self) -> None:
         state = _session_state()
         if state._native_runtime is None:
-            raise RuntimeError("cooked pipeline assets require the native runtime")
+            raise RuntimeError("cooked Program assets require the native runtime")
         if self._native is not None and self._runtime_generation == state._runtime_generation:
             return
         self._native = state._native_runtime.load_program(
@@ -104,11 +104,11 @@ class CookedProgram:
         self._load()
         names = self.parameter_names
         if len(arguments) > len(names):
-            raise TypeError(f"pipeline expects at most {len(names)} positional arguments")
+            raise TypeError(f"Program executable expects at most {len(names)} positional arguments")
         bindings = dict(zip(names, arguments, strict=False))
         duplicate = set(bindings) & set(keywords)
         if duplicate:
-            raise TypeError(f"pipeline received duplicate binding(s): {', '.join(sorted(duplicate))}")
+            raise TypeError(f"Program executable received duplicate binding(s): {', '.join(sorted(duplicate))}")
         bindings.update(keywords)
         missing = set(names) - set(bindings)
         unknown = set(bindings) - set(names)
@@ -118,7 +118,7 @@ class CookedProgram:
                 details.append("missing " + ", ".join(sorted(missing)))
             if unknown:
                 details.append("unknown " + ", ".join(sorted(unknown)))
-            raise TypeError("pipeline bindings do not match its signature: " + "; ".join(details))
+            raise TypeError("Program executable bindings do not match its signature: " + "; ".join(details))
         if (
             not isinstance(grid, tuple)
             or len(grid) != 3
@@ -173,7 +173,7 @@ class CookedProgram:
         if grid_parameters != set(grid_values):
             raise RuntimeError("cooked Program is missing compute workgroup boundary Values")
         if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
-            raise ValueError("autodiff bindings do not match pipeline parameters")
+            raise ValueError("autodiff bindings do not match Program parameters")
         state = _session_state()
         access_names = {
             state._native.ACCESS_READ: "read",
@@ -222,15 +222,15 @@ def load_program(
 ) -> CookedProgram:
     manifest_path = Path(manifest).resolve()
     if any(not isinstance(feature, str) or not feature for feature in features):
-        raise ValueError("pipeline asset features must be non-empty strings")
+        raise ValueError("Program features must be non-empty strings")
     bundle = manifest_path.read_bytes()
-    pipeline = CookedProgram(
+    executable = CookedProgram(
         bundle,
         str(manifest_path.parent),
         tuple(sorted(set(features))),
     )
-    pipeline._load()
-    return pipeline
+    executable._load()
+    return executable
 
 
 __all__ = ["CookedProgram", "load_program"]

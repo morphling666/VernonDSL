@@ -18,6 +18,6 @@ acknowledgement within seven days. Disclosure timing is coordinated after the
 issue is reproduced and a fix or mitigation is available.
 
 VernonDSL compiles and loads executable CPU/GPU artifacts. Applications must
-treat untrusted Python DSL source, MLIR, pipeline manifests, native objects,
-shader artifacts, and caches as untrusted executable input and isolate them
+treat untrusted Python DSL source, MLIR, Program manifests, native objects,
+Stage artifacts, and caches as untrusted executable input and isolate them
 accordingly. The 0.1.2 API does not provide a sandbox.

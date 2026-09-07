@@ -774,12 +774,12 @@ bool materializeFixtureUse(const nlohmann::json &source, vernon::runtime::Parame
     std::string error;
     if (source.contains("value_layout")) {
         use.valueLayout.emplace();
-        if (!vernon::runtime::parsePipelineValueLayout(source["value_layout"], *use.valueLayout, error))
+        if (!vernon::runtime::parseArtifactValueLayout(source["value_layout"], *use.valueLayout, error))
             return false;
     }
     if (source.contains("interface_plan")) {
         use.interfacePlan.emplace();
-        if (!vernon::runtime::parsePipelineInterfacePlan(source["interface_plan"], *use.interfacePlan, error))
+        if (!vernon::runtime::parseArtifactInterfacePlan(source["interface_plan"], *use.interfacePlan, error))
             return false;
     }
     if (source.contains("tensor_view_descriptor")) {
@@ -796,8 +796,17 @@ bool materializeFixtureParameter(const nlohmann::json &source, vernon::runtime::
     parameter.slot = source.value("slot", 0u);
     parameter.name = source.value("name", "");
     parameter.kind = source.value("kind", "");
-    parameter.source = source.value("source", "");
-    parameter.systemValue = source.value("system_value", "");
+    const std::string parameterSource = source.value("source", "");
+    if (parameterSource.empty())
+        parameter.source = vernon::runtime::StageParameterSource::Projected;
+    else if (parameterSource == "direct")
+        parameter.source = vernon::runtime::StageParameterSource::Direct;
+    else if (parameterSource == "implicit_sampler")
+        parameter.source = vernon::runtime::StageParameterSource::ImplicitSampler;
+    else if (parameterSource == "system_value" && source.value("system_value", "") == "resolution")
+        parameter.source = vernon::runtime::StageParameterSource::Resolution;
+    else
+        return false;
     parameter.access = source.value("access", "");
     parameter.addressSpace = source.value("address_space", "");
     parameter.dimension = source.value("dimension", "");
@@ -808,11 +817,11 @@ bool materializeFixtureParameter(const nlohmann::json &source, vernon::runtime::
     std::string error;
     if (source.contains("value_layout")) {
         parameter.valueLayout.emplace();
-        if (!vernon::runtime::parsePipelineValueLayout(source["value_layout"], *parameter.valueLayout, error))
+        if (!vernon::runtime::parseArtifactValueLayout(source["value_layout"], *parameter.valueLayout, error))
             return false;
     }
     if (source.contains("element_layout") &&
-        !vernon::runtime::parsePipelineValueLayout(source["element_layout"], parameter.elementLayout, error))
+        !vernon::runtime::parseArtifactValueLayout(source["element_layout"], parameter.elementLayout, error))
         return false;
     for (const nlohmann::json &sourceUse : source.value("uses", nlohmann::json::array())) {
         parameter.uses.emplace_back();
@@ -828,20 +837,20 @@ VernonStageExecutable *loadDirectGraphicsFixture(VernonRuntimeContext *context, 
         !fixture.contains("stages"))
         return nullptr;
     const nlohmann::json &sourceVariant = fixture["variants"][0];
-    vernon::runtime::Variant variant;
+    vernon::runtime::StageBindingPlan variant;
     for (const auto &[stage, entry] : sourceVariant["program"].items())
-        variant.program.emplace(stage, entry.get<std::string>());
-    variant.compute = variant.program.count("compute") ? variant.program.at("compute") : "";
-    variant.vertex = variant.program.count("vertex") ? variant.program.at("vertex") : "";
-    variant.fragment = variant.program.count("fragment") ? variant.program.at("fragment") : "";
+        variant.artifactKeys.emplace(stage, entry.get<std::string>());
+    variant.compute = variant.artifactKeys.count("compute") ? variant.artifactKeys.at("compute") : "";
+    variant.vertex = variant.artifactKeys.count("vertex") ? variant.artifactKeys.at("vertex") : "";
+    variant.fragment = variant.artifactKeys.count("fragment") ? variant.artifactKeys.at("fragment") : "";
     for (const nlohmann::json &source : sourceVariant.value("parameters", nlohmann::json::array())) {
         variant.parameters.emplace_back();
         if (!materializeFixtureParameter(source, variant.parameters.back()))
             return nullptr;
     }
     for (const nlohmann::json &source : sourceVariant.value("internal_parameters", nlohmann::json::array())) {
-        variant.internalParameters.emplace_back();
-        if (!materializeFixtureParameter(source, variant.internalParameters.back()))
+        variant.runtimeParameters.emplace_back();
+        if (!materializeFixtureParameter(source, variant.runtimeParameters.back()))
             return nullptr;
     }
     for (const nlohmann::json &source : sourceVariant.value("outputs", nlohmann::json::array()))
@@ -849,21 +858,20 @@ VernonStageExecutable *loadDirectGraphicsFixture(VernonRuntimeContext *context, 
             {source.value("name", ""), source.value("kind", ""), source.value("dtype", ""), source.value("access", ""),
              fixtureShape(source.value("shape", nlohmann::json::array())), source.value("location", UINT32_MAX)});
     std::string error;
-    if (!variant.validate(error))
+    if (!vernon::runtime::validateStageBindingPlan(variant, error))
         return nullptr;
-    vernon::runtime::rebuildVariantLayoutViews(variant);
+    vernon::runtime::rebuildStageBindingLayoutViews(variant);
 
-    vernon::runtime::BackendPipelineBundle stages;
+    vernon::runtime::BackendStageBuildInputs stages;
     stages.context = context;
     for (const auto &[id, source] : fixture["stages"].items()) {
-        vernon::runtime::Stage stage;
-        stage.stage = source.value("stage", "");
+        vernon::runtime::LoadedStageArtifact stage;
         stage.entry = source.value("entry", "");
         const nlohmann::json &artifact = source["artifact"];
         if (artifact.value("storage", "") != "inline" || !artifact["data"].is_string())
             return nullptr;
         stage.source = artifact["data"].get<std::string>();
-        stages.stages.emplace(id, std::move(stage));
+        stages.artifacts.emplace(id, std::move(stage));
     }
     auto pipeline = std::make_unique<VernonStageExecutable>();
     pipeline->context = context;

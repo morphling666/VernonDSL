@@ -48,7 +48,7 @@ private:
             (void)node;
             if (!nodePlan.stage)
                 continue;
-            const Variant &bindingProjection = nodePlan.stage->bindingProjection;
+            const StageBindingPlan &bindingProjection = nodePlan.stage->bindingProjection;
             if (!bindingProjection.vertex.empty())
                 continue;
             for (size_t index = 0; index < nodePlan.projections.size() && index < bindingProjection.parameters.size();

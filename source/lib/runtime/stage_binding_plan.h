@@ -1,5 +1,5 @@
-#ifndef VERNON_RUNTIME_PIPELINE_MANIFEST_H
-#define VERNON_RUNTIME_PIPELINE_MANIFEST_H
+#ifndef VERNON_RUNTIME_STAGE_BINDING_PLAN_H
+#define VERNON_RUNTIME_STAGE_BINDING_PLAN_H
 
 #include "VernonRuntime.h"
 #include "autodiff/autodiff_metadata.h"
@@ -113,6 +113,13 @@ struct ParameterUse {
     std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
 };
 
+enum class StageParameterSource {
+    Projected,
+    Direct,
+    ImplicitSampler,
+    Resolution,
+};
+
 enum class AutodiffResourceRole {
     None,
     Input,
@@ -132,8 +139,7 @@ struct Parameter {
     uint32_t slot{};
     std::string name;
     std::string kind;
-    std::string source;
-    std::string systemValue;
+    StageParameterSource source{StageParameterSource::Projected};
     std::optional<ValueLayout> valueLayout;
     ValueLayout elementLayout;
     std::string access;
@@ -181,30 +187,27 @@ struct RuntimeRequirements {
     RuntimeVersion minimumOsVersion;
 };
 
-struct Variant {
-    std::vector<std::string> key;
+struct StageBindingPlan {
     std::vector<Parameter> parameters;
-    std::vector<Parameter> internalParameters;
+    std::vector<Parameter> runtimeParameters;
     std::vector<Output> outputs;
-    std::map<std::string, std::string> program;
+    std::map<std::string, std::string> artifactKeys;
     std::string compute;
     std::string vertex;
     std::string fragment;
-
-    bool validate(std::string &error) const;
 };
 
-// Backend-neutral binding representation consumed by every pipeline backend.
-// Pipeline manifests parse into it; Program plans project into it exactly once.
-using ExecutableBindingView = Variant;
+// Immutable physical ABI projection for one reusable Stage implementation.
+// Program-to-endpoint projection is performed once while resolving a Node.
 
-std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension);
-std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format);
+std::optional<VernonTextureDimension> artifactTextureDimension(const std::string &dimension);
+std::optional<VernonTextureFormat> artifactTextureFormat(const std::string &format);
 
-bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
-bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
+bool parseArtifactValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error);
+bool parseArtifactInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error);
+bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error);
 void rebuildValueLayoutPathViews(ValueLayout &layout);
-void rebuildVariantLayoutViews(Variant &variant);
+void rebuildStageBindingLayoutViews(StageBindingPlan &plan);
 bool runtimeVersionAtLeast(RuntimeVersion actual, RuntimeVersion required);
 uint32_t glslVersionForApi(RuntimeVersion apiVersion);
 

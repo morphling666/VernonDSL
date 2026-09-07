@@ -236,7 +236,7 @@ class ShaderAssetManifestTests(unittest.TestCase):
         self.assertNotIn("dependencies", canonical["graphs"][0]["nodes"][0])
         self.assertEqual(canonical["graphs"][0]["nodes"][0]["operation"]["workgroups"], [4, 1, 1])
 
-    def test_pipeline_asset_promotes_an_imported_entry_without_wrapper(self) -> None:
+    def test_program_asset_promotes_an_imported_entry_without_wrapper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             package = root / "shaders"
@@ -282,7 +282,7 @@ asset = vd.program_asset(
             self.assertIn("def fullscreen_vertex(", promoted.source)
             self.assertIn("fullscreen.py", dict(promoted.dependencies))
 
-    def test_pipeline_asset_rejects_unsupported_import_entry_forms(self) -> None:
+    def test_program_asset_rejects_unsupported_import_entry_forms(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / "fullscreen.py").write_text(
@@ -371,7 +371,7 @@ asset = vd.program_asset(
             self.assertEqual(lint.variants, ((), ("FEATURE",)))
             self.assertEqual(set(lint.entries), {"vertex_main", "fragment_main"})
 
-    def test_python_pipeline_asset_rejects_legacy_stage_fields(self) -> None:
+    def test_python_program_asset_rejects_legacy_stage_fields(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             source.write_text(
@@ -394,7 +394,7 @@ asset = vd.program_asset(
             with self.assertRaisesRegex(ProgramCompileError, "unknown program_asset argument"):
                 lint_python_program_asset(source, "asset")
 
-    def test_python_pipeline_asset_rejects_graphics_stage_order(self) -> None:
+    def test_python_program_asset_rejects_graphics_stage_order(self) -> None:
         """Topology is checked by program_asset itself, so it is checked here where it is enforced."""
 
         from vernon_dsl._program_assets.source import load_program_asset_declaration
@@ -424,7 +424,7 @@ asset = vd.program_asset(
             with self.assertRaisesRegex(ProgramCompileError, "topology order"):
                 load_program_asset_declaration(source, "asset")
 
-    def test_python_pipeline_asset_rejects_noncanonical_variants(self) -> None:
+    def test_python_program_asset_rejects_noncanonical_variants(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             source.write_text(
@@ -448,7 +448,7 @@ asset = vd.program_asset(
             with self.assertRaisesRegex(ProgramCompileError, "not canonical"):
                 lint_python_program_asset(source, "asset")
 
-    def test_python_pipeline_asset_enforces_variant_cap(self) -> None:
+    def test_python_program_asset_enforces_variant_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             features = "\n".join(f'F{index} = vd.feature("F{index:02}")' for index in range(17))
@@ -473,12 +473,12 @@ asset = vd.program_asset(
             with self.assertRaisesRegex(ProgramCompileError, "variant cap 16"):
                 lint_python_program_asset(source, "asset")
 
-    def test_example_pipeline_asset_has_canonical_variants(self) -> None:
+    def test_example_program_asset_has_canonical_variants(self) -> None:
         root = Path(__file__).parents[2]
-        pipeline = lint_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
-        self.assertEqual(pipeline.id, "shaders/variant_mesh")
+        declaration = lint_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
+        self.assertEqual(declaration.id, "shaders/variant_mesh")
         self.assertEqual(
-            pipeline.variants,
+            declaration.variants,
             ((), ("INSTANCE",), ("SKIN",), ("INSTANCE", "SKIN")),
         )
 
@@ -512,7 +512,7 @@ class Square(vd.Module):
         return output
 
 kernel_asset = vd.program_asset(id="capture/kernel", program=square)
-pipeline_asset = vd.program_asset(
+graphics_asset = vd.program_asset(
     id="capture/pipeline",
     program=vd.pipeline(
         vertex_main,
@@ -543,7 +543,7 @@ module_vjp_asset = vd.program_asset(
                 capture_program(load_program_asset_declaration(source, name))
                 for name in (
                     "kernel_asset",
-                    "pipeline_asset",
+                    "graphics_asset",
                     "kernel_vjp_asset",
                     "module_asset",
                     "module_vjp_asset",
@@ -739,7 +739,7 @@ class BarePipelineAssetCookTests(unittest.TestCase):
         )
         return cast(dict[str, Any], json.loads(manifest.read_text(encoding="utf-8")))
 
-    def test_a_bare_pipeline_asset_cooks(self) -> None:
+    def test_a_bare_graphics_program_asset_cooks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             document = self._cook(directory, "bare")
         self.assertEqual(document["id"], "shaders/bare")
@@ -899,7 +899,7 @@ class ShaderAssetCookTests(unittest.TestCase):
             ".wasm.o",
         )
 
-    def test_cooker_rejects_non_python_pipeline_asset_references(self) -> None:
+    def test_cooker_rejects_non_python_program_asset_references(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaisesRegex(ProgramCompileError, "source.py:descriptor_name"):
@@ -1080,7 +1080,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                         host = native.RhiHost(backend)
                         runtime = host.create_runtime()
                         compiled_stages = []
-                    loaded = runtime.load_canonical_program(
+                    loaded = runtime.load_in_memory_program(
                         canonical_json(deployed).encode(),
                         str(runtime_root),
                         compiled_stages,
@@ -1129,7 +1129,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                             stage: stage for stage in artifact_system["artifacts"]
                         }
                         with self.assertRaisesRegex(RuntimeError, "invalid|unsupported"):
-                            runtime.load_canonical_program(
+                            runtime.load_in_memory_program(
                                 canonical_json(with_content_hash(legacy_deployment)).encode(),
                                 str(runtime_root),
                                 compiled_stages,
@@ -1147,7 +1147,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                         bad_artifacts["artifacts"][artifact_id]["contract_hash"] = contract_hash
                         bad_program["stages"][next(iter(bad_program["stages"]))]["contract_hash"] = contract_hash
                         with self.assertRaisesRegex(RuntimeError, "portable ABI slots|resource ABI slots"):
-                            runtime.load_canonical_program(
+                            runtime.load_in_memory_program(
                                 canonical_json(with_content_hash(bad_deployment)).encode(),
                                 str(runtime_root),
                                 compiled_stages,
@@ -1159,7 +1159,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                         artifact_path.write_bytes(b"broken")
                         try:
                             with self.assertRaisesRegex(RuntimeError, "PROGRAM_BLOB_AUTHENTICATION"):
-                                runtime.load_canonical_program(
+                                runtime.load_in_memory_program(
                                     canonical_json(deployed).encode(),
                                     str(runtime_root),
                                     compiled_stages,
@@ -1408,7 +1408,7 @@ asset = vd.program_asset(
                             else:
                                 self.assertEqual(data[:4], b"DXBC")
 
-    def test_vulkan_pipeline_bundle_embeds_verified_spirv(self) -> None:
+    def test_vulkan_program_bundle_embeds_verified_spirv(self) -> None:
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")

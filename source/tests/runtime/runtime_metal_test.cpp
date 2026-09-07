@@ -1569,9 +1569,9 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     vernonRhiDestroyDevice(device);
 }
 
-#if defined(VERNON_METAL_COMPUTE_PIPELINE_BUNDLE)
+#if defined(VERNON_METAL_COMPUTE_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
-    const std::filesystem::path manifestPath = VERNON_METAL_COMPUTE_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_METAL_COMPUTE_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
@@ -1665,9 +1665,9 @@ TEST(RuntimeMetal, PublicRuntimeLoadsDispatchesAndReadsBackCookedBundle) {
 }
 #endif
 
-#if defined(VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE)
+#if defined(VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
-    const std::filesystem::path manifestPath = VERNON_METAL_RESOLUTION_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_METAL_RESOLUTION_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
@@ -1771,9 +1771,9 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
 }
 #endif
 
-#if defined(VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE)
+#if defined(VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE)
 TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
-    const std::filesystem::path manifestPath = VERNON_METAL_GRAPHICS_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_METAL_GRAPHICS_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());

@@ -44,7 +44,7 @@ def main() -> None:
             "parameters": parameters(1.0, 1.0),
             "count": np.int32(2),
         },
-        "do not match pipeline parameters",
+        "do not match Program parameters",
     )
     expect_binding_error(
         {

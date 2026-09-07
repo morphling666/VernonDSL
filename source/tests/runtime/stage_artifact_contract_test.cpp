@@ -1,5 +1,5 @@
-#include "runtime/pipeline_bundle.h"
-#include "runtime/pipeline_manifest.h"
+#include "runtime/stage_artifact.h"
+#include "runtime/stage_binding_plan.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
@@ -7,7 +7,7 @@
 #include <string_view>
 
 namespace {
-TEST(PipelineManifestRequirements, ValidatesCanonicalDerivativeGroupsAndRejectsDivergentMetadata) {
+TEST(StageArtifactContract, ValidatesCanonicalDerivativeGroupsAndRejectsDivergentMetadata) {
     using namespace vernon::runtime;
     std::string error;
     const std::vector<AutodiffDerivativeGroup> canonical{
@@ -44,7 +44,7 @@ TEST(PipelineManifestRequirements, ValidatesCanonicalDerivativeGroupsAndRejectsD
     EXPECT_NE(error.find("leaves"), std::string::npos);
 }
 
-TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
+TEST(StageArtifactContract, ComparesApiAndCpuHostRequirements) {
     using vernon::runtime::glslVersionForApi;
     using vernon::runtime::RuntimeVersion;
     using vernon::runtime::runtimeVersionAtLeast;
@@ -86,7 +86,7 @@ TEST(PipelineManifestRequirements, ComparesApiAndCpuHostRequirements) {
     EXPECT_NE(error.find("runtime provides"), std::string::npos);
 }
 
-TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
+TEST(StageArtifactContract, ParsesStructuredLeafPathsAndStaticShapes) {
     const nlohmann::json layout = {
         {"logical_type", "!vernon.struct<\"Payload\">"},
         {"struct_name", "Payload"},
@@ -101,7 +101,7 @@ TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
     };
     vernon::runtime::ValueLayout parsed;
     std::string error;
-    ASSERT_TRUE(vernon::runtime::parsePipelineValueLayout(layout, parsed, error)) << error;
+    ASSERT_TRUE(vernon::runtime::parseArtifactValueLayout(layout, parsed, error)) << error;
     ASSERT_EQ(parsed.leaves.size(), 1u);
     ASSERT_EQ(parsed.leaves[0].path.size(), 2u);
     EXPECT_EQ(parsed.leaves[0].path[0].field, "nested");
@@ -114,35 +114,35 @@ TEST(PipelineManifestRequirements, ParsesStructuredLeafPathsAndStaticShapes) {
 
     nlohmann::json invalid = layout;
     invalid["leaves"][0]["shape"] = nlohmann::json::array({4, 2});
-    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed = {}, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactValueLayout(invalid, parsed = {}, error));
     EXPECT_NE(error.find("scalar_count"), std::string::npos);
 
     invalid = layout;
     invalid["leaves"][0]["byte_offset"] = 12;
-    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactValueLayout(invalid, parsed, error));
     EXPECT_NE(error.find("byte offset"), std::string::npos);
     EXPECT_TRUE(parsed.leaves.empty());
 
     invalid = layout;
     invalid["leaves"].push_back(
         {{"path", nlohmann::json::array({"overlap"})}, {"dtype", "f32"}, {"byte_offset", 20}, {"scalar_count", 1}});
-    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactValueLayout(invalid, parsed, error));
     EXPECT_NE(error.find("overlap"), std::string::npos);
 
     invalid = layout;
     invalid["leaves"][0]["path"] = nlohmann::json::array({"nested.field"});
-    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactValueLayout(invalid, parsed, error));
     EXPECT_NE(error.find("cannot contain"), std::string::npos);
 
     invalid = layout;
     invalid["byte_size"] = 40;
     invalid["leaves"].push_back(invalid["leaves"][0]);
     invalid["leaves"][1]["byte_offset"] = 24;
-    EXPECT_FALSE(vernon::runtime::parsePipelineValueLayout(invalid, parsed, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactValueLayout(invalid, parsed, error));
     EXPECT_NE(error.find("not unique"), std::string::npos);
 }
 
-TEST(PipelineManifestRequirements, ParsesSharedInterfacePlansTransactionally) {
+TEST(StageArtifactContract, ParsesSharedInterfacePlansTransactionally) {
     const nlohmann::json source = {
         {"kind", "native_uniform"},
         {"profile", "opengl_native_uniform"},
@@ -161,7 +161,7 @@ TEST(PipelineManifestRequirements, ParsesSharedInterfacePlansTransactionally) {
     };
     vernon::runtime::InterfacePlan plan;
     std::string error;
-    ASSERT_TRUE(vernon::runtime::parsePipelineInterfacePlan(source, plan, error)) << error;
+    ASSERT_TRUE(vernon::runtime::parseArtifactInterfacePlan(source, plan, error)) << error;
     EXPECT_EQ(plan.kind, vernon::runtime::InterfacePlanKind::NativeUniform);
     EXPECT_EQ(plan.profile, "opengl_native_uniform");
     EXPECT_EQ(plan.frameOffset, 16u);
@@ -170,11 +170,53 @@ TEST(PipelineManifestRequirements, ParsesSharedInterfacePlansTransactionally) {
 
     nlohmann::json invalid = source;
     invalid["root"]["byte_strides"] = nlohmann::json::array({0});
-    EXPECT_FALSE(vernon::runtime::parsePipelineInterfacePlan(invalid, plan, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactInterfacePlan(invalid, plan, error));
 
     invalid = source;
     invalid["unknown"] = true;
-    EXPECT_FALSE(vernon::runtime::parsePipelineInterfacePlan(invalid, plan, error));
+    EXPECT_FALSE(vernon::runtime::parseArtifactInterfacePlan(invalid, plan, error));
+}
+
+TEST(StageArtifactContract, ValidatesExternalAndRuntimeParameterOwnership) {
+    using namespace vernon::runtime;
+
+    StageBindingPlan plan;
+    plan.artifactKeys.emplace("compute", "square");
+    plan.compute = "square";
+
+    Parameter external;
+    external.name = "x";
+    external.kind = "scalar";
+    external.source = StageParameterSource::Direct;
+    external.uses.emplace_back().stage = "compute";
+    plan.parameters.push_back(external);
+
+    std::string error;
+    EXPECT_TRUE(validateStageBindingPlan(plan, error)) << error;
+
+    plan.parameters.front().source = StageParameterSource::Projected;
+    error.clear();
+    EXPECT_TRUE(validateStageBindingPlan(plan, error)) << error;
+
+    plan.parameters.front().source = StageParameterSource::Resolution;
+    error.clear();
+    EXPECT_FALSE(validateStageBindingPlan(plan, error));
+    EXPECT_NE(error.find("external Stage parameter"), std::string::npos);
+
+    plan.parameters.clear();
+    Parameter runtime;
+    runtime.name = "__resolution";
+    runtime.kind = "tensor";
+    runtime.source = StageParameterSource::Resolution;
+    runtime.elementLayout.logicalType = "f32";
+    runtime.elementLayout.byteSize = 4;
+    runtime.elementLayout.alignment = 4;
+    runtime.elementLayout.leaves.emplace_back("f32", 1, 0);
+    runtime.shape = {2};
+    runtime.uses.emplace_back().stage = "compute";
+    plan.runtimeParameters.push_back(runtime);
+    error.clear();
+    EXPECT_TRUE(validateStageBindingPlan(plan, error)) << error;
 }
 
 } // namespace

@@ -7,8 +7,6 @@
 #include "runtime/compute_launch_planner.h"
 #include "runtime/graphics_invocation_planner.h"
 #include "runtime/graphics_scope_planner.h"
-#include "runtime/pipeline_bundle.h"
-#include "runtime/pipeline_manifest.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/program_execution/device_commands.h"
 #include "runtime/program_execution/materialized_node_frame.h"
@@ -21,6 +19,8 @@
 #include "runtime/program_invocation_context.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
+#include "runtime/stage_artifact.h"
+#include "runtime/stage_binding_plan.h"
 #include "runtime/target_implementation_metadata.h"
 #include "runtime/tensor_bridge.h"
 
@@ -159,16 +159,6 @@ vernon::runtime::RuntimeDiagnosticScope::~RuntimeDiagnosticScope() noexcept {
 namespace {
 
 using namespace vernon::runtime;
-
-ArtifactResolution artifactResolutionFor(const VernonRuntimeContext &context) {
-    // CPU relocatable objects are build inputs linked by the embedding
-    // application. The runtime consumes their manifest metadata and resolves
-    // the linked entry through the static registry; it must never load object
-    // bytes or acquire an LLVM/ORC dependency.
-    if (context.backend == VERNON_RUNTIME_CPU)
-        return ArtifactResolution::MetadataOnly;
-    return ArtifactResolution::LoadBytes;
-}
 
 VernonStatus fail(VernonRuntimeContext *context, std::string_view error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) noexcept {
@@ -595,7 +585,7 @@ VernonStatus vernonRuntimeProgramBundleInspectTarget(const void *bundleData, siz
             !root["target"].contains("kind") || !root["target"]["kind"].is_string() ||
             !root["target"].contains("options") || !root["target"]["options"].is_object() || !root.contains("blobs") ||
             !root["blobs"].is_object() || !root.contains("variants") || !root["variants"].is_array() ||
-            !validateManifestHash(root, true, manifestError))
+            !validateProgramBundleHash(root, true, manifestError))
             return VERNON_STATUS_PARSE_ERROR;
         const std::string name = pipelineTargetKind(root);
         if (name.empty())
@@ -633,7 +623,7 @@ VernonProgramBundle *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeCont
          context->backend != VERNON_RUNTIME_CUDA && context->backend != VERNON_RUNTIME_DIRECTX12 &&
          context->backend != VERNON_RUNTIME_METAL) ||
         !bundleData || !bundleSize || (options && options->struct_size < sizeof(VernonProgramBundleLoadOptions))) {
-        invocationDiagnostic(*context) = "invalid pipeline bundle load invocation";
+        invocationDiagnostic(*context) = "invalid Program bundle load invocation";
         return nullptr;
     }
     try {
@@ -678,7 +668,7 @@ VernonProgramBundle *vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeCont
             bundle->bundleRoot = *bundleDirectory;
         if (!parseProgramDeployments(*context, root, bundle->deployments))
             return nullptr;
-        if (!validateManifestHash(root, true, invocationDiagnostic(*context)))
+        if (!validateProgramBundleHash(root, true, invocationDiagnostic(*context)))
             return nullptr;
         ++context->liveBundles;
         return bundle.release();
@@ -757,7 +747,7 @@ bool fillBoundaryParameterView(const VernonProgramExecutable &pipeline, const pr
 VernonStatus fillImageConstraintView(const Parameter &source, VernonProgramImageConstraintView &destination) {
     if (source.kind != "image")
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const auto dimension = pipelineTextureDimension(source.dimension);
+    const auto dimension = artifactTextureDimension(source.dimension);
     if (!dimension)
         return VERNON_STATUS_PARSE_ERROR;
     destination.dimension = *dimension;
@@ -765,7 +755,7 @@ VernonStatus fillImageConstraintView(const Parameter &source, VernonProgramImage
         source.bindingRole == "sampled" ? VERNON_IMAGE_BINDING_SAMPLED : VERNON_IMAGE_BINDING_STORAGE;
     destination.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
     if (destination.binding_role == VERNON_IMAGE_BINDING_STORAGE) {
-        const auto format = pipelineTextureFormat(source.exactStorageFormat);
+        const auto format = artifactTextureFormat(source.exactStorageFormat);
         if (!format)
             return VERNON_STATUS_PARSE_ERROR;
         destination.storage_format = *format;
@@ -781,7 +771,7 @@ VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source
     if (source.category != program::BoundaryCategory::Texture || !source.storage ||
         source.storage->descriptorKind != program::StorageDescriptorKind::Image)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    const auto dimension = pipelineTextureDimension(source.storage->image.dimension);
+    const auto dimension = artifactTextureDimension(source.storage->image.dimension);
     if (!dimension)
         return VERNON_STATUS_PARSE_ERROR;
     destination.dimension = *dimension;
@@ -795,7 +785,7 @@ VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source
                                                                                 : VERNON_IMAGE_BINDING_STORAGE;
     destination.sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
     if (destination.binding_role == VERNON_IMAGE_BINDING_STORAGE) {
-        const auto format = pipelineTextureFormat(source.storage->image.format);
+        const auto format = artifactTextureFormat(source.storage->image.format);
         if (!format)
             return VERNON_STATUS_PARSE_ERROR;
         destination.storage_format = *format;

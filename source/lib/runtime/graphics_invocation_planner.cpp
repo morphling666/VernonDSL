@@ -156,17 +156,17 @@ void destroyGraphicsVariant(PreparedGraphicsVariant &prepared) {
     prepared = {};
 }
 
-bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationDescriptor &source,
+bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &source,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error) {
     plan = {};
     for (size_t index = 0; index < source.argument_count; ++index)
         if (!plan.arguments.emplace(source.arguments[index].slot, &source.arguments[index]).second)
             return fail(error, "duplicate pipeline argument slot");
-    if (plan.arguments.size() != variant.parameters.size())
+    if (plan.arguments.size() != stagePlan.parameters.size())
         return fail(error, "pipeline argument count does not match layout");
 
-    for (const Parameter &parameter : variant.parameters) {
+    for (const Parameter &parameter : stagePlan.parameters) {
         const auto found = plan.arguments.find(parameter.slot);
         if (found == plan.arguments.end()) {
             error = "graphics pipeline argument '" + parameter.name + "' is missing at slot " +
@@ -186,7 +186,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationD
             if (!valueLayoutsEqual(argument.tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
                 !validTensor(argument.tensor))
                 return fail(error, "pipeline Tensor argument does not match layout");
-            if (parameter.source != "direct") {
+            if (parameter.source != StageParameterSource::Direct) {
                 const bool allowLeading =
                     std::any_of(parameter.uses.begin(), parameter.uses.end(),
                                 [](const ParameterUse &use) { return use.interfaceKind == "input"; });
@@ -209,7 +209,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationD
         }
     }
 
-    if (variant.vertex.empty())
+    if (stagePlan.vertex.empty())
         return true;
 
     if (!source.graphics_state || source.graphics_state->struct_size < sizeof(VernonGraphicsState))
@@ -326,7 +326,7 @@ bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationD
     plan.instanceCount = draw.instance_count;
 
     std::map<std::pair<uint32_t, uint32_t>, PlannedSampledResource> sampled;
-    for (const Parameter &parameter : variant.parameters) {
+    for (const Parameter &parameter : stagePlan.parameters) {
         const VernonProgramArgument &argument = *plan.arguments.at(parameter.slot);
         for (const ParameterUse &use : parameter.uses) {
             const uint32_t stage = shaderStage(use);
@@ -401,8 +401,8 @@ bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationD
         }
     }
 
-    for (const Parameter &parameter : variant.internalParameters) {
-        if (parameter.source != "implicit_sampler")
+    for (const Parameter &parameter : stagePlan.runtimeParameters) {
+        if (parameter.source != StageParameterSource::ImplicitSampler)
             continue;
         for (const ParameterUse &use : parameter.uses) {
             const uint32_t stage = shaderStage(use);

@@ -62,13 +62,14 @@ VkFormat vulkanTextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
+bool resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                           VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     auto *state = new VulkanPipelineState();
-    if (!variant.compute.empty()) {
-        const Stage &stage = bundle.stages.at(variant.compute);
+    if (!plan.compute.empty()) {
+        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
         ReflectedEntry reflection;
-        if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection, invocationDiagnostic(*bundle.context))) {
+        if (!resolveStageReflection(stage, VERNON_RUNTIME_VULKAN, reflection, invocationDiagnostic(*inputs.context))) {
             delete state;
             return false;
         }
@@ -87,14 +88,14 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
                 flattenedBinding +=
                     static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
         }
-        for (const Parameter &parameter : variant.parameters)
+        for (const Parameter &parameter : plan.parameters)
             internalSlot = std::max(internalSlot, parameter.slot);
-        for (const Parameter &parameter : variant.parameters)
+        for (const Parameter &parameter : plan.parameters)
             for (const ParameterUse &use : parameter.uses) {
-                if (use.stage != "compute" && use.stage != variant.compute)
+                if (use.stage != "compute" && use.stage != plan.compute)
                     continue;
                 if (use.index >= reflection.arguments.size()) {
-                    invocationDiagnostic(*bundle.context) = "Vulkan parameter use exceeds reflected argument table";
+                    invocationDiagnostic(*inputs.context) = "Vulkan parameter use exceeds reflected argument table";
                     delete state;
                     return false;
                 }
@@ -182,21 +183,21 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
         descriptor.binding_count = state->rhiComputeLayout.size();
         std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
         const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*bundle.context).adapter),
+            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter),
                                              &descriptor, &state->rhiComputePipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(vulkanState(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data
+                vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare Vulkan provider compute pipeline";
             delete state;
             return false;
         }
     }
-    if (!variant.vertex.empty()) {
-        const Stage &vertex = bundle.stages.at(variant.vertex);
-        const Stage &fragment = bundle.stages.at(variant.fragment);
+    if (!plan.vertex.empty()) {
+        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
             std::vector<VernonRuntimeProviderVertexAttribute> attributes;
@@ -271,7 +272,7 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
                         ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
                         : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
                 if (!packing || packing->elementSize != canonical.byteSize) {
-                    invocationDiagnostic(*bundle.context) =
+                    invocationDiagnostic(*inputs.context) =
                         !packing ? "Vulkan graphics value packing is incompatible with the canonical layout"
                                  : "Vulkan graphics value packing scalar size does not match its dtype";
                     return false;
@@ -309,7 +310,7 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
             candidates.push_back(std::move(candidate));
             return true;
         };
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             for (const ParameterUse &use : parameter.uses)
                 if (!addUse(parameter, use, false)) {
                     supported = false;
@@ -318,17 +319,17 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
             if (!supported)
                 break;
         }
-        for (const Parameter &parameter : variant.internalParameters)
+        for (const Parameter &parameter : plan.runtimeParameters)
             for (const ParameterUse &use : parameter.uses)
                 if (!supported || !addUse(parameter, use, true)) {
                     supported = false;
                     break;
                 }
         if (!supported) {
-            std::string &diagnostic = invocationDiagnostic(*bundle.context);
+            std::string &diagnostic = invocationDiagnostic(*inputs.context);
             if (diagnostic.empty())
                 diagnostic = "Vulkan RuntimeCore graphics path does not support this parameter layout";
-            for (const Parameter &parameter : variant.parameters)
+            for (const Parameter &parameter : plan.parameters)
                 for (const ParameterUse &use : parameter.uses)
                     diagnostic += " [" + parameter.name + ": kind=" + parameter.kind +
                                   ", interface=" + use.interfaceKind + ", stage=" + use.stage + ", dtype=" + use.dtype +
@@ -375,12 +376,12 @@ bool resolveVulkanPipeline(BackendPipelineBundle &bundle, const Variant &variant
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*bundle.context).adapter),
+            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(vulkanState(*inputs.context).adapter),
                                              &descriptor, &state->rhiGraphicsPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(vulkanState(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data
+                vernonRuntimeRhiAdapterGetLastError(vulkanState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare Vulkan provider graphics pipeline";
             delete state;

@@ -13,14 +13,14 @@ namespace vernon::runtime::ad {
 using program_execution::ProgramValueState;
 namespace {
 
-const Parameter *findParameter(const Variant &variant, const std::string &name) {
-    const auto external = std::find_if(variant.parameters.begin(), variant.parameters.end(),
+const Parameter *findParameter(const StageBindingPlan &stagePlan, const std::string &name) {
+    const auto external = std::find_if(stagePlan.parameters.begin(), stagePlan.parameters.end(),
                                        [&](const Parameter &parameter) { return parameter.name == name; });
-    if (external != variant.parameters.end())
+    if (external != stagePlan.parameters.end())
         return &*external;
-    const auto internal = std::find_if(variant.internalParameters.begin(), variant.internalParameters.end(),
+    const auto internal = std::find_if(stagePlan.runtimeParameters.begin(), stagePlan.runtimeParameters.end(),
                                        [&](const Parameter &parameter) { return parameter.name == name; });
-    return internal == variant.internalParameters.end() ? nullptr : &*internal;
+    return internal == stagePlan.runtimeParameters.end() ? nullptr : &*internal;
 }
 
 execution::detail::AutodiffCheckpointPolicy checkpointPolicy(const std::string &name) {
@@ -119,7 +119,7 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
 }
 
 bool planProgramResiduals(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                          const Variant &variant, const std::vector<ProgramValueState> &materialized,
+                          const StageBindingPlan &stagePlan, const std::vector<ProgramValueState> &materialized,
                           const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, const std::string &policy,
                           bool rematerializeTapes, ProgramResidualPlan &result, std::string &error) {
     const program::Graph *forward = program::findGraph(execution, "forward");
@@ -156,7 +156,7 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
         if (input.kind != program::GraphInputKind::UserInput)
             continue;
         const program::Value &slot = execution.values[input.value];
-        const std::optional<size_t> bytes = materializedBytes(input.value, slot, findParameter(variant, slot.name));
+        const std::optional<size_t> bytes = materializedBytes(input.value, slot, findParameter(stagePlan, slot.name));
         if (!bytes || *bytes > std::numeric_limits<uint64_t>::max() - initialStateBytes)
             return error = "Program autodiff initial state size overflows", false;
         initialStateBytes += *bytes;
@@ -165,7 +165,7 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
         if (!producers[value] || (rematerializeTapes && program::isTapeValueType(execution.values[value].type)))
             continue;
         const program::Value &slot = execution.values[value];
-        const std::optional<size_t> bytes = materializedBytes(value, slot, findParameter(variant, slot.name));
+        const std::optional<size_t> bytes = materializedBytes(value, slot, findParameter(stagePlan, slot.name));
         execution::detail::AutodiffDagNode &node = nodes[*producers[value]];
         if (!bytes || *bytes > std::numeric_limits<uint64_t>::max() - node.residualBytes)
             return error = "Program autodiff residual size overflows", false;
@@ -214,7 +214,7 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
                               (slot.storage && retainedStorages.find(*slot.storage) != retainedStorages.end());
         if (!retained)
             continue;
-        const std::optional<size_t> bytes = materializedBytes(value, slot, findParameter(variant, slot.name));
+        const std::optional<size_t> bytes = materializedBytes(value, slot, findParameter(stagePlan, slot.name));
         if (!bytes || *bytes > std::numeric_limits<uint64_t>::max() - logicalResidualBytes)
             return error = "Program autodiff logical residual size overflows", false;
         logicalResidualBytes += *bytes;

@@ -1,6 +1,6 @@
 #include "pipeline_metadata.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
+#include "stage_artifact.h"
+#include "stage_binding_plan.h"
 
 #include "VernonVersions.h"
 #include <nlohmann/json.hpp>
@@ -472,7 +472,7 @@ std::optional<VernonValueAccess> pipelineValueAccess(const std::string &access) 
     return std::nullopt;
 }
 
-bool resolveStageReflection(const Stage &stage, VernonRuntimeBackend backend, ReflectedEntry &output,
+bool resolveStageReflection(const LoadedStageArtifact &stage, VernonRuntimeBackend backend, ReflectedEntry &output,
                             std::string &error) {
     if (stage.reflected) {
         output = *stage.reflected;
@@ -489,7 +489,7 @@ bool resolveStageReflection(const Stage &stage, VernonRuntimeBackend backend, Re
 bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProviderBindingLayoutEntry &layout) {
     if (parameter.kind != "image")
         return false;
-    const auto dimension = pipelineTextureDimension(parameter.dimension);
+    const auto dimension = artifactTextureDimension(parameter.dimension);
     if (!dimension)
         return false;
     layout.image_dimension = *dimension;
@@ -501,7 +501,7 @@ bool configureImageBindingLayout(const Parameter &parameter, VernonRuntimeProvid
     }
     if (parameter.bindingRole != "storage")
         return false;
-    const auto format = pipelineTextureFormat(parameter.exactStorageFormat);
+    const auto format = artifactTextureFormat(parameter.exactStorageFormat);
     if (!format)
         return false;
     layout.storage_image_format = *format;

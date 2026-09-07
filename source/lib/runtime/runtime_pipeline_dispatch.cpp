@@ -33,20 +33,27 @@
 
 namespace vernon::runtime {
 
-bool resolveBackendPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
-    if (bundle.context->backend == VERNON_RUNTIME_CPU)
-        return resolveCpuPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_CUDA)
-        return resolveCudaPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_VULKAN)
-        return resolveVulkanPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return resolveDirectX12Pipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_METAL)
-        return resolveMetalPipeline(bundle, variant, pipeline);
-    if (isOpenGLBackend(bundle.context->backend))
-        return resolveOpenGLPipeline(bundle, variant, pipeline);
-    invocationDiagnostic(*bundle.context) = "unsupported runtime pipeline backend";
+bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                            VernonStageExecutable &pipeline) {
+    std::string error;
+    if (!inputs.context || !validateStageBindingPlan(plan, error)) {
+        if (inputs.context)
+            invocationDiagnostic(*inputs.context) = std::move(error);
+        return false;
+    }
+    if (inputs.context->backend == VERNON_RUNTIME_CPU)
+        return resolveCpuPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_CUDA)
+        return resolveCudaPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_VULKAN)
+        return resolveVulkanPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return resolveDirectX12Pipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_METAL)
+        return resolveMetalPipeline(inputs, plan, pipeline);
+    if (isOpenGLBackend(inputs.context->backend))
+        return resolveOpenGLPipeline(inputs, plan, pipeline);
+    invocationDiagnostic(*inputs.context) = "unsupported runtime pipeline backend";
     return false;
 }
 

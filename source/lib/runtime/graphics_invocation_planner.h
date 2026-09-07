@@ -4,7 +4,7 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
-#include "pipeline_manifest.h"
+#include "stage_binding_plan.h"
 
 #include <array>
 #include <cstddef>
@@ -69,7 +69,7 @@ struct PreparedGraphicsVariant {
     VernonRuntimeCoreGraphicsVariant *handle{};
 };
 
-bool planGraphicsInvocation(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
+bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                             DescribeImageResource describeImage, void *describeImageUserData,
                             PlannedGraphicsInvocation &plan, std::string &error);
 bool planGraphicsState(const VernonStageInvocationDescriptor &invocation, size_t colorCount, bool hasDepth,

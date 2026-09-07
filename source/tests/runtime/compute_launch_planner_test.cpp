@@ -52,7 +52,7 @@ Parameter storageF32Parameter(uint32_t slot, uint32_t index, const char *access)
     Parameter parameter;
     parameter.slot = slot;
     parameter.kind = "tensor";
-    parameter.source = "direct";
+    parameter.source = StageParameterSource::Direct;
     parameter.access = access;
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     ParameterUse use;
@@ -64,18 +64,18 @@ Parameter storageF32Parameter(uint32_t slot, uint32_t index, const char *access)
 }
 
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
-    Variant variant;
+    StageBindingPlan variant;
     Parameter contiguous;
     contiguous.slot = 0;
     contiguous.kind = "tensor";
     setScalarLayout(contiguous, "f32", VERNON_DATA_F32);
-    contiguous.source = "direct";
+    contiguous.source = StageParameterSource::Direct;
     contiguous.uses.push_back(packedF32Use(2, contiguous.elementLayout.layoutHash));
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
     setScalarLayout(strided, "f32", VERNON_DATA_F32);
-    strided.source = "direct";
+    strided.source = StageParameterSource::Direct;
     strided.uses.push_back(packedF32Use(0, strided.elementLayout.layoutHash));
     variant.parameters = {contiguous, strided};
 
@@ -131,12 +131,12 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
 }
 
 TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
-    Variant variant;
+    StageBindingPlan variant;
     Parameter parameter;
     parameter.slot = 0;
     parameter.kind = "tensor";
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
-    parameter.source = "direct";
+    parameter.source = StageParameterSource::Direct;
     parameter.access = "read";
     parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 0}, 0, UINT32_MAX, 0, 0, 0, {}});
     parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{2, 1, {2, 3}, {4, 5}};
@@ -199,7 +199,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
 }
 
 TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
-    Variant variant;
+    StageBindingPlan variant;
     Parameter parameter = storageF32Parameter(0, 0, "read_write");
     parameter.shape = {};
     parameter.uses.front().shape = {};
@@ -232,11 +232,11 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
 }
 
 TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
-    Variant variant;
+    StageBindingPlan variant;
     Parameter parameter;
     parameter.slot = 0;
     parameter.kind = "tensor";
-    parameter.source = "direct";
+    parameter.source = StageParameterSource::Direct;
     parameter.access = "read";
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 0, {}});
@@ -268,7 +268,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
 }
 
 TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases) {
-    Variant variant;
+    StageBindingPlan variant;
     variant.parameters = {storageF32Parameter(0, 0, "write")};
 
     const std::array<float, 8> values{};
@@ -319,7 +319,7 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
 }
 
 TEST(ComputeLaunchPlannerTest, RequiresEveryExplicitGridAxisWithoutTensorInference) {
-    Variant variant;
+    StageBindingPlan variant;
     VernonStageInvocationDescriptor invocation{};
     PlannedComputeLaunch plan;
     std::string error;

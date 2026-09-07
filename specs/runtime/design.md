@@ -87,8 +87,9 @@ capability-driven rather than selected by the host platform.
 
 OpenGL function resolution is isolated in `backend_opengl_driver`; unlike CUDA
 and Vulkan it consumes context callbacks. OpenGL and OpenGL ES are distinct
-external-context backends and only accept pipeline manifests for their matching
-GLSL profile. Cooked GLSL is an external content-addressed artifact;
+external-context backends and only accept Program bundles containing Stage
+artifacts for their matching GLSL profile. Cooked GLSL is an external
+content-addressed artifact;
 interactive GLSL remains inline.
 
 Context ownership is a separate layer: `Context Owner -> external callbacks ->
@@ -517,8 +518,8 @@ context with `register_external_opengl_context`. Otherwise Python creates a
 hidden context through the separately linked `_gl_context` GLFW extension.
 `VernonRuntime` itself never creates or links a window-system context.
 
-Each backend accepts only pipeline bundles compiled for its matching GLSL
-profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
+Each backend accepts only Program bundles containing artifacts compiled for its
+matching GLSL profile. Compute requires OpenGL 4.3 or OpenGL ES 3.1 and binds reflected
 storage buffers and storage images before issuing the required memory barrier.
 The current language contract permits filtered texture sampling only in
 fragment shaders, so a compute pipeline containing a sampled-image parameter is

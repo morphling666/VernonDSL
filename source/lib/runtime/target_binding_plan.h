@@ -2,11 +2,11 @@
 #define VERNON_RUNTIME_TARGET_BINDING_PLAN_H
 
 #include "VernonRuntime.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
 #include "pipeline_metadata.h"
 #include "program_execution_manifest.h"
 #include "shape_layout.h"
+#include "stage_artifact.h"
+#include "stage_binding_plan.h"
 
 #include <optional>
 #include <string>
@@ -179,8 +179,8 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                             VernonRuntimeBackend backend, TargetBindingPlan &plan, Diagnostic &diagnostic);
 bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBackend backend,
                                  ResolvedExecutablePlan &plan, Diagnostic &diagnostic);
-bool buildExecutableBindingView(const TargetBindingPlan &plan, vernon::runtime::ExecutableBindingView &view,
-                                vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
+bool buildStageBindingPlan(const TargetBindingPlan &plan, vernon::runtime::StageBindingPlan &view,
+                           vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
 
 } // namespace vernon::runtime::program
 

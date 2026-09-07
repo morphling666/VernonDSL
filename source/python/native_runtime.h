@@ -119,17 +119,17 @@ struct Runtime {
         if (!bundle)
             throw std::runtime_error("cannot load Program bundle: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
-        VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {names.data(), names.size()});
-        if (!pipeline) {
+        VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, {names.data(), names.size()});
+        if (!executable) {
             const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
             vernonRuntimeProgramBundleDestroy(bundle);
             throw std::runtime_error("cannot resolve Program bundle: " + error);
         }
-        return std::make_unique<PythonProgramExecutable>(this, handle, bundle, pipeline);
+        return std::make_unique<PythonProgramExecutable>(this, handle, bundle, executable);
     }
 
     std::unique_ptr<PythonProgramExecutable>
-    loadCanonicalProgram(const nb::bytes &manifestData, const std::string &directory, const nb::list &compiledStages) {
+    loadInMemoryProgram(const nb::bytes &manifestData, const std::string &directory, const nb::list &compiledStages) {
         std::string error;
         std::vector<SharedCompileResult> retained;
         std::vector<std::pair<std::string, VernonCpuEntryPoint>> registered;
@@ -139,16 +139,16 @@ struct Runtime {
                 vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
         };
         try {
-            registerInternedCpuStages(compiledStages, "compiled canonical Program stage metadata is invalid",
-                                      "compiled canonical Program CPU entry ",
-                                      "cannot register canonical Program CPU entry ", retained, registered, interned);
+            registerInternedCpuStages(compiledStages, "compiled in-memory Program stage metadata is invalid",
+                                      "compiled in-memory Program CPU entry ",
+                                      "cannot register in-memory Program CPU entry ", retained, registered, interned);
             VernonProgramBundleLoadOptions options{};
             options.struct_size = sizeof(options);
             options.bundle_directory = directory.c_str();
             VernonProgramBundle *bundle =
                 vernonRuntimeLoadProgramBundleWithOptions(handle, manifestData.c_str(), manifestData.size(), &options);
             if (!bundle)
-                throw std::runtime_error("cannot load canonical Program bundle: " +
+                throw std::runtime_error("cannot load in-memory Program bundle: " +
                                          nativeStringView(vernonRuntimeGetLastError(handle)));
             VernonProgramExecutable *loaded = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
             if (!loaded) {
@@ -156,11 +156,11 @@ struct Runtime {
                 vernonRuntimeProgramBundleDestroy(bundle);
                 throw std::runtime_error(error);
             }
-            auto pipeline =
+            auto executable =
                 std::make_unique<PythonProgramExecutable>(this, handle, bundle, loaded, std::move(retained));
-            pipeline->internedCpuJits = std::move(interned);
-            pipeline->registeredCpuEntries = std::move(registered);
-            return pipeline;
+            executable->internedCpuJits = std::move(interned);
+            executable->registeredCpuEntries = std::move(registered);
+            return executable;
         } catch (...) {
             unregister();
             throw;

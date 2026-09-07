@@ -63,14 +63,15 @@ DXGI_FORMAT directX12TextureFormat(VernonTextureFormat format) {
 } // namespace
 #endif
 
-bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
+bool resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                              VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
     auto *pipelineState = new DirectX12PipelineState();
-    if (!variant.compute.empty()) {
-        const Stage &stage = bundle.stages.at(variant.compute);
+    if (!plan.compute.empty()) {
+        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
         ReflectedEntry reflection;
         if (!resolveStageReflection(stage, VERNON_RUNTIME_DIRECTX12, reflection,
-                                    invocationDiagnostic(*bundle.context))) {
+                                    invocationDiagnostic(*inputs.context))) {
             delete pipelineState;
             return false;
         }
@@ -89,14 +90,14 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
                 flattenedBinding +=
                     static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
         }
-        for (const Parameter &parameter : variant.parameters)
+        for (const Parameter &parameter : plan.parameters)
             internalSlot = std::max(internalSlot, parameter.slot);
-        for (const Parameter &parameter : variant.parameters)
+        for (const Parameter &parameter : plan.parameters)
             for (const ParameterUse &use : parameter.uses) {
-                if (use.stage != "compute" && use.stage != variant.compute)
+                if (use.stage != "compute" && use.stage != plan.compute)
                     continue;
                 if (use.index >= reflection.arguments.size()) {
-                    invocationDiagnostic(*bundle.context) = "D3D12 parameter use exceeds reflected argument table";
+                    invocationDiagnostic(*inputs.context) = "D3D12 parameter use exceeds reflected argument table";
                     delete pipelineState;
                     return false;
                 }
@@ -132,7 +133,7 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
                     candidate.resourceOffset = 0;
                     candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0) {
-                        invocationDiagnostic(*bundle.context) = "D3D12 reflected compute binding is incomplete";
+                        invocationDiagnostic(*inputs.context) = "D3D12 reflected compute binding is incomplete";
                         delete pipelineState;
                         return false;
                     }
@@ -193,12 +194,12 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
         descriptor.binding_count = pipelineState->rhiComputeLayout.size();
         std::copy_n(pipelineState->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
-            vernonRuntimeRhiAdapterGetProvider(directX12State(*bundle.context).adapter), &descriptor,
+            vernonRuntimeRhiAdapterGetProvider(directX12State(*inputs.context).adapter), &descriptor,
             &pipelineState->rhiComputePipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(directX12State(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data
+                vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare D3D12 provider compute pipeline";
             delete pipelineState;
@@ -214,7 +215,7 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
         uint32_t maximumExternalSlot = 0;
         uint32_t vertexInputSlot = 0;
         bool supported = true;
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             maximumExternalSlot = std::max(maximumExternalSlot, parameter.slot);
             if (parameter.uses.size() != 1) {
                 supported = false;
@@ -307,7 +308,7 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
             candidates.push_back(candidate);
         }
         uint32_t internalSlot = maximumExternalSlot;
-        for (const Parameter &parameter : variant.internalParameters) {
+        for (const Parameter &parameter : plan.runtimeParameters) {
             if (!supported || parameter.uses.size() != 1 || internalSlot == UINT32_MAX) {
                 supported = false;
                 break;
@@ -319,14 +320,14 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
             candidate.layout.stage_mask =
                 use.stage == "vertex" ? VERNON_RUNTIME_PROVIDER_STAGE_VERTEX : VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
             candidate.layout.array_count = 1;
-            if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
+            if (parameter.source == StageParameterSource::ImplicitSampler && parameter.kind == "sampler" &&
                 use.sampledImageBindings.size() == 1 && use.sampledImageBindings[0].descriptorSet == 0) {
                 candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLER;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.binding = use.sampledImageBindings[0].binding;
                 candidate.binding.source = DirectX12PipelineState::GraphicsBinding::IMPLICIT_SAMPLER;
-            } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                       parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan) {
+            } else if (parameter.source == StageParameterSource::Resolution && parameter.kind == "tensor" &&
+                       use.interfaceKind == "uniform" && use.interfacePlan) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
                 const uint64_t physicalSize = use.interfacePlan->root->size;
@@ -356,7 +357,7 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
             candidates.push_back(candidate);
         }
         if (!supported) {
-            invocationDiagnostic(*bundle.context) =
+            invocationDiagnostic(*inputs.context) =
                 "D3D12 RuntimeCore graphics path does not support this parameter layout";
             delete pipelineState;
             return false;
@@ -370,8 +371,8 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
             pipelineState->rhiGraphicsBindingsPlan.push_back(candidate.binding);
         }
         pipelineState->rhiGraphicsValues.resize(candidates.size());
-        const Stage &vertex = bundle.stages.at(variant.vertex);
-        const Stage &fragment = bundle.stages.at(variant.fragment);
+        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
         const VernonRuntimeProviderShaderDescriptor shaders[2]{{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                 VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
                                                                 {"dxil", 4},
@@ -401,12 +402,12 @@ bool resolveDirectX12Pipeline(BackendPipelineBundle &bundle, const Variant &vari
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
-            vernonRuntimeRhiAdapterGetProvider(directX12State(*bundle.context).adapter), &descriptor,
+            vernonRuntimeRhiAdapterGetProvider(directX12State(*inputs.context).adapter), &descriptor,
             &pipelineState->rhiGraphicsPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(directX12State(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data
+                vernonRuntimeRhiAdapterGetLastError(directX12State(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare D3D12 provider graphics pipeline";
             delete pipelineState;

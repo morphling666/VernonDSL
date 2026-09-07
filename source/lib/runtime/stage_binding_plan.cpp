@@ -1,10 +1,9 @@
-#include "pipeline_manifest.h"
+#include "stage_binding_plan.h"
 #include "pipeline_metadata.h"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <charconv>
 #include <limits>
 #include <set>
 #include <string_view>
@@ -13,7 +12,7 @@
 namespace vernon::runtime {
 namespace {} // namespace
 
-std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string &dimension) {
+std::optional<VernonTextureDimension> artifactTextureDimension(const std::string &dimension) {
     if (dimension == "2d")
         return VERNON_TEXTURE_2D;
     if (dimension == "3d")
@@ -23,7 +22,7 @@ std::optional<VernonTextureDimension> pipelineTextureDimension(const std::string
     return std::nullopt;
 }
 
-std::optional<VernonTextureFormat> pipelineTextureFormat(const std::string &format) {
+std::optional<VernonTextureFormat> artifactTextureFormat(const std::string &format) {
     if (format == "r8_unorm")
         return VERNON_TEXTURE_R8_UNORM;
     if (format == "r16_float")
@@ -360,42 +359,6 @@ bool isScalarLayout(const ValueLayout &layout, const char *dtype) {
            layout.leaves[0].byteOffset == 0;
 }
 
-void parseStaticType(const std::string &type, std::string &dtype, std::vector<uint64_t> &shape) {
-    if (type.rfind("tensor<", 0) != 0 || type.size() < 9 || type.back() != '>') {
-        dtype = type;
-        return;
-    }
-    const std::string body = type.substr(7, type.size() - 8);
-    size_t begin = 0;
-    while (true) {
-        const size_t separator = body.find('x', begin);
-        if (separator == std::string::npos) {
-            dtype = body.substr(begin);
-            return;
-        }
-        const std::string dimension = body.substr(begin, separator - begin);
-        if (dimension == "?")
-            shape.push_back(0);
-        else {
-            try {
-                shape.push_back(std::stoull(dimension));
-            } catch (...) {
-                dtype.clear();
-                shape.clear();
-                return;
-            }
-        }
-        begin = separator + 1;
-    }
-}
-
-bool hasOnlyKeys(const nlohmann::json &value, std::initializer_list<std::string_view> allowed) {
-    for (auto row = value.begin(); row != value.end(); ++row)
-        if (std::find(allowed.begin(), allowed.end(), row.key()) == allowed.end())
-            return false;
-    return true;
-}
-
 } // namespace
 
 void rebuildValueLayoutPathViews(ValueLayout &layout) {
@@ -412,60 +375,57 @@ void rebuildValueLayoutPathViews(ValueLayout &layout) {
     }
 }
 
-void rebuildVariantLayoutViews(Variant &variant) {
+void rebuildStageBindingLayoutViews(StageBindingPlan &plan) {
     const auto rebuild = [](Parameter &parameter) {
         if (parameter.valueLayout)
             rebuildValueLayoutPathViews(*parameter.valueLayout);
         rebuildValueLayoutPathViews(parameter.elementLayout);
     };
-    for (Parameter &parameter : variant.parameters)
+    for (Parameter &parameter : plan.parameters)
         rebuild(parameter);
-    for (Parameter &parameter : variant.internalParameters)
+    for (Parameter &parameter : plan.runtimeParameters)
         rebuild(parameter);
 }
 
-bool parsePipelineValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
+bool parseArtifactValueLayout(const nlohmann::json &value, ValueLayout &layout, std::string &error) {
     return parseValueLayout(value, layout, error);
 }
 
-bool parsePipelineInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error) {
+bool parseArtifactInterfacePlan(const nlohmann::json &value, InterfacePlan &plan, std::string &error) {
     return parseInterfacePlan(value, plan, error);
 }
 
-bool Variant::validate(std::string &error) const {
+bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) {
     const auto validTextureDimension = [](const std::string &dimension) {
         return dimension == "2d" || dimension == "3d" || dimension == "cube";
     };
-    if (!std::is_sorted(key.begin(), key.end()) || std::adjacent_find(key.begin(), key.end()) != key.end()) {
-        error = "pipeline variant feature key is not canonical";
-        return false;
-    }
-    if (!std::is_sorted(parameters.begin(), parameters.end(),
+    if (!std::is_sorted(plan.parameters.begin(), plan.parameters.end(),
                         [](const Parameter &left, const Parameter &right) { return left.slot < right.slot; }) ||
-        std::adjacent_find(parameters.begin(), parameters.end(), [](const Parameter &left, const Parameter &right) {
-            return left.slot == right.slot;
-        }) != parameters.end()) {
-        error = "pipeline variant parameter slots are not unique and sorted";
+        std::adjacent_find(plan.parameters.begin(), plan.parameters.end(),
+                           [](const Parameter &left, const Parameter &right) { return left.slot == right.slot; }) !=
+            plan.parameters.end()) {
+        error = "Stage binding parameter slots are not unique and sorted";
         return false;
     }
-    if (!std::is_sorted(internalParameters.begin(), internalParameters.end(),
+    if (!std::is_sorted(plan.runtimeParameters.begin(), plan.runtimeParameters.end(),
                         [](const Parameter &left, const Parameter &right) { return left.name < right.name; }) ||
-        std::adjacent_find(internalParameters.begin(), internalParameters.end(),
+        std::adjacent_find(plan.runtimeParameters.begin(), plan.runtimeParameters.end(),
                            [](const Parameter &left, const Parameter &right) { return left.name == right.name; }) !=
-            internalParameters.end()) {
-        error = "pipeline variant internal parameters are not unique and sorted";
+            plan.runtimeParameters.end()) {
+        error = "runtime-supplied Stage parameters are not unique and sorted";
         return false;
     }
-    for (const Parameter &parameter : parameters) {
-        if (parameter.name.empty() || parameter.uses.empty() || !parameter.source.empty() ||
-            !parameter.systemValue.empty()) {
-            error = "external pipeline parameter invariant failed";
+    for (const Parameter &parameter : plan.parameters) {
+        const bool externalTransport =
+            parameter.source == StageParameterSource::Projected || parameter.source == StageParameterSource::Direct;
+        if (parameter.name.empty() || parameter.uses.empty() || !externalTransport) {
+            error = "external Stage parameter invariant failed";
             return false;
         }
         const bool imageConstraintsValid =
             parameter.kind == "image" ? validTextureDimension(parameter.dimension) : parameter.dimension.empty();
         if (!imageConstraintsValid) {
-            error = "pipeline parameter image constraint invariant failed";
+            error = "Stage parameter image constraint invariant failed";
             return false;
         }
         for (const ParameterUse &use : parameter.uses)
@@ -475,16 +435,14 @@ bool Variant::validate(std::string &error) const {
                 return false;
             }
     }
-    for (const Parameter &parameter : internalParameters) {
+    for (const Parameter &parameter : plan.runtimeParameters) {
         const bool implicitSampler =
-            parameter.source == "implicit_sampler" && parameter.kind == "sampler" && parameter.systemValue.empty();
-        const bool resolution = parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                                parameter.kind == "tensor" && isScalarLayout(parameter.elementLayout, "f32") &&
+            parameter.source == StageParameterSource::ImplicitSampler && parameter.kind == "sampler";
+        const bool resolution = parameter.source == StageParameterSource::Resolution && parameter.kind == "tensor" &&
+                                isScalarLayout(parameter.elementLayout, "f32") &&
                                 parameter.shape == std::vector<uint64_t>{2};
-        const bool programValue =
-            parameter.source == "program_value" && parameter.kind == "tensor" && parameter.systemValue.empty();
-        if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution && !programValue)) {
-            error = "internal pipeline parameter invariant failed";
+        if (parameter.name.empty() || parameter.uses.empty() || (!implicitSampler && !resolution)) {
+            error = "runtime-supplied Stage parameter invariant failed";
             return false;
         }
         for (const ParameterUse &use : parameter.uses) {
@@ -509,8 +467,8 @@ bool Variant::validate(std::string &error) const {
     std::vector<BindingKey> samplerBindings;
     const auto validateBindings = [&](const Parameter &parameter) {
         for (const ParameterUse &use : parameter.uses) {
-            if (program.find(use.stage) == program.end()) {
-                error = "pipeline parameter use references a stage outside its program";
+            if (plan.artifactKeys.find(use.stage) == plan.artifactKeys.end()) {
+                error = "Stage parameter use references an unknown loaded artifact";
                 return false;
             }
             const bool descriptorRequired =
@@ -518,14 +476,14 @@ bool Variant::validate(std::string &error) const {
                 ((use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
                  (use.transport == "uniform_buffer" || use.transport == "storage_buffer"));
             if (descriptorRequired && use.binding == UINT32_MAX) {
-                error = "descriptor-backed pipeline parameter is missing set/binding";
+                error = "descriptor-backed Stage parameter is missing set/binding";
                 return false;
             }
             if (use.binding != UINT32_MAX && parameter.kind != "sampler") {
                 BindingKey key{use.stage, use.descriptorSet, use.binding};
                 const auto [found, inserted] = descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
                 if (!inserted && found->second.first != parameter.name) {
-                    error = "pipeline descriptor binding is assigned to multiple parameters";
+                    error = "Stage descriptor binding is assigned to multiple parameters";
                     return false;
                 }
                 if (parameter.kind == "image")
@@ -545,10 +503,10 @@ bool Variant::validate(std::string &error) const {
         }
         return true;
     };
-    for (const Parameter &parameter : parameters)
+    for (const Parameter &parameter : plan.parameters)
         if (!validateBindings(parameter))
             return false;
-    for (const Parameter &parameter : internalParameters)
+    for (const Parameter &parameter : plan.runtimeParameters)
         if (!validateBindings(parameter))
             return false;
     for (const BindingKey &binding : samplerBindings)
@@ -556,10 +514,11 @@ bool Variant::validate(std::string &error) const {
             error = "sampler references an unknown sampled image binding";
             return false;
         }
-    const bool computeTopology = !compute.empty() && program.size() == 1;
-    const bool graphicsTopology = compute.empty() && !vertex.empty() && !fragment.empty() && program.size() == 2;
+    const bool computeTopology = !plan.compute.empty() && plan.artifactKeys.size() == 1;
+    const bool graphicsTopology =
+        plan.compute.empty() && !plan.vertex.empty() && !plan.fragment.empty() && plan.artifactKeys.size() == 2;
     if (!computeTopology && !graphicsTopology) {
-        error = "pipeline variant must contain either one compute program or one graphics program";
+        error = "Stage binding plan must select one compute artifact or a vertex/fragment artifact pair";
         return false;
     }
     return true;

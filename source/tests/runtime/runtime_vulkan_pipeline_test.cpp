@@ -13,11 +13,11 @@
 #include <string>
 #include <vector>
 
-#ifndef VERNON_VULKAN_PIPELINE_BUNDLE
-#error VERNON_VULKAN_PIPELINE_BUNDLE must name the cooked pipeline bundle
+#ifndef VERNON_VULKAN_PROGRAM_BUNDLE
+#error VERNON_VULKAN_PROGRAM_BUNDLE must name the cooked Program bundle
 #endif
-#ifndef VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE
-#error VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE must name the cooked compute pipeline bundle
+#ifndef VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE
+#error VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE must name the cooked compute Program bundle
 #endif
 namespace {
 
@@ -53,7 +53,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
 
-    const std::filesystem::path manifestPath = VERNON_VULKAN_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_VULKAN_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_TRUE(!bundle.empty());
@@ -301,7 +301,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
 TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
         GTEST_SKIP() << "Vulkan runtime backend is unavailable";
-    const std::filesystem::path manifestPath = VERNON_VULKAN_COMPUTE_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());

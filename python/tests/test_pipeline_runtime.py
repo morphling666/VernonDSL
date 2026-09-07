@@ -1266,7 +1266,7 @@ class VulkanPipelineTests(unittest.TestCase):
         ):
             render(position=positions, render_pass=render_target(target))
         compiled = next(iter(render._specializations.values()))
-        self.assertGreater(len(compiled.specialization.pipeline.program_abi["boundary_slots"]), 0)
+        self.assertGreater(len(compiled.specialization.executable.program_abi["boundary_slots"]), 0)
         self.assertEqual(len(compiled.invocation.graph.operations), 1)
 
     def test_program_abi_keeps_attachments_as_invocation_controls(self) -> None:
@@ -1276,7 +1276,7 @@ class VulkanPipelineTests(unittest.TestCase):
         attachments = render_target(target)
         render(position=positions, render_pass=attachments)
         compiled = next(iter(render._specializations.values()))
-        native = compiled.specialization.pipeline
+        native = compiled.specialization.executable
         self.assertEqual(
             [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in native.parameters],
             [("position", 0, (0, 2))],

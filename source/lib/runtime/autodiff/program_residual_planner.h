@@ -20,7 +20,8 @@ collectProgramPassTelemetry(const program::Graph &forward, const program::Progra
                             const ProgramTapeScratch &tapeScratch, const ProgramResidualPlan &plan);
 
 bool planProgramResiduals(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                          const Variant &variant, const std::vector<program_execution::ProgramValueState> &materialized,
+                          const StageBindingPlan &stagePlan,
+                          const std::vector<program_execution::ProgramValueState> &materialized,
                           const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, const std::string &policy,
                           bool rematerializeTapes, ProgramResidualPlan &result, std::string &error);
 

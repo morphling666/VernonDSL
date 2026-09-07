@@ -17,14 +17,14 @@
 #include <string>
 #include <vector>
 
-#ifndef VERNON_DIRECTX_PIPELINE_BUNDLE
-#error VERNON_DIRECTX_PIPELINE_BUNDLE must name the cooked pipeline bundle
+#ifndef VERNON_DIRECTX_PROGRAM_BUNDLE
+#error VERNON_DIRECTX_PROGRAM_BUNDLE must name the cooked Program bundle
 #endif
-#ifndef VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE
-#error VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE must name the cooked compute pipeline bundle
+#ifndef VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE
+#error VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE must name the cooked compute Program bundle
 #endif
-#ifndef VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE
-#error VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE must name the cooked resolution pipeline bundle
+#ifndef VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE
+#error VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE must name the cooked resolution Program bundle
 #endif
 namespace {
 
@@ -119,7 +119,7 @@ TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
 }
 
 TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
-    const std::filesystem::path manifestPath = VERNON_DIRECTX_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_DIRECTX_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
@@ -252,7 +252,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
 }
 
 TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
-    const std::filesystem::path manifestPath = VERNON_DIRECTX_RESOLUTION_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_DIRECTX_RESOLUTION_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());
@@ -429,7 +429,7 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
 }
 
 TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
-    const std::filesystem::path manifestPath = VERNON_DIRECTX_COMPUTE_PIPELINE_BUNDLE;
+    const std::filesystem::path manifestPath = VERNON_DIRECTX_COMPUTE_PROGRAM_BUNDLE;
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string bundle((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(bundle.empty());

@@ -5,10 +5,10 @@
 #include "VernonRuntimeCore.h"
 #include "VernonRuntimeProvider.h"
 #include "cpu_workgroup_dispatch.h"
-#include "pipeline_bundle.h"
 #include "pipeline_metadata.h"
 #include "platform/platform_library.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
+#include "stage_artifact.h"
 
 #include <cstddef>
 #include <limits>

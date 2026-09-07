@@ -1,8 +1,8 @@
 #ifndef VERNON_RUNTIME_PROGRAM_EXECUTION_PHYSICAL_BUFFER_VIEW_H
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_PHYSICAL_BUFFER_VIEW_H
 
-#include "runtime/pipeline_manifest.h"
 #include "runtime/shape_layout.h"
+#include "runtime/stage_binding_plan.h"
 
 #include <vector>
 

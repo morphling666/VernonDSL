@@ -159,10 +159,11 @@ The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
 native entries are `PythonProgramExecutable` objects and invoke the same compute pipeline
 ABI as ProgramAssets. Reinitializing a session invalidates loaded pipelines
 without discarding deterministic frontend and compiler results.
-Graphics Pipeline bundle compilation, binding, and invocation live in
-`_runtime.pipeline`; session now contains only backend/context lifecycle and
-generation state. The public Runtime and shader-asset modules are thin facades,
-and implementation modules never circularly re-export those facades.
+Graphics Pipeline authoring and interactive invocation live in `_runtime.pipeline`;
+cooked deployment is captured into the same Program Asset path as every other
+authored form. Session contains only backend/context lifecycle and generation
+state. Public Runtime and Program Asset modules are thin facades, and
+implementation modules never circularly re-export those facades.
 
 ## Autodiff representation boundary
 

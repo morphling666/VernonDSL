@@ -1966,7 +1966,7 @@ bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blo
                 if (rowValue.contains("interface_plan")) {
                     vernon::runtime::InterfacePlan plan;
                     std::string error;
-                    if (!vernon::runtime::parsePipelineInterfacePlan(rowValue["interface_plan"], plan, error))
+                    if (!vernon::runtime::parseArtifactInterfacePlan(rowValue["interface_plan"], plan, error))
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
                                     endpointPath + "/interface_plan", error);
                     compiled.interfacePlan = std::move(plan);
@@ -1981,7 +1981,7 @@ bool parseArtifactSystem(const nlohmann::json &target, const nlohmann::json &blo
                 if (rowValue.contains("element_layout")) {
                     vernon::runtime::ValueLayout layout;
                     std::string error;
-                    if (!vernon::runtime::parsePipelineValueLayout(rowValue["element_layout"], layout, error))
+                    if (!vernon::runtime::parseArtifactValueLayout(rowValue["element_layout"], layout, error))
                         return fail(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "parse",
                                     endpointPath + "/element_layout", error);
                     compiled.elementLayout = std::move(layout);

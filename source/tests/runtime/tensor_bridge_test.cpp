@@ -1,4 +1,4 @@
-#include "runtime/pipeline_manifest.h"
+#include "runtime/stage_binding_plan.h"
 #include "runtime/tensor_bridge.h"
 
 #include <gtest/gtest.h>

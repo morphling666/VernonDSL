@@ -58,15 +58,15 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
     return true;
 }
 
-bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
+bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgumentMap &arguments,
                           const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
                           std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
     size_t computeArgumentSpan = 0;
     size_t computeArgumentCount = 0;
-    for (const Parameter &parameter : variant.parameters)
+    for (const Parameter &parameter : stagePlan.parameters)
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != variant.compute)
+            if (use.stage != "compute" && use.stage != stagePlan.compute)
                 continue;
             if (use.index > kMaxComputeArgumentIndex)
                 return fail(error, "compute argument index exceeds the supported range");
@@ -79,13 +79,13 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
     plan.hostTensorStorage.reserve(computeArgumentCount);
     std::vector<uint8_t> assigned(computeArgumentSpan);
 
-    for (const Parameter &parameter : variant.parameters) {
+    for (const Parameter &parameter : stagePlan.parameters) {
         const auto suppliedIt = arguments.find(parameter.slot);
         if (suppliedIt == arguments.end())
             return fail(error, "compute argument is missing");
         const VernonProgramArgument &supplied = *suppliedIt->second;
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != variant.compute)
+            if (use.stage != "compute" && use.stage != stagePlan.compute)
                 continue;
             if (assigned[use.index])
                 return fail(error, "compute argument index is duplicated");
@@ -204,18 +204,18 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
     return std::nullopt;
 }
 
-bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
+bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (!arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
             return fail(error, "duplicate pipeline argument slot");
-    if (arguments.size() != variant.parameters.size())
+    if (arguments.size() != stagePlan.parameters.size())
         return fail(error, "pipeline argument count does not match layout");
 
     std::vector<const VernonTensorView *> tensors;
-    tensors.reserve(variant.parameters.size());
-    for (const Parameter &parameter : variant.parameters) {
+    tensors.reserve(stagePlan.parameters.size());
+    for (const Parameter &parameter : stagePlan.parameters) {
         const auto found = arguments.find(parameter.slot);
         if (found == arguments.end())
             return fail(error, "pipeline argument kind does not match layout");
@@ -254,7 +254,7 @@ bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDe
         if (tensor.access != VERNON_ACCESS_READ && !tensorByteLayoutInjective(tensor))
             return fail(error, "writable pipeline Tensor argument must have an injective byte layout");
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != variant.compute)
+            if (use.stage != "compute" && use.stage != stagePlan.compute)
                 continue;
             if (!use.tensorViewDescriptor)
                 continue;
@@ -271,7 +271,7 @@ bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDe
                            false;
             }
         }
-        if (parameter.source != "direct") {
+        if (parameter.source != StageParameterSource::Direct) {
             const bool allowLeading =
                 std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
                     return use.interfaceKind == "input" || use.interfaceKind == "value";
@@ -303,7 +303,7 @@ bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDe
                                std::to_string(tensors[left]->rank ? tensors[left]->byte_strides[0] : 0) + " and " +
                                std::to_string(tensors[right]->rank ? tensors[right]->byte_strides[0] : 0) + ")",
                        false;
-    return planComputeArguments(variant, arguments, invocation, plan, error);
+    return planComputeArguments(stagePlan, arguments, invocation, plan, error);
 }
 
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error) {

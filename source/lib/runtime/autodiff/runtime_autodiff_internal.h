@@ -3,9 +3,9 @@
 
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
-#include "runtime/pipeline_bundle.h"
-#include "runtime/pipeline_manifest.h"
 #include "runtime/program_execution/execution_control_plane.h"
+#include "runtime/stage_artifact.h"
+#include "runtime/stage_binding_plan.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -129,19 +129,20 @@ bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t text
 #endif
 }
 
-bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
+bool resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                          VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    if (variant.compute.empty()) {
-        const Stage &vertex = bundle.stages.at(variant.vertex);
-        const Stage &fragment = bundle.stages.at(variant.fragment);
+    if (plan.compute.empty()) {
+        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
         MetalArgumentBufferUsage argumentBufferUsage;
         if (!collectMetalArgumentBufferUsage(vertex.nativeSlots, vertex.entry, "vertex", argumentBufferUsage,
-                                             invocationDiagnostic(*bundle.context)) ||
+                                             invocationDiagnostic(*inputs.context)) ||
             !collectMetalArgumentBufferUsage(fragment.nativeSlots, fragment.entry, "fragment", argumentBufferUsage,
-                                             invocationDiagnostic(*bundle.context)) ||
-            !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
-                                              metalState(*bundle.context).argumentBufferEncodingSupported,
-                                              invocationDiagnostic(*bundle.context)))
+                                             invocationDiagnostic(*inputs.context)) ||
+            !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
+                                              metalState(*inputs.context).argumentBufferEncodingSupported,
+                                              invocationDiagnostic(*inputs.context)))
             return false;
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -165,14 +166,14 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
             candidate.binding.externalSlot = parameter.slot;
             candidate.binding.descriptorSet = use.descriptorSet;
             candidate.binding.descriptorBinding = use.binding;
-            const Stage &nativeStage = use.stage == "vertex" ? vertex : fragment;
+            const LoadedStageArtifact &nativeStage = use.stage == "vertex" ? vertex : fragment;
             const std::vector<NativeResourceSlot> &nativeSlots =
                 use.stage == "vertex" ? vertex.nativeSlots : fragment.nativeSlots;
             auto resolveDescriptor = [&](const char *kind) {
                 MetalResourceLocation location;
                 if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), kind,
                                                   use.descriptorSet, use.binding, location,
-                                                  invocationDiagnostic(*bundle.context)))
+                                                  invocationDiagnostic(*inputs.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -199,7 +200,7 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
                     MetalResourceLocation location;
                     if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), "sampler",
                                                       binding.descriptorSet, binding.binding, location,
-                                                      invocationDiagnostic(*bundle.context)))
+                                                      invocationDiagnostic(*inputs.context)))
                         return false;
                     sampler.layout.set = location.argumentBufferIndex;
                     sampler.layout.binding = location.memberId;
@@ -247,7 +248,7 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
                     const std::string inlineName = !use.uniformName.empty() ? use.uniformName : parameter.name;
                     if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(),
                                                       "inline_constant", UINT32_MAX, UINT32_MAX, location,
-                                                      invocationDiagnostic(*bundle.context), &inlineName))
+                                                      invocationDiagnostic(*inputs.context), &inlineName))
                         return false;
                     candidate.layout.set = UINT32_MAX;
                     candidate.layout.binding = location.directBufferIndex;
@@ -287,7 +288,7 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
             return true;
         };
         bool supported = true;
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             for (const ParameterUse &use : parameter.uses)
                 if (!addUse(parameter, use, false)) {
                     supported = false;
@@ -296,15 +297,15 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
             if (!supported)
                 break;
         }
-        for (const Parameter &parameter : variant.internalParameters)
+        for (const Parameter &parameter : plan.runtimeParameters)
             for (const ParameterUse &use : parameter.uses)
                 if (!supported || !addUse(parameter, use, true)) {
                     supported = false;
                     break;
                 }
         if (!supported) {
-            if (invocationDiagnostic(*bundle.context).empty())
-                invocationDiagnostic(*bundle.context) =
+            if (invocationDiagnostic(*inputs.context).empty())
+                invocationDiagnostic(*inputs.context) =
                     "Metal RuntimeCore graphics path does not support this parameter layout";
             return false;
         }
@@ -347,12 +348,12 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*bundle.context).adapter),
+            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
                                              &descriptor, &state->rhiGraphicsPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data
+                vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare Metal provider graphics pipeline";
             return false;
@@ -360,16 +361,16 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
         installRuntimeBackendState(pipeline, state.release());
         return true;
     }
-    const Stage &stage = bundle.stages.at(variant.compute);
+    const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
     ReflectedEntry reflection;
-    if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*bundle.context)))
+    if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*inputs.context)))
         return false;
     MetalArgumentBufferUsage argumentBufferUsage;
     if (!collectMetalArgumentBufferUsage(stage.nativeSlots, stage.entry, "compute", argumentBufferUsage,
-                                         invocationDiagnostic(*bundle.context)) ||
-        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
-                                          metalState(*bundle.context).argumentBufferEncodingSupported,
-                                          invocationDiagnostic(*bundle.context)))
+                                         invocationDiagnostic(*inputs.context)) ||
+        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
+                                          metalState(*inputs.context).argumentBufferEncodingSupported,
+                                          invocationDiagnostic(*inputs.context)))
         return false;
 
     struct Candidate {
@@ -387,14 +388,14 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
             flattenedBinding +=
                 static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
     }
-    for (const Parameter &parameter : variant.parameters)
+    for (const Parameter &parameter : plan.parameters)
         internalSlot = std::max(internalSlot, parameter.slot);
-    for (const Parameter &parameter : variant.parameters) {
+    for (const Parameter &parameter : plan.parameters) {
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != variant.compute)
+            if (use.stage != "compute" && use.stage != plan.compute)
                 continue;
             if (use.index >= reflection.arguments.size()) {
-                invocationDiagnostic(*bundle.context) = "Metal parameter use exceeds reflected argument table";
+                invocationDiagnostic(*inputs.context) = "Metal parameter use exceeds reflected argument table";
                 return false;
             }
             const ReflectedArgument &argument = reflection.arguments[use.index];
@@ -432,7 +433,7 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
                 if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
                     !resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind,
                                                   candidate.layout.set, candidate.layout.binding, location,
-                                                  invocationDiagnostic(*bundle.context)))
+                                                  invocationDiagnostic(*inputs.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -455,7 +456,7 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
                     MetalResourceLocation location;
                     if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", "storage_buffer",
                                                       candidate.layout.set, binding, location,
-                                                      invocationDiagnostic(*bundle.context)))
+                                                      invocationDiagnostic(*inputs.context)))
                         return false;
                     candidate.layout.set = location.argumentBufferIndex;
                     candidate.layout.binding = location.memberId;
@@ -505,11 +506,11 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
     descriptor.binding_count = state->rhiComputeLayout.size();
     std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
     const VernonStatus status =
-        vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*bundle.context).adapter),
+        vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
                                          &descriptor, &state->rhiComputePipeline);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-        invocationDiagnostic(*bundle.context) = providerError.data
+        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+        invocationDiagnostic(*inputs.context) = providerError.data
                                                     ? std::string(providerError.data, providerError.size)
                                                     : "failed to prepare Metal provider compute pipeline";
         return false;
@@ -517,8 +518,8 @@ bool resolveMetalPipeline(BackendPipelineBundle &bundle, const Variant &variant,
     installRuntimeBackendState(pipeline, state.release());
     return true;
 #else
-    (void)bundle;
-    (void)variant;
+    (void)inputs;
+    (void)plan;
     (void)pipeline;
     return false;
 #endif

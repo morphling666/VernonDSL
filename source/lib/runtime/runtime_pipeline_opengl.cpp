@@ -48,7 +48,8 @@ VernonStatus fail(VernonRuntimeContext &context, std::string error,
 
 } // namespace
 
-bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant, VernonStageExecutable &pipeline) {
+bool resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                           VernonStageExecutable &pipeline) {
     auto *state = new OpenGLPipelineState();
     struct OpenGLBindingCandidate {
         VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -59,28 +60,28 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
     };
     std::vector<OpenGLBindingCandidate> candidates;
     uint32_t computeInternalSlot = 0;
-    for (const Parameter &parameter : variant.parameters)
+    for (const Parameter &parameter : plan.parameters)
         computeInternalSlot = std::max(computeInternalSlot, parameter.slot);
-    if (!variant.compute.empty()) {
-        const Stage &stage = bundle.stages.at(variant.compute);
+    if (!plan.compute.empty()) {
+        const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
         ReflectedEntry reflection;
-        if (!resolveStageReflection(stage, bundle.context->backend, reflection,
-                                    invocationDiagnostic(*bundle.context))) {
+        if (!resolveStageReflection(stage, inputs.context->backend, reflection,
+                                    invocationDiagnostic(*inputs.context))) {
             delete state;
             return false;
         }
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             if (parameter.kind == "image" && parameter.bindingRole == "sampled") {
-                invocationDiagnostic(*bundle.context) =
+                invocationDiagnostic(*inputs.context) =
                     "OpenGL compute pipelines do not support sampled textures in the current language contract";
                 delete state;
                 return false;
             }
             for (const ParameterUse &use : parameter.uses) {
-                if (use.stage != "compute" && use.stage != variant.compute)
+                if (use.stage != "compute" && use.stage != plan.compute)
                     continue;
                 if (use.index >= reflection.arguments.size() || use.binding == UINT32_MAX) {
-                    invocationDiagnostic(*bundle.context) = "OpenGL compute parameter reflection is incomplete";
+                    invocationDiagnostic(*inputs.context) = "OpenGL compute parameter reflection is incomplete";
                     delete state;
                     return false;
                 }
@@ -115,7 +116,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
                                                     : OpenGLPipelineState::InlineBinding::COMPUTE_INLINE;
                     candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                     if (candidate.layout.element_size == 0) {
-                        invocationDiagnostic(*bundle.context) = "OpenGL compute parameter has zero element size";
+                        invocationDiagnostic(*inputs.context) = "OpenGL compute parameter has zero element size";
                         delete state;
                         return false;
                     }
@@ -186,11 +187,11 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         descriptor.binding_count = state->rhiLayout.size();
         std::copy_n(stage.workgroup, 3, descriptor.workgroup_size);
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
-            vernonRuntimeRhiAdapterGetProvider(openGLState(*bundle.context).adapter), &descriptor, &state->rhiPipeline);
+            vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor, &state->rhiPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data && providerError.size
+                vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare OpenGL provider compute pipeline";
             delete state;
@@ -209,7 +210,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         installRuntimeBackendState(pipeline, state);
         return true;
     }
-    bool useRhiGraphics = variant.compute.empty() && !variant.vertex.empty() && !variant.fragment.empty();
+    bool useRhiGraphics = plan.compute.empty() && !plan.vertex.empty() && !plan.fragment.empty();
     std::string representationError;
     const auto graphicsStageMask = [](const std::string &stage) {
         return stage == "vertex"     ? uint32_t{VERNON_RUNTIME_PROVIDER_STAGE_VERTEX}
@@ -217,7 +218,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
                                      : uint32_t{0};
     };
     if (useRhiGraphics) {
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             for (const ParameterUse &use : parameter.uses) {
                 if (graphicsStageMask(use.stage) == 0) {
                     representationError = "OpenGL graphics parameter references an unsupported stage";
@@ -350,7 +351,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         }
     }
     if (useRhiGraphics) {
-        for (const Parameter &parameter : variant.internalParameters) {
+        for (const Parameter &parameter : plan.runtimeParameters) {
             for (const ParameterUse &use : parameter.uses) {
                 if (graphicsStageMask(use.stage) == 0) {
                     representationError = "OpenGL internal parameter references an unsupported stage";
@@ -358,7 +359,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
                     break;
                 }
                 const uint32_t stageMask = graphicsStageMask(use.stage);
-                if (parameter.source == "implicit_sampler" && parameter.kind == "sampler" &&
+                if (parameter.source == StageParameterSource::ImplicitSampler && parameter.kind == "sampler" &&
                     !use.sampledImageBindings.empty()) {
                     for (const SampledImageBinding &binding : use.sampledImageBindings) {
                         if (binding.descriptorSet != 0 || binding.binding == UINT32_MAX) {
@@ -376,8 +377,8 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
                         candidate.binding.source = OpenGLPipelineState::InlineBinding::IMPLICIT_SAMPLER;
                         candidates.push_back(std::move(candidate));
                     }
-                } else if (parameter.source == "system_value" && parameter.systemValue == "resolution" &&
-                           use.interfaceKind == "uniform" && !use.uniformName.empty()) {
+                } else if (parameter.source == StageParameterSource::Resolution && use.interfaceKind == "uniform" &&
+                           !use.uniformName.empty()) {
                     OpenGLBindingCandidate candidate;
                     candidate.layout.stage_mask = stageMask;
                     candidate.layout.array_count = 1;
@@ -420,8 +421,8 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         }
     }
     if (useRhiGraphics) {
-        const Stage &vertex = bundle.stages.at(variant.vertex);
-        const Stage &fragment = bundle.stages.at(variant.fragment);
+        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
         std::vector<VernonRuntimeProviderShaderDescriptor> shaders{{sizeof(VernonRuntimeProviderShaderDescriptor),
                                                                     VERNON_RUNTIME_PROVIDER_STAGE_VERTEX,
                                                                     {"glsl", 4},
@@ -451,11 +452,11 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status = vernonRuntimeCorePreparePipeline(
-            vernonRuntimeRhiAdapterGetProvider(openGLState(*bundle.context).adapter), &descriptor, &state->rhiPipeline);
+            vernonRuntimeRhiAdapterGetProvider(openGLState(*inputs.context).adapter), &descriptor, &state->rhiPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-            invocationDiagnostic(*bundle.context) = providerError.data && providerError.size
+                vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
                                                         ? std::string(providerError.data, providerError.size)
                                                         : "failed to prepare OpenGL RHI provider pipeline";
             delete state;
@@ -481,8 +482,8 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
                 state->rhiPipeline, state->rhiValues.data(), state->rhiValues.size(), &state->rhiBindings);
             if (bindingStatus != VERNON_STATUS_OK) {
                 const VernonStringView providerError =
-                    vernonRuntimeRhiAdapterGetLastError(openGLState(*bundle.context).adapter);
-                invocationDiagnostic(*bundle.context) = providerError.data && providerError.size
+                    vernonRuntimeRhiAdapterGetLastError(openGLState(*inputs.context).adapter);
+                invocationDiagnostic(*inputs.context) = providerError.data && providerError.size
                                                             ? std::string(providerError.data, providerError.size)
                                                             : "failed to prepare OpenGL RHI bindings";
                 vernonRuntimeCorePipelineDestroy(state->rhiPipeline);
@@ -493,7 +494,7 @@ bool resolveOpenGLPipeline(BackendPipelineBundle &bundle, const Variant &variant
         installRuntimeBackendState(pipeline, state);
         return true;
     }
-    invocationDiagnostic(*bundle.context) = representationError.empty()
+    invocationDiagnostic(*inputs.context) = representationError.empty()
                                                 ? "OpenGL ProgramAsset is not representable by the RuntimeCore provider"
                                                 : std::move(representationError);
     delete state;

@@ -1313,8 +1313,8 @@ class _VjpSpecialization:
         return self.compiled.template
 
     @property
-    def pipeline(self) -> Any:
-        return self.compiled.pipeline
+    def executable(self) -> Any:
+        return self.compiled.executable
 
     def invoke(
         self,

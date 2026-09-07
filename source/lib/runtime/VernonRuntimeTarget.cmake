@@ -214,8 +214,8 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_implementation_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/prepared_graphics_draw.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_bundle.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/pipeline_manifest.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/stage_artifact.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/stage_binding_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_instance.cpp

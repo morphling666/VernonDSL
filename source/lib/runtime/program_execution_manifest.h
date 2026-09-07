@@ -2,8 +2,8 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_MANIFEST_H
 
 #include "VernonProgramPlanTypes.h"
-#include "pipeline_bundle.h"
-#include "pipeline_manifest.h"
+#include "stage_artifact.h"
+#include "stage_binding_plan.h"
 
 #include <nlohmann/json_fwd.hpp>
 

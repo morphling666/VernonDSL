@@ -93,13 +93,14 @@ VernonStatus fail(VernonRuntimeContext &context, const std::string &error) {
 class ProgramPullback final : public PullbackExecution {
 public:
     ProgramPullback(VernonRuntimeContext &context, std::shared_ptr<const program::ResolvedExecutionPlan> topology,
-                    Variant variant, Signature signature, std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings,
+                    StageBindingPlan stagePlan, Signature signature,
+                    std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings,
                     std::shared_ptr<const RetainedPullbackState> state,
                     std::vector<AutodiffPullbackPassTelemetry> passTelemetry)
-        : context_(&context), topology_(std::move(topology)), variant_(std::move(variant)),
+        : context_(&context), topology_(std::move(topology)), stagePlan_(std::move(stagePlan)),
           signature_(std::move(signature)), derivativeBindings_(std::move(derivativeBindings)),
           state_(std::move(state)), passTelemetry_(std::move(passTelemetry)) {
-        rebuildVariantLayoutViews(variant_);
+        rebuildStageBindingLayoutViews(stagePlan_);
     }
 
     VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
@@ -280,7 +281,7 @@ public:
 private:
     VernonRuntimeContext *context_;
     std::shared_ptr<const program::ResolvedExecutionPlan> topology_;
-    Variant variant_;
+    StageBindingPlan stagePlan_;
     Signature signature_;
     std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::shared_ptr<const RetainedPullbackState> state_;
@@ -292,10 +293,10 @@ private:
 class ProgramExecutable final : public CanonicalProgramExecution {
 public:
     ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<const program::ResolvedExecutionPlan> topology,
-                      CanonicalProgramAutodiffState &programAutodiff, Variant variant)
+                      CanonicalProgramAutodiffState &programAutodiff, StageBindingPlan stagePlan)
         : context_(&context), topology_(std::move(topology)), programAutodiff_(&programAutodiff),
-          variant_(std::move(variant)) {
-        rebuildVariantLayoutViews(variant_);
+          stagePlan_(std::move(stagePlan)) {
+        rebuildStageBindingLayoutViews(stagePlan_);
         const std::shared_ptr<const program::ResolvedExecutionPlan> locked = topology_.lock();
         if (!locked || !locked->resolvedProgram) {
             signatureError_ = "Program executable has no resolved canonical owner";
@@ -495,7 +496,7 @@ public:
         const bool rematerializeTapes = programAutodiff_->checkpointMemoryBudget.has_value();
         if (rematerializeTapes)
             memoryBudget = *programAutodiff_->checkpointMemoryBudget;
-        if (!planProgramResiduals(*execution, topology.get(), variant_, arena.values(), tapeScratch, memoryBudget,
+        if (!planProgramResiduals(*execution, topology.get(), stagePlan_, arena.values(), tapeScratch, memoryBudget,
                                   programAutodiff_->checkpointPolicy, rematerializeTapes, plan, error))
             return fail(*context_, error);
         for (uint32_t value : plan.retainedValues) {
@@ -517,7 +518,7 @@ public:
                 retained[value] = 1;
         arena.retainOnly(retained);
         auto state = std::make_shared<const RetainedPullbackState>(std::move(plan), arena, std::move(tapeScratch));
-        pullback = std::make_unique<ProgramPullback>(*context_, topology, variant_, signature_, derivativeBindings_,
+        pullback = std::make_unique<ProgramPullback>(*context_, topology, stagePlan_, signature_, derivativeBindings_,
                                                      std::move(state), std::move(telemetry));
         return VERNON_STATUS_OK;
     }
@@ -526,7 +527,7 @@ private:
     VernonRuntimeContext *context_;
     std::weak_ptr<const program::ResolvedExecutionPlan> topology_;
     const CanonicalProgramAutodiffState *programAutodiff_{};
-    Variant variant_;
+    StageBindingPlan stagePlan_;
     Signature signature_;
     std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::vector<std::pair<uint32_t, uint32_t>> forwardBindings_;
@@ -547,7 +548,8 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
     }
     if (!pipeline.context->autodiffMemoryPolicy)
         pipeline.context->autodiffMemoryPolicy = std::make_shared<AutodiffMemoryPolicy>();
-    auto executable = std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.executionPlan, state, Variant{});
+    auto executable =
+        std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.executionPlan, state, StageBindingPlan{});
     std::vector<AutodiffDerivativeGroup> groups = derivativeGroups;
     const auto appendGroups = [&](AutodiffDerivativeRole role, program::BoundaryRole boundaryRole,
                                   const std::vector<ValueAbi> &leaves, std::vector<AutodiffDerivativeGroup> &result) {

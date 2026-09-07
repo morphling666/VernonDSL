@@ -16,7 +16,7 @@ from .._program_assets.compile_orchestration import (
 from ..bundle import build_program_manifest, build_program_plan, canonical_json, make_target_options
 from ..storage import TensorStorage, TensorView
 from . import session as state
-from .autodiff import _pipeline_derivative_groups
+from .autodiff import _program_derivative_groups
 from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .sampler import SamplerState
 from .tensor import RawBuffer
@@ -32,14 +32,14 @@ class _ProgramDeployment:
     def load(self) -> Any:
         if state._native_runtime is None:
             raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
-        return state._native_runtime.load_canonical_program(
+        return state._native_runtime.load_in_memory_program(
             self.manifest,
             self.directory.name,
             self.compiled_stages,
         )
 
 
-def _bind_program_graphics_controls(pipeline: Any, cache: _PersistentBindingTable, invocation: Any) -> list[Any]:
+def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTable, invocation: Any) -> list[Any]:
     from ..render import ColorBlendState, LoadOperation, StoreOperation, lines, points, triangles
 
     load_values = {
@@ -58,7 +58,7 @@ def _bind_program_graphics_controls(pipeline: Any, cache: _PersistentBindingTabl
         render_slot, render_pass = controls["render_pass"]
         draw_slot, draw = controls["draw"]
         dynamic_slot, dynamic = controls["dynamic_state"]
-        builder = pipeline.invocation_builder()
+        builder = executable.invocation_builder()
         colors = tuple(render_pass.target._color_attachments())
         color_operations = dict(render_pass.colors)
         for location, texture in colors:
@@ -156,19 +156,19 @@ def _program_host_array(value: Any) -> np.ndarray:
 
 @contextmanager
 def _bound_program_invocation(
-    pipeline: Any,
+    executable: Any,
     cache: _PersistentBindingTable,
     invocation: Any,
     targets: Mapping[str, Any],
     *,
     retain_borrows: bool = False,
 ) -> Iterator[tuple[Any, list[Any], _DispatchBorrowLease]]:
-    parameters = tuple(pipeline.parameters)
+    parameters = tuple(executable.parameters)
     parameters_by_slot = {parameter.slot: parameter for parameter in parameters}
     if len(parameters_by_slot) != len(parameters):
         raise RuntimeError("Program compiler ABI contains duplicate public slots")
     boundary_slots = tuple(
-        slot for slot in pipeline.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
+        slot for slot in executable.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
     )
     boundary_slots_by_slot = {slot["slot"]: slot for slot in boundary_slots}
     if not set(parameters_by_slot) <= set(boundary_slots_by_slot):
@@ -215,16 +215,16 @@ def _bound_program_invocation(
     lease = _DispatchBorrowLease(borrows)
     succeeded = False
     try:
-        with cache.invocation(pipeline) as builder:
+        with cache.invocation(executable) as builder:
             for parameter, slot, path, value in resolved:
                 if parameter.kind == state._native.PIPELINE_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
-                    cache.bind_sampler(builder, pipeline, parameter, value)
+                    cache.bind_sampler(builder, executable, parameter, value)
                 else:
                     cache.bind_argument(
                         builder,
-                        pipeline,
+                        executable,
                         parameter,
                         value,
                         host_value=slot.get("category") == "value",
@@ -236,7 +236,7 @@ def _bound_program_invocation(
                     and hasattr(value, "_mark_device_dirty")
                 ):
                     written.append(value)
-            written.extend(_bind_program_graphics_controls(pipeline, cache, invocation))
+            written.extend(_bind_program_graphics_controls(executable, cache, invocation))
             yield builder, written, lease
         succeeded = True
     finally:
@@ -370,7 +370,7 @@ class ProgramNativePullback:
 class ProgramAutodiffSpecialization:
     template: Any
     deployment: _ProgramDeployment
-    pipeline: Any
+    executable: Any
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -378,12 +378,12 @@ class ProgramAutodiffSpecialization:
 
     def _release_runtime_native(self) -> None:
         self.binding_cache.clear()
-        self.pipeline = None
+        self.executable = None
 
-    def _loaded_pipeline(self) -> Any:
-        if self.pipeline is None:
-            self.pipeline = self.deployment.load()
-        return self.pipeline
+    def _loaded_executable(self) -> Any:
+        if self.executable is None:
+            self.executable = self.deployment.load()
+        return self.executable
 
     @property
     def binding_telemetry(self) -> Mapping[str, int]:
@@ -396,8 +396,8 @@ class ProgramAutodiffSpecialization:
         checkpoint_memory_budget: int | None = None,
         checkpoint_policy: str = "",
     ) -> tuple[Any, ProgramNativePullback]:
-        pipeline = self._loaded_pipeline()
-        signature = pipeline.program_ad_signature
+        executable = self._loaded_executable()
+        signature = executable.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
         actual_inputs = set(invocation.inputs)
         if actual_inputs != expected_inputs:
@@ -411,13 +411,13 @@ class ProgramAutodiffSpecialization:
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
         with _bound_program_invocation(
-            pipeline,
+            executable,
             self.binding_cache,
             invocation,
             targets,
             retain_borrows=True,
         ) as (builder, written, lease):
-            native_outputs, native_pullback = pipeline.program_vjp_bound(
+            native_outputs, native_pullback = executable.program_vjp_bound(
                 builder,
                 program_bindings,
                 checkpoint_memory_budget=checkpoint_memory_budget,
@@ -425,7 +425,7 @@ class ProgramAutodiffSpecialization:
             )
             for value in written:
                 value._mark_device_dirty()
-        derivative_groups = _pipeline_derivative_groups(pipeline)
+        derivative_groups = _program_derivative_groups(executable)
         pullback = ProgramNativePullback(
             native_pullback,
             signature,
@@ -447,7 +447,7 @@ class ProgramAutodiffSpecialization:
 class ProgramSpecialization:
     template: Any
     deployment: _ProgramDeployment
-    pipeline: Any
+    executable: Any
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -455,12 +455,12 @@ class ProgramSpecialization:
 
     def _release_runtime_native(self) -> None:
         self.binding_cache.clear()
-        self.pipeline = None
+        self.executable = None
 
-    def _loaded_pipeline(self) -> Any:
-        if self.pipeline is None:
-            self.pipeline = self.deployment.load()
-        return self.pipeline
+    def _loaded_executable(self) -> Any:
+        if self.executable is None:
+            self.executable = self.deployment.load()
+        return self.executable
 
     @property
     def binding_telemetry(self) -> Mapping[str, int]:
@@ -469,9 +469,9 @@ class ProgramSpecialization:
     def invoke(self, invocation: Any) -> Any:
         from ..program import flatten_program_outputs
 
-        pipeline = self._loaded_pipeline()
+        executable = self._loaded_executable()
         targets = flatten_program_outputs(invocation.outputs)
-        with _bound_program_invocation(pipeline, self.binding_cache, invocation, targets) as (
+        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
             builder,
             written,
             _,

@@ -2,7 +2,7 @@
 #define VERNON_RUNTIME_COMPUTE_LAUNCH_PLANNER_H
 
 #include "VernonRuntime.h"
-#include "pipeline_manifest.h"
+#include "stage_binding_plan.h"
 #include "tensor_bridge.h"
 
 #include <cstdint>
@@ -63,7 +63,7 @@ struct PlannedComputeLaunch {
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
                                                      const ComputeBindingSource &source);
 
-bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
+bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error);
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 

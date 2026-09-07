@@ -61,12 +61,12 @@ nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, co
     return grouped;
 }
 
-PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *pipeline, const ProgramParameterMetadata &parameter,
+PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *executable, const ProgramParameterMetadata &parameter,
                                      size_t leafIndex, VernonProgramValueLeafView *reflected) {
     VernonProgramValueLeafView leaf{};
     leaf.struct_size = sizeof(leaf);
     const VernonStringView parameterName{parameter.name.data(), parameter.name.size()};
-    if (vernonRuntimeProgramExecutableGetParameterValueLeaf(pipeline, parameterName, leafIndex, &leaf) !=
+    if (vernonRuntimeProgramExecutableGetParameterValueLeaf(executable, parameterName, leafIndex, &leaf) !=
         VERNON_STATUS_OK)
         throw std::runtime_error("cannot read autodiff input leaf metadata");
     PythonAdMetadata result{parameter.name, parameter.name, static_cast<VernonDataType>(leaf.value.dtype), {}};

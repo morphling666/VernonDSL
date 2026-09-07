@@ -1,5 +1,5 @@
-#ifndef VERNON_RUNTIME_PIPELINE_BUNDLE_H
-#define VERNON_RUNTIME_PIPELINE_BUNDLE_H
+#ifndef VERNON_RUNTIME_STAGE_ARTIFACT_H
+#define VERNON_RUNTIME_STAGE_ARTIFACT_H
 
 #include "VernonRuntime.h"
 #include "pipeline_metadata.h"
@@ -28,18 +28,6 @@ struct CpuNativeArtifact {
     bool staticallyLinked{};
 };
 
-struct ResolvedArtifact {
-    std::string format;
-    std::vector<uint8_t> bytes;
-    std::filesystem::path path;
-    bool external{};
-};
-
-enum class ArtifactResolution {
-    LoadBytes,
-    MetadataOnly,
-};
-
 struct NativeResourceSlot {
     std::string entry;
     std::string stage;
@@ -53,8 +41,7 @@ struct NativeResourceSlot {
     uint32_t count{1};
 };
 
-struct Stage {
-    std::string stage;
+struct LoadedStageArtifact {
     std::string entry;
     std::string source;
     std::string reflection;
@@ -68,13 +55,9 @@ struct Stage {
     std::vector<TensorViewWriteFootprint> writeFootprints;
 };
 
-bool validateManifestHash(const nlohmann::json &root, bool required, std::string &error);
+bool validateProgramBundleHash(const nlohmann::json &root, bool required, std::string &error);
 bool validateCpuRuntimeRequirements(const std::string &targetTriple, const std::string &objectFormat,
                                     std::string &error);
-
-bool resolveArtifact(const nlohmann::json &descriptor, const std::optional<std::filesystem::path> &directory,
-                     ResolvedArtifact &output, std::string &error,
-                     ArtifactResolution resolution = ArtifactResolution::LoadBytes);
 
 bool resolveCpuNativeArtifact(const CpuNativeArtifact &artifact, std::filesystem::path &libraryPath,
                               ReflectedEntry *reflection, std::string &error);
