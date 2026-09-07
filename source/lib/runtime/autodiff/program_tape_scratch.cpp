@@ -1,6 +1,5 @@
 #include "program_tape_scratch.h"
 
-#include "runtime/autodiff/runtime_gpu_argument_binding.h"
 #include "runtime/tensor_bridge.h"
 
 #include <algorithm>

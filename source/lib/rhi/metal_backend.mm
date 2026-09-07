@@ -610,6 +610,34 @@ bool DeviceState::copyBuffer(uint64_t native, const Buffer &source, uint64_t sou
     return true;
 }
 
+bool DeviceState::copyImage(uint64_t native, const Image &source, const Image &destination,
+                            const VernonRhiImageCopyRegion *regions, size_t regionCount, std::string &error) {
+    if (!native || !source.texture || !destination.texture || !regions || !regionCount) {
+        error = "Metal image copy arguments are invalid";
+        return false;
+    }
+    id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>)(reinterpret_cast<void *>(native));
+    id<MTLBlitCommandEncoder> blit = [commandBuffer blitCommandEncoder];
+    if (!blit) {
+        error = "Metal image blit command encoder creation failed";
+        return false;
+    }
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        [blit copyFromTexture:source.texture
+                 sourceSlice:region.source_array_layer
+                 sourceLevel:region.source_mip_level
+                sourceOrigin:MTLOriginMake(region.source_x, region.source_y, region.source_z)
+                  sourceSize:MTLSizeMake(region.width, region.height, region.depth)
+                   toTexture:destination.texture
+            destinationSlice:region.destination_array_layer
+            destinationLevel:region.destination_mip_level
+           destinationOrigin:MTLOriginMake(region.destination_x, region.destination_y, region.destination_z)];
+    }
+    [blit endEncoding];
+    return true;
+}
+
 bool DeviceState::submitCommands(uint64_t native, std::string &error) {
     if (!native) {
         error = "Metal command buffer is invalid";

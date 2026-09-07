@@ -93,6 +93,27 @@ inline void appendRhiBufferBinding(std::vector<RhiCommandResourceBinding> &bindi
     bindings.push_back({identity, ResourceKind::Buffer, buffer, {}});
 }
 
+inline CommandResourceAccess rhiImageAccess(VernonRhiImage image, VernonRhiImageSubresourceRange subresources,
+                                            AccessMode access, VernonRhiResourceState state, uint32_t stageMask = 0) {
+    CommandResourceAccess result;
+    result.resource = image.index;
+    result.aliasDomain = rhi::encodeResourceKey(image);
+    result.access = access;
+    result.kind = ResourceKind::Image;
+    result.imageSubresources = subresources;
+    result.state = state;
+    result.stageMask = stageMask;
+    return result;
+}
+
+inline void appendRhiImageBinding(std::vector<RhiCommandResourceBinding> &bindings, VernonRhiImage image) {
+    const uint64_t identity = rhi::encodeResourceKey(image);
+    for (const RhiCommandResourceBinding &binding : bindings)
+        if (binding.aliasDomain == identity && binding.kind == ResourceKind::Image)
+            return;
+    bindings.push_back({identity, ResourceKind::Image, {}, image});
+}
+
 struct RhiCommandDagExecutionStats {
     uint64_t submissions{};
     uint64_t waits{};

@@ -48,40 +48,40 @@ bool DeviceBuffer::valid() const {
 }
 
 bool DeviceBuffer::upload(const void *source, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Upload) &&
+    return valid() && size == size_ && !injectFailure(FailureBoundary::Transfer) &&
            vernonRhiDeviceUploadBuffer(context_->rhiDevice, handle_, 0, source, size) == VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, const void *source, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Upload) &&
+    return valid() && size == size_ && !injectFailure(FailureBoundary::Transfer) &&
            vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, 0, source, size) ==
                VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::upload(VernonRhiCommandEncoder encoder, size_t offset, const void *source, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Upload) &&
+    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Transfer) &&
            vernonRhiCommandEncoderUploadBuffer(context_->rhiDevice, encoder, handle_, offset, source, size) ==
                VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::upload(size_t offset, const void *source, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Upload) &&
+    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Transfer) &&
            vernonRhiDeviceUploadBuffer(context_->rhiDevice, handle_, offset, source, size) == VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::uploadRanges(const std::vector<VernonRhiBufferUploadRange> &ranges) const {
-    return valid() && !injectFailure(FailureBoundary::Upload) &&
+    return valid() && !injectFailure(FailureBoundary::Transfer) &&
            vernonRhiDeviceUploadBufferRanges(context_->rhiDevice, handle_, ranges.data(), ranges.size()) ==
                VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::download(void *destination, size_t size) const {
-    return valid() && size == size_ && !injectFailure(FailureBoundary::Download) &&
+    return valid() && size == size_ && !injectFailure(FailureBoundary::Readback) &&
            vernonRhiDeviceDownloadBuffer(context_->rhiDevice, handle_, 0, destination, size) == VERNON_RHI_STATUS_OK;
 }
 
 bool DeviceBuffer::download(size_t offset, void *destination, size_t size) const {
-    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Download) &&
+    return valid() && offset <= size_ && size <= size_ - offset && !injectFailure(FailureBoundary::Readback) &&
            vernonRhiDeviceDownloadBuffer(context_->rhiDevice, handle_, offset, destination, size) ==
                VERNON_RHI_STATUS_OK;
 }

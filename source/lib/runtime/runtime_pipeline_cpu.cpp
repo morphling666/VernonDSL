@@ -3,7 +3,6 @@
 #include "backend_cpu.h"
 #include "compute_launch_planner.h"
 #include "runtime/autodiff/host_tape_allocator.h"
-#include "runtime/autodiff/runtime_cpu_preparation.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 
 #include "VernonCpuWorkgroupABI.h"
@@ -46,6 +45,26 @@ bool cpuDispatchVolume(const uint32_t groupCount[3], const uint32_t workgroup[3]
         volume *= axisVolume;
     }
     return volume != 0;
+}
+
+VernonStatus accumulateCpuResult(VernonDataType dtype, uint8_t *destination, const uint8_t *source, size_t byteSize) {
+    const auto accumulate = [&](auto scalar) {
+        using Scalar = decltype(scalar);
+        if (byteSize % sizeof(Scalar))
+            return false;
+        for (size_t offset = 0; offset < byteSize; offset += sizeof(Scalar)) {
+            Scalar current;
+            Scalar contribution;
+            std::memcpy(&current, destination + offset, sizeof(Scalar));
+            std::memcpy(&contribution, source + offset, sizeof(Scalar));
+            current += contribution;
+            std::memcpy(destination + offset, &current, sizeof(Scalar));
+        }
+        return true;
+    };
+    return (dtype == VERNON_DATA_F32 && accumulate(float{})) || (dtype == VERNON_DATA_F64 && accumulate(double{}))
+               ? VERNON_STATUS_OK
+               : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 VernonStatus packCpuInvocation(const CpuPipelineState &state, std::vector<unsigned char> &packed, std::string &error) {
@@ -148,15 +167,12 @@ VernonStatus reduceCpuLaneResults(VernonRuntimeContext &context, const CpuPipeli
             std::memcpy(results.data() + offset, lanes.back().data() + offset, size);
             continue;
         }
-        ad::ValueAbi abi;
-        abi.dtype = *state.packedResultReductions[index];
-        abi.byteSize = size;
         std::vector<uint8_t> reduced(size);
         for (const std::vector<unsigned char> &lane : lanes)
-            if (const VernonStatus status =
-                    ad::cpu::accumulateGradientBytes(context, abi, lane.data() + offset, reduced);
+            if (const VernonStatus status = accumulateCpuResult(*state.packedResultReductions[index], reduced.data(),
+                                                                lane.data() + offset, size);
                 status != VERNON_STATUS_OK)
-                return status;
+                return fail(context, "CPU Stage can only reduce well-formed floating results", status);
         std::memcpy(results.data() + offset, reduced.data(), size);
     }
     return VERNON_STATUS_OK;

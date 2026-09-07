@@ -1686,6 +1686,67 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
     return true;
 }
 
+bool supportsImageCopy(VernonRhiDevice handle) {
+    return lookupVulkanDevice(handle) != nullptr && vernon::rhi::vulkan::driver().cmdCopyImage;
+}
+
+bool recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, VernonRhiImage source,
+                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    auto device = lookupVulkanDevice(handle);
+    const VkCommandBuffer command = vulkanHandle<VkCommandBuffer>(native);
+    if (!device || !command || !regions || !regionCount)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    auto *sourceSlot = lookupResourceRecord(device->images, resourceKey(source));
+    auto *destinationSlot = lookupResourceRecord(device->images, resourceKey(destination));
+    if (!sourceSlot || !destinationSlot)
+        return false;
+    const auto prepare = [&](VulkanImageSlot &slot, VkImageLayout layout) {
+        auto journal = slot.image.layoutJournals.find(encoderKey);
+        bool inserted = false;
+        if (journal == slot.image.layoutJournals.end()) {
+            const auto result = slot.image.layoutJournals.emplace(
+                encoderKey,
+                vernon::rhi::vulkan::Image::LayoutJournal{slot.image.layout, slot.image.subresourceLayouts});
+            journal = result.first;
+            inserted = result.second;
+        }
+        if (inserted &&
+            (!deferCommandCleanup(handle, encoderKey, &slot.image, encoderKey, clearVulkanImageLayoutJournal) ||
+             !deferCommandRollback(handle, encoderKey, &slot.image, encoderKey, restoreVulkanImageLayouts))) {
+            slot.image.layoutJournals.erase(journal);
+            return false;
+        }
+        transitionVulkanImage(command, slot, layout);
+        return true;
+    };
+    if (!prepare(*sourceSlot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) ||
+        !prepare(*destinationSlot, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL))
+        return false;
+    try {
+        std::vector<VkImageCopy> copies(regionCount);
+        for (size_t index = 0; index < regionCount; ++index) {
+            const VernonRhiImageCopyRegion &region = regions[index];
+            VkImageCopy &copy = copies[index];
+            copy.srcSubresource = {static_cast<VkImageAspectFlags>(region.aspects), region.source_mip_level,
+                                   region.source_array_layer, 1};
+            copy.srcOffset = {static_cast<int32_t>(region.source_x), static_cast<int32_t>(region.source_y),
+                              static_cast<int32_t>(region.source_z)};
+            copy.dstSubresource = {static_cast<VkImageAspectFlags>(region.aspects), region.destination_mip_level,
+                                   region.destination_array_layer, 1};
+            copy.dstOffset = {static_cast<int32_t>(region.destination_x), static_cast<int32_t>(region.destination_y),
+                              static_cast<int32_t>(region.destination_z)};
+            copy.extent = {region.width, region.height, region.depth};
+        }
+        vernon::rhi::vulkan::driver().cmdCopyImage(
+            command, sourceSlot->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, destinationSlot->image.image,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<uint32_t>(copies.size()), copies.data());
+        return true;
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1951,6 +2012,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         abandonCommands,
         recordBarriers,
         recordBufferCopy,
+        supportsImageCopy,
+        recordImageCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

@@ -2,6 +2,7 @@
 #include "runtime/autodiff/host_tape_allocator.h"
 #include "runtime/autodiff/host_tape_test_hooks.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/runtime_state.h"
 #include "runtime_rhi_test_utils.h"
 
@@ -206,6 +207,87 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForwardAndPullback) {
+    using vernon::runtime::program_execution::clearFailureInjectionForTesting;
+    using vernon::runtime::program_execution::FailureBoundary;
+    using vernon::runtime::program_execution::setFailureInjectionForTesting;
+    ASSERT_EQ(vernonRegisterStructuredScalarAutodiffFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory =
+        std::filesystem::path(VERNON_STRUCTURED_SCALAR_AUTODIFF_MANIFEST).parent_path().string();
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundleLoadOptions options{sizeof(options), bundleDirectory.c_str(), {}};
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    ASSERT_NE(pipeline, nullptr) << lastError(context);
+
+    float x = 2.0f;
+    float y = 3.0f;
+    float z = 0.25f;
+    constexpr size_t laneCount = 6;
+    const uint64_t outputShape[]{1, 3, 2};
+    std::array<float, laneCount> output{};
+    VernonAdValue inputValues[]{
+        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &x, sizeof(x), {}},
+        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &y, sizeof(y), {}},
+        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &z, sizeof(z), {}},
+        {sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, output.data(), sizeof(output), 3, outputShape},
+    };
+    VernonAdValueSet inputs{sizeof(VernonAdValueSet), inputValues, std::size(inputValues), {}};
+    VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
+    constexpr std::array forwardFailures{
+        FailureBoundary::Planning,       FailureBoundary::Allocation, FailureBoundary::Submission,
+        FailureBoundary::TapeValidation, FailureBoundary::Commit,
+    };
+    for (FailureBoundary boundary : forwardFailures) {
+        output.fill(-19.0f);
+        VernonPullback *failed = nullptr;
+        setFailureInjectionForTesting(boundary);
+        EXPECT_NE(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &failed),
+                  VERNON_STATUS_OK)
+            << static_cast<int>(boundary);
+        clearFailureInjectionForTesting();
+        EXPECT_EQ(failed, nullptr);
+        EXPECT_EQ(output, (std::array<float, laneCount>{-19, -19, -19, -19, -19, -19}));
+    }
+
+    output.fill(0.0f);
+    VernonPullback *pullback = nullptr;
+    ASSERT_EQ(vernon::tests::completeCanonicalAutodiffInvocation(pipeline, {1, 1, 1}, inputs, outputs, &pullback),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(pullback, nullptr);
+    std::array<float, laneCount> seedValues{};
+    seedValues.fill(1.0f);
+    VernonAdValue seed{
+        sizeof(VernonAdValue), {"output", 6}, VERNON_DATA_F32, seedValues.data(), sizeof(seedValues), 3, outputShape};
+    VernonAdValueSet seeds{sizeof(VernonAdValueSet), &seed, 1, {}};
+    std::array<float, 3> gradientStorage{};
+    VernonAdValue gradientValues[]{
+        {sizeof(VernonAdValue), {"x", 1}, VERNON_DATA_F32, &gradientStorage[0], sizeof(float), {}},
+        {sizeof(VernonAdValue), {"y", 1}, VERNON_DATA_F32, &gradientStorage[1], sizeof(float), {}},
+        {sizeof(VernonAdValue), {"z", 1}, VERNON_DATA_F32, &gradientStorage[2], sizeof(float), {}},
+    };
+    VernonAdValueSet gradients{sizeof(VernonAdValueSet), gradientValues, std::size(gradientValues), {}};
+    for (FailureBoundary boundary : forwardFailures) {
+        gradientStorage.fill(-23.0f);
+        setFailureInjectionForTesting(boundary);
+        EXPECT_NE(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << static_cast<int>(boundary);
+        clearFailureInjectionForTesting();
+        EXPECT_EQ(gradientStorage, (std::array<float, 3>{-23, -23, -23}));
+    }
+
+    vernonPullbackDestroy(pullback);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    vernonRuntimeDestroy(context);
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION

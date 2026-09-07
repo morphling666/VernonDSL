@@ -106,6 +106,7 @@ public:
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
     const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
     const VernonRuntimeProviderResourceReference *controlImage(uint32_t storage) const;
+    const VernonProgramArgument *externalStorage(uint32_t storage) const;
 
 private:
     friend class ResolvedTransferExecutor;

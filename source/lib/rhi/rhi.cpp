@@ -329,6 +329,19 @@ VernonRhiStatus vernon::rhi::recordBufferCopy(VernonRhiDevice device, uint64_t n
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus vernon::rhi::recordImageCopy(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
+                                             VernonRhiImage source, VernonRhiImage destination,
+                                             const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordImageCopy || !backend->supportsImageCopy || !backend->supportsImageCopy(device))
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordImageCopy(device, encoderKey, native, source, destination, regions, regionCount)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 bool vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
                                       uint32_t renderingKind, uint32_t colorDiscardMask, uint32_t depthStencilDiscard,
                                       const uint64_t *colorResources, size_t colorCount, uint64_t depthResource,

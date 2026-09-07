@@ -323,6 +323,211 @@ TEST(RuntimeMetal, RoundTripsTextureGeneratesMipmapsAndCreatesSampler) {
     vernonRhiDestroyDevice(device);
 }
 
+TEST(RuntimeMetal, CopiesImageMipLayerRegionsAndRejectsInvalidCopies) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    descriptor.width = 4;
+    descriptor.height = 4;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 2;
+    descriptor.array_layers = 2;
+    descriptor.sample_count = 1;
+    descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage source{};
+    VernonRhiImage destination{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &source), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &destination), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 16> expected{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.mip_level = 1;
+    upload.array_layer = 1;
+    upload.width = 2;
+    upload.height = 2;
+    upload.depth = 1;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    upload.data = expected.data();
+    ASSERT_EQ(vernonRhiDeviceUploadImage(device, source, &upload, 1), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiImageCopyRegion region{sizeof(VernonRhiImageCopyRegion), 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 2, 2, 1,
+                                    VERNON_RHI_IMAGE_ASPECT_COLOR,    {}};
+    ASSERT_EQ(vernonRhiCommandEncoderCopyImage(device, encoder, source, destination, &region, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+
+    std::array<uint8_t, 16> actual{};
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.mip_level = 1;
+    download.array_layer = 1;
+    download.width = 2;
+    download.height = 2;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, destination, &download, actual.data(), actual.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(actual, expected);
+
+    VernonRhiCommandEncoder invalidEncoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &invalidEncoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderCopyImage(device, invalidEncoder, source, source, &region, 1),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    region.width = 3;
+    EXPECT_EQ(vernonRhiCommandEncoderCopyImage(device, invalidEncoder, source, destination, &region, 1),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    region.width = 2;
+    const std::array<VernonRhiImageCopyRegion, 2> overlapping{region, region};
+    EXPECT_EQ(vernonRhiCommandEncoderCopyImage(device, invalidEncoder, source, destination, overlapping.data(),
+                                               overlapping.size()),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    VernonRhiImageDescriptor incompatibleDescriptor = descriptor;
+    incompatibleDescriptor.format = VERNON_RHI_FORMAT_R8_UNORM;
+    VernonRhiImage incompatible{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &incompatibleDescriptor, &incompatible), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderCopyImage(device, invalidEncoder, source, incompatible, &region, 1),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, incompatible), VERNON_RHI_STATUS_OK);
+    VernonRhiImageDescriptor wrongUsageDescriptor = descriptor;
+    wrongUsageDescriptor.usage = VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage wrongUsage{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &wrongUsageDescriptor, &wrongUsage), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCommandEncoderCopyImage(device, invalidEncoder, wrongUsage, destination, &region, 1),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, wrongUsage), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, invalidEncoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, destination), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, source), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(RuntimeMetal, CopiesThreeDimensionalImageDepthExtent) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_3D;
+    descriptor.format = VERNON_RHI_FORMAT_R8_UNORM;
+    descriptor.width = 2;
+    descriptor.height = 2;
+    descriptor.depth = 2;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage source{};
+    VernonRhiImage destination{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &source), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &destination), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 8> expected{1, 2, 3, 4, 5, 6, 7, 8};
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.width = 2;
+    upload.height = 2;
+    upload.depth = 2;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_RED;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    upload.data = expected.data();
+    ASSERT_EQ(vernonRhiDeviceUploadImage(device, source, &upload, 1), VERNON_RHI_STATUS_OK);
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiImageCopyRegion region{sizeof(VernonRhiImageCopyRegion), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2,
+                                    VERNON_RHI_IMAGE_ASPECT_COLOR,    {}};
+    ASSERT_EQ(vernonRhiCommandEncoderCopyImage(device, encoder, source, destination, &region, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    std::array<uint8_t, 8> actual{};
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 2;
+    download.height = 2;
+    download.depth = 2;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RED;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, destination, &download, actual.data(), actual.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, destination), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, source), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST(RuntimeMetal, CopiesDepthImageAspect) {
+    VernonRhiDevice device = createMetalDevice();
+    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
+    VernonRhiImageDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.dimension = VERNON_RHI_IMAGE_2D;
+    descriptor.format = VERNON_RHI_FORMAT_D32_FLOAT;
+    descriptor.width = 2;
+    descriptor.height = 2;
+    descriptor.depth = 1;
+    descriptor.mip_levels = 1;
+    descriptor.array_layers = 1;
+    descriptor.sample_count = 1;
+    descriptor.usage = VERNON_RHI_IMAGE_TRANSFER_SOURCE | VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
+    VernonRhiImage source{};
+    VernonRhiImage destination{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &source), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &descriptor, &destination), VERNON_RHI_STATUS_OK);
+    const std::array<float, 4> expected{0.1f, 0.25f, 0.5f, 1.0f};
+    VernonRhiImageUploadDescriptor upload{};
+    upload.struct_size = sizeof(upload);
+    upload.width = 2;
+    upload.height = 2;
+    upload.depth = 1;
+    upload.source_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    upload.source_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    upload.data = expected.data();
+    ASSERT_EQ(vernonRhiDeviceUploadImage(device, source, &upload, 1), VERNON_RHI_STATUS_OK);
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiImageCopyRegion region{sizeof(VernonRhiImageCopyRegion), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 1,
+                                    VERNON_RHI_IMAGE_ASPECT_DEPTH,    {}};
+    ASSERT_EQ(vernonRhiCommandEncoderCopyImage(device, encoder, source, destination, &region, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    std::array<float, 4> actual{};
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 2;
+    download.height = 2;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, destination, &download, actual.data(), sizeof(actual)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, destination), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, source), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
 TEST(RuntimeMetal, CreatesImageViewsAndRetainsTheirParentImage) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);

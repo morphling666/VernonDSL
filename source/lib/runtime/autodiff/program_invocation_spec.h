@@ -22,6 +22,7 @@ struct ValueAbi;
 
 struct ProgramLeafBinding {
     uint32_t value{UINT32_MAX};
+    uint32_t slot{UINT32_MAX};
     size_t byteOffset{};
     size_t elementStride{};
     size_t leafElementBytes{};

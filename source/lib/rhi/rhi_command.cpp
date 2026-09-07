@@ -1,5 +1,6 @@
 #include "VernonRHI.h"
 
+#include "image_data_layout.h"
 #include "logical_resource_record.h"
 #include "rhi_internal.h"
 
@@ -625,6 +626,114 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice dev
         slot->busy = false;
         if (recordStatus == VERNON_RHI_STATUS_OK)
             slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Buffer, destinationResource});
+        else
+            slot->failed = true;
+    }
+    return recordStatus;
+}
+
+namespace {
+
+bool imageCopyBoxValid(const VernonRhiImageDescriptor &image, uint32_t mip, uint32_t layer, uint32_t x, uint32_t y,
+                       uint32_t z, uint32_t width, uint32_t height, uint32_t depth) {
+    if (mip >= image.mip_levels || layer >= image.array_layers || !width || !height || !depth)
+        return false;
+    const uint32_t mipWidth = vernon::rhi::imageMipExtent(image.width, mip);
+    const uint32_t mipHeight = vernon::rhi::imageMipExtent(image.height, mip);
+    const uint32_t mipDepth =
+        image.dimension == VERNON_RHI_IMAGE_3D ? vernon::rhi::imageMipExtent(image.depth, mip) : 1;
+    return x < mipWidth && width <= mipWidth - x && y < mipHeight && height <= mipHeight - y && z < mipDepth &&
+           depth <= mipDepth - z && (image.dimension == VERNON_RHI_IMAGE_3D || (z == 0 && depth == 1));
+}
+
+bool intervalsOverlap(uint32_t firstOffset, uint32_t firstSize, uint32_t secondOffset, uint32_t secondSize) {
+    return uint64_t{firstOffset} < uint64_t{secondOffset} + secondSize &&
+           uint64_t{secondOffset} < uint64_t{firstOffset} + firstSize;
+}
+
+bool imageCopyBoxesOverlap(const VernonRhiImageCopyRegion &first, bool firstSource,
+                           const VernonRhiImageCopyRegion &second, bool secondSource) {
+    const uint32_t firstMip = firstSource ? first.source_mip_level : first.destination_mip_level;
+    const uint32_t firstLayer = firstSource ? first.source_array_layer : first.destination_array_layer;
+    const uint32_t firstX = firstSource ? first.source_x : first.destination_x;
+    const uint32_t firstY = firstSource ? first.source_y : first.destination_y;
+    const uint32_t firstZ = firstSource ? first.source_z : first.destination_z;
+    const uint32_t secondMip = secondSource ? second.source_mip_level : second.destination_mip_level;
+    const uint32_t secondLayer = secondSource ? second.source_array_layer : second.destination_array_layer;
+    const uint32_t secondX = secondSource ? second.source_x : second.destination_x;
+    const uint32_t secondY = secondSource ? second.source_y : second.destination_y;
+    const uint32_t secondZ = secondSource ? second.source_z : second.destination_z;
+    return firstMip == secondMip && firstLayer == secondLayer && (first.aspects & second.aspects) &&
+           intervalsOverlap(firstX, first.width, secondX, second.width) &&
+           intervalsOverlap(firstY, first.height, secondY, second.height) &&
+           intervalsOverlap(firstZ, first.depth, secondZ, second.depth);
+}
+
+bool validateImageCopies(VernonRhiDevice device, VernonRhiImage source, VernonRhiImage destination,
+                         const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    VernonRhiImageDescriptor sourceDescriptor{};
+    VernonRhiImageDescriptor destinationDescriptor{};
+    const uint64_t sourceResource = vernon::rhi::imageResource(device, source);
+    const uint64_t destinationResource = vernon::rhi::imageResource(device, destination);
+    if (!sourceResource || !destinationResource ||
+        !vernon::rhi::describeImageResource(device, sourceResource, sourceDescriptor) ||
+        !vernon::rhi::describeImageResource(device, destinationResource, destinationDescriptor) ||
+        sourceDescriptor.format != destinationDescriptor.format ||
+        sourceDescriptor.dimension != destinationDescriptor.dimension ||
+        sourceDescriptor.sample_count != destinationDescriptor.sample_count ||
+        !(sourceDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(destinationDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) || sourceResource == destinationResource)
+        return false;
+    const uint32_t availableAspects = vernon::rhi::imageFormatAspects(sourceDescriptor.format);
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        if (region.struct_size < sizeof(region) || !region.aspects || (region.aspects & ~availableAspects) ||
+            std::any_of(
+                std::begin(region.reserved), std::end(region.reserved), [](uint32_t value) { return value != 0; }) ||
+            !imageCopyBoxValid(sourceDescriptor, region.source_mip_level, region.source_array_layer, region.source_x,
+                               region.source_y, region.source_z, region.width, region.height, region.depth) ||
+            !imageCopyBoxValid(destinationDescriptor, region.destination_mip_level, region.destination_array_layer,
+                               region.destination_x, region.destination_y, region.destination_z, region.width,
+                               region.height, region.depth))
+            return false;
+        for (size_t previous = 0; previous < index; ++previous)
+            if (imageCopyBoxesOverlap(regions[previous], false, region, false))
+                return false;
+    }
+    return true;
+}
+
+} // namespace
+
+extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                            VernonRhiImage source, VernonRhiImage destination,
+                                                            const VernonRhiImageCopyRegion *regions,
+                                                            size_t regionCount) {
+    auto slot = lookup(device, encoder);
+    if (!slot || !validHandle(source) || !validHandle(destination) || !regionCount || !regions ||
+        !validateImageCopies(device, source, destination, regions, regionCount))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
+    const uint64_t sourceResource = logicalResourceKey(source);
+    const uint64_t destinationResource = logicalResourceKey(destination);
+    if (!vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Image, sourceResource) ||
+        !vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Image, destinationResource))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        slot->busy = true;
+        native = slot->native;
+    }
+    const VernonRhiStatus recordStatus =
+        vernon::rhi::recordImageCopy(device, key, native, source, destination, regions, regionCount);
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        slot->busy = false;
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Image, destinationResource});
         else
             slot->failed = true;
     }

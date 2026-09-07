@@ -1,5 +1,7 @@
 #include "host_tape_allocator.h"
 
+#include "runtime/runtime_state.h"
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -388,6 +390,10 @@ bool HostTapeDispatchBudget::beginRecycledConstruction() {
 }
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
+void setHostTapeMemoryPolicyForTesting(VernonRuntimeContext &context, std::shared_ptr<HostTapeMemoryPolicy> policy) {
+    context.autodiffMemoryPolicy = std::move(policy);
+}
+
 size_t hostTapeMemoryPolicyChargedBytesForTesting(HostTapeMemoryPolicy &policy) {
     std::lock_guard lock(policy.mutex_);
     return policy.contextBytes_;

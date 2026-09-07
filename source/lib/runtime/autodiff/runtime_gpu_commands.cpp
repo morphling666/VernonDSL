@@ -48,6 +48,14 @@ void appendUploadBindings(std::vector<execution::detail::RhiCommandResourceBindi
         execution::detail::appendRhiBufferBinding(bindings, upload.destination);
 }
 
+void appendImageCopyBindings(std::vector<execution::detail::RhiCommandResourceBinding> &bindings,
+                             const std::vector<DeviceImageCopy> &copies) {
+    for (const DeviceImageCopy &copy : copies) {
+        execution::detail::appendRhiImageBinding(bindings, copy.source);
+        execution::detail::appendRhiImageBinding(bindings, copy.destination);
+    }
+}
+
 void appendCopyAccesses(execution::detail::CommandNode &node, const std::vector<DeviceBufferCopy> &copies) {
     node.accesses.reserve(copies.size() * 2);
     for (const DeviceBufferCopy &copy : copies) {
@@ -61,6 +69,18 @@ void appendUploadAccesses(execution::detail::CommandNode &node, const std::vecto
     for (const DeviceBufferUpload &upload : uploads)
         node.accesses.push_back(
             bufferAccess(upload.destination, upload.destinationOffset, upload.size, execution::AccessMode::Write));
+}
+
+void appendImageCopyAccesses(execution::detail::CommandNode &node, const std::vector<DeviceImageCopy> &copies) {
+    for (const DeviceImageCopy &copy : copies)
+        for (const VernonRhiImageCopyRegion &region : copy.regions) {
+            node.accesses.push_back(execution::detail::rhiImageAccess(
+                copy.source, {region.source_mip_level, 1, region.source_array_layer, 1, region.aspects},
+                execution::AccessMode::Read, VERNON_RHI_STATE_TRANSFER_SOURCE));
+            node.accesses.push_back(execution::detail::rhiImageAccess(
+                copy.destination, {region.destination_mip_level, 1, region.destination_array_layer, 1, region.aspects},
+                execution::AccessMode::Write, VERNON_RHI_STATE_TRANSFER_DESTINATION));
+        }
 }
 
 bool decodeBuffer(uint64_t key, VernonRhiBuffer &buffer) {
@@ -99,8 +119,9 @@ bool appendPipelineResources(execution::detail::CommandNode &node,
 
 struct TransferCommandContext {
     TransferCommandContext(VernonRuntimeContext &runtimeValue, const std::vector<DeviceBufferCopy> &copyValues,
+                           const std::vector<DeviceImageCopy> &imageCopyValues,
                            const std::vector<DeviceBufferUpload> &uploadValues)
-        : runtime(runtimeValue), copies(copyValues), uploads(uploadValues) {
+        : runtime(runtimeValue), copies(copyValues), imageCopies(imageCopyValues), uploads(uploadValues) {
         uploadBytes.reserve(uploads.size());
         for (DeviceBufferUpload &upload : uploads) {
             const auto *begin = static_cast<const uint8_t *>(upload.source);
@@ -111,6 +132,7 @@ struct TransferCommandContext {
 
     VernonRuntimeContext &runtime;
     std::vector<DeviceBufferCopy> copies;
+    std::vector<DeviceImageCopy> imageCopies;
     std::vector<DeviceBufferUpload> uploads;
     std::vector<std::vector<uint8_t>> uploadBytes;
 };
@@ -146,7 +168,7 @@ bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder e
                         const std::vector<DeviceBufferCopy> &copies) {
     for (size_t index = 0; index < copies.size(); ++index) {
         const DeviceBufferCopy &copy = copies[index];
-        if (injectFailure(FailureBoundary::Copy) ||
+        if (injectFailure(FailureBoundary::Transfer) ||
             vernonRhiCommandEncoderCopyBuffer(context.rhiDevice, encoder, copy.source, copy.sourceOffset,
                                               copy.destination, copy.destinationOffset,
                                               copy.size) != VERNON_RHI_STATUS_OK) {
@@ -160,10 +182,24 @@ bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder e
     return true;
 }
 
+bool encodeImageCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
+                       const std::vector<DeviceImageCopy> &copies) {
+    for (size_t index = 0; index < copies.size(); ++index) {
+        const DeviceImageCopy &copy = copies[index];
+        if (copy.regions.empty() || injectFailure(FailureBoundary::Transfer) ||
+            vernonRhiCommandEncoderCopyImage(context.rhiDevice, encoder, copy.source, copy.destination,
+                                             copy.regions.data(), copy.regions.size()) != VERNON_RHI_STATUS_OK) {
+            invocationDiagnostic(context) = "GPU image copy " + std::to_string(index) + " failed";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool encodeBufferUploads(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                          const std::vector<DeviceBufferUpload> &uploads) {
     for (const DeviceBufferUpload &upload : uploads)
-        if (!upload.source || !upload.size || injectFailure(FailureBoundary::Upload) ||
+        if (!upload.source || !upload.size || injectFailure(FailureBoundary::Transfer) ||
             vernonRhiCommandEncoderUploadBuffer(context.rhiDevice, encoder, upload.destination,
                                                 upload.destinationOffset, upload.source,
                                                 upload.size) != VERNON_RHI_STATUS_OK)
@@ -176,6 +212,7 @@ namespace {
 VernonRhiStatus encodeTransferCommand(void *opaque, VernonRhiCommandEncoder encoder) {
     auto &state = *static_cast<TransferCommandContext *>(opaque);
     return encodeBufferCopies(state.runtime, encoder, state.copies) &&
+                   encodeImageCopies(state.runtime, encoder, state.imageCopies) &&
                    encodeBufferUploads(state.runtime, encoder, state.uploads)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
@@ -198,7 +235,7 @@ public:
     bool validationPhase() const override { return true; }
 
     void complete(bool succeeded, const execution::detail::RhiCommandDagExecutionStats &) override {
-        if (!succeeded || !injectFailure(FailureBoundary::Wait))
+        if (!succeeded || !injectFailure(FailureBoundary::Submission))
             return;
         invocationDiagnostic(context_) = "injected GPU command DAG wait failure";
         throw std::runtime_error("injected GPU command DAG wait failure");
@@ -215,7 +252,7 @@ struct EncodeFailureContext {
 
 VernonRhiStatus encodeWithFailureBoundary(void *opaque, VernonRhiCommandEncoder encoder) {
     auto &context = *static_cast<EncodeFailureContext *>(opaque);
-    if (injectFailure(FailureBoundary::Encode)) {
+    if (injectFailure(FailureBoundary::Submission)) {
         invocationDiagnostic(context.runtime) = "injected GPU command DAG encoding failure";
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
@@ -260,7 +297,7 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
             return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
         return VERNON_STATUS_OK;
     }
-    if (injectFailure(FailureBoundary::Encode))
+    if (injectFailure(FailureBoundary::Submission))
         return fail(context, "injected GPU command DAG encoding failure", VERNON_STATUS_INTERNAL_ERROR);
     const uint32_t requiredCapabilities =
         std::any_of(plan.commands.nodes.begin(), plan.commands.nodes.end(),
@@ -275,7 +312,7 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
         telemetry->waits += stats.waits;
         telemetry->deviceWaitNanoseconds += stats.deviceWaitNanoseconds;
     }
-    if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Wait))
+    if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Submission))
         return fail(context, "injected GPU command DAG wait failure", VERNON_STATUS_INTERNAL_ERROR);
     if (status == VERNON_RHI_STATUS_OK)
         return VERNON_STATUS_OK;
@@ -284,48 +321,61 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
 }
 
 VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies) {
-    if (copies.empty())
+    return executeDeviceCopiesAndWait(context, copies, {});
+}
+
+VernonStatus executeDeviceCopiesAndWait(VernonRuntimeContext &context,
+                                        const std::vector<DeviceBufferCopy> &bufferCopies,
+                                        const std::vector<DeviceImageCopy> &imageCopies) {
+    if (bufferCopies.empty() && imageCopies.empty())
         return VERNON_STATUS_OK;
     execution::detail::RhiCommandExecutionPlan plan;
-    appendCopyBindings(plan.bindings, copies);
-    auto transferContext = std::make_shared<TransferCommandContext>(context, copies, std::vector<DeviceBufferUpload>{});
-    execution::detail::CommandNode transfer;
-    transfer.kind = execution::detail::CommandNodeKind::Transfer;
-    transfer.queue = execution::detail::CommandQueueClass::Transfer;
-    appendCopyAccesses(transfer, copies);
-    plan.commands.nodes.push_back(std::move(transfer));
-    plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
-    plan.retainedContexts.push_back(std::move(transferContext));
+    if (const VernonStatus status = buildDeviceTransferCommandPlan(context, bufferCopies, imageCopies, {}, plan);
+        status != VERNON_STATUS_OK)
+        return status;
     std::string error;
     if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
         return fail(context, std::move(error));
     return executeCommandPlanAndWait(context, plan);
 }
 
-VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies,
+VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,
+                                            const std::vector<DeviceBufferCopy> &bufferCopies,
+                                            const std::vector<DeviceImageCopy> &imageCopies,
                                             const std::vector<DeviceBufferUpload> &uploads,
                                             execution::detail::RhiCommandExecutionPlan &plan) {
     plan = {};
-    if (copies.empty() && uploads.empty())
+    if (bufferCopies.empty() && imageCopies.empty() && uploads.empty())
         return VERNON_STATUS_OK;
-    for (const DeviceBufferCopy &copy : copies)
+    for (const DeviceBufferCopy &copy : bufferCopies)
         if (!copy.size)
             return fail(context, "Program Storage copy has no payload");
+    for (const DeviceImageCopy &copy : imageCopies)
+        if (copy.regions.empty())
+            return fail(context, "Program image copy has no regions");
     for (const DeviceBufferUpload &upload : uploads)
         if (!upload.source || !upload.size)
             return fail(context, "Program Storage upload has no source bytes");
-    appendCopyBindings(plan.bindings, copies);
+    appendCopyBindings(plan.bindings, bufferCopies);
+    appendImageCopyBindings(plan.bindings, imageCopies);
     appendUploadBindings(plan.bindings, uploads);
-    auto transferContext = std::make_shared<TransferCommandContext>(context, copies, uploads);
+    auto transferContext = std::make_shared<TransferCommandContext>(context, bufferCopies, imageCopies, uploads);
     execution::detail::CommandNode transfer;
     transfer.kind = execution::detail::CommandNodeKind::Transfer;
     transfer.queue = execution::detail::CommandQueueClass::Transfer;
-    appendCopyAccesses(transfer, copies);
+    appendCopyAccesses(transfer, bufferCopies);
+    appendImageCopyAccesses(transfer, imageCopies);
     appendUploadAccesses(transfer, uploads);
     plan.commands.nodes.push_back(std::move(transfer));
     plan.encoders.push_back({encodeTransferCommand, transferContext.get()});
     plan.retainedContexts.push_back(std::move(transferContext));
     return VERNON_STATUS_OK;
+}
+
+VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies,
+                                            const std::vector<DeviceBufferUpload> &uploads,
+                                            execution::detail::RhiCommandExecutionPlan &plan) {
+    return buildDeviceTransferCommandPlan(context, copies, {}, uploads, plan);
 }
 
 VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
@@ -362,7 +412,8 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
     appendCopyBindings(plan.bindings, copiesAfter);
     appendUploadBindings(plan.bindings, uploadsBefore);
     if (!copiesBefore.empty() || !uploadsBefore.empty()) {
-        auto transferContext = std::make_shared<TransferCommandContext>(context, copiesBefore, uploadsBefore);
+        auto transferContext = std::make_shared<TransferCommandContext>(context, copiesBefore,
+                                                                        std::vector<DeviceImageCopy>{}, uploadsBefore);
         execution::detail::CommandNode transfer;
         transfer.kind = execution::detail::CommandNodeKind::Transfer;
         transfer.queue = execution::detail::CommandQueueClass::Transfer;
@@ -384,8 +435,8 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
     plan.encoders.push_back({encodePipelinePlanCommand, pipelineContext.get()});
     plan.retainedContexts.push_back(std::move(pipelineContext));
     if (!copiesAfter.empty()) {
-        auto transferContext =
-            std::make_shared<TransferCommandContext>(context, copiesAfter, std::vector<DeviceBufferUpload>{});
+        auto transferContext = std::make_shared<TransferCommandContext>(
+            context, copiesAfter, std::vector<DeviceImageCopy>{}, std::vector<DeviceBufferUpload>{});
         execution::detail::CommandNode transfer;
         transfer.kind = execution::detail::CommandNodeKind::Transfer;
         transfer.queue = execution::detail::CommandQueueClass::Transfer;
@@ -417,7 +468,7 @@ executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vecto
                                  const std::vector<DeviceBufferCopy> &copiesAfter,
                                  execution::detail::CommandNodeKind kind, ExecutionControlPlaneUsage *telemetry,
                                  execution::detail::RhiCommandPlanSink *sink) {
-    if (injectFailure(FailureBoundary::Submit))
+    if (injectFailure(FailureBoundary::Submission))
         return fail(context, "injected GPU pipeline submission failure", VERNON_STATUS_INTERNAL_ERROR);
     execution::detail::RhiCommandExecutionPlan plan;
     if (const VernonStatus status = buildPipelineCommandPlan(context, copiesBefore, uploadsBefore, pipeline, arguments,
@@ -437,7 +488,7 @@ executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std:
                                        execution::detail::RhiCommandPlanSink *sink) {
     if (!complete || !statusSize)
         return fail(context, "GPU command DAG status callback is invalid");
-    if (injectFailure(FailureBoundary::Submit))
+    if (injectFailure(FailureBoundary::Submission))
         return fail(context, "injected GPU pipeline submission failure", VERNON_STATUS_INTERNAL_ERROR);
     execution::detail::RhiCommandExecutionPlan plan;
     if (const VernonStatus status =

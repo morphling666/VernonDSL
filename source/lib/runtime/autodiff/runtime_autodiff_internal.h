@@ -108,9 +108,9 @@ public:
                                      execution::detail::RhiCommandPlanSink *sink = nullptr) = 0;
 };
 
-class Executable {
+class CanonicalProgramExecution {
 public:
-    virtual ~Executable() = default;
+    virtual ~CanonicalProgramExecution() = default;
     virtual const Signature &signature() const = 0;
     virtual VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize computeGrid,
                                  const VernonAdValueSet &inputs, VernonAdValueSet *outputs,
@@ -138,23 +138,6 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
                                               const std::vector<AutodiffDerivativeGroup> &groups,
                                               const Signature &signature);
 
-bool createCpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
-                         const Stage &backward, const std::vector<std::string> &gradientPaths,
-                         uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                         const std::string &selectedPolicy, bool wholeDispatchRetentionPermitted,
-                         std::shared_ptr<Executable> &executable);
-bool createCpuEntryExecutable(VernonRuntimeContext &context, VernonCpuEntryPoint primalEntry,
-                              VernonStringView primalReflection, VernonStringView primalName,
-                              VernonCpuEntryPoint forwardEntry, VernonStringView forwardReflection,
-                              VernonStringView forwardName, VernonCpuEntryPoint backwardEntry,
-                              VernonStringView backwardReflection, VernonStringView backwardName,
-                              const std::vector<std::string> &gradientPaths, uint64_t staticTapeBytesHint,
-                              const std::string &residualStorage, const std::string &selectedPolicy,
-                              bool wholeDispatchRetentionPermitted, std::shared_ptr<Executable> &executable);
-bool createGpuExecutable(VernonRuntimeContext &context, const Stage &primal, const Stage &forward,
-                         const Stage &backward, const std::vector<std::string> &gradientPaths,
-                         uint64_t staticTapeBytesHint, const std::string &residualStorage,
-                         const std::string &selectedPolicy, std::shared_ptr<Executable> &executable);
 bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups);
 

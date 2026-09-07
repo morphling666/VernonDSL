@@ -1,5 +1,6 @@
 #include "runtime/autodiff/retained_pullback_state.h"
 #include "runtime/content_hash.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution_manifest.h"
@@ -9,6 +10,8 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <array>
+
 namespace {
 
 VernonProgramArgument hostTensor(void *data, size_t size) {
@@ -17,6 +20,16 @@ VernonProgramArgument hostTensor(void *data, size_t size) {
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_HOST;
     argument.tensor.host_data = data;
+    argument.tensor.byte_size = size;
+    argument.tensor.element_layout.byte_size = size;
+    return argument;
+}
+
+VernonProgramArgument deviceTensor(size_t size) {
+    VernonProgramArgument argument{};
+    argument.kind = VERNON_PROGRAM_TENSOR;
+    argument.tensor.struct_size = sizeof(VernonTensorView);
+    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     argument.tensor.byte_size = size;
     argument.tensor.element_layout.byte_size = size;
     return argument;
@@ -95,10 +108,9 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     program_execution::ProgramInvocationState invocation(plan, std::move(storage), {});
     program_execution::PublicationTransaction invalid(plan.publications);
     std::string error;
+    ASSERT_TRUE(invalid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
     ASSERT_TRUE(
-        invalid.stage(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt, error));
-    ASSERT_TRUE(invalid.stage(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2),
-                              std::nullopt, error));
+        invalid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2), error));
     VernonRuntimeContext context{};
     EXPECT_EQ(invalid.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::Poisoned);
@@ -106,10 +118,8 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     EXPECT_EQ(secondDestination, -2.0f);
 
     program_execution::PublicationTransaction valid(plan.publications);
-    ASSERT_TRUE(
-        valid.stage(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), std::nullopt, error));
-    ASSERT_TRUE(
-        valid.stage(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination)), std::nullopt, error));
+    ASSERT_TRUE(valid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
+    ASSERT_TRUE(valid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination)), error));
     ASSERT_EQ(valid.commit(context, invocation, error), VERNON_STATUS_OK) << error;
     EXPECT_EQ(valid.status(), program_execution::PublicationTransaction::Status::Committed);
     EXPECT_EQ(firstDestination, firstSource);
@@ -126,10 +136,86 @@ TEST(ProgramPublication, RollbackLeavesDestinationUnchanged) {
     }};
     program_execution::PublicationTransaction transaction(plan);
     std::string error;
-    ASSERT_TRUE(transaction.stage(0, target, hostTensor(&destination, sizeof(destination)), std::nullopt, error));
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination)), error));
     transaction.rollback();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -1.0f);
+}
+
+TEST(ProgramPublication, CommitInjectionLeavesHostDestinationUnchanged) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    float source = 9.0f;
+    float destination = -3.0f;
+    PublicationTarget target{0, 0, BoundaryRole::Output, {ProgramOwnerKind::Storage, 0}};
+    ResolvedExecutionPlan plan;
+    plan.publications.transactions = {
+        {0, 0, {ProgramOwnerKind::Storage, 0}, PublicationCommitMode::CommitAfterSuccess},
+    };
+    std::vector<program_execution::ProgramValueState> values(1);
+    values[0].argument = hostTensor(&source, sizeof(source));
+    program_execution::ProgramInvocationState invocation(plan, std::move(values), {});
+    program_execution::PublicationTransaction transaction(plan.publications);
+    std::string error;
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination)), error));
+    program_execution::setFailureInjectionForTesting(program_execution::FailureBoundary::Commit);
+    VernonRuntimeContext context{};
+    EXPECT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_INTERNAL_ERROR);
+    program_execution::clearFailureInjectionForTesting();
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
+    EXPECT_EQ(destination, -3.0f);
+}
+
+TEST(ProgramPublication, CommitsStridedHostOutputByValidatedRegions) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    std::array<float, 4> source{1, 2, 3, 4};
+    std::array<float, 6> destination{-1, -1, -1, -1, -1, -1};
+    const uint64_t shape[]{2, 2};
+    const int64_t sourceStrides[]{2 * static_cast<int64_t>(sizeof(float)), sizeof(float)};
+    const int64_t destinationStrides[]{3 * static_cast<int64_t>(sizeof(float)), sizeof(float)};
+    VernonProgramArgument staged = hostTensor(source.data(), sizeof(source));
+    staged.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    staged.tensor.rank = 2;
+    staged.tensor.shape = shape;
+    staged.tensor.byte_strides = sourceStrides;
+    VernonProgramArgument output = hostTensor(destination.data(), sizeof(destination));
+    output.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
+    output.tensor.rank = 2;
+    output.tensor.shape = shape;
+    output.tensor.byte_strides = destinationStrides;
+    PublicationTarget target{0, 0, BoundaryRole::Output, {ProgramOwnerKind::Storage, 0}};
+    ResolvedExecutionPlan plan;
+    plan.publications.transactions = {
+        {0, 0, {ProgramOwnerKind::Storage, 0}, PublicationCommitMode::CommitAfterSuccess},
+    };
+    std::vector<program_execution::ProgramValueState> values(1);
+    values[0].argument = staged;
+    program_execution::ProgramInvocationState invocation(plan, std::move(values), {});
+    program_execution::PublicationTransaction transaction(plan.publications);
+    std::string error;
+    ASSERT_TRUE(transaction.bindHostCommit(0, target, output, error));
+    VernonRuntimeContext context{};
+    ASSERT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_OK) << error;
+    EXPECT_EQ(destination, (std::array<float, 6>{1, 2, -1, 3, 4, -1}));
+}
+
+TEST(ProgramPublication, InPlaceBindingIsExplicitAndNotRollbackStaged) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    float destination = 2.0f;
+    VernonProgramArgument argument = hostTensor(&destination, sizeof(destination));
+    argument.tensor.access = VERNON_ACCESS_WRITE;
+    ResolvedPublicationPlan plan{{
+        {3, 0, {ProgramOwnerKind::Storage, 4}, PublicationCommitMode::InPlace},
+    }};
+    program_execution::PublicationTransaction transaction(plan);
+    std::string error;
+    ASSERT_TRUE(transaction.bindInPlace(3, argument, error)) << error;
+    destination = 11.0f; // Graph execution writes the explicitly mutable backing directly.
+    transaction.rollback();
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
+    EXPECT_EQ(destination, 11.0f);
 }
 
 TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
@@ -151,7 +237,7 @@ TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
     program_execution::PublicationTransaction transaction(plan.publications);
     std::string error;
     ASSERT_TRUE(
-        transaction.stage(0, target, hostTensor(&destination, sizeof(destination)), VernonRhiBuffer{1, 1}, error));
+        transaction.bindDeviceCommit(0, target, deviceTensor(sizeof(destination)), VernonRhiBuffer{1, 1}, error));
     VernonRuntimeContext context{};
     EXPECT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::Poisoned);
@@ -581,6 +667,9 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     nlohmann::json missingPublication = manifest;
     missingPublication["abi"]["boundary_slots"][1].erase("publication");
     expectBoundaryMismatch(std::move(missingPublication), "/publication");
+    nlohmann::json unknownPublication = manifest;
+    unknownPublication["abi"]["boundary_slots"][1]["publication"] = "atomic_swap";
+    expectBoundaryMismatch(std::move(unknownPublication), "/publication");
 
     nlohmann::json inPlaceManifest = manifest;
     inPlaceManifest["abi"]["boundary_slots"][1]["publication"] = "in_place";

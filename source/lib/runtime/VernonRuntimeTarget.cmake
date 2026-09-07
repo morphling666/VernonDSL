@@ -277,6 +277,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/materialized_node_frame.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_tensor_copy.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_transaction.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/resolved_transfer_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/device_buffer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/failure_injection.cpp
@@ -291,28 +292,9 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_tape_lifecycle.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/program_value_materializer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_cpu.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_backward.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_executable.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_forward.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_preparation.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_program.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_replay.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_cpu_values.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_gpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_autodiff_policy.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_argument_binding.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_bindings.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_commands.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_derivatives.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_executable.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_preparation.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_pullback.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_replay.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_replay_execution.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_resources.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_signature.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_gpu_telemetry.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/runtime_program_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/backend_opengl.cpp

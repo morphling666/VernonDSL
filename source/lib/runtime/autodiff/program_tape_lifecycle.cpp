@@ -1,7 +1,8 @@
 #include "program_tape_lifecycle.h"
 
-#include "runtime/autodiff/runtime_gpu_argument_binding.h"
 #include "runtime/autodiff/runtime_gpu_replay.h"
+#include "runtime/program_execution/failure_injection.h"
+#include "runtime/program_execution/physical_buffer_view.h"
 
 #include <algorithm>
 #include <limits>
@@ -149,6 +150,8 @@ bool prepareProgramTapeStates(program_execution::ProgramInvocationState &frame, 
 bool validateProgramTapeStates(ProgramTapeScratch &scratch, std::vector<ProgramTapeState> &states, bool &retry,
                                std::string &error) {
     retry = false;
+    if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
+        return error = "injected Program tape validation failure", false;
     for (ProgramTapeState &state : states) {
         if (!state.status)
             continue;

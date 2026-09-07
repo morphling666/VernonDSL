@@ -353,6 +353,25 @@ typedef struct VernonRhiImageDownloadDescriptor {
     uint32_t reserved[4];
 } VernonRhiImageDownloadDescriptor;
 
+typedef struct VernonRhiImageCopyRegion {
+    uint32_t struct_size;
+    uint32_t source_mip_level;
+    uint32_t source_array_layer;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_z;
+    uint32_t destination_mip_level;
+    uint32_t destination_array_layer;
+    uint32_t destination_x;
+    uint32_t destination_y;
+    uint32_t destination_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t aspects;
+    uint32_t reserved[4];
+} VernonRhiImageCopyRegion;
+
 typedef struct VernonRhiShaderModuleDescriptor {
     uint32_t struct_size;
     uint32_t stage;
@@ -613,6 +632,11 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevic
                                                                   VernonRhiBuffer source, uint64_t source_offset,
                                                                   VernonRhiBuffer destination,
                                                                   uint64_t destination_offset, uint64_t size);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice device,
+                                                                 VernonRhiCommandEncoder encoder, VernonRhiImage source,
+                                                                 VernonRhiImage destination,
+                                                                 const VernonRhiImageCopyRegion *regions,
+                                                                 size_t region_count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice device,
                                                                     VernonRhiCommandEncoder encoder,
                                                                     VernonRhiBuffer destination,

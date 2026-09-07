@@ -92,6 +92,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool beginCommands(uint64_t &native, std::string &error);
     bool copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset, const Buffer &destination,
                     uint64_t destinationOffset, uint64_t size, std::string &error);
+    bool copyImage(uint64_t native, const Image &source, const Image &destination,
+                   const VernonRhiImageCopyRegion *regions, size_t regionCount, std::string &error);
     bool submitCommands(uint64_t native, std::string &error);
     bool pollCommands(uint64_t native, bool &completed, bool &succeeded, std::string &error);
     bool completeCommands(uint64_t native, std::string &error);

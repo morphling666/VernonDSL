@@ -80,7 +80,10 @@ bool bindProgramGraphicsControlResources(const program::Program &program, const 
             return error = "managed graphics fragment outputs must exactly match the color attachments", false;
         const auto bind = [&](const program::ResolvedGraphicsAttachment &attachment) {
             VernonRuntimeProviderResourceReference view{};
-            if (attachment.aspects & VERNON_IMAGE_ASPECT_COLOR) {
+            const VernonProgramArgument *staging = invocation.externalStorage(attachment.storage);
+            if (staging && staging->kind == VERNON_PROGRAM_IMAGE) {
+                view = staging->image.view;
+            } else if (attachment.aspects & VERNON_IMAGE_ASPECT_COLOR) {
                 const auto signature = std::find_if(graphics.colorAttachments.begin(), graphics.colorAttachments.end(),
                                                     [&](const program::GraphicsAttachmentSignature &candidate) {
                                                         return candidate.location == attachment.location;

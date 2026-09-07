@@ -7,15 +7,13 @@ namespace vernon::runtime::program_execution {
 
 enum class FailureBoundary {
     None,
+    Planning,
     Allocation,
-    Upload,
-    Download,
-    Copy,
-    Encode,
-    Submit,
-    Wait,
-    Resize,
-    Publication,
+    Transfer,
+    Submission,
+    TapeValidation,
+    Readback,
+    Commit,
 };
 
 bool injectFailure(FailureBoundary boundary);

@@ -3,6 +3,7 @@
 #include "program_boundary_binder.h"
 #include "program_invocation_values.h"
 #include "program_tape_scratch.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime_autodiff_internal.h"
 
@@ -261,6 +262,8 @@ bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::
                                   std::map<uint32_t, ProgramStorageBacking> &storageBackings,
                                   ProgramTapeScratch &tapeScratch, const ForwardInvocationSpec &spec,
                                   std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
+    if (program_execution::injectFailure(program_execution::FailureBoundary::Allocation))
+        return error = "injected Program invocation allocation failure", false;
     if (const auto *canonical = std::get_if<CanonicalForwardBindings>(&spec.bindings))
         return build(context, execution, plan, values, storageBackings, tapeScratch, {spec.requiredValues, canonical},
                      std::move(tapePolicy), error);

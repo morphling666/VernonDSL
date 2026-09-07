@@ -213,6 +213,11 @@ const VernonRuntimeProviderResourceReference *ProgramInvocationState::controlIma
     return found == controlImages_.end() ? nullptr : &found->second;
 }
 
+const VernonProgramArgument *ProgramInvocationState::externalStorage(uint32_t storage) const {
+    const auto found = storageBackings_.find(storage);
+    return found != storageBackings_.end() && found->second.external ? &*found->second.external : nullptr;
+}
+
 const VernonProgramArgument *ProgramInvocationState::argument(uint32_t value) const {
     return value < arguments_.size() ? &arguments_[value] : nullptr;
 }

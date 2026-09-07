@@ -1074,6 +1074,40 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
                                     static_cast<size_t>(destinationOffset), static_cast<size_t>(size), device->error);
 }
 
+bool supportsImageCopy(VernonRhiDevice handle) {
+    auto device = lookupDevice(handle);
+    return device && device->state.driver.copyImageSubData;
+}
+
+bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
+                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    auto device = lookupDevice(handle);
+    if (!device || native != reinterpret_cast<uintptr_t>(&device->state) || !regions || !regionCount)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageSlot *sourceSlot = lookupImage(*device, source);
+    ImageSlot *destinationSlot = lookupImage(*device, destination);
+    if (!sourceSlot || !destinationSlot || !device->state.driver.copyImageSubData)
+        return false;
+    device->state.makeCurrent();
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        const Int sourceZ = sourceSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                ? static_cast<Int>(region.source_z)
+                                : static_cast<Int>(region.source_array_layer);
+        const Int destinationZ = destinationSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                     ? static_cast<Int>(region.destination_z)
+                                     : static_cast<Int>(region.destination_array_layer);
+        device->state.driver.copyImageSubData(
+            sourceSlot->image.name, sourceSlot->target, static_cast<Int>(region.source_mip_level),
+            static_cast<Int>(region.source_x), static_cast<Int>(region.source_y), sourceZ, destinationSlot->image.name,
+            destinationSlot->target, static_cast<Int>(region.destination_mip_level),
+            static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y), destinationZ,
+            static_cast<Size>(region.width), static_cast<Size>(region.height), static_cast<Size>(region.depth));
+    }
+    return true;
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1340,6 +1374,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         abandonCommands,
         recordBarriers,
         recordBufferCopy,
+        supportsImageCopy,
+        recordImageCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

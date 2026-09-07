@@ -245,16 +245,10 @@ const program::Program *executableProgram(const VernonProgramExecutable &pipelin
 }
 
 bool publicBoundarySlot(const program::Program &program, const program::BoundarySlot &slot) {
+    (void)program;
     if (slot.role == program::BoundaryRole::Input)
         return true;
-    if (slot.role != program::BoundaryRole::Output || !program::findPublicationTarget(program.abi, slot.id))
-        return false;
-    return std::none_of(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
-                        [&](const program::BoundarySlot &candidate) {
-                            return candidate.role == program::BoundaryRole::Input &&
-                                   candidate.aliasOwner.kind == slot.aliasOwner.kind &&
-                                   candidate.aliasOwner.id == slot.aliasOwner.id;
-                        });
+    return slot.role == program::BoundaryRole::Output && slot.publication != program::BoundaryPublication::None;
 }
 
 size_t publicBoundaryCount(const program::Program &program) {
@@ -1376,6 +1370,31 @@ VernonStatus executePipelineProgramGraphImpl(
                 auto draw = control(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand);
                 auto dynamic = control(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState);
                 renderPass->refresh();
+                const auto *graphicsControls = std::get_if<program::ResolvedGraphicsControls>(&resolvedNode->controls);
+                if (!graphicsControls)
+                    return fail(pipeline.context, "managed graphics node has no resolved attachment controls");
+                auto stagedRenderPass = std::make_shared<RuntimeProgramControl>(*renderPass);
+                bool usesStaging = false;
+                for (const program::ResolvedGraphicsAttachment &attachment : graphicsControls->colorAttachments)
+                    if (const VernonRuntimeProviderResourceReference *view = arena.controlImage(attachment.storage)) {
+                        if (attachment.location >= stagedRenderPass->colors.size())
+                            return fail(pipeline.context,
+                                        "managed graphics staging attachment has an invalid color location");
+                        stagedRenderPass->colors[attachment.location].view = *view;
+                        usesStaging = true;
+                    }
+                if (graphicsControls->depthStencilAttachment)
+                    if (const VernonRuntimeProviderResourceReference *view =
+                            arena.controlImage(graphicsControls->depthStencilAttachment->storage)) {
+                        if (!stagedRenderPass->depth)
+                            return fail(pipeline.context, "managed graphics staging has no depth attachment");
+                        stagedRenderPass->depth->view = *view;
+                        usesStaging = true;
+                    }
+                if (usesStaging) {
+                    stagedRenderPass->refresh();
+                    renderPass = std::move(stagedRenderPass);
+                }
                 if (renderPass->renderPass.color_attachment_count != graphics.colorAttachments.size())
                     return fail(pipeline.context,
                                 "managed graphics fragment outputs must exactly match the color attachments");

@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -148,12 +149,28 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
               VERNON_STATUS_OK);
     VernonPullback *pullback = nullptr;
     vernon::runtime::program_execution::setFailureInjectionForTesting(
-        vernon::runtime::program_execution::FailureBoundary::Encode);
+        vernon::runtime::program_execution::FailureBoundary::Submission);
     EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK);
     vernon::runtime::program_execution::clearFailureInjectionForTesting();
     vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
     float unpublished = -1.0f;
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), outputBuffer, 0, &unpublished, sizeof(unpublished)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_FLOAT_EQ(unpublished, zero);
+
+    invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceToken, &sourceArgument, nullptr, sizeof(source), 1),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    vernon::runtime::program_execution::setFailureInjectionForTesting(
+        vernon::runtime::program_execution::FailureBoundary::Commit);
+    EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK);
+    vernon::runtime::program_execution::clearFailureInjectionForTesting();
+    vernonRuntimeProgramInvocationRollback(invocation);
+    vernonRuntimeProgramInvocationDestroy(invocation);
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), outputBuffer, 0, &unpublished, sizeof(unpublished)),
               VERNON_RHI_STATUS_OK);
     EXPECT_FLOAT_EQ(unpublished, zero);
@@ -192,6 +209,22 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
                            1,
                            shape};
     VernonAdValueSet gradients{sizeof(VernonAdValueSet), &gradient, 1, {}};
+    constexpr std::array failureBoundaries{
+        vernon::runtime::program_execution::FailureBoundary::Planning,
+        vernon::runtime::program_execution::FailureBoundary::Allocation,
+        vernon::runtime::program_execution::FailureBoundary::Submission,
+        vernon::runtime::program_execution::FailureBoundary::TapeValidation,
+        vernon::runtime::program_execution::FailureBoundary::Readback,
+        vernon::runtime::program_execution::FailureBoundary::Commit,
+    };
+    for (const auto boundary : failureBoundaries) {
+        gradientValue = -31.0f;
+        vernon::runtime::program_execution::setFailureInjectionForTesting(boundary);
+        EXPECT_NE(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << static_cast<int>(boundary);
+        vernon::runtime::program_execution::clearFailureInjectionForTesting();
+        EXPECT_FLOAT_EQ(gradientValue, -31.0f);
+    }
+    gradientValue = 0.0f;
     ASSERT_EQ(vernonPullbackApply(pullback, &seeds, &gradients), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 

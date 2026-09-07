@@ -1597,6 +1597,77 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
     return true;
 }
 
+bool supportsImageCopy(VernonRhiDevice handle) { return lookupDirectX12Device(handle) != nullptr; }
+
+bool recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native, VernonRhiImage source,
+                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    auto device = lookupDirectX12Device(handle);
+    auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
+    if (!device || !commands || commands != device->state.commandList() || !regions || !regionCount)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    DirectX12ImageSlot *sourceSlot = lookupDirectX12Slot(device->images, source);
+    DirectX12ImageSlot *destinationSlot = lookupDirectX12Slot(device->images, destination);
+    if (!sourceSlot || !destinationSlot)
+        return false;
+    const auto prepare = [&](DirectX12ImageSlot &slot, D3D12_RESOURCE_STATES target) {
+        auto journal = slot.image.stateJournals.find(encoderKey);
+        bool inserted = false;
+        if (journal == slot.image.stateJournals.end()) {
+            const auto result = slot.image.stateJournals.emplace(
+                encoderKey,
+                vernon::rhi::directx12::Image::StateJournal{slot.image.state, slot.image.subresourceStates});
+            journal = result.first;
+            inserted = result.second;
+        }
+        if (inserted &&
+            (!deferCommandCleanup(handle, encoderKey, &slot.image, encoderKey, clearDirectX12ImageStateJournal) ||
+             !deferCommandRollback(handle, encoderKey, &slot.image, encoderKey, restoreDirectX12ImageState))) {
+            slot.image.stateJournals.erase(journal);
+            return false;
+        }
+        transitionDirectX12Image(commands, slot.image, target);
+        return true;
+    };
+    if (!prepare(*sourceSlot, D3D12_RESOURCE_STATE_COPY_SOURCE) ||
+        !prepare(*destinationSlot, D3D12_RESOURCE_STATE_COPY_DEST))
+        return false;
+    const VernonRhiImageDescriptor &descriptor =
+        sourceSlot->image.owned ? sourceSlot->ownedDescriptor : sourceSlot->descriptor.image;
+    const uint32_t planeStride = descriptor.mip_levels * descriptor.array_layers;
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        for (uint32_t plane = 0; plane < directX12PlaneCount(descriptor.format); ++plane) {
+            const uint32_t planeAspect =
+                plane == 0 ? (descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                                                                                       : region.aspects)
+                           : VERNON_RHI_IMAGE_ASPECT_STENCIL;
+            if (!(region.aspects & planeAspect))
+                continue;
+            D3D12_TEXTURE_COPY_LOCATION sourceLocation{};
+            sourceLocation.pResource = sourceSlot->image.resource;
+            sourceLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            sourceLocation.SubresourceIndex =
+                region.source_mip_level + region.source_array_layer * descriptor.mip_levels + plane * planeStride;
+            D3D12_TEXTURE_COPY_LOCATION destinationLocation{};
+            destinationLocation.pResource = destinationSlot->image.resource;
+            destinationLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            destinationLocation.SubresourceIndex = region.destination_mip_level +
+                                                   region.destination_array_layer * descriptor.mip_levels +
+                                                   plane * planeStride;
+            const D3D12_BOX sourceBox{region.source_x,
+                                      region.source_y,
+                                      region.source_z,
+                                      region.source_x + region.width,
+                                      region.source_y + region.height,
+                                      region.source_z + region.depth};
+            commands->CopyTextureRegion(&destinationLocation, region.destination_x, region.destination_y,
+                                        region.destination_z, &sourceLocation, &sourceBox);
+        }
+    }
+    return true;
+}
+
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *colorResources,
                   size_t colorCount, uint64_t depthResource, uint64_t) {
@@ -1863,6 +1934,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         abandonCommands,
         recordBarriers,
         recordBufferCopy,
+        supportsImageCopy,
+        recordImageCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

@@ -16,7 +16,7 @@
 #include <vector>
 
 namespace vernon::runtime::ad {
-class Executable;
+class CanonicalProgramExecution;
 class AutodiffMemoryPolicy;
 size_t autodiffMemoryContextLimit(const std::shared_ptr<AutodiffMemoryPolicy> &policy);
 } // namespace vernon::runtime::ad
@@ -123,8 +123,8 @@ struct VernonProgramBundle {
     std::filesystem::path bundleRoot;
 };
 
-struct VernonDifferentiatedProgram {
-    std::shared_ptr<vernon::runtime::ad::Executable> executable;
+struct CanonicalProgramAutodiffState {
+    std::shared_ptr<vernon::runtime::ad::CanonicalProgramExecution> canonicalExecution;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
     std::optional<uint64_t> checkpointMemoryBudget;
     std::string checkpointPolicy;
@@ -141,7 +141,7 @@ struct VernonProgramExecutable {
 
     VernonRuntimeContext *context;
     const std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> executionPlan;
-    VernonDifferentiatedProgram autodiff;
+    CanonicalProgramAutodiffState programAutodiff;
 };
 
 inline VernonProgramExecutable::VernonProgramExecutable(

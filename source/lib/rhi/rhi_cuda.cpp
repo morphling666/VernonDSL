@@ -481,6 +481,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         nullptr,
         nullptr,
         nullptr,
+        nullptr,
+        nullptr,
     };
     return dispatch;
 }

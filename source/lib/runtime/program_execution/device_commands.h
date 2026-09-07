@@ -32,11 +32,26 @@ struct DeviceBufferUpload {
     size_t size{};
 };
 
+struct DeviceImageCopy {
+    VernonRhiImage source;
+    VernonRhiImage destination;
+    std::vector<VernonRhiImageCopyRegion> regions;
+};
+
 using GpuCommandCompletionCallback = VernonRhiStatus (*)(void *context);
 
 bool encodeBufferCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
                         const std::vector<DeviceBufferCopy> &copies);
+bool encodeImageCopies(VernonRuntimeContext &context, VernonRhiCommandEncoder encoder,
+                       const std::vector<DeviceImageCopy> &copies);
 VernonStatus executeBufferCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies);
+VernonStatus executeDeviceCopiesAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &buffers,
+                                        const std::vector<DeviceImageCopy> &images);
+VernonStatus buildDeviceTransferCommandPlan(VernonRuntimeContext &context,
+                                            const std::vector<DeviceBufferCopy> &bufferCopies,
+                                            const std::vector<DeviceImageCopy> &imageCopies,
+                                            const std::vector<DeviceBufferUpload> &uploads,
+                                            execution::detail::RhiCommandExecutionPlan &plan);
 VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copies,
                                             const std::vector<DeviceBufferUpload> &uploads,
                                             execution::detail::RhiCommandExecutionPlan &plan);

@@ -8,7 +8,9 @@
 #include "program_tape_lifecycle.h"
 #include "program_tape_scratch.h"
 #include "retained_pullback_state.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/program_invocation_state.h"
+#include "runtime/program_execution/publication_executor.h"
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution/resolved_transfer_executor.h"
 #include "runtime/program_execution_manifest.h"
@@ -40,6 +42,8 @@ using program_execution::ResolvedTransferExecutor;
 
 bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, const ProgramTapeScratch &tapeScratch,
                                std::string &error) {
+    if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
+        return error = "injected Program tape validation failure", false;
     for (size_t value = 0; value < storage.size(); ++value) {
         const auto batch = tapeScratch.hostBatch(static_cast<uint32_t>(value));
         if (!batch)
@@ -122,7 +126,8 @@ bool transferLeaves(const VernonAdValueSet &supplied, const std::vector<ValueAbi
             uint8_t *packedElement = packed + element * binding.elementStride + binding.byteOffset;
             uint8_t *leafElement = leaf + element * binding.leafElementBytes;
             if (publish) {
-                if (!publication->stageHostBytes(leafElement, packedElement, binding.leafElementBytes, error))
+                if (!publication->stageHostRegion(binding.slot, leafElement, packedElement, binding.leafElementBytes,
+                                                  error))
                     return false;
             } else
                 std::memcpy(packedElement, leafElement, binding.leafElementBytes);
@@ -208,10 +213,14 @@ public:
         }
         if (temporaryBytes > options.maximumTemporaryBytes)
             return fail(*context_, "Program pullback exceeds its temporary memory limit");
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Allocation))
+            return fail(*context_, "injected Program pullback allocation failure");
 
         ProgramInvocationState values(*topology_, std::move(storage), std::move(storageBackings));
         if (!state_->importInto(values, tapeScratch, !replay, error))
             return fail(*context_, error);
+        if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
+            return fail(*context_, "injected Program pullback tape validation failure");
         const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
             [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
             if (binding.semantic == program::CarrierSemantic::Tape)
@@ -220,6 +229,8 @@ public:
             return values.argument(value);
         };
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
+            return fail(*context_, "injected Program pullback submission failure");
         VernonProgramExecutable proxy(*context_, topology_);
         if (replay) {
             if (device) {
@@ -272,7 +283,8 @@ public:
         PublicationTransaction publication(topology_->publications);
         if (!transferLeaves(gradients, signature_.gradients, gradientBindings_, values.values(), &publication, error))
             return fail(*context_, error);
-        if (const VernonStatus publicationStatus = publication.commit(*context_, values, error);
+        if (const VernonStatus publicationStatus =
+                program_execution::executePublicationCommit(*context_, publication, values, error);
             publicationStatus != VERNON_STATUS_OK)
             return error.empty() ? publicationStatus : fail(*context_, error);
         ++usage_.submissions;
@@ -346,10 +358,10 @@ private:
     program_execution::ExecutionControlPlaneUsage usage_;
 };
 
-class ProgramExecutable final : public Executable {
+class ProgramExecutable final : public CanonicalProgramExecution {
 public:
     ProgramExecutable(VernonRuntimeContext &context, std::weak_ptr<const program::ResolvedExecutionPlan> topology,
-                      VernonDifferentiatedProgram &programAutodiff, Variant variant)
+                      CanonicalProgramAutodiffState &programAutodiff, Variant variant)
         : context_(&context), topology_(std::move(topology)), programAutodiff_(&programAutodiff),
           variant_(std::move(variant)) {
         rebuildVariantLayoutViews(variant_);
@@ -366,16 +378,8 @@ public:
                 return;
             }
         for (const program::BoundarySlot &slot : canonicalProgram.abi.boundarySlots) {
-            const bool aliasesInput =
-                std::any_of(canonicalProgram.abi.boundarySlots.begin(), canonicalProgram.abi.boundarySlots.end(),
-                            [&](const program::BoundarySlot &candidate) {
-                                return candidate.role == program::BoundaryRole::Input &&
-                                       candidate.aliasOwner.kind == slot.aliasOwner.kind &&
-                                       candidate.aliasOwner.id == slot.aliasOwner.id;
-                            });
             if (slot.role == program::BoundaryRole::Input ||
-                (slot.role == program::BoundaryRole::Output && !aliasesInput &&
-                 program::findPublicationTarget(canonicalProgram.abi, slot.id)))
+                (slot.role == program::BoundaryRole::Output && slot.publication != program::BoundaryPublication::None))
                 forwardBindings_.emplace_back(slot.id, slot.value);
         }
         // ProgramABI is the execution authority. Signature is validated against
@@ -440,7 +444,7 @@ public:
             for (const ValueLeaf *selected : selectedLeaves) {
                 const ValueLeaf &leaf = *selected;
                 const std::optional<VernonDataType> dtype = pipelineDataType(leaf.dtype);
-                leafBindings.push_back({publicSlot.value, leaf.byteOffset, layout.byteSize,
+                leafBindings.push_back({publicSlot.value, publicSlot.id, leaf.byteOffset, layout.byteSize,
                                         dtype ? dtypeSize(*dtype) * static_cast<size_t>(leaf.scalarCount) : 0,
                                         elementCount});
             }
@@ -449,7 +453,7 @@ public:
             if (slot.role == program::BoundaryRole::Input)
                 append(slot, nullptr, signature_.inputs, inputBindings_);
             else if (slot.role == program::BoundaryRole::Output &&
-                     program::findPublicationTarget(canonicalProgram.abi, slot.id))
+                     slot.publication != program::BoundaryPublication::None)
                 append(slot, nullptr, signature_.outputs, outputBindings_);
         }
         for (const program::DerivativeProjection &projection : canonicalProgram.abi.derivativeProjections) {
@@ -504,6 +508,10 @@ public:
              !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, nullptr, error)))
             return fail(*context_, error);
         ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
+        if (const VernonStatus initialization =
+                program_execution::executePublicationInitialization(*context_, publication, error);
+            initialization != VERNON_STATUS_OK)
+            return error.empty() ? initialization : fail(*context_, error);
         const program_execution::ResolvePhysicalEndpoint resolvePhysicalEndpoint =
             [&](uint32_t value, const program::TargetBinding &binding) -> const VernonProgramArgument * {
             if (binding.semantic == program::CarrierSemantic::Tape)
@@ -521,6 +529,8 @@ public:
                         return fail(*context_, error);
                 }
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
+        if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
+            return fail(*context_, "injected Program forward submission failure");
         if (device) {
             std::vector<ProgramTapeState> tapeStates;
             if (!prepareProgramTapeStates(arena, tapeScratch, *context_, *execution, *topology, *forward, tapeStates,
@@ -564,7 +574,8 @@ public:
         if (!canonicalInvocation &&
             !transferLeaves(*outputs, signature_.outputs, outputBindings_, arena.values(), &publication, error))
             return fail(*context_, error);
-        if (const VernonStatus publicationStatus = publication.commit(*context_, arena, error);
+        if (const VernonStatus publicationStatus =
+                program_execution::executePublicationCommit(*context_, publication, arena, error);
             publicationStatus != VERNON_STATUS_OK)
             return error.empty() ? publicationStatus : fail(*context_, error);
         if (!hasBackward)
@@ -605,7 +616,7 @@ public:
 private:
     VernonRuntimeContext *context_;
     std::weak_ptr<const program::ResolvedExecutionPlan> topology_;
-    const VernonDifferentiatedProgram *programAutodiff_{};
+    const CanonicalProgramAutodiffState *programAutodiff_{};
     Variant variant_;
     Signature signature_;
     std::vector<ProgramLeafBinding> inputBindings_;
@@ -622,7 +633,7 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
                             const std::vector<AutodiffDerivativeGroup> &derivativeGroups) {
     if (!pipeline.context)
         return false;
-    VernonDifferentiatedProgram &state = pipeline.autodiff;
+    CanonicalProgramAutodiffState &state = pipeline.programAutodiff;
     const program::Program &execution = pipeline.executionPlan->resolvedProgram->program;
     if (!program::findGraph(execution, "forward")) {
         invocationDiagnostic(*pipeline.context) = "Program execution topology requires a forward graph";
@@ -709,7 +720,7 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
             invocationDiagnostic(*pipeline.context) = "Program autodiff derivative groups do not match its signature";
         return false;
     }
-    state.executable = std::move(executable);
+    state.canonicalExecution = std::move(executable);
     state.derivativeGroups = std::move(groups);
     return true;
 }

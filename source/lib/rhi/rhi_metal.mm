@@ -851,6 +851,21 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
                                     destinationOffset, size, device->error);
 }
 
+bool supportsImageCopy(VernonRhiDevice handle) { return lookupMetalDevice(handle) != nullptr; }
+
+bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
+                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    auto device = lookupMetalDevice(handle);
+    if (!device || !native || !regions || !regionCount)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalImageSlot *sourceSlot = lookupResourceRecord(device->images, resourceKey(source));
+    MetalImageSlot *destinationSlot = lookupResourceRecord(device->images, resourceKey(destination));
+    return sourceSlot && destinationSlot &&
+           device->state.copyImage(native, sourceSlot->native, destinationSlot->native, regions, regionCount,
+                                   device->error);
+}
+
 bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, int32_t x, int32_t y,
                       uint32_t width, uint32_t height, uint32_t layers, int32_t colorLocation,
                       const float *clearColor, float clearDepth, uint32_t clearStencil, uint32_t aspects) {
@@ -1052,6 +1067,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         abandonCommands,
         recordBarriers,
         recordBufferCopy,
+        supportsImageCopy,
+        recordImageCopy,
         endRendering,
         clearColor,
         clearDepthStencil,

@@ -71,11 +71,11 @@ private:
 
 TEST(RuntimeGpuAutodiff, FailureInjectionSelectsBoundaryAndOccurrence) {
     using namespace vernon::runtime::program_execution;
-    setFailureInjectionForTesting(FailureBoundary::Upload, 2);
+    setFailureInjectionForTesting(FailureBoundary::Transfer, 2);
     EXPECT_FALSE(injectFailure(FailureBoundary::Allocation));
-    EXPECT_FALSE(injectFailure(FailureBoundary::Upload));
-    EXPECT_TRUE(injectFailure(FailureBoundary::Upload));
-    EXPECT_FALSE(injectFailure(FailureBoundary::Upload));
+    EXPECT_FALSE(injectFailure(FailureBoundary::Transfer));
+    EXPECT_TRUE(injectFailure(FailureBoundary::Transfer));
+    EXPECT_FALSE(injectFailure(FailureBoundary::Transfer));
 }
 
 TEST(RuntimeGpuAutodiff, MemoryAccountingSeparatesLogicalObservationalAndBudgetedBytes) {
@@ -388,9 +388,9 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
 
     constexpr std::array forwardBoundaries{
         FailureBoundary::Allocation,
-        FailureBoundary::Upload,
-        FailureBoundary::Wait,
-        FailureBoundary::Download,
+        FailureBoundary::Transfer,
+        FailureBoundary::Submission,
+        FailureBoundary::Readback,
     };
     for (FailureBoundary boundary : forwardBoundaries) {
         values = original;

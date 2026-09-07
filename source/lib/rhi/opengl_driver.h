@@ -105,6 +105,8 @@ struct Driver {
     void(VERNON_GL_CALL *bufferData)(Enum, SizePtr, const void *, Enum){};
     void(VERNON_GL_CALL *bufferSubData)(Enum, IntPtr, SizePtr, const void *){};
     void(VERNON_GL_CALL *copyBufferSubData)(Enum, Enum, IntPtr, IntPtr, SizePtr){};
+    void(VERNON_GL_CALL *copyImageSubData)(Uint, Enum, Int, Int, Int, Int, Uint, Enum, Int, Int, Int, Int, Size, Size,
+                                           Size){};
     void *(VERNON_GL_CALL *mapBufferRange)(Enum, IntPtr, SizePtr, Bitfield){};
     Boolean(VERNON_GL_CALL *unmapBuffer)(Enum) {};
     void(VERNON_GL_CALL *bindBufferBase)(Enum, Uint, Uint){};
