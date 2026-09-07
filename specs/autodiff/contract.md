@@ -1,6 +1,7 @@
-# Autodiff design
+# Autodiff contract
 
-> **Status:** accepted contract and implemented compute Program VJP surface.
+Status: normative compute Program VJP contract.
+
 > Canonical forward/backward Program graphs, typed derivative groups, checked
 > dynamic tape, explicit accumulation plans, persistent boundary binding, and
 > invocation-time `(x,y,z)` carriers are implemented. Direct Kernel VJP is a
@@ -194,8 +195,8 @@ loss_asset = vd.program_asset(
 `vd.ad.vjp(...)` in this position is a statically parsed program transform,
 not an execution call and not another asset type.
 
-An ordinary `program=(vertex, fragment)` or `program=kernel` declaration cooks
-one primal Program. A VJP program expression cooks one differentiated Program
+An ordinary `program=vd.pipeline(vertex, fragment, ...)` or `program=kernel`
+declaration cooks one primal Program. A VJP program expression cooks one differentiated Program
 containing forward and backward graphs, residual state, and versioned
 cotangent/gradient signature metadata. The cooker does not emit a three-profile
 topology.
@@ -280,7 +281,7 @@ Runtime contract does not promise concurrent calls on one pullback.
 
 CPU primal, forward-with-tape, and backward compute implementations all use the
 ordinary range-phase scheduler described by
-[`runtime/design.md`](runtime/design.md#cpu-range-phase-execution). There is no
+[`runtime/design.md`](../runtime/design.md#range-phase-scheduler). There is no
 AD scalar-entry adapter, worker-local lane identity, fixed-tape execution
 branch, or serial fallback.
 
@@ -447,20 +448,54 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 13 and pipeline contract 17 are the current Program VJP
-boundary. The breaking release intentionally rejects all older profile manifests. It
-does not reinterpret, normalize, or retain them as a parallel loading path.
-The target CPU VJP has one Program/ResolveProgram/ExecuteProgram path.
-Differentiated graphics remains unsupported.
+Compiler contract 14 and Program version 19 define the current Program VJP
+boundary. Older profile manifests are rejected rather than reinterpreted,
+normalized, or retained as a parallel loading path. CPU and supported GPU VJP
+use the same Program/ResolveProgram/ExecuteProgram path. Differentiated
+graphics remains unsupported.
 
-Current pre-breaking CPU acceptance covers direct and cooked structured Storage VJP, recursive
+CPU acceptance covers direct and cooked structured Storage VJP, recursive
 aggregate tangents, multiple outputs, owner aliases, signed-stride descriptors,
 multi-invocation cotangent carriers, dynamic control flow, scratch overwrite,
 finite differences, and deterministic reusable pullbacks. Runtime acceptance
-also freezes tape allocator ABI, ownership, memory charging, failure latching,
-and public exception containment. GPU acceptance covers only ordinary non-AD
-compute and graphics pipelines.
+also covers tape allocator ABI, ownership, memory charging, failure latching,
+and public exception containment. Supported GPU backends cover canonical
+compute Program VJP, including no-Tape rematerialization and device-resident
+residual and gradient paths.
 
 Any missing derivative or custom rule, unbounded tape, unsupported target
 capability, uncertain write conflict, malformed group/cotangent/signature,
 or stale contract version fails before execution.
+
+## 12. Residual planning
+
+Residual decisions are keyed by active Program Value and ABI leaf. A value may
+be rematerialized only when its dependency slice is pure, reconstructible, and
+exact-version safe. Storage reload uses logical resource versions rather than
+current owner identity.
+
+The planner distinguishes:
+
+- logical residual bytes;
+- retained allocation bytes;
+- forward construction and compaction scratch;
+- resident and allocated tape;
+- checkpoints and restoration state;
+- backward values and accumulation;
+- recomputation cost;
+- total Runtime-managed peak.
+
+Legality is decided before policy or cost. `min_memory`, `balanced`, and
+`min_runtime` select only among legal plans and obey hard physical budgets.
+Replay segments are complete workgroups and preserve virtual global,
+workgroup, and local IDs. A running workgroup is not suspended to satisfy a
+budget.
+
+Backward reads immutable retained state. Construction scratch is recyclable
+only after its read epoch ends. Missing write-footprint metadata requires
+conservative whole-view restoration. Gradients use transactional publication.
+No tape strategy uses file backing or GPU-to-host spill.
+
+The compiler emits explicit captures and residual source metadata. Runtime
+enforces the resolved plan and physical budget; it does not recreate compiler
+cost planning or choose workload-size heuristics.

@@ -1,5 +1,7 @@
 # Example Design Notes
 
+Status: non-normative example implementation notes.
+
 ## Terrain showcase
 
 The terrain is a full-screen ray-marched graphics workload. A repeat-wrapped

@@ -1,5 +1,7 @@
 # Invocation index ownership
 
+Status: current compiler proof contract.
+
 This document is the mathematical account of the ordinary-write injectivity
 proof implemented in `VernonGlobalIdIndexProof.cpp`. Language residual
 conditions are `vernon.dispatch_contract` in

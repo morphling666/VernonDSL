@@ -373,17 +373,16 @@ a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
 Value even if a backend uses a buffer physically. Direct shader addressing,
 stores, and atomics require `TensorView[..., resource()]`.
 
-A persistent `ProgramAsset` wraps exactly one executable pipeline. Its
-`program=` is either one `@kernel` entry or a non-empty tuple containing only
-graphics entries. Kernel programs are compute-only; graphics stage tuples form
-graphics-only Pipelines. Compute and graphics entries cannot be mixed in one
-pipeline.
+A persistent `ProgramAsset` wraps exactly one executable Program. Its
+`program=` is a compute Kernel, a `vd.pipeline(...)` graphics pipeline, an
+initialized Module, or a supported explicit Program transform. Standalone
+compute and graphics executables normalize to one-node Programs. Modules may
+compose compute and graphics Nodes in one static Program DAG.
 
 Each graphics entry carries an explicit stage kind. A target-independent stage
-registry validates tuple topology and ordering. The registered graphics
-topology is `vertex -> fragment`. Future stage additions can extend topology
-validation without changing `ProgramAsset` syntax; such changes are covered by
-`COMPILER_CONTRACT_VERSION`.
+registry validates `vd.pipeline(...)` topology and ordering. The registered
+graphics topology is `vertex -> fragment`. Future stage additions can extend
+topology validation through a versioned compiler contract.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
@@ -459,7 +458,8 @@ explicitly and never silently narrow or change semantics.
 
 ## 8. First-order autodiff
 
-The complete normative design is [`../autodiff.md`](../autodiff.md).
+The complete normative design is
+[`../autodiff/contract.md`](../autodiff/contract.md).
 Autodiff transforms specialized, validated typed IR and never executes Python
 to trace a function.
 
@@ -536,7 +536,7 @@ cache identity.
 | Layout | Backend/runtime details | Dense strided views, AoS field projections, explicit alias rules | Transparent sparse layouts and SNode trees |
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
 | Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, and typed barriers | Additional atomic types/orderings and full race model |
-| Autodiff | Not implemented | First-order VJP over typed programs, stateful Kernels, and versioned graphics custom rules | JVP, full Jacobians, convenience aliases, and higher-order AD |
+| Autodiff | No public transform | First-order compute Program VJP over typed Programs and stateful Kernels; graphics paths fail closed | Graphics VJP/custom rules, JVP, full Jacobians, convenience aliases, and higher-order AD |
 | Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
 | Rendering | Typed graphics stages, textures, samplers | Same model with versioned rasterization/visibility/depth/blend/texture VJP boundaries | Graphics derivatives without explicit accepted custom rules |
 

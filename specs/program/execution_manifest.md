@@ -1,5 +1,7 @@
 # Program Execution Manifest
 
+Status: normative Program deployment contract.
+
 ## 1. Status and contract selection
 
 This document defines the normative deployment representation of a Vernon
@@ -11,9 +13,8 @@ object. There is no sibling or nested execution object.
 
 The Program representation has no independent nested schema or version field.
 Top-level `COMPILER_CONTRACT_VERSION` and `PROGRAM_VERSION` jointly select
-exactly one Program contract. The coordinated Program Asset release uses the
-generated values recorded by the repository (`14` and `19` in the examples
-below). A loader MUST require the unique Program contract mapped by the
+exactly one Program contract. The current generated values are `14` and `19`.
+A loader MUST require the unique Program contract mapped by the
 selected pair and reject every other shape. It MUST NOT translate a legacy
 pipeline, program-bundle, stage topology, or profile representation into this
 one.
@@ -329,7 +330,7 @@ followed by the exact backend fields:
 Every version or capability pair is exactly a two-element uint32 array.
 `address_size` is 32 or 64. `profile` is `core`, `compatibility`, or `es` and
 must agree with target kind. Backend-specific values and feature names are
-defined by the same pipeline contract pair; unknown or extra members are
+defined by the same compiler and Program contract pair; unknown or extra members are
 errors. Requirements are minimum execution requirements, not compilation
 options, and Runtime validates them before loading any code.
 Workgroup size is StageArtifact compute reflection authority and is not
@@ -951,8 +952,8 @@ endpoints are not Program bindings.
 
 ### 11.1 Artifact reflection
 
-Artifact reflection is selected by the same future compiler/pipeline contract
-pair as Program; it has no independently selectable Program ABI. The
+Artifact reflection is selected by the same compiler and Program contract pair
+as Program; it has no independently selectable Program ABI. The
 root contains required `required_features` and `endpoints` plus exactly one of
 `compute` or `graphics`, matching StageArtifact operation.
 The StageArtifact `reflection.endpoints` array contains strict endpoint records

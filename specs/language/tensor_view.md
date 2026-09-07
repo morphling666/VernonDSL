@@ -1,23 +1,22 @@
 # Tensor and TensorView contract
 
-## Status
+Status: normative Tensor-family detail for the language contract.
 
-This document records the accepted Tensor-family design and the in-progress v4
-migration of the TensorView shape model and workgroup storage model. The old
+This document records the accepted Tensor-family design and TensorView shape
+and workgroup storage model. The old
 `workgroup_array` and `!vernon.workgroup` forms are removed directly; no
 aliases, parser fallbacks, IR translations, reflection readers, or runtime
 compatibility paths are added.
 
-The released Python frontend remains language version 3 while this v4 design is
-implemented and validated; the current code has no numeric `FRONTEND_VERSION`
-constant. Source syntax, typed IR, and compile-time tests cover unified
+The current code has no numeric `FRONTEND_VERSION` constant. Source syntax,
+typed IR, and compile-time tests cover unified
 TensorView load/store/atomic operations, workgroup address space, and
-`workgroup_storage`. The 0.1.2 Runtime descriptor ABI accepts dynamic shape,
+`workgroup_storage`. The Runtime descriptor ABI accepts dynamic shape,
 signed stride, and offset as invocation data without layout-specific
 recompilation. Broader language-v4 parity and validation remain tracked in
-the [project roadmap](../roadmap.md#language-v4). Serialized reflection,
-pipeline, and invocation ABI versions are bumped wherever this migration
-changes their records.
+the [language roadmap](future_language_roadmap.md). Serialized reflection,
+Program, and invocation ABI versions are changed only through their
+authoritative contract version sources.
 
 ## 1. Tensor family and semantic categories
 
@@ -203,7 +202,7 @@ owner when their accessed regions are compatible.
 Autodiff creates a separate host-owned tangent allocation rather than writing
 through a primal owner. Scalar elements use the promoted derivative dtype.
 Aggregate elements use the structural `TangentLayout` defined by
-[`autodiff.md`](../autodiff.md#3-value-storage-and-resource-gradients):
+[`autodiff/contract.md`](../autodiff/contract.md#3-value-storage-and-resource-gradients):
 Vector, Matrix, Tensor, Tuple, and Struct dimensions and paths remain element
 structure, while f16 leaves promote to f32 and non-differentiable leaves become
 zero tangent nodes. The tangent layout may have different offsets and stride
@@ -318,29 +317,15 @@ bindings, and the offset/extent/stride descriptor binding sequence. Concrete
 dispatch values are never reflected. The capability name remains
 `tensor_views`.
 
-Native runtime records use `VernonTensorView`; the invocation ABI version is
-bumped when descriptor fields change. Reflection and pipeline schemas are
-bumped together, and old schema readers are removed rather than translated.
+Native runtime records use `VernonTensorView`; the Program contract changes
+when serialized descriptor fields change. Old schema readers are removed
+rather than translated.
 
 Workgroup TensorViews are compile-time kernel state, not host-bound arguments.
 Required workgroup bytes and synchronization features are reflected only where
 backend/device capability validation needs them.
 
-## 10. Acceptance tests
+## 10. Conformance
 
-Acceptance requires:
-
-- static, dynamic, and mixed TensorView shape parsing and runtime matching;
-- strict Tensor versus TensorView host binding;
-- full-owner and explicit subview dispatch;
-- disjoint and overlapping views sharing one owner;
-- graphics Tensor attributes sourced from bound vertex storage;
-- multidimensional workgroup load/store and row-major projection;
-- workgroup storage of Scalar, Tensor, Tuple, and Struct Value elements;
-- rank-one and tuple atomic indexing with inferred scope;
-- independent allocations across multiple workgroups;
-- barrier-visible writes within one workgroup;
-- backend-independent verifier tests plus runtime parity on every available
-  CUDA, Vulkan, OpenGL, and DirectX backend;
-- rejection of old workgroup source names, old split workgroup IR, and old
-  serialized schemas.
+Tensor-family compile and runtime coverage is tracked by
+[`../testing/cross_backend_language_testing_plan.md`](../testing/cross_backend_language_testing_plan.md).

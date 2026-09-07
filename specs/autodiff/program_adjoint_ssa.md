@@ -1,28 +1,16 @@
 # Program VJP interior adjoint SSA
 
-Design for cotangent accumulation on multi-node Programs. Architecture target
-remains [`unified_program_vjp.md`](unified_program_vjp.md). Public gradient
-rules remain [`autodiff.md`](autodiff.md) §3 and
-[`language/contract.md`](language/contract.md) (TensorView gradients are newly
+Status: current compiler architecture for cotangent accumulation inside
+multi-node Programs.
+
+Program architecture is defined in
+[`../program/architecture.md`](../program/architecture.md). Public gradient
+rules are defined in [`contract.md`](contract.md) §3 and
+[`../language/contract.md`](../language/contract.md) (TensorView gradients are newly
 owned Storage; compute-node ABI is a writable TensorView, not a kernel that
-returns Storage). Do not bump `COMPILER_CONTRACT_VERSION` / `PROGRAM_VERSION`.
+returns Storage).
 
-## 1. Symptom
-
-`test_module_forward_and_backward_use_program_operation_graph` fails cook with
-`Program VJP cannot accumulate derivative values`.
-
-`addValues` already emits `vernon.intrinsic "add"` for matching
-`Tensor` / `TensorView` pairs. It returns null only when the two SSA types
-differ. FanIn passes because both contributions are the same type. Fluid fails
-because one adjoint is a public cotangent (`read` TensorView) and the other is
-a nested kernel VJP result (`write` TensorView).
-
-That is not “Tensor vs tuple-of-leaves”. Density and velocity are returned
-**and** read by a later kernel (`smoke_loss`, `transport_density`). Reverse
-walk therefore adds an output cotangent to a kernel-input gradient.
-
-## 2. SSA handles vs kernel DSL
+## 1. SSA handles vs kernel DSL
 
 Program IR may use SSA. That SSA is a **handle** (Value, or TensorView over
 Storage). It is not a license for the kernel DSL to return Storage.
@@ -50,7 +38,7 @@ Value-producing `%sum = add %left, %right` is only for Tensor **Values**.
 `createZero` for a TensorView is `zeros` / `zeros_like` (alloc), not a kernel
 result.
 
-## 3. Three layers
+## 2. Three layers
 
 Access `read` / `write` / `read_write` is a **capability** of a TensorView.
 It is valid in three different places. Mixing those places is the bug.
@@ -72,7 +60,7 @@ Kernel ABI assignment of `read` (cotangent) and `write` (gradient dest) is
 correct. Public signature assignment is correct. Interior handles must not use
 `cotangentType` / `gradientDestType`.
 
-## 4. Target construction
+## 3. Target construction
 
 Nested `compute.vjp` is a primal compute node that happens to implement a
 derivative, not a second type system.
@@ -96,7 +84,7 @@ derivative, not a second type system.
    If the interior handle is already that dest and was not accumulated further,
    return it. If DPS add wrote a new dest, that dest is the owner.
 
-## 5. Casts
+## 4. Casts
 
 Access-changing `cast` is not the solution. It is an adapter, and most
 directions are unsound.
@@ -114,7 +102,7 @@ both read operands of DPS add are the interior type.
 Do not accumulate TensorView adjoints by first converting them to Tensor
 Values. That would make the DSL return Storage.
 
-## 6. Builtin add is rank + dyn
+## 5. Builtin add is rank + dyn
 
 The kernel is already `_program_add_{dtype}_rank{n}` with `TensorView[...,
 vd.dyn, ..., write|read]` and `-> None`. Rank selects the kernel; extents stay
@@ -128,7 +116,7 @@ rank plus descriptor extents (same as other dyn TensorView kernels). Do not
 specialize `vd.dyn` into the artifact and do not treat static shape as the
 add design.
 
-## 7. How large is the change
+## 6. Implementation scope
 
 Localized to Program VJP construction plus any host add request that still
 bakes static extents:
@@ -144,7 +132,7 @@ Not in this change: contract versions, Module ABI names, flattening
 aggregates, parent `variant.parameters` synthesis, unique-ifying CPU symbols,
 relaxing `addValues`, user-facing `accumulate_into`.
 
-## 8. Acceptance
+## 7. Acceptance
 
 ```bash
 PYTHONPATH=python .venv/bin/python -m pytest \

@@ -1,13 +1,11 @@
 # Image resource architecture
 
-## Status
+Status: current image-resource architecture.
 
-This document defines the 0.1.2 image-resource architecture for Texture,
-sampled-image, storage-image, image-view, Runtime provider, and RHI
-integration. The ABI changes were made before the 0.1.2 release without
-changing the compiler or pipeline contract version: the existing reflection
-already contains the required image binding role, dimension, sample-result
-class, storage format, and access constraints.
+This document defines Texture, sampled-image, storage-image, image-view,
+Runtime provider, and RHI integration. Program reflection contains the
+required image binding role, dimension, sample-result class, storage format,
+and access constraints.
 
 Provider-neutral logical texture enums live in `VernonTextureTypes.h`;
 `VernonRuntimeProvider.h` and RuntimeCore do not depend on `VernonRHI.h`.

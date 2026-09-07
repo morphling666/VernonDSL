@@ -1,6 +1,6 @@
 # Language v4 roadmap
 
-## Status
+Status: active language-v4 roadmap.
 
 The released Python frontend remains language version 3. There is no numeric
 `FRONTEND_VERSION` constant. Version 4 is the target defined by
@@ -24,33 +24,20 @@ correctness guarantees are complete.
 
 ### First-order VJP autodiff
 
-The normative design is [`../autodiff.md`](../autodiff.md).
+The normative design is
+[`../autodiff/contract.md`](../autodiff/contract.md). Compute Program VJP,
+including standalone kernels and Modules, is implemented. Remaining v4 gates
+are:
 
-- Add one public reverse-mode transform, `vd.ad.vjp`, for a Kernel, graphics
-  stage tuple, or existing ExecutionGraph. Keep authored entry signatures
-  unchanged.
-- Extend `program_asset(program=...)` with a declarative VJP
-  `ProgramExpression`; cook independent primal, forward-with-tape, and
-  backward profiles under one asset ID.
-- Derive adjoint Values recursively for floating Scalar, Tensor, Tuple, and
-  Struct leaves. Return new owned Storage for differentiated TensorView or
-  mutable Storage inputs.
-- Use `wrt` as the only differentiated-input declaration. Do not introduce
-  `grad_or_not`, `requires_grad`, implicit `.grad`, global gradient clearing,
-  or hidden backward execution.
-- Accept Tensor/aggregate outputs through explicit cotangents. Permit omitted
-  cotangent only for one floating Scalar output, where the seed is `1`.
-- Define versioned derivative rules for arithmetic, casts, Tensor
-  construction, `matmul`, and supported math intrinsics.
-- Build compiler-internal ProgramGraph Value/control/effect dependencies,
-  functionalize legal Storage mutation, prove alias/scatter behavior, and
-  reject unbounded tape or unsupported accumulation.
-- Define required custom VJPs for rasterization, visibility, depth, blend, and
-  texture sampling before accepting cross-stage graphics differentiation.
-- Add deterministic transform, rule-set, tape, cotangent, gradient, reflection,
-  and manifest identity across Python, C, and C++.
-- Compare analytical derivatives with finite differences on CPU and every
-  backend that advertises the corresponding AD capability.
+- run finite-difference and reusable-pullback acceptance on every backend that
+  advertises the corresponding compute AD capability;
+- complete the independent WASM Program VJP gate before advertising browser
+  VJP;
+- keep graphics differentiation rejected until versioned rules and declared
+  differentiability domains exist for rasterization, visibility, depth,
+  blending, and texture sampling;
+- keep custom compute VJP declarations rejected until their typing, identity,
+  capture, and deployment contracts are specified.
 
 JVP, full-Jacobian materialization, convenience `grad` aliases, nested
 transforms, Hessians, and HVPs are outside the initial public surface.
@@ -82,11 +69,11 @@ Unavailable devices remain explicit skips, not silent passes.
 
 ### Cross-backend acceptance
 
-- Compare representative CPU, CUDA, Vulkan, OpenGL, and DirectX programs where
-  each backend advertises support.
+- Compare representative CPU, CUDA, Vulkan, DirectX, Metal, OpenGL, and OpenGL
+  ES programs where each backend advertises support.
 - Keep target capability failures deterministic and target-independent where
   possible.
-- Include compiler-contract and pipeline versions in cache identity.
+- Include compiler-contract and Program versions in cache identity.
 - Preserve deterministic MLIR, artifacts, reflection, and symbols.
 
 ## Post-v4 autodiff expansion

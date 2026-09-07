@@ -1,6 +1,7 @@
 # VernonDSL automatic differentiation
 
-This guide describes the compiler-contract 13 and Pipeline 17 architecture.
+Status: non-normative tutorial for compiler contract 14 and Program version 19.
+
 Canonical Program is the only differentiation topology; Python pass graphs and
 legacy pipeline AD manifests are not part of the API.
 
@@ -142,9 +143,9 @@ signature and resolved carrier layout are the authority.
 
 ## 9. Unsupported behavior
 
-- Python `ExecutionGraph`, pass descriptors, and graph-level VJP APIs were
-  removed in Pipeline 17.
-- Compiler-contract 12 and Pipeline 16 artifacts are rejected rather than
+- Python `ExecutionGraph`, pass descriptors, and graph-level VJP APIs are not
+  public Program APIs.
+- Artifacts from older compiler and Program contracts are rejected rather than
   normalized.
 - Graphics differentiation requires explicit versioned derivative rules for
   rasterization, visibility, depth, blending, and texture operations; ordinary

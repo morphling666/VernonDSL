@@ -1,5 +1,7 @@
 # Compiler design
 
+Status: current compiler architecture.
+
 ## Version policy
 
 `versions.toml` is the only manually edited version source. Vernon has three
@@ -21,8 +23,9 @@ component; third-party precompiled Provider/RHI plugins are not supported.
 
 Kernel native artifacts stay layout-polymorphic. Compiler analysis, kernel
 `specialize`, and compute `finalize` must not consume invoke-time extents.
-Borrowed dyn Storage keeps TensorView `vd.dyn` as `-1` on Value shape and
-`byte_length` `0` on the buffer descriptor; bind uses the provider buffer.
+Borrowed dynamic Storage keeps TensorView `vd.dyn` as `-1` on Value shape and
+omits unknown concrete extent from its descriptor; bind uses the provider
+resource descriptor.
 Do not restore a Python `specialize(shapes=...)` path for compute. Graphics
 `shape_facts` remain the way to materialize image/attachment extents at
 pipeline finalize.
@@ -167,7 +170,8 @@ implementation modules never circularly re-export those facades.
 
 ## Autodiff representation boundary
 
-The normative architecture is [`../autodiff.md`](../autodiff.md). Autodiff is a
+The normative contract is
+[`../autodiff/contract.md`](../autodiff/contract.md). Autodiff is a
 VJP transform of specialized, validated typed programs, not an arbitrary
 Python-object Tensor element model. The transform generates explicit primal,
 adjoint, and bounded tape representations with deterministic ABI and cache
@@ -294,8 +298,7 @@ the assignment from the source AST and must not import or execute the module.
 `program=` accepts one of these executable source forms:
 
 - one `@kernel` entry, which defines a compute Kernel program;
-- one non-empty tuple of graphics entry functions, which defines a graphics
-  Pipeline program;
+- one `vd.pipeline(...)` graphics pipeline;
 - one initialized `Module`;
 - one explicit Program transform such as VJP.
 
@@ -314,20 +317,19 @@ compute_asset = vd.program_asset(
 
 graphics_asset = vd.program_asset(
     id="pipeline/mesh",
-    program=(mesh_vertex, mesh_fragment),
+    program=vd.pipeline(mesh_vertex, mesh_fragment),
     variants=((), (SKIN,)),
 )
 ```
 
-Kernel is compute-only and Pipeline is graphics-only. A ProgramAsset cannot
-mix a Kernel entry with graphics entries. The previous
-compute-plus-vertex-plus-fragment Pipeline form is invalid.
+Kernel is compute-only and `vd.pipeline(...)` is graphics-only. An initialized
+Module may compose compute and graphics Nodes.
 
-Every graphics tuple member carries its stage kind through its decorator.
-Tuple position does not infer stage kind. A target-independent stage registry
-and topology rules validate the set and ordering. The current registry accepts
+Every graphics entry carries its stage kind through its decorator. Argument
+position does not infer stage kind. A target-independent stage registry and
+topology rules validate the set and ordering. The current registry accepts
 `vertex -> fragment`; future tessellation, task, mesh, or other graphics stages
-can use the same mechanism without changing `ProgramAsset` syntax or Program
+can use the same mechanism without changing Program
 structure. Unknown stages, duplicate singleton stages, invalid ordering, and
 incompatible stage families are program-validation errors. Stage topology is
 part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
@@ -361,7 +363,7 @@ is rejected.
 
 Program semantic topology, attachment operations, resource transitions, and
 forward/backward/residual AD topology belong to typed Program IR. The native
-the private runtime Command DAG consumes the resolved static graph and owns hazards,
+private runtime Command DAG consumes the resolved static graph and owns hazards,
 barriers, render-scope fusion, scheduling, and submission; it does not define a
 parallel deployment or AD topology. The target Program contract contains only
 static compute and graphics DAG nodes. Transfer and deployment control-flow
@@ -370,7 +372,7 @@ remains Kernel IR.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonProgramParameterView` remains ABI-stable.
-Pipeline 17 records the required texture dimension; format remains
+Program version 19 records the required texture dimension; format remains
 unconstrained.
 
 A target is reported as available only after its complete lowering and
@@ -734,8 +736,8 @@ is part of the stable Apple Silicon macOS compute and offscreen graphics
 subset. DirectX DXIL stage artifacts resolve through the Windows D3D12 runtime
 backend.
 
-Pipeline 17 is intentionally artifact-incompatible: loaders do not reinterpret
-old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
+Program version 19 is intentionally artifact-incompatible: loaders do not
+reinterpret old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
 Differentiated Programs contain forward and backward graphs plus residual and
 ProgramABI derivative-projection metadata. CPU cooking writes the same Program, a
 content-addressed relocatable `.o`/`.obj`, and generated static-registration
@@ -751,7 +753,7 @@ Each StageArtifact carries hash-covered `runtime_requirements` derived from
 its emitted object, GLSL/GLES, SPIR-V, PTX, MSL, or DXIL modules and portable
 reflection features. Each cooked variant carries the aggregate of only its
 reachable StageArtifacts.
-Each StageArtifact ID hashes the selected compiler/pipeline contract pair,
+Each StageArtifact ID hashes the selected compiler and Program contract pair,
 ArtifactSystem target, and its own requirements together with its code
 modules, entry points, and reflection.
 Code Blobs retain independent content hashes,
