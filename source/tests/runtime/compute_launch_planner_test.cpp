@@ -106,7 +106,7 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 3u);
     ASSERT_EQ(plan.hostTensorStorage.size(), 2u);
     const std::array<float, 2> expectedPacked{1, 2};
@@ -151,9 +151,10 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     VernonStageInvocationDescriptor invocation{};
     invocation.arguments = &supplied;
     invocation.argument_count = 1;
+    invocation.compute_grid = {3, 2, 1};
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
     const auto &firstPlan = std::get<ComputeTensorArgument>(plan.arguments[0]);
     EXPECT_EQ(firstPlan.resource.identity, resource.identity);
@@ -167,14 +168,15 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.shape = secondShape.data();
     supplied.tensor.byte_strides = secondStrides.data();
     supplied.tensor.byte_offset = 0;
-    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    invocation.compute_grid = {4, 2, 1};
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_TRUE(std::get<ComputeTensorArgument>(plan.arguments[0]).tensorView);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorExtent, 0, 1}), 4);
     EXPECT_EQ(*computeBindingDescriptorValue(plan.arguments[0], {ComputeBindingSourceKind::TensorStride, 0, 0}), 4);
 
     const std::array<uint64_t, 2> invalidStaticShape{3, 4};
     supplied.tensor.shape = invalidStaticShape.data();
-    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error,
               "pipeline Tensor argument '' TensorView descriptor violates static shape or element stride at axis 0");
 
@@ -182,7 +184,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     supplied.tensor.byte_strides = strides.data();
     supplied.tensor.byte_offset = 2 * sizeof(float);
     supplied.tensor.byte_size = 6 * sizeof(float);
-    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor argument '' at byte offset 8 requires 36 bytes but its allocation has 24");
 }
 
@@ -211,7 +213,7 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
     ASSERT_EQ(plan.arguments.size(), 1u);
     const auto &argument = std::get<ComputeTensorArgument>(plan.arguments.front());
     ASSERT_NE(argument.tensorView, nullptr);
@@ -251,7 +253,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
 
     PlannedComputeLaunch plan;
     std::string error;
-    ASSERT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    ASSERT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor argument access does not match reflection");
 }
 
@@ -281,7 +283,7 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
     invocation.compute_grid = {1, 1, 1};
     PlannedComputeLaunch plan;
     std::string error;
-    EXPECT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    EXPECT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "writable pipeline Tensor argument must have an injective byte layout");
 
     const std::array<int64_t, 1> sparseStride{2 * sizeof(float)};
@@ -293,17 +295,37 @@ TEST(ComputeLaunchPlannerTest, EnforcesInjectiveAndPairwisePhysicalTensorAliases
     supplied[1].tensor.byte_offset = sizeof(float);
     variant.parameters = {storageF32Parameter(0, 0, "read"), storageF32Parameter(1, 1, "write")};
     invocation.argument_count = 2;
-    ASSERT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    ASSERT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
 
     supplied[1].tensor.byte_offset = 2;
-    EXPECT_FALSE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error));
+    EXPECT_FALSE(planComputeInvocation(variant, invocation, plan, error));
     EXPECT_EQ(error, "pipeline Tensor arguments #0 and #1 have incompatible physical overlap "
                      "(offsets 0 and 2, element bytes 4 and 4, ranks 1 and 1, first strides 8 and 8)");
 
     supplied[0].tensor.access = VERNON_ACCESS_READ;
     supplied[1].tensor.access = VERNON_ACCESS_READ;
     variant.parameters[1].access = "read";
-    EXPECT_TRUE(planComputeInvocation(variant, {1, 1, 1}, invocation, plan, error)) << error;
+    EXPECT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+}
+
+TEST(ComputeLaunchPlannerTest, RequiresEveryExplicitGridAxisWithoutTensorInference) {
+    Variant variant;
+    VernonStageInvocationDescriptor invocation{};
+    PlannedComputeLaunch plan;
+    std::string error;
+    EXPECT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "compute grid axis x must be nonzero");
+    invocation.compute_grid = {1, 0, 1};
+    EXPECT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "compute grid axis y must be nonzero");
+    invocation.compute_grid = {1, 1, 0};
+    EXPECT_FALSE(planComputeInvocation(variant, invocation, plan, error));
+    EXPECT_EQ(error, "compute grid axis z must be nonzero");
+    invocation.compute_grid = {2, 3, 4};
+    EXPECT_TRUE(planComputeInvocation(variant, invocation, plan, error)) << error;
+    EXPECT_EQ(plan.grid.x, 2u);
+    EXPECT_EQ(plan.grid.y, 3u);
+    EXPECT_EQ(plan.grid.z, 4u);
 }
 
 } // namespace

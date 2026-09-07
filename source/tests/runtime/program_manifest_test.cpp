@@ -807,7 +807,6 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
                                              {"descriptor",
                                               {{"tag", "image"},
                                                {"dimension", "2d"},
-                                               {"extent", nlohmann::json::array({32, 32, 1})},
                                                {"format", "rgba8_unorm"},
                                                {"sample_count", 1},
                                                {"mip_levels", 1},
@@ -931,6 +930,14 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalGraphicsAttachment) {
         << diagnostic.message;
     EXPECT_EQ(vernon::runtime::program::executionKind(resolved.program.graphs.front().nodes.front()),
               vernon::runtime::program::ExecutionKind::Graphics);
+    nlohmann::json placeholder = manifest;
+    placeholder["storages"][0]["descriptor"]["extent"] = nlohmann::json::array({0, 0, 1});
+    placeholder["abi"]["boundary_slots"][0]["storage_descriptor"] = placeholder["storages"][0]["descriptor"];
+    placeholder["abi"]["boundary_slots"][1]["storage_descriptor"] = placeholder["storages"][0]["descriptor"];
+    vernon::runtime::program::Program rejected;
+    EXPECT_FALSE(vernon::runtime::program::parse(placeholder, rejected, diagnostic));
+    EXPECT_FALSE(diagnostic.code.empty());
+    EXPECT_NE(diagnostic.path.find("/descriptor"), std::string::npos);
 }
 
 } // namespace

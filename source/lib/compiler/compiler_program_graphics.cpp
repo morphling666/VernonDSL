@@ -399,9 +399,8 @@ bool buildCanonicalGraphicsOperation(const llvm::json::Object &node, const llvm:
                 ? storages[static_cast<size_t>(resource.storage)].getAsObject()
                 : nullptr;
         const llvm::json::Object *descriptor = storage ? storage->getObject("descriptor") : nullptr;
-        const llvm::json::Array *extent = descriptor ? descriptor->getArray("extent") : nullptr;
-        if (!descriptor || descriptor->getString("tag") != "image" || !extent || extent->size() < 2) {
-            error = ("canonical graphics " + role + " requires a concrete image Storage").str();
+        if (!descriptor || descriptor->getString("tag") != "image") {
+            error = ("canonical graphics " + role + " requires an image Storage").str();
             return std::nullopt;
         }
         return AttachmentImage{*valueId, *access, descriptor, descriptor->getString("format").value_or("").str()};

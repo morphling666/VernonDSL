@@ -28,6 +28,7 @@ from ..program_frontend import (
     ProviderChain,
 )
 from .capture import CapturedProgram
+from .deployment_validation import validate_canonical_deployment
 
 
 def _native_module() -> Any:
@@ -339,6 +340,7 @@ def _compile_program_variant(
     contracts = finalized_reflection.get("stage_contracts")
     if not isinstance(canonical_program, Mapping) or not isinstance(contracts, Mapping):
         raise ProgramCompileError("C++ Program finalization returned no canonical deployment")
+    validate_canonical_deployment(canonical_program)
     reflected_target = reflected_targets.pop()
     if set(contracts) != set(stages) or any(not isinstance(contract, Mapping) for contract in contracts.values()):
         raise ProgramCompileError("canonical stage contracts do not exactly cover logical compute requests")

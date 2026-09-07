@@ -775,7 +775,7 @@ class BarePipelineAssetCookTests(unittest.TestCase):
             for storage in program["storages"]
             if "tag" in storage["descriptor"]
         }
-        self.assertEqual(storages["image"]["extent"], [0, 0, 1], "the attachment extent is chosen per invocation")
+        self.assertNotIn("extent", storages["image"], "borrowed attachment extent comes from each bound image view")
         self.assertEqual(storages["buffer"]["byte_length"], 0, "the vertex count is chosen per invocation")
         self.assertIn("vertex", storages["buffer"]["usage"])
 

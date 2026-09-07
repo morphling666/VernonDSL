@@ -51,8 +51,13 @@ inline bool parseDispatchContract(const nlohmann::json &entry, DispatchContract 
 inline bool validateDispatchContract(const DispatchContract &contract, const uint32_t grid[3],
                                      const uint32_t workgroup[3], std::string &error) {
     for (unsigned axis = 0; axis < 3; ++axis) {
-        if (!grid[axis] || !workgroup[axis]) {
-            error = "compute dispatch dimensions must be positive";
+        constexpr const char *axisNames[] = {"x", "y", "z"};
+        if (!grid[axis]) {
+            error = "compute grid axis " + std::string(axisNames[axis]) + " must be nonzero";
+            return false;
+        }
+        if (!workgroup[axis]) {
+            error = "compute workgroup axis " + std::string(axisNames[axis]) + " must be nonzero";
             return false;
         }
         if (contract.unitGridAxes[axis] && grid[axis] != 1) {

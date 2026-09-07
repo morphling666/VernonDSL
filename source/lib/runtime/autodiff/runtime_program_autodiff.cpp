@@ -217,7 +217,8 @@ public:
             return fail(*context_, "injected Program pullback allocation failure");
 
         ProgramInvocationState values(*topology_, std::move(storage), std::move(storageBackings));
-        if (!state_->importInto(values, tapeScratch, !replay, error))
+        if (!state_->importInto(values, tapeScratch, !replay, error) ||
+            !values.allocateOwnedImageStorages(*context_, execution, error))
             return fail(*context_, error);
         if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
             return fail(*context_, "injected Program pullback tape validation failure");
@@ -471,7 +472,7 @@ public:
 
     const Signature &signature() const override { return signature_; }
 
-    VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize, const VernonAdValueSet &inputs,
+    VernonStatus forward(const ForwardExecutionTarget &target, const VernonAdValueSet &inputs,
                          VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) override {
         const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
         const program::Program *execution =
@@ -508,6 +509,8 @@ public:
              !transferLeaves(inputs, signature_.inputs, inputBindings_, hostStorage, nullptr, error)))
             return fail(*context_, error);
         ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
+        if (!arena.allocateOwnedImageStorages(*context_, *execution, error))
+            return fail(*context_, error);
         if (const VernonStatus initialization =
                 program_execution::executePublicationInitialization(*context_, publication, error);
             initialization != VERNON_STATUS_OK)

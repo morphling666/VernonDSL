@@ -1,6 +1,7 @@
 #include "../../lib/rhi/metal_backend.h"
 #include "../../lib/rhi/rhi_internal.h"
 #include "../../lib/rhi/sampler_filter.h"
+#include "../../lib/runtime/program_execution/program_image_binding.h"
 #include "../../lib/runtime/rhi_adapter/adapter_test_hooks.h"
 #include "../../lib/runtime/runtime_dispatch.h"
 #include "../../lib/runtime/runtime_test_hooks.h"
@@ -41,6 +42,71 @@ bool supportsMetalArgumentBufferEncoding(VernonRhiDevice device) {
 bool supportsMetalArgumentBuffersTier2(VernonRhiDevice device) {
     const auto *state = metalDeviceState(device);
     return state && state->argumentBufferEncodingSupported && state->argumentBuffersTier >= MTLArgumentBuffersTier2;
+}
+
+TEST(RuntimeMetal, ResolvesBorrowedProgramImageExtentPerInvocation) {
+    VernonRhiDevice device = createMetalDevice();
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << "Metal is unavailable";
+    VernonRuntimeContext *runtime = vernonRuntimeCreateForRhiDevice(VERNON_RUNTIME_METAL, device);
+    ASSERT_NE(runtime, nullptr);
+    vernon::runtime::program::Storage storage;
+    storage.ownership = vernon::runtime::program::StorageOwnership::Borrowed;
+    storage.descriptorKind = vernon::runtime::program::StorageDescriptorKind::Image;
+    storage.image.dimension = "2d";
+    storage.image.format = "rgba8_unorm";
+    storage.image.sampleCount = 1;
+    storage.image.mipLevels = 1;
+    storage.image.arrayLayers = 1;
+    storage.image.aspects = {"color"};
+    storage.image.usage = {"color_attachment"};
+
+    const auto resolveExtent = [&](uint32_t width, uint32_t height,
+                                   vernon::runtime::program_execution::BoundProgramImage &resolved) {
+        VernonRhiImageDescriptor imageDescriptor{};
+        imageDescriptor.struct_size = sizeof(imageDescriptor);
+        imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+        imageDescriptor.width = width;
+        imageDescriptor.height = height;
+        imageDescriptor.depth = 1;
+        imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+        imageDescriptor.mip_levels = 1;
+        imageDescriptor.array_layers = 1;
+        imageDescriptor.sample_count = 1;
+        imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
+        VernonRhiImage image{};
+        EXPECT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+        VernonRhiImageViewDescriptor viewDescriptor{};
+        viewDescriptor.struct_size = sizeof(viewDescriptor);
+        viewDescriptor.image = image;
+        viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+        viewDescriptor.format = imageDescriptor.format;
+        viewDescriptor.mip_level_count = 1;
+        viewDescriptor.array_layer_count = 1;
+        viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+        VernonRhiImageView view{};
+        EXPECT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+        VernonRuntimeProviderResourceReference reference{};
+        EXPECT_EQ(vernonRuntimeReferenceRhiImageView(runtime, view, &reference), VERNON_STATUS_OK);
+        std::string error;
+        EXPECT_TRUE(vernon::runtime::program_execution::resolveBorrowedProgramImage(*runtime, storage, reference,
+                                                                                    resolved, error))
+            << error;
+        EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+    };
+
+    vernon::runtime::program_execution::BoundProgramImage first;
+    vernon::runtime::program_execution::BoundProgramImage second;
+    resolveExtent(8, 4, first);
+    resolveExtent(31, 17, second);
+    EXPECT_EQ(first.image.width, 8u);
+    EXPECT_EQ(first.image.height, 4u);
+    EXPECT_EQ(second.image.width, 31u);
+    EXPECT_EQ(second.image.height, 17u);
+    EXPECT_TRUE(storage.image.extent.empty());
+    vernonRuntimeDestroy(runtime);
+    vernonRhiDestroyDevice(device);
 }
 
 } // namespace

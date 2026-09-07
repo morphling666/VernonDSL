@@ -58,8 +58,8 @@ bool checkAttachmentFormat(const program::GraphicsAttachmentSignature &signature
 
 } // namespace
 
-bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedExecutionPlan &resolved,
+bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const program::Program &program,
+                                         const program::Graph &graph, const program::ResolvedExecutionPlan &resolved,
                                          program_execution::ProgramInvocationState &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error) {
     const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
@@ -97,7 +97,7 @@ bool bindProgramGraphicsControlResources(const program::Program &program, const 
                     return error = "managed graphics node requires a depth-stencil attachment", false;
                 view = renderPass->depth_attachment->view;
             }
-            return invocation.bindControlImageStorage(program, attachment.storage, view, error);
+            return invocation.bindControlImageStorage(context, program, attachment.storage, view, error);
         };
         for (const program::ResolvedGraphicsAttachment &attachment : controls->colorAttachments)
             if (!bind(attachment))

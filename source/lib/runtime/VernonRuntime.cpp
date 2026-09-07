@@ -988,6 +988,10 @@ size_t vernonRuntimeStageExecutableGetParameterCount(const VernonStageExecutable
     return stage ? stage->bindingProjection.parameters.size() : 0;
 }
 
+uint32_t vernonRuntimeStageExecutableIsCompute(const VernonStageExecutable *stage) {
+    return stage && !stage->bindingProjection.compute.empty();
+}
+
 VernonStatus vernonRuntimeStageExecutableGetParameterByIndex(const VernonStageExecutable *stage, size_t index,
                                                              VernonProgramParameterView *parameter) {
     if (!stage || !parameter || index >= stage->bindingProjection.parameters.size())
@@ -1208,7 +1212,7 @@ public:
                 bindTape(result);
             vernon::runtime::setCpuProgramTape(pipeline_, allocator, root);
         }
-        if (!planComputeInvocation(pipeline_.bindingProjection, pipeline_.workgroupSize, invocation, plan, error)) {
+        if (!planComputeInvocation(pipeline_.bindingProjection, invocation, plan, error)) {
             invocationDiagnostic(*pipeline_.context) = std::move(error);
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         }
@@ -1327,7 +1331,7 @@ VernonStatus executePipelineProgramGraphImpl(
     };
     std::string controlBindingError;
     if (!bindProgramGraphicsControlResources(
-            canonicalProgram, graph, execution, arena,
+            *pipeline.context, canonicalProgram, graph, execution, arena,
             [&](uint32_t slot) -> const VernonRenderPass * {
                 auto renderPass = control(slot, RuntimeProgramControl::RenderPass);
                 if (!renderPass)
@@ -1547,10 +1551,22 @@ VernonStatus executePipelineProgramGraphImpl(
                                                                       materializationError))
             return fail(pipeline.context, std::move(materializationError));
         uint64_t controlGrid[3]{};
-        for (size_t axis = 0; axis < 3; ++axis)
-            if (!arena.resolveControl(canonicalProgram, program::computeOperation(node).workgroups[axis],
-                                      controlGrid[axis], materializationError))
-                return fail(pipeline.context, std::move(materializationError));
+        constexpr const char *axisNames[] = {"x", "y", "z"};
+        for (size_t axis = 0; axis < 3; ++axis) {
+            const program::ControlComponent &component = program::computeOperation(node).workgroups[axis];
+            const std::string source = component.kind == program::ControlKind::Static ? "static declaration"
+                                       : component.kind == program::ControlKind::Value
+                                           ? "Value " + std::to_string(component.reference)
+                                       : component.kind == program::ControlKind::Capture
+                                           ? "captured Value " + std::to_string(component.reference)
+                                           : "parameter " + std::to_string(component.reference);
+            if (!arena.resolveControl(canonicalProgram, component, controlGrid[axis], materializationError))
+                return fail(pipeline.context, "Program compute grid axis " + std::string(axisNames[axis]) + " from " +
+                                                  source + " failed: " + materializationError);
+            if (!controlGrid[axis] || controlGrid[axis] > UINT32_MAX)
+                return fail(pipeline.context, "Program compute grid axis " + std::string(axisNames[axis]) + " from " +
+                                                  source + " must be in [1, UINT32_MAX]");
+        }
         VernonLaunchSize grid{};
         const auto *computeControls = std::get_if<program::ResolvedComputeControls>(&resolvedNode->controls);
         if (!computeControls || !resolveProgramGrid(computeControls->dispatchMapping, controlGrid,
@@ -1587,7 +1603,7 @@ VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const Vernon
             return VERNON_STATUS_INVALID_ARGUMENT;
         PlannedComputeLaunch plan;
         std::string planningError;
-        if (!planComputeInvocation(pipeline.bindingProjection, pipeline.workgroupSize, invocation, plan, planningError))
+        if (!planComputeInvocation(pipeline.bindingProjection, invocation, plan, planningError))
             return fail(pipeline.context, planningError);
         return invokeBackendComputePipeline(pipeline, plan);
     }

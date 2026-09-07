@@ -367,45 +367,68 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             llvm::json::Array extent;
             llvm::json::Array dynamicExtents;
             bool hasDynamic = false;
-            for (size_t axis = 0; axis < spatialRank; ++axis)
-                if (axis < shape->size() && isDynamicProgramExtent((*shape)[axis]))
+            for (size_t axis = 0; axis < shape->size(); ++axis) {
+                const std::optional<int64_t> component = (*shape)[axis].getAsInteger();
+                if (!component || *component == 0 || *component < -1) {
+                    error = "canonical Program image extent must be positive or a dynamic source extent";
+                    return false;
+                }
+                if (*component == -1)
                     hasDynamic = true;
+            }
             if (hasDynamic && !borrowed &&
                 !planOwnedDynamicExtents(rawValues, root, allocationGraph, captureLegal, *shape, index.argumentSlots,
                                          capturedValues, index.producerByValue, index.storageParents, dynamicExtents,
                                          error))
                 return false;
-            for (size_t axis = 0; axis < 3; ++axis) {
-                const size_t sourceAxis = spatialRank > axis ? spatialRank - axis - 1 : spatialRank;
-                if (sourceAxis >= spatialRank) {
-                    extent.emplace_back(int64_t{1});
-                    continue;
-                }
-                const llvm::json::Value *planned = sourceAxis < shape->size() ? &(*shape)[sourceAxis] : nullptr;
-                if (planned && !isDynamicProgramExtent(*planned))
-                    extent.emplace_back(*planned->getAsInteger());
-                else if (borrowed)
-                    extent.emplace_back(int64_t{0});
-                else if (sourceAxis < dynamicExtents.size())
-                    extent.emplace_back(dynamicExtents[sourceAxis]);
-                else {
-                    error = "owned Program texture requires a concrete extent";
-                    return false;
+            if (!borrowed) {
+                for (size_t axis = 0; axis < 3; ++axis) {
+                    const size_t sourceAxis = spatialRank > axis ? spatialRank - axis - 1 : spatialRank;
+                    if (sourceAxis >= spatialRank) {
+                        extent.emplace_back(int64_t{1});
+                        continue;
+                    }
+                    const llvm::json::Value *planned = sourceAxis < shape->size() ? &(*shape)[sourceAxis] : nullptr;
+                    if (planned && planned->getAsInteger().value_or(-1) > 0)
+                        extent.emplace_back(*planned->getAsInteger());
+                    else if (sourceAxis < dynamicExtents.size())
+                        extent.emplace_back(dynamicExtents[sourceAxis]);
+                    else {
+                        error = "owned Program texture requires a concrete extent";
+                        return false;
+                    }
                 }
             }
             const bool colorAttachment = colorAttachmentRoots.count(root);
             const bool depthAttachment = depthAttachmentRoots.count(root);
+            bool computeImage = false;
+            for (const auto &[stageName, resources] : index.resourcesByStage) {
+                const auto compiled = index.compiledByRequest.find(stageName);
+                if (compiled == index.compiledByRequest.end() ||
+                    compiled->second->operation != ProgramStageOperation::Compute)
+                    continue;
+                computeImage |= llvm::any_of(resources, [&](const auto &entry) {
+                    const auto owner = plan.aliases.ownerByValue.find(entry.second.before);
+                    return owner != plan.aliases.ownerByValue.end() && owner->second.value == root;
+                });
+            }
+            llvm::json::Array usage;
+            if (colorAttachment)
+                usage.emplace_back("color_attachment");
+            else if (depthAttachment)
+                usage.emplace_back("depth_stencil_attachment");
+            else if (computeImage)
+                usage.emplace_back("storage");
             descriptor = llvm::json::Object{{"tag", "image"},
                                             {"dimension", fields[0]},
-                                            {"extent", std::move(extent)},
                                             {"format", fields[1]},
                                             {"sample_count", int64_t{1}},
                                             {"mip_levels", int64_t{1}},
                                             {"array_layers", int64_t{1}},
                                             {"aspects", llvm::json::Array{depthAttachment ? "depth" : "color"}},
-                                            {"usage", llvm::json::Array{colorAttachment   ? "color_attachment"
-                                                                        : depthAttachment ? "depth_stencil_attachment"
-                                                                                          : "storage"}}};
+                                            {"usage", std::move(usage)}};
+            if (!borrowed)
+                descriptor["extent"] = std::move(extent);
         } else if (isProgramSamplerType(type) || isProgramAdTapeType(type)) {
             descriptor = llvm::json::Object{
                 {"tag", "opaque"},

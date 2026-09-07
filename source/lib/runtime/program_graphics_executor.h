@@ -13,8 +13,8 @@ namespace vernon::runtime {
 
 using ResolveProgramRenderPass = std::function<const VernonRenderPass *(uint32_t control)>;
 
-bool bindProgramGraphicsControlResources(const program::Program &program, const program::Graph &graph,
-                                         const program::ResolvedExecutionPlan &resolved,
+bool bindProgramGraphicsControlResources(VernonRuntimeContext &context, const program::Program &program,
+                                         const program::Graph &graph, const program::ResolvedExecutionPlan &resolved,
                                          program_execution::ProgramInvocationState &invocation,
                                          const ResolveProgramRenderPass &resolveRenderPass, std::string &error);
 

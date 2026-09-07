@@ -1,5 +1,6 @@
 #include "program_boundary_binder.h"
 
+#include "runtime/program_execution/program_image_binding.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_dispatch.h"
@@ -167,6 +168,22 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             return false;
         }
         const program::ProgramOwnerId &owner = boundary.aliasOwner;
+        if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
+            if (owner.kind != program::ProgramOwnerKind::Storage || owner.id >= execution.storages.size()) {
+                error = "Program image boundary does not reference Storage";
+                return false;
+            }
+            const program::Storage &storage = execution.storages[owner.id];
+            if (storage.ownership == program::StorageOwnership::Borrowed) {
+                program_execution::BoundProgramImage resolvedImage;
+                if (!program_execution::resolveBorrowedProgramImage(context, storage, supplied->second->image.view,
+                                                                    resolvedImage, error))
+                    return false;
+            } else if (boundary.role != program::BoundaryRole::Output) {
+                error = "owned Program image Storage cannot be supplied as an input boundary";
+                return false;
+            }
+        }
         if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
             for (const auto &[boundOwner, tensor] : tensorOwners)
                 if ((boundOwner.kind != owner.kind || boundOwner.id != owner.id) &&

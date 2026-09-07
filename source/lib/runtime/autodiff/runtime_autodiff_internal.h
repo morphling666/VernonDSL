@@ -112,9 +112,8 @@ class CanonicalProgramExecution {
 public:
     virtual ~CanonicalProgramExecution() = default;
     virtual const Signature &signature() const = 0;
-    virtual VernonStatus forward(const ForwardExecutionTarget &target, VernonLaunchSize computeGrid,
-                                 const VernonAdValueSet &inputs, VernonAdValueSet *outputs,
-                                 std::unique_ptr<PullbackExecution> &pullback) = 0;
+    virtual VernonStatus forward(const ForwardExecutionTarget &target, const VernonAdValueSet &inputs,
+                                 VernonAdValueSet *outputs, std::unique_ptr<PullbackExecution> &pullback) = 0;
 };
 
 size_t dtypeSize(VernonDataType dtype);

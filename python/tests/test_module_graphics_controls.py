@@ -747,6 +747,41 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         finally:
             vd.init(arch=vd.cpu)
 
+    def test_real_metal_reuses_one_program_across_attachment_extents_and_dynamic_states(self) -> None:
+        try:
+            vd.init(arch=vd.metal)
+        except RuntimeUnavailableError as error:
+            self.skipTest(f"Metal runtime unavailable: {error}")
+        try:
+            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
+                access="read"
+            )
+            module = ManagedGraphics()
+            executable_identity = None
+            manifest_snapshot = None
+            for size, stencil in ((8, 3), (16, 9)):
+                texture = vd.Texture.zeros(shape=(size, size))
+                module(
+                    vertices,
+                    vd.render_pass(
+                        vd.RenderTarget.from_attachments(colors={0: texture}),
+                        color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+                    ),
+                    vd.draw(vertex_count=3),
+                    vd.dynamic_state(viewport=(0, 0, size, size), stencil_reference=stencil),
+                )
+                self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+                self.assertEqual(len(module._program_cache), 1)
+                specialization = next(iter(module._program_cache.values()))
+                if executable_identity is None:
+                    executable_identity = id(specialization.native_program)
+                    manifest_snapshot = repr(specialization.invocation.graph)
+                else:
+                    self.assertEqual(id(specialization.native_program), executable_identity)
+                    self.assertEqual(repr(specialization.invocation.graph), manifest_snapshot)
+        finally:
+            vd.init(arch=vd.cpu)
+
 
 declared_pipeline = vd.pipeline(
     managed_vertex,
@@ -808,7 +843,7 @@ class DeclaredTargetFormatTests(unittest.TestCase):
             storage["descriptor"] for storage in canonical["storages"] if storage["descriptor"].get("tag") == "image"
         ]
         self.assertEqual(images[0]["format"], "rgba16_float")
-        self.assertEqual(images[0]["extent"], [0, 0, 1], "the attachment extent is an invocation fact")
+        self.assertNotIn("extent", images[0], "borrowed attachment extent comes from each invocation")
 
     def test_capture_without_declared_formats_or_a_render_pass_is_refused(self) -> None:
         with self.assertRaisesRegex(TypeError, "requires vd.pipeline\\(\\.\\.\\., targets="):

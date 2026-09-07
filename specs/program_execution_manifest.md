@@ -617,11 +617,14 @@ Python launch shape into the descriptor.
 `alignment` is a positive power of two. `memory` and `usage` use enums defined
 in Appendix B.
 
-Image `dimension` is REQUIRED and is `1d`, `2d`, `3d`, or `cube`. `extent`
-has exactly three non-negative components. `0` on an axis is legal only on
-borrowed Storage and means that axis is TensorView dyn (same as Value `.shape`
-`-1`). Canonical static shapes are `1d = [W,1,1]`, `2d = [W,H,1]`,
-`cube = [W,H,1]` with `W = H`, and `3d = [W,H,D]`.
+Image `dimension` is REQUIRED and is `1d`, `2d`, `3d`, or `cube`. Owned image
+Storage MUST contain `extent` with exactly three positive literal or
+ControlExpr components; it is allocation authority. Borrowed image Storage
+MUST omit `extent`: its concrete extent is taken from the image view bound to
+the current invocation. Zero, negative, null, empty-array, and other
+placeholder image extents are invalid. Canonical owned static shapes are
+`1d = [W,1,1]`, `2d = [W,H,1]`, `cube = [W,H,1]` with `W = H`, and
+`3d = [W,H,D]`.
 Format, sample count, mip levels, array layers, aspects, and usage are exact
 creation or provider requirements. Opaque contract identity is exact; opaque
 storage has no byte range, image subresource, or ValueLayout.
@@ -631,6 +634,9 @@ runtime creates it at the start of its declared lifetime and MUST NOT replace
 it with a merely compatible resource. For borrowed Storage, the descriptor is
 a provider constraint checked before first use; the runtime MUST NOT recreate,
 resize, reformat, migrate, or assume ownership of the provider resource.
+Borrowed descriptor validation and extent resolution are repeated from the
+current binding on every invocation; neither the Bundle, Executable, nor
+ResolvedExecutionPlan is specialized or mutated with invocation dimensions.
 
 `invocation` lifetime is fresh per call, `instance` lifetime belongs to one
 Program instance, and `pullback` lifetime belongs to PullbackState. Borrowed

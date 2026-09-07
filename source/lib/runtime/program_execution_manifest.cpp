@@ -733,12 +733,19 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                             "usage must be sorted and unique");
         } else if (descriptorTag == "image") {
             storage.descriptorKind = StorageDescriptorKind::Image;
-            if (!exactObject(descriptor,
-                             {"tag", "dimension", "extent", "format", "sample_count", "mip_levels", "array_layers",
-                              "aspects", "usage"},
-                             {}, diagnostic, path + "/descriptor") ||
-                !descriptor["dimension"].is_string() || !descriptor["extent"].is_array() ||
-                descriptor["extent"].size() != 3 || !descriptor["format"].is_string() ||
+            const bool borrowedImage = storage.ownership == StorageOwnership::Borrowed;
+            const bool exactDescriptor = borrowedImage
+                                             ? exactObject(descriptor,
+                                                           {"tag", "dimension", "format", "sample_count", "mip_levels",
+                                                            "array_layers", "aspects", "usage"},
+                                                           {}, diagnostic, path + "/descriptor")
+                                             : exactObject(descriptor,
+                                                           {"tag", "dimension", "extent", "format", "sample_count",
+                                                            "mip_levels", "array_layers", "aspects", "usage"},
+                                                           {}, diagnostic, path + "/descriptor");
+            if (!exactDescriptor || !descriptor["dimension"].is_string() ||
+                (!borrowedImage && (!descriptor["extent"].is_array() || descriptor["extent"].size() != 3)) ||
+                !descriptor["format"].is_string() ||
                 !uint32Value(descriptor["sample_count"], storage.image.sampleCount) ||
                 !uint32Value(descriptor["mip_levels"], storage.image.mipLevels) ||
                 !uint32Value(descriptor["array_layers"], storage.image.arrayLayers) || !storage.image.sampleCount ||
@@ -748,24 +755,20 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                             "invalid static image descriptor");
             storage.image.dimension = descriptor["dimension"].get<std::string>();
             storage.image.format = descriptor["format"].get<std::string>();
-            const bool borrowedImage = storage.ownership == StorageOwnership::Borrowed;
-            for (size_t axis = 0; axis < descriptor["extent"].size(); ++axis) {
-                ControlComponent component;
-                if (!parseExtentComponent(descriptor["extent"][axis], component, diagnostic,
-                                          path + "/descriptor/extent/" + std::to_string(axis), borrowedImage))
-                    return false;
-                if (component.kind == ControlKind::Static) {
-                    storage.image.extent.push_back(component.value);
-                } else {
-                    if (borrowedImage)
-                        return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse",
-                                    path + "/descriptor/extent/" + std::to_string(axis),
-                                    "borrowed image extent uses 0 for dyn, not a control component");
-                    storage.image.extent.push_back(0);
-                    storage.image.extentControls.resize(3);
-                    storage.image.extentControls[axis] = component;
+            if (!borrowedImage)
+                for (size_t axis = 0; axis < descriptor["extent"].size(); ++axis) {
+                    ControlComponent component;
+                    if (!parseExtentComponent(descriptor["extent"][axis], component, diagnostic,
+                                              path + "/descriptor/extent/" + std::to_string(axis), false))
+                        return false;
+                    if (component.kind == ControlKind::Static) {
+                        storage.image.extent.push_back(component.value);
+                    } else {
+                        storage.image.extent.push_back(0);
+                        storage.image.extentControls.resize(3);
+                        storage.image.extentControls[axis] = component;
+                    }
                 }
-            }
             if (!storage.image.extentControls.empty())
                 for (size_t axis = 0; axis < storage.image.extent.size(); ++axis)
                     if (storage.image.extentControls.size() <= axis ||

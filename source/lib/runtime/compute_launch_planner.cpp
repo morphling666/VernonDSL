@@ -44,7 +44,7 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
     return true;
 }
 
-bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments, VernonLaunchSize workgroup,
+bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &arguments,
                           const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
                           std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
@@ -146,44 +146,12 @@ bool planComputeArguments(const Variant &variant, const ComputeArgumentMap &argu
 
     plan.commandEncoder = invocation.command_encoder;
     plan.grid = invocation.compute_grid;
-    if (!plan.grid.x || !plan.grid.y || !plan.grid.z) {
-        for (const Parameter &parameter : variant.parameters) {
-            const auto argumentIt = arguments.find(parameter.slot);
-            if (argumentIt == arguments.end())
-                continue;
-            const VernonProgramArgument &argument = *argumentIt->second;
-            if (argument.kind != VERNON_PROGRAM_TENSOR ||
-                (argument.tensor.storage != VERNON_TENSOR_RHI_RESOURCE &&
-                 argument.tensor.storage != VERNON_TENSOR_HOST) ||
-                (argument.tensor.rank && !argument.tensor.shape))
-                continue;
-            const uint32_t rank = argument.tensor.rank;
-            if (!rank) {
-                plan.grid = {1, 1, 1};
-                break;
-            }
-            const uint32_t gridDimensions = rank < 3 ? rank : 3;
-            for (uint32_t dimension = 0; dimension < gridDimensions; ++dimension) {
-                if (!argument.tensor.shape[rank - 1 - dimension] ||
-                    argument.tensor.shape[rank - 1 - dimension] > std::numeric_limits<uint32_t>::max())
-                    return fail(error, "inferred compute grid exceeds uint32 range");
-            }
-            if (!workgroup.x || !workgroup.y || !workgroup.z)
-                return fail(error, "compute workgroup size is invalid");
-            const auto groups = [](uint64_t extent, uint32_t size) {
-                return static_cast<uint32_t>((extent - 1) / size + 1);
-            };
-            plan.grid = {1, 1, 1};
-            plan.grid.x = groups(argument.tensor.shape[rank - 1], workgroup.x);
-            if (rank > 1)
-                plan.grid.y = groups(argument.tensor.shape[rank - 2], workgroup.y);
-            if (rank > 2)
-                plan.grid.z = groups(argument.tensor.shape[rank - 3], workgroup.z);
-            break;
-        }
-    }
-    if (!plan.grid.x || !plan.grid.y || !plan.grid.z)
-        return fail(error, "compute grid cannot be inferred");
+    if (!plan.grid.x)
+        return fail(error, "compute grid axis x must be nonzero");
+    if (!plan.grid.y)
+        return fail(error, "compute grid axis y must be nonzero");
+    if (!plan.grid.z)
+        return fail(error, "compute grid axis z must be nonzero");
     return true;
 }
 
@@ -219,9 +187,8 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
     return std::nullopt;
 }
 
-bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
-                           const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
-                           std::string &error) {
+bool planComputeInvocation(const Variant &variant, const VernonStageInvocationDescriptor &invocation,
+                           PlannedComputeLaunch &plan, std::string &error) {
     ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
         if (!arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
@@ -319,7 +286,7 @@ bool planComputeInvocation(const Variant &variant, VernonLaunchSize workgroup,
                                std::to_string(tensors[left]->rank ? tensors[left]->byte_strides[0] : 0) + " and " +
                                std::to_string(tensors[right]->rank ? tensors[right]->byte_strides[0] : 0) + ")",
                        false;
-    return planComputeArguments(variant, arguments, workgroup, invocation, plan, error);
+    return planComputeArguments(variant, arguments, invocation, plan, error);
 }
 
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error) {

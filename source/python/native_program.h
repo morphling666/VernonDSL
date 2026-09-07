@@ -602,11 +602,6 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
-    ProgramInvocationBuilder &grid(uint32_t x, uint32_t y, uint32_t z) {
-        computeGrid = {x, y, z};
-        return *this;
-    }
-
     ProgramInvocationBuilder &setViewport(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
         viewport[0] = x;
         viewport[1] = y;
@@ -691,7 +686,6 @@ struct ProgramInvocationBuilder {
         invocation.abi_version = VERNON_PROGRAM_VERSION;
         invocation.arguments = values.empty() ? nullptr : values.data();
         invocation.argument_count = values.size();
-        invocation.compute_grid = computeGrid;
         invocation.graphics_state = hasGraphicsState ? &graphicsState : nullptr;
         if (hasGraphicsState) {
             renderPass = {};
@@ -776,7 +770,6 @@ struct ProgramInvocationBuilder {
     VernonPrimitiveTopology topology{VERNON_TOPOLOGY_TRIANGLE_LIST};
     uint32_t vertexCount{};
     uint32_t instanceCount{};
-    VernonLaunchSize computeGrid{};
     uint32_t viewport[4]{};
     uint32_t scissor[4]{};
     VernonGraphicsState graphicsState{};

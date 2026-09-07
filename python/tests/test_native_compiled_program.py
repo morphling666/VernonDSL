@@ -432,6 +432,10 @@ class CompiledProgramTests(unittest.TestCase):
         values = vd.storage.from_numpy(np.array([2.0, 4.0, 6.0], dtype=np.float32))
         invocation = pipeline.invocation_builder()
         invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
+        with self.assertRaisesRegex(ValueError, "compute Stage submission requires an explicit grid"):
+            invocation.submit()
+        with self.assertRaisesRegex(ValueError, "compute grid axis x must be nonzero"):
+            invocation.grid(0, 1, 1)
         invocation.grid(3, 1, 1).submit().wait()
         np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
 

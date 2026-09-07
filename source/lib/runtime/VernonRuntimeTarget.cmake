@@ -274,6 +274,7 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/VernonRuntime.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_graphics_executor.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_invocation_state.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_image_binding.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/materialized_node_frame.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/program_tensor_copy.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution/publication_transaction.cpp

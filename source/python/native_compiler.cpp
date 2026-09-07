@@ -295,8 +295,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("topology", &ProgramInvocationBuilder::setTopology, nb::arg("topology"), nb::rv_policy::reference_internal)
         .def("counts", &ProgramInvocationBuilder::counts, nb::arg("vertex_count") = 0, nb::arg("instance_count") = 0,
              nb::rv_policy::reference_internal)
-        .def("grid", &ProgramInvocationBuilder::grid, nb::arg("x"), nb::arg("y"), nb::arg("z"),
-             nb::rv_policy::reference_internal)
         .def("viewport", &ProgramInvocationBuilder::setViewport, nb::arg("x"), nb::arg("y"), nb::arg("width"),
              nb::arg("height"), nb::rv_policy::reference_internal)
         .def("scissor", &ProgramInvocationBuilder::setScissor, nb::arg("x"), nb::arg("y"), nb::arg("width"),

@@ -1,7 +1,11 @@
 #include "program_invocation_state.h"
 
+#include "runtime/runtime_state.h"
+
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <limits>
 
 namespace vernon::runtime::program_execution {
 
@@ -16,13 +20,24 @@ ProgramInvocationState::ProgramInvocationState(const program::ResolvedExecutionP
     }
 }
 
-ProgramInvocationState::~ProgramInvocationState() = default;
+ProgramInvocationState::~ProgramInvocationState() {
+    if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return;
+    for (auto image = ownedImages_.rbegin(); image != ownedImages_.rend(); ++image) {
+        if (image->view.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+            vernonRhiDeviceDestroyImageView(imageDevice_, image->view);
+        if (image->image.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+            vernonRhiDeviceDestroyImage(imageDevice_, image->image);
+    }
+}
 
 ProgramInvocationState::ProgramInvocationState(ProgramInvocationState &&other) noexcept
     : plan_(other.plan_), values_(std::move(other.values_)), storageBackings_(std::move(other.storageBackings_)),
       arguments_(std::move(other.arguments_)), deviceValues_(std::move(other.deviceValues_)),
       deviceUploads_(std::move(other.deviceUploads_)), controlImages_(std::move(other.controlImages_)),
-      invocationContext_(other.invocationContext_) {
+      controlImageDescriptors_(std::move(other.controlImageDescriptors_)), imageDevice_(other.imageDevice_),
+      ownedImages_(std::move(other.ownedImages_)), invocationContext_(other.invocationContext_) {
+    other.imageDevice_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     for (size_t value = 0; value < arguments_.size(); ++value)
         rebindDescriptor(static_cast<uint32_t>(value));
 }
@@ -198,14 +213,86 @@ bool ProgramInvocationState::resolveControl(const program::Program &program, con
     return resolveProgramControl(program, values_, control, value, error);
 }
 
-bool ProgramInvocationState::bindControlImageStorage(const program::Program &program, uint32_t storage,
-                                                     VernonRuntimeProviderResourceReference view, std::string &error) {
+bool ProgramInvocationState::bindControlImageStorage(VernonRuntimeContext &context, const program::Program &program,
+                                                     uint32_t storage, VernonRuntimeProviderResourceReference view,
+                                                     std::string &error) {
     if (!view.identity || !view.resource.value)
         return error = "Program attachment Storage has no runtime image view", false;
     if (storage >= program.storages.size())
         return error = "Program attachment references unknown Storage", false;
-    return controlImages_.emplace(storage, view).second || controlImages_.at(storage).identity == view.identity ||
-           (error = "Program Storage has multiple runtime image views", false);
+    const auto [binding, inserted] = controlImages_.emplace(storage, view);
+    if (!inserted && binding->second.identity != view.identity)
+        return error = "Program Storage has multiple runtime image views", false;
+    if (!inserted)
+        return true;
+    BoundProgramImage descriptor;
+    if (!resolveBorrowedProgramImage(context, program.storages[storage], view, descriptor, error)) {
+        controlImages_.erase(storage);
+        return false;
+    }
+    controlImageDescriptors_.emplace(storage, std::move(descriptor));
+    return true;
+}
+
+bool ProgramInvocationState::allocateOwnedImageStorages(VernonRuntimeContext &context, const program::Program &program,
+                                                        std::string &error) {
+    imageDevice_ = context.rhiDevice;
+    if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return std::none_of(program.storages.begin(), program.storages.end(),
+                            [](const program::Storage &storage) {
+                                return storage.ownership == program::StorageOwnership::Owned &&
+                                       storage.descriptorKind == program::StorageDescriptorKind::Image;
+                            }) ||
+               (error = "owned Program image Storage requires an RHI device", false);
+    for (const program::Storage &storage : program.storages) {
+        if (storage.ownership != program::StorageOwnership::Owned ||
+            storage.descriptorKind != program::StorageDescriptorKind::Image)
+            continue;
+        std::array<uint32_t, 3> extent{};
+        for (size_t axis = 0; axis < extent.size(); ++axis) {
+            uint64_t component = axis < storage.image.extent.size() ? storage.image.extent[axis] : 0;
+            if (!storage.image.extentControls.empty() &&
+                !resolveControl(program, storage.image.extentControls[axis], component, error))
+                return error = "owned Program image extent axis " + std::to_string(axis) + " failed: " + error, false;
+            if (!component || component > std::numeric_limits<uint32_t>::max())
+                return error =
+                           "owned Program image extent axis " + std::to_string(axis) + " must be in [1, UINT32_MAX]",
+                       false;
+            extent[axis] = static_cast<uint32_t>(component);
+        }
+        VernonRhiImageDescriptor imageDescriptor{};
+        if (!materializeOwnedProgramImageDescriptor(storage, extent, imageDescriptor, error))
+            return false;
+        OwnedImageStorage owned{{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0},
+                                {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}};
+        if (vernonRhiDeviceCreateImage(imageDevice_, &imageDescriptor, &owned.image) != VERNON_RHI_STATUS_OK)
+            return error = "cannot allocate owned Program image Storage", false;
+        VernonRhiImageViewDescriptor viewDescriptor{};
+        viewDescriptor.struct_size = sizeof(viewDescriptor);
+        viewDescriptor.image = owned.image;
+        viewDescriptor.dimension = imageDescriptor.dimension;
+        viewDescriptor.format = imageDescriptor.format;
+        viewDescriptor.mip_level_count = imageDescriptor.mip_levels;
+        viewDescriptor.array_layer_count = imageDescriptor.array_layers;
+        for (const std::string &aspect : storage.image.aspects)
+            viewDescriptor.aspects |= aspect == "color"     ? VERNON_RHI_IMAGE_ASPECT_COLOR
+                                      : aspect == "depth"   ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                                      : aspect == "stencil" ? VERNON_RHI_IMAGE_ASPECT_STENCIL
+                                                            : 0;
+        if (vernonRhiDeviceCreateImageView(imageDevice_, &viewDescriptor, &owned.view) != VERNON_RHI_STATUS_OK) {
+            vernonRhiDeviceDestroyImage(imageDevice_, owned.image);
+            return error = "cannot create owned Program image view", false;
+        }
+        VernonRuntimeProviderResourceReference reference{};
+        if (vernonRuntimeReferenceRhiImageView(&context, owned.view, &reference) != VERNON_STATUS_OK) {
+            vernonRhiDeviceDestroyImageView(imageDevice_, owned.view);
+            vernonRhiDeviceDestroyImage(imageDevice_, owned.image);
+            return error = "cannot reference owned Program image view", false;
+        }
+        ownedImages_.push_back(owned);
+        controlImages_.emplace(storage.id, reference);
+    }
+    return true;
 }
 
 const VernonRuntimeProviderResourceReference *ProgramInvocationState::controlImage(uint32_t storage) const {

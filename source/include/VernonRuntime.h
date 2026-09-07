@@ -517,6 +517,7 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsContro
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramGraphicsControlsView *output);
 VERNON_RUNTIME_CAPI void vernonRuntimeStageExecutableDestroy(VernonStageExecutable *stage);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeStageExecutableGetParameterCount(const VernonStageExecutable *stage);
+VERNON_RUNTIME_CAPI uint32_t vernonRuntimeStageExecutableIsCompute(const VernonStageExecutable *stage);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableGetParameterByIndex(const VernonStageExecutable *stage,
                                                                                  size_t index,
                                                                                  VernonProgramParameterView *parameter);

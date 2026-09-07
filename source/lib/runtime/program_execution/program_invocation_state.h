@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_PROGRAM_INVOCATION_STATE_H
 
 #include "runtime/program_execution/device_buffer.h"
+#include "runtime/program_execution/program_image_binding.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/target_binding_plan.h"
@@ -87,8 +88,9 @@ public:
     bool importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots, std::string &error);
     void retainOnly(const std::vector<char> &retained);
     bool restoreDeviceValuesFromHost(program::GraphDirection graph, std::string &error);
-    bool bindControlImageStorage(const program::Program &program, uint32_t storage,
+    bool bindControlImageStorage(VernonRuntimeContext &context, const program::Program &program, uint32_t storage,
                                  VernonRuntimeProviderResourceReference view, std::string &error);
+    bool allocateOwnedImageStorages(VernonRuntimeContext &context, const program::Program &program, std::string &error);
     bool resolveControl(const program::Program &program, const program::ControlComponent &control, uint64_t &value,
                         std::string &error) const;
 
@@ -109,6 +111,11 @@ public:
     const VernonProgramArgument *externalStorage(uint32_t storage) const;
 
 private:
+    struct OwnedImageStorage {
+        VernonRhiImage image{};
+        VernonRhiImageView view{};
+    };
+
     friend class ResolvedTransferExecutor;
 
     void rebindDescriptor(uint32_t value);
@@ -120,6 +127,9 @@ private:
     std::vector<std::shared_ptr<DeviceBuffer>> deviceValues_;
     std::vector<ProgramDeviceUpload> deviceUploads_;
     std::map<uint32_t, VernonRuntimeProviderResourceReference> controlImages_;
+    std::map<uint32_t, BoundProgramImage> controlImageDescriptors_;
+    VernonRhiDevice imageDevice_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::vector<OwnedImageStorage> ownedImages_;
     const ProgramInvocationContext *invocationContext_{};
 };
 

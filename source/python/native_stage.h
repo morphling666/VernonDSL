@@ -9,7 +9,7 @@ struct PythonStageExecutable;
 
 struct StageInvocationBuilder {
     StageInvocationBuilder(VernonRuntimeContext *runtime, VernonStageExecutable *stage)
-        : runtime(runtime), stage(stage) {}
+        : runtime(runtime), stage(stage), compute(vernonRuntimeStageExecutableIsCompute(stage) != 0) {}
     StageInvocationBuilder(const StageInvocationBuilder &) = delete;
     StageInvocationBuilder &operator=(const StageInvocationBuilder &) = delete;
 
@@ -137,11 +137,19 @@ struct StageInvocationBuilder {
     }
 
     StageInvocationBuilder &grid(uint32_t x, uint32_t y, uint32_t z) {
+        if (!x)
+            throw std::invalid_argument("compute grid axis x must be nonzero");
+        if (!y)
+            throw std::invalid_argument("compute grid axis y must be nonzero");
+        if (!z)
+            throw std::invalid_argument("compute grid axis z must be nonzero");
         computeGrid = {x, y, z};
         return *this;
     }
 
     std::unique_ptr<PythonRuntimeSubmission> submit() {
+        if (compute && !computeGrid)
+            throw std::invalid_argument("compute Stage submission requires an explicit grid");
         std::vector<VernonProgramArgument> values;
         values.reserve(arguments.size());
         for (const PreparedProgramArgument *argument : arguments)
@@ -151,7 +159,8 @@ struct StageInvocationBuilder {
         descriptor.abi_version = VERNON_PROGRAM_VERSION;
         descriptor.arguments = values.empty() ? nullptr : values.data();
         descriptor.argument_count = values.size();
-        descriptor.compute_grid = computeGrid;
+        if (computeGrid)
+            descriptor.compute_grid = *computeGrid;
         VernonSubmission *submission = nullptr;
         if (vernonRuntimeStageSubmit(stage, &descriptor, &submission) != VERNON_STATUS_OK || !submission)
             throw std::runtime_error(nativeStringView(vernonRuntimeGetLastError(runtime)));
@@ -160,7 +169,8 @@ struct StageInvocationBuilder {
 
     VernonRuntimeContext *runtime{};
     VernonStageExecutable *stage{};
-    VernonLaunchSize computeGrid{1, 1, 1};
+    std::optional<VernonLaunchSize> computeGrid;
+    bool compute{};
     std::unordered_set<uint32_t> slots;
     std::vector<std::unique_ptr<PreparedProgramArgument>> ownedArguments;
     std::vector<PreparedProgramArgument *> arguments;
