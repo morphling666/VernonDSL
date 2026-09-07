@@ -216,13 +216,14 @@ versioned Host entry wrapper and reflection containing:
 
 ### Invocation ABI
 
-Use a pointer-width-safe Host invocation contract rather than the existing
-64-bit CPU compute wrapper. The C struct is compiled for the destination target
-and uses explicit sizes for values and buffers.
+The Host invocation contract is pointer-width-safe. The C struct is compiled
+for the destination target and uses explicit sizes for values and buffers.
+CPU call-frame reflection and TensorView descriptor packing use the target
+pointer size and alignment; they must not use the compiler host ABI.
 
-The Host compiler must validate target data layout before emitting wrappers.
-Native and wasm32 artifacts use identical logical arguments but target-specific
-pointer layout.
+The Host compiler installs and validates the target data layout before
+reflection, ABI metadata capture, or wrapper lowering. Native and wasm32
+artifacts use identical logical arguments but target-specific pointer layout.
 
 ### Desktop
 
@@ -242,7 +243,8 @@ through the native Runtime.
 Requirements:
 
 - build the pinned LLVM with the WebAssembly target enabled;
-- remove 64-bit assumptions only from the new Host ABI path;
+- reject host-pointer and TensorView descriptor layouts that cannot be
+  represented by the target pointer width;
 - set the wasm target triple and data layout before LLVM conversion;
 - preserve imported and exported versioned C symbols;
 - use a pinned Emscripten toolchain for final linking;

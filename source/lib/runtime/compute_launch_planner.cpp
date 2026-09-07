@@ -26,20 +26,34 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
         (tensor.rank && (!tensor.shape || !tensor.byte_strides)) ||
         tensor.byte_offset % tensor.element_layout.byte_size)
         return false;
-    storage.assign(8 * (2 + 2 * tensor.rank), 0);
-    const uint64_t pointer = tensor.storage == VERNON_TENSOR_HOST
-                                 ? static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tensor.host_data))
-                                 : static_cast<uint64_t>(tensor.resource.resource.value + tensor.resource.offset);
-    const uint64_t elementOffset = tensor.byte_offset / tensor.element_layout.byte_size;
+    constexpr size_t fieldSize = sizeof(uintptr_t);
+    storage.assign(fieldSize * (2 + 2 * tensor.rank), 0);
+    uintptr_t pointer = reinterpret_cast<uintptr_t>(tensor.host_data);
+    if (tensor.storage != VERNON_TENSOR_HOST) {
+        const uint64_t resourceAddress = tensor.resource.resource.value + tensor.resource.offset;
+        if (resourceAddress < tensor.resource.resource.value || resourceAddress > std::numeric_limits<uintptr_t>::max())
+            return false;
+        pointer = static_cast<uintptr_t>(resourceAddress);
+    }
+    const uint64_t wideElementOffset = tensor.byte_offset / tensor.element_layout.byte_size;
+    if (wideElementOffset > std::numeric_limits<size_t>::max())
+        return false;
+    const size_t elementOffset = static_cast<size_t>(wideElementOffset);
     std::memcpy(storage.data(), &pointer, sizeof(pointer));
-    std::memcpy(storage.data() + 8, &elementOffset, sizeof(elementOffset));
+    std::memcpy(storage.data() + fieldSize, &elementOffset, sizeof(elementOffset));
     for (uint32_t dimension = 0; dimension < tensor.rank; ++dimension) {
         if (tensor.byte_strides[dimension] % static_cast<int64_t>(tensor.element_layout.byte_size))
             return false;
         const int64_t elementStride =
             tensor.byte_strides[dimension] / static_cast<int64_t>(tensor.element_layout.byte_size);
-        std::memcpy(storage.data() + 16 + 8 * dimension, &tensor.shape[dimension], sizeof(uint64_t));
-        std::memcpy(storage.data() + 16 + 8 * (tensor.rank + dimension), &elementStride, sizeof(elementStride));
+        if (tensor.shape[dimension] > std::numeric_limits<size_t>::max() ||
+            elementStride < std::numeric_limits<intptr_t>::min() ||
+            elementStride > std::numeric_limits<intptr_t>::max())
+            return false;
+        const size_t extent = static_cast<size_t>(tensor.shape[dimension]);
+        const intptr_t stride = static_cast<intptr_t>(elementStride);
+        std::memcpy(storage.data() + fieldSize * (2 + dimension), &extent, sizeof(extent));
+        std::memcpy(storage.data() + fieldSize * (2 + tensor.rank + dimension), &stride, sizeof(stride));
     }
     return true;
 }

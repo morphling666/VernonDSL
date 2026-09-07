@@ -264,23 +264,6 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
     if (mlir::failed(preparedTarget))
         return CpuCompileResult::VerificationFailure;
     mlir::OwningOpRef<mlir::ModuleOp> sourceModule = std::move(preparedTarget->module);
-    mlir::FailureOr<std::string> targetReflection = buildReflection(
-        *sourceModule, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
-    if (mlir::failed(targetReflection))
-        return CpuCompileResult::CodegenFailure;
-    reflection = std::move(*targetReflection);
-
-    llvm::Expected<llvm::json::Value> parsedReflection = llvm::json::parse(reflection);
-    llvm::json::Object *reflectionRoot = parsedReflection ? parsedReflection->getAsObject() : nullptr;
-    std::optional<llvm::StringRef> moduleHash =
-        reflectionRoot ? reflectionRoot->getString("module_hash") : std::nullopt;
-    if (!moduleHash || moduleHash->empty()) {
-        diagnostics = "CPU reflection is missing its module hash";
-        return CpuCompileResult::CodegenFailure;
-    }
-    std::vector<vernon::CpuAbiWrapperMetadata> entries;
-    if (!captureCpuAbiMetadata(*sourceModule, entries, *moduleHash, diagnostics))
-        return CpuCompileResult::CodegenFailure;
 
     const bool hostTarget = options.targetTriple.empty();
     const std::string targetTriple =
@@ -305,11 +288,28 @@ CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &o
         return CpuCompileResult::CodegenFailure;
     }
     const llvm::DataLayout dataLayout = objectTargetMachine->createDataLayout();
-
     sourceModule->getOperation()->setAttr(mlir::LLVM::LLVMDialect::getDataLayoutAttrName(),
                                           mlir::StringAttr::get(&context, dataLayout.getStringRepresentation()));
     sourceModule->getOperation()->setAttr(mlir::LLVM::LLVMDialect::getTargetTripleAttrName(),
                                           mlir::StringAttr::get(&context, targetTriple));
+
+    mlir::FailureOr<std::string> targetReflection = buildReflection(
+        *sourceModule, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    if (mlir::failed(targetReflection))
+        return CpuCompileResult::CodegenFailure;
+    reflection = std::move(*targetReflection);
+
+    llvm::Expected<llvm::json::Value> parsedReflection = llvm::json::parse(reflection);
+    llvm::json::Object *reflectionRoot = parsedReflection ? parsedReflection->getAsObject() : nullptr;
+    std::optional<llvm::StringRef> moduleHash =
+        reflectionRoot ? reflectionRoot->getString("module_hash") : std::nullopt;
+    if (!moduleHash || moduleHash->empty()) {
+        diagnostics = "CPU reflection is missing its module hash";
+        return CpuCompileResult::CodegenFailure;
+    }
+    std::vector<vernon::CpuAbiWrapperMetadata> entries;
+    if (!captureCpuAbiMetadata(*sourceModule, entries, *moduleHash, diagnostics))
+        return CpuCompileResult::CodegenFailure;
     mlir::PassManager passManager(&context);
     mlir::vernon::buildVernonCpuLoweringPipeline(passManager);
     if (mlir::failed(passManager.run(*sourceModule)))

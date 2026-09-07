@@ -20,7 +20,6 @@ struct VernonRuntimeContext;
 
 namespace vernon::execution::detail {
 class RhiCommandPlanSink;
-struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
 namespace vernon::runtime {
@@ -79,14 +78,8 @@ struct PullbackApplyOptions {
 };
 
 struct ForwardExecutionTarget {
-    VernonRuntimeProviderObject encoder{};
     const VernonStageInvocationDescriptor *invocation{};
-    execution::detail::RhiCommandExecutionPlan *commandPlan{};
     const ProgramInvocationContext *programContext{};
-
-    bool externalEncoder() const { return encoder.value != 0; }
-    bool deferredCommandPlan() const { return commandPlan != nullptr; }
-    bool encodedInvocation() const { return externalEncoder() || deferredCommandPlan(); }
 };
 
 class PullbackExecution {

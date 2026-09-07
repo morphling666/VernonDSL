@@ -177,27 +177,29 @@ Delete:
 - compiler-generated placeholder graphics state that is later ignored;
 - undocumented graphics override fields.
 
-## 5. Pipeline invocation ABI
+## 5. Program graphics invocation ABI
 
-`VernonProgramSubmitDescriptor` keeps typed pointers:
+A cooked graphics Program uses the same canonical lifecycle as every other
+Program:
 
-```c
-const VernonGraphicsState *graphics_state;
-const VernonRenderPass *render_pass;
-const VernonDrawCommand *draw_command;
-const VernonDynamicState *dynamic_state;
+```text
+bundle → executable → persistent instance → invocation → bind → forward
 ```
 
-Remove the deprecated flat graphics fields:
+The caller discovers the graphics control slots from the executable and binds
+typed `RenderPass`, `DrawCommand`, and `DynamicState` controls to the invocation.
+Pipeline compatibility state such as topology, formats, sample count, blending,
+and depth/stencil behavior belongs to the resolved Stage implementation, not to
+an invocation submit descriptor.
 
-- topology;
-- color attachments and depth attachment;
-- index binding;
-- vertex and instance counts;
-- viewport and scissor;
-- stencil reference.
+There is no `VernonProgramSubmitDescriptor`, Program encode operation, external
+Program command encoder, or fallback from typed controls to flat graphics
+fields. Runtime records and submits the resolved Program plan internally.
 
-There is no fallback from typed pointers to flat fields.
+External execution graphs may independently embed a directly loaded
+`VernonStageExecutable`. That Stage-only facility consumes a
+`VernonStageInvocationDescriptor` and an external encoder; it neither loads a
+Program manifest nor shares the Program binding ABI.
 
 The runtime resolves one immutable invocation:
 

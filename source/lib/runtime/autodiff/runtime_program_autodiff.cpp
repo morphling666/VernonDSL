@@ -482,7 +482,7 @@ public:
         const bool canonicalInvocation = target.invocation != nullptr;
         if (!signatureError_.empty())
             return fail(*context_, signatureError_);
-        if (!topology || !forward || (!canonicalInvocation && !outputs) || target.encodedInvocation())
+        if (!topology || !forward || (!canonicalInvocation && !outputs))
             return fail(*context_, "Program autodiff forward requires a live pipeline and host API values");
         std::vector<HostProgramValue> hostStorage;
         std::string error;

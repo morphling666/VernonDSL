@@ -1,8 +1,7 @@
+#include "canonical_program_call.h"
 #include "engine_demo.h"
 #include "graphics_host.h"
 
-#include "VernonExecutionGraph.h"
-#include "VernonRuntime.h"
 #include "embedded_bundles.h"
 
 #include <array>
@@ -10,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace {
@@ -18,11 +18,6 @@ constexpr uint64_t kVectorShape[] = {3};
 constexpr int64_t kVectorStride[] = {sizeof(float)};
 constexpr uint64_t kPositionShape[] = {3, 2};
 constexpr int64_t kPositionStrides[] = {2 * sizeof(float), sizeof(float)};
-
-std::string runtimeError(VernonRuntimeContext *runtime) {
-    const VernonStringView error = vernonRuntimeGetLastError(runtime);
-    return error.data ? std::string(error.data, error.size) : "unknown Runtime error";
-}
 
 bool findParameter(VernonProgramExecutable *pipeline, const char *name, size_t size,
                    VernonProgramParameterView &parameter) {
@@ -47,67 +42,6 @@ VernonProgramArgument hostArgument(const VernonProgramParameterView &parameter, 
     return argument;
 }
 
-class MandelbulbRenderPass final : public vernon::execution::RenderPass {
-public:
-    MandelbulbRenderPass(vernon::execution::GraphImage target, VernonRuntimeContext *runtime,
-                         VernonProgramExecutable *pipeline, VernonStageInvocationDescriptor *invocation)
-        : RenderPass("mandelbulb-raymarch"), target_(target), runtime_(runtime), pipeline_(pipeline),
-          invocation_(invocation) {}
-
-    void declare() override {
-        vernon::execution::ColorAttachmentUse attachment{};
-        attachment.image = target_;
-        attachment.load = VERNON_RHI_LOAD_CLEAR;
-        attachment.store = VERNON_RHI_STORE_PRESERVE;
-        attachment.clear[3] = 1.0F;
-        color(0, attachment);
-        renderArea(0, 0, target_.width, target_.height);
-    }
-
-    VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
-                            const vernon::execution::ExecutionResources &) override {
-        (void)encoder;
-        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline_);
-        VernonProgramInvocation *invocation =
-            instance ? vernonRuntimeProgramInstanceBeginInvocation(instance) : nullptr;
-        VernonStatus status = invocation ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
-        for (size_t index = 0; invocation && index < invocation_->argument_count && status == VERNON_STATUS_OK;
-             ++index) {
-            const VernonProgramBindingToken token{sizeof(token), &index, sizeof(index)};
-            status =
-                vernonRuntimeProgramInvocationBind(invocation, &token, &invocation_->arguments[index], nullptr, 0, 0);
-        }
-        VernonProgramGraphicsControlsView controls{};
-        controls.struct_size = sizeof(controls);
-        const VernonProgramBindingToken controlToken{sizeof(controlToken), this, sizeof(*this)};
-        if (status == VERNON_STATUS_OK)
-            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(pipeline_, 0, &controls);
-        if (status == VERNON_STATUS_OK && invocation_->render_pass)
-            status = vernonRuntimeProgramInvocationBindRenderPass(invocation, controls.render_pass_control,
-                                                                  &controlToken, invocation_->render_pass, nullptr, 0);
-        if (status == VERNON_STATUS_OK && invocation_->draw_command)
-            status = vernonRuntimeProgramInvocationBindDrawCommand(invocation, controls.draw_command_control,
-                                                                   &controlToken, invocation_->draw_command, nullptr);
-        if (status == VERNON_STATUS_OK && invocation_->dynamic_state)
-            status = vernonRuntimeProgramInvocationBindDynamicState(invocation, controls.dynamic_state_control,
-                                                                    &controlToken, invocation_->dynamic_state);
-        if (status == VERNON_STATUS_OK)
-            status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
-        vernonRuntimeProgramInvocationDestroy(invocation);
-        vernonRuntimeProgramInstanceDestroy(instance);
-        if (status == VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_OK;
-        std::cerr << "Mandelbulb encode failed: " << runtimeError(runtime_) << '\n';
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    vernon::execution::GraphImage target_;
-    VernonRuntimeContext *runtime_{};
-    VernonProgramExecutable *pipeline_{};
-    VernonStageInvocationDescriptor *invocation_{};
-};
-
 class MandelbulbPanel final : public ExternalEnginePanel {
 public:
     ~MandelbulbPanel() override { shutdown(); }
@@ -127,14 +61,21 @@ public:
 #endif
         if (!runtime_)
             return false;
-        bundle_ =
-            vernonRuntimeLoadProgramBundleWithOptions(runtime_, vernon_external_engine::graphics_bundle::kManifest,
-                                                      vernon_external_engine::graphics_bundle::kManifestSize, nullptr);
-        pipeline_ = bundle_ ? vernonRuntimeResolveProgram(bundle_, {nullptr, 0}) : nullptr;
-        if (!pipeline_) {
-            std::cerr << "failed to load the Mandelbulb pipeline: " << runtimeError(runtime_) << '\n';
+        VernonProgramBundleLoadOptions bundleOptions{};
+        bundleOptions.struct_size = sizeof(bundleOptions);
+        bundleOptions.bundle_directory = vernon_external_engine::graphics_bundle::kCookedDirectory;
+        try {
+            program_.emplace(vernon::runtime::ProgramExecutable::load(
+                runtime_, vernon_external_engine::graphics_bundle::kManifest,
+                vernon_external_engine::graphics_bundle::kManifestSize, {nullptr, 0}, &bundleOptions));
+            instance_ = std::make_unique<vernon::runtime::ProgramInstance>(*program_);
+        } catch (const std::exception &exception) {
+            const std::string diagnostic = vernon_external_engine::programRuntimeError(runtime_);
+            std::cerr << "failed to load the Mandelbulb Program: "
+                      << (diagnostic.empty() ? exception.what() : diagnostic) << '\n';
             return false;
         }
+        VernonProgramExecutable *pipeline = program_->get();
 
         constexpr std::array<float, 6> positions{-1.0F, -1.0F, 3.0F, -1.0F, -1.0F, 3.0F};
         VernonRhiBufferDescriptor vertexDescriptor{};
@@ -155,8 +96,7 @@ public:
                                "power",    "max_iterations",  "max_steps",     "shadow_steps"};
         std::array<VernonProgramParameterView, 8> parameters{};
         for (size_t index = 0; index < parameters.size(); ++index)
-            if (!findParameter(pipeline_, names[index], std::char_traits<char>::length(names[index]),
-                               parameters[index]))
+            if (!findParameter(pipeline, names[index], std::char_traits<char>::length(names[index]), parameters[index]))
                 return false;
         arguments_[0] = hostArgument(parameters[0], nullptr, sizeof(positions), 2, kPositionShape, kPositionStrides);
         arguments_[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
@@ -170,19 +110,17 @@ public:
         arguments_[5] = hostArgument(parameters[5], &maxIterations_, sizeof(maxIterations_));
         arguments_[6] = hostArgument(parameters[6], &maxSteps_, sizeof(maxSteps_));
         arguments_[7] = hostArgument(parameters[7], &shadowSteps_, sizeof(shadowSteps_));
-        invocation_.struct_size = sizeof(invocation_);
-        invocation_.abi_version = VERNON_PROGRAM_VERSION;
-        invocation_.arguments = arguments_.data();
-        invocation_.argument_count = arguments_.size();
         attachment_.location = 0;
         attachment_.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
         attachment_.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
         attachment_.clear_color[3] = 1.0F;
-        invocation_.color_attachments = &attachment_;
-        invocation_.color_attachment_count = 1;
-        invocation_.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-        invocation_.vertex_count = 3;
-        invocation_.instance_count = 1;
+        renderPass_.struct_size = sizeof(renderPass_);
+        renderPass_.color_attachments = &attachment_;
+        renderPass_.color_attachment_count = 1;
+        drawCommand_.struct_size = sizeof(drawCommand_);
+        drawCommand_.vertex_count = 3;
+        drawCommand_.instance_count = 1;
+        dynamicState_.struct_size = sizeof(dynamicState_);
         return true;
     }
 
@@ -197,10 +135,16 @@ public:
         cameraPosition_ = {3.15F * std::cos(angle), 0.48F + std::sin(phase * 0.17F) * 0.12F, 3.15F * std::sin(angle)};
         time_ = phase;
         power_ = 8.0F + std::sin(phase * 0.21F) * 0.18F;
-        if (!graph_ || graph_->submit().wait() != VERNON_RHI_STATUS_OK)
+        const vernon_external_engine::ProgramGraphicsInvocation graphics{&renderPass_, &drawCommand_, &dynamicState_,
+                                                                         renderTargetRevision_};
+        std::string error;
+        if (!vernon_external_engine::invokeProgram(runtime_, *program_, *instance_, arguments_.data(),
+                                                   arguments_.size(), &graphics, error)) {
+            std::cerr << "Mandelbulb Program invocation failed: " << error << '\n';
             return false;
+        }
         if (frame_++ == 0)
-            std::cout << "Vernon Mandelbulb Execution Graph animation started\n";
+            std::cout << "Vernon Mandelbulb Program animation started\n";
         return true;
     }
 
@@ -209,7 +153,8 @@ public:
     uint32_t imageHeight() const override { return renderHeight_; }
 
     void shutdown() override {
-        graph_.reset();
+        instance_.reset();
+        program_.reset();
         if (view_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
             vernonRhiDeviceDestroyImageView(graphics_->device(), view_);
         if (image_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
@@ -219,20 +164,13 @@ public:
         view_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         image_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
         vertexBuffer_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-        if (pipeline_)
-            vernonRuntimeProgramExecutableDestroy(pipeline_);
-        if (bundle_)
-            vernonRuntimeProgramBundleDestroy(bundle_);
         if (runtime_)
             vernonRuntimeDestroy(runtime_);
-        pipeline_ = nullptr;
-        bundle_ = nullptr;
         runtime_ = nullptr;
     }
 
 private:
     bool recreateRenderTarget(uint32_t width, uint32_t height) {
-        graph_.reset();
         if (view_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
             vernonRhiDeviceDestroyImageView(graphics_->device(), view_);
         if (image_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
@@ -250,7 +188,8 @@ private:
         imageDescriptor.mip_levels = 1;
         imageDescriptor.array_layers = 1;
         imageDescriptor.sample_count = 1;
-        imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE;
+        imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_TRANSFER_SOURCE |
+                                VERNON_RHI_IMAGE_TRANSFER_DESTINATION;
         if (vernonRhiDeviceCreateImage(graphics_->device(), &imageDescriptor, &image_) != VERNON_RHI_STATUS_OK)
             return false;
         VernonRhiImageViewDescriptor viewDescriptor{};
@@ -268,25 +207,20 @@ private:
         renderWidth_ = width;
         renderHeight_ = height;
         attachment_.view = viewReference_;
-        invocation_.viewport[2] = width;
-        invocation_.viewport[3] = height;
-        invocation_.scissor[2] = width;
-        invocation_.scissor[3] = height;
-        vernon::execution::ExecutionGraph graph(graphics_->device());
-        const auto target = graph.importImage(image_, view_, true);
-        graph.emplacePass<MandelbulbRenderPass>(target, runtime_, pipeline_, &invocation_);
-        std::string error;
-        graph_ = graph.compile(error);
-        if (graph_)
-            return true;
-        std::cerr << "failed to compile Mandelbulb graph: " << error << '\n';
-        return false;
+        renderPass_.render_area[2] = width;
+        renderPass_.render_area[3] = height;
+        dynamicState_.viewport[2] = width;
+        dynamicState_.viewport[3] = height;
+        dynamicState_.scissor[2] = width;
+        dynamicState_.scissor[3] = height;
+        ++renderTargetRevision_;
+        return true;
     }
 
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
-    VernonProgramBundle *bundle_{};
-    VernonProgramExecutable *pipeline_{};
+    std::optional<vernon::runtime::ProgramExecutable> program_;
+    std::unique_ptr<vernon::runtime::ProgramInstance> instance_;
     VernonRhiBuffer vertexBuffer_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeProviderResourceReference vertexReference_{};
     VernonRhiImage image_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
@@ -301,10 +235,12 @@ private:
     int32_t shadowSteps_{32};
     std::array<VernonProgramArgument, 8> arguments_{};
     VernonColorAttachment attachment_{};
-    VernonStageInvocationDescriptor invocation_{};
-    std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
+    VernonRenderPass renderPass_{};
+    VernonDrawCommand drawCommand_{};
+    VernonDynamicState dynamicState_{};
     uint32_t renderWidth_{};
     uint32_t renderHeight_{};
+    uint64_t renderTargetRevision_{};
     uint64_t frame_{};
 };
 

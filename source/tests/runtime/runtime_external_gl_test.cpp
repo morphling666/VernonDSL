@@ -1,5 +1,6 @@
 #include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
+#include "direct_stage_execution_graph_pass.h"
 #include "runtime/content_hash.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
@@ -126,42 +127,6 @@ VernonRhiImageViewDescriptor fullImageView(RhiImage image, VernonRhiFormat forma
     descriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     return descriptor;
 }
-
-class RuntimeGraphRenderPass final : public vernon::execution::RenderPass {
-public:
-    RuntimeGraphRenderPass(std::string name, vernon::execution::GraphImage target, VernonRuntimeContext *runtime,
-                           VernonStageExecutable *pipeline, const VernonStageInvocationDescriptor *invocation,
-                           VernonRhiLoadOperation load, VernonRhiStoreOperation store = VERNON_RHI_STORE_PRESERVE)
-        : RenderPass(std::move(name)), target_(target), runtime_(runtime), pipeline_(pipeline), invocation_(invocation),
-          load_(load), store_(store) {}
-
-    void declare() override {
-        vernon::execution::ColorAttachmentUse attachment{};
-        attachment.image = target_;
-        attachment.load = load_;
-        attachment.store = store_;
-        color(0, attachment);
-        renderArea(0, 0, target_.width, target_.height);
-    }
-
-    VernonRhiStatus execute(vernon::execution::GraphicsEncoder &encoder,
-                            const vernon::execution::ExecutionResources &) override {
-        VernonRuntimeProviderObject providerEncoder{};
-        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimeStageEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    vernon::execution::GraphImage target_;
-    VernonRuntimeContext *runtime_{};
-    VernonStageExecutable *pipeline_{};
-    const VernonStageInvocationDescriptor *invocation_{};
-    VernonRhiLoadOperation load_{};
-    VernonRhiStoreOperation store_{};
-};
 
 class GraphImageWritePass final : public vernon::execution::ComputePass {
 public:
@@ -1696,10 +1661,10 @@ TEST(RuntimeExternalGl, ExecutionGraphFusesDrawsAndSubmitsOnce) {
         RhiImage replacement = importOpenGLTexture2D(gl, 11, 16, 12, VERNON_TEXTURE_RGBA8_UNORM);
         EXPECT_NE(replacement.handle.index, target.handle.index);
         graph.emplacePass<GraphImageWritePass>("produce", graphTarget);
-        graph.emplacePass<RuntimeGraphRenderPass>("first", graphTarget, gl, pipeline, &invocation,
-                                                  VERNON_RHI_LOAD_CLEAR);
-        graph.emplacePass<RuntimeGraphRenderPass>("second", graphTarget, gl, pipeline, &invocation,
-                                                  VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_DISCARD);
+        graph.emplacePass<vernon::tests::DirectStageGraphRenderPass>("first", graphTarget, gl, pipeline, &invocation,
+                                                                     VERNON_RHI_LOAD_CLEAR);
+        graph.emplacePass<vernon::tests::DirectStageGraphRenderPass>(
+            "second", graphTarget, gl, pipeline, &invocation, VERNON_RHI_LOAD_PRESERVE, VERNON_RHI_STORE_DISCARD);
         std::string error;
         auto plan = graph.compile(error);
         ASSERT_TRUE(plan) << error;

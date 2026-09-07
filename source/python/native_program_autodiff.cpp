@@ -74,10 +74,6 @@ PythonAdViewDescriptor validatePythonAdOriginalView(const std::string &path, Ver
     return descriptor;
 }
 
-bool pythonAdViewsOverlap(const PythonAdViewDescriptor &left, const PythonAdViewDescriptor &right) {
-    return vernon::runtime::tensorViewsHaveWritableOverlap(left.tensorView(), right.tensorView());
-}
-
 namespace {
 
 std::vector<std::string> derivativeGroupLeaves(const nb::handle &group) {
@@ -318,58 +314,6 @@ PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *pipeline, const Pr
     if (reflected)
         *reflected = leaf;
     return result;
-}
-
-nb::object resolveAdInputLeaf(const nb::dict &bindings, const ProgramParameterMetadata &parameter,
-                              const VernonProgramValueLeafView &leaf) {
-    nb::str root(parameter.name.c_str());
-    if (!bindings.contains(root))
-        throw std::invalid_argument("missing autodiff binding '" + parameter.name + "'");
-    nb::object value = nb::borrow<nb::object>(bindings[root]);
-    if (nb::hasattr(value, "_native_host_array")) {
-        nb::object array = value.attr("_native_host_array")();
-        nb::object fields = array.attr("dtype").attr("fields");
-        if (!fields.is_none()) {
-            nb::str key("__value");
-            if (nb::cast<bool>(fields.attr("__contains__")(key)))
-                array = array.attr("__getitem__")(key);
-        }
-        value = std::move(array);
-        if (leaf.path_count == 0)
-            return value;
-    }
-    for (size_t index = 0; index < leaf.path_count; ++index) {
-        const VernonValuePathComponentView &component = leaf.path[index];
-        if (component.kind == VERNON_VALUE_PATH_FIELD) {
-            const std::string field = nativeStringView(component.field);
-            if (nb::isinstance<nb::dict>(value)) {
-                nb::dict mapping = nb::cast<nb::dict>(value);
-                nb::str key(field.c_str());
-                if (!mapping.contains(key))
-                    throw std::invalid_argument("autodiff Struct binding is missing field '" + field + "'");
-                value = nb::borrow<nb::object>(mapping[key]);
-            } else {
-                if (nb::hasattr(value, field.c_str()))
-                    value = value.attr(field.c_str());
-                else if (nb::hasattr(value, "__getitem__"))
-                    value = value.attr("__getitem__")(field);
-                else
-                    throw std::invalid_argument("autodiff Struct binding has no field '" + field + "'");
-            }
-        } else if (component.kind == VERNON_VALUE_PATH_INDEX) {
-            nb::object fields = nb::hasattr(value, "dtype") ? value.attr("dtype").attr("fields") : nb::none();
-            const std::string index = std::to_string(component.index);
-            nb::str key(index.c_str());
-            if (!fields.is_none() && nb::cast<bool>(fields.attr("__contains__")(key)))
-                value = value.attr("__getitem__")(key);
-            else
-                value = nb::module_::import_("numpy").attr("take")(value, component.index,
-                                                                   nb::arg("axis") = parameter.shape.size());
-        } else {
-            throw std::runtime_error("autodiff input leaf has an invalid path");
-        }
-    }
-    return value;
 }
 
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath) {

@@ -6,6 +6,8 @@
 #include "execution_graph/execution_command_model.h"
 
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <vector>
 
 struct VernonRuntimeContext;
@@ -31,6 +33,16 @@ struct DeviceBufferUpload {
     const void *source{};
     size_t size{};
 };
+
+inline bool checkedDeviceBufferOffset(uint64_t base, size_t relative, size_t &result) {
+    if (base > std::numeric_limits<size_t>::max())
+        return false;
+    const size_t converted = static_cast<size_t>(base);
+    if (relative > std::numeric_limits<size_t>::max() - converted)
+        return false;
+    result = converted + relative;
+    return true;
+}
 
 struct DeviceImageCopy {
     VernonRhiImage source;

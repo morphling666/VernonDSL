@@ -178,9 +178,12 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             auto carrier = std::make_shared<DeviceBuffer>(*nodePlan.stage->context, materialized.tensor.byte_size);
             if (!carrier->valid() || !carrier->reference(materialized.tensor.resource))
                 return error = "uniform endpoint carrier allocation failed", false;
-            output.deviceCopiesBefore.push_back({canonicalBuffer, carrier->handle(),
-                                                 materialized.tensor.resource.offset + materialized.tensor.byte_offset,
-                                                 0, materialized.tensor.byte_size});
+            size_t canonicalOffset = 0;
+            if (!checkedDeviceBufferOffset(materialized.tensor.resource.offset, materialized.tensor.byte_offset,
+                                           canonicalOffset))
+                return error = "uniform endpoint resource offset exceeds the host address space", false;
+            output.deviceCopiesBefore.push_back(
+                {canonicalBuffer, carrier->handle(), canonicalOffset, 0, materialized.tensor.byte_size});
             output.deviceEndpointCarriers.push_back(std::move(carrier));
             materialized.tensor.byte_offset = 0;
         }
@@ -285,14 +288,15 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 if (!resolveBackendRhiBufferReference(*nodePlan.stage->context, canonical.resource, canonicalBuffer))
                     return error = "logical endpoint has no RHI Storage backing", false;
                 for (const ProgramTensorCopyRegion &region : regions) {
+                    size_t canonicalOffset = 0;
+                    if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
+                        return error = "logical endpoint resource offset exceeds the host address space", false;
                     if (reads)
-                        output.deviceCopiesBefore.push_back({canonicalBuffer, carrier->handle(),
-                                                             canonical.resource.offset + region.sourceOffset,
+                        output.deviceCopiesBefore.push_back({canonicalBuffer, carrier->handle(), canonicalOffset,
                                                              region.destinationOffset, region.size});
                     if (writes)
-                        output.deviceCopiesAfter.push_back(
-                            {carrier->handle(), canonicalBuffer, region.destinationOffset,
-                             canonical.resource.offset + region.sourceOffset, region.size});
+                        output.deviceCopiesAfter.push_back({carrier->handle(), canonicalBuffer,
+                                                            region.destinationOffset, canonicalOffset, region.size});
                 }
             } else {
                 return error = "endpoint projection has no physical carrier backing", false;
@@ -373,14 +377,16 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                                        "backing",
                                false;
                     for (const ProgramTensorCopyRegion &region : regions) {
+                        size_t canonicalOffset = 0;
+                        if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
+                            return error = "aggregate leaf resource offset exceeds the host address space", false;
                         if (reads)
-                            output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(),
-                                                                 canonical.resource.offset + region.sourceOffset,
+                            output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(), canonicalOffset,
                                                                  region.destinationOffset, region.size});
                         if (writes)
-                            output.deviceCopiesAfter.push_back(
-                                {storage->handle(), canonicalBuffer, region.destinationOffset,
-                                 canonical.resource.offset + region.sourceOffset, region.size});
+                            output.deviceCopiesAfter.push_back({storage->handle(), canonicalBuffer,
+                                                                region.destinationOffset, canonicalOffset,
+                                                                region.size});
                     }
                 } else {
                     return error = "aggregate leaf has no materializable backing", false;

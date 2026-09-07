@@ -248,36 +248,6 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
     return true;
 }
 
-VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline,
-                                               const VernonStageInvocationDescriptor &invocation,
-                                               const VernonAdValueSet &inputs,
-                                               execution::detail::RhiCommandExecutionPlan &plan,
-                                               VernonPullback *&pullback) {
-    pullback = nullptr;
-    const auto *autodiff = canonicalProgramAutodiff(&pipeline);
-    auto *executable = autodiff ? autodiff->canonicalExecution.get() : nullptr;
-    if (!executable || invocation.struct_size < sizeof(VernonStageInvocationDescriptor) ||
-        invocation.abi_version != VERNON_PROGRAM_VERSION || (invocation.argument_count && !invocation.arguments) ||
-        !validSet(&inputs, true)) {
-        invocationDiagnostic(*pipeline.context) = "invalid deferred autodiff forward invocation";
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    }
-    auto result = std::make_unique<VernonPullback>();
-    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
-    std::unique_ptr<PullbackExecution> execution;
-    const ForwardExecutionTarget target{{}, &invocation, &plan};
-    const VernonStatus status = executable->forward(target, inputs, nullptr, execution);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    if (!execution) {
-        invocationDiagnostic(*pipeline.context) = "deferred autodiff forward produced no pullback";
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    result->execution = std::move(execution);
-    pullback = result.release();
-    return VERNON_STATUS_OK;
-}
-
 } // namespace vernon::runtime::ad
 
 namespace vernon::runtime::program_execution {
@@ -296,7 +266,7 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline,
     VernonAdValueSet inputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     VernonAdValueSet outputs{sizeof(VernonAdValueSet), nullptr, 0, {}};
     std::unique_ptr<ad::PullbackExecution> execution;
-    const ad::ForwardExecutionTarget target{{}, &invocation, nullptr, programContext};
+    const ad::ForwardExecutionTarget target{&invocation, programContext};
     const VernonStatus status = executable->forward(target, inputs, &outputs, execution);
     if (status != VERNON_STATUS_OK)
         return status;

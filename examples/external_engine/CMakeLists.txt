@@ -34,7 +34,7 @@ function(vernon_find_single_manifest directory output)
        manifest_count
        EQUAL
        1)
-        message(FATAL_ERROR "${directory} must contain exactly one pipeline manifest")
+        message(FATAL_ERROR "${directory} must contain exactly one Program manifest")
     endif()
     list(
         GET
@@ -69,8 +69,9 @@ string(
     _vernon_cpu_target_triple
     GET
     "${VERNON_EXTERNAL_ENGINE_CPU_MANIFEST}"
-    runtime_requirements
-    target_triple)
+    target
+    options
+    triple)
 string(
     JSON
     _vernon_graphics_target_kind
@@ -142,6 +143,8 @@ if(EMSCRIPTEN)
         message(FATAL_ERROR "Emscripten requires wasm CPU and OpenGL ES bundles")
     endif()
     set(_vernon_runtime_profile web)
+    add_compile_options("-fexceptions")
+    add_link_options("-sDISABLE_EXCEPTION_CATCHING=0")
 else()
     if(_vernon_cpu_target_triple MATCHES "^wasm"
        OR NOT
@@ -155,23 +158,14 @@ else()
     include_glfw()
 endif()
 
-find_package(
-    Python3
-    COMPONENTS Interpreter
-    REQUIRED)
-set(_vernon_embedded_graphics_manifest "${CMAKE_CURRENT_BINARY_DIR}/generated/graphics.program.json")
-execute_process(
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/embed_text_artifacts.py" "${_vernon_graphics_manifest}"
-            "${_vernon_embedded_graphics_manifest}"
-    RESULT_VARIABLE _vernon_embed_result
-    ERROR_VARIABLE _vernon_embed_error)
-if(NOT
-   _vernon_embed_result
-   EQUAL
-   0)
-    message(FATAL_ERROR "Failed to embed graphics artifacts: ${_vernon_embed_error}")
+set(VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST "${_vernon_graphics_external_manifest}")
+if(EMSCRIPTEN)
+    set(VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR "/vernon-cpu-bundle")
+    set(VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR "/vernon-graphics-bundle")
+else()
+    set(VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
+    set(VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR "${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}")
 endif()
-file(READ "${_vernon_embedded_graphics_manifest}" VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST)
 configure_file(embedded_bundles.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/embedded_bundles.h" @ONLY)
 
 set(VERNON_RUNTIME_PROFILE
@@ -210,7 +204,7 @@ target_include_directories(vernon-external-engine PRIVATE "${CMAKE_CURRENT_BINAR
                                                           "${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}")
 target_compile_definitions(vernon-external-engine
                            PRIVATE "VERNON_EXTERNAL_ENGINE_REGISTRATION_FUNCTION=${_vernon_registration_function}")
-target_link_libraries(vernon-external-engine PRIVATE VernonRuntime VernonExecutionGraph)
+target_link_libraries(vernon-external-engine PRIVATE VernonRuntime)
 if(NOT EMSCRIPTEN)
     target_link_libraries(vernon-external-engine PRIVATE glfw)
 endif()
@@ -224,7 +218,9 @@ if(EMSCRIPTEN)
         "-sEXIT_RUNTIME=1"
         "-sENVIRONMENT=web,node"
         "-sFULL_ES3=1"
-        "-sUSE_GLFW=3")
+        "-sUSE_GLFW=3"
+        "--embed-file=${VERNON_EXTERNAL_ENGINE_CPU_COOKED_DIR}@${VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR}"
+        "--embed-file=${VERNON_EXTERNAL_ENGINE_GRAPHICS_COOKED_DIR}@${VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR}")
     add_custom_command(
         TARGET vernon-external-engine
         POST_BUILD

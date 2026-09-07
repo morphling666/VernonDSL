@@ -50,13 +50,13 @@ reserved fields zero. Enum numeric values and exported C function signatures
 are stable once published in a 0.1 release. Unreleased API drafts may be
 replaced without compatibility wrappers before their first release.
 
-Execution is submission-based. Runtime pipelines use
-`vernonRuntimeProgramSubmit`, and RHI command encoders are consumed by
-`vernonRhiDeviceSubmit`. A submission may already be
-complete; callers use its state query or `wait()` method. C callers explicitly
-destroy submission/completion handles, while C++ and Python submissions use
-managed lifetime. Submission destruction and device shutdown drain unfinished
-work before releasing retained resources.
+Canonical Program execution uses bundle → executable → instance → invocation.
+`vernonRuntimeProgramInvocationForward` records, submits, and completes the
+resolved Program plan inside the Runtime; a Program caller does not provide a
+command encoder or submit descriptor. The independent direct-Stage facility may
+encode a `VernonStageExecutable` into an RHI command encoder for embedding in an
+external execution graph. RHI encoders are submitted with
+`vernonRhiDeviceSubmit`.
 
 Borrowed Vulkan and DirectX 12 command targets are queued by their external
 owner. Their completions remain pending until that owner has observed its GPU

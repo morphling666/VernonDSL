@@ -4,9 +4,11 @@
 
 This C++ engine embeds two cooked bundles and displays them in one DPI-aware
 GLFW window or WebGL canvas. The left panel runs `examples/fractal.py` through
-a CPU Execution Graph; the right panel encodes the Mandelbulb pipeline through
-an RHI Execution Graph. A shared frame loop composites both images with
-aspect-preserving blits.
+one persistent CPU Program instance; the right panel runs one persistent
+graphics Program instance. Every frame begins a fresh canonical Program
+invocation and binds its current Values and graphics controls. Presentation is
+a separate host/RHI operation, and the shared frame loop composites both
+images with aspect-preserving blits.
 
 Python and nanobind are used only by the host-side cooking step. Browser builds
 perform no filesystem or dynamic-library access.

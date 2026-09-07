@@ -298,67 +298,6 @@ inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiComma
     return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
 }
 
-class RuntimeGraphRenderPass final : public execution::RenderPass {
-public:
-    RuntimeGraphRenderPass(std::string name, execution::GraphImage target, VernonRuntimeContext *runtime,
-                           VernonStageExecutable *pipeline, const VernonStageInvocationDescriptor *invocation,
-                           VernonRhiLoadOperation load = VERNON_RHI_LOAD_CLEAR,
-                           VernonRhiStoreOperation store = VERNON_RHI_STORE_PRESERVE)
-        : RenderPass(std::move(name)), target_(target), runtime_(runtime), pipeline_(pipeline), invocation_(invocation),
-          load_(load), store_(store) {}
-
-    void declare() override {
-        execution::ColorAttachmentUse attachment{};
-        attachment.image = target_;
-        attachment.load = load_;
-        attachment.store = store_;
-        color(0, attachment);
-        renderArea(0, 0, target_.width, target_.height);
-    }
-
-    VernonRhiStatus execute(execution::GraphicsEncoder &encoder, const execution::ExecutionResources &) override {
-        VernonRuntimeProviderObject providerEncoder{};
-        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimeStageEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    execution::GraphImage target_;
-    VernonRuntimeContext *runtime_{};
-    VernonStageExecutable *pipeline_{};
-    const VernonStageInvocationDescriptor *invocation_{};
-    VernonRhiLoadOperation load_{};
-    VernonRhiStoreOperation store_{};
-};
-
-class RuntimeGraphComputePass final : public execution::ComputePass {
-public:
-    RuntimeGraphComputePass(std::string name, execution::GraphBuffer buffer, VernonRuntimeContext *runtime,
-                            VernonStageExecutable *pipeline, const VernonStageInvocationDescriptor *invocation)
-        : ComputePass(std::move(name)), buffer_(buffer), runtime_(runtime), pipeline_(pipeline),
-          invocation_(invocation) {}
-
-    void declare() override { readWrite(buffer_, VERNON_RHI_STATE_SHADER_WRITE, VERNON_RHI_STAGE_COMPUTE); }
-
-    VernonRhiStatus execute(execution::ComputeEncoder &encoder, const execution::ExecutionResources &) override {
-        VernonRuntimeProviderObject providerEncoder{};
-        if (vernonRuntimeReferenceRhiCommandEncoder(runtime_, encoder.native(), &providerEncoder) != VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        return vernonRuntimeStageEncode(providerEncoder, pipeline_, invocation_) == VERNON_STATUS_OK
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    execution::GraphBuffer buffer_;
-    VernonRuntimeContext *runtime_{};
-    VernonStageExecutable *pipeline_{};
-    const VernonStageInvocationDescriptor *invocation_{};
-};
-
 inline VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
     switch (backend) {
     case VERNON_RUNTIME_CUDA:

@@ -93,10 +93,13 @@ bool ResolvedTransferExecutor::prepareGraph(program::GraphDirection graph, std::
                     ", destination element bytes " + std::to_string(destinationView.element_layout.byte_size) + ")";
             return false;
         }
-        for (const ProgramTensorCopyRegion &region : regions)
-            initialCopies_.push_back({source, state_.deviceValues_[value]->handle(),
-                                      initial->source.offset + region.sourceOffset, region.destinationOffset,
-                                      region.size});
+        for (const ProgramTensorCopyRegion &region : regions) {
+            size_t sourceOffset = 0;
+            if (!checkedDeviceBufferOffset(initial->source.offset, region.sourceOffset, sourceOffset))
+                return error = "staged device input offset exceeds the host address space", false;
+            initialCopies_.push_back(
+                {source, state_.deviceValues_[value]->handle(), sourceOffset, region.destinationOffset, region.size});
+        }
     }
     initialCopiesPending_ = !state_.deviceUploads_.empty() || !initialCopies_.empty();
     return true;

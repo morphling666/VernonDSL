@@ -247,6 +247,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     const unsigned pointerBits = module.getDataLayout().getPointerSizeInBits();
     if (pointerBits != 32 && pointerBits != 64)
         return invalidAbi("CPU ABI requires 32-bit or 64-bit pointers");
+    const uint64_t pointerBytes = pointerBits / 8;
     llvm::IntegerType *sizeType = llvm::IntegerType::get(context, pointerBits);
     auto *invocationType = llvm::StructType::get(context, {pointerType, sizeType, pointerType, sizeType, pointerType});
     auto wrapperType = llvm::FunctionType::get(llvm::Type::getInt32Ty(context), {pointerType}, false);
@@ -324,10 +325,10 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             continue;
         }
 
-        const uint64_t descriptorSize = 8 * (2 + 2 * static_cast<uint64_t>(packing.tensorRank));
+        const uint64_t descriptorSize = pointerBytes * (2 + 2 * static_cast<uint64_t>(packing.tensorRank));
         if (packing.size != descriptorSize)
             return invalidAbi("CPU TensorView descriptor has an incompatible size");
-        llvm::LoadInst *rawPointerBits = builder.CreateLoad(builder.getInt64Ty(), address, "buffer_address");
+        llvm::LoadInst *rawPointerBits = builder.CreateLoad(sizeType, address, "buffer_address");
         rawPointerBits->setAlignment(llvm::Align(1));
         llvm::Value *rawPointer = builder.CreateIntToPtr(rawPointerBits, pointerType, "buffer");
         for (size_t leafIndex = 0; leafIndex < packing.tensorLeafElementSizes.size(); ++leafIndex) {
@@ -346,8 +347,9 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
                 return invalidAbi("lowered CPU buffer descriptor index types are "
                                   "incompatible");
             for (uint32_t dimension = 0; dimension < packing.tensorRank; ++dimension) {
-                llvm::Value *extentAddress = builder.CreateGEP(
-                    builder.getInt8Ty(), address, builder.getInt64(8 * (2 + static_cast<uint64_t>(dimension))));
+                llvm::Value *extentAddress =
+                    builder.CreateGEP(builder.getInt8Ty(), address,
+                                      builder.getInt64(pointerBytes * (2 + static_cast<uint64_t>(dimension))));
                 llvm::LoadInst *runtimeExtent = builder.CreateLoad(sizeType, extentAddress);
                 runtimeExtent->setAlignment(llvm::Align(1));
                 extent = builder.CreateMul(extent, runtimeExtent);
@@ -366,9 +368,10 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
             llvm::Type *fieldType = function->getArg(loweredIndex++)->getType();
             if (!llvm::isa<llvm::IntegerType>(fieldType))
                 return invalidAbi("CPU TensorView descriptor field type is not an integer");
-            llvm::Value *fieldAddress = builder.CreateGEP(
-                llvm::Type::getInt8Ty(context), descriptor,
-                llvm::ConstantInt::get(llvm::Type::getInt64Ty(context), 8 * (1 + static_cast<uint64_t>(field))));
+            llvm::Value *fieldAddress =
+                builder.CreateGEP(llvm::Type::getInt8Ty(context), descriptor,
+                                  llvm::ConstantInt::get(llvm::Type::getInt64Ty(context),
+                                                         pointerBytes * (1 + static_cast<uint64_t>(field))));
             llvm::LoadInst *fieldValue = builder.CreateLoad(fieldType, fieldAddress);
             fieldValue->setAlignment(llvm::Align(1));
             argumentsToCall.push_back(fieldValue);

@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -676,6 +677,12 @@ FailureOr<NodeProjection> projectNode(const CanonicalAbiNode &canonical, Physica
     return result;
 }
 
+std::pair<uint64_t, uint64_t> hostPointerLayout(ModuleOp module) {
+    const auto layoutAttribute = module->getAttrOfType<StringAttr>("llvm.data_layout");
+    const llvm::DataLayout layout(layoutAttribute ? layoutAttribute.getValue() : StringRef());
+    return {layout.getPointerSize(), layout.getPointerABIAlignment(0).value()};
+}
+
 std::shared_ptr<const ByteTransportNode> buildTransportTree(const CanonicalAbiNode &canonical,
                                                             const NodeProjection &physical, PhysicalAbiProfile profile,
                                                             uint64_t byteOffset) {
@@ -719,10 +726,12 @@ FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleO
         if (failed(getValueStorageLayout(view.getElementType(), module)))
             return failure();
         switch (profile) {
-        case PhysicalAbiProfile::HostValue:
-            return BackendInterfaceAbiPlan{
-                ResourceBindingPlan{PhysicalResourceAbiKind::TensorViewDescriptor,
-                                    8 * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), 8}};
+        case PhysicalAbiProfile::HostValue: {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{
+                PhysicalResourceAbiKind::TensorViewDescriptor,
+                pointerSize * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), pointerAlignment}};
+        }
         case PhysicalAbiProfile::CudaKernelParameter:
             return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0}};
         case PhysicalAbiProfile::VulkanStd140UniformBuffer:
@@ -737,27 +746,35 @@ FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleO
         }
     }
     if (isa<TextureType>(type)) {
-        if (profile == PhysicalAbiProfile::HostValue)
-            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile == PhysicalAbiProfile::HostValue) {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{
+                ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, pointerSize, pointerAlignment}};
+        }
         if (profile != PhysicalAbiProfile::CudaKernelParameter)
             return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsTexture, 0, 0}};
         return BackendInterfaceAbiPlan{UnsupportedBackendInterfaceAbi{"texture_argument"}};
     }
     if (isa<SamplerType>(type)) {
-        if (profile == PhysicalAbiProfile::HostValue)
-            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile == PhysicalAbiProfile::HostValue) {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{
+                ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, pointerSize, pointerAlignment}};
+        }
         if (profile != PhysicalAbiProfile::CudaKernelParameter)
             return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsSampler, 0, 0}};
         return BackendInterfaceAbiPlan{UnsupportedBackendInterfaceAbi{"sampler_argument"}};
     }
     if (type.isIndex()) {
+        const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
         CanonicalAbiNode canonical;
         canonical.kind = CanonicalAbiNodeKind::Scalar;
         canonical.type = type;
         canonical.representation = "index";
-        canonical.size = 8;
-        canonical.alignment = 8;
-        const std::string layoutHash = hashCanonical("scalar(index,8,8)");
+        canonical.size = pointerSize;
+        canonical.alignment = pointerAlignment;
+        const std::string layoutHash =
+            hashCanonical("scalar(index," + std::to_string(pointerSize) + "," + std::to_string(pointerAlignment) + ")");
         FailureOr<NodeProjection> projection = projectNode(canonical, profile);
         if (failed(projection))
             return failure();

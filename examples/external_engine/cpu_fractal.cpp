@@ -1,8 +1,7 @@
+#include "canonical_program_call.h"
 #include "engine_demo.h"
 #include "graphics_host.h"
 
-#include "VernonExecutionGraph.h"
-#include "VernonRuntime.h"
 #include "embedded_bundles.h"
 
 #include <algorithm>
@@ -12,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -27,96 +27,7 @@ constexpr uint32_t kWidth = 640;
 constexpr uint32_t kHeight = 320;
 constexpr uint64_t kPixelShape[] = {kHeight, kWidth};
 constexpr int64_t kPixelStrides[] = {kWidth * sizeof(float), sizeof(float)};
-
-std::string runtimeError(VernonRuntimeContext *runtime) {
-    const VernonStringView error = vernonRuntimeGetLastError(runtime);
-    return error.data ? std::string(error.data, error.size) : "unknown Runtime error";
-}
-
-class FractalComputePass final : public vernon::execution::ComputePass {
-public:
-    FractalComputePass(vernon::execution::GraphBuffer pixels, VernonRuntimeContext *runtime,
-                       VernonProgramExecutable *pipeline, VernonStageInvocationDescriptor *invocation)
-        : ComputePass("fractal-compute"), pixels_(pixels), runtime_(runtime), pipeline_(pipeline),
-          invocation_(invocation) {}
-
-    void declare() override { write(pixels_, VERNON_RHI_STATE_COMMON); }
-
-    VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
-                            const vernon::execution::ExecutionResources &) override {
-        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(pipeline_);
-        VernonProgramInvocation *invocation =
-            instance ? vernonRuntimeProgramInstanceBeginInvocation(instance) : nullptr;
-        VernonStatus status = invocation ? VERNON_STATUS_OK : VERNON_STATUS_INVALID_ARGUMENT;
-        for (size_t index = 0; invocation && index < invocation_->argument_count && status == VERNON_STATUS_OK;
-             ++index) {
-            const VernonProgramBindingToken token{sizeof(token), &index, sizeof(index)};
-            status =
-                vernonRuntimeProgramInvocationBind(invocation, &token, &invocation_->arguments[index], nullptr, 0, 0);
-        }
-        if (status == VERNON_STATUS_OK)
-            status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
-        vernonRuntimeProgramInvocationDestroy(invocation);
-        vernonRuntimeProgramInstanceDestroy(instance);
-        if (status == VERNON_STATUS_OK)
-            return VERNON_RHI_STATUS_OK;
-        std::cerr << "fractal invocation failed: " << runtimeError(runtime_) << '\n';
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    }
-
-private:
-    vernon::execution::GraphBuffer pixels_;
-    VernonRuntimeContext *runtime_{};
-    VernonProgramExecutable *pipeline_{};
-    VernonStageInvocationDescriptor *invocation_{};
-};
-
-class FractalPresentPass final : public vernon::execution::ComputePass {
-public:
-    FractalPresentPass(vernon::execution::GraphBuffer pixels, const std::vector<float> *values,
-                       std::vector<uint8_t> *rgba, GraphicsHost *graphics, VernonRhiImage image, bool headless)
-        : ComputePass("fractal-present"), pixels_(pixels), values_(values), rgba_(rgba), graphics_(graphics),
-          image_(image), headless_(headless) {
-        setFlags(vernon::execution::PassSideEffect | vernon::execution::PassNeverCull);
-    }
-
-    void declare() override { read(pixels_, VERNON_RHI_STATE_COMMON); }
-
-    VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
-                            const vernon::execution::ExecutionResources &) override {
-        if (headless_) {
-            const double checksum = std::accumulate(values_->begin(), values_->end(), 0.0);
-            if (!std::isfinite(checksum) || checksum <= 0.0)
-                return VERNON_RHI_STATUS_INTERNAL_ERROR;
-            std::cout << "Vernon CPU fractal headless checksum: " << checksum << '\n';
-            return VERNON_RHI_STATUS_OK;
-        }
-        for (size_t index = 0; index < values_->size(); ++index) {
-            const auto gray = static_cast<uint8_t>(std::clamp((*values_)[index], 0.0F, 1.0F) * 255.0F);
-            (*rgba_)[index * 4] = gray;
-            (*rgba_)[index * 4 + 1] = gray;
-            (*rgba_)[index * 4 + 2] = gray;
-            (*rgba_)[index * 4 + 3] = 255;
-        }
-        VernonRhiImageUploadDescriptor upload{};
-        upload.struct_size = sizeof(upload);
-        upload.width = kWidth;
-        upload.height = kHeight;
-        upload.depth = 1;
-        upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
-        upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
-        upload.data = rgba_->data();
-        return vernonRhiDeviceUploadImage(graphics_->device(), image_, &upload, 1);
-    }
-
-private:
-    vernon::execution::GraphBuffer pixels_;
-    const std::vector<float> *values_{};
-    std::vector<uint8_t> *rgba_{};
-    GraphicsHost *graphics_{};
-    VernonRhiImage image_{};
-    bool headless_{};
-};
+constexpr std::array<uint32_t, 3> kGrid{kWidth / 16, kHeight / 16, 1};
 
 class CpuFractalPanel final : public ExternalEnginePanel {
 public:
@@ -132,57 +43,63 @@ public:
         runtime_ = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
         if (!runtime_)
             return false;
-#if defined(__EMSCRIPTEN__)
-        const VernonProgramBundleLoadOptions *loadOptions = nullptr;
-#else
-        VernonProgramBundleLoadOptions desktopOptions{};
-        desktopOptions.struct_size = sizeof(desktopOptions);
-        desktopOptions.bundle_directory = vernon_external_engine::cpu_bundle::kCookedDirectory;
-        const VernonProgramBundleLoadOptions *loadOptions = &desktopOptions;
-#endif
-        bundle_ =
-            vernonRuntimeLoadProgramBundleWithOptions(runtime_, vernon_external_engine::cpu_bundle::kManifest,
-                                                      vernon_external_engine::cpu_bundle::kManifestSize, loadOptions);
-        pipeline_ = bundle_ ? vernonRuntimeResolveProgram(bundle_, {nullptr, 0}) : nullptr;
-        if (!pipeline_) {
-            std::cerr << "failed to load the fractal pipeline: " << runtimeError(runtime_) << '\n';
+        VernonProgramBundleLoadOptions bundleOptions{};
+        bundleOptions.struct_size = sizeof(bundleOptions);
+        bundleOptions.bundle_directory = vernon_external_engine::cpu_bundle::kCookedDirectory;
+        const VernonProgramBundleLoadOptions *loadOptions = &bundleOptions;
+        try {
+            program_.emplace(vernon::runtime::ProgramExecutable::load(
+                runtime_, vernon_external_engine::cpu_bundle::kManifest,
+                vernon_external_engine::cpu_bundle::kManifestSize, {nullptr, 0}, loadOptions));
+            instance_ = std::make_unique<vernon::runtime::ProgramInstance>(*program_);
+        } catch (const std::exception &exception) {
+            const std::string diagnostic = vernon_external_engine::programRuntimeError(runtime_);
+            std::cerr << "failed to load the fractal Program: " << (diagnostic.empty() ? exception.what() : diagnostic)
+                      << '\n';
             return false;
         }
+        VernonProgramExecutable *pipeline = program_->get();
 
-        VernonProgramParameterView pixelsParameter{};
-        VernonProgramParameterView timeParameter{};
-        if (vernonRuntimeProgramExecutableFindParameter(pipeline_, {"pixels", 6}, &pixelsParameter) !=
-                VERNON_STATUS_OK ||
-            vernonRuntimeProgramExecutableFindParameter(pipeline_, {"time", 4}, &timeParameter) != VERNON_STATUS_OK)
-            return false;
+        constexpr std::array<const char *, 5> names{"pixels", "time", "__grid_x", "__grid_y", "__grid_z"};
+        std::array<VernonProgramParameterView, 5> parameters{};
+        for (size_t index = 0; index < parameters.size(); ++index)
+            if (vernonRuntimeProgramExecutableFindParameter(
+                    pipeline, {names[index], std::char_traits<char>::length(names[index])}, &parameters[index]) !=
+                VERNON_STATUS_OK)
+                return false;
         pixels_.resize(static_cast<size_t>(kWidth) * kHeight);
         rgba_.resize(pixels_.size() * 4);
 
-        arguments_[0].slot = pixelsParameter.slot;
+        arguments_[0].slot = parameters[0].slot;
         arguments_[0].kind = VERNON_PROGRAM_TENSOR;
         arguments_[0].tensor.struct_size = sizeof(VernonTensorView);
         arguments_[0].tensor.storage = VERNON_TENSOR_HOST;
         arguments_[0].tensor.host_data = pixels_.data();
-        arguments_[0].tensor.element_layout = pixelsParameter.element_layout;
-        arguments_[0].tensor.access = pixelsParameter.access;
+        arguments_[0].tensor.element_layout = parameters[0].element_layout;
+        arguments_[0].tensor.access = parameters[0].access;
         arguments_[0].tensor.rank = 2;
         arguments_[0].tensor.shape = kPixelShape;
         arguments_[0].tensor.byte_strides = kPixelStrides;
         arguments_[0].tensor.byte_size = pixels_.size() * sizeof(float);
-        arguments_[1].slot = timeParameter.slot;
+        arguments_[1].slot = parameters[1].slot;
         arguments_[1].kind = VERNON_PROGRAM_TENSOR;
         arguments_[1].tensor.struct_size = sizeof(VernonTensorView);
         arguments_[1].tensor.storage = VERNON_TENSOR_HOST;
         arguments_[1].tensor.host_data = &time_;
-        arguments_[1].tensor.element_layout = timeParameter.element_layout;
-        arguments_[1].tensor.access = timeParameter.access;
+        arguments_[1].tensor.element_layout = parameters[1].element_layout;
+        arguments_[1].tensor.access = parameters[1].access;
         arguments_[1].tensor.byte_size = sizeof(time_);
-        invocation_.struct_size = sizeof(invocation_);
-        invocation_.abi_version = VERNON_PROGRAM_VERSION;
-        invocation_.arguments = arguments_.data();
-        invocation_.argument_count = arguments_.size();
-        invocation_.compute_grid = {kWidth / 16, kHeight / 16, 1};
-
+        for (size_t axis = 0; axis < kGrid.size(); ++axis) {
+            VernonProgramArgument &argument = arguments_[axis + 2];
+            argument.slot = parameters[axis + 2].slot;
+            argument.kind = VERNON_PROGRAM_TENSOR;
+            argument.tensor.struct_size = sizeof(VernonTensorView);
+            argument.tensor.storage = VERNON_TENSOR_HOST;
+            argument.tensor.host_data = &kGrid[axis];
+            argument.tensor.element_layout = parameters[axis + 2].element_layout;
+            argument.tensor.access = parameters[axis + 2].access;
+            argument.tensor.byte_size = sizeof(kGrid[axis]);
+        }
         if (!headless_) {
             if (!graphics_)
                 return false;
@@ -201,25 +118,40 @@ public:
                 return false;
         }
 
-        vernon::execution::ExecutionGraph graph;
-        const auto graphPixels = graph.importHostBuffer(reinterpret_cast<uint64_t>(pixels_.data()), true);
-        graph.emplacePass<FractalComputePass>(graphPixels, runtime_, pipeline_, &invocation_);
-        graph.emplacePass<FractalPresentPass>(graphPixels, &pixels_, &rgba_, graphics_, presentImage_, headless_);
-        std::string error;
-        graph_ = graph.compile(error);
-        if (!graph_) {
-            std::cerr << "failed to compile CPU fractal graph: " << error << '\n';
-            return false;
-        }
         return true;
     }
 
     bool renderFrame(double elapsedSeconds, uint32_t, uint32_t) override {
         time_ = static_cast<float>(elapsedSeconds);
-        if (!graph_)
+        std::string error;
+        if (!vernon_external_engine::invokeProgram(runtime_, *program_, *instance_, arguments_.data(),
+                                                   arguments_.size(), nullptr, error)) {
+            std::cerr << "fractal Program invocation failed: " << error << '\n';
             return false;
-        auto submission = graph_->submit();
-        return submission.wait() == VERNON_RHI_STATUS_OK;
+        }
+        if (headless_) {
+            const double checksum = std::accumulate(pixels_.begin(), pixels_.end(), 0.0);
+            if (!std::isfinite(checksum) || checksum <= 0.0)
+                return false;
+            std::cout << "Vernon CPU fractal headless checksum: " << checksum << '\n';
+            return true;
+        }
+        for (size_t index = 0; index < pixels_.size(); ++index) {
+            const auto gray = static_cast<uint8_t>(std::clamp(pixels_[index], 0.0F, 1.0F) * 255.0F);
+            rgba_[index * 4] = gray;
+            rgba_[index * 4 + 1] = gray;
+            rgba_[index * 4 + 2] = gray;
+            rgba_[index * 4 + 3] = 255;
+        }
+        VernonRhiImageUploadDescriptor upload{};
+        upload.struct_size = sizeof(upload);
+        upload.width = kWidth;
+        upload.height = kHeight;
+        upload.depth = 1;
+        upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
+        upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
+        upload.data = rgba_.data();
+        return vernonRhiDeviceUploadImage(graphics_->device(), presentImage_, &upload, 1) == VERNON_RHI_STATUS_OK;
     }
 
     VernonRhiImage image() const override { return presentImage_; }
@@ -227,18 +159,13 @@ public:
     uint32_t imageHeight() const override { return kHeight; }
 
     void shutdown() override {
-        graph_.reset();
+        instance_.reset();
+        program_.reset();
         if (!headless_ && graphics_ && presentImage_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
             vernonRhiDeviceDestroyImage(graphics_->device(), presentImage_);
         presentImage_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-        if (pipeline_)
-            vernonRuntimeProgramExecutableDestroy(pipeline_);
-        if (bundle_)
-            vernonRuntimeProgramBundleDestroy(bundle_);
         if (runtime_)
             vernonRuntimeDestroy(runtime_);
-        pipeline_ = nullptr;
-        bundle_ = nullptr;
         runtime_ = nullptr;
     }
 
@@ -246,15 +173,13 @@ private:
     bool headless_{};
     GraphicsHost *graphics_{};
     VernonRuntimeContext *runtime_{};
-    VernonProgramBundle *bundle_{};
-    VernonProgramExecutable *pipeline_{};
+    std::optional<vernon::runtime::ProgramExecutable> program_;
+    std::unique_ptr<vernon::runtime::ProgramInstance> instance_;
     VernonRhiImage presentImage_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     std::vector<float> pixels_;
     std::vector<uint8_t> rgba_;
     float time_{};
-    std::array<VernonProgramArgument, 2> arguments_{};
-    VernonStageInvocationDescriptor invocation_{};
-    std::shared_ptr<vernon::execution::CompiledExecutionGraph> graph_;
+    std::array<VernonProgramArgument, 5> arguments_{};
 };
 
 } // namespace

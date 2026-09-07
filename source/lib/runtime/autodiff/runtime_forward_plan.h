@@ -12,15 +12,9 @@ struct ProgramInvocationContext;
 
 namespace vernon::execution::detail {
 class RhiCommandPlanSink;
-struct RhiCommandExecutionPlan;
 } // namespace vernon::execution::detail
 
 namespace vernon::runtime::ad {
-VernonStatus preparePipelineForwardCommandPlan(VernonProgramExecutable &pipeline,
-                                               const VernonStageInvocationDescriptor &invocation,
-                                               const VernonAdValueSet &inputs,
-                                               execution::detail::RhiCommandExecutionPlan &plan,
-                                               VernonPullback *&pullback);
 VernonStatus applyPullbackDeviceWithPlanSink(VernonPullback &pullback, const VernonAdDeviceValueSet *cotangents,
                                              VernonAdDeviceValueSet &gradients,
                                              const VernonPullbackApplyOptions *options,

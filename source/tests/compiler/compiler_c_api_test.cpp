@@ -2206,6 +2206,24 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     ASSERT_TRUE(vernonCompileResultGetCpuEntry(wasm_cpu_compile, "add_vectors", 11) == NULL);
     vernonCompileResultDestroy(wasm_cpu_compile);
 
+    VernonCompileResult *wasm_tensor_compile =
+        vernonCompilerCompileMlirWithOptions(context, cpu_compute_module, strlen(cpu_compute_module), &wasm_options);
+    ASSERT_NE(wasm_tensor_compile, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(wasm_tensor_compile), VERNON_STATUS_OK)
+        << std::string(vernonCompileResultGetDiagnostics(wasm_tensor_compile).data,
+                       vernonCompileResultGetDiagnostics(wasm_tensor_compile).size);
+    const VernonStringView wasm_tensor_reflection = vernonCompileResultGetReflection(wasm_tensor_compile);
+    const nlohmann::json wasm_tensor_json =
+        nlohmann::json::parse(wasm_tensor_reflection.data, wasm_tensor_reflection.data + wasm_tensor_reflection.size);
+    const nlohmann::json &wasm_tensor_host =
+        wasm_tensor_json.at("entries").at(0).at("arguments").at(0).at("physical_layouts").at("host_value");
+    EXPECT_EQ(wasm_tensor_host.at("resource_kind"), "tensor_view_descriptor");
+    EXPECT_EQ(wasm_tensor_host.at("size"), 16);
+    EXPECT_EQ(wasm_tensor_host.at("alignment"), 4);
+    EXPECT_EQ(wasm_tensor_json.at("entries").at(0).at("physical_layouts").at("host_value").at("packed_arguments_size"),
+              28);
+    vernonCompileResultDestroy(wasm_tensor_compile);
+
     VernonCompileResult *cpu_large_compile =
         vernonCompilerCompileMlir(context, cpu_large_vector_module, strlen(cpu_large_vector_module), VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu_large_compile != NULL);

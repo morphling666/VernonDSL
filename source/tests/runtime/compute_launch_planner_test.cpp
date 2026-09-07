@@ -1,13 +1,23 @@
 #include "runtime/compute_launch_planner.h"
+#include "runtime/program_execution/device_commands.h"
 
 #include <gtest/gtest.h>
 
 #include <array>
 #include <cstring>
+#include <limits>
 
 namespace {
 
 using namespace vernon::runtime;
+
+TEST(DeviceCommandsTest, RejectsOffsetsOutsideHostAddressSpace) {
+    size_t result = 0;
+    EXPECT_TRUE(program_execution::checkedDeviceBufferOffset(7, 5, result));
+    EXPECT_EQ(result, 12u);
+    EXPECT_FALSE(program_execution::checkedDeviceBufferOffset(std::numeric_limits<uint64_t>::max(), 1, result));
+    EXPECT_FALSE(program_execution::checkedDeviceBufferOffset(std::numeric_limits<size_t>::max(), 1, result));
+}
 
 void setScalarLayout(Parameter &parameter, const char *dtype, VernonDataType dataType) {
     const VernonValueLayoutView view = vernonRuntimeGetScalarValueLayout(dataType);
@@ -218,7 +228,7 @@ TEST(ComputeLaunchPlannerTest, PacksRankZeroTensorViewDescriptor) {
     const auto &argument = std::get<ComputeTensorArgument>(plan.arguments.front());
     ASSERT_NE(argument.tensorView, nullptr);
     EXPECT_EQ(argument.tensorView->rank, 0u);
-    EXPECT_EQ(argument.tensorViewSize, 16u);
+    EXPECT_EQ(argument.tensorViewSize, 2 * sizeof(uintptr_t));
 }
 
 TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
