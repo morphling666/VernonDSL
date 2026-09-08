@@ -5,7 +5,6 @@
 #include "runtime/program_execution/program_image_binding.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
-#include "runtime/target_binding_plan.h"
 
 #include <map>
 #include <memory>
@@ -30,6 +29,11 @@ enum class ProgramValueOwnership {
 };
 
 struct ProgramValueState {
+    struct BoundTensorLayout {
+        std::vector<uint64_t> shape;
+        std::vector<int64_t> byteStrides;
+    };
+
     struct StagedDeviceInitial {
         VernonRuntimeProviderResourceReference source{};
         std::optional<VernonRhiBuffer> retainedSourceBuffer;
@@ -43,6 +47,7 @@ struct ProgramValueState {
     std::vector<uint8_t> ownedHostBytes;
     std::vector<int64_t> strides;
     std::optional<shape::ConcreteShape> concreteShape;
+    std::optional<BoundTensorLayout> boundTensorLayout;
     VernonProgramArgument argument{};
     std::optional<StagedDeviceInitial> stagedDeviceInitial;
     ProgramValueOwnership ownership{ProgramValueOwnership::OwnedInvocation};

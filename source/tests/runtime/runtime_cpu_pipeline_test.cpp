@@ -1,10 +1,5 @@
-#include "VernonCpuWorkgroupABI.h"
-#include "runtime/backend_stage_pipeline.h"
 #include "runtime/runtime_state.h"
 
-#include <nlohmann/json.hpp>
-
-#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -91,93 +86,9 @@ void destroy(CanonicalCpuProgram &program) {
 }
 #endif
 
-std::atomic<uint32_t> staticInvocationCount{};
-
-VernonStatus staticallyLinkedFill(const VernonCpuInvocation *invocation) {
-    if (!invocation || invocation->arguments_size != VERNON_CPU_RANGE_ARGUMENTS_SIZE_V1)
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    auto *range = reinterpret_cast<VernonCpuRangeV1 *>(const_cast<void *>(invocation->arguments));
-    if (!range || range->struct_size != sizeof(*range))
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    ++staticInvocationCount;
-    return VERNON_STATUS_OK;
-}
-
-constexpr char kDirectCpuReflection[] =
-    "{" VERNON_JSON_VERSION_FIELDS ",\"entries\":[{\"name\":\"fill\","
-    "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"packed_arguments_size\":12}},"
-    "\"workgroup_size\":[1,1,1],"
-    "\"dispatch_contract\":{\"unit_grid_axes\":[],\"requires_unit_workgroup\":false},"
-    "\"arguments\":[{\"kind\":\"builtin\",\"builtin\":\"global_invocation_id\","
-    "\"physical_layouts\":{\"host_value\":{\"profile\":\"host_value\",\"kind\":\"cpu_call\","
-    "\"frame_offset\":0,\"root\":{\"kind\":\"array\",\"offset\":0,\"size\":12,\"alignment\":4,"
-    "\"shape\":[3],\"byte_strides\":[4],\"children\":[{\"kind\":\"scalar\","
-    "\"representation\":\"i32\",\"offset\":0,\"size\":4,\"alignment\":4}]}}},\"index\":0}]}]}";
-
 } // namespace
 
-TEST(RuntimeCpuPipeline, LoadsAndInvokesDirectCpuEntry) {
-    staticInvocationCount = 0;
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(runtime, nullptr);
-    VernonStageExecutable *pipeline = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
-                                                                sizeof(kDirectCpuReflection) - 1, "fill", 4);
-    ASSERT_NE(pipeline, nullptr) << lastError(runtime);
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.compute_grid = {2, 3, 4};
-    VernonSubmission *submission = nullptr;
-    ASSERT_EQ(vernonRuntimeStageSubmit(pipeline, &invocation, &submission), VERNON_STATUS_OK) << lastError(runtime);
-    ASSERT_NE(submission, nullptr) << lastError(runtime);
-    EXPECT_EQ(vernonSubmissionWait(submission), VERNON_STATUS_OK);
-    vernonSubmissionDestroy(submission);
-    EXPECT_EQ(staticInvocationCount.load(), 24u);
-    vernonRuntimeStageExecutableDestroy(pipeline);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-}
-
 #if !defined(VERNON_RUNTIME_PROFILE_WEB)
-TEST(RuntimeCpuPipeline, ReflectsImageConstraintsAndRejectsLegacyMetadata) {
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(runtime, nullptr);
-    VernonStageExecutable pipeline;
-    pipeline.context = runtime;
-    vernon::runtime::Parameter tensor;
-    tensor.slot = 0;
-    tensor.name = "values";
-    tensor.kind = "tensor";
-    pipeline.bindingProjection.parameters.push_back(tensor);
-    vernon::runtime::Parameter image;
-    image.slot = 1;
-    image.name = "output";
-    image.kind = "image";
-    image.dimension = "3d";
-    image.bindingRole = "sampled";
-    image.sampleResultClass = "float";
-    image.access = "read";
-    pipeline.bindingProjection.parameters.push_back(image);
-
-    VernonProgramImageConstraintView constraint{};
-    constraint.struct_size = sizeof(constraint);
-    EXPECT_EQ(vernonRuntimeStageExecutableGetImageConstraintByParameterIndex(&pipeline, 0, &constraint),
-              VERNON_STATUS_INVALID_ARGUMENT);
-    ASSERT_EQ(vernonRuntimeStageExecutableGetImageConstraintByParameterIndex(&pipeline, 1, &constraint),
-              VERNON_STATUS_OK);
-    EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
-    EXPECT_EQ(constraint.binding_role, VERNON_IMAGE_BINDING_SAMPLED);
-    ASSERT_EQ(
-        vernonRuntimeStageExecutableFindImageConstraint(&pipeline, {"output", std::strlen("output")}, &constraint),
-        VERNON_STATUS_OK);
-    EXPECT_EQ(constraint.dimension, VERNON_TEXTURE_3D);
-
-    constexpr char legacyReflection[] = "{" VERNON_JSON_VERSION_FIELDS ",\"legacy\":true,\"entries\":[]}";
-    EXPECT_EQ(vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, legacyReflection, sizeof(legacyReflection) - 1,
-                                        "fill", 4),
-              nullptr);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-}
-
 TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
     const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
@@ -292,23 +203,5 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
     destroy(program);
-}
-#endif
-
-#if defined(VERNON_RUNTIME_PROFILE_WEB)
-TEST(RuntimeCpuPipeline, WebProfileLoadsMultipleStaticPipelinesWithoutFilesystem) {
-    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
-    ASSERT_NE(runtime, nullptr);
-    VernonStageExecutable *first = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
-                                                             sizeof(kDirectCpuReflection) - 1, "fill", 4);
-    VernonStageExecutable *second = vernonRuntimeLoadCpuEntry(runtime, staticallyLinkedFill, kDirectCpuReflection,
-                                                              sizeof(kDirectCpuReflection) - 1, "fill", 4);
-    ASSERT_NE(first, nullptr);
-    ASSERT_NE(second, nullptr);
-    EXPECT_NE(first, second);
-    EXPECT_EQ(runtime->livePipelines, 2u);
-    vernonRuntimeStageExecutableDestroy(second);
-    vernonRuntimeStageExecutableDestroy(first);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 #endif

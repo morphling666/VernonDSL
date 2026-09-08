@@ -395,7 +395,7 @@ struct VernonToGPUPass : public PassWrapper<VernonToGPUPass, OperationPass<Modul
                     kernelArgumentTypes.push_back(view);
                     resourceBindings.emplace_back(kernelIndex, std::make_pair(descriptorSet.getInt(), kernelIndex));
                     sourceArgumentRanges[index] = {kernelIndex, 1};
-                } else if (!attrs.builtin && (type.isIntOrIndexOrFloat() || isa<VectorType>(type))) {
+                } else if (!attrs.builtin && (type.isIntOrIndexOrFloat() || isa<mlir::VectorType>(type))) {
                     unsigned kernelIndex = kernelArgumentTypes.size();
                     kernelArgumentTypes.push_back(type);
                     sourceArgumentRanges[index] = {kernelIndex, 1};

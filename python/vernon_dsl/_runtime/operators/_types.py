@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from ..._dtypes import scalar_name as _scalar_name
-from ..._mlir import first_generic_type_argument, generic_type_arguments, ranked_tensor_parts
+from ..._mlir import generic_type_arguments, ranked_tensor_parts, ranked_type_parts
 from ...language.scalar_types import SCALAR_TYPES
 from ..tensor import TensorStorage, TensorView
 
@@ -55,7 +55,14 @@ def python_element_annotation(value: Mapping[str, Any]) -> str | None:
 
 
 def program_element_type(value: Mapping[str, Any]) -> str | None:
-    return first_generic_type_argument(str(value.get("type") or ""), "!vernon.tensor_view")
+    spelling = str(value.get("type") or "")
+    if spelling in _SCALAR_ANNOTATIONS:
+        return spelling
+    for constructor in ("tensor_view", "tensor"):
+        parts = ranked_type_parts(spelling, constructor)
+        if parts is not None:
+            return parts[1]
+    return None
 
 
 def as_view(value: TensorStorage | TensorView, access: str) -> TensorView:

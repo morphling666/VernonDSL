@@ -1964,11 +1964,11 @@ FailureOr<func::FuncOp> createStructuredBackward(func::FuncOp primal, StringRef 
                                                               "vernon.source_name");
         if (!sourceName || sourceName.getValue().empty())
             return primal.emitError("Storage identity has no source name for its backward shape source");
+        const SmallVector<StringRef> dtypes = languageLeafDtypes(
+            primal.getArgAttrDict(cast<BlockArgument>(identity.binding).getArgNumber()), identity.binding.getType());
         backwardArgumentAttrs.push_back(makeInterfaceAttrs(
-            context, "input", ("shape." + sourceName.getValue()).str(),
-            languageLeafDtypes(primal.getArgAttrDict(cast<BlockArgument>(identity.binding).getArgNumber()),
-                               identity.binding.getType()),
-            shapeBase + shapeSourceIndex, identity.binding.getType(), "retained_primal", sourceName.getValue(), true));
+            context, "input", ("shape." + sourceName.getValue()).str(), dtypes, shapeBase + shapeSourceIndex,
+            profileTypes.shapeSources[shapeSourceIndex], "retained_primal", sourceName.getValue(), true));
         ++shapeSourceIndex;
     }
     const unsigned cotangentBase = shapeBase + profileTypes.shapeSources.size();

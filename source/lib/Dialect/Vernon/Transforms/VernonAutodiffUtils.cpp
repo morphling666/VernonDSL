@@ -39,13 +39,13 @@ FailureOr<Type> getAutodiffDerivativeValueType(Type valueType, ModuleOp module) 
             return failure();
         return RankedTensorType::get(tensor.getShape(), *element, tensor.getEncoding());
     }
-    if (auto vector = dyn_cast<VectorType>(valueType)) {
+    if (auto vector = dyn_cast<mlir::VectorType>(valueType)) {
         if (vector.isScalable())
             return failure();
         FailureOr<Type> element = getAutodiffDerivativeValueType(vector.getElementType(), module);
         if (failed(element))
             return failure();
-        return VectorType::get(vector.getShape(), *element, vector.getScalableDims());
+        return mlir::VectorType::get(vector.getShape(), *element, vector.getScalableDims());
     }
     FailureOr<ValueAbiLayout> layout = getValueStorageLayout(valueType, module);
     if (failed(layout))

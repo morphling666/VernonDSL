@@ -1,5 +1,6 @@
 #include "compiler_program_storage.h"
 
+#include "VernonProgramSemanticTypes.h"
 #include "compiler_json.h"
 
 #include <limits>
@@ -8,21 +9,6 @@
 
 namespace vernon::compiler {
 namespace {
-
-std::vector<std::string> quotedTypeFields(llvm::StringRef type) {
-    std::vector<std::string> fields;
-    while (true) {
-        const size_t begin = type.find('"');
-        if (begin == llvm::StringRef::npos)
-            return fields;
-        type = type.drop_front(begin + 1);
-        const size_t end = type.find('"');
-        if (end == llvm::StringRef::npos)
-            return {};
-        fields.push_back(type.take_front(end).str());
-        type = type.drop_front(end + 1);
-    }
-}
 
 llvm::json::Object manifestLayout(const llvm::json::Object &layout, llvm::StringRef scope) {
     llvm::json::Object result;
@@ -130,15 +116,27 @@ llvm::json::Value dimensionExtent(const llvm::json::Object &reference, int64_t a
 
 } // namespace
 
-bool isProgramTextureType(llvm::StringRef type) { return type.starts_with("!vernon.texture<"); }
-
-bool isProgramSamplerType(llvm::StringRef type) { return type.starts_with("!vernon.sampler"); }
-
-bool isProgramAdTapeType(llvm::StringRef type) {
-    return type == "!vernon.ad_tape" || type.starts_with("!vernon.ad_tape<");
+bool isProgramTextureType(llvm::StringRef type) {
+    std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type.str());
+    return semantic && semantic->isImage();
 }
 
-bool isProgramTensorViewType(llvm::StringRef type) { return type.starts_with("!vernon.tensor_view<"); }
+bool isProgramSamplerType(llvm::StringRef type) {
+    std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type.str());
+    return semantic && semantic->isSampler();
+}
+
+bool isProgramAdTapeType(llvm::StringRef type) {
+    std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type.str());
+    return semantic && semantic->kind == vernon::program::SemanticTypeKind::Opaque &&
+           semantic->parameter ==
+               vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::AdTape)->contract;
+}
+
+bool isProgramTensorViewType(llvm::StringRef type) {
+    std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type.str());
+    return semantic && semantic->isTensorView();
+}
 
 bool isValidProgramResourceAccess(llvm::StringRef access) {
     return access == "read" || access == "write" || access == "read_write";
@@ -355,14 +353,16 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
         const bool captureLegal = direction != index.graphDirections.end() && direction->second == "backward";
         llvm::json::Object descriptor;
         if (isProgramTextureType(type)) {
-            const std::vector<std::string> fields = quotedTypeFields(type);
-            if (fields.size() < 2 || shape->size() > 3) {
+            const std::optional<vernon::program::SemanticType> semantic =
+                vernon::program::parseSemanticType(type.str());
+            const std::optional<llvm::StringRef> dimension = value->getString("texture_dimension");
+            if (!semantic || !dimension || shape->size() > 3) {
                 error = "canonical Program texture has no valid dimension, format, or rank";
                 return false;
             }
             size_t spatialRank = shape->size();
             if (spatialRank == 0)
-                spatialRank = fields[0] == "1d" ? 1 : fields[0] == "3d" ? 3 : 2;
+                spatialRank = *dimension == "3d" ? 3 : 2;
             const bool borrowed = index.argumentSlots.count(root);
             llvm::json::Array extent;
             llvm::json::Array dynamicExtents;
@@ -420,8 +420,8 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             else if (computeImage)
                 usage.emplace_back("storage");
             descriptor = llvm::json::Object{{"tag", "image"},
-                                            {"dimension", fields[0]},
-                                            {"format", fields[1]},
+                                            {"dimension", dimension->str()},
+                                            {"format", semantic->parameter},
                                             {"sample_count", int64_t{1}},
                                             {"mip_levels", int64_t{1}},
                                             {"array_layers", int64_t{1}},
@@ -430,9 +430,16 @@ bool materializeProgramStoragePlan(const llvm::json::Array &rawValues,
             if (!borrowed)
                 descriptor["extent"] = std::move(extent);
         } else if (isProgramSamplerType(type) || isProgramAdTapeType(type)) {
+            const vernon::program::BuiltinStorageContract *contract = vernon::program::builtinStorageContract(
+                isProgramSamplerType(type) ? vernon::program::BuiltinStorageContractId::Sampler
+                                           : vernon::program::BuiltinStorageContractId::AdTape);
+            const llvm::json::Object contractIdentity{{"contract", std::string(contract->contract)},
+                                                      {"type", std::string(contract->canonicalType)}};
             descriptor = llvm::json::Object{
                 {"tag", "opaque"},
-                {"contract_hash", canonicalJsonSha256(llvm::json::Value(llvm::json::Object{{"type", type.str()}}))}};
+                {"contract", std::string(contract->contract)},
+                {"contract_hash", canonicalJsonSha256(llvm::json::Value(copyJsonObject(contractIdentity)))},
+                {"usage", llvm::json::Array{"stage_binding"}}};
         } else {
             uint64_t byteLength = 0;
             const std::optional<int64_t> alignment = layout ? layout->getInteger("alignment") : std::nullopt;

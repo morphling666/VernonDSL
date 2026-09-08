@@ -228,9 +228,10 @@ bool resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPla
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = internal ? MetalPipelineState::GraphicsBinding::RESOLUTION
                                                     : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
-                const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
+                const ValueLayout &canonical = *use.valueLayout;
                 std::optional<TensorCopyPlan> packing =
-                    parameter.valueLayout
+                    wholeValue
                         ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
                         : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
                 if (!packing || packing->elementSize != canonical.byteSize)

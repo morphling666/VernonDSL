@@ -1,7 +1,6 @@
 #ifndef VERNON_PYTHON_NATIVE_PROGRAM_AUTODIFF_H
 #define VERNON_PYTHON_NATIVE_PROGRAM_AUTODIFF_H
 
-#include "native_command_retention.h"
 #include "native_program.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/program_boundary_view.h"

@@ -126,10 +126,10 @@ class MixedGrid(vd.Module):
 
 
 def _builtin_program_value(value_id: int, dtype: str, shape: list[int]) -> dict[str, object]:
-    rank_shape = ", ".join("-1" for _ in shape)
+    semantic_type = f"tensor_view<{'?x' * len(shape)}{dtype}>" if shape else dtype
     return {
         "id": value_id,
-        "type": f'!vernon.tensor_view<{dtype}, [{rank_shape}], "read_write", "device">',
+        "type": semantic_type,
         "dtype": dtype,
         "shape": shape,
         "value_layout": {

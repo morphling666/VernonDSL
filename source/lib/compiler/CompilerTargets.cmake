@@ -32,6 +32,7 @@ add_library(
     compiler_program_lowering.cpp
     compiler_program_publication.cpp
     compiler_program_reflection.cpp
+    compiler_program_semantic_type.cpp
     compiler_program_serializer.cpp
     compiler_program_stage.cpp
     compiler_program_storage.cpp

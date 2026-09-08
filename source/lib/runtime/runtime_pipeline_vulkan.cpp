@@ -6,7 +6,6 @@
 #include "compute_launch_planner.h"
 #include "pipeline_metadata.h"
 #include "prepared_graphics_draw.h"
-#include "rhi/rhi_internal.h"
 #include "tensor_bridge.h"
 
 #include <nlohmann/json.hpp>
@@ -266,9 +265,10 @@ bool resolveVulkanPipeline(BackendStageBuildInputs &inputs, const StageBindingPl
                 candidate.layout.set = use.descriptorSet;
                 candidate.binding.source = internal ? VulkanPipelineState::Binding::RESOLUTION
                                                     : VulkanPipelineState::Binding::EXTERNAL_UNIFORM;
-                const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
+                const ValueLayout &canonical = *use.valueLayout;
                 std::optional<TensorCopyPlan> packing =
-                    parameter.valueLayout
+                    wholeValue
                         ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
                         : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
                 if (!packing || packing->elementSize != canonical.byteSize) {
@@ -475,8 +475,22 @@ VernonStatus invokeVulkanGraphicsPipeline(VernonStageExecutable &pipeline,
                 return fail(*pipeline.context, "Vulkan RHI uniform argument is missing");
             const VernonTensorView &tensor = found->second->tensor;
             const std::optional<std::vector<uint8_t>> packed = packTensor(tensor, prepared.packing);
-            if (!packed || packed->size() != prepared.storage.size())
-                return fail(*pipeline.context, "Vulkan RHI uniform Tensor is invalid");
+            if (!packed)
+                return fail(*pipeline.context,
+                            "Vulkan RHI uniform Tensor at slot " + std::to_string(prepared.externalSlot) +
+                                " does not satisfy its resolved packing plan (rank " + std::to_string(tensor.rank) +
+                                ", element bytes " + std::to_string(tensor.element_layout.byte_size) +
+                                ", allocation bytes " + std::to_string(tensor.byte_size) + ", packing element bytes " +
+                                std::to_string(prepared.packing.elementSize) + ", packing rank " +
+                                std::to_string(prepared.packing.shape.size()) + ", storage " +
+                                std::to_string(static_cast<uint32_t>(tensor.storage)) + ", host data " +
+                                (tensor.host_data ? "present" : "missing") + ", byte offset " +
+                                std::to_string(tensor.byte_offset) + ")");
+            if (packed->size() != prepared.storage.size())
+                return fail(*pipeline.context, "Vulkan RHI uniform Tensor at slot " +
+                                                   std::to_string(prepared.externalSlot) + " packed to " +
+                                                   std::to_string(packed->size()) + " bytes; expected " +
+                                                   std::to_string(prepared.storage.size()));
             prepared.storage = *packed;
             value.payload.inline_value.data = prepared.storage.data();
             value.payload.inline_value.size = prepared.storage.size();

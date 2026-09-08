@@ -13,17 +13,17 @@ FailureOr<Value> lowerAtan2ToSpirv(Location location, Type resultType, Value y, 
 
     auto floatConstant = [&](double value) -> Value {
         Attribute attribute = builder.getFloatAttr(elementType, value);
-        if (auto vectorType = dyn_cast<VectorType>(resultType))
+        if (auto vectorType = dyn_cast<mlir::VectorType>(resultType))
             attribute = DenseElementsAttr::get(vectorType, cast<TypedAttr>(attribute));
         return spirv::ConstantOp::create(builder, location, resultType, cast<TypedAttr>(attribute));
     };
     Type integerElementType = builder.getIntegerType(elementType.getWidth());
     Type integerType = integerElementType;
-    if (auto vectorType = dyn_cast<VectorType>(resultType))
-        integerType = VectorType::get(vectorType.getShape(), integerElementType);
+    if (auto vectorType = dyn_cast<mlir::VectorType>(resultType))
+        integerType = mlir::VectorType::get(vectorType.getShape(), integerElementType);
     auto integerConstant = [&](const APInt &value) -> Value {
         Attribute attribute = builder.getIntegerAttr(integerElementType, value);
-        if (auto vectorType = dyn_cast<VectorType>(integerType))
+        if (auto vectorType = dyn_cast<mlir::VectorType>(integerType))
             attribute = DenseElementsAttr::get(vectorType, cast<TypedAttr>(attribute));
         return spirv::ConstantOp::create(builder, location, integerType, cast<TypedAttr>(attribute));
     };

@@ -242,7 +242,7 @@ bool parseGraphicsPipelineState(const nlohmann::json &value, GraphicsPipelineSta
 bool parseTextureFormat(const nlohmann::json &value, VernonTextureFormat &format) {
     return enumName(value,
                     {"rgba8_unorm", "rgba8_srgb", "rgba16_float", "rgba32_float", "r8_unorm", "r16_float", "r32_float",
-                     "rg8_unorm", "rgb8_unorm", "r11g11b10_float", "d32_float", "d32_float_s8_uint"},
+                     "rg8_unorm", "rgb8_unorm", "r11g11b10_float", "depth32_float", "depth32_float_stencil8"},
                     format);
 }
 
@@ -342,40 +342,22 @@ bool parseShape(const nlohmann::json &value, std::vector<uint64_t> &result, Diag
 
 bool parseCanonicalValueType(std::string_view type, CanonicalValueType &parsed) {
     parsed = {};
-    if (type.rfind("tensor<", 0) != 0 && type.rfind("vector<", 0) != 0) {
-        if (type.find('<') == std::string_view::npos)
-            parsed.dtype = std::string(type);
-        return true;
-    }
-    if (type.size() < 9 || type.back() != '>')
+    std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type);
+    if (!semantic || vernon::program::serializeSemanticType(*semantic) != type)
         return false;
-    const std::string_view body = type.substr(7, type.size() - 8);
-    size_t begin = 0;
-    while (true) {
-        const size_t separator = body.find('x', begin);
-        if (separator == std::string_view::npos)
-            break;
-        const std::string_view extent = body.substr(begin, separator - begin);
-        if (extent.empty() ||
-            !std::all_of(extent.begin(), extent.end(), [](char value) { return value >= '0' && value <= '9'; }))
-            break;
-        uint64_t parsedExtent = 0;
-        for (char digit : extent) {
-            const uint64_t value = static_cast<uint64_t>(digit - '0');
-            if (parsedExtent > (std::numeric_limits<uint64_t>::max() - value) / 10)
-                return false;
-            parsedExtent = parsedExtent * 10 + value;
-        }
-        if (!parsedExtent)
-            return false;
-        parsed.innerShape.push_back(parsedExtent);
-        begin = separator + 1;
-    }
-    if (begin == body.size())
-        return false;
-    parsed.dtype = std::string(body.substr(begin));
-    parsed.rankedValue = true;
-    return !parsed.dtype.empty();
+    parsed.semantic = std::move(*semantic);
+    parsed.rankedValue = parsed.semantic.isRankedValue();
+    if (parsed.rankedValue)
+        for (int64_t dimension : parsed.semantic.dimensions)
+            parsed.innerShape.push_back(static_cast<uint64_t>(dimension));
+    const vernon::program::SemanticType *leaf = &parsed.semantic;
+    while (leaf->elements.size() == 1 && (leaf->kind == vernon::program::SemanticTypeKind::Tensor ||
+                                          leaf->kind == vernon::program::SemanticTypeKind::TensorView))
+        leaf = &leaf->elements.front();
+    if (leaf->kind == vernon::program::SemanticTypeKind::Scalar)
+        if (const vernon::program::ScalarDescriptor *scalar = vernon::program::programScalar(leaf->scalar))
+            parsed.dtype = std::string(scalar->spelling);
+    return true;
 }
 
 bool sortedUnique(const std::vector<uint32_t> &values) {
@@ -420,11 +402,8 @@ bool parseLayout(const nlohmann::json &value, ValueLayout &layout, Diagnostic &d
             leaf.path.push_back(std::move(pathComponent));
         }
         leaf.dtype = row["dtype"].get<std::string>();
-        const uint64_t scalarSize = leaf.dtype == "bool" || leaf.dtype == "i8" || leaf.dtype == "u8"    ? 1
-                                    : leaf.dtype == "i16" || leaf.dtype == "u16" || leaf.dtype == "f16" ? 2
-                                    : leaf.dtype == "i32" || leaf.dtype == "u32" || leaf.dtype == "f32" ? 4
-                                    : leaf.dtype == "i64" || leaf.dtype == "u64" || leaf.dtype == "f64" ? 8
-                                                                                                        : 0;
+        const vernon::program::ScalarDescriptor *scalar = vernon::program::programScalar(leaf.dtype);
+        const uint64_t scalarSize = scalar ? std::max<uint64_t>(scalar->bitWidth / 8, 1) : 0;
         if (!scalarSize ||
             leaf.scalarCount > (layout.byteSize - std::min(layout.byteSize, leaf.byteOffset)) / scalarSize)
             return fail(diagnostic, "PROGRAM_LAYOUT_HASH", "parse", leafPath, "layout leaf exceeds its byte range");
@@ -612,8 +591,10 @@ void markGraphValues(const Graph &graph, std::vector<char> &live) {
 }
 
 bool isTapeValueType(std::string_view type) {
-    return type == "!vernon.ad_tape" ||
-           (type.rfind("!vernon.ad_tape<", 0) == 0 && type.size() > 17 && type.back() == '>');
+    const std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type);
+    return semantic && semantic->kind == vernon::program::SemanticTypeKind::Opaque &&
+           semantic->parameter ==
+               vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::AdTape)->contract;
 }
 
 bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
@@ -787,11 +768,20 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             }
         } else if (descriptorTag == "opaque") {
             storage.descriptorKind = StorageDescriptorKind::Opaque;
-            if (!exactObject(descriptor, {"tag", "contract_hash"}, {}, diagnostic, path + "/descriptor") ||
-                !digestValue(descriptor["contract_hash"]))
+            if (!exactObject(descriptor, {"tag", "contract", "contract_hash", "usage"}, {}, diagnostic,
+                             path + "/descriptor") ||
+                !descriptor["contract"].is_string() || !digestValue(descriptor["contract_hash"]) ||
+                !descriptor["usage"].is_array())
                 return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
                             "invalid opaque descriptor");
+            storage.opaqueContract = descriptor["contract"].get<std::string>();
+            const std::optional<vernon::program::SemanticType> contractType =
+                vernon::program::parseSemanticType("opaque<" + storage.opaqueContract + ">");
+            if (!contractType || descriptor["usage"] != nlohmann::json::array({"stage_binding"}))
+                return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
+                            "opaque descriptor contract or usage is invalid");
             storage.opaqueContractHash = descriptor["contract_hash"].get<std::string>();
+            storage.opaqueUsage = descriptor["usage"].get<std::vector<std::string>>();
         } else {
             return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse", path + "/descriptor",
                         "unknown storage descriptor tag");
@@ -828,6 +818,24 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
                 return false;
             parsed.layout = std::move(layout);
         }
+        if (parsed.layout) {
+            const vernon::program::SemanticType *layoutType = &parsed.canonicalType.semantic;
+            if (parsed.layout->scope == "element" && layoutType->kind == vernon::program::SemanticTypeKind::TensorView)
+                layoutType = &layoutType->elements.front();
+            std::vector<vernon::program::ScalarSemanticId> expectedLeaves;
+            if (!vernon::program::appendSemanticScalarLeaves(*layoutType, expectedLeaves) ||
+                expectedLeaves.size() != parsed.layout->leaves.size())
+                return fail(diagnostic, "PROGRAM_LAYOUT_HASH", "parse", path + "/value_layout",
+                            "ValueLayout leaf structure disagrees with the canonical Program type");
+            for (size_t leaf = 0; leaf < expectedLeaves.size(); ++leaf) {
+                const vernon::program::ScalarDescriptor *expected =
+                    vernon::program::programScalar(expectedLeaves[leaf]);
+                if (!expected || parsed.layout->leaves[leaf].dtype != expected->spelling)
+                    return fail(diagnostic, "PROGRAM_LAYOUT_HASH", "parse",
+                                path + "/value_layout/leaves/" + std::to_string(leaf) + "/dtype",
+                                "ValueLayout dtype disagrees with the canonical Program type");
+            }
+        }
         if (parsed.canonicalType.rankedValue && parsed.layout && parsed.layout->scope == "value" &&
             parsed.layout->leaves.size() == 1 && parsed.layout->leaves.front().path.empty() &&
             (parsed.layout->leaves.front().dtype != parsed.canonicalType.dtype ||
@@ -835,6 +843,24 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             return fail(diagnostic, "PROGRAM_LAYOUT_HASH", "parse", path + "/value_layout",
                         "canonical tensor type disagrees with its ValueLayout");
         program.values.push_back(std::move(parsed));
+    }
+    for (const Value &logicalValue : program.values) {
+        if (!logicalValue.storage || *logicalValue.storage >= program.storages.size())
+            continue;
+        const Storage &storage = program.storages[*logicalValue.storage];
+        if (logicalValue.canonicalType.semantic.kind == vernon::program::SemanticTypeKind::Opaque &&
+            (storage.descriptorKind != StorageDescriptorKind::Opaque ||
+             storage.opaqueContract != logicalValue.canonicalType.semantic.parameter))
+            return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse",
+                        "/values/" + std::to_string(logicalValue.id) + "/storage",
+                        "opaque Value contract disagrees with its Storage descriptor");
+        if (logicalValue.canonicalType.semantic.isSampler() &&
+            (storage.descriptorKind != StorageDescriptorKind::Opaque ||
+             storage.opaqueContract !=
+                 vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::Sampler)->contract))
+            return fail(diagnostic, "PROGRAM_STORAGE_DESCRIPTOR", "parse",
+                        "/values/" + std::to_string(logicalValue.id) + "/storage",
+                        "Sampler Value contract disagrees with its Storage descriptor");
     }
 
     for (size_t graphIndex = 0; graphIndex < value["graphs"].size(); ++graphIndex) {
@@ -1269,13 +1295,19 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             boundaryStorage.descriptorKind = storage.descriptorKind;
             boundaryStorage.buffer = storage.buffer;
             boundaryStorage.image = storage.image;
+            boundaryStorage.opaqueContract = storage.opaqueContract;
             boundaryStorage.opaqueContractHash = storage.opaqueContractHash;
+            boundaryStorage.opaqueUsage = storage.opaqueUsage;
             const BoundaryCategory storageCategory =
                 storage.descriptorKind == StorageDescriptorKind::Buffer  ? BoundaryCategory::StorageView
                 : storage.descriptorKind == StorageDescriptorKind::Image ? BoundaryCategory::Texture
                                                                          : BoundaryCategory::Sampler;
             if (slot.category != storageCategory ||
-                (storage.descriptorKind == StorageDescriptorKind::Opaque && logicalValue.type != "!vernon.sampler"))
+                (storage.descriptorKind == StorageDescriptorKind::Opaque &&
+                 (!logicalValue.canonicalType.semantic.isSampler() ||
+                  storage.opaqueContract !=
+                      vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::Sampler)
+                          ->contract)))
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/category",
                             "ProgramABI category disagrees with its Storage");
             slot.storage = std::move(boundaryStorage);

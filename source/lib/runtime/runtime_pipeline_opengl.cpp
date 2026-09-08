@@ -291,13 +291,12 @@ bool resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPl
                     candidate.layout.set = use.descriptorSet;
                     candidate.binding.source = OpenGLPipelineState::InlineBinding::EXTERNAL_UNIFORM;
                     candidate.name = use.uniformName;
-                    const ValueLayout &canonical =
-                        parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                    const bool wholeValue = use.tensorPacking == TensorRepresentation::WholeValue;
+                    const ValueLayout &canonical = *use.valueLayout;
                     std::optional<TensorCopyPlan> packing =
-                        parameter.valueLayout
-                            ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
-                            : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape,
-                                                           *use.interfacePlan->root);
+                        wholeValue ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                                   : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape,
+                                                                  *use.interfacePlan->root);
                     if (!packing || packing->elementSize != canonical.byteSize) {
                         representationError = "OpenGL interface plan does not match the canonical layout";
                         useRhiGraphics = false;

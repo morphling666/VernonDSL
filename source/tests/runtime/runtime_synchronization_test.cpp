@@ -15,6 +15,52 @@ namespace {
 
 class RhiRuntimeSynchronization : public testing::TestWithParam<vernon::tests::BackendTestRow> {};
 
+#if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
+extern "C" VernonStatus vernonRegisterSynchronizationProgramFixture(void);
+
+#ifndef VERNON_SYNCHRONIZATION_CPU_MANIFEST
+#define VERNON_SYNCHRONIZATION_CPU_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_CUDA_MANIFEST
+#define VERNON_SYNCHRONIZATION_CUDA_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_VULKAN_MANIFEST
+#define VERNON_SYNCHRONIZATION_VULKAN_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST
+#define VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_METAL_MANIFEST
+#define VERNON_SYNCHRONIZATION_METAL_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_OPENGL_MANIFEST
+#define VERNON_SYNCHRONIZATION_OPENGL_MANIFEST ""
+#endif
+#ifndef VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST
+#define VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST ""
+#endif
+
+const char *synchronizationManifest(VernonTarget target) {
+    switch (target) {
+    case VERNON_TARGET_CPU:
+        return VERNON_SYNCHRONIZATION_CPU_MANIFEST;
+    case VERNON_TARGET_CUDA:
+        return VERNON_SYNCHRONIZATION_CUDA_MANIFEST;
+    case VERNON_TARGET_VULKAN:
+        return VERNON_SYNCHRONIZATION_VULKAN_MANIFEST;
+    case VERNON_TARGET_DIRECTX:
+        return VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST;
+    case VERNON_TARGET_METAL:
+        return VERNON_SYNCHRONIZATION_METAL_MANIFEST;
+    case VERNON_TARGET_OPENGL:
+        return VERNON_SYNCHRONIZATION_OPENGL_MANIFEST;
+    case VERNON_TARGET_OPENGL_ES:
+        return VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST;
+    }
+    return "";
+}
+#endif
+
 std::string stringValue(VernonStringView value) {
     return value.data ? std::string(value.data, value.size) : std::string{};
 }
@@ -87,68 +133,43 @@ void verifySynchronizationResult(const std::array<int32_t, 10> &result) {
     }
 }
 
-VernonCompileResult *compileSynchronization(VernonTarget target, VernonCompilerContext **compiler) {
-    *compiler = vernonCompilerCreate();
-    if (!*compiler)
-        return nullptr;
-    if (target == VERNON_TARGET_CPU) {
-        const VernonCpuRuntimeHelpersV1 helpers{sizeof(VernonCpuRuntimeHelpersV1), &vernonCpuWorkgroupAddressV1,
-                                                &vernonCpuLaneAddressV1, &vernonCpuWorkgroupBarrierV1,
-                                                &vernonCpuWorkgroupIsLeaderV1};
-        if (vernonCompilerRegisterCpuRuntimeHelpersV1(*compiler, &helpers) != VERNON_STATUS_OK)
-            return nullptr;
-    }
-    return vernonCompilerCompileMlir(*compiler, synchronizationModule, sizeof(synchronizationModule) - 1, target);
-}
-
-TEST(CompilerRuntimeSynchronization, CpuJitEntryExecutesCooperativeWorkgroups) {
-    VernonCompilerContext *compiler = nullptr;
-    VernonCompileResult *compiled = compileSynchronization(VERNON_TARGET_CPU, &compiler);
-    ASSERT_NE(compiler, nullptr);
-    ASSERT_NE(compiled, nullptr);
-    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK)
-        << stringValue(vernonCompileResultGetDiagnostics(compiled));
-    ASSERT_EQ(vernonCompileResultGetArtifactCount(compiled), 1u);
-
+#if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
+TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkgroups) {
+    ASSERT_EQ(vernonRegisterSynchronizationProgramFixture(), VERNON_STATUS_OK);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
-    const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    VernonCpuEntryPoint entry = vernonCompileResultGetCpuEntry(compiled, "synchronize", std::strlen("synchronize"));
-    ASSERT_NE(entry, nullptr);
-    VernonStageExecutable *pipeline = vernonRuntimeLoadCpuEntry(runtime, entry, reflection.data, reflection.size,
-                                                                "synchronize", std::strlen("synchronize"));
-    ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
+    {
+        vernon::tests::OwnedProgramExecutable program(runtime, VERNON_SYNCHRONIZATION_CPU_MANIFEST);
+        ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(runtime));
 
-    std::array<int32_t, 10> result{};
-    constexpr uint64_t shape[]{result.size()};
-    constexpr int64_t strides[]{sizeof(int32_t)};
-    VernonProgramArgument argument{};
-    argument.slot = 0;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_HOST;
-    argument.tensor.host_data = result.data();
-    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
-    argument.tensor.access = VERNON_ACCESS_WRITE;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = sizeof(result);
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
-        << stringValue(vernonRuntimeGetLastError(runtime));
-    verifySynchronizationResult(result);
+        std::array<int32_t, 10> result{};
+        constexpr uint64_t shape[]{result.size()};
+        constexpr int64_t strides[]{sizeof(int32_t)};
+        VernonProgramArgument argument{};
+        VernonProgramParameterView parameter{};
+        ASSERT_EQ(
+            vernonRuntimeProgramExecutableFindParameter(program.get(), {"output", std::strlen("output")}, &parameter),
+            VERNON_STATUS_OK);
+        argument.slot = parameter.slot;
+        argument.kind = VERNON_PROGRAM_TENSOR;
+        argument.tensor.struct_size = sizeof(VernonTensorView);
+        argument.tensor.storage = VERNON_TENSOR_HOST;
+        argument.tensor.host_data = result.data();
+        argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
+        argument.tensor.access = VERNON_ACCESS_WRITE;
+        argument.tensor.rank = 1;
+        argument.tensor.shape = shape;
+        argument.tensor.byte_strides = strides;
+        argument.tensor.byte_size = sizeof(result);
+        ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {2, 1, 1}),
+                  VERNON_STATUS_OK)
+            << stringValue(vernonRuntimeGetLastError(runtime));
+        verifySynchronizationResult(result);
+    }
 
-    vernonRuntimeStageExecutableDestroy(pipeline);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-    vernonCompileResultDestroy(compiled);
-    vernonCompilerDestroy(compiler);
 }
+#endif
 
 TEST(CompilerRuntimeSynchronization, CpuArtifactCompilationDoesNotUseProcessGlobalHelpers) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
@@ -164,7 +185,8 @@ TEST(CompilerRuntimeSynchronization, CpuArtifactCompilationDoesNotUseProcessGlob
     vernonCompilerDestroy(compiler);
 }
 
-TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) {
+#if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
+TEST_P(RhiRuntimeSynchronization, CanonicalProgramExecutesIndependentWorkgroupBarrierAndAtomic) {
     const vernon::tests::BackendTestRow backend = GetParam();
     vernon::tests::BackendTestRequirements requirements;
     requirements.compute = true;
@@ -177,31 +199,22 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
         vernonCompilerDestroy(compiler);
         GTEST_SKIP() << compilerProbe.reason;
     }
-    VernonCompileResult *compiled =
-        vernonCompilerCompileMlir(compiler, synchronizationModule, sizeof(synchronizationModule) - 1, backend.compiler);
-    ASSERT_NE(compiled, nullptr);
-    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK)
-        << stringValue(vernonCompileResultGetDiagnostics(compiled));
-    ASSERT_EQ(vernonCompileResultGetArtifactCount(compiled), 1u);
-
     vernon::tests::OwnedRhiRuntime owned(backend.runtime, nullptr, backend.runtime == VERNON_RUNTIME_DIRECTX12);
     vernon::tests::RhiRuntime &context = owned.context();
     const vernon::tests::BackendProbeResult runtimeProbe =
         vernon::tests::probeRuntimeBackend(backend, requirements, context.runtime);
     if (!runtimeProbe.available()) {
-        vernonCompileResultDestroy(compiled);
         vernonCompilerDestroy(compiler);
         if (runtimeProbe.skippable())
             GTEST_SKIP() << runtimeProbe.reason;
         FAIL() << runtimeProbe.reason;
     }
-    const VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
-    const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    VernonStageExecutable *pipeline =
-        vernonRuntimeLoadArtifact(context.runtime, artifact.data, artifact.size, reflection.data, reflection.size,
-                                  "synchronize", std::strlen("synchronize"));
-    ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(context.runtime))
-                                 << "\nreflection: " << stringValue(reflection);
+    vernonCompilerDestroy(compiler);
+    const char *manifest = synchronizationManifest(backend.compiler);
+    ASSERT_NE(manifest, nullptr);
+    ASSERT_NE(*manifest, '\0');
+    vernon::tests::OwnedProgramExecutable program(context.runtime, manifest);
+    ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(context.runtime));
 
     std::array<int32_t, 10> result{};
     vernon::tests::RhiBuffer buffer = vernon::tests::createBuffer(context, sizeof(result), alignof(int32_t),
@@ -210,7 +223,10 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     constexpr uint64_t shape[]{result.size()};
     constexpr int64_t strides[]{sizeof(int32_t)};
     VernonProgramArgument argument{};
-    argument.slot = 0;
+    VernonProgramParameterView parameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(program.get(), {"output", std::strlen("output")}, &parameter),
+              VERNON_STATUS_OK);
+    argument.slot = parameter.slot;
     argument.kind = VERNON_PROGRAM_TENSOR;
     argument.tensor.struct_size = sizeof(VernonTensorView);
     argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
@@ -221,13 +237,8 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     argument.tensor.shape = shape;
     argument.tensor.byte_strides = strides;
     argument.tensor.byte_size = sizeof(result);
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    invocation.compute_grid = {2, 1, 1};
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
+    ASSERT_EQ(vernon::tests::completeCanonicalComputeInvocation(program.get(), &argument, 1, {2, 1, 1}),
+              VERNON_STATUS_OK)
         << "RHI: " << stringValue(vernonRhiDeviceGetLastError(context.device))
         << "; runtime: " << stringValue(vernonRuntimeGetLastError(context.runtime));
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, result.data(), sizeof(result)),
@@ -235,9 +246,6 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
     verifySynchronizationResult(result);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeStageExecutableDestroy(pipeline);
-    vernonCompileResultDestroy(compiled);
-    vernonCompilerDestroy(compiler);
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, RhiRuntimeSynchronization,
@@ -246,5 +254,6 @@ INSTANTIATE_TEST_SUITE_P(AvailableBackends, RhiRuntimeSynchronization,
                          [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
                              return std::string(info.param.name);
                          });
+#endif
 
 } // namespace

@@ -46,10 +46,10 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     if (tensor.getRank() == 0)
         return elementType;
     if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4)
-        return VectorType::get(tensor.getShape(), elementType);
+        return mlir::VectorType::get(tensor.getShape(), elementType);
     if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 && tensor.getDimSize(1) >= 2 &&
         tensor.getDimSize(1) <= 4) {
-        auto columnType = VectorType::get({tensor.getShape()[0]}, elementType);
+        auto columnType = mlir::VectorType::get({tensor.getShape()[0]}, elementType);
         return spirv::MatrixType::get(columnType, tensor.getShape()[1]);
     }
     Type result = elementType;
@@ -88,7 +88,7 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
 
     Type result;
     if (carrierComponents <= 4) {
-        result = VectorType::get({static_cast<int64_t>(carrierComponents)}, elementType);
+        result = mlir::VectorType::get({static_cast<int64_t>(carrierComponents)}, elementType);
     } else {
         SmallVector<Type> fields;
         SmallVector<uint32_t> offsets;
@@ -96,8 +96,9 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
         uint64_t offset = 0;
         while (remaining) {
             const uint64_t components = std::min<uint64_t>(remaining, 4);
-            fields.push_back(components == 1 ? elementType
-                                             : Type(VectorType::get({static_cast<int64_t>(components)}, elementType)));
+            fields.push_back(components == 1
+                                 ? elementType
+                                 : Type(mlir::VectorType::get({static_cast<int64_t>(components)}, elementType)));
             offsets.push_back(static_cast<uint32_t>(offset));
             offset += components * elementSize;
             remaining -= components;
@@ -207,7 +208,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
         return IntegerType::get(type.getContext(), integer.getWidth());
     if (type.isIntOrFloat())
         return type;
-    if (isa<VectorType>(type))
+    if (isa<mlir::VectorType>(type))
         return type;
     if (isa<spirv::ArrayType, spirv::MatrixType, spirv::StructType>(type))
         return type;
@@ -222,10 +223,10 @@ Type applyInterfaceIntegerSignedness(Type type, DictionaryAttr attributes) {
                                                       : IntegerType::SignednessSemantics::Unsigned;
     if (auto integer = dyn_cast<IntegerType>(type))
         return IntegerType::get(type.getContext(), integer.getWidth(), signedness);
-    if (auto vector = dyn_cast<VectorType>(type))
+    if (auto vector = dyn_cast<mlir::VectorType>(type))
         if (auto integer = dyn_cast<IntegerType>(vector.getElementType()))
-            return VectorType::get(vector.getShape(),
-                                   IntegerType::get(type.getContext(), integer.getWidth(), signedness));
+            return mlir::VectorType::get(vector.getShape(),
+                                         IntegerType::get(type.getContext(), integer.getWidth(), signedness));
     return type;
 }
 
@@ -409,7 +410,7 @@ void flattenComposite(Location location, Value value, OpBuilder &builder, SmallV
         return;
     }
     if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
-        auto columnType = cast<VectorType>(matrix.getColumnType());
+        auto columnType = cast<mlir::VectorType>(matrix.getColumnType());
         const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
         for (unsigned row = 0; row < rows; ++row)
             for (unsigned column = 0; column < matrix.getNumColumns(); ++column)
@@ -418,7 +419,7 @@ void flattenComposite(Location location, Value value, OpBuilder &builder, SmallV
                     ArrayRef<int32_t>{static_cast<int32_t>(column), static_cast<int32_t>(row)}));
         return;
     }
-    if (auto vector = dyn_cast<VectorType>(type)) {
+    if (auto vector = dyn_cast<mlir::VectorType>(type)) {
         for (int64_t index = 0; index < vector.getNumElements(); ++index)
             leaves.push_back(spirv::CompositeExtractOp::create(builder, location, value,
                                                                ArrayRef<int32_t>{static_cast<int32_t>(index)}));
@@ -451,7 +452,7 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
     if (auto array = dyn_cast<spirv::ArrayType>(type))
         return constructElements(array.getElementType(), array.getNumElements());
     if (auto matrix = dyn_cast<spirv::MatrixType>(type)) {
-        auto columnType = cast<VectorType>(matrix.getColumnType());
+        auto columnType = cast<mlir::VectorType>(matrix.getColumnType());
         const unsigned rows = static_cast<unsigned>(columnType.getNumElements());
         const unsigned columns = matrix.getNumColumns();
         if (cursor > leaves.size() || leaves.size() - cursor < rows * columns)
@@ -466,7 +467,7 @@ FailureOr<Value> constructComposite(Location location, Type type, ArrayRef<Value
         cursor += rows * columns;
         return spirv::CompositeConstructOp::create(builder, location, matrix, valueColumns).getResult();
     }
-    if (auto vector = dyn_cast<VectorType>(type))
+    if (auto vector = dyn_cast<mlir::VectorType>(type))
         return constructElements(vector.getElementType(), static_cast<unsigned>(vector.getNumElements()));
     if (auto structure = dyn_cast<spirv::StructType>(type)) {
         SmallVector<Value> fields;
@@ -508,7 +509,7 @@ FailureOr<Value> unpackStd140TensorInterface(Location location, Value value, Ran
             carrierType = structure.getElementType(0);
             continue;
         }
-        if (auto vector = dyn_cast<VectorType>(carrierType)) {
+        if (auto vector = dyn_cast<mlir::VectorType>(carrierType)) {
             carrierIndices.push_back(0);
             carrierType = vector.getElementType();
             continue;
@@ -893,7 +894,7 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
             Value sampledImage = mapped(intrinsic.getOperand(0));
             FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
             auto sampledImageType = sampledImage ? dyn_cast<spirv::SampledImageType>(sampledImage.getType()) : nullptr;
-            auto vectorType = succeeded(resultType) ? dyn_cast<VectorType>(*resultType) : nullptr;
+            auto vectorType = succeeded(resultType) ? dyn_cast<mlir::VectorType>(*resultType) : nullptr;
             if (!sampledImageType || !vectorType)
                 return failure();
 
@@ -967,7 +968,7 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                 return spirv::MatrixTimesMatrixOp::create(builder, location, *resultType, operands[0], operands[1])
                     .getResult();
             if (leftType.getRank() == 2 && rightType.getRank() == 1 && isa<spirv::MatrixType>(operands[0].getType()) &&
-                isa<VectorType>(operands[1].getType()))
+                isa<mlir::VectorType>(operands[1].getType()))
                 return spirv::MatrixTimesVectorOp::create(builder, location, *resultType, operands[0], operands[1])
                     .getResult();
 
@@ -1568,8 +1569,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                                                 : IntegerType::SignednessSemantics::Unsigned;
                     scalarType = IntegerType::get(source.getContext(), integer.getWidth(), signedness);
                 }
-                Type leafType =
-                    leaf.componentCount == 1 ? *scalarType : Type(VectorType::get({leaf.componentCount}, *scalarType));
+                Type leafType = leaf.componentCount == 1
+                                    ? *scalarType
+                                    : Type(mlir::VectorType::get({leaf.componentCount}, *scalarType));
                 NamedAttrList leafAttrs(argumentAttrs);
                 leafAttrs.set(kLocationAttrName,
                               moduleBuilder.getI64IntegerAttr(location.getInt() + leaf.locationOffset));

@@ -2,7 +2,6 @@
 #define VERNON_PYTHON_NATIVE_RUNTIME_H
 
 #include "native_program_autodiff.h"
-#include "native_stage.h"
 #include "runtime/program_execution_backend.h"
 
 #include <nanobind/stl/map.h>
@@ -75,35 +74,6 @@ struct Runtime {
             rollback();
             throw;
         }
-    }
-
-    std::unique_ptr<PythonStageExecutable> load(const nb::bytes &artifact, const std::string &reflection,
-                                                const std::string &entry) {
-        VernonStageExecutable *stage =
-            vernonRuntimeLoadArtifact(handle, artifact.c_str(), artifact.size(), reflection.data(), reflection.size(),
-                                      entry.data(), entry.size());
-        if (!stage)
-            throw std::runtime_error("cannot load compute pipeline: " +
-                                     nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<PythonStageExecutable>(handle, stage);
-    }
-
-    std::unique_ptr<PythonStageExecutable> loadCpuEntry(const CompiledProgram &program, const std::string &entry) {
-        program.requireSuccess();
-        if (program.target != VERNON_TARGET_CPU)
-            throw std::runtime_error("CPU entries can be loaded only from CPU compiled programs");
-        if (entry.empty())
-            throw std::runtime_error("CPU entry name must not be empty");
-        VernonCpuEntryPoint entryPoint =
-            vernonCompileResultGetCpuEntry(program.result.get(), entry.data(), entry.size());
-        if (!entryPoint)
-            throw std::runtime_error("CPU entry '" + entry + "' was not found in compiled program");
-        const std::string reflection = program.reflection();
-        VernonStageExecutable *stage = vernonRuntimeLoadCpuEntry(handle, entryPoint, reflection.data(),
-                                                                 reflection.size(), entry.data(), entry.size());
-        if (!stage)
-            throw std::runtime_error("cannot load CPU entry: " + nativeStringView(vernonRuntimeGetLastError(handle)));
-        return std::make_unique<PythonStageExecutable>(handle, stage, program.result);
     }
 
     std::unique_ptr<PythonProgramExecutable> loadProgramAsset(const nb::bytes &data, const std::string &directory,

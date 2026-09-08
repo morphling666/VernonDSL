@@ -17,6 +17,9 @@ namespace vernon::compiler {
 mlir::FailureOr<LogicalReflectionModel> buildLogicalReflectionModel(mlir::ModuleOp module);
 mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
                                                                 llvm::ArrayRef<llvm::StringRef> logicalDtypes = {});
+mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
+                                                                llvm::ArrayRef<llvm::StringRef> logicalDtypes,
+                                                                llvm::StringRef logicalType);
 llvm::json::Object reflectCanonicalValueLayout(const mlir::vernon::ValueAbiLayout &layout, llvm::StringRef logicalType);
 std::vector<PhysicalEntryModel> buildPhysicalEntryModels(mlir::ModuleOp module,
                                                          const std::vector<PhysicalEntryProvenance> &provenance);

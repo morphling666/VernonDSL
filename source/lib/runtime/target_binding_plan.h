@@ -118,6 +118,7 @@ struct TargetBinding {
     std::string builtin;
     std::optional<ViewTransform> viewTransform;
     std::optional<CanonicalValueType> valueType;
+    std::optional<vernon::program::SemanticType> endpointType;
     shape::DeclaredShape shape;
     std::vector<int64_t> viewShape;
     std::optional<vernon::runtime::ValueLayout> wholeValueLayout;

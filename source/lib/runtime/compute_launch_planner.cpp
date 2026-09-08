@@ -119,12 +119,19 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
                         return fail(error, "compute Tensor physical size exceeds the host size range");
                     const std::vector<uint64_t> &logicalShape = use.shape.empty() ? parameter.shape : use.shape;
                     std::optional<TensorCopyPlan> layout =
-                        parameter.valueLayout
-                            ? compileWholeValueCopyPlan(supplied.tensor.element_layout, *use.interfacePlan->root)
-                            : compileElementStreamCopyPlan(supplied.tensor.element_layout, logicalShape,
+                        use.tensorPacking == TensorRepresentation::WholeValue
+                            ? compileWholeValueCopyPlan(pipelineValueLayout(*use.valueLayout), *use.interfacePlan->root)
+                            : compileElementStreamCopyPlan(pipelineValueLayout(*use.valueLayout), logicalShape,
                                                            *use.interfacePlan->root);
-                    if (!layout)
-                        return fail(error, "compute Tensor interface plan does not match its canonical layout");
+                    if (!layout) {
+                        const ValueLayout &canonical = *use.valueLayout;
+                        error = "compute Tensor interface plan for parameter '" + parameter.name +
+                                "' does not match its canonical layout (type " + canonical.logicalType + ", bytes " +
+                                std::to_string(canonical.byteSize) + ", leaves " +
+                                std::to_string(canonical.leaves.size()) + ", physical bytes " +
+                                std::to_string(use.interfacePlan->root->size) + ")";
+                        return false;
+                    }
                     VernonTensorView packedTensor = supplied.tensor;
                     if (packedTensor.rank == layout->shape.size() + 1 && packedTensor.shape &&
                         packedTensor.byte_strides && packedTensor.shape[0] == 1) {
@@ -227,7 +234,10 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         if (parameter.kind != "tensor" || found->second->kind != VERNON_PROGRAM_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
         const VernonTensorView &tensor = found->second->tensor;
-        const ValueLayout &expectedLayout = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+        const ValueLayout &expectedLayout =
+            parameter.tensorArgument == TensorRepresentation::WholeValue && parameter.valueLayout
+                ? *parameter.valueLayout
+                : parameter.elementLayout;
         const bool accessCompatible = parameter.access.empty()      ? true
                                       : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
                                       : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
@@ -236,8 +246,15 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
             error = "pipeline Tensor argument '" + parameter.name + "' structure is incomplete";
             return false;
         }
-        if (!valueLayoutsEqual(tensor.element_layout, pipelineValueLayout(expectedLayout)))
-            return fail(error, "pipeline Tensor argument element layout does not match reflection");
+        const VernonValueLayoutView expectedLayoutView = pipelineValueLayout(expectedLayout);
+        if (!valueLayoutsEqual(tensor.element_layout, expectedLayoutView)) {
+            error = "pipeline Tensor argument '" + parameter.name + "' element layout does not match reflection";
+            error += " (supplied bytes " + std::to_string(tensor.element_layout.byte_size) + ", expected bytes " +
+                     std::to_string(expectedLayoutView.byte_size) + ", supplied leaves " +
+                     std::to_string(tensor.element_layout.leaf_count) + ", expected leaves " +
+                     std::to_string(expectedLayoutView.leaf_count) + ")";
+            return false;
+        }
         if (tensor.access > VERNON_ACCESS_READ_WRITE || !accessCompatible)
             return fail(error, "pipeline Tensor argument access does not match reflection");
         if (tensor.storage != VERNON_TENSOR_HOST && tensor.storage != VERNON_TENSOR_RHI_RESOURCE)
@@ -271,7 +288,8 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
                            false;
             }
         }
-        if (parameter.source != StageParameterSource::Direct) {
+        if (parameter.source != StageParameterSource::Direct &&
+            parameter.tensorArgument != TensorRepresentation::WholeValue) {
             const bool allowLeading =
                 std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
                     return use.interfaceKind == "input" || use.interfaceKind == "value";

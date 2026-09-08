@@ -1,12 +1,11 @@
 #include "compiler_program_tape.h"
+#include "compiler_program_storage.h"
 
 #include <algorithm>
 #include <optional>
 
 namespace vernon::compiler {
 namespace {
-
-bool isAdTapeType(llvm::StringRef type) { return type == "!vernon.ad_tape" || type.starts_with("!vernon.ad_tape<"); }
 
 llvm::json::Array serializeCarriers(const std::vector<ProgramTapeCarrier> &carriers) {
     llvm::json::Array result;
@@ -27,7 +26,7 @@ std::vector<ProgramTapePlan> planProgramTapes(const llvm::json::Array &values, c
         const llvm::json::Object *value = valueRow.getAsObject();
         const std::optional<int64_t> valueId = value ? value->getInteger("id") : std::nullopt;
         const std::optional<llvm::StringRef> type = value ? value->getString("type") : std::nullopt;
-        if (!valueId || !type || !isAdTapeType(*type))
+        if (!valueId || !type || !isProgramAdTapeType(*type))
             continue;
         const llvm::json::Object *origin = value->getObject("origin");
         const bool producer =

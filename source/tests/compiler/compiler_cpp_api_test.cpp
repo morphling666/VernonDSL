@@ -78,14 +78,11 @@ TEST(CompilerPreparation, MockGpuPreparerMaterializesResourceSignatureFromLogica
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @compute(
       %values: tensor<4xf32> {
-        vernon.source_name = "values",
-        vernon.dtype = "f32",
-        vernon.abi_leaf_dtypes = ["f32"]
+        vernon.source_name = "values"
       }) attributes {vernon.entry, vernon.stage = "compute"} {
     func.return
   }
-}
-)mlir",
+})mlir",
                                                           &context);
     ASSERT_TRUE(module);
     mlir::FailureOr<vernon::compiler::LogicalReflectionModel> logical =
@@ -170,13 +167,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @compute(
       %value: f32 {
         vernon.source_name = "value",
-        vernon.dtype = "f32",
         vernon.interface = "input",
         vernon.location = 0 : i64
       }
     ) -> (f32 {
       vernon.source_name = "output",
-      vernon.dtype = "f32",
       vernon.interface = "output",
       vernon.location = 0 : i64
     }) attributes {
@@ -186,8 +181,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } {
     return %value : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *context = vernonCompilerCreate();
     ASSERT_NE(context, nullptr);
     VernonCompileResult *validation = vernonCompilerValidateMlir(context, module.data(), module.size());
@@ -222,10 +216,10 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     EXPECT_GT(validationEntry.at("physical_layouts").size(), 1u);
     EXPECT_EQ(compiledEntry.at("physical_layouts").size(), 1u);
     EXPECT_TRUE(compiledEntry.at("physical_layouts").contains("host_value"));
-    for (std::string_view field : {"vernon.source_name", "vernon.dtype"}) {
-        EXPECT_EQ(argument(validationEntry, 0).at(field), argument(compiledEntry, 0).at(field));
-        EXPECT_EQ(validationEntry.at("results").at(0).at(field), compiledEntry.at("results").at(0).at(field));
-    }
+    EXPECT_EQ(argument(validationEntry, 0).at("vernon.source_name"),
+              argument(compiledEntry, 0).at("vernon.source_name"));
+    EXPECT_EQ(validationEntry.at("results").at(0).at("vernon.source_name"),
+              compiledEntry.at("results").at(0).at("vernon.source_name"));
     EXPECT_GT(argument(validationEntry, 0).at("physical_layouts").size(), 1u);
     EXPECT_EQ(argument(compiledEntry, 0).at("physical_layouts").size(), 1u);
 
@@ -268,8 +262,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *context = vernonCompilerCreate();
     ASSERT_TRUE(context);
@@ -342,8 +335,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %c : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     nlohmann::json relationReflection = validateReflection(context, relationModule);
     std::fprintf(stderr, "%s\n", relationReflection.dump(2).c_str());
     const nlohmann::json &relationEntry = entry(relationReflection, "relation");
@@ -427,8 +419,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %result : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     nlohmann::json forwardingReflection = validateReflection(context, forwardingModule);
     const nlohmann::json &forwardingEntry = entry(forwardingReflection, "forwarding");
     ASSERT_TRUE(argument(forwardingEntry, 3).at("sampled_image_bindings") ==
@@ -465,8 +456,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     nlohmann::json helperReflection = validateReflection(context, helperModule);
     const nlohmann::json &helperEntry = entry(helperReflection, "helper_entry");
     ASSERT_TRUE(helperReflection.at("entries").size() == 1);
@@ -505,8 +495,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     expectDiagnostic(context, ambiguousSamplerModule, "may use multiple sampler entry arguments (#2, #4)");
 
     std::fprintf(stderr, "unknown\n");
@@ -533,8 +522,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         -> tensor<4xf32>
     return %sample : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     expectDiagnostic(context, unknownProvenanceModule, "argument #0 has no finite canonical Value ABI layout");
 
     std::fprintf(stderr, "intrinsic\n");

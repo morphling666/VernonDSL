@@ -1,6 +1,7 @@
 #include "compiler_program_boundary.h"
 
 #include "compiler_json.h"
+#include "compiler_program_storage.h"
 
 #include <optional>
 
@@ -80,10 +81,10 @@ bool appendProgramBoundaries(const llvm::json::Object &signature, llvm::StringRe
                 error = "canonical ProgramABI boundary Storage has no typed descriptor";
                 return false;
             }
-            slot.category = *tag == "buffer"                    ? ProgramBoundaryCategory::StorageView
-                            : *tag == "image"                   ? ProgramBoundaryCategory::Texture
-                            : *logicalType == "!vernon.sampler" ? ProgramBoundaryCategory::Sampler
-                                                                : ProgramBoundaryCategory::Value;
+            slot.category = *tag == "buffer"                     ? ProgramBoundaryCategory::StorageView
+                            : *tag == "image"                    ? ProgramBoundaryCategory::Texture
+                            : isProgramSamplerType(*logicalType) ? ProgramBoundaryCategory::Sampler
+                                                                 : ProgramBoundaryCategory::Value;
             if (slot.category == ProgramBoundaryCategory::Value) {
                 error = "canonical ProgramABI boundary has an unsupported opaque resource type";
                 return false;

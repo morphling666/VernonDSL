@@ -46,9 +46,8 @@ FailureOr<Type> gradientDestType(Type type, Operation *scope) {
     return getAutodiffDerivativeType(type, module, "write");
 }
 
-ProgramLanguageAbi derivativeLanguageAbi(Type primalType, DictionaryAttr primalAttrs, Type derivativeType,
+ProgramLanguageAbi derivativeLanguageAbi(Type primalType, ProgramLanguageAbi primalAbi, Type derivativeType,
                                          Operation *scope) {
-    ProgramLanguageAbi primalAbi = programLanguageAbiFromAttrs(primalAttrs, primalType);
     ModuleOp module = scope->getParentOfType<ModuleOp>();
     if (!module)
         return {};
@@ -65,14 +64,18 @@ ProgramLanguageAbi derivativeLanguageAbi(Type primalType, DictionaryAttr primalA
     return derivativeAbi;
 }
 
+ProgramLanguageAbi derivativeLanguageAbi(Type primalType, DictionaryAttr primalAttrs, Type derivativeType,
+                                         Operation *scope) {
+    return derivativeLanguageAbi(primalType, programLanguageAbiFromAttrs(primalAttrs, primalType), derivativeType,
+                                 scope);
+}
+
 ProgramLanguageAbi derivativeLanguageAbi(Value primal, Type derivativeType) {
-    if (primal.getType() == derivativeType)
-        return getProgramValueLanguageAbi(primal);
+    Operation *scope = primal.getDefiningOp();
     if (auto argument = dyn_cast<BlockArgument>(primal))
-        if (auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp()))
-            return derivativeLanguageAbi(primal.getType(), function.getArgAttrDict(argument.getArgNumber()),
-                                         derivativeType, function);
-    return {};
+        scope = argument.getOwner()->getParentOp();
+    return scope ? derivativeLanguageAbi(primal.getType(), getProgramValueLanguageAbi(primal), derivativeType, scope)
+                 : ProgramLanguageAbi{};
 }
 
 Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef name, ValueRange operands,

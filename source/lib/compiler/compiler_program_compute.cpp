@@ -296,7 +296,16 @@ bool buildCanonicalComputeEndpoints(const llvm::json::Object &compiledEntry, con
                 projectedLeafIndex.reset();
         }
         if (!tapeCarrier && !opaqueMatches && !byteValueMatches && !projectedLeafMatches) {
-            error = "compiled compute endpoint layout/type/shape does not match logical value '" + source->str() + "'";
+            error = "compiled compute endpoint layout/type/shape does not match logical value '" + source->str() +
+                    "' (logical type '" +
+                    (logicalValue ? logicalValue->getString("type").value_or("").str() : std::string()) +
+                    "', endpoint type '" + row.getString("type").value_or("").str() + "', logical layout '" +
+                    (logicalLayout ? logicalLayout->getString("layout_hash").value_or("").str() : std::string()) +
+                    "', endpoint layout '" +
+                    (wholeLayout ? wholeLayout->getString("layout_hash").value_or("").str() : std::string()) +
+                    "', endpoint kind '" + endpointKind.str() + "', resource " + (resource ? "true" : "false") +
+                    ", has value layout " + (row.getObject("value_layout") ? "true" : "false") +
+                    ", has element layout " + (row.getObject("element_layout") ? "true" : "false") + ")";
             return false;
         }
         if (std::optional<llvm::StringRef> logicalType = logicalValue->getString("type");

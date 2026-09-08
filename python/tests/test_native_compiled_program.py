@@ -5,8 +5,6 @@ import json
 import struct
 import unittest
 
-import numpy as np
-import vernon_dsl as vd
 from vernon_dsl import _native as native
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.frontend.compiler import compile_source
@@ -58,31 +56,6 @@ module attributes {$VERNON_VERSION_ATTRIBUTES} {
 """)
 
 DYNAMIC_CPU_MODULE = CPU_MODULE.replace("[3]", "[-1]")
-
-CONSTANT_WRITE_CPU_MODULE = _versioned(r"""
-module attributes {$VERNON_VERSION_ATTRIBUTES} {
-  func.func @constant_write(
-      %values: !vernon.tensor_view<f32, [1], "write", "device"> {
-        vernon.interface = "resource",
-        vernon.source_name = "values",
-        vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
-      }) attributes {
-        vernon.entry,
-        vernon.stage = "compute",
-        vernon.workgroup_size = array<i32: 1, 1, 1>,
-        vernon.storage_effects = [
-          {kind = "write", owner = "values", region = "element", indices = array<i64: 0>}
-        ]
-      } {
-    %zero = arith.constant 0 : index
-    %one = arith.constant 1.0 : f32
-    "vernon.store"(%one, %values, %zero) :
-        (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
-    return
-  }
-}
-""")
 
 MULTI_ENTRY_MODULE = _versioned(r"""
 module attributes {$VERNON_VERSION_ATTRIBUTES} {
@@ -394,7 +367,7 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertEqual(len({name for name, _ in program.artifacts}), 2)
         self.assertTrue(all(name.endswith(".glsl") for name, _ in program.artifacts))
 
-    def test_cpu_entry_execution_and_result_lifetime(self) -> None:
+    def test_cpu_entry_reflection_and_result_lifetime(self) -> None:
 
         def compile_locally() -> object:
             compiler = native.Compiler()
@@ -420,41 +393,8 @@ class CompiledProgramTests(unittest.TestCase):
             reflection["entries"][0]["tensor_view_write_footprints"],
             [{"version": 1, "owner": "values", "kind": "whole_view", "indices": []}],
         )
-
-        vd.init(arch=vd.cpu)
-        runtime = native.Runtime(native.RuntimeBackend.CPU)
-        with self.assertRaisesRegex(RuntimeError, "CPU entry 'missing' was not found"):
-            runtime.load_cpu_entry(program, "missing")
-        pipeline = runtime.load_cpu_entry(program, "increment")
         del program
         gc.collect()
-
-        values = vd.storage.from_numpy(np.array([2.0, 4.0, 6.0], dtype=np.float32))
-        invocation = pipeline.invocation_builder()
-        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
-        with self.assertRaisesRegex(ValueError, "compute Stage submission requires an explicit grid"):
-            invocation.submit()
-        with self.assertRaisesRegex(ValueError, "compute grid axis x must be nonzero"):
-            invocation.grid(0, 1, 1)
-        invocation.grid(3, 1, 1).submit().wait()
-        np.testing.assert_array_equal(values.to_numpy(), np.array([3.0, 5.0, 7.0], dtype=np.float32))
-
-    def test_cpu_constant_write_requires_single_invocation(self) -> None:
-        program = native.Compiler().compile_program_result(CONSTANT_WRITE_CPU_MODULE, native.Target.CPU)
-        self.assertTrue(program.ok, program.diagnostics)
-        runtime = native.Runtime(native.RuntimeBackend.CPU)
-        pipeline = runtime.load_cpu_entry(program, "constant_write")
-        values = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
-
-        invocation = pipeline.invocation_builder()
-        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
-        invocation.grid(1, 1, 1).submit().wait()
-        np.testing.assert_array_equal(values.to_numpy(), np.array([1.0], dtype=np.float32))
-
-        invocation = pipeline.invocation_builder()
-        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
-        with self.assertRaisesRegex(RuntimeError, "dispatch grid axis 0 must equal 1"):
-            invocation.grid(2, 1, 1).submit().wait()
 
     def test_cpu_profile_batch_compilation_preserves_order_and_options(self) -> None:
         programs = native._compile_cpu_program_results(
@@ -469,22 +409,17 @@ class CompiledProgramTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unknown option 'version'"):
             native._compile_cpu_program_results([CPU_MODULE], {"version": "450"})
 
-    def test_cpu_artifact_reuses_dynamic_tensor_view_descriptor(self) -> None:
+    def test_cpu_dynamic_tensor_view_reflection(self) -> None:
         program = native.Compiler().compile_program_result(DYNAMIC_CPU_MODULE, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
-        runtime = native.Runtime(native.RuntimeBackend.CPU)
-        pipeline = runtime.load_cpu_entry(program, "increment")
-        values = vd.storage.from_numpy(np.arange(5, dtype=np.float32))
-
-        invocation = pipeline.invocation_builder()
-        invocation.host_tensor(pipeline.parameters[0].name, values._native_host_array())
-        invocation.grid(5, 1, 1).submit().wait()
-
-        reverse = values.view(shape=(3,), strides=(-1,), offset=4, access="read_write")
-        invocation = pipeline.invocation_builder()
-        invocation.host_tensor(pipeline.parameters[0].name, reverse._native_host_array())
-        invocation.grid(3, 1, 1).submit().wait()
-        np.testing.assert_array_equal(values.to_numpy(), np.array([1.0, 2.0, 4.0, 5.0, 6.0], dtype=np.float32))
+        entry = json.loads(program.reflection)["entries"][0]
+        argument = entry["arguments"][0]
+        self.assertEqual(argument["source_shape"], [-1])
+        self.assertEqual(
+            argument["tensor_view_descriptor"],
+            {"rank": 1, "offset_binding": 1, "extent_bindings": [2], "stride_bindings": [3]},
+        )
+        self.assertEqual(argument["physical_layouts"]["host_value"]["resource_kind"], "tensor_view_descriptor")
 
     def test_cpu_tuple_create_and_constant_extract_lowering(self) -> None:
         program = native.Compiler().compile_program_result(CPU_TUPLE_MODULE, native.Target.CPU)

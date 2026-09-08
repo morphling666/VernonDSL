@@ -125,8 +125,12 @@ TEST(CompilerCApi, ReflectsTypedProgramValueBindings) {
     static const char module[] = R"mlir(
 module {
   func.func @forward(
-      %source: tensor<4xf32> {vernon.source_name = "source"})
-      -> (tensor<4xf32> {vernon.source_name = "output"})
+      %source: tensor<4xf32> {
+        vernon.source_name = "source"
+      })
+      -> (tensor<4xf32> {
+        vernon.source_name = "output"
+      })
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.source"],
@@ -141,8 +145,7 @@ module {
     } : (tensor<4xf32>) -> tensor<4xf32>
     func.return %result : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *analyzed = vernonCompilerValidateMlir(compiler, module, strlen(module));
@@ -163,8 +166,9 @@ module {
 TEST(CompilerCApi, ReflectsBackwardCapturesAsSharedForwardValues) {
     static const char module[] = R"mlir(
 module {
-  func.func @forward(%source: tensor<4xf32> {vernon.source_name = "source"})
-      -> tensor<4xf32>
+  func.func @forward(%source: tensor<4xf32> {vernon.source_name = "source"
+  })
+      -> (tensor<4xf32> {                         })
       attributes {vernon_program.graph = "forward"} {
     %result = "vernon_program.compute"(%source) {
       callee = "Square.square", grid = array<i64: 4, 1, 1>, features = [],
@@ -173,10 +177,13 @@ module {
     func.return %result : tensor<4xf32>
   }
   func.func @backward(
-      %source: tensor<4xf32> {vernon_program.capture_forward_value = 0 : i32},
-      %output: tensor<4xf32> {vernon_program.capture_forward_value = 1 : i32},
-      %output_cotangent: tensor<4xf32> {vernon.source_name = "output_cotangent"})
-      -> tensor<4xf32>
+      %source: tensor<4xf32> {vernon_program.capture_forward_value = 0 : i32
+      },
+      %output: tensor<4xf32> {vernon_program.capture_forward_value = 1 : i32
+      },
+      %output_cotangent: tensor<4xf32> {vernon.source_name = "output_cotangent"
+      })
+      -> (tensor<4xf32> {                         })
       attributes {vernon_program.graph = "backward"} {
     %gradient = "vernon_program.compute"(%source, %output, %output_cotangent) {
       callee = "Square.backward", grid = array<i64: 4, 1, 1>, features = [],
@@ -184,8 +191,7 @@ module {
     } : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
     func.return %gradient : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *analyzed = vernonCompilerValidateMlir(compiler, module, strlen(module));
@@ -224,8 +230,7 @@ module {
     } : (f32) -> f32
     func.return %result : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -262,8 +267,7 @@ module {
       } {
     return %source : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompileResult *compiled =
         vernonCompilerCompileMlir(compiler, implementation, strlen(implementation), VERNON_TARGET_CPU);
     ASSERT_NE(compiled, nullptr);
@@ -355,8 +359,10 @@ TEST(CompilerCApi, FinalizesMultiNodeComputeGraphAsOneCanonicalProgram) {
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %source: !vernon.tensor_view<f32, [4], "read", "device"> {vernon.source_name = "source"})
-      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "output"})
+      %source: !vernon.tensor_view<f32, [4], "read", "device"> {
+        vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {
+        vernon.source_name = "output"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.source"],
@@ -374,8 +380,7 @@ module {
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     func.return %output : !vernon.tensor_view<f32, [4], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     static const char implementation[] = R"mlir(
 module {
   func.func @copy(
@@ -392,8 +397,7 @@ module {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -477,8 +481,7 @@ module {
         -> !vernon.texture<"2d", f32, "rgba8_unorm", "read_write">
     func.return %updated : !vernon.texture<"2d", f32, "rgba8_unorm", "read_write">
   }
-}
-)mlir";
+})mlir";
     static const char vertexReflection[] = R"json({
       "entries": [
         {
@@ -658,8 +661,7 @@ module {
       %id: tensor<3xi32> {
         vernon.interface = "input",
         vernon.builtin = "global_invocation_id",
-        vernon.dtype = "u32",
-        vernon.abi_leaf_dtypes = ["u32"]
+                vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -667,16 +669,17 @@ module {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {vernon.source_name = "values"},
-      %groups_x: i32 {vernon.source_name = "groups_x", vernon.dtype = "u32"},
-      %groups_y: i32 {vernon.source_name = "groups_y", vernon.dtype = "u32"},
-      %groups_z: i32 {vernon.source_name = "groups_z", vernon.dtype = "u32"})
-      -> (!vernon.tensor_view<f32, [-1], "read_write", "device"> {vernon.source_name = "values"})
+      %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
+        vernon.source_name = "values"},
+      %groups_x: i32 {vernon.source_name = "groups_x",                       vernon.abi_leaf_dtypes = ["u32"]},
+      %groups_y: i32 {vernon.source_name = "groups_y",                       vernon.abi_leaf_dtypes = ["u32"]},
+      %groups_z: i32 {vernon.source_name = "groups_z",                       vernon.abi_leaf_dtypes = ["u32"]})
+      -> (!vernon.tensor_view<f32, [-1], "read_write", "device"> {
+        vernon.source_name = "values"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.values", "input.groups_x", "input.groups_y", "input.groups_z"],
@@ -695,8 +698,7 @@ module {
         -> !vernon.tensor_view<f32, [-1], "read_write", "device">
     func.return %result : !vernon.tensor_view<f32, [-1], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -773,6 +775,129 @@ module {
     vernonCompilerDestroy(compiler);
 }
 
+TEST(CompilerCApi, EmitsCanonicalUnsignedProgramSemanticType) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %budget: tensor<3xi32> {
+        vernon.source_name = "budget",
+        vernon.abi_leaf_dtypes = ["u32"]
+      })
+      -> (tensor<3xi32> {
+        vernon.source_name = "output",
+        vernon.abi_leaf_dtypes = ["u32"]
+      })
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.budget"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %result = "vernon_program.compute"(%budget) {
+      callee = "Identity.copy",
+      grid = array<i64: 1, 1, 1>,
+      features = [],
+      operand_names = ["source"],
+      result_names = ["output"],
+      vernon_program.result_abi_leaf_dtypes = [["u32"]]
+    } : (tensor<3xi32>) -> tensor<3xi32>
+    func.return %result : tensor<3xi32>
+  }
+})mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *analyzed = vernonCompilerValidateMlir(compiler, program, strlen(program));
+    ASSERT_NE(analyzed, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(analyzed), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(analyzed).data, vernonCompileResultGetDiagnostics(analyzed).size);
+    const VernonStringView reflection = vernonCompileResultGetReflection(analyzed);
+    const nlohmann::json reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+    const nlohmann::json &value = reflected.at("program_plan").at("values").at(0);
+    EXPECT_EQ(value.at("type"), "tensor<3xu32>");
+    EXPECT_EQ(value.at("value_layout").at("logical_type"), "tensor<3xu32>");
+    ASSERT_EQ(value.at("value_layout").at("leaves").size(), 1u);
+    EXPECT_EQ(value.at("value_layout").at("leaves").at(0).at("dtype"), "u32");
+    vernonCompileResultDestroy(analyzed);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, EmitsCanonicalNestedProgramSemanticType) {
+    static const char program[] = R"mlir(
+module {
+  "vernon.struct"() {
+    abi_leaf_dtypes = ["u32", "f32"],
+    fields = ["id:i32", "weights:tensor<2xf32>"],
+    sym_name = "Payload"
+  } : () -> ()
+  func.func @forward(
+      %payload: !vernon.struct<"Payload"> {
+        vernon.source_name = "payload",
+        vernon.abi_leaf_dtypes = ["u32", "f32"]
+      })
+      -> (!vernon.struct<"Payload"> {
+        vernon.source_name = "output",
+        vernon.abi_leaf_dtypes = ["u32", "f32"]
+      })
+      attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.payload"],
+        vernon_program.result_names = ["output.result"]
+      } {
+    %result = "vernon_program.compute"(%payload) {
+      callee = "Identity.copy",
+      grid = array<i64: 1, 1, 1>,
+      features = [],
+      operand_names = ["source"],
+      result_names = ["output"],
+      vernon_program.result_abi_leaf_dtypes = [["u32", "f32"]]
+    } : (!vernon.struct<"Payload">) -> !vernon.struct<"Payload">
+    func.return %result : !vernon.struct<"Payload">
+  }
+})mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *analyzed = vernonCompilerValidateMlir(compiler, program, strlen(program));
+    ASSERT_NE(analyzed, nullptr);
+    ASSERT_EQ(vernonCompileResultGetStatus(analyzed), VERNON_STATUS_OK) << std::string(
+        vernonCompileResultGetDiagnostics(analyzed).data, vernonCompileResultGetDiagnostics(analyzed).size);
+    const VernonStringView reflection = vernonCompileResultGetReflection(analyzed);
+    const nlohmann::json reflected = nlohmann::json::parse(reflection.data, reflection.data + reflection.size);
+    const nlohmann::json &value = reflected.at("program_plan").at("values").at(0);
+    constexpr const char *expected = "struct<id:u32,weights:tensor<2xf32>>";
+    EXPECT_EQ(value.at("type"), expected);
+    EXPECT_EQ(value.at("value_layout").at("logical_type"), expected);
+    const nlohmann::json &leaves = value.at("value_layout").at("leaves");
+    ASSERT_EQ(leaves.size(), 2u);
+    EXPECT_EQ(leaves.at(0).at("dtype"), "u32");
+    EXPECT_EQ(leaves.at(1).at("dtype"), "f32");
+    vernonCompileResultDestroy(analyzed);
+    vernonCompilerDestroy(compiler);
+}
+
+TEST(CompilerCApi, RejectsProgramDtypeStorageMismatch) {
+    static const char program[] = R"mlir(
+module {
+  func.func @forward(
+      %value: tensor<3xi32> {
+        vernon.source_name = "value",
+        vernon.abi_leaf_dtypes = ["f32"]
+      }) attributes {
+        vernon_program.graph = "forward",
+        vernon_program.argument_names = ["input.value"]
+      } {
+    func.return
+  }
+})mlir";
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    VernonCompileResult *analyzed = vernonCompilerValidateMlir(compiler, program, strlen(program));
+    ASSERT_NE(analyzed, nullptr);
+    EXPECT_EQ(vernonCompileResultGetStatus(analyzed), VERNON_STATUS_VERIFICATION_ERROR);
+    EXPECT_TRUE(view_contains(vernonCompileResultGetDiagnostics(analyzed),
+                              "cannot derive canonical executable Program semantic type"));
+    vernonCompileResultDestroy(analyzed);
+    vernonCompilerDestroy(compiler);
+}
+
 TEST(CompilerCApi, RejectsKernelStorageEffectDeclarationConflicts) {
     static const char kernel[] = R"mlir(
 module {
@@ -790,8 +915,7 @@ module {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerCompileMlir(compiler, kernel, strlen(kernel), VERNON_TARGET_CPU);
@@ -806,14 +930,17 @@ TEST(CompilerCApi, FinalizesOwnedDynamicZerosLikeFromLikeSource) {
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {vernon.source_name = "source"})
-      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "output"})
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {
+        vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {
+        vernon.source_name = "output"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.source"],
         vernon_program.result_names = ["output.result"]
       } {
-    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like", vernon.dtype = "f32"}
+    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like"
+    }
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
@@ -826,8 +953,7 @@ module {
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     func.return %result : !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     static const char implementation[] = R"mlir(
 module {
   func.func @copy(
@@ -849,8 +975,7 @@ module {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -931,14 +1056,17 @@ TEST(CompilerCApi, PlansFromValuesWithoutLike) {
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %source: !vernon.tensor_view<f32, [4], "read", "device"> {vernon.source_name = "source"})
-      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "output"})
+      %source: !vernon.tensor_view<f32, [4], "read", "device"> {
+        vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {
+        vernon.source_name = "output"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.source"],
         vernon_program.result_names = ["output.result"]
       } {
-    %buffer = "vernon.intrinsic"(%source) {name = "from_values", vernon.dtype = "f32"}
+    %buffer = "vernon.intrinsic"(%source) {name = "from_values"
+    }
         : (!vernon.tensor_view<f32, [4], "read", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
@@ -951,8 +1079,7 @@ module {
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     func.return %result : !vernon.tensor_view<f32, [4], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -973,14 +1100,17 @@ TEST(CompilerCApi, FinalizesBackwardZerosLikeFromCapturedNodeResult) {
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {vernon.source_name = "source"})
-      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "output"})
+      %source: !vernon.tensor_view<f32, [-1, -1], "read", "device"> {
+        vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {
+        vernon.source_name = "output"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.source"],
         vernon_program.result_names = ["output.result"]
       } {
-    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like", vernon.dtype = "f32"}
+    %buffer = "vernon.intrinsic"(%source) {name = "zeros_like"
+    }
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
@@ -995,16 +1125,19 @@ module {
   }
   func.func @backward(
       %output: !vernon.tensor_view<f32, [-1, -1], "read", "device">
-          {vernon_program.capture_forward_value = 2 : i32},
+          {vernon_program.capture_forward_value = 2 : i32
+                      },
       %cotangent: !vernon.tensor_view<f32, [-1, -1], "read", "device">
           {vernon.source_name = "output"})
-      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [-1, -1], "read_write", "device"> {
+        vernon.source_name = "source"})
       attributes {
         vernon_program.graph = "backward",
         vernon_program.argument_names = ["cotangent.output"],
         vernon_program.result_names = ["gradient.source"]
       } {
-    %buffer = "vernon.intrinsic"(%output) {name = "zeros_like", vernon.dtype = "f32"}
+    %buffer = "vernon.intrinsic"(%output) {name = "zeros_like"
+    }
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %gradient = "vernon_program.compute"(%cotangent, %buffer) {
@@ -1017,8 +1150,7 @@ module {
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     func.return %gradient : !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     static const char implementation[] = R"mlir(
 module {
   func.func @copy(
@@ -1040,8 +1172,7 @@ module {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -1132,24 +1263,29 @@ module {
 TEST(CompilerCApi, PlansProgramVjpAndFanInFromPrimalProgram) {
     static const char program[] = R"mlir(
 module attributes {vernon_program.vjp_wrt = ["source"]} {
-  func.func @primal(%source: tensor<4xf32> {vernon.source_name = "source"})
-      -> (tensor<4xf32> {vernon.source_name = "left"},
-          tensor<4xf32> {vernon.source_name = "right"})
+  func.func @primal(%source: !vernon.tensor_view<f32, [4], "read", "device"> {
+      vernon.source_name = "source"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {
+            vernon.source_name = "left"},
+          !vernon.tensor_view<f32, [4], "read_write", "device"> {
+            vernon.source_name = "right"})
       attributes {
         vernon_program.graph = "primal"
       } {
     %left = "vernon_program.compute"(%source) {
       callee = "Module.left", grid = array<i64: 1, 1, 1>, features = [],
       operand_names = ["source"], result_names = ["output"]
-    } : (tensor<4xf32>) -> tensor<4xf32>
+    } : (!vernon.tensor_view<f32, [4], "read", "device">)
+        -> !vernon.tensor_view<f32, [4], "read_write", "device">
     %right = "vernon_program.compute"(%source) {
       callee = "Module.right", grid = array<i64: 1, 1, 1>, features = [],
       operand_names = ["source"], result_names = ["output"]
-    } : (tensor<4xf32>) -> tensor<4xf32>
-    func.return %left, %right : tensor<4xf32>, tensor<4xf32>
+    } : (!vernon.tensor_view<f32, [4], "read", "device">)
+        -> !vernon.tensor_view<f32, [4], "read_write", "device">
+    func.return %left, %right : !vernon.tensor_view<f32, [4], "read_write", "device">,
+                                !vernon.tensor_view<f32, [4], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -1163,7 +1299,7 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
     EXPECT_EQ(graphs.at(0).at("direction"), "forward");
     EXPECT_EQ(graphs.at(1).at("direction"), "backward");
     const nlohmann::json &requests = reflection.at("kernel_compile_requests");
-    ASSERT_EQ(requests.size(), 5u);
+    ASSERT_EQ(requests.size(), 8u);
     EXPECT_TRUE(std::any_of(requests.begin(), requests.end(), [](const nlohmann::json &request) {
         return request.at("implementation_hint") == "vernon.builtin.add";
     }));
@@ -1175,14 +1311,14 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
         const auto hint = request.at("implementation_hint").get<std::string>();
         return hint.size() >= 4 && hint.compare(hint.size() - 4, 4, ".vjp") == 0;
     }));
-    EXPECT_EQ(reflection.at("program_plan").at("values").size(), 10u);
+    EXPECT_EQ(reflection.at("program_plan").at("values").size(), 19u);
     const nlohmann::json &signature = reflection.at("program_plan").at("signature");
     EXPECT_EQ(signature.at("inputs"), nlohmann::json::array({{{"value", 0}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("outputs"),
               nlohmann::json::array({{{"value", 1}, {"path", "left"}}, {{"value", 3}, {"path", "right"}}}));
     EXPECT_EQ(signature.at("cotangents"),
               nlohmann::json::array({{{"value", 5}, {"path", "left"}}, {{"value", 6}, {"path", "right"}}}));
-    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 9}, {"path", "source"}}}));
+    EXPECT_EQ(signature.at("gradients"), nlohmann::json::array({{{"value", 18}, {"path", "source"}}}));
     EXPECT_EQ(signature.at("captures"), nlohmann::json::array({0, 1, 2, 3, 4}));
 
     vernonCompileResultDestroy(planned);
@@ -1208,8 +1344,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %zero = arith.constant 0.0 : f32
     return %zero : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
@@ -1240,8 +1375,10 @@ TEST(CompilerCApi, FinalizeProgramKeepsTapeAllocatorOnKernelAbi) {
     static const char program[] = R"mlir(
 module {
   func.func @forward(
-      %values: !vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "values"})
-      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {vernon.source_name = "output"})
+      %values: !vernon.tensor_view<f32, [4], "read_write", "device"> {
+        vernon.source_name = "values"})
+      -> (!vernon.tensor_view<f32, [4], "read_write", "device"> {
+        vernon.source_name = "output"})
       attributes {
         vernon_program.graph = "forward",
         vernon_program.argument_names = ["input.values"],
@@ -1256,8 +1393,7 @@ module {
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     func.return %result : !vernon.tensor_view<f32, [4], "read_write", "device">
   }
-}
-)mlir";
+})mlir";
     static const char implementation[] = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @increment(
@@ -1274,8 +1410,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %id: tensor<3xi32> {
         vernon.interface = "input",
         vernon.builtin = "global_invocation_id",
-        vernon.dtype = "u32",
-        vernon.abi_leaf_dtypes = ["u32"]
+                vernon.abi_leaf_dtypes = ["u32"]
       }) attributes {
         vernon.entry,
         vernon.stage = "compute",
@@ -1283,8 +1418,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       } {
     return
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *planned = vernonCompilerPlanProgram(compiler, program, strlen(program));
@@ -1382,8 +1516,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       } {
     return %allocator : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
@@ -1407,20 +1540,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   } : () -> ()
   func.func @roundtrip(
       %value: !vernon.tensor<!vernon.struct<"Payload">, [2]> {
-        vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"],
-        vernon.element_abi_leaf_dtypes = ["f32", "i32"],
-        vernon.interface = "input",
+
+
+                vernon.interface = "input",
         vernon.location = 0 : i64
       }) -> (!vernon.tensor<!vernon.struct<"Payload">, [2]> {
-        vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"],
-        vernon.element_abi_leaf_dtypes = ["f32", "i32"],
-        vernon.interface = "output",
+
+
+                vernon.interface = "output",
         vernon.location = 0 : i64
       }) attributes {vernon.entry, vernon.stage = "fragment"} {
     return %value : !vernon.tensor<!vernon.struct<"Payload">, [2]>
   }
-}
-)mlir";
+})mlir";
     struct Payload {
         float direction[3];
         int32_t id;
@@ -1478,32 +1610,40 @@ TEST(CompilerCApi, CpuHalfConversionsAreSelfContainedAndIeeeCompliant) {
     static const char module[] = R"mlir(
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @extend_f32(
-      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f32 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f32 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.extf %value : f16 to f32
     return %result : f32
   }
   func.func @truncate_f32(
-      %value: f32 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f32 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.truncf %value : f32 to f16
     return %result : f16
   }
   func.func @extend_f64(
-      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f64 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f64 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.extf %value : f16 to f64
     return %result : f64
   }
   func.func @truncate_f64(
-      %value: f64 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f64 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.truncf %value : f64 to f16
@@ -1514,15 +1654,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     return %result : vector<2xf32>
   }
   func.func @square_f16(
-      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.mulf %value, %value : f16
     return %result : f16
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *compiled = vernonCompilerCompileMlir(compiler, module, strlen(module), VERNON_TARGET_CPU);
@@ -1661,15 +1802,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @integer_to_half(
       %value: i32 {vernon.interface = "input", vernon.location = 0 : i64,
-                   vernon.dtype = "i32", vernon.abi_leaf_dtypes = ["i32"]}) ->
-      (f16 {vernon.interface = "output", vernon.location = 0 : i64})
+                   vernon.abi_leaf_dtypes = ["i32"]
+                   }) ->
+      (f16 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.sitofp %value : i32 to f16
     return %result : f16
   }
-}
-)mlir";
+})mlir";
     options.as.cpu.features = {};
     VernonCompileResult *unsupported =
         vernonCompilerCompileMlirWithOptions(compiler, unsupportedModule, strlen(unsupportedModule), &options);
@@ -1683,15 +1825,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     return %value : f32
   }
   func.func @extend_with_collision(
-      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64}) ->
-      (f32 {vernon.interface = "output", vernon.location = 0 : i64})
+      %value: f16 {vernon.interface = "input", vernon.location = 0 : i64
+      }) ->
+      (f32 {vernon.interface = "output", vernon.location = 0 : i64
+      })
       attributes {vernon.entry, vernon.stage = "compute",
                   vernon.workgroup_size = array<i32: 1, 1, 1>} {
     %result = arith.extf %value : f16 to f32
     return %result : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompileResult *collision =
         vernonCompilerCompileMlirWithOptions(compiler, collisionModule, strlen(collisionModule), &options);
     ASSERT_TRUE(collision);
@@ -1712,7 +1855,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     static const char module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                  "  func.func @vertex_main("
                                  "%position: vector<3xf32> {vernon.interface = \"input\", "
-                                 "vernon.location = 0 : i64}) attributes {vernon.entry, "
+                                 "vernon.location = 0 : i64"
+                                 "}) attributes {vernon.entry, "
                                  "vernon.stage = \"vertex\"} {\n"
                                  "    return\n"
                                  "  }\n"
@@ -1726,11 +1870,14 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     static const char cpu_module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                      "  func.func @add_vectors("
                                      "%left: tensor<4xf32> {vernon.interface = \"input\", "
-                                     "vernon.location = 0 : i64}, "
+                                     "vernon.location = 0 : i64"
+                                     "}, "
                                      "%right: tensor<4xf32> {vernon.interface = \"input\", "
-                                     "vernon.location = 1 : i64}) -> "
+                                     "vernon.location = 1 : i64"
+                                     "}) -> "
                                      "(tensor<4xf32> {vernon.interface = \"output\", "
-                                     "vernon.location = 0 : i64}) attributes {vernon.entry, "
+                                     "vernon.location = 0 : i64"
+                                     "}) attributes {vernon.entry, "
                                      "vernon.stage = \"fragment\"} {\n"
                                      "    %sum = arith.addf %left, %right : tensor<4xf32>\n"
                                      "    return %sum : tensor<4xf32>\n"
@@ -1739,10 +1886,13 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     static const char cpu_intrinsic_module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                                "  func.func @normal_score("
                                                "%normal: tensor<3xf32> {vernon.interface = \"input\", "
-                                               "vernon.location = 0 : i64}, "
+                                               "vernon.location = 0 : i64"
+                                               "}, "
                                                "%light: tensor<3xf32> {vernon.interface = \"input\", "
-                                               "vernon.location = 1 : i64}) -> "
-                                               "(f32 {vernon.interface = \"output\", vernon.location = 0 : i64}) "
+                                               "vernon.location = 1 : i64"
+                                               "}) -> "
+                                               "(f32 {vernon.interface = \"output\", vernon.location = 0 : i64"
+                                               "}) "
                                                "attributes {vernon.entry, vernon.stage = \"fragment\"} {\n"
                                                "    %unit = \"vernon.intrinsic\"(%normal) "
                                                "{name = \"normalize\"} : (tensor<3xf32>) -> tensor<3xf32>\n"
@@ -1753,11 +1903,14 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
                                                "}\n";
     static const char cpu_large_vector_module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                                   "  func.func @add_large(%left: tensor<20xf32> "
-                                                  "{vernon.interface = \"input\", vernon.location = 0 : i64}, "
+                                                  "{vernon.interface = \"input\", vernon.location = 0 : i64"
+                                                  "}, "
                                                   "%right: tensor<20xf32> "
-                                                  "{vernon.interface = \"input\", vernon.location = 1 : i64}) -> "
+                                                  "{vernon.interface = \"input\", vernon.location = 1 : i64"
+                                                  "}) -> "
                                                   "(tensor<20xf32> {vernon.interface = \"output\", "
-                                                  "vernon.location = 0 : i64}) attributes "
+                                                  "vernon.location = 0 : i64"
+                                                  "}) attributes "
                                                   "{vernon.entry, vernon.stage = \"fragment\"} {\n"
                                                   "    %sum = arith.addf %left, %right : tensor<20xf32>\n"
                                                   "    return %sum : tensor<20xf32>\n"
@@ -1765,9 +1918,11 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
                                                   "}\n";
     static const char cpu_unknown_intrinsic_module[] = "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
                                                        "  func.func @unknown_cpu(%value: f32 "
-                                                       "{vernon.interface = \"input\", vernon.location = 0 : i64}) -> "
+                                                       "{vernon.interface = \"input\", vernon.location = 0 : i64"
+                                                       "}) -> "
                                                        "(f32 {vernon.interface = \"output\", "
-                                                       "vernon.location = 0 : i64}) attributes "
+                                                       "vernon.location = 0 : i64"
+                                                       "}) attributes "
                                                        "{vernon.entry, vernon.stage = \"fragment\"} {\n"
                                                        "    %result = \"vernon.intrinsic\"(%value) "
                                                        "{name = \"not_a_cpu_intrinsic\"} : (f32) -> f32\n"
@@ -1779,9 +1934,10 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "  func.func @increment("
         "%values: !vernon.tensor_view<f32, [3], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}, "
+        "vernon.binding = 0 : i64"
+        "}, "
         "%id: tensor<3xi32> {vernon.interface = \"input\", "
-        "vernon.builtin = \"global_invocation_id\", vernon.dtype = \"u32\", "
+        "vernon.builtin = \"global_invocation_id\", "
         "vernon.abi_leaf_dtypes = [\"u32\"]}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 8, 1, 1>} {\n"
@@ -1801,9 +1957,11 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
         "  func.func @loop(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}, "
+        "vernon.binding = 0 : i64"
+        "}, "
         "%phase: f32 "
-        "{vernon.interface = \"input\", vernon.location = 1 : i64}) "
+        "{vernon.interface = \"input\", vernon.location = 1 : i64"
+        "}) "
         "attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
@@ -1853,7 +2011,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "module attributes {" VERNON_MLIR_VERSION_ATTRIBUTES "} {\n"
         "  func.func @tensor3(%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64"
+        "}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %ones = arith.constant dense<1.0> : tensor<2x3x4xf32>\n"
@@ -1876,7 +2035,8 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
         "  func.func @dynamic_local("
         "%values: !vernon.tensor_view<f32, [1], \"read_write\", \"device\"> "
         "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-        "vernon.binding = 0 : i64}) attributes {vernon.entry, "
+        "vernon.binding = 0 : i64"
+        "}) attributes {vernon.entry, "
         "vernon.stage = \"compute\", "
         "vernon.workgroup_size = array<i32: 1, 1, 1>} {\n"
         "    %size = arith.constant 4 : index\n"
@@ -1892,13 +2052,17 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
                                              "  func.func @sample_color("
                                              "%texture: !vernon.texture<\"2d\", f32, \"unknown\", \"sampled\"> "
                                              "{vernon.interface = \"resource\", vernon.set = 0 : i64, "
-                                             "vernon.binding = 0 : i64}, "
+                                             "vernon.binding = 0 : i64"
+                                             "}, "
                                              "%sampler: !vernon.sampler {vernon.interface = \"resource\", "
-                                             "vernon.set = 0 : i64, vernon.binding = 1 : i64}, "
+                                             "vernon.set = 0 : i64, vernon.binding = 1 : i64"
+                                             "}, "
                                              "%uv: tensor<2xf32> {vernon.interface = \"input\", "
-                                             "vernon.location = 0 : i64}) -> "
+                                             "vernon.location = 0 : i64"
+                                             "}) -> "
                                              "(tensor<4xf32> {vernon.interface = \"output\", "
-                                             "vernon.location = 0 : i64}) attributes {vernon.entry, "
+                                             "vernon.location = 0 : i64"
+                                             "}) attributes {vernon.entry, "
                                              "vernon.stage = \"fragment\"} {\n"
                                              "    %color = \"vernon.intrinsic\"(%texture, %sampler, %uv) "
                                              "{name = \"texture_sample\"} : "

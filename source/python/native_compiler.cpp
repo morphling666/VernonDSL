@@ -1,9 +1,6 @@
 #include "native_compiler.h"
 
-#include "VernonExecutionGraph.h"
 #include "VernonProgramCapabilities.h"
-#include "execution_graph/execution_graph_internal.h"
-#include "native_command_retention.h"
 #include "native_runtime.h"
 #include "runtime/dirty_index_set.h"
 #include "runtime/dirty_range_set.h"
@@ -29,9 +26,6 @@ nb::dict runtimeCapabilitiesDict(const VernonRuntimeCapabilities &capabilities) 
 } // namespace
 
 void bindNativeCompiler(nb::module_ &module) {
-    nb::class_<vernon::execution::detail::RhiCommandExecutionPlan>(module, "_CommandPlan").def(nb::init<>());
-    nb::class_<vernon::execution::detail::RhiCommandPlanSink>(module, "_CommandPlanSink")
-        .def("_retain_completion", &retainPythonCommandCompletion, nb::arg("transaction"));
     module.def("target_available", &targetAvailable, nb::arg("target"));
     module.def("target_capabilities", &targetCapabilities, nb::arg("target"));
     module.def(
@@ -208,9 +202,6 @@ void bindNativeCompiler(nb::module_ &module) {
                      [](const Runtime &runtime) {
                          return runtimeCapabilitiesDict(vernonRuntimeGetContextCapabilities(runtime.handle));
                      })
-        .def("load", &Runtime::load, nb::arg("artifact"), nb::arg("reflection"), nb::arg("entry"),
-             nb::keep_alive<0, 1>())
-        .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::arg("program"), nb::arg("entry"), nb::keep_alive<0, 1>())
         .def("load_program", &Runtime::loadProgramAsset, nb::keep_alive<0, 1>())
         .def("load_in_memory_program", &Runtime::loadInMemoryProgram, nb::arg("manifest"), nb::arg("directory"),
              nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
@@ -253,9 +244,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("access", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &ProgramOutputMetadata::shape)
         .def_ro("location", &ProgramOutputMetadata::location);
-    nb::class_<PythonRuntimeSubmission>(module, "Submission")
-        .def("wait", &PythonRuntimeSubmission::wait, nb::call_guard<nb::gil_scoped_release>())
-        .def_prop_ro("state", &PythonRuntimeSubmission::state);
     nb::class_<vernon::runtime::DirtyRangeSet>(module, "_DirtyRangeSet")
         .def(nb::init<size_t, bool>(), nb::arg("byte_size"), nb::arg("dirty") = false)
         .def_prop_ro("ranges", &vernon::runtime::DirtyRangeSet::ranges)
@@ -276,15 +264,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("clear", &vernon::runtime::DirtyIndexSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
     nb::class_<PreparedProgramArgument>(module, "_PreparedProgramArgument");
-    nb::class_<StageInvocationBuilder>(module, "StageInvocationBuilder")
-        .def("host_tensor", &StageInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
-             nb::rv_policy::reference_internal)
-        .def("grid", &StageInvocationBuilder::grid, nb::arg("x"), nb::arg("y"), nb::arg("z"),
-             nb::rv_policy::reference_internal)
-        .def("submit", &StageInvocationBuilder::submit);
-    nb::class_<PythonStageExecutable>(module, "StageExecutable")
-        .def("invocation_builder", &PythonStageExecutable::invocationBuilder, nb::keep_alive<0, 1>())
-        .def_prop_ro("parameters", &PythonStageExecutable::parameters);
     nb::class_<ProgramInvocationBuilder>(module, "ProgramInvocationBuilder")
         .def("prepare_host_tensor", &ProgramInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
@@ -396,27 +375,13 @@ void bindNativeCompiler(nb::module_ &module) {
     module.attr("ACCESS_READ") = static_cast<uint32_t>(VERNON_ACCESS_READ);
     module.attr("ACCESS_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_WRITE);
     module.attr("ACCESS_READ_WRITE") = static_cast<uint32_t>(VERNON_ACCESS_READ_WRITE);
-    module.attr("PIPELINE_TENSOR") = static_cast<uint32_t>(VERNON_PROGRAM_TENSOR);
-    module.attr("PIPELINE_IMAGE") = static_cast<uint32_t>(VERNON_PROGRAM_IMAGE);
-    module.attr("PIPELINE_SAMPLER") = static_cast<uint32_t>(VERNON_PROGRAM_SAMPLER);
+    module.attr("PROGRAM_SAMPLER") = static_cast<uint32_t>(VERNON_PROGRAM_SAMPLER);
     module.attr("TOPOLOGY_TRIANGLE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_TRIANGLE_LIST);
     module.attr("ATTACHMENT_CLEAR") = static_cast<uint32_t>(VERNON_RHI_LOAD_CLEAR);
     module.attr("ATTACHMENT_PRESERVE") = static_cast<uint32_t>(VERNON_RHI_LOAD_PRESERVE);
     module.attr("ATTACHMENT_DISCARD") = static_cast<uint32_t>(VERNON_RHI_LOAD_DISCARD);
     module.attr("ATTACHMENT_STORE") = static_cast<uint32_t>(VERNON_RHI_STORE_PRESERVE);
     module.attr("ATTACHMENT_DONT_CARE") = static_cast<uint32_t>(VERNON_RHI_STORE_DISCARD);
-    module.attr("GRAPH_READ") = static_cast<uint32_t>(vernon::execution::AccessMode::Read);
-    module.attr("GRAPH_WRITE") = static_cast<uint32_t>(vernon::execution::AccessMode::Write);
-    module.attr("GRAPH_READ_WRITE") = static_cast<uint32_t>(vernon::execution::AccessMode::ReadWrite);
-    module.attr("GRAPH_SHADER_READ") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_READ);
-    module.attr("GRAPH_SHADER_WRITE") = static_cast<uint32_t>(VERNON_RHI_STATE_SHADER_WRITE);
-    module.attr("GRAPH_STAGE_COMPUTE") = static_cast<uint32_t>(VERNON_RHI_STAGE_COMPUTE);
-    module.attr("GRAPH_STAGE_VERTEX") = static_cast<uint32_t>(VERNON_RHI_STAGE_VERTEX);
-    module.attr("GRAPH_STAGE_FRAGMENT") = static_cast<uint32_t>(VERNON_RHI_STAGE_FRAGMENT);
-    module.attr("GRAPH_PASS_NEVER_CULL") = static_cast<uint32_t>(vernon::execution::PassNeverCull);
-    module.attr("GRAPH_PASS_NO_MERGE") = static_cast<uint32_t>(vernon::execution::PassNoMerge);
-    module.attr("GRAPH_PASS_SIDE_EFFECT") = static_cast<uint32_t>(vernon::execution::PassSideEffect);
-    module.attr("GRAPH_PASS_DERIVATIVE") = static_cast<uint32_t>(vernon::execution::PassDerivative);
     module.attr("TOPOLOGY_LINE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
     module.attr("TOPOLOGY_POINT_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
     module.def("runtime_capabilities", [](VernonRuntimeBackend backend) {

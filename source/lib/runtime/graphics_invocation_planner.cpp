@@ -180,13 +180,14 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
         }
         const VernonProgramArgument &argument = *found->second;
         if (argument.kind == VERNON_PROGRAM_TENSOR) {
-            const ValueLayout &expectedLayout = !parameter.elementLayout.leaves.empty() ? parameter.elementLayout
-                                                : parameter.valueLayout                 ? *parameter.valueLayout
-                                                                                        : parameter.elementLayout;
+            const ValueLayout &expectedLayout = parameter.tensorArgument == TensorRepresentation::WholeValue
+                                                    ? *parameter.valueLayout
+                                                    : parameter.elementLayout;
             if (!valueLayoutsEqual(argument.tensor.element_layout, pipelineValueLayout(expectedLayout)) ||
                 !validTensor(argument.tensor))
                 return fail(error, "pipeline Tensor argument does not match layout");
-            if (parameter.source != StageParameterSource::Direct) {
+            if (parameter.source != StageParameterSource::Direct &&
+                parameter.tensorArgument != TensorRepresentation::WholeValue) {
                 const bool allowLeading =
                     std::any_of(parameter.uses.begin(), parameter.uses.end(),
                                 [](const ParameterUse &use) { return use.interfaceKind == "input"; });
@@ -426,7 +427,7 @@ bool planGraphicsInvocation(const StageBindingPlan &stagePlan, const VernonStage
 
     if (!plan.instanceCount)
         plan.instanceCount = 1;
-    if (!plan.vertexCount)
+    if (!plan.vertexCount && !draw.index_binding)
         return fail(error, "graphics draw counts cannot be inferred");
     if (draw.index_binding) {
         const VernonIndexBinding &index = *draw.index_binding;

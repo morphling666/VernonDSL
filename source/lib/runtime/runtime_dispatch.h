@@ -7,6 +7,7 @@
 #include "program_execution/materialized_node_frame.h"
 #include "program_execution/program_invocation_state.h"
 #include "program_execution_manifest.h"
+#include "resolved_stage_invocation.h"
 #include "runtime_state.h"
 
 #include <string>
@@ -41,9 +42,6 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
 bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
                              const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
                              LoadedStageArtifact &stage, StageBindingPlan &stagePlan, ReflectedEntry &reflectedEntry);
-bool buildReflectedComputeStageBindingPlan(const LoadedStageArtifact &stage, VernonRuntimeBackend backend,
-                                           StageBindingPlan &stagePlan, std::string &error);
-bool isDirectStagePipelinePlan(const StageBindingPlan &plan);
 
 bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                             VernonStageExecutable &pipeline);

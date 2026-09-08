@@ -7,6 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -53,6 +56,40 @@ public:
 
 private:
     RhiRuntime context_;
+};
+
+class OwnedProgramExecutable {
+public:
+    OwnedProgramExecutable(VernonRuntimeContext *runtime, const std::filesystem::path &manifestPath) {
+        std::ifstream input(manifestPath, std::ios::binary);
+        const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+        if (!runtime || manifest.empty())
+            return;
+        const std::string directory = manifestPath.parent_path().string();
+        VernonProgramBundleLoadOptions options{};
+        options.struct_size = sizeof(options);
+        options.bundle_directory = directory.c_str();
+        bundle_ = vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
+        if (bundle_)
+            executable_ = vernonRuntimeResolveProgram(bundle_, {nullptr, 0});
+    }
+
+    ~OwnedProgramExecutable() {
+        vernonRuntimeProgramExecutableDestroy(executable_);
+        vernonRuntimeProgramBundleDestroy(bundle_);
+    }
+
+    OwnedProgramExecutable(const OwnedProgramExecutable &) = delete;
+    OwnedProgramExecutable &operator=(const OwnedProgramExecutable &) = delete;
+    OwnedProgramExecutable(OwnedProgramExecutable &&) = delete;
+    OwnedProgramExecutable &operator=(OwnedProgramExecutable &&) = delete;
+
+    VernonProgramExecutable *get() const { return executable_; }
+    explicit operator bool() const { return executable_ != nullptr; }
+
+private:
+    VernonProgramBundle *bundle_{};
+    VernonProgramExecutable *executable_{};
 };
 
 struct RhiBuffer {
@@ -355,17 +392,6 @@ inline VernonStatus applyCanonicalPullback(VernonProgramExecutable *pipeline, Ve
         return VERNON_STATUS_INVALID_ARGUMENT;
     return options ? vernonProgramPullbackApplyWithOptions(pullback, arguments.data(), arguments.size(), options)
                    : vernonProgramPullbackApply(pullback, arguments.data(), arguments.size());
-}
-
-inline VernonStatus completeSubmission(VernonStageExecutable *pipeline,
-                                       const VernonStageInvocationDescriptor *invocation) {
-    VernonSubmission *submission{};
-    const VernonStatus submitStatus = vernonRuntimeStageSubmit(pipeline, invocation, &submission);
-    if (submitStatus != VERNON_STATUS_OK)
-        return submitStatus;
-    const VernonStatus completionStatus = vernonSubmissionWait(submission);
-    vernonSubmissionDestroy(submission);
-    return completionStatus;
 }
 
 inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiCommandEncoder encoder,

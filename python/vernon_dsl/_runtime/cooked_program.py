@@ -147,7 +147,7 @@ class CookedProgram:
         ]
         with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
             for parameter, value in resolved:
-                if parameter.kind == state._native.PIPELINE_SAMPLER:
+                if parameter.kind == state._native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
                     self._binding_cache.bind_sampler(builder, self._native, parameter, value)

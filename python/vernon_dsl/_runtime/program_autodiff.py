@@ -217,7 +217,7 @@ def _bound_program_invocation(
     try:
         with cache.invocation(executable) as builder:
             for parameter, slot, path, value in resolved:
-                if parameter.kind == state._native.PIPELINE_SAMPLER:
+                if parameter.kind == state._native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
                     cache.bind_sampler(builder, executable, parameter, value)

@@ -233,7 +233,7 @@ FailureOr<Value> buildAggregateValueLlvm(Type sourceType, ValueRange leaves, uns
         elements.push_back(*value);
     }
     Type targetType = converter.convertType(sourceType);
-    if (auto vector = dyn_cast<VectorType>(targetType))
+    if (auto vector = dyn_cast<mlir::VectorType>(targetType))
         return vector::FromElementsOp::create(builder, location, vector, elements).getResult();
     auto array = dyn_cast<LLVM::LLVMArrayType>(targetType);
     if (!array)
@@ -287,7 +287,7 @@ LogicalResult decomposeAggregateValueLlvm(Type sourceType, Value value, SmallVec
         count *= dimension;
     for (int64_t index = 0; index < count; ++index) {
         Value extracted;
-        if (isa<VectorType>(value.getType()))
+        if (isa<mlir::VectorType>(value.getType()))
             extracted = vector::ExtractOp::create(builder, location, value, index);
         else
             extracted = LLVM::ExtractValueOp::create(builder, location, value, ArrayRef<int64_t>{index});

@@ -39,12 +39,12 @@ std::optional<VernonRhiFormat> format(std::string_view value) {
         {"rgba16_float", VERNON_RHI_FORMAT_RGBA16_FLOAT},
         {"r32_float", VERNON_RHI_FORMAT_R32_FLOAT},
         {"rgba32_float", VERNON_RHI_FORMAT_RGBA32_FLOAT},
-        {"d32_float", VERNON_RHI_FORMAT_D32_FLOAT},
+        {"depth32_float", VERNON_RHI_FORMAT_D32_FLOAT},
         {"rgb8_unorm", VERNON_RHI_FORMAT_RGB8_UNORM},
         {"rg32_float", VERNON_RHI_FORMAT_RG32_FLOAT},
         {"rgb32_float", VERNON_RHI_FORMAT_RGB32_FLOAT},
         {"r11g11b10_float", VERNON_RHI_FORMAT_R11G11B10_FLOAT},
-        {"d32_float_s8_uint", VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT},
+        {"depth32_float_stencil8", VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT},
     }};
     const auto found =
         std::find_if(values.begin(), values.end(), [&](const auto &entry) { return entry.first == value; });

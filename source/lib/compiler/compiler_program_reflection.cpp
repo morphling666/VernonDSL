@@ -1,4 +1,5 @@
 #include "compiler_program_reflection.h"
+#include "compiler_program_semantic_type.h"
 #include "compiler_reflection.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -101,17 +102,17 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             if (mlir::failed(layout))
                 return mlir::failure();
         }
-        mlir::Type logicalType = derivativeType;
-        if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(logicalType))
-            logicalType = view.getElementType();
-        else if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(logicalType))
-            logicalType = tensor.getElementType();
-        else if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(logicalType))
-            logicalType = tensor.getElementType();
-        std::string spelling;
-        llvm::raw_string_ostream stream(spelling);
-        logicalType.print(stream);
-        stream.flush();
+        mlir::FailureOr<vernon::program::SemanticType> semantic =
+            programSemanticType(module, derivativeType, logicalDtypes);
+        if (mlir::failed(semantic))
+            return mlir::failure();
+        if ((semantic->kind == vernon::program::SemanticTypeKind::Tensor ||
+             semantic->kind == vernon::program::SemanticTypeKind::TensorView) &&
+            semantic->elements.size() == 1)
+            *semantic = semantic->elements.front();
+        std::string spelling = vernon::program::serializeSemanticType(*semantic);
+        if (spelling.empty())
+            return mlir::failure();
         return reflectCanonicalValueLayout(*layout, spelling);
     };
     const auto reflectValue = [&](uint32_t id, llvm::StringRef name, mlir::Type type, bool external, bool output,
@@ -140,9 +141,6 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             }
             return;
         }
-        std::string spelling;
-        llvm::raw_string_ostream stream(spelling);
-        type.print(stream);
         mlir::Type element = type;
         mlir::Type layoutType = type;
         llvm::json::Array shape;
@@ -172,8 +170,24 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
         else if (logicalDtypes.size() == 1)
             dtype = logicalDtypes.front().str();
         if (logicalDtype && !logicalDtype->empty() && logicalDtypes.size() == 1 &&
-            logicalDtype->str() != logicalDtypes.front()) {
+            *logicalDtype != logicalDtypes.front()) {
             module.emitError("vernon.dtype does not match vernon.abi_leaf_dtypes");
+            invalid = true;
+            return;
+        }
+        llvm::SmallVector<llvm::StringRef> semanticDtypes(logicalDtypes.begin(), logicalDtypes.end());
+        if (semanticDtypes.empty() && logicalDtype && !logicalDtype->empty())
+            semanticDtypes.push_back(*logicalDtype);
+        mlir::FailureOr<vernon::program::SemanticType> semantic = programSemanticType(module, type, semanticDtypes);
+        if (mlir::failed(semantic)) {
+            module.emitError() << "cannot derive canonical executable Program semantic type for MLIR storage " << type
+                               << " with " << semanticDtypes.size() << " ABI leaf dtypes";
+            invalid = true;
+            return;
+        }
+        std::string spelling = vernon::program::serializeSemanticType(*semantic);
+        if (spelling.empty()) {
+            module.emitError("cannot serialize canonical executable Program semantic type");
             invalid = true;
             return;
         }
@@ -184,12 +198,12 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                                                  {"shape", std::move(shape)},
                                                  {"external", external},
                                                  {"output", output}};
+        if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(type))
+            (*reflectedValues[id])["texture_dimension"] = texture.getDimension().str();
         if (!layoutType) {
             return;
         }
-        llvm::SmallVector<llvm::StringRef> layoutDtypes(logicalDtypes.begin(), logicalDtypes.end());
-        if (layoutDtypes.empty() && logicalDtype && !logicalDtype->empty())
-            layoutDtypes.push_back(*logicalDtype);
+        llvm::SmallVector<llvm::StringRef> layoutDtypes(semanticDtypes.begin(), semanticDtypes.end());
         if (auto tensor = mlir::dyn_cast<mlir::vernon::TensorType>(layoutType);
             tensor && !tensor.getElementType().isIntOrFloat() && !layoutDtypes.empty()) {
             llvm::SmallVector<llvm::StringRef> elementDtypes(layoutDtypes);
@@ -208,7 +222,17 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 return;
             }
         } else {
-            valueLayout = reflectCanonicalValueLayout(module, layoutType, layoutDtypes);
+            vernon::program::SemanticType layoutSemantic = *semantic;
+            if (layoutType != type &&
+                (layoutSemantic.kind == vernon::program::SemanticTypeKind::Tensor ||
+                 layoutSemantic.kind == vernon::program::SemanticTypeKind::TensorView) &&
+                layoutSemantic.elements.size() == 1)
+                layoutSemantic = layoutSemantic.elements.front();
+            mlir::FailureOr<mlir::vernon::ValueAbiLayout> plannedLayout =
+                mlir::vernon::getValueAbiLayout(layoutType, module, layoutDtypes);
+            if (mlir::succeeded(plannedLayout))
+                valueLayout =
+                    reflectCanonicalValueLayout(*plannedLayout, vernon::program::serializeSemanticType(layoutSemantic));
         }
         if (mlir::failed(valueLayout)) {
             module.emitError("cannot reflect executable Program Value ABI");
@@ -266,18 +290,13 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                 : function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.source_name")
                     ? function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.source_name").getValue()
                     : llvm::StringRef("argument");
-            llvm::SmallVector<llvm::StringRef> logicalDtypes;
-            if (auto dtypes = function.getArgAttrOfType<mlir::ArrayAttr>(index, "vernon.abi_leaf_dtypes"))
-                for (mlir::Attribute dtype : dtypes)
-                    logicalDtypes.push_back(mlir::cast<mlir::StringAttr>(dtype).getValue());
+            mlir::vernon::program::ProgramLanguageAbi languageAbi =
+                mlir::vernon::program::programLanguageAbiFromAttrs(function.getArgAttrDict(index), argument.getType());
             mlir::Type derivativeOf;
             if (!capture && direction.getValue() == "backward")
                 derivativeOf = findPrimalType(primalOutputs, name);
-            std::optional<llvm::StringRef> logicalDtype;
-            if (auto dtype = function.getArgAttrOfType<mlir::StringAttr>(index, "vernon.dtype"))
-                logicalDtype = dtype.getValue();
             reflectValue(valueId, name, argument.getType(), !capture && !invocationControl, false, !capture,
-                         logicalDtypes, derivativeOf, logicalDtype);
+                         languageAbi.leaves, derivativeOf, languageAbi.dtype);
         }
         graph["arguments"] = std::move(arguments);
 
@@ -592,18 +611,15 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
                     : function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.source_name")
                         ? function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.source_name").getValue()
                         : llvm::StringRef("result");
-                llvm::SmallVector<llvm::StringRef> logicalDtypes;
-                if (auto dtypes = function.getResultAttrOfType<mlir::ArrayAttr>(index, "vernon.abi_leaf_dtypes"))
-                    for (mlir::Attribute dtype : dtypes)
-                        logicalDtypes.push_back(mlir::cast<mlir::StringAttr>(dtype).getValue());
+                mlir::vernon::program::ProgramLanguageAbi languageAbi =
+                    mlir::vernon::program::programLanguageAbiFromAttrs(function.getResultAttrDict(index),
+                                                                       function.getResultTypes()[index]);
                 mlir::Type derivativeOf;
                 if (direction.getValue() == "backward")
                     derivativeOf = findPrimalType(primalInputs, name);
-                std::optional<llvm::StringRef> logicalDtype;
-                if (auto dtype = function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.dtype"))
-                    logicalDtype = dtype.getValue();
                 reflectValue(static_cast<uint32_t>(id), name, function.getResultTypes()[index], false,
-                             direction.getValue() == "forward", true, logicalDtypes, derivativeOf, logicalDtype);
+                             direction.getValue() == "forward", true, languageAbi.leaves, derivativeOf,
+                             languageAbi.dtype);
                 llvm::StringRef path =
                     function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.source_name")
                         ? function.getResultAttrOfType<mlir::StringAttr>(index, "vernon.source_name").getValue()

@@ -14,6 +14,39 @@ def triangle_vertex(
     return vd.Vector([position, 0.0, 1.0])
 
 
+@vd.vertex
+def matrix_vertex(
+    transform: Annotated[vd.Matrix[vd.f32, 4, 4], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.matmul(transform, vd.Vector([0.0, 0.0, 0.0, 1.0]))
+
+
+@vd.vertex
+def signed_uniform_vertex(
+    budget: Annotated[vd.i32, vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vd.f32(budget), 0.0, 0.0, 1.0])
+
+
+@vd.vertex
+def unsigned_uniform_vertex(
+    budget: Annotated[vd.Vector[vd.u32, 3], vd.uniform()],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vd.f32(budget.x), 0.0, 0.0, 1.0])
+
+
+@vd.vertex
+def indexed_vertex(
+    position: Annotated[vd.Vector[vd.f32, 3], vd.attribute(divisor=1)],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([position, 1.0])
+
+
+@vd.vertex
+def resource_only_vertex() -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([0.0, 0.0, 0.0, 1.0])
+
+
 @vd.fragment
 def solid_fragment() -> vd.Vector[vd.f32, 4]:
     return vd.Vector([1.0, 0.25, 0.0, 1.0])
@@ -50,6 +83,63 @@ def scale(
     index = gid[0]
     values[index] = values[index] * factor
 
+
+@vd.kernel(workgroup_size=(1, 1, 1))
+def write_rgba32_storage_image(
+    image: vd.Texture["2d", vd.rgba32_float, vd.write],  # noqa: F722
+) -> None:
+    vd.texture_store(image, vd.Vector([vd.i32(0), vd.i32(0)]), vd.Vector([1.0, 1.0, 1.0, 1.0]))
+
+
+matrix_asset = vd.program_asset(
+    id="pipelines/matrix_uniform",
+    program=vd.pipeline(
+        matrix_vertex,
+        solid_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
+
+signed_uniform_asset = vd.program_asset(
+    id="pipelines/signed_uniform",
+    program=vd.pipeline(
+        signed_uniform_vertex,
+        solid_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
+
+unsigned_uniform_asset = vd.program_asset(
+    id="pipelines/unsigned_uniform",
+    program=vd.pipeline(
+        unsigned_uniform_vertex,
+        solid_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
+
+indexed_asset = vd.program_asset(
+    id="pipelines/indexed_vertex",
+    program=vd.pipeline(
+        indexed_vertex,
+        solid_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
+
+explicit_sampler_asset = vd.program_asset(
+    id="pipelines/explicit_sampler",
+    program=vd.pipeline(
+        resource_only_vertex,
+        sampled_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)
 
 triangle_asset = vd.program_asset(
     id="pipelines/triangle",
@@ -108,5 +198,11 @@ opengl_runtime_acceptance_asset = vd.program_asset(
 scale_asset = vd.program_asset(
     id="pipelines/scale",
     program=scale,
+    variants=((),),
+)
+
+storage_image_asset = vd.program_asset(
+    id="pipelines/storage_image",
+    program=write_rgba32_storage_image,
     variants=((),),
 )

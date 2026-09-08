@@ -8,7 +8,10 @@
 // CHECK-SAME: vernon.source_name = "__vernon_ad_segment"
 // CHECK-SAME: !vernon.tensor_view<i32, [-1], "read_write", "device">
 // CHECK-SAME: vernon.source_name = "__vernon_ad_status"
-// CHECK-SAME: tensor<3xi32> {vernon.builtin = "local_invocation_id"
+// CHECK-SAME: tensor<3xi32> {
+// CHECK-SAME: vernon.builtin = "local_invocation_id"
+// CHECK-SAME: vernon.dtype = "u32"
+// CHECK-SAME: vernon.interface = "input"
 // CHECK-NOT: !vernon.ad_tape
 // CHECK-NOT: !vernon.ad_region_header
 // CHECK-NOT: arith.constant {{.*}} : i64

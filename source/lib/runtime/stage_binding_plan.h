@@ -94,6 +94,11 @@ struct TensorViewDescriptorUse {
     std::vector<uint32_t> strideBindings;
 };
 
+enum class TensorRepresentation {
+    ElementStream,
+    WholeValue,
+};
+
 struct ParameterUse {
     std::string stage;
     std::string interfaceKind;
@@ -108,6 +113,7 @@ struct ParameterUse {
     std::vector<SampledImageBinding> sampledImageBindings;
     std::vector<AttributeLeaf> attributeLeaves;
     std::string transport;
+    TensorRepresentation tensorPacking{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;
     std::optional<InterfacePlan> interfacePlan;
     std::optional<TensorViewDescriptorUse> tensorViewDescriptor;
@@ -140,6 +146,8 @@ struct Parameter {
     std::string name;
     std::string kind;
     StageParameterSource source{StageParameterSource::Projected};
+    // Representation of the invocation-owned Tensor descriptor.
+    TensorRepresentation tensorArgument{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;
     ValueLayout elementLayout;
     std::string access;

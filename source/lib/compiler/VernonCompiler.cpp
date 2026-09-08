@@ -6,6 +6,7 @@
 #include "compiler_program_finalization.h"
 #include "compiler_program_implementation.h"
 #include "compiler_program_stage.h"
+#include "compiler_program_storage.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -262,7 +263,8 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                         }
             llvm::json::Object *value = valueId ? valueById(*valueId) : nullptr;
             llvm::json::Array *plannedShape = value ? value->getArray("shape") : nullptr;
-            const bool textureShape = value && value->getString("type").value_or("").starts_with("!vernon.texture<") &&
+            const bool textureShape = value &&
+                                      vernon::compiler::isProgramTextureType(value->getString("type").value_or("")) &&
                                       plannedShape && plannedShape->empty() && fact.rank > 0 && fact.rank <= 3;
             if (!valueId || !value || !plannedShape || (!textureShape && plannedShape->size() != fact.rank)) {
                 result->status = VERNON_STATUS_VERIFICATION_ERROR;
@@ -345,7 +347,7 @@ VernonCompileResult *vernonCompilerFinalizeProgramWithShapes(VernonCompilerConte
                 const std::optional<llvm::StringRef> autodiffSource =
                     binding ? binding->getString("autodiff_source") : std::nullopt;
                 const llvm::StringRef valueType = value ? value->getString("type").value_or("") : "";
-                if (role == "tape" || valueType == "!vernon.ad_tape" || valueType.starts_with("!vernon.ad_tape<"))
+                if (role == "tape" || vernon::compiler::isProgramAdTapeType(valueType))
                     continue;
                 auto parameterIt = endpoint    ? interface.find(endpoint->str())
                                    : parameter ? interface.find(parameter->str())

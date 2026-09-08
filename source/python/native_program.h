@@ -242,27 +242,6 @@ ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &vie
 
 ProgramOutputMetadata outputMetadata(const VernonProgramOutputView &view);
 
-struct PythonRuntimeSubmission {
-    explicit PythonRuntimeSubmission(VernonSubmission *value) : handle(value) {}
-    ~PythonRuntimeSubmission() { vernonSubmissionDestroy(handle); }
-    PythonRuntimeSubmission(const PythonRuntimeSubmission &) = delete;
-    PythonRuntimeSubmission &operator=(const PythonRuntimeSubmission &) = delete;
-
-    void wait() {
-        if (vernonSubmissionWait(handle) != VERNON_STATUS_OK)
-            throw std::runtime_error("executable submission failed");
-    }
-
-    uint32_t state() const {
-        VernonSubmissionState value{};
-        if (vernonSubmissionGetState(handle, &value) != VERNON_STATUS_OK)
-            throw std::runtime_error("cannot query executable submission");
-        return static_cast<uint32_t>(value);
-    }
-
-    VernonSubmission *handle{};
-};
-
 struct PreparedProgramArgument {
     PreparedProgramArgument() = default;
     PreparedProgramArgument(const PreparedProgramArgument &other)

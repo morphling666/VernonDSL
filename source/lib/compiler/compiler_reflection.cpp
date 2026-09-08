@@ -1,6 +1,7 @@
 #include "compiler_reflection.h"
 
 #include "compiler_program_reflection.h"
+#include "compiler_program_semantic_type.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -449,14 +450,20 @@ analyzeSampledTextureBindings(mlir::func::FuncOp function) {
 
 mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
                                                                 llvm::ArrayRef<llvm::StringRef> logicalDtypes) {
-    mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned =
-        mlir::vernon::getValueAbiLayout(type, module, logicalDtypes);
-    if (mlir::failed(planned))
-        return mlir::failure();
     std::string logicalType;
     llvm::raw_string_ostream typeStream(logicalType);
     type.print(typeStream);
     typeStream.flush();
+    return reflectCanonicalValueLayout(module, type, logicalDtypes, logicalType);
+}
+
+mlir::FailureOr<llvm::json::Object> reflectCanonicalValueLayout(mlir::ModuleOp module, mlir::Type type,
+                                                                llvm::ArrayRef<llvm::StringRef> logicalDtypes,
+                                                                llvm::StringRef logicalType) {
+    mlir::FailureOr<mlir::vernon::ValueAbiLayout> planned =
+        mlir::vernon::getValueAbiLayout(type, module, logicalDtypes);
+    if (mlir::failed(planned))
+        return mlir::failure();
     llvm::json::Object reflected = reflectCanonicalValueLayout(*planned, logicalType);
     if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type))
         reflected["struct_name"] = structure.getName().str();
@@ -518,8 +525,10 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             return sugar.getValue().str();
         return "";
     };
-    auto reflectValueLayout = [&](mlir::Type type, llvm::ArrayRef<llvm::StringRef> logicalDtypes = {})
-        -> mlir::FailureOr<llvm::json::Object> { return reflectCanonicalValueLayout(module, type, logicalDtypes); };
+    auto reflectValueLayout = [&](mlir::Type type, llvm::ArrayRef<llvm::StringRef> logicalDtypes,
+                                  llvm::StringRef logicalType) -> mlir::FailureOr<llvm::json::Object> {
+        return reflectCanonicalValueLayout(module, type, logicalDtypes, logicalType);
+    };
     std::function<llvm::json::Object(const mlir::vernon::ByteTransportNode &)> reflectTransportNode;
     reflectTransportNode = [&](const mlir::vernon::ByteTransportNode &node) {
         llvm::StringRef kind = node.kind == mlir::vernon::ByteTransportNodeKind::Scalar    ? "scalar"
@@ -875,10 +884,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             argument["index"] = static_cast<int64_t>(index);
             argument["kind"] = "scalar";
 
-            std::string type;
-            llvm::raw_string_ostream typeStream(type);
-            function.getArgumentTypes()[index].print(typeStream);
-            argument["type"] = std::move(type);
             mlir::DictionaryAttr argumentAttrs = function.getArgAttrDict(index);
             mlir::Type argumentType = function.getArgumentTypes()[index];
             const auto leafDtypes = [&](llvm::StringRef attribute) {
@@ -904,9 +909,25 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (explicitElementLogicalDtypes.empty() && valueLogicalDtypes.size() == 1)
                 explicitElementLogicalDtypes = valueLogicalDtypes;
             const llvm::ArrayRef<llvm::StringRef> interfaceLogicalDtypes =
-                mlir::isa<mlir::vernon::TensorViewType>(argumentType)
+                mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TensorType, mlir::RankedTensorType>(argumentType)
                     ? llvm::ArrayRef<llvm::StringRef>(explicitElementLogicalDtypes)
                     : llvm::ArrayRef<llvm::StringRef>(valueLogicalDtypes);
+            std::string canonicalType;
+            if (argumentType.isIndex()) {
+                llvm::raw_string_ostream typeStream(canonicalType);
+                argumentType.print(typeStream);
+                typeStream.flush();
+            } else {
+                mlir::FailureOr<vernon::program::SemanticType> semantic =
+                    programSemanticType(module, argumentType, interfaceLogicalDtypes);
+                if (mlir::failed(semantic)) {
+                    function.emitError() << "cannot derive canonical type for argument #" << index;
+                    invalid = true;
+                    return;
+                }
+                canonicalType = vernon::program::serializeSemanticType(*semantic);
+            }
+            argument["type"] = canonicalType;
             llvm::json::Object physicalLayouts;
             uint64_t hostAlignment = 1;
             const bool cpuOpaqueBuiltin = argumentType.isIndex() && argumentAttrs.get("vernon.builtin");
@@ -1034,7 +1055,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (!argumentType.isIndex() &&
                 !mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TextureType, mlir::vernon::SamplerType>(
                     argumentType)) {
-                mlir::FailureOr<llvm::json::Object> valueLayout = reflectValueLayout(argumentType, valueLogicalDtypes);
+                mlir::FailureOr<llvm::json::Object> valueLayout =
+                    reflectValueLayout(argumentType, valueLogicalDtypes, canonicalType);
                 if (mlir::failed(valueLayout)) {
                     function.emitError() << "cannot reflect canonical logical ABI for argument #" << index;
                     invalid = true;
@@ -1058,8 +1080,16 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                     return;
                 }
                 llvm::ArrayRef<llvm::StringRef> elementLogicalDtypes = explicitElementLogicalDtypes;
+                mlir::FailureOr<vernon::program::SemanticType> elementSemantic =
+                    programSemanticType(module, elementLayoutType, elementLogicalDtypes);
+                if (mlir::failed(elementSemantic)) {
+                    function.emitError() << "cannot derive canonical element type for argument #" << index;
+                    invalid = true;
+                    return;
+                }
+                const std::string elementType = vernon::program::serializeSemanticType(*elementSemantic);
                 mlir::FailureOr<llvm::json::Object> elementLayout =
-                    reflectValueLayout(elementLayoutType, elementLogicalDtypes);
+                    reflectValueLayout(elementLayoutType, elementLogicalDtypes, elementType);
                 if (mlir::failed(elementLayout)) {
                     function.emitError() << "cannot reflect canonical element layout for argument #" << index;
                     invalid = true;
@@ -1310,11 +1340,6 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 continue;
             llvm::json::Object output;
             output["index"] = static_cast<int64_t>(index);
-
-            std::string type;
-            llvm::raw_string_ostream typeStream(type);
-            function.getResultTypes()[index].print(typeStream);
-            output["type"] = std::move(type);
             mlir::DictionaryAttr resultAttrs = function.getResultAttrDict(index);
             mlir::Type resultType = function.getResultTypes()[index];
             llvm::SmallVector<llvm::StringRef> logicalDtypes;
@@ -1331,6 +1356,28 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
             if (logicalDtypes.empty() && logicalValue)
                 for (const std::string &dtype : logicalValue->leafDtypes)
                     logicalDtypes.push_back(dtype);
+            llvm::SmallVector<llvm::StringRef> elementLogicalDtypes;
+            if (resultAttrs)
+                if (auto dtypes = resultAttrs.getAs<mlir::ArrayAttr>("vernon.element_abi_leaf_dtypes"))
+                    for (mlir::Attribute dtype : dtypes) {
+                        auto value = mlir::dyn_cast<mlir::StringAttr>(dtype);
+                        elementLogicalDtypes.push_back(value ? value.getValue() : llvm::StringRef());
+                    }
+            if (elementLogicalDtypes.empty() && logicalDtypes.size() == 1)
+                elementLogicalDtypes = logicalDtypes;
+            const llvm::ArrayRef<llvm::StringRef> semanticDtypes =
+                mlir::isa<mlir::vernon::TensorViewType, mlir::vernon::TensorType, mlir::RankedTensorType>(resultType)
+                    ? llvm::ArrayRef<llvm::StringRef>(elementLogicalDtypes)
+                    : llvm::ArrayRef<llvm::StringRef>(logicalDtypes);
+            mlir::FailureOr<vernon::program::SemanticType> semantic =
+                programSemanticType(module, resultType, semanticDtypes);
+            if (mlir::failed(semantic)) {
+                function.emitError() << "cannot derive canonical type for result #" << index;
+                invalid = true;
+                return;
+            }
+            const std::string canonicalType = vernon::program::serializeSemanticType(*semantic);
+            output["type"] = canonicalType;
             if (logicalValue) {
                 if (logicalValue->sourcePathExplicit)
                     output["vernon.source_name"] = logicalValue->sourcePath;
@@ -1425,7 +1472,8 @@ mlir::FailureOr<std::string> buildReflection(mlir::ModuleOp module, const Logica
                 for (mlir::NamedAttribute attr : resultAttrs)
                     output[attr.getName().strref().str()] = attributeToJson(attr.getValue());
             }
-            mlir::FailureOr<llvm::json::Object> valueLayout = reflectValueLayout(resultType, logicalDtypes);
+            mlir::FailureOr<llvm::json::Object> valueLayout =
+                reflectValueLayout(resultType, logicalDtypes, canonicalType);
             if (mlir::failed(valueLayout)) {
                 function.emitError() << "cannot reflect canonical logical ABI for result #" << index;
                 invalid = true;

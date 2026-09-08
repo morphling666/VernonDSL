@@ -401,6 +401,16 @@ bool materializeProgramValues(const program::Program &execution, const program::
                 value.concreteShape = storage[backing.owner].concreteShape;
         } else if (const auto external = externalValues.find(slot.id); external != externalValues.end()) {
             value.argument = external->second;
+            if (value.argument.kind == VERNON_PROGRAM_TENSOR && value.argument.tensor.rank) {
+                value.boundTensorLayout.emplace();
+                value.boundTensorLayout->shape.assign(value.argument.tensor.shape,
+                                                      value.argument.tensor.shape + value.argument.tensor.rank);
+                value.boundTensorLayout->byteStrides.assign(value.argument.tensor.byte_strides,
+                                                            value.argument.tensor.byte_strides +
+                                                                value.argument.tensor.rank);
+                value.argument.tensor.shape = value.boundTensorLayout->shape.data();
+                value.argument.tensor.byte_strides = value.boundTensorLayout->byteStrides.data();
+            }
             value.ownership =
                 value.argument.kind == VERNON_PROGRAM_TENSOR && value.argument.tensor.storage == VERNON_TENSOR_HOST
                     ? ProgramValueOwnership::BorrowedHost

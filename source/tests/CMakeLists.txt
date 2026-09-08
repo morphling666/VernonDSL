@@ -172,7 +172,7 @@ function(
 endfunction()
 
 function(
-    vernon_add_cpu_autodiff_fixture
+    vernon_add_cpu_program_fixture
     name
     directory_stem
     manifest_name
@@ -191,9 +191,9 @@ function(
     endif()
     set(_vernon_directory "${VERNON_TEST_BINARY_ROOT}/${directory_stem}")
     set(_vernon_manifest "${_vernon_directory}/${manifest_name}")
-    set(_vernon_registration "${_vernon_directory}/autodiff_registration.c")
-    set(_vernon_wrapper "${_vernon_directory}/autodiff_registration_wrapper.c")
-    set(_vernon_artifact_archive "${_vernon_directory}/autodiff_artifacts.a")
+    set(_vernon_registration "${_vernon_directory}/program_registration.c")
+    set(_vernon_wrapper "${_vernon_directory}/program_registration_wrapper.c")
+    set(_vernon_artifact_archive "${_vernon_directory}/program_artifacts.a")
     string(
         REGEX
         REPLACE ":[^:]+$"
@@ -214,15 +214,14 @@ function(
                "${_vernon_artifact_archive}"
         COMMAND ${CMAKE_COMMAND} -E rm -rf "${_vernon_directory}"
         COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python" ${_vernon_cook_command}
-        COMMAND
-            ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py" "${_vernon_manifest}"
-            "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}" --archiver "${CMAKE_AR}"
+        COMMAND ${Python_EXECUTABLE} "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py" "${_vernon_manifest}"
+                "${CMAKE_C_OUTPUT_EXTENSION}" --wrapper-function "${wrapper_function}" --archiver "${CMAKE_AR}"
         DEPENDS vernon-dsl-native
                 "$<TARGET_FILE:vernon-dsl-native>"
                 "${_vernon_asset_source}"
                 ${FIXTURE_COOK_SCRIPT}
                 ${VERNON_TEST_BUNDLE_PYTHON_SOURCES}
-                "${VERNON_TEST_ROOT}/scripts/prepare_autodiff_cooked_fixture.py"
+                "${VERNON_TEST_ROOT}/scripts/prepare_cpu_program_fixture.py"
         VERBATIM)
     set_source_files_properties("${_vernon_registration}" "${_vernon_wrapper}" PROPERTIES GENERATED TRUE)
     set(_vernon_target "vernon-${name}-fixture")
@@ -365,6 +364,51 @@ if(TARGET VernonRuntime)
         set(gpu_autodiff_fixture_targets)
         set(module_program_gpu_fixture_targets)
         set(module_graphics_fixture_targets)
+        set(synchronization_fixture_targets)
+        set(synchronization_architectures opengl opengles)
+        if(VERNON_ENABLE_VULKAN_RUNTIME)
+            list(APPEND synchronization_architectures vulkan)
+        endif()
+        if(VERNON_ENABLE_CUDA_RUNTIME)
+            list(APPEND synchronization_architectures cuda)
+        endif()
+        if(VERNON_ENABLE_DIRECTX12_RUNTIME)
+            list(APPEND synchronization_architectures directx)
+        endif()
+        if(VERNON_ENABLE_METAL_RUNTIME)
+            list(APPEND synchronization_architectures metal)
+        endif()
+        foreach(synchronization_architecture IN LISTS synchronization_architectures)
+            set(synchronization_manifest_variable "synchronization_${synchronization_architecture}_manifest")
+            vernon_add_program_asset_test_bundle(
+                "synchronization-${synchronization_architecture}"
+                "${synchronization_architecture}"
+                "${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset"
+                "synchronization_${synchronization_architecture}_fixture"
+                "${synchronization_manifest_variable}")
+            string(TOUPPER "${synchronization_architecture}" synchronization_architecture_upper)
+            target_compile_definitions(
+                VernonCompilerRuntimeIntegrationTests
+                PRIVATE
+                    "VERNON_SYNCHRONIZATION_${synchronization_architecture_upper}_MANIFEST=\"${${synchronization_manifest_variable}}\""
+            )
+            list(APPEND synchronization_fixture_targets
+                 "vernon-synchronization-${synchronization_architecture}-test-bundle")
+        endforeach()
+        vernon_add_cpu_program_fixture(
+            synchronization-cpu
+            synchronization_cpu_fixture
+            synchronization_cpu_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset"
+            vernonRegisterSynchronizationProgramFixture
+            synchronization_cpu_manifest
+            synchronization_cpu_fixture_target)
+        target_compile_definitions(
+            VernonCompilerRuntimeIntegrationTests
+            PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1
+                    "VERNON_SYNCHRONIZATION_CPU_MANIFEST=\"${synchronization_cpu_manifest}\"")
+        target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE ${synchronization_cpu_fixture_target})
+        add_dependencies(VernonCompilerRuntimeIntegrationTests ${synchronization_fixture_targets})
         if(VERNON_ENABLE_VULKAN_RUNTIME)
             vernon_add_program_asset_test_bundle(
                 gpu-autodiff-vulkan
@@ -568,7 +612,7 @@ if(TARGET VernonRuntime)
             gpu_autodiff_opengl_dynamic_manifest
             gpu_autodiff_fixture_targets)
 
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             cooked-autodiff
             autodiff_cooked_fixture
             autodiff_cooked_fixture.program.json
@@ -576,7 +620,7 @@ if(TARGET VernonRuntime)
             vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
             cooked_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             module-program-cooked
             module_program_cooked_fixture
             module_program_cooked_fixture.program.json
@@ -584,7 +628,7 @@ if(TARGET VernonRuntime)
             vernonRegisterModuleProgramFixture
             module_program_cooked_manifest
             module_program_cooked_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
             autodiff_native_f16_fixture.program.json
@@ -592,7 +636,7 @@ if(TARGET VernonRuntime)
             vernonRegisterNativeAutodiffF16Fixture
             native_autodiff_f16_manifest
             native_autodiff_f16_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             native-autodiff-numeric-cpu
             autodiff_native_numeric_cpu_fixture
             autodiff_native_numeric_cpu_fixture.program.json
@@ -600,7 +644,7 @@ if(TARGET VernonRuntime)
             vernonRegisterNativeAutodiffNumericCpuFixture
             native_autodiff_numeric_cpu_manifest
             native_autodiff_numeric_cpu_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-scalar-autodiff
             autodiff_structured_scalar_fixture
             autodiff_structured_scalar_fixture.program.json
@@ -608,7 +652,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredScalarAutodiffFixture
             structured_scalar_autodiff_manifest
             structured_scalar_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-scalar-balanced-autodiff
             autodiff_structured_scalar_balanced_fixture
             autodiff_structured_scalar_balanced_fixture.program.json
@@ -616,7 +660,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredScalarBalancedAutodiffFixture
             structured_scalar_balanced_autodiff_manifest
             structured_scalar_balanced_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-dynamic-autodiff
             autodiff_structured_dynamic_fixture
             autodiff_structured_dynamic_fixture.program.json
@@ -624,7 +668,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredDynamicAutodiffFixture
             structured_dynamic_autodiff_manifest
             structured_dynamic_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-f64-autodiff
             autodiff_structured_f64_fixture
             autodiff_structured_f64_fixture.program.json
@@ -632,7 +676,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredF64AutodiffFixture
             structured_f64_autodiff_manifest
             structured_f64_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-aggregate-autodiff
             autodiff_structured_aggregate_fixture
             autodiff_structured_aggregate_fixture.program.json
@@ -640,7 +684,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredAggregateAutodiffFixture
             structured_aggregate_autodiff_manifest
             structured_aggregate_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-storage-autodiff
             autodiff_structured_storage_fixture
             autodiff_structured_storage_fixture.program.json
@@ -648,7 +692,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAutodiffFixture
             structured_storage_autodiff_manifest
             structured_storage_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-storage-aggregate-autodiff
             autodiff_structured_storage_aggregate_fixture
             autodiff_structured_storage_aggregate_fixture.program.json
@@ -656,7 +700,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             structured_storage_aggregate_autodiff_manifest
             structured_storage_aggregate_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             structured-storage-workgroup-autodiff
             autodiff_structured_storage_workgroup_fixture
             autodiff_structured_storage_workgroup_fixture.program.json
@@ -664,7 +708,7 @@ if(TARGET VernonRuntime)
             vernonRegisterStructuredStorageWorkgroupAutodiffFixture
             structured_storage_workgroup_autodiff_manifest
             structured_storage_workgroup_autodiff_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-signed-stride
             autodiff_dynamic_v2_signed_stride_fixture
             autodiff_dynamic_v2_signed_stride_fixture.program.json
@@ -672,7 +716,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2SignedStrideFixture
             dynamic_v2_signed_stride_manifest
             dynamic_v2_signed_stride_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-field-path
             autodiff_dynamic_v2_field_path_fixture
             autodiff_dynamic_v2_field_path_fixture.program.json
@@ -680,7 +724,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2FieldPathFixture
             dynamic_v2_field_path_manifest
             dynamic_v2_field_path_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-strided-scatter
             autodiff_dynamic_v2_strided_scatter_fixture
             autodiff_dynamic_v2_strided_scatter_fixture.program.json
@@ -688,7 +732,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2StridedScatterFixture
             dynamic_v2_strided_scatter_manifest
             dynamic_v2_strided_scatter_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-gather
             autodiff_dynamic_v2_gather_fixture
             autodiff_dynamic_v2_gather_fixture.program.json
@@ -696,7 +740,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2GatherFixture
             dynamic_v2_gather_manifest
             dynamic_v2_gather_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-multi-output
             autodiff_dynamic_v2_multi_output_fixture
             autodiff_dynamic_v2_multi_output_fixture.program.json
@@ -704,7 +748,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2MultiOutputFixture
             dynamic_v2_multi_output_manifest
             dynamic_v2_multi_output_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-partially-dynamic
             autodiff_dynamic_v2_partially_dynamic_fixture
             autodiff_dynamic_v2_partially_dynamic_fixture.program.json
@@ -712,7 +756,7 @@ if(TARGET VernonRuntime)
             vernonRegisterDynamicV2PartiallyDynamicFixture
             dynamic_v2_partially_dynamic_manifest
             dynamic_v2_partially_dynamic_fixture_target)
-        vernon_add_cpu_autodiff_fixture(
+        vernon_add_cpu_program_fixture(
             dynamic-v2-mixed-alias
             autodiff_dynamic_v2_mixed_alias_fixture
             autodiff_dynamic_v2_mixed_alias_fixture.program.json
@@ -1044,11 +1088,6 @@ if(TARGET VernonRuntime)
                 "${VERNON_REPOSITORY_ROOT}/python" "${VERNON_TEST_ROOT}/fixtures")
     endif()
 
-    target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cuda_pipeline_test.cpp)
-    if(VERNON_ENABLE_CUDA_RUNTIME)
-        target_sources(VernonRuntimeTests PRIVATE runtime/runtime_cuda_test.cpp)
-    endif()
-
     if(VERNON_ENABLE_VULKAN_RUNTIME AND TARGET VernonDSLCompiler)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_test.cpp)
         target_link_libraries(VernonRuntimeTests PRIVATE VernonDSLCompiler)
@@ -1214,9 +1253,68 @@ if(TARGET VernonRuntime)
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:opengl_runtime_acceptance_asset"
             opengl_runtime_acceptance_bundle
             opengl_runtime_acceptance_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-matrix-uniform
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:matrix_asset"
+            opengl_matrix_uniform_bundle
+            opengl_matrix_uniform_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengles-matrix-uniform
+            opengles
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:matrix_asset"
+            opengles_matrix_uniform_bundle
+            opengles_matrix_uniform_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-signed-uniform
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:signed_uniform_asset"
+            opengl_signed_uniform_bundle
+            opengl_signed_uniform_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-unsigned-uniform
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:unsigned_uniform_asset"
+            opengl_unsigned_uniform_bundle
+            opengl_unsigned_uniform_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-explicit-sampler
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:explicit_sampler_asset"
+            opengl_explicit_sampler_bundle
+            opengl_explicit_sampler_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-indexed-vertex
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:indexed_asset"
+            opengl_indexed_vertex_bundle
+            opengl_indexed_vertex_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-storage-image
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:storage_image_asset"
+            opengl_storage_image_bundle
+            opengl_storage_image_manifest)
         target_compile_definitions(
-            VernonRuntimeTests PRIVATE VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE="${opengl_runtime_acceptance_manifest}")
-        add_dependencies(VernonRuntimeTests vernon-opengl-runtime-acceptance-test-bundle)
+            VernonRuntimeTests
+            PRIVATE VERNON_OPENGL_RUNTIME_ACCEPTANCE_BUNDLE="${opengl_runtime_acceptance_manifest}"
+                    VERNON_OPENGL_MATRIX_UNIFORM_BUNDLE="${opengl_matrix_uniform_manifest}"
+                    VERNON_OPENGLES_MATRIX_UNIFORM_BUNDLE="${opengles_matrix_uniform_manifest}"
+                    VERNON_OPENGL_SIGNED_UNIFORM_BUNDLE="${opengl_signed_uniform_manifest}"
+                    VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE="${opengl_unsigned_uniform_manifest}"
+                    VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE="${opengl_explicit_sampler_manifest}"
+                    VERNON_OPENGL_INDEXED_VERTEX_BUNDLE="${opengl_indexed_vertex_manifest}"
+                    VERNON_OPENGL_STORAGE_IMAGE_BUNDLE="${opengl_storage_image_manifest}")
+        add_dependencies(
+            VernonRuntimeTests
+            vernon-opengl-runtime-acceptance-test-bundle
+            vernon-opengl-matrix-uniform-test-bundle
+            vernon-opengles-matrix-uniform-test-bundle
+            vernon-opengl-signed-uniform-test-bundle
+            vernon-opengl-unsigned-uniform-test-bundle
+            vernon-opengl-explicit-sampler-test-bundle
+            vernon-opengl-indexed-vertex-test-bundle
+            vernon-opengl-storage-image-test-bundle)
     endif()
 
     vernon_discover_gtests(VernonRuntimeTests)

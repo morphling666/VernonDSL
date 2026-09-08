@@ -105,6 +105,7 @@ bool materializeComputeEndpoint(const nlohmann::json &root, const std::string &e
                 if (!parseArtifactValueLayout(argument["value_layout"], layout, error))
                     return false;
                 parameter.valueLayout = std::move(layout);
+                parameter.tensorArgument = TensorRepresentation::WholeValue;
             } else {
                 error = "compute value reflection has no canonical layout";
                 return false;
@@ -166,11 +167,15 @@ bool materializeComputeEndpoint(const nlohmann::json &root, const std::string &e
         use.dtype = argument.value("dtype", std::string());
         use.shape = parameter.shape;
         use.transport = transport;
+        use.tensorPacking =
+            argument.contains("value_layout") ? TensorRepresentation::WholeValue : TensorRepresentation::ElementStream;
         if (argument.contains("value_layout")) {
             ValueLayout layout;
             if (!parseArtifactValueLayout(argument["value_layout"], layout, error))
                 return false;
             use.valueLayout = std::move(layout);
+        } else if (parameter.kind == "tensor") {
+            use.valueLayout = parameter.elementLayout;
         }
         if (argument.contains("tensor_view_descriptor")) {
             const auto &descriptor = argument["tensor_view_descriptor"];
@@ -230,22 +235,6 @@ bool materializeComputeEndpoint(const nlohmann::json &root, const std::string &e
 }
 
 } // namespace
-
-bool buildReflectedComputeStageBindingPlan(const LoadedStageArtifact &stage, VernonRuntimeBackend backend,
-                                           StageBindingPlan &stagePlan, std::string &error) {
-    const nlohmann::json reflection = nlohmann::json::parse(stage.reflection, nullptr, false);
-    if (reflection.is_discarded()) {
-        error = "compute artifact reflection is invalid JSON";
-        return false;
-    }
-    ReflectedEntry entry;
-    return materializeComputeEndpoint(reflection, stage.entry, stagePlan, entry, backend, error);
-}
-
-bool isDirectStagePipelinePlan(const StageBindingPlan &stagePlan) {
-    return stagePlan.artifactKeys.size() == 1 && !stagePlan.compute.empty() &&
-           stagePlan.artifactKeys.find("compute") != stagePlan.artifactKeys.end();
-}
 
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint) {
     return registerStaticCpuEntry(symbol, entryPoint);

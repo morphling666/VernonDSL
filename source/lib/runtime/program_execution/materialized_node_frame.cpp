@@ -3,7 +3,7 @@
 #include "physical_buffer_view.h"
 #include "program_tensor_copy.h"
 #include "runtime/runtime_dispatch.h"
-#include "runtime/runtime_state.h"
+#include "runtime/shape_layout.h"
 #include "runtime/tensor_bridge.h"
 
 #include <algorithm>
@@ -112,7 +112,10 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         const program::Value &programValue = program.values[binding.value];
         const bool requiresHostProjection =
             std::any_of(parameter.uses.begin(), parameter.uses.end(), [](const ParameterUse &use) {
-                return !use.tensorViewDescriptor && (use.interfaceKind == "value" || use.interfaceKind == "result");
+                return !use.tensorViewDescriptor &&
+                       (use.interfaceKind == "uniform" || use.interfaceKind == "value" ||
+                        use.interfaceKind == "result" ||
+                        (use.interfacePlan && use.interfacePlan->kind == InterfacePlanKind::NativeUniform));
             });
         const VernonRuntimeProviderResourceReference *image =
             programValue.storage ? invocation.controlImage(*programValue.storage) : nullptr;
@@ -131,22 +134,66 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
         if (!source)
             return error = "resolved Program endpoint has no physical carrier", false;
         VernonProgramArgument materialized = *source;
+        if (materialized.kind == VERNON_PROGRAM_TENSOR && programValue.canonicalType.rankedValue &&
+            binding.value < invocation.values().size()) {
+            const ProgramValueState &value = invocation.values()[binding.value];
+            if (value.boundTensorLayout && value.boundTensorLayout->shape == programValue.canonicalType.innerShape &&
+                value.boundTensorLayout->byteStrides.size() == value.boundTensorLayout->shape.size()) {
+                materialized.tensor.rank = static_cast<uint32_t>(value.boundTensorLayout->shape.size());
+                materialized.tensor.shape = value.boundTensorLayout->shape.data();
+                materialized.tensor.byte_strides = value.boundTensorLayout->byteStrides.data();
+            }
+        }
+        std::vector<uint64_t> suppliedShape;
+        std::vector<int64_t> suppliedStrides;
+        if (materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.rank && materialized.tensor.shape &&
+            materialized.tensor.byte_strides) {
+            suppliedShape.assign(materialized.tensor.shape, materialized.tensor.shape + materialized.tensor.rank);
+            suppliedStrides.assign(materialized.tensor.byte_strides,
+                                   materialized.tensor.byte_strides + materialized.tensor.rank);
+        }
         materialized.slot = parameter.slot;
         if (requiresHostProjection && materialized.kind == VERNON_PROGRAM_TENSOR &&
             materialized.tensor.storage == VERNON_TENSOR_RHI_RESOURCE)
             return error = "resolved Program host endpoint requires a planned "
                            "transfer before materialization",
                    false;
+        const ValueLayout *targetTensorLayout = nullptr;
         if (materialized.kind == VERNON_PROGRAM_TENSOR) {
             materialized.tensor.access = valueAccess(binding.target.access);
-            materialized.tensor.element_layout = pipelineValueLayout(binding.target.elementLayout);
+            targetTensorLayout = &parameter.elementLayout;
+            if (parameter.tensorArgument == TensorRepresentation::WholeValue) {
+                if (!parameter.valueLayout)
+                    return error = "whole-value endpoint has no canonical Value layout", false;
+                targetTensorLayout = &*parameter.valueLayout;
+                materialized.tensor.rank = 0;
+                materialized.tensor.shape = nullptr;
+                materialized.tensor.byte_strides = nullptr;
+            }
+            if (!binding.target.endpointProjection)
+                materialized.tensor.element_layout = pipelineValueLayout(*targetTensorLayout);
+            if (parameter.tensorArgument == TensorRepresentation::ElementStream &&
+                programValue.canonicalType.rankedValue && suppliedShape.empty()) {
+                suppliedShape = programValue.canonicalType.innerShape;
+                if (!shape::rowMajorByteStrides(suppliedShape, targetTensorLayout->byteSize, suppliedStrides))
+                    return error = "ranked Program Value byte strides overflow", false;
+                materialized.tensor.rank = static_cast<uint32_t>(suppliedShape.size());
+                materialized.tensor.shape = suppliedShape.data();
+                materialized.tensor.byte_strides = suppliedStrides.data();
+            }
         }
 
         output.shapes.emplace_back();
         output.strides.emplace_back();
         if (materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.rank) {
             const shape::DeclaredShape declared = shape::decodeRuntimeContractShape(programValue.shape);
-            if (binding.value < invocation.values().size() && invocation.values()[binding.value].concreteShape) {
+            const bool suppliedRankedValue = programValue.shape.empty() && programValue.canonicalType.rankedValue &&
+                                             suppliedShape == programValue.canonicalType.innerShape &&
+                                             suppliedStrides.size() == suppliedShape.size();
+            if (suppliedRankedValue) {
+                output.shapes.back() = suppliedShape;
+                output.strides.back() = suppliedStrides;
+            } else if (binding.value < invocation.values().size() && invocation.values()[binding.value].concreteShape) {
                 output.shapes.back() = *invocation.values()[binding.value].concreteShape;
                 output.strides.back() = invocation.values()[binding.value].strides;
             } else if (!shape::isConcrete(declared)) {
@@ -261,8 +308,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 return false;
             materialized.tensor.byte_offset = 0;
             materialized.tensor.byte_size = byteSize;
+            materialized.tensor.element_layout = pipelineValueLayout(*targetTensorLayout);
             materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
-            const bool reads = materialized.tensor.access != VERNON_ACCESS_WRITE;
             const bool writes = materialized.tensor.access != VERNON_ACCESS_READ;
             if (!elements) {
                 // Empty domains retain canonical identity and have no carrier.
@@ -272,9 +319,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 const auto *canonicalBytes = static_cast<const uint8_t *>(canonical.host_data);
                 auto *carrierBytes = output.hostEndpointCarriers.back().data();
                 for (const ProgramTensorCopyRegion &region : regions) {
-                    if (reads)
-                        output.copiesBefore.push_back(
-                            {canonicalBytes, carrierBytes, region.sourceOffset, region.destinationOffset, region.size});
+                    output.copiesBefore.push_back(
+                        {canonicalBytes, carrierBytes, region.sourceOffset, region.destinationOffset, region.size});
                     if (writes)
                         output.copiesAfter.push_back({carrierBytes, const_cast<uint8_t *>(canonicalBytes),
                                                       region.destinationOffset, region.sourceOffset, region.size});
@@ -291,9 +337,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                     size_t canonicalOffset = 0;
                     if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
                         return error = "logical endpoint resource offset exceeds the host address space", false;
-                    if (reads)
-                        output.deviceCopiesBefore.push_back({canonicalBuffer, carrier->handle(), canonicalOffset,
-                                                             region.destinationOffset, region.size});
+                    output.deviceCopiesBefore.push_back(
+                        {canonicalBuffer, carrier->handle(), canonicalOffset, region.destinationOffset, region.size});
                     if (writes)
                         output.deviceCopiesAfter.push_back({carrier->handle(), canonicalBuffer,
                                                             region.destinationOffset, canonicalOffset, region.size});
@@ -308,8 +353,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 return error = "resolved endpoint leaf exceeds canonical Value ABI", false;
             const ValueLayout valueLayout = program::materializeValueLayout(*slot.layout, slot.type);
             const ValueLeaf &leaf = valueLayout.leaves[*binding.logicalLeaf];
-            const ValueLayout &parameterLayout =
-                parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+            const ValueLayout &parameterLayout = *targetTensorLayout;
             materialized.tensor.byte_offset += leaf.byteOffset;
             materialized.tensor.element_layout = pipelineValueLayout(parameterLayout);
             const auto projectionShape = logicalProjectionShape(parameter, &binding.target);
@@ -323,6 +367,11 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 !shape::materializeCompactProjection(output.shapes.back(), *projectionShape, parameterLayout.byteSize,
                                                      compactShape, compactStrides))
                 return error = "aggregate leaf has an incompatible physical shape", false;
+            if (slot.shape.empty() && valueLayout.leaves.size() == 1 && leaf.byteOffset == 0 &&
+                suppliedShape == projectedShape && suppliedStrides.size() == projectedShape.size()) {
+                projectedStrides = suppliedStrides;
+                compactStrides = suppliedStrides;
+            }
             if (projectedShape != compactShape || projectedStrides != compactStrides) {
                 size_t elements = 0;
                 if (!shape::checkedElementCount(compactShape, elements) ||
@@ -343,7 +392,6 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
                 materialized.tensor.byte_strides =
                     output.strides.back().empty() ? nullptr : output.strides.back().data();
-                const bool reads = materialized.tensor.access != VERNON_ACCESS_WRITE;
                 const bool writes = materialized.tensor.access != VERNON_ACCESS_READ;
                 std::vector<ProgramTensorCopyRegion> regions;
                 if (canonical.storage == VERNON_TENSOR_HOST) {
@@ -355,9 +403,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                     const auto *canonicalBytes = static_cast<const uint8_t *>(canonical.host_data);
                     auto *compactBytes = output.hostEndpointCarriers.back().data();
                     for (const ProgramTensorCopyRegion &region : regions) {
-                        if (reads)
-                            output.copiesBefore.push_back({canonicalBytes, compactBytes, region.sourceOffset,
-                                                           region.destinationOffset, region.size});
+                        output.copiesBefore.push_back(
+                            {canonicalBytes, compactBytes, region.sourceOffset, region.destinationOffset, region.size});
                         if (writes)
                             output.copiesAfter.push_back({compactBytes, const_cast<uint8_t *>(canonicalBytes),
                                                           region.destinationOffset, region.sourceOffset, region.size});
@@ -380,9 +427,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                         size_t canonicalOffset = 0;
                         if (!checkedDeviceBufferOffset(canonical.resource.offset, region.sourceOffset, canonicalOffset))
                             return error = "aggregate leaf resource offset exceeds the host address space", false;
-                        if (reads)
-                            output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(), canonicalOffset,
-                                                                 region.destinationOffset, region.size});
+                        output.deviceCopiesBefore.push_back({canonicalBuffer, storage->handle(), canonicalOffset,
+                                                             region.destinationOffset, region.size});
                         if (writes)
                             output.deviceCopiesAfter.push_back({storage->handle(), canonicalBuffer,
                                                                 region.destinationOffset, canonicalOffset,

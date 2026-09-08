@@ -237,7 +237,7 @@ TEST(CompilerProgramTapePlanner, ProducerAndConsumerComeFromCanonicalGraphs) {
     llvm::json::Value values = parse(R"([
       {
         "id": 4,
-        "type": "!vernon.ad_tape<16>",
+        "type": "opaque<vernon.ad_tape>",
         "origin": {"tag": "node_result", "graph": "forward", "node": 0}
       }
     ])");

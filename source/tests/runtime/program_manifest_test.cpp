@@ -15,6 +15,30 @@
 
 namespace {
 
+TEST(ProgramSemanticType, StrictCanonicalRoundTripAndClassification) {
+    using namespace vernon::program;
+    for (const ScalarDescriptor &scalar : programScalarDescriptors) {
+        std::optional<SemanticType> parsed = parseSemanticType(scalar.spelling);
+        ASSERT_TRUE(parsed) << scalar.spelling;
+        EXPECT_EQ(serializeSemanticType(*parsed), scalar.spelling);
+    }
+    for (std::string_view spelling :
+         {"tensor<3xu32>", "tensor<2x3xf16>", "tensor<?x3xf16>", "tensor_view<f32>", "tensor_view<?x4xf32>",
+          "tuple<bool,tensor<3xi32>>", "struct<position:tensor<3xf32>,index:u32>", "image<rgba16_float>", "sampler",
+          "opaque<vernon.ad_tape>"}) {
+        std::optional<SemanticType> parsed = parseSemanticType(spelling);
+        ASSERT_TRUE(parsed) << spelling;
+        EXPECT_EQ(serializeSemanticType(*parsed), spelling);
+    }
+    ASSERT_TRUE(parseSemanticType("tensor_view<?x4xf32>")->isTensorView());
+    ASSERT_TRUE(parseSemanticType("image<rgba8_unorm>")->isImage());
+    ASSERT_TRUE(parseSemanticType("sampler")->isSampler());
+    for (std::string_view rejected :
+         {"bf16", "f8E4M3FN", "tensor<3xi32,>", "tensor<03xi32>", "tensor<0xi32>", "tensor<3xi32> ", "tensor<3xsi32>",
+          "!vernon.tensor<i32, [3]>", "struct<x:i32,x:u32>"})
+        EXPECT_FALSE(parseSemanticType(rejected)) << rejected;
+}
+
 VernonProgramArgument hostTensor(void *data, size_t size) {
     VernonProgramArgument argument{};
     argument.kind = VERNON_PROGRAM_TENSOR;
@@ -337,7 +361,11 @@ TEST(ProgramTargetBinding, PreservesCanonicalNumericShapeAcrossComputeAndGraphic
     binding.name = "view_projection";
     binding.kind = "tensor";
     binding.access = "read";
-    binding.valueType = CanonicalValueType{"f32", {2, 3}, true};
+    binding.valueType.emplace();
+    binding.valueType->semantic = *vernon::program::parseSemanticType("tensor<2x3xf32>");
+    binding.valueType->dtype = "f32";
+    binding.valueType->innerShape = {2, 3};
+    binding.valueType->rankedValue = true;
     binding.wholeValueLayout = matrixLayout;
     binding.elementLayout = matrixLayout;
     binding.transport = TargetPhysicalTransport{nativeUniform, {0, 4, UINT32_MAX}};
@@ -416,7 +444,11 @@ TEST(ProgramTargetBinding, PreservesCompilerSelectedBufferCarrierForLargeMatrice
     binding.name = "large_matrix";
     binding.kind = "tensor";
     binding.access = "read";
-    binding.valueType = CanonicalValueType{"f32", {10, 10}, true};
+    binding.valueType.emplace();
+    binding.valueType->semantic = *vernon::program::parseSemanticType("tensor<10x10xf32>");
+    binding.valueType->dtype = "f32";
+    binding.valueType->innerShape = {10, 10};
+    binding.valueType->rankedValue = true;
     binding.wholeValueLayout = layout;
     binding.elementLayout = layout;
     binding.transport = TargetPhysicalTransport{buffer, {0, 0, UINT32_MAX}};
@@ -647,6 +679,16 @@ TEST(ProgramExecutionManifest, ResolvesCanonicalComputePrograms) {
     EXPECT_EQ(program.values[0].canonicalType.innerShape, std::vector<uint64_t>({256}));
     EXPECT_FALSE(program.values[2].canonicalType.rankedValue);
     EXPECT_EQ(program.values[2].canonicalType.dtype, "u32");
+    for (const auto &[semanticType, layoutDtype] :
+         {std::pair<const char *, const char *>{"tensor<256xu32>", "f32"}, {"tensor<256xi32>", "u32"}}) {
+        nlohmann::json rejected = manifest;
+        rejected["values"][0]["type"] = semanticType;
+        rejected["values"][0]["value_layout"]["leaves"][0]["dtype"] = layoutDtype;
+        vernon::runtime::program::Program rejectedProgram;
+        EXPECT_FALSE(vernon::runtime::program::parse(rejected, rejectedProgram, diagnostic));
+        EXPECT_EQ(diagnostic.code, "PROGRAM_LAYOUT_HASH") << diagnostic.message;
+        EXPECT_NE(diagnostic.path.find("/dtype"), std::string::npos) << diagnostic.path;
+    }
     for (const char *retiredSource : {"parameter", "capture"}) {
         nlohmann::json rejected = manifest;
         rejected["graphs"][0]["nodes"][0]["operation"]["workgroups"][0]["control"] = {{retiredSource, 0}};

@@ -380,6 +380,9 @@ void rebuildStageBindingLayoutViews(StageBindingPlan &plan) {
         if (parameter.valueLayout)
             rebuildValueLayoutPathViews(*parameter.valueLayout);
         rebuildValueLayoutPathViews(parameter.elementLayout);
+        for (ParameterUse &use : parameter.uses)
+            if (use.valueLayout)
+                rebuildValueLayoutPathViews(*use.valueLayout);
     };
     for (Parameter &parameter : plan.parameters)
         rebuild(parameter);
@@ -428,12 +431,22 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
             error = "Stage parameter image constraint invariant failed";
             return false;
         }
-        for (const ParameterUse &use : parameter.uses)
-            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value") &&
-                !use.interfacePlan) {
-                error = "packed Tensor value is missing its typed interface plan";
-                return false;
+        if (parameter.tensorArgument == TensorRepresentation::WholeValue && !parameter.valueLayout) {
+            error = "whole-value Tensor argument has no canonical Value layout";
+            return false;
+        }
+        for (const ParameterUse &use : parameter.uses) {
+            if (parameter.kind == "tensor" && (use.interfaceKind == "uniform" || use.interfaceKind == "value")) {
+                if (!use.interfacePlan) {
+                    error = "packed Tensor value is missing its typed interface plan";
+                    return false;
+                }
+                if (!use.valueLayout) {
+                    error = "packed Tensor value is missing its canonical layout";
+                    return false;
+                }
             }
+        }
     }
     for (const Parameter &parameter : plan.runtimeParameters) {
         const bool implicitSampler =
@@ -479,11 +492,13 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
                 error = "descriptor-backed Stage parameter is missing set/binding";
                 return false;
             }
-            if (use.binding != UINT32_MAX && parameter.kind != "sampler") {
+            if (descriptorRequired && parameter.kind != "sampler") {
                 BindingKey key{use.stage, use.descriptorSet, use.binding};
                 const auto [found, inserted] = descriptorOwners.emplace(key, std::pair{parameter.name, parameter.kind});
                 if (!inserted && found->second.first != parameter.name) {
-                    error = "Stage descriptor binding is assigned to multiple parameters";
+                    error = "Stage descriptor " + use.stage + " set " + std::to_string(use.descriptorSet) +
+                            " binding " + std::to_string(use.binding) + " is assigned to both '" + found->second.first +
+                            "' and '" + parameter.name + "'";
                     return false;
                 }
                 if (parameter.kind == "image")

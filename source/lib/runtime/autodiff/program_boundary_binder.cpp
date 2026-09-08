@@ -203,7 +203,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
         }
         const auto staged = stagedOwners.find(ownerKey);
         if (staged != stagedOwners.end()) {
-            if (boundary.role == program::BoundaryRole::Input && boundary.access != program::BoundaryAccess::Write) {
+            if (boundary.role == program::BoundaryRole::Input) {
                 if (owner.kind != program::ProgramOwnerKind::Storage) {
                     error = "staged Program input requires Storage data";
                     return false;
@@ -211,7 +211,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
                     ProgramStorageBacking &backing = backings[owner.id];
                     backing.initial = *supplied->second;
-                    backing.bytes = supplied->second->tensor.byte_size;
+                    backing.bytes = std::max(backing.bytes, supplied->second->tensor.byte_size);
                     backing.sized = true;
                 } else if (supplied->second->kind != VERNON_PROGRAM_IMAGE) {
                     error = "staged Program input has an unsupported Storage resource";

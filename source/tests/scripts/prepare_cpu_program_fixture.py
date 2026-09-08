@@ -20,11 +20,11 @@ def main() -> int:
     variants = document.get("variants")
     blobs = document.get("blobs")
     if document.get("type") != "program" or not isinstance(variants, list) or len(variants) != 1:
-        raise ValueError("cooked Program fixture must contain exactly one variant")
+        raise ValueError("cooked CPU Program fixture must contain exactly one variant")
     artifact_system = variants[0].get("artifact_system")
     records = artifact_system.get("artifacts") if isinstance(artifact_system, dict) else None
     if not isinstance(blobs, dict) or not isinstance(records, dict):
-        raise ValueError("cooked Program fixture has no canonical artifact system")
+        raise ValueError("cooked CPU Program fixture has no canonical artifact system")
     digests = {
         module["blob"]
         for record in records.values()
@@ -37,8 +37,8 @@ def main() -> int:
         if digest in blobs and blobs[digest].get("location", {}).get("tag") == "external"
     )
     if not artifacts:
-        raise ValueError("cooked autodiff fixture contains no relocatable objects")
-    artifact_archive = output / "autodiff_artifacts.a"
+        raise ValueError("cooked CPU Program fixture contains no relocatable objects")
+    artifact_archive = output / "program_artifacts.a"
     artifact_archive.unlink(missing_ok=True)
     subprocess.run(
         [
@@ -52,12 +52,12 @@ def main() -> int:
 
     registration_sources = sorted(output.glob("vernon_cpu_registration_*.c"))
     if len(registration_sources) != 1:
-        raise ValueError("cooked autodiff fixture must contain exactly one CPU registration source")
+        raise ValueError("cooked CPU Program fixture must contain exactly one CPU registration source")
     registration_source = registration_sources[0]
     identity_suffix = registration_source.stem.removeprefix("vernon_cpu_registration_")
     registration_function = f"vernonRegisterCpuArtifacts_{identity_suffix}"
-    shutil.copyfile(registration_source, output / "autodiff_registration.c")
-    (output / "autodiff_registration_wrapper.c").write_text(
+    shutil.copyfile(registration_source, output / "program_registration.c")
+    (output / "program_registration_wrapper.c").write_text(
         "\n".join(
             [
                 '#include "VernonRuntime.h"',

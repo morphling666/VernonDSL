@@ -273,7 +273,7 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
     invocation.arguments = arguments.data();
     invocation.argument_count = arguments.size();
     invocation.compute_grid = grid;
-    return vernonRuntimeStageEncode(provider, &pipeline, &invocation);
+    return encodeResolvedStage(provider, &pipeline, &invocation);
 }
 
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
@@ -378,21 +378,6 @@ VernonStatus buildBufferTransferCommandPlan(VernonRuntimeContext &context, const
     return buildDeviceTransferCommandPlan(context, copies, {}, uploads, plan);
 }
 
-VernonStatus buildBufferUploadCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferUpload> &uploads,
-                                          execution::detail::RhiCommandExecutionPlan &plan) {
-    return buildBufferTransferCommandPlan(context, {}, uploads, plan);
-}
-
-VernonStatus executePipelineCommandDagAndWait(VernonStageExecutable &pipeline, VernonLaunchSize grid,
-                                              std::vector<VernonProgramArgument> &arguments,
-                                              const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                              execution::detail::CommandNodeKind kind,
-                                              ExecutionControlPlaneUsage *telemetry,
-                                              execution::detail::RhiCommandPlanSink *sink) {
-    return executePipelineCommandDagAndWait(*pipeline.context, {}, uploadsBefore, pipeline, arguments, grid, {}, kind,
-                                            telemetry, sink);
-}
-
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
                                       VernonStageExecutable &pipeline,
@@ -459,51 +444,6 @@ VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::
     if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
         return fail(context, std::move(error));
     return VERNON_STATUS_OK;
-}
-
-VernonStatus
-executePipelineCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                 const std::vector<DeviceBufferUpload> &uploadsBefore, VernonStageExecutable &pipeline,
-                                 std::vector<VernonProgramArgument> &arguments, VernonLaunchSize grid,
-                                 const std::vector<DeviceBufferCopy> &copiesAfter,
-                                 execution::detail::CommandNodeKind kind, ExecutionControlPlaneUsage *telemetry,
-                                 execution::detail::RhiCommandPlanSink *sink) {
-    if (injectFailure(FailureBoundary::Submission))
-        return fail(context, "injected GPU pipeline submission failure", VERNON_STATUS_INTERNAL_ERROR);
-    execution::detail::RhiCommandExecutionPlan plan;
-    if (const VernonStatus status = buildPipelineCommandPlan(context, copiesBefore, uploadsBefore, pipeline, arguments,
-                                                             grid, copiesAfter, kind, plan);
-        status != VERNON_STATUS_OK)
-        return status;
-    return executeCommandPlanAndWait(context, plan, telemetry, sink);
-}
-
-VernonStatus
-executePipelineStatusCommandDagAndWait(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
-                                       VernonStageExecutable &pipeline, std::vector<VernonProgramArgument> &arguments,
-                                       VernonLaunchSize grid, const std::vector<DeviceBufferUpload> &uploadsBefore,
-                                       VernonRhiBuffer statusBuffer, size_t statusOffset, size_t statusSize,
-                                       GpuCommandCompletionCallback complete, void *completionContext,
-                                       execution::detail::CommandNodeKind kind, ExecutionControlPlaneUsage *telemetry,
-                                       execution::detail::RhiCommandPlanSink *sink) {
-    if (!complete || !statusSize)
-        return fail(context, "GPU command DAG status callback is invalid");
-    if (injectFailure(FailureBoundary::Submission))
-        return fail(context, "injected GPU pipeline submission failure", VERNON_STATUS_INTERNAL_ERROR);
-    execution::detail::RhiCommandExecutionPlan plan;
-    if (const VernonStatus status =
-            buildPipelineCommandPlan(context, copiesBefore, uploadsBefore, pipeline, arguments, grid, {}, kind, plan);
-        status != VERNON_STATUS_OK)
-        return status;
-    execution::detail::CommandNode status;
-    status.kind = execution::detail::CommandNodeKind::Status;
-    status.queue = execution::detail::CommandQueueClass::Ordered;
-    status.predecessors.push_back(static_cast<uint32_t>(plan.commands.nodes.size() - 1));
-    status.accesses.push_back(bufferAccess(statusBuffer, statusOffset, statusSize, execution::AccessMode::Read));
-    plan.commands.nodes.push_back(std::move(status));
-    plan.encoders.push_back({nullptr, completionContext, complete});
-    execution::detail::appendRhiBufferBinding(plan.bindings, statusBuffer);
-    return executeCommandPlanAndWait(context, plan, telemetry, sink, true);
 }
 
 } // namespace vernon::runtime::program_execution

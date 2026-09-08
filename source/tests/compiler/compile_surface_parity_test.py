@@ -381,7 +381,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertIn("artifacts", selected["artifact_system"])
                 _assert_content_hash(self, cooked)
 
-    def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
+    def test_cpu_compiled_program_and_kernel_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)
         frontend = scale._lower().frontend
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
@@ -392,15 +392,6 @@ class CompileSurfaceParityTests(unittest.TestCase):
         self.assertTrue(program.has_cpu_entry("scale"))
 
         vd.init(arch=vd.cpu)
-        direct_runtime = native.Runtime(native.RuntimeBackend.CPU)
-        direct_kernel = direct_runtime.load_cpu_entry(program, "scale")
-        direct_values = vd.storage.from_numpy(source)
-        direct_builder = direct_kernel.invocation_builder()
-        direct_builder.host_tensor(direct_kernel.parameters[0].name, direct_values._native_host_array())
-        direct_builder.host_tensor(direct_kernel.parameters[1].name, np.asarray(np.float32(2.5)))
-        direct_builder.grid(4, 1, 1).submit().wait()
-        direct_result = direct_values.to_numpy()
-
         runtime_module.Kernel.clear_cache()
         scale.compile_count = 0
         first = vd.storage.from_numpy(source)
@@ -410,9 +401,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
         ):
             scale(first, 2.5, grid=(4, 1, 1))
             scale(second, 2.5, grid=(4, 1, 1))
-        np.testing.assert_array_equal(first.to_numpy(), direct_result)
-        np.testing.assert_array_equal(second.to_numpy(), direct_result)
-        np.testing.assert_array_equal(direct_result, source * np.float32(2.5))
+        expected = source * np.float32(2.5)
+        np.testing.assert_array_equal(first.to_numpy(), expected)
+        np.testing.assert_array_equal(second.to_numpy(), expected)
         self.assertEqual(scale.compile_count, 1)
 
 

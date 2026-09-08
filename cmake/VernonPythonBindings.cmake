@@ -54,7 +54,6 @@ function(vernon_add_python_bindings package_directory source_directory)
     target_sources(VernonDSLCompiler PRIVATE "${source_directory}/lib/compiler/compiler_python_bridge.cpp")
     nanobind_add_module(
         vernon-dsl-native
-        "${source_directory}/python/native_command_retention.cpp"
         "${source_directory}/python/native_compiler.cpp"
         "${source_directory}/python/native_module.cpp"
         "${source_directory}/python/native_program.cpp"
@@ -62,12 +61,7 @@ function(vernon_add_python_bindings package_directory source_directory)
         "${source_directory}/python/native_rhi.cpp"
         "${source_directory}/python/native_runtime.cpp")
     _vernon_set_python_module_output(vernon-dsl-native "${package_directory}")
-    target_link_libraries(
-        vernon-dsl-native
-        PRIVATE VernonDSLCompiler
-                Vernon::Runtime
-                Vernon::RHI
-                Vernon::ExecutionGraph)
+    target_link_libraries(vernon-dsl-native PRIVATE VernonDSLCompiler Vernon::Runtime Vernon::RHI)
     target_include_directories(vernon-dsl-native PRIVATE "${source_directory}/lib/compiler" "${source_directory}/lib")
     if(MSVC)
         target_compile_options(vernon-dsl-native PRIVATE /EHsc)

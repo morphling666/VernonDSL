@@ -256,8 +256,9 @@ VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
 bool drawInvocationIsValid(const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
                            const VernonRuntimeCoreDrawInvocation *invocation) {
     if (!pipeline || pipeline->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || !invocation ||
-        invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) || invocation->vertex_count == 0 ||
-        invocation->instance_count == 0 || (bindings && bindings->pipeline != pipeline) ||
+        invocation->struct_size < sizeof(VernonRuntimeCoreDrawInvocation) ||
+        (invocation->vertex_count == 0 && invocation->index_count == 0) || invocation->instance_count == 0 ||
+        (bindings && bindings->pipeline != pipeline) ||
         (invocation->color_attachment_count != 0 && !invocation->color_attachments) ||
         invocation->color_attachment_count > VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS ||
         ((invocation->index_count != 0) != (invocation->index_buffer.resource.value != 0)) ||

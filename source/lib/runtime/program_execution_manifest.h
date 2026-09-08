@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_MANIFEST_H
 
 #include "VernonProgramPlanTypes.h"
+#include "VernonProgramSemanticTypes.h"
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
@@ -205,7 +206,9 @@ struct Storage {
     StorageDescriptorKind descriptorKind{StorageDescriptorKind::Buffer};
     BufferDescriptor buffer;
     ImageDescriptor image;
+    std::string opaqueContract;
     std::string opaqueContractHash;
+    std::vector<std::string> opaqueUsage;
 };
 
 enum class OriginKind {
@@ -245,6 +248,7 @@ struct ValueLayout {
 };
 
 struct CanonicalValueType {
+    vernon::program::SemanticType semantic;
     std::string dtype;
     std::vector<uint64_t> innerShape;
     bool rankedValue{};
@@ -424,7 +428,9 @@ struct BoundaryStorage {
     StorageDescriptorKind descriptorKind{StorageDescriptorKind::Buffer};
     BufferDescriptor buffer;
     ImageDescriptor image;
+    std::string opaqueContract;
     std::string opaqueContractHash;
+    std::vector<std::string> opaqueUsage;
 };
 
 enum class ProgramOwnerKind {

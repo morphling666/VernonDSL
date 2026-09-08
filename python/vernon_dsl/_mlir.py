@@ -36,11 +36,15 @@ def first_generic_type_argument(spelling: str, constructor: str) -> str | None:
 
 
 def ranked_tensor_parts(spelling: str) -> tuple[tuple[str, ...], str] | None:
-    arguments = generic_type_arguments(spelling, "tensor")
+    return ranked_type_parts(spelling, "tensor")
+
+
+def ranked_type_parts(spelling: str, constructor: str) -> tuple[tuple[str, ...], str] | None:
+    arguments = generic_type_arguments(spelling, constructor)
     if arguments is None or len(arguments) != 1:
         return None
-    parts = arguments[0].split("x")
-    if len(parts) < 2 or not parts[-1]:
+    parts = split_top_level(arguments[0], "x")
+    if not parts or not parts[-1]:
         return None
     return tuple(parts[:-1]), parts[-1]
 
@@ -49,5 +53,6 @@ __all__ = [
     "first_generic_type_argument",
     "generic_type_arguments",
     "ranked_tensor_parts",
+    "ranked_type_parts",
     "split_top_level",
 ]

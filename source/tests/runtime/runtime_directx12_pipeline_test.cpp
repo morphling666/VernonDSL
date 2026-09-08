@@ -1,6 +1,4 @@
-#include "VernonCompiler.h"
 #include "VernonRuntime.h"
-#include "VernonVersions.h"
 #include "runtime/rhi_adapter/adapter_directx12_test_hooks.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
@@ -10,7 +8,6 @@
 #include <d3d12.h>
 
 #include <array>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -335,97 +332,6 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     vernonRuntimeProgramBundleDestroy(loaded);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
-}
-
-TEST(RuntimeDirectX12Pipeline, CompilesAndDispatchesComputeDxil) {
-    static constexpr char module[] = R"(
-module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
-  func.func @increment(
-      %values: !vernon.tensor_view<f32, [-1], "read_write", "device"> {
-        vernon.interface = "resource",
-        vernon.set = 0 : i64,
-        vernon.binding = 0 : i64
-      },
-      %id: index {
-        vernon.interface = "input",
-        vernon.builtin = "global_invocation_id"
-      }) attributes {
-        vernon.entry,
-        vernon.stage = "compute",
-        vernon.workgroup_size = array<i32: 8, 1, 1>
-      } {
-    %value = "vernon.load"(%values, %id) :
-      (!vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> f32
-    %one = arith.constant 1.0 : f32
-    %sum = arith.addf %value, %one : f32
-    "vernon.store"(%sum, %values, %id) :
-      (f32, !vernon.tensor_view<f32, [-1], "read_write", "device">, index) -> ()
-    return
-  }
-}
-)";
-    VernonCompilerContext *compiler = vernonCompilerCreate();
-    ASSERT_NE(compiler, nullptr);
-    VernonCompileResult *compiled =
-        vernonCompilerCompileMlir(compiler, module, std::strlen(module), VERNON_TARGET_DIRECTX);
-    ASSERT_NE(compiled, nullptr);
-    ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK) << std::string(
-        vernonCompileResultGetDiagnostics(compiled).data, vernonCompileResultGetDiagnostics(compiled).size);
-    ASSERT_EQ(vernonCompileResultGetArtifactCount(compiled), 1u);
-
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_DIRECTX12, nullptr, true);
-    VernonRuntimeContext *runtime = context.runtime;
-    ASSERT_NE(runtime, nullptr);
-    const VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
-    const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
-    ASSERT_GE(artifact.size, 4u);
-    ASSERT_EQ(std::memcmp(artifact.data, "DXBC", 4), 0)
-        << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[0])) << " "
-        << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[1])) << " "
-        << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[2])) << " "
-        << static_cast<unsigned>(static_cast<unsigned char>(artifact.data[3]));
-    VernonStageExecutable *pipeline = vernonRuntimeLoadArtifact(runtime, artifact.data, artifact.size, reflection.data,
-                                                                reflection.size, "increment", std::strlen("increment"));
-    ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
-                                                vernonRuntimeGetLastError(runtime).size);
-    std::array<float, 8> values{0, 1, 2, 3, 4, 5, 6, 7};
-    auto buffer =
-        vernon::tests::createBuffer(context, sizeof(values), alignof(float), VERNON_RHI_BUFFER_STORAGE, values.data());
-    ASSERT_NE(buffer.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    const uint64_t shape[]{8};
-    const int64_t strides[]{sizeof(float)};
-    VernonProgramArgument argument{};
-    argument.slot = 0;
-    argument.kind = VERNON_PROGRAM_TENSOR;
-    argument.tensor.struct_size = sizeof(VernonTensorView);
-    argument.tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
-    argument.tensor.resource = buffer.reference;
-    argument.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
-    argument.tensor.access = VERNON_ACCESS_READ_WRITE;
-    argument.tensor.rank = 1;
-    argument.tensor.shape = shape;
-    argument.tensor.byte_strides = strides;
-    argument.tensor.byte_size = sizeof(values);
-    VernonStageInvocationDescriptor invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PROGRAM_VERSION;
-    invocation.arguments = &argument;
-    invocation.argument_count = 1;
-    invocation.compute_grid = {8, 1, 1};
-    ASSERT_EQ(vernon::tests::completeSubmission(pipeline, &invocation), VERNON_STATUS_OK)
-        << std::string(vernonRuntimeGetLastError(runtime).data, vernonRuntimeGetLastError(runtime).size);
-    std::array<float, 8> result{};
-    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, result.data(), sizeof(result)),
-              VERNON_RHI_STATUS_OK);
-    for (size_t index = 0; index < values.size(); ++index)
-        EXPECT_EQ(result[index], values[index] + 1.0f);
-
-    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeStageExecutableDestroy(pipeline);
-    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
-    vernonRhiDestroyDevice(context.device);
-    vernonCompileResultDestroy(compiled);
-    vernonCompilerDestroy(compiler);
 }
 
 TEST(RuntimeDirectX12Pipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {

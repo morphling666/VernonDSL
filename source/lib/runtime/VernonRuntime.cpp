@@ -1051,13 +1051,15 @@ void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline) {
     delete pipeline;
 }
 
-void vernonRuntimeStageExecutableDestroy(VernonStageExecutable *stage) {
+void vernon::runtime::destroyResolvedStage(VernonStageExecutable *stage) {
     if (!stage)
         return;
     RuntimeDiagnosticScope diagnostic(stage->context);
     --stage->context->livePipelines;
     delete stage;
 }
+
+void vernonRuntimeStageExecutableDestroy(VernonStageExecutable *stage) { vernon::runtime::destroyResolvedStage(stage); }
 
 size_t vernonRuntimeStageExecutableGetParameterCount(const VernonStageExecutable *stage) {
     return stage ? stage->bindingProjection.parameters.size() : 0;
@@ -1695,8 +1697,9 @@ VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const Vernon
 
 } // namespace
 
-VernonStatus vernonRuntimeStageSubmit(VernonStageExecutable *pipeline,
-                                      const VernonStageInvocationDescriptor *invocation, VernonSubmission **output) {
+VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipeline,
+                                                  const VernonStageInvocationDescriptor *invocation,
+                                                  VernonSubmission **output) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (output)
         *output = nullptr;
@@ -1771,8 +1774,13 @@ VernonStatus vernonRuntimeStageSubmit(VernonStageExecutable *pipeline,
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonRuntimeStageEncode(VernonRuntimeProviderObject encoder, VernonStageExecutable *pipeline,
-                                      const VernonStageInvocationDescriptor *invocation) {
+VernonStatus vernonRuntimeStageSubmit(VernonStageExecutable *pipeline,
+                                      const VernonStageInvocationDescriptor *invocation, VernonSubmission **output) {
+    return vernon::runtime::submitResolvedStage(pipeline, invocation, output);
+}
+
+VernonStatus vernon::runtime::encodeResolvedStage(VernonRuntimeProviderObject encoder, VernonStageExecutable *pipeline,
+                                                  const VernonStageInvocationDescriptor *invocation) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
     if (!pipeline || !invocation || invocation->struct_size < sizeof(VernonStageInvocationDescriptor) ||
         invocation->abi_version != VERNON_PROGRAM_VERSION || (invocation->argument_count && !invocation->arguments))
@@ -1780,6 +1788,11 @@ VernonStatus vernonRuntimeStageEncode(VernonRuntimeProviderObject encoder, Verno
     VernonStageInvocationDescriptor encoded = *invocation;
     encoded.command_encoder = encoder;
     return encodeStageInvocation(*pipeline, encoded);
+}
+
+VernonStatus vernonRuntimeStageEncode(VernonRuntimeProviderObject encoder, VernonStageExecutable *pipeline,
+                                      const VernonStageInvocationDescriptor *invocation) {
+    return vernon::runtime::encodeResolvedStage(encoder, pipeline, invocation);
 }
 
 VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline) {

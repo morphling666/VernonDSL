@@ -6,6 +6,8 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -29,7 +31,7 @@ void setScalarLayout(Parameter &parameter, const char *dtype, VernonDataType dat
     parameter.elementLayout.abiLeaves.assign(view.leaves, view.leaves + view.leaf_count);
 }
 
-ParameterUse packedF32Use(uint32_t index, const std::string &layoutHash) {
+ParameterUse packedF32Use(uint32_t index, const ValueLayout &layout) {
     ParameterUse use;
     use.stage = "compute";
     use.interfaceKind = "value";
@@ -37,12 +39,13 @@ ParameterUse packedF32Use(uint32_t index, const std::string &layoutHash) {
     use.shape = {2};
     use.index = index;
     use.transport = "storage_buffer";
+    use.valueLayout = layout;
     TransportNode scalar{TransportNodeKind::Scalar, "f32", 0, 4, 4};
     TransportNode array{TransportNodeKind::Array, "", 0, 8, 4, {2}, {4}, {std::move(scalar)}};
     InterfacePlan plan;
     plan.kind = InterfacePlanKind::ByteTransport;
     plan.profile = "vulkan_std430_storage_buffer";
-    plan.canonicalLayoutHash = layoutHash;
+    plan.canonicalLayoutHash = layout.layoutHash;
     plan.root = std::move(array);
     use.interfacePlan = std::move(plan);
     return use;
@@ -63,6 +66,15 @@ Parameter storageF32Parameter(uint32_t slot, uint32_t index, const char *access)
     return parameter;
 }
 
+ParameterUse tensorViewF32Use(std::vector<uint64_t> shape) {
+    ParameterUse use;
+    use.stage = "compute";
+    use.interfaceKind = "buffer";
+    use.dtype = "f32";
+    use.shape = std::move(shape);
+    return use;
+}
+
 TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     StageBindingPlan variant;
     Parameter contiguous;
@@ -70,13 +82,13 @@ TEST(ComputeLaunchPlannerTest, PlacesArgumentsDirectlyByReflectionIndex) {
     contiguous.kind = "tensor";
     setScalarLayout(contiguous, "f32", VERNON_DATA_F32);
     contiguous.source = StageParameterSource::Direct;
-    contiguous.uses.push_back(packedF32Use(2, contiguous.elementLayout.layoutHash));
+    contiguous.uses.push_back(packedF32Use(2, contiguous.elementLayout));
     Parameter strided;
     strided.slot = 1;
     strided.kind = "tensor";
     setScalarLayout(strided, "f32", VERNON_DATA_F32);
     strided.source = StageParameterSource::Direct;
-    strided.uses.push_back(packedF32Use(0, strided.elementLayout.layoutHash));
+    strided.uses.push_back(packedF32Use(0, strided.elementLayout));
     variant.parameters = {contiguous, strided};
 
     const std::array<float, 2> contiguousValues{3, 4};
@@ -138,7 +150,7 @@ TEST(ComputeLaunchPlannerTest, ReusesTensorViewArtifactAcrossDispatchLayouts) {
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
     parameter.source = StageParameterSource::Direct;
     parameter.access = "read";
-    parameter.uses.push_back({"compute", "buffer", "", "f32", {2, 0}, 0, UINT32_MAX, 0, 0, 0, {}});
+    parameter.uses.push_back(tensorViewF32Use({2, 0}));
     parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{2, 1, {2, 3}, {4, 5}};
     variant.parameters = {parameter};
 
@@ -239,7 +251,7 @@ TEST(ComputeLaunchPlannerTest, RejectsTensorViewAccessMismatchBeforeDispatch) {
     parameter.source = StageParameterSource::Direct;
     parameter.access = "read";
     setScalarLayout(parameter, "f32", VERNON_DATA_F32);
-    parameter.uses.push_back({"compute", "buffer", "", "f32", {2}, 0, UINT32_MAX, 0, 0, 0, {}});
+    parameter.uses.push_back(tensorViewF32Use({2}));
     parameter.uses.back().tensorViewDescriptor = TensorViewDescriptorUse{1, 1, {2}, {3}};
     variant.parameters = {parameter};
 

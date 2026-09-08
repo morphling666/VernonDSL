@@ -342,6 +342,10 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         TargetBinding target;
         target.endpoint = {endpoint.module, endpoint.interfaceKind, endpoint.index, UINT32_MAX, endpoint.access};
+        target.endpointType = vernon::program::parseSemanticType(endpoint.type);
+        if (endpoint.tag == "value" && !target.endpointType)
+            return reject(diagnostic, "PROGRAM_REFLECTION_MISMATCH", "/endpoints",
+                          "value endpoint has no canonical semantic type");
         target.role = endpoint.role;
         target.access = endpoint.access;
         target.dimension = endpoint.imageDimension;
@@ -551,6 +555,9 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         } else {
             target.shape = shape::decodeRuntimeContractShape(value.shape);
         }
+        if (target.shape.empty() && value.canonicalType.rankedValue)
+            for (uint64_t extent : value.canonicalType.innerShape)
+                target.shape.push_back(shape::Extent::fixed(extent));
         if (!endpoint.autodiffCarrier.empty()) {
             if (endpoint.role != "cotangent" || endpoint.autodiffCarrier != "invocation_linear" ||
                 endpoint.viewShape.size() != value.shape.size() + 1)
@@ -591,7 +598,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         const std::optional<program_plan::TapeCarrier> tapeCarrier =
             program_plan::tapeCarrierFromRoleName(endpoint.role);
-        const bool typedTapeCarrier = value.type.rfind("!vernon.ad_tape", 0) == 0 && tapeCarrier;
+        const bool typedTapeCarrier = program::isTapeValueType(value.type) && tapeCarrier;
 
         if (typedTapeCarrier) {
             if (backend == VERNON_RUNTIME_CPU || !compiled || !compiled->elementLayout || !endpoint.viewDescriptor)
@@ -691,7 +698,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
                                   "value endpoint is missing the compiler-selected physical plan");
                 target.source = SourceRepresentation::WholeValueBytes;
                 target.reflectedKind = value.canonicalType.rankedValue ? "tensor_value" : "scalar";
-                target.elementLayout = *target.wholeValueLayout;
+                target.elementLayout = compiled->elementLayout ? *compiled->elementLayout : *target.wholeValueLayout;
                 target.carrier = compiled->valueTransport == "uniform_buffer"   ? TargetCarrier::UniformBuffer
                                  : compiled->valueTransport == "storage_buffer" ? TargetCarrier::StorageBuffer
                                                                                 : TargetCarrier::InlineValue;
@@ -930,6 +937,17 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
     return true;
 }
 
+static bool usesWholeValuePacking(const TargetBinding &binding) {
+    return binding.source == SourceRepresentation::WholeValueBytes;
+}
+
+static TensorRepresentation tensorArgumentRepresentation(const TargetBinding &binding) {
+    return binding.source == SourceRepresentation::WholeValueBytes && !binding.projection.leaf &&
+                   binding.endpointType && !binding.endpointType->isRankedValue()
+               ? TensorRepresentation::WholeValue
+               : TensorRepresentation::ElementStream;
+}
+
 static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBindingPlan &stagePlan,
                                          ReflectedEntry &reflection, Diagnostic &diagnostic) {
     diagnostic = {};
@@ -968,10 +986,14 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         argument.descriptorSet = 0;
         argument.binding = binding.endpoint.portableSlot;
         argument.storageLeaves = binding.storageLeaves;
-        argument.tensorElementSize = binding.elementLayout.byteSize;
+        const bool wholeValue = usesWholeValuePacking(binding);
+        argument.tensorElementSize = wholeValue ? binding.physical.size : binding.elementLayout.byteSize;
         argument.sourceShape = binding.viewShape;
-        if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(binding.shape);
-            concrete && !concrete->empty()) {
+        if (wholeValue) {
+            argument.tensorElements = 1;
+            argument.tensorBytes = binding.physical.size;
+        } else if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(binding.shape);
+                   concrete && !concrete->empty()) {
             size_t elements = 0;
             if (!shape::checkedElementCount(*concrete, elements))
                 return false;
@@ -995,9 +1017,12 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         parameter.name = binding.name;
         parameter.source = StageParameterSource::Direct;
         parameter.kind = binding.kind;
+        parameter.tensorArgument = tensorArgumentRepresentation(binding);
         parameter.access = binding.access.empty() ? "read" : binding.access;
-        parameter.elementLayout = binding.elementLayout;
-        if (binding.source == SourceRepresentation::WholeValueBytes)
+        parameter.elementLayout = !binding.elementLayout.leaves.empty() || !binding.wholeValueLayout
+                                      ? binding.elementLayout
+                                      : *binding.wholeValueLayout;
+        if (parameter.tensorArgument == TensorRepresentation::WholeValue)
             parameter.valueLayout = binding.wholeValueLayout;
         parameter.dimension = binding.dimension;
         parameter.bindingRole = binding.role;
@@ -1020,6 +1045,8 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
         use.dtype = binding.elementLayout.logicalType.empty() && !binding.elementLayout.leaves.empty()
                         ? binding.elementLayout.leaves.front().dtype
                         : binding.elementLayout.logicalType;
+        use.tensorPacking =
+            usesWholeValuePacking(binding) ? TensorRepresentation::WholeValue : TensorRepresentation::ElementStream;
         use.shape = binding.source == SourceRepresentation::WholeValueBytes && binding.valueType &&
                             binding.valueType->rankedValue
                         ? binding.valueType->innerShape
@@ -1028,7 +1055,9 @@ static bool buildComputeStageBindingPlan(const TargetBindingPlan &plan, StageBin
                         : binding.carrier == TargetCarrier::UniformBuffer ? "uniform_buffer"
                         : binding.carrier == TargetCarrier::InlineValue   ? "push_constant"
                                                                           : "storage_buffer";
-        use.valueLayout = binding.wholeValueLayout;
+        use.valueLayout = use.tensorPacking == TensorRepresentation::WholeValue
+                              ? binding.wholeValueLayout
+                              : std::optional<vernon::runtime::ValueLayout>(binding.elementLayout);
         use.interfacePlan = binding.transport ? std::optional<InterfacePlan>(binding.transport->targetAbi)
                                               : std::optional<InterfacePlan>{};
         use.tensorViewDescriptor = binding.tensorViewDescriptor;
@@ -1178,6 +1207,7 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
                                                   : binding.name;
             parameter.kind = "tensor";
             parameter.source = StageParameterSource::Resolution;
+            parameter.tensorArgument = TensorRepresentation::WholeValue;
             parameter.elementLayout = binding.elementLayout;
             parameter.valueLayout = binding.wholeValueLayout;
             parameter.access = binding.access.empty() ? "read" : binding.access;
@@ -1185,6 +1215,7 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             ParameterUse use;
             use.stage = binding.endpoint.module;
             use.interfaceKind = "uniform";
+            use.tensorPacking = TensorRepresentation::WholeValue;
             use.index = binding.endpoint.index;
             use.dtype = "f32";
             use.shape = parameter.shape;
@@ -1209,8 +1240,12 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             parameter.name = binding.name;
             parameter.access = binding.access;
             parameter.kind = binding.kind;
-            parameter.elementLayout = binding.wholeValueLayout ? *binding.wholeValueLayout : binding.elementLayout;
-            parameter.valueLayout = binding.wholeValueLayout;
+            parameter.tensorArgument = tensorArgumentRepresentation(binding);
+            parameter.elementLayout = !binding.elementLayout.leaves.empty() || !binding.wholeValueLayout
+                                          ? binding.elementLayout
+                                          : *binding.wholeValueLayout;
+            if (parameter.tensorArgument == TensorRepresentation::WholeValue)
+                parameter.valueLayout = binding.wholeValueLayout;
             parameter.dimension = binding.dimension;
             parameter.bindingRole = binding.role;
             parameter.exactStorageFormat = binding.imageFormat;
@@ -1223,6 +1258,8 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
         vernon::runtime::Parameter &parameter = stagePlan.parameters[found->second];
         ParameterUse use;
         use.stage = binding.endpoint.module;
+        use.tensorPacking =
+            usesWholeValuePacking(binding) ? TensorRepresentation::WholeValue : TensorRepresentation::ElementStream;
         use.interfaceKind = binding.carrier == TargetCarrier::VertexBuffer           ? "input"
                             : binding.source == SourceRepresentation::ResourceHandle ? "resource"
                                                                                      : "uniform";
@@ -1243,6 +1280,9 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
                                 binding.valueType->rankedValue
                             ? binding.valueType->innerShape
                             : parameter.shape;
+            use.valueLayout = use.tensorPacking == TensorRepresentation::WholeValue
+                                  ? binding.wholeValueLayout
+                                  : std::optional<vernon::runtime::ValueLayout>(binding.elementLayout);
         }
         if (binding.carrier == TargetCarrier::VertexBuffer) {
             use.dtype = binding.attributeLeaves.front().dtype;

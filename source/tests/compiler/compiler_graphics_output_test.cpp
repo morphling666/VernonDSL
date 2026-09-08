@@ -133,8 +133,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     }
     return %rgba, %bloom : tensor<4xf32>, tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
 std::string artifacts(const VernonCompileResult *result) {
     std::string output;
@@ -344,11 +343,13 @@ module attributes {)" VERNON_MLIR_VERSION_ATTRIBUTES R"(} {
   func.func @multi_set_compute(
       %left: !vernon.tensor_view<f32, [1], "read_write", "device"> {
         vernon.interface = "resource",
+
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       },
       %right: !vernon.tensor_view<f32, [1], "read", "device"> {
         vernon.interface = "resource",
+
         vernon.set = 1 : i64,
         vernon.binding = 0 : i64
       }) attributes {
@@ -434,27 +435,27 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
         },
         tensor<2xi32> {
           vernon.interface = "output", vernon.location = 1 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
           vernon.interface = "output", vernon.location = 2 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
           vernon.interface = "output", vernon.location = 3 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<3xi32> {
           vernon.interface = "output", vernon.location = 4 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
           vernon.interface = "output", vernon.location = 5 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         },
         tensor<2xi32> {
           vernon.interface = "output", vernon.location = 6 : i64,
-          vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+          vernon.abi_leaf_dtypes = ["u32"]
         }) attributes {vernon.entry, vernon.stage = "fragment"} {
     %lod = arith.constant 1.0 : f32
     %level = arith.constant 1 : i32
@@ -500,11 +501,11 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @builtin_vertex(
       %vertexId: i32 {
         vernon.interface = "input", vernon.builtin = "vertex_index",
-        vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %instanceId: i32 {
         vernon.interface = "input", vernon.builtin = "instance_index",
-        vernon.dtype = "u32", vernon.abi_leaf_dtypes = ["u32"]
+        vernon.abi_leaf_dtypes = ["u32"]
       },
       %position: tensor<4xf32> {
         vernon.interface = "input", vernon.location = 0 : i64
@@ -513,8 +514,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       }) attributes {vernon.entry, vernon.stage = "vertex"} {
     return %position : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -576,7 +576,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %coordinate: tensor<3xi32> {
         vernon.interface = "uniform",
         vernon.source_name = "coordinate",
-        vernon.dtype = "i32",
         vernon.abi_leaf_dtypes = ["i32"]
       },
       %value: tensor<4xf32> {
@@ -595,8 +594,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (!vernon.texture<"3d", f32, "rgba32_float", "read_write">, tensor<3xi32>, tensor<4xf32>) -> ()
     return
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -628,23 +626,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @static_tensor_fragment(
       %value: tensor<2x3x5xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "value",
-        vernon.dtype = "f32"
+        vernon.source_name = "value"
       },
       %matrix: tensor<3x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix"
       },
       %matrix2: tensor<4x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix2",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix2"
       },
       %matrix3: tensor<4x4xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "matrix3",
-        vernon.dtype = "f32"
+        vernon.source_name = "matrix3"
       }) -> (f32 {
         vernon.interface = "output",
         vernon.location = 0 : i64
@@ -671,8 +665,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %result = arith.addf %partial, %matrix_value : f32
     return %result : f32
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -754,8 +747,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %tail: tensor<2x2x)mlir") + std::to_string(tailWidth) +
                                          R"mlir(xf32> {
         vernon.interface = "uniform",
-        vernon.source_name = "tail",
-        vernon.dtype = "f32"
+        vernon.source_name = "tail"
       }) -> (f32 {
         vernon.interface = "output",
         vernon.location = 0 : i64
@@ -767,8 +759,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
                                          std::to_string(tailWidth) + R"mlir(xf32>
     return %value : f32
   }
-}
-)mlir";
+})mlir";
 
         SCOPED_TRACE("tail width " + std::to_string(tailWidth));
         VernonCompileResult *result =
@@ -819,8 +810,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @static_tensor_compute(
       %value: tensor<2x2x2xf32> {
         vernon.interface = "input",
-        vernon.location = 0 : i64,
-        vernon.dtype = "f32"
+        vernon.location = 0 : i64
       },
       %output: !vernon.tensor_view<f32, [1], "write", "device"> {
         vernon.interface = "resource",
@@ -840,8 +830,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       (f32, !vernon.tensor_view<f32, [1], "write", "device">, index) -> ()
     return
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -909,7 +898,6 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %value: tensor<2x3xf32> {
         vernon.interface = "input",
         vernon.location = 0 : i64,
-        vernon.dtype = "f32",
         vernon.source_name = "value"
       }) -> (tensor<4xf32> {
         vernon.interface = "output",
@@ -918,8 +906,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     %position = arith.constant dense<[0.0, 0.0, 0.0, 1.0]> : tensor<4xf32>
     return %position : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *result =
@@ -945,17 +932,16 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @overlap(
       %value: tensor<2x3xf32> {
-        vernon.interface = "input", vernon.location = 0 : i64, vernon.dtype = "f32"
+        vernon.interface = "input", vernon.location = 0 : i64
       },
       %other: tensor<4xf32> {
-        vernon.interface = "input", vernon.location = 1 : i64, vernon.dtype = "f32"
+        vernon.interface = "input", vernon.location = 1 : i64
       }) -> (tensor<4xf32> {
         vernon.interface = "output", vernon.builtin = "position"
       }) attributes {vernon.entry, vernon.stage = "vertex"} {
     return %other : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
     result = vernonCompilerCompileMlir(compiler, overlapModule.data(), overlapModule.size(), VERNON_TARGET_VULKAN);
     ASSERT_TRUE(result);
     EXPECT_NE(vernonCompileResultGetStatus(result), VERNON_STATUS_OK);
@@ -977,7 +963,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       %value: !vernon.struct<"Vertex"> {
         vernon.interface = "input",
         vernon.location = 0 : i64,
-        vernon.source_name = "value"
+        vernon.source_name = "value",
+        vernon.abi_leaf_dtypes = ["f32", "u32", "f32"]
       }) -> (tensor<4xf32> {
         vernon.interface = "output",
         vernon.builtin = "position"
@@ -991,8 +978,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (tensor<3xf32>, f32) -> tensor<4xf32>
     return %result : tensor<4xf32>
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
@@ -1059,8 +1045,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     } : (!vernon.struct<"State">) -> f32
     return %value : f32
   }
-}
-)mlir";
+})mlir";
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
     VernonCompileResult *result = vernonCompilerCompileMlir(compiler, aggregateLoopModule.data(),
@@ -1092,6 +1077,8 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
   func.func @nested(
       %values: !vernon.tensor_view<!vernon.struct<"Nested">, [2], "read", "device"> {
         vernon.interface = "resource",
+        vernon.abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
+        vernon.element_abi_leaf_dtypes = ["i32", "f32", "f32", "u32"],
         vernon.set = 0 : i64,
         vernon.binding = 0 : i64
       }) attributes {
@@ -1101,8 +1088,7 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
       } {
     return
   }
-}
-)mlir";
+})mlir";
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);

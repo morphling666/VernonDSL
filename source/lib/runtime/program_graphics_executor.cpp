@@ -28,9 +28,9 @@ const char *textureFormatName(VernonTextureFormat format) {
     case VERNON_TEXTURE_R11G11B10_FLOAT:
         return "r11g11b10_float";
     case VERNON_TEXTURE_D32_FLOAT:
-        return "d32_float";
+        return "depth32_float";
     case VERNON_TEXTURE_D32_FLOAT_S8_UINT:
-        return "d32_float_s8_uint";
+        return "depth32_float_stencil8";
     }
     return "unknown";
 }

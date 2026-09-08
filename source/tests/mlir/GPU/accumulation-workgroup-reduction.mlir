@@ -1,8 +1,8 @@
 // RUN: %vernon-opt \
-// RUN:   --vernon-lower-accumulation="f32-device-atomic=native supports-workgroup-reduction=true" \
+// RUN:   --vernon-lower-accumulation="f32-device-atomic=native supports-workgroup-reduction=true native-atomic-reduction-crossover=1" \
 // RUN:   --vernon-to-gpu %s | %FileCheck %s --check-prefix=GENERIC
 // RUN: %vernon-opt \
-// RUN:   --vernon-lower-accumulation="f32-device-atomic=native supports-workgroup-reduction=true" \
+// RUN:   --vernon-lower-accumulation="f32-device-atomic=native supports-workgroup-reduction=true native-atomic-reduction-crossover=1" \
 // RUN:   --vernon-to-gpu="use-spirv-storage=true use-spirv-workgroup-reduction=true" %s \
 // RUN:   | %FileCheck %s --check-prefix=SPIRV
 //
