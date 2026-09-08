@@ -1,6 +1,6 @@
 // RUN: %vernon-opt --vernon-validate %s -o %t
 
-module attributes {vernon.compiler_contract_version = 14 : i64, vernon.program_version = 19 : i64} {
+module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
   func.func @noop(
       %value: f32 {
         vernon.interface = "input",

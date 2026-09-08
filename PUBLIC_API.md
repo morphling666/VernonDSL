@@ -1,6 +1,6 @@
 # Public API policy
 
-VernonDSL 0.1.2 treats the following installed interfaces as public:
+VernonDSL treats the following installed interfaces as public:
 
 - names exported by `vernon_dsl.__all__`;
 - `vernon_dsl.runtime_source` helpers for locating the bundled Runtime source;
@@ -12,8 +12,8 @@ VernonDSL 0.1.2 treats the following installed interfaces as public:
 - the `VernonRHI.hpp` and `VernonRuntime.hpp` C++ wrappers;
 - the standalone CMake project bundled under `vernon_dsl/runtime_src` and its
   documented Runtime targets;
-- canonical Program bundles and artifacts accepted by compiler contract 13 and
-  pipeline contract 17.
+- canonical Program bundles and artifacts accepted by the current Compiler
+  Contract and Program Version.
 
 The wheel does not install a prebuilt `lib/cmake/VernonRuntime` package into the
 environment. Embedders locate `vernon_dsl/runtime_src` and configure that
@@ -24,7 +24,7 @@ not part of the PyPI wheel contract.
 `VernonRuntimeCore.h`, `VernonRuntimeProvider.h`, and
 `VernonRuntimeRHIAdapter.h` are shipped embedder SPI used to implement backend
 providers. They are not application-facing stable API and may change when the
-compiler or pipeline contract changes. Compiler C headers installed only by the
+compiler contract or Program version changes. Compiler C headers installed only by the
 development component are likewise outside the wheel's stable API.
 
 The native `vernon-compile` executable and compiler shared library are bundled
@@ -47,10 +47,11 @@ defect.
 Struct-based C APIs use `struct_size` and reserved fields for compatible
 extension. Callers must zero-initialize structures, set `struct_size`, and leave
 reserved fields zero. Enum numeric values and exported C function signatures
-are stable once published in a 0.1 release. Unreleased API drafts may be
+are stable once published in a release. Unreleased API drafts may be
 replaced without compatibility wrappers before their first release.
 
-Canonical Program execution uses bundle → executable → instance → invocation.
+Canonical Program execution uses bundle → executable → instance → invocation
+→ bind → forward.
 `vernonRuntimeProgramInvocationForward` records, submits, and completes the
 resolved Program plan inside the Runtime; a Program caller does not provide a
 command encoder or submit descriptor. The independent direct-Stage facility may
@@ -72,7 +73,7 @@ Sparse host updates use `vernonRhiDeviceUploadBufferRanges`, which validates a
 complete range list before mutation and lets each backend execute the list as
 one transfer transaction.
 
-The 0.1.2 contract does not guarantee concurrent execution or multiple frames
+The current public contract does not guarantee concurrent execution or multiple frames
 in flight. Backends may complete work inline while preserving the same
 submission and lifetime semantics. Swapchain presentation remains outside the
 public Runtime contract.

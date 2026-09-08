@@ -448,7 +448,7 @@ autodiff transform.
 
 ## 11. Versioning and acceptance
 
-Compiler contract 14 and Program version 19 define the current Program VJP
+The current Compiler Contract and Program Version define the Program VJP
 boundary. Older profile manifests are rejected rather than reinterpreted,
 normalized, or retained as a parallel loading path. CPU and supported GPU VJP
 use the same Program/ResolveProgram/ExecuteProgram path. Differentiated

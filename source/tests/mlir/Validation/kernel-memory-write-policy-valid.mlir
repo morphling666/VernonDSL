@@ -9,7 +9,7 @@
 // CHECK-LABEL: func.func @partial_leader_guarded_workgroup_store
 // CHECK-SAME: vernon.dispatch_contract = {requires_unit_workgroup = false, unit_grid_axes = array<i32: 1, 2>}
 
-module attributes {vernon.compiler_contract_version = 14 : i64, vernon.program_version = 19 : i64} {
+module attributes {vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64} {
   func.func @rank_one_global_x(
       %output: !vernon.tensor_view<f32, [-1], "write", "device"> {
         vernon.interface = "resource", vernon.set = 0 : i64, vernon.binding = 0 : i64

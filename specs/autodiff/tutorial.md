@@ -1,6 +1,7 @@
 # VernonDSL automatic differentiation
 
-Status: non-normative tutorial for compiler contract 14 and Program version 19.
+Status: non-normative tutorial for the current Compiler Contract and Program
+Version.
 
 Canonical Program is the only differentiation topology; Python pass graphs and
 legacy pipeline AD manifests are not part of the API.
@@ -114,10 +115,10 @@ outputs, pullback = expression(source, loss, grid=(groups_x, 1, 1))
 gradients = pullback(output_cotangent)
 ```
 
-It compiles through the same typed stage and Program contracts. The native
-direct-endpoint loader is separate from managed Module loading, so endpoint
-invocation semantics are explicit rather than inferred from node count or
-Storage ownership.
+It compiles through the same typed Stage and Program contracts and uses the
+same bundle → executable → instance → invocation lifecycle as Module VJP.
+Endpoint semantics come from reflected Program boundaries rather than node
+count, names, or Storage ownership.
 
 ## 8. Diagnostics
 

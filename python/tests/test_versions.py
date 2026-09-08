@@ -19,4 +19,4 @@ def test_generated_versions_are_current() -> None:
 def test_public_version_axes_are_valid() -> None:
     assert RELEASE_VERSION
     assert COMPILER_CONTRACT_VERSION > 0
-    assert PROGRAM_VERSION > COMPILER_CONTRACT_VERSION
+    assert PROGRAM_VERSION > 0

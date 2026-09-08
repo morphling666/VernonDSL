@@ -2,13 +2,13 @@
 #ifndef VERNON_VERSIONS_H
 #define VERNON_VERSIONS_H
 
-#define VERNON_RELEASE_VERSION "0.2.0"
-#define VERNON_COMPILER_CONTRACT_VERSION 14
-#define VERNON_PROGRAM_VERSION 19
-#define VERNON_COMPILER_CONTRACT_VERSION_STRING "14"
-#define VERNON_PROGRAM_VERSION_STRING "19"
-#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 14 : i64, vernon.program_version = 19 : i64"
-#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":14,\"program_version\":19"
-#define VERNON_PROGRAM_JSON_FIELD "\"program_version\":19"
+#define VERNON_RELEASE_VERSION "0.1.2"
+#define VERNON_COMPILER_CONTRACT_VERSION 1
+#define VERNON_PROGRAM_VERSION 1
+#define VERNON_COMPILER_CONTRACT_VERSION_STRING "1"
+#define VERNON_PROGRAM_VERSION_STRING "1"
+#define VERNON_MLIR_VERSION_ATTRIBUTES "vernon.compiler_contract_version = 1 : i64, vernon.program_version = 1 : i64"
+#define VERNON_JSON_VERSION_FIELDS "\"compiler_contract_version\":1,\"program_version\":1"
+#define VERNON_PROGRAM_JSON_FIELD "\"program_version\":1"
 
 #endif // VERNON_VERSIONS_H

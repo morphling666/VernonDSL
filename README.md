@@ -52,12 +52,12 @@ paint(pixels, 0.0, grid=(WIDTH // 16, HEIGHT // 16, 1))
 image = pixels.to_numpy()
 ```
 
-The current stable release is `0.1.2`. It supports CPython 3.11 through 3.14
-on Windows x64, Linux x64, and Apple Silicon macOS. The frontend remains
-language version 3 while the v4 roadmap is developed. See the
-[`0.1.2 release notes`](https://github.com/morphling666/VernonDSL/blob/master/RELEASE_NOTES.md),
+Release and contract versions are defined only by
+[`versions.toml`](versions.toml). The frontend remains language version 3
+while the v4 acceptance gates are completed. See
+[`specs/README.md`](specs/README.md),
 [`PUBLIC_API.md`](PUBLIC_API.md), and [`COMPATIBILITY.md`](COMPATIBILITY.md)
-for the supported surface and compatibility contract.
+for the authoritative boundaries.
 
 ## Demos
 
@@ -120,17 +120,18 @@ when Vulkan is unavailable. The presenter targets the requested frame rate;
 actual throughput depends on the GPU, driver, image size, and readback cost.
 Use `--preset smoke --headless` for fast acceptance checks.
 
-## Install from PyPI
+## Install
 
-Prebuilt wheels are provided for Windows x64, Linux x64, and Apple Silicon
-macOS 15 or newer for CPython 3.11 through 3.14:
+Published releases provide wheels for Windows x64, Linux x64, and Apple
+Silicon macOS 15 or newer for CPython 3.11 through 3.14:
 
 ```powershell
-py -m pip install vernon-lang==0.1.2
+py -m pip install vernon-lang
 ```
 
-VernonDSL 0.1.2 is wheel-only. Intel macOS, source distributions, PyPy, and
-other Python versions are not published.
+The source tree may be ahead of the latest published wheel. VernonDSL releases
+are wheel-only. Intel macOS, source distributions, PyPy, and other Python
+versions are not published.
 
 Verify the installation:
 
@@ -155,13 +156,13 @@ Runtime availability therefore depends on the selected backend:
   supported Apple Silicon Macs, with no additional loader.
 
 Cooked MSL bundles are consumed by the Runtime on Apple. Metal presentation and
-swapchain management are outside the `0.1.2` contract. Argument-buffer
+swapchain management are outside the public Runtime contract. Argument-buffer
 pipelines fail explicitly when the selected device cannot provide the required
 tier or encoder.
 
 CPU graphics, CUDA images and samplers, f16/f64 vertex attributes,
 non-relaxed atomics, asynchronous dispatch, and multiple frames in flight are
-outside the supported `0.1.2` subset. See
+outside the currently advertised capability set. See
 [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for the complete release contract.
 
 ### Optional Vulkan setup
@@ -212,13 +213,16 @@ Declare a persistent asset beside its shader stages:
 ```python
 mesh_asset = vd.program_asset(
     id="pipeline/mesh",
-    program=(mesh_vertex, mesh_fragment),
+    program=vd.pipeline(
+        mesh_vertex,
+        mesh_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
     variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
 )
 ```
 
-Cook it for a deployment target without importing or executing the source
-module:
+Cook the trusted declaration source for a deployment target:
 
 ```powershell
 vernon-cook-program examples/variant_mesh.py:mesh_asset `
@@ -234,11 +238,12 @@ vernon-cook-program python/tests/program_asset_fixture.py:scale_asset `
   -o build/cpu_scale
 ```
 
-The output contains the canonical pipeline-18 `*.program.json` manifest and
+The output contains the canonical versioned `*.program.json` manifest and
 content-addressed files under `artifacts/`. Depending on the target, artifacts
-are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, LLVM IR, or relocatable CPU
-objects. A differentiated asset adds the optional root `autodiff` object to the
-same manifest schema. CPU cooking also emits a `.o`/`.obj` plus generated
+are SPIR-V, GLSL/ESSL, DXIL, PTX, Metal source, or relocatable CPU objects.
+A differentiated asset contains forward/backward graphs, derivative ABI, and
+residual metadata in the same Program schema. CPU cooking also emits a
+`.o`/`.obj` plus generated
 static-registration `.c` and `.h` sources; there is no separate `compute.json`
 bundle. Cooked Metal bundles contain MSL consumed by the Runtime on Apple.
 Missing variants and unsupported target combinations fail explicitly rather
@@ -436,15 +441,9 @@ More examples and their third-party attributions are documented in
 
 ## Future roadmap
 
-The post-`0.1.2` roadmap includes:
-
-1. finish and accept the language-v4 contract, including first-order
-   pure-function autodiff;
-2. broaden repeatable hardware-backed GPU acceptance;
-3. design the ABI change required for asynchronous dispatch and deferred
-   multi-frame resource reclamation;
-4. replace the remaining temporary compiler bridges tracked in the completion
-   roadmap.
+Current work is tracked in [`specs/roadmap.md`](specs/roadmap.md). Immediate
+priorities are contract-driven cross-backend language coverage, the remaining
+language-v4 acceptance gates, bounded GPU tape replay, and release validation.
 
 Release support and security reporting are documented in
 [`SUPPORT.md`](SUPPORT.md) and [`SECURITY.md`](SECURITY.md). Published wheel,
@@ -453,10 +452,14 @@ checksum, SBOM, and provenance requirements are documented in
 
 Related design and release documents:
 
+- [Specification index](specs/README.md)
+- [Program architecture](specs/program/architecture.md)
+- [Program execution manifest](specs/program/execution_manifest.md)
+- [Autodiff contract](specs/autodiff/contract.md)
+- [Runtime design](specs/runtime/design.md)
 - [Project roadmap](https://github.com/morphling666/VernonDSL/blob/master/specs/roadmap.md)
 - [Language v4 roadmap](https://github.com/morphling666/VernonDSL/blob/master/specs/language/future_language_roadmap.md)
 - [Release readiness](https://github.com/morphling666/VernonDSL/blob/master/RELEASE_READINESS.md)
-- [Compiler and runtime design](https://github.com/morphling666/VernonDSL/blob/master/specs/compiler/design.md)
 
 ## License
 

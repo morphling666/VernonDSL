@@ -1,4 +1,4 @@
 [vernon]
-release = "0.2.0"
-compiler_contract = 14
-program = 19
+release = "0.1.2"
+compiler_contract = 1
+program = 1

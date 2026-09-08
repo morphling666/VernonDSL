@@ -317,9 +317,10 @@ bindings, and the offset/extent/stride descriptor binding sequence. Concrete
 dispatch values are never reflected. The capability name remains
 `tensor_views`.
 
-Native runtime records use `VernonTensorView`; the Program contract changes
-when serialized descriptor fields change. Old schema readers are removed
-rather than translated.
+Native runtime records use `VernonTensorView`. Its serialized descriptor is
+frozen for the active release line; backend implementations must conform to it. A future
+descriptor change requires an explicitly approved Program Version cut. Old
+schema readers are removed rather than translated.
 
 Workgroup TensorViews are compile-time kernel state, not host-bound arguments.
 Required workgroup bytes and synchronization features are reflected only where

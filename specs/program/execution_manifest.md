@@ -13,8 +13,8 @@ object. There is no sibling or nested execution object.
 
 The Program representation has no independent nested schema or version field.
 Top-level `COMPILER_CONTRACT_VERSION` and `PROGRAM_VERSION` jointly select
-exactly one Program contract. The current generated values are `14` and `19`.
-A loader MUST require the unique Program contract mapped by the
+exactly one Program contract. A loader MUST require the unique Program
+contract mapped by the
 selected pair and reject every other shape. It MUST NOT translate a legacy
 pipeline, program-bundle, stage topology, or profile representation into this
 one.
@@ -211,8 +211,8 @@ A cooked deployment bundle is exactly:
 
 ```json
 {
-  "compiler_contract_version": 14,
-  "program_version": 19,
+  "compiler_contract_version": 1,
+  "program_version": 1,
   "type": "program",
   "id": "example/program",
   "target": {"kind": "vulkan", "options": {}},
@@ -1978,9 +1978,9 @@ translation path, or release mode.
 
 ## Appendix B. Closed ABI vocabulary
 
-This appendix closes spellings used by the strict objects above. A coordinated
-contract release may add spellings only by assigning a new compiler/pipeline
-pair.
+This appendix closes spellings used by the strict objects above. The active
+release line must not add spellings. A future addition requires an explicitly
+approved Compiler Contract and/or Program Version cut.
 
 Canonical type strings contain no whitespace. Scalars are `bool`, `i8`, `u8`,
 `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f16`, `f32`, and `f64`.

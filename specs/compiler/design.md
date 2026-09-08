@@ -335,8 +335,10 @@ incompatible stage families are program-validation errors. Stage topology is
 part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
 additions use the Program portable `stages` contract map; each variant stores
 the implementing target artifact directly at
-`artifact_system.artifacts[stage]`. Incompatible changes bump the compiler
-contract.
+`artifact_system.artifacts[stage]`. Implementations must conform to the frozen
+contract for the active release line. A future incompatible topology change requires a
+separately approved contract cut; implementation work must not bump the
+contract automatically.
 
 `variants=` explicitly enumerates every accepted canonical feature
 combination, preventing implicit powerset growth. It contains at least one
@@ -372,7 +374,7 @@ remains Kernel IR.
 
 Texture parameter constraints are queried through a separate `struct_size`-
 versioned runtime view so `VernonProgramParameterView` remains ABI-stable.
-Program version 19 records the required texture dimension; format remains
+The current Program contract records the required texture dimension; format remains
 unconstrained.
 
 A target is reported as available only after its complete lowering and
@@ -736,7 +738,8 @@ is part of the stable Apple Silicon macOS compute and offscreen graphics
 subset. DirectX DXIL stage artifacts resolve through the Windows D3D12 runtime
 backend.
 
-Program version 19 is intentionally artifact-incompatible: loaders do not
+The current Program contract is intentionally artifact-incompatible with pre-Program
+artifacts: loaders do not
 reinterpret old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
 Differentiated Programs contain forward and backward graphs plus residual and
 ProgramABI derivative-projection metadata. CPU cooking writes the same Program, a
