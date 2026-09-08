@@ -1,5 +1,7 @@
 # Compiler design
 
+Status: current compiler architecture.
+
 ## Version policy
 
 `versions.toml` is the only manually edited version source. Vernon has three
@@ -9,13 +11,24 @@ version axes:
   compatibility.
 - `COMPILER_CONTRACT_VERSION` covers Python semantics, MLIR module attributes,
   canonical Value layout, stage topology, and compiler reflection.
-- `PIPELINE_VERSION` covers pipeline manifests and invocation, CPU/GPU
+- `PROGRAM_VERSION` covers Program manifests and invocation, CPU/GPU
   artifacts, graphics draw data, device providers, and the RHI API.
 
 Generated Python, C/C++, and CMake constants are consumed directly. Caches use
-the compiler-contract and pipeline versions instead of private cache epochs.
-Changing `PIPELINE_VERSION` requires rebuilding every Runtime, Provider, and RHI
+the compiler-contract and Program versions instead of private cache epochs.
+Changing `PROGRAM_VERSION` requires rebuilding every Runtime, Provider, and RHI
 component; third-party precompiled Provider/RHI plugins are not supported.
+
+## Compute kernel compile vs bind
+
+Kernel native artifacts stay layout-polymorphic. Compiler analysis, kernel
+`specialize`, and compute `finalize` must not consume invoke-time extents.
+Borrowed dynamic Storage keeps TensorView `vd.dyn` as `-1` on Value shape and
+omits unknown concrete extent from its descriptor; bind uses the provider
+resource descriptor.
+Do not restore a Python `specialize(shapes=...)` path for compute. Graphics
+`shape_facts` remain the way to materialize image/attachment extents at
+pipeline finalize.
 
 ## Tensor-first type system
 
@@ -30,6 +43,30 @@ The MLIR representation is selected by use rather than source spelling:
   vector/matrix types.
 - General value computation uses `tensor` and `linalg`.
 - Addressable resources use `memref` or target buffer types.
+
+## MLIR storage vs language ABI dtype
+
+MLIR integer types are storage class. They do not encode language signedness.
+
+- Allowed storage scalars: `i1`, signless `i32`, `f16`, `f32`, `f64`.
+- Language `u32` lowers to signless `i32`. Vernon does not emit MLIR `ui32`.
+- Unsigned meaning lives in ops (`divui`, `uitofp`) and ABI metadata, not the type.
+
+Language ABI dtypes are `bool`, `i32`, `u32`, `f16`, `f32`, and `f64`.
+
+- `vernon.abi_leaf_dtypes` is the source of truth on every public kernel or
+  Program argument and result. Struct declarations use `abi_leaf_dtypes`.
+  TensorView cells use `vernon.element_abi_leaf_dtypes`.
+- `vernon.dtype` is sugar for a single leaf. If present it must equal that
+  leaf. It is not a second independent channel.
+- `layout_hash` is `physical_canonical|dtypes=...`. Physical canonical uses
+  signless storage names (`scalar(i32,4,4)`). Language signedness enters only
+  through `|dtypes=`.
+- `getValueAbiLayout` fails if a 32-bit integer leaf has no explicit language
+  dtype. Do not recover `i32`/`u32` from `IntegerType::isUnsigned()`.
+- Host tensors, Program JSON `dtype`, compiled parameter `dtype`, and planner
+  `element_layout` all use language names. Shape specialization is a separate
+  axis.
 
 ## Backend split
 
@@ -95,8 +132,9 @@ covered by execution tests.
 
 ## Pure bundle planning boundary
 
-Bundle value types, compiler-reflection normalization, parameter merging,
-variant planning, and `PIPELINE_VERSION` serialization live in separate pure modules.
+Program value types, compiler-reflection validation, canonical parameter
+construction, variant planning, and Program serialization live in separate
+pure modules.
 The planner composes those modules and owns no duplicate implementation.
 Neither bundle planning nor serialization imports the Python frontend or
 Runtime, allowing cooked-manifest identity to be tested independently of
@@ -110,10 +148,10 @@ invalidation remain session state; resources never cache a copied global
 runtime handle.
 
 Shader artifact encoding, extension selection, and content-addressed file writes
-live in `_shader_assets.artifact_io`. Cooking consumes that implementation
+live in `_program_assets.artifact_io`. Cooking consumes that implementation
 through the public facade, preserving canonical pipeline bytes while keeping filesystem
 artifact policy independent of descriptor parsing and native compilation.
-Python pipeline descriptor parsing lives in `_shader_assets.parsing`; it reads
+Python pipeline descriptor parsing lives in `_program_assets.parsing`; it reads
 source AST and project feature declarations without importing or executing the
 descriptor module. Cooking receives only the validated immutable descriptor,
 so parser diagnostics and variant canonicalization remain testable without a
@@ -121,28 +159,31 @@ native compiler.
 
 Compute source compilation and invocation behavior lives in `_runtime.kernel`.
 The `Kernel` frontend decorator retains the semantic/artifact cache, but loaded
-native entries are `LoadedPipeline` objects and invoke the same compute pipeline
-ABI as PipelineAssets. Reinitializing a session invalidates loaded pipelines
+native entries are `PythonProgramExecutable` objects and invoke the same compute pipeline
+ABI as ProgramAssets. Reinitializing a session invalidates loaded pipelines
 without discarding deterministic frontend and compiler results.
-Graphics Pipeline bundle compilation, binding, and invocation live in
-`_runtime.pipeline`; session now contains only backend/context lifecycle and
-generation state. The public Runtime and shader-asset modules are thin facades,
-and implementation modules never circularly re-export those facades.
+Graphics Pipeline authoring and interactive invocation live in `_runtime.pipeline`;
+cooked deployment is captured into the same Program Asset path as every other
+authored form. Session contains only backend/context lifecycle and generation
+state. Public Runtime and Program Asset modules are thin facades, and
+implementation modules never circularly re-export those facades.
 
 ## Autodiff representation boundary
 
-Autodiff is a transform of specialized, validated typed numeric functions, not
-an arbitrary Python-object Tensor element model. The transform generates
-explicit primal, tangent, adjoint, and tape values with deterministic ABI and
-cache identity. Floating leaves are differentiable; aggregates derive tangent
-structure recursively, while integer, Boolean, resource, sampler, and opaque
-leaves require an explicit custom rule. Pure-function JVP/VJP precedes
-stateful-kernel differentiation. Language v4 accepts first-order transforms
-only and explicitly rejects nested transforms, Hessians, and HVPs.
-TensorView mutation, aliasing, scatter adjoints, loops requiring tapes, and
-multi-program rendering wait for a future orchestration and effect model.
+The normative contract is
+[`../autodiff/contract.md`](../autodiff/contract.md). Autodiff is a
+VJP transform of specialized, validated typed programs, not an arbitrary
+Python-object Tensor element model. The transform generates explicit primal,
+adjoint, and bounded tape representations with deterministic ABI and cache
+identity. Floating leaves are differentiable; aggregates derive adjoint
+structure recursively, while integer, Boolean, Resource handle, sampler, and
+opaque leaves remain non-differentiable unless a versioned custom rule applies.
+Stateful Kernel and graphics VJP require ProgramGraph functionalization,
+effect/alias-safe reverse traversal, and explicit custom graphics primitives.
+The initial public surface rejects JVP, full Jacobian materialization, nested
+transforms, Hessians, and HVPs.
 Native stage compilation, compile-result normalization, variant deduplication,
-and manifest materialization live in `_shader_assets.cooking`. Tests inject
+and manifest materialization live in `_program_assets.cooking`. Tests inject
 compiler and project capabilities at that implementation boundary rather than
 patching the public facade.
 
@@ -221,12 +262,14 @@ effects from operation-name fallbacks.
 There is one Python AST-to-MLIR frontend (`FrontendCompileRequest`) and one
 native compiler implementation behind the stable C API. Interactive
 `Kernel`/`Pipeline`, the owning `_native.CompiledProgram`, `vernon-compile`,
-and the target `vernon-cook-pipeline` tool must pass the same specialized MLIR
+and the target `vernon-cook-program` tool must pass the same specialized MLIR
 and target options to that C API; none may carry an independent lowering or
 reflection path.
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
-invoke it as a subprocess.
+invoke it as a subprocess. It may write raw compiler artifacts and reflection;
+the removed `--compute-bundle` option and `compute.json` format are not
+pipeline packaging surfaces.
 
 Compilation stops at owned artifacts, reflection, and optional CPU JIT entry
 points. Creating a runtime context, loading a pipeline, and dispatching work
@@ -238,57 +281,64 @@ that result. Relocatable objects remain the persistent CPU format.
 
 Stage cache identity is derived from the semantic module ID, entry, stage,
 target options, reflected dependencies and interface, and exact artifact
-digest. PipelineAsset serialization is deliberately excluded: changing
+digest. ProgramAsset serialization is deliberately excluded: changing
 asset packaging without changing the specialized program must not create a
 different stage. Frontend specialization caches include source dependency
 hashes, enabled features, captured constants, runtime tensor shapes, and
 workgroup size. Cache hits must preserve byte-identical artifacts and canonical
 reflection; content changes must invalidate the corresponding key.
 
-## Pipeline asset declarations
+## Program Asset declarations
 
 A persistent executable is declared by one module-level
-`pipeline_asset(...)` assignment beside its entry functions. The cooker parses
+`program_asset(...)` assignment beside its entry functions. The cooker parses
 the assignment from the source AST and must not import or execute the module.
-`PipelineAsset` applies equally to compute and graphics pipelines.
+`ProgramAsset` applies equally to compute and graphics pipelines.
 
-`program=` has exactly two forms:
+`program=` accepts one of these executable source forms:
 
 - one `@kernel` entry, which defines a compute Kernel program;
-- one non-empty tuple of graphics entry functions, which defines a graphics
-  Pipeline program.
+- one `vd.pipeline(...)` graphics pipeline;
+- one initialized `Module`;
+- one explicit Program transform such as VJP.
+
+All forms lower to the same typed Program IR. A standalone compute kernel or
+graphics pipeline is a one-node Program; a Module differs only in node count.
 
 ```python
 FAST_PATH = vd.feature("FAST_PATH")
 SKIN = vd.feature("SKIN")
 
-compute_asset = vd.pipeline_asset(
+compute_asset = vd.program_asset(
     id="pipeline/simulate",
     program=simulate_kernel,
     variants=((), (FAST_PATH,)),
 )
 
-graphics_asset = vd.pipeline_asset(
+graphics_asset = vd.program_asset(
     id="pipeline/mesh",
-    program=(mesh_vertex, mesh_fragment),
+    program=vd.pipeline(mesh_vertex, mesh_fragment),
     variants=((), (SKIN,)),
 )
 ```
 
-Kernel is compute-only and Pipeline is graphics-only. A PipelineAsset cannot
-mix a Kernel entry with graphics entries. The previous
-compute-plus-vertex-plus-fragment Pipeline form is invalid.
+Kernel is compute-only and `vd.pipeline(...)` is graphics-only. An initialized
+Module may compose compute and graphics Nodes.
 
-Every graphics tuple member carries its stage kind through its decorator.
-Tuple position does not infer stage kind. A target-independent stage registry
-and topology rules validate the set and ordering. The current registry accepts
+Every graphics entry carries its stage kind through its decorator. Argument
+position does not infer stage kind. A target-independent stage registry and
+topology rules validate the set and ordering. The current registry accepts
 `vertex -> fragment`; future tessellation, task, mesh, or other graphics stages
-can use the same mechanism without changing `PipelineAsset` syntax or manifest
+can use the same mechanism without changing Program
 structure. Unknown stages, duplicate singleton stages, invalid ordering, and
 incompatible stage families are program-validation errors. Stage topology is
 part of `COMPILER_CONTRACT_VERSION` and frontend semantic identity. Stage
-additions use the existing manifest `program` map and provider shader descriptor
-array; incompatible changes bump the compiler contract.
+additions use the Program portable `stages` contract map; each variant stores
+the implementing target artifact directly at
+`artifact_system.artifacts[stage]`. Implementations must conform to the frozen
+contract for the active release line. A future incompatible topology change requires a
+separately approved contract cut; implementation work must not bump the
+contract automatically.
 
 `variants=` explicitly enumerates every accepted canonical feature
 combination, preventing implicit powerset growth. It contains at least one
@@ -297,33 +347,35 @@ the list contains no duplicate key. `()` is the empty feature key, not an
 implicit fallback. Stage compilation remains cached per entry and feature key,
 so unchanged artifacts are content-addressed and shared across variants. The
 manifest-level `features` list is exactly the union of names present in those
-keys. Features declared by source modules but omitted from every PipelineAsset
+keys. Features declared by source modules but omitted from every ProgramAsset
 variant are not part of its contract.
 
-Target architecture and target options are cooker inputs, not PipelineAsset
-source fields. A compute PipelineAsset accepts a compute target; a graphics
-PipelineAsset accepts a graphics target. The same backend-independent
-PipelineAsset may be cooked separately for multiple targets. Target and options
+Target architecture and target options are cooker inputs, not ProgramAsset
+source fields. A compute ProgramAsset accepts a compute target; a graphics
+ProgramAsset accepts a graphics target. The same backend-independent
+ProgramAsset may be cooked separately for multiple targets. Target and options
 participate in artifact and cache identity and are recorded in the resulting
 manifest, but do not alter backend-independent program semantic identity.
 
 The legacy stage-specific
-`pipeline_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
+`program_asset(compute=..., vertex=..., fragment=..., targets=...)` signature
 is rejected.
 
 ## Host orchestration boundary
 
-Multi-program orchestration, render passes, attachment load/store behavior,
-dynamic graphics state, and resource transitions belong to
-`VernonExecutionGraph` and are specified in `specs/runtime/design.md`. They do
-not change PipelineAsset syntax, compiler semantic identity, or artifact
-serialization. Runtime host orchestration remains separate from the
-compiler-internal ProgramGraph proposed for autodiff.
+Program semantic topology, attachment operations, resource transitions, and
+forward/backward/residual AD topology belong to typed Program IR. The native
+private runtime Command DAG consumes the resolved static graph and owns hazards,
+barriers, render-scope fusion, scheduling, and submission; it does not define a
+parallel deployment or AD topology. The target Program contract contains only
+static compute and graphics DAG nodes. Transfer and deployment control-flow
+nodes are excluded; structured control flow inside a compute implementation
+remains Kernel IR.
 
 Texture parameter constraints are queried through a separate `struct_size`-
-versioned runtime view so `VernonPipelineParameterView` remains ABI-stable.
-Dimension is required; manifests may additionally provide canonical
-`texture_format` names. Omitted formats are explicitly unconstrained.
+versioned runtime view so `VernonProgramParameterView` remains ABI-stable.
+The current Program contract records the required texture dimension; format remains
+unconstrained.
 
 A target is reported as available only after its complete lowering and
 artifact generation pipeline is registered. An IR-only prototype must return
@@ -351,18 +403,39 @@ SCF semantics.
 
 The external `__vernon_cpu_<module-hash>_<entry>` ABI remains a dedicated
 LLVM-only component. The module hash prevents symbol collisions when many
-objects are statically linked into one game. The wrapper validates
-`VernonCpuInvocation`, unpacks direct values, constructs the five internal
-rank-one memref arguments from each packed raw buffer pointer (zero offset,
-captured static extent or zero, unit stride), and appends the texture callback
-table. The private texture helper owns callback-table layout knowledge; generic
-Vernon conversion patterns do not. Internal entry functions and memref
-descriptors are never exported.
+objects are statically linked into one game. Every exported CPU entry accepts a
+`VernonCpuInvocation` whose argument is exactly one checked
+`VernonCpuRangeV1`; scalar-entry compatibility dispatch is not supported. The
+wrapper rejects a stale descriptor size, empty or out-of-bounds lane interval,
+zero or overflowing grid/workgroup extent, out-of-range group coordinate, and
+undersized or null common/per-invocation frames before entering the lane loop.
+The LLVM `StructLayout` for the generated descriptor is checked against the
+host C layout during compilation.
+
+The generated wrapper loops directly over one contiguous workgroup-linear lane
+interval. It derives local, workgroup, and global IDs in compiled code, selects
+either common packed frames or flattened-global per-invocation frame tables,
+unpacks direct values, constructs the internal memref arguments, and appends
+the texture callback table. There is no runtime per-lane callback or indirect
+kernel-entry call inside the loop. The private texture helper owns
+callback-table layout knowledge; generic Vernon conversion patterns do not.
+Internal entry functions and memref descriptors are never exported.
+
+Barrier-free entries are one complete range phase. If an entry contains a
+validated workgroup barrier, the ABI wrapper clones its lowered function into
+an LLVM coroutine before the standard `-O2` pipeline. Barrier calls become
+suspension points, and values live across a barrier are spilled by coroutine
+lowering into lane-owned frame storage obtained from
+`vernonCpuLaneAddressV1`. A final suspend distinguishes lane completion from a
+barrier yield. Coroutine handles and frames use reserved lane-allocation sites;
+allocation overflow or failure returns an internal error rather than
+dereferencing a null frame. The runtime advances a workgroup only when every
+range reports the same barrier site or every lane completes.
 
 Relocatable objects are the canonical persistent CPU artifact. Desktop Python
-uses the same-host LLD driver embedded in `VernonDSLCompiler` to create an
-ephemeral shared library for immediate execution. Vernon desktop/mobile builds
-link target objects into the application and register their exported wrappers;
+uses LLJIT to load the same host object directly for immediate execution.
+Vernon desktop/mobile builds link target objects into the application and
+register their exported wrappers;
 the lightweight Runtime never embeds an object linker. Initial cross-target
 support covers the compiler host and iOS arm64 Mach-O.
 
@@ -410,7 +483,7 @@ target-native inline uniforms. Elementwise operations on native matrices lower
 per column vector and reconstruct the matrix; they are distinct from `matmul`.
 
 Compiler reflection is the only source of descriptor `(set, binding)` records.
-Cooking never invents missing bindings. Current `PIPELINE_VERSION` manifests
+Cooking never invents missing bindings. Current `PROGRAM_VERSION` manifests
 retain sampler-to-texture provenance, and Runtime validates duplicate descriptors, stage
 visibility, and sampler resolution before preparing provider state. OpenGL
 accepts descriptor set zero and rejects other sets before provider mutation;
@@ -464,7 +537,7 @@ Every compile surface uses the same target-discriminated vocabulary:
 
 The C API represents these as `VernonCompileOptions.target` plus the matching
 `as.*` union member. Python exposes one frozen dataclass per target. Reflection
-and PipelineAssets serialize the same model as
+and ProgramAssets serialize the same model as
 `{"kind": <target>, "options": {...}}`; emitted language and minimum-OS
 metadata are output facts, not compile options.
 
@@ -472,7 +545,7 @@ HLSL Shader Model is likewise a compile option and is valid only for DirectX.
 The C API DirectX union member and cooker encode it as major times ten plus minor (`60` for
 Shader Model 6.0), defaulting to `60` and rejecting older models. It
 participates in artifact identity and is recorded in compiler reflection and
-the PipelineAsset target spec. Builds use a pinned, hash-verified official DXC
+the ProgramAsset target spec. Builds use a pinned, hash-verified official DXC
 redistributable so developer and CI artifacts share the same compiler.
 `VERNON_DXC_EXECUTABLE` remains an explicit override for offline and managed
 toolchains. The cooker strips debug/reflection data for deterministic runtime
@@ -484,7 +557,7 @@ Every DSL function has exactly one explicit kind. The currently implemented
 entry decorators are `@kernel`, `@vertex`, and `@fragment`; `@func` declares a
 private, stage-polymorphic helper. Future graphics entry decorators register a
 stage kind and topology constraints under `COMPILER_CONTRACT_VERSION` rather
-than changing PipelineAsset syntax. The module graph preserves helper
+than changing ProgramAsset syntax. The module graph preserves helper
 dependency hashes, rejects recursion and calls to entries, and the normal
 per-stage compiler validation checks an inlined helper's operations against
 each reachable stage. Requiring `@func` avoids silently treating unrelated
@@ -523,7 +596,8 @@ stage suffix. This preserves location-based linkage without discarding author
 names or requiring GLSL 4.30 varying-location qualifiers.
 
 Unbound graphics uniforms use target-specific SPIR-V interfaces. Vulkan packs
-them into one aligned push-constant block per stage, while OpenGL, OpenGL ES,
+them into one aligned push-constant block per module role within the graphics
+StageArtifact, while OpenGL, OpenGL ES,
 and Metal represent each value as a separately named `UniformConstant` so
 SPIRV-Cross preserves plain source-level uniforms. Explicitly descriptor-bound
 uniforms remain `Uniform` blocks.
@@ -566,6 +640,8 @@ the same path as explicitly annotated inputs. Generated inputs carry
 `vernon.implicit` metadata and deterministic source names. `resolution()` is a
 generated viewport uniform; fragment/vertex hardware values use SPIR-V builtin
 decorations.
+Deployment reflection normalizes these generated inputs to StageArtifact
+`system` endpoints. They do not become Program Parameters or Values.
 
 Raw `builtin(...)` annotations use the same closed stage/direction/type
 contracts as generated inputs. In particular, graphics IDs are `u32`,
@@ -642,28 +718,75 @@ Lowering walks those typed records and uses the attached AST only as source
 syntax/location payload; promotion, overload resolution, and loop convergence
 remain exclusively in semantic analysis.
 
-## Persistent asset contract
+## Persistent Program asset contract
 
-The target `vernon-cook-pipeline` command emits one PipelineAsset manifest and
-content-addressed external artifacts. It compiles in process through
-`vernon_dsl._native`; there is no compiler-executable argument or compatibility
-manifest. For runtime-backed targets, Runtime validates manifest structure,
+The target `vernon-cook-program` command emits exactly one Program object and
+content-addressed external StageArtifacts, exactly one per selected stage ID;
+nodes may share a stage ID, and a graphics StageArtifact contains both shader
+modules. The Program directly contains
+`stages`, `parameters`, `storages`, `values`, `graphs`, and `abi`.
+`stages` identify portable StageContracts; each variant stores its target
+StageArtifact directly at `artifact_system.artifacts[stage]`, without a second
+name-binding authority. The
+command compiles in process through
+`vernon_dsl._native`; there is no compiler-executable argument, compatibility
+manifest, legacy profile input, or direct topology. For runtime-backed targets,
+`ResolveProgram` validates Program structure,
 content hashes, artifact paths, sizes, digests, reflection, and exact feature
-keys. Metal MSL manifests are consumed by the Metal Runtime on Apple; that path
+keys. Metal MSL artifacts are consumed by the Metal Runtime on Apple; that path
 is part of the stable Apple Silicon macOS compute and offscreen graphics
-subset. DirectX DXIL manifests use the Windows D3D12 runtime backend.
+subset. DirectX DXIL stage artifacts resolve through the Windows D3D12 runtime
+backend.
 
-Runtime-backed PipelineAssets also carry hash-covered `runtime_requirements`.
-The cooker derives these from the emitted object,
-GLSL, SPIR-V, PTX, MSL, or DXIL artifact and aggregates sorted reflection
-features.
-Requirements do not participate in stage artifact identity, so content
-addressing and cross-variant artifact deduplication remain stable.
-The canonical `target` object is a tagged union with `kind` and one
+The current Program contract is intentionally artifact-incompatible with pre-Program
+artifacts: loaders do not
+reinterpret old pipeline or profile manifests as Programs. Primal Programs contain only a forward graph.
+Differentiated Programs contain forward and backward graphs plus residual and
+ProgramABI derivative-projection metadata. CPU cooking writes the same Program, a
+content-addressed relocatable `.o`/`.obj`, and generated static-registration
+`.c`/`.h` sources.
+
+`StorageDescriptor` is the sole authority for resource allocation identity,
+layout, extent, lifetime, and ownership. Program control metadata is entry-only
+and cannot override it. Resources use ordinary public ProgramABI output slots.
+The cooker emits no copied `parameters`/`internal_parameters`/`uses` tracks and
+no compatibility name-binding table.
+
+Each StageArtifact carries hash-covered `runtime_requirements` derived from
+its emitted object, GLSL/GLES, SPIR-V, PTX, MSL, or DXIL modules and portable
+reflection features. Each cooked variant carries the aggregate of only its
+reachable StageArtifacts.
+Each StageArtifact ID hashes the selected compiler and Program contract pair,
+ArtifactSystem target, and its own requirements together with its code
+modules, entry points, and reflection.
+Code Blobs retain independent content hashes,
+so identical module bytes can still be deduplicated without allowing a
+requirement or ABI change to retain stage identity.
+The artifact-system `target` descriptor is a tagged union with `kind` and one
 backend-specific `options` object; it describes compilation inputs.
 `runtime_requirements` describe the resulting artifact's minimum execution environment. Metal requirements
 record the Apple platform, MSL version, minimum OS version, and required
 features.
+
+Every node stage resolves through the ArtifactSystem to one strict
+StageArtifact. Compute artifacts contain one compute module. Graphics
+artifacts contain ordered vertex and fragment modules. Each module records its
+exact deployment format, authenticated Blob range, and entry point; filename
+or extension inference is forbidden. Supported deployment formats are CPU
+relocatable object, PTX, SPIR-V, GLSL/GLES, MSL, and DXIL.
+One cooked bundle contains one target ArtifactSystem and all feature variants
+for that target. Multi-target deployment emits separate bundles.
+Artifact reflection emits the closed endpoint resource-layout and portable
+ABI slots from the Program manifest Appendix B. Backend lowering maps these
+slots deterministically to native locations; descriptor sets, root
+parameters, Metal indices, and GL locations are not manifest fields. Legacy
+`entries[].arguments[].physical_layouts` is not carried into the new pair.
+
+The compiler serializes no node `dependencies` member. It emits Value SSA,
+ResourceAccess version transitions, and canonical node order; ResolveProgram
+derives producer and overlapping-resource RAW/WAR/WAW edges exactly as
+specified by the Program manifest. The compiler rejects forked Storage
+versions before cooking.
 
 ## Language representation boundary
 
@@ -715,15 +838,14 @@ decompose it recursively. Reflection records the generated leaf bindings so
 CPU, CUDA, Vulkan, and OpenGL bind one source argument to every generated
 descriptor without exposing this representation in the language or runtime API.
 
-Autodiff is a deterministic transform of specialized, validated typed Value
-IR. Generated primal, tangent, adjoint, and tape objects remain ordinary typed
-representations; gradients use separate companion Storage. V4 accepts
-first-order pure transforms only. Mutation, Storage effects, aliasing,
-gather/scatter accumulation, loops requiring tapes, checkpointing, and
-effect-preserving reverse traversal require a future compiler-internal
-ProgramGraph before stateful-kernel differentiation can be accepted. That
-graph represents one specialized program and is not a deployment asset or
-multi-program orchestration model.
+Autodiff is a deterministic VJP transform of specialized, validated typed
+Program IR. Generated primal, adjoint, and tape objects remain ordinary typed
+representations; mutable inputs produce separate owned gradient Storage.
+Program VJP alone constructs the Program forward graph, backward graph, and
+residual contract, including fan-in accumulation. Kernel structured VJP is only
+a compute-node implementation transform and owns only its local tape ABI.
+The private runtime Command DAG executes the resolved Program topology; it does not
+compose node profiles into a second reverse topology.
 
 Vertex and instance Tensor inputs use one rank-independent attribute ABI.
 Positive static logical shapes are flattened in row-major order and partitioned

@@ -44,7 +44,8 @@ def Vernon_TensorType : TypeDef<Vernon_Dialect, "Tensor"> {
     TypeParameter<"::mlir::Type", "element type">:$elementType,
     ArrayRefParameter<"int64_t", "static shape">:$shape
   );
-  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `>`";
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
 }
 
 def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
@@ -57,7 +58,7 @@ def Vernon_TensorViewType : TypeDef<Vernon_Dialect, "TensorView"> {
     StringRefParameter<"device, workgroup, or private address space">:$addressSpace
   );
   let genVerifyDecl = 1;
-  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `,` $access `,` $addressSpace `>`";
+  let hasCustomAssemblyFormat = 1;
 }
 
 def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
@@ -65,14 +66,52 @@ def Vernon_TextureType : TypeDef<Vernon_Dialect, "Texture"> {
   let summary = "Sampled or storage texture resource";
   let parameters = (ins
     StringRefParameter<"texture dimension">:$dimension,
-    TypeParameter<"::mlir::Type", "sample element type">:$elementType
+    TypeParameter<"::mlir::Type", "texel element type">:$elementType,
+    StringRefParameter<"storage image format or unknown">:$format,
+    StringRefParameter<"sampled, read, write, or read_write access">:$access
   );
-  let assemblyFormat = "`<` $dimension `,` $elementType `>`";
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $dimension `,` $elementType `,` $format `,` $access `>`";
 }
 
 def Vernon_SamplerType : TypeDef<Vernon_Dialect, "Sampler"> {
   let mnemonic = "sampler";
   let summary = "Texture sampling state";
+}
+
+//===----------------------------------------------------------------------===//
+// Internal logical autodiff types
+//===----------------------------------------------------------------------===//
+
+def Vernon_AdTapeType : TypeDef<Vernon_Dialect, "AdTape"> {
+  let mnemonic = "ad_tape";
+  let summary = "Backend-neutral ownership handle for one autodiff invocation tape";
+  let description = [{
+    An internal logical handle for the tape owned by one differentiated
+    invocation. Its physical representation is intentionally unspecified.
+  }];
+}
+
+def Vernon_AdRegionHeaderType : TypeDef<Vernon_Dialect, "AdRegionHeader"> {
+  let mnemonic = "ad_region_header";
+  let summary = "Backend-neutral handle for one dynamic autodiff region";
+  let description = [{
+    Identifies a checked dynamic-region header in an invocation tape. Region
+    headers record logical record location, execution count, exit kind, and
+    nested-region identity without exposing a physical backend layout.
+  }];
+}
+
+def Vernon_AdAdjointBufferType : TypeDef<Vernon_Dialect, "AdAdjointBuffer"> {
+  let mnemonic = "ad_adjoint_buffer";
+  let summary = "Invocation-local mutable Storage adjoint state";
+  let parameters = (ins
+    TypeParameter<"::mlir::Type", "scalar derivative type">:$elementType,
+    ArrayRefParameter<"int64_t", "flattened runtime-capable shape">:$shape,
+    "unsigned":$indexRank
+  );
+  let genVerifyDecl = 1;
+  let assemblyFormat = "`<` $elementType `,` `[` $shape `]` `,` $indexRank `>`";
 }
 
 #endif // VERNON_TYPES

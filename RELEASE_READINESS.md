@@ -1,56 +1,63 @@
-# VernonDSL 0.1.1 release readiness
+# VernonDSL 0.1.2 release readiness
 
-Assessment date: 2026-08-02
+Status: active release checklist.
 
-## Release decision
+`0.1.2` is publishable only from an exact commit for which every required gate
+is green. [`versions.toml`](versions.toml) is the only manually edited version
+source.
 
-`0.1.1` is publishable only from an exact commit for which every required gate
-below is green. `versions.toml` is the single manually edited version source.
+## Release contract
 
-## Supported distribution
-
-- Windows x64, Linux x64, and Apple Silicon macOS wheels;
+- latest released version 0.1.1;
+- release target 0.1.2;
+- Compiler Contract 1;
+- Program Version 1;
 - CPython 3.11 through 3.14;
-- wheel-only distribution for `0.1.1`; no sdist or Intel macOS wheel;
-- compiler contract 9 and pipeline contract 12.
+- Windows x64, Linux x64, and Apple Silicon macOS wheels;
+- wheel-only distribution with no sdist, Intel macOS, PyPy, or 32-bit wheel.
 
-Backend capabilities and limitations are defined in
-[`RELEASE_NOTES.md`](RELEASE_NOTES.md) and [`SUPPORT.md`](SUPPORT.md). Public
-surface and compatibility guarantees are defined in
-[`PUBLIC_API.md`](PUBLIC_API.md) and [`COMPATIBILITY.md`](COMPATIBILITY.md).
+Backend capabilities are defined by [`RELEASE_NOTES.md`](RELEASE_NOTES.md) and
+[`SUPPORT.md`](SUPPORT.md). Public and compatibility boundaries are defined by
+[`PUBLIC_API.md`](PUBLIC_API.md) and
+[`COMPATIBILITY.md`](COMPATIBILITY.md).
 
 ## Required gates
 
-- [ ] `versions.toml` and all generated version files report `0.1.1`.
-- [ ] Native CTest and Python tests pass on Linux, macOS, and Windows on the
-      exact release commit.
-- [ ] Windows formatting, Ruff, Python coverage, and Runtime AddressSanitizer
-      gates pass on that commit; generated-version validation passes in the
-      release workflow.
+- [ ] `versions.toml` and all generated files report release 0.1.2, Compiler
+      Contract 1, and Program Version 1.
+- [ ] Native builds and all CTest tests pass on Linux, macOS, and Windows.
+- [ ] The complete Python suite and MLIR lit suite pass on every required host.
+- [ ] Cross-backend language and Program matrices run every applicable case;
+      every skip identifies an unavailable platform, device, context, API
+      version, or capability.
+- [ ] CPU, Vulkan, CUDA, DirectX 12, Metal, OpenGL, and OpenGL ES execute on
+      the release hardware assigned to their gates.
+- [ ] A physical Apple Silicon Mac runs Metal compute, graphics, Program VJP,
+      argument-buffer, dispatch, and readback acceptance.
+- [ ] The independent wasm32 build/runtime gate passes, including external
+      engine browser rendering and CPU checksum verification.
+- [ ] Formatting, Ruff, Python coverage, generated-version validation, and
+      Runtime sanitizers pass.
 - [ ] Windows x64, manylinux x64, and macOS arm64 wheels build for CPython
-      3.11–3.14, pass metadata/platform auditing, and install in clean
-      environments.
-- [ ] Every installed wheel passes CPU dispatch/readback, frontend and cooker
-      module CLI, and bundled Runtime-source presence/version checks.
-- [ ] A physical Apple Silicon Mac executes Metal compute, graphics, Argument
-      Buffer, dispatch, and readback acceptance. Hosted virtual Metal skips are
-      not sufficient for this gate.
-- [ ] The release workflow produces one immutable set of wheels, SHA256 sums,
-      SBOM, and provenance, stages those files in a GitHub Release, and
-      publishes the wheels to PyPI through Trusted Publishing.
-- [ ] Clean CPython 3.11 environments on Windows, Linux, and macOS install
-      `vernon-lang==0.1.1` from PyPI and repeat the installed-wheel smoke test
-      before the GitHub Release leaves draft state.
+      3.11–3.14 and pass metadata/platform auditing.
+- [ ] Every wheel installs in a clean environment and passes CPU
+      dispatch/readback, frontend, cooker, and bundled Runtime-source checks.
+- [ ] Release artifacts contain exactly the expected wheels, SHA256SUMS, SPDX
+      SBOM, and provenance.
+- [ ] The release workflow publishes through the configured PyPI Trusted
+      Publisher and verifies installation from PyPI before finalizing GitHub
+      Release.
 
 ## Publication procedure
 
-1. Merge the release changes through review.
-2. Require all platform and wheel checks on that exact merged commit.
-3. Verify the PyPI `pypi` environment and Trusted Publisher configuration.
-4. Create the immutable `v0.1.1` tag on that commit.
-5. Let the release workflow build, verify, attest, stage, publish, verify from
-   PyPI, and then finalize the GitHub Release.
-6. Verify GitHub Release and PyPI filenames, hashes, version, and clean install.
+1. Merge all release changes through review.
+2. Require every release gate on the exact merged commit.
+3. Verify the PyPI environment and Trusted Publisher configuration.
+4. Create immutable tag `v0.1.2`.
+5. Build, audit, attest, and stage the complete artifact set.
+6. Publish to PyPI.
+7. Install and verify the published wheels on Linux, macOS, and Windows.
+8. Finalize the GitHub Release only after published verification succeeds.
 
-Do not move or reuse a failed tag. Any source or packaging change requires a
-new version and a complete rerun of the release gates.
+Do not move or reuse a failed tag. Any source or packaging change after tag
+creation requires a new version and a complete gate rerun.

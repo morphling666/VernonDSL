@@ -2,8 +2,8 @@
 
 #if defined(VERNON_HAS_CUDA_RHI)
 
-#include "../../rhi/cuda_backend.h"
-#include "../../rhi/rhi_internal.h"
+#include "rhi/cuda_backend.h"
+#include "rhi/rhi_internal.h"
 
 #include <algorithm>
 #include <cassert>
@@ -246,11 +246,12 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         if (value->kind != slot.layout.kind)
             return fail(adapter, "CUDA binding slot or kind does not match the prepared layout");
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            const DevicePointer resource = resolveRhiResource(adapter, value->resource);
-            if (!resource || value->resource.size == 0)
+            const auto &reference = value->payload.buffer.resource;
+            const DevicePointer resource = resolveRhiResource(adapter, reference);
+            if (!resource || reference.size == 0)
                 return fail(adapter, "CUDA storage-buffer binding is invalid");
-            bindings.resolvedValues[index] = resource + value->resource.offset;
-        } else if (!value->inline_data || value->inline_size != slot.inlineStorage.size())
+            bindings.resolvedValues[index] = resource + reference.offset;
+        } else if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.inlineStorage.size())
             return fail(adapter, "CUDA inline binding size changed after preparation");
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
@@ -259,11 +260,11 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         slot.resourceReference = {};
         if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const DevicePointer pointer = bindings.resolvedValues[index];
-            bindings.descriptors[slot.descriptorOffset] = {pointer, pointer, 0,
-                                                           value->resource.size / slot.layout.element_size, 1};
-            slot.resourceReference = value->resource;
+            bindings.descriptors[slot.descriptorOffset] = {
+                pointer, pointer, 0, value->payload.buffer.resource.size / slot.layout.element_size, 1};
+            slot.resourceReference = value->payload.buffer.resource;
         } else
-            std::memcpy(slot.inlineStorage.data(), value->inline_data, value->inline_size);
+            std::memcpy(slot.inlineStorage.data(), value->payload.inline_value.data, value->payload.inline_value.size);
     }
     return VERNON_STATUS_OK;
 }
@@ -312,9 +313,9 @@ VernonStatus createBindingSet(void *data, const VernonRuntimeProviderBindingSetD
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER)
                 continue;
             const auto &value = descriptor->values[bindings->valueIndices[index]];
-            if (!value.inline_data || value.inline_size == 0)
+            if (!value.payload.inline_value.data || value.payload.inline_value.size == 0)
                 return fail(adapter, "CUDA inline binding requires initial storage");
-            slot.inlineStorage.resize(value.inline_size);
+            slot.inlineStorage.resize(value.payload.inline_value.size);
         }
         bindings->descriptors.resize(descriptorCount);
         bindings->parameters.resize(parameterCount);
@@ -413,7 +414,7 @@ void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
 
 void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.struct_size = sizeof(adapter.provider);
-    adapter.provider.abi_version = VERNON_PIPELINE_VERSION;
+    adapter.provider.abi_version = VERNON_PROGRAM_VERSION;
     adapter.provider.user_data = &adapter;
     adapter.provider.get_capabilities = getCapabilities;
     adapter.provider.get_device_identity = getDeviceIdentity;
@@ -422,6 +423,7 @@ void initializeCudaProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.prepare_pipeline = preparePipeline;
     adapter.provider.retain_resource = retainResource;
     adapter.provider.release_resource = releaseResource;
+    adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindingSet;
     adapter.provider.update_binding_set = updateBindingSet;
     adapter.provider.encode_dispatch = encodeDispatch;

@@ -4,8 +4,11 @@
 #include "VernonRHI.h"
 #include "vulkan_driver.h"
 
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace vernon::rhi::vulkan {
 
@@ -26,14 +29,22 @@ inline VkImageAspectFlags imagePrimaryCopyAspectMask(VkFormat format) {
 struct Buffer {
     VkBuffer buffer{};
     VkDeviceMemory memory{};
+    uint8_t *mapped{};
     bool owned{true};
 };
 
 struct Image {
+    struct LayoutJournal {
+        VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+        std::vector<VkImageLayout> subresources;
+    };
+
     VkImage image{};
     VkDeviceMemory memory{};
     VkImageView view{};
     VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+    std::vector<VkImageLayout> subresourceLayouts;
+    std::unordered_map<uint64_t, LayoutJournal> layoutJournals;
     VkFormat format{VK_FORMAT_UNDEFINED};
     bool colorAttachment{};
     bool owned{true};
@@ -46,9 +57,9 @@ struct Sampler {
 
 struct VERNON_RHI_CAPI DeviceState {
     struct CommandFrame {
+        VkCommandPool pool{};
         VkCommandBuffer command{};
         VkFence fence{};
-        bool submitted{};
     };
 
     struct StagingRing {
@@ -68,6 +79,7 @@ struct VERNON_RHI_CAPI DeviceState {
     bool synchronize(std::string &error);
     bool beginCommands(VkCommandBuffer &command, std::string &error);
     bool submitCommands(VkCommandBuffer command, std::string &error);
+    void abandonCommands(VkCommandBuffer command);
     std::optional<uint32_t> findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required,
                                            VkMemoryPropertyFlags preferred = 0) const;
     bool createBuffer(Buffer &buffer, VkDeviceSize size, VkBufferUsageFlags usage,
@@ -96,13 +108,15 @@ struct VERNON_RHI_CAPI DeviceState {
     uint32_t maxComputeWorkGroupSize[3]{};
     VkDeviceSize descriptorBufferOffsetAlignment{1};
     bool dynamicRendering{};
+    bool shaderBufferFloat32AtomicAdd{};
     bool portabilityEnumeration{};
     bool portabilitySubset{};
     bool nativeObjectsBorrowed{};
     VkCommandBuffer borrowedCommandBuffer{};
-    VkCommandPool commandPool{};
-    CommandFrame frame;
+    std::vector<CommandFrame> availableCommandFrames;
+    std::unordered_map<uintptr_t, CommandFrame> activeCommandFrames;
     VkDescriptorPool descriptorPool{};
+    std::mutex descriptorMutex;
     VkPhysicalDeviceMemoryProperties memoryProperties{};
     Sampler defaultImplicitSampler;
     size_t defaultImplicitSamplerCreations{};

@@ -74,7 +74,7 @@ class InferenceBackendNumericTests(unittest.TestCase):
         inferred_numeric(
             output,
             vd.storage.from_numpy(values),
-            grid=(values.size, 1, 1),
+            grid=((values.size + 7) // 8, 1, 1),
         )
         return output.to_numpy()
 
@@ -124,7 +124,7 @@ class InferenceBackendNumericTests(unittest.TestCase):
                         kernel(
                             output,
                             vd.storage.from_numpy(values_array),
-                            grid=(values_array.size, 1, 1),
+                            grid=((values_array.size + 7) // 8, 1, 1),
                         )
                     except RuntimeError as error:
                         message = str(error).lower()

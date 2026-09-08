@@ -20,11 +20,15 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUABI.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonStorageProjection.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -87,13 +91,23 @@ void registerVernonCpuPipelineDialects(DialectRegistry &registry) {
 
 void buildVernonCpuPreparationPipeline(OpPassManager &passManager) {
     passManager.addPass(createVernonValidatePass());
+    passManager.addPass(createVernonVerifyCPUAutodiffABIPass());
     passManager.addPass(createVernonInlineHelpersPass());
+    passManager.addPass(createVernonPrepareCPUAutodiffSignaturesPass());
+    passManager.addPass(createVernonLowerCPUAutodiffPass());
     passManager.addPass(std::make_unique<MaterializeStorageProjectionPass>());
+    passManager.addPass(createVernonCPUAutodiffToLLVMPass());
 }
 
 void buildVernonCpuLoweringPipeline(OpPassManager &passManager) {
+    passManager.addPass(createVernonLowerAccumulationPass(
+        AccumulationTargetCapabilities{{AtomicAddImplementation::Native, AtomicAddImplementation::Native},
+                                       {AtomicAddImplementation::Native, AtomicAddImplementation::Native},
+                                       AggregateGradientStorage::InvocationPrivateStaging,
+                                       /*supportsWorkgroupReduction=*/false}));
+    passManager.addPass(createVernonLowerCPUABIPass());
     passManager.addPass(createVernonLowerCPUTensorsPass());
-    passManager.addPass(createVernonLowerSynchronizationPass());
+    passManager.addPass(createVernonLowerCPUSynchronizationPass());
     passManager.addPass(createVernonLowerCPUResourcesPass());
     passManager.addPass(createSCFToControlFlowPass());
     passManager.addPass(createConvertToLLVMPass());

@@ -1,23 +1,22 @@
 # Tensor and TensorView contract
 
-## Status
+Status: normative Tensor-family detail for the language contract.
 
-This document records the accepted Tensor-family design and the in-progress v4
-migration of the TensorView shape model and workgroup storage model. The old
+This document records the accepted Tensor-family design and TensorView shape
+and workgroup storage model. The old
 `workgroup_array` and `!vernon.workgroup` forms are removed directly; no
 aliases, parser fallbacks, IR translations, reflection readers, or runtime
 compatibility paths are added.
 
-The released Python frontend remains language version 3 while this v4 design is
-implemented and validated; the current code has no numeric `FRONTEND_VERSION`
-constant. Source syntax, typed IR, and compile-time tests cover unified
+The current code has no numeric `FRONTEND_VERSION` constant. Source syntax,
+typed IR, and compile-time tests cover unified
 TensorView load/store/atomic operations, workgroup address space, and
-`workgroup_storage`. The 0.1.1 Runtime descriptor ABI accepts dynamic shape,
+`workgroup_storage`. The Runtime descriptor ABI accepts dynamic shape,
 signed stride, and offset as invocation data without layout-specific
 recompilation. Broader language-v4 parity and validation remain tracked in
-the [project roadmap](../roadmap.md#language-v4). Serialized reflection,
-pipeline, and invocation ABI versions are bumped wherever this migration
-changes their records.
+the [language roadmap](future_language_roadmap.md). Serialized reflection,
+Program, and invocation ABI versions are changed only through their
+authoritative contract version sources.
 
 ## 1. Tensor family and semantic categories
 
@@ -75,6 +74,7 @@ TensorView[element_type, shape, access]
 Examples:
 
 ```python
+TensorView[f32, (), read_write]
 TensorView[f32, (4, 4), read]
 TensorView[f32, (vd.dyn, 4), read]
 TensorView[Particle, (vd.dyn,), read_write]
@@ -86,6 +86,14 @@ TensorView[Particle, (vd.dyn,), read_write]
 TensorView dimension. It is not callable. Every static extent is a positive
 integer; a runtime extent resolving `vd.dyn` is non-negative. Rank is explicit
 because every dimension occupies one shape entry.
+
+The empty shape `()` is the canonical rank-zero form. It models one scalar
+storage cell rather than an empty collection. Device code loads and stores it
+with `view[()]`; host code uses the same `view[()]` spelling or NumPy's 0-d
+`array[()]`/`item()` APIs. Its runtime descriptor has rank zero, null
+shape/stride arrays, and still carries the storage offset. Rank-zero
+`workgroup_storage` is the corresponding one-cell workgroup allocation; the
+positive-extent rule applies to every dimension that is present.
 
 Shape is part of the source TensorView contract. Strides and offset are
 concrete view-layout metadata and do not participate in core source type
@@ -191,6 +199,20 @@ Static source extents, bounds, internal injectivity, owner lifetime, and
 overlapping read/write borrows are validated. Multiple views can share an
 owner when their accessed regions are compatible.
 
+Autodiff creates a separate host-owned tangent allocation rather than writing
+through a primal owner. Scalar elements use the promoted derivative dtype.
+Aggregate elements use the structural `TangentLayout` defined by
+[`autodiff/contract.md`](../autodiff/contract.md#3-value-storage-and-resource-gradients):
+Vector, Matrix, Tensor, Tuple, and Struct dimensions and paths remain element
+structure, while f16 leaves promote to f32 and non-differentiable leaves become
+zero tangent nodes. The tangent layout may have different offsets and stride
+from the primal canonical Value ABI and must not be used to reinterpret primal
+bytes.
+
+All compatible differentiated views of one owner scatter-add into one fresh
+tangent owner. Separately bound overlapping read/write views remain invalid;
+one legal read-write binding is handled through explicit Storage versions.
+
 ## 6. Workgroup storage
 
 The source constructor is:
@@ -238,9 +260,12 @@ exactly one integer index per dimension. `atomic_add(storage[y, x], value)` is
 invalid because the subscript denotes an ordinary load, not an lvalue
 reference.
 
-The first atomic element set remains `i32` and `u32`. Wider integers and
-floating-point atomics require explicit backend capability contracts and are
-not emulated implicitly.
+All four atomic operations accept `i32` and `u32`. `atomic_add` also accepts
+`f32` and `f64` when the selected target profile declares a legal native or
+integer-compare-exchange implementation for that type and scope. Unsupported
+floating-point combinations are rejected during capability validation rather
+than silently narrowed or executed non-atomically. Wider integer atomics are
+not part of the current contract.
 
 Atomic scope is inferred from address space:
 
@@ -252,7 +277,11 @@ device TensorView    -> device scope
 Atomic scope is not a public argument. Atomic ordering remains represented in
 typed effects; initial public operations request `relaxed`, and a backend may
 strengthen but not weaken it. Barrier scope remains explicit because a barrier
-has no storage operand.
+has no storage operand. `vd.workgroup_barrier()` requests an acquire-release
+workgroup-scope barrier; `vd.storage_barrier()` requests an acquire-release
+device-scope barrier. Both are compute-only and accept no arguments. A target
+without a legal requested scope rejects the operation during capability
+validation.
 
 ## 8. Vernon IR contract
 
@@ -295,29 +324,16 @@ bindings, and the offset/extent/stride descriptor binding sequence. Concrete
 dispatch values are never reflected. The capability name remains
 `tensor_views`.
 
-Native runtime records use `VernonTensorView`; the invocation ABI version is
-bumped when descriptor fields change. Reflection and pipeline schemas are
-bumped together, and old schema readers are removed rather than translated.
+Native runtime records use `VernonTensorView`. Its serialized descriptor is
+frozen for the active release line; backend implementations must conform to it. A future
+descriptor change requires an explicitly approved Program Version cut. Old
+schema readers are removed rather than translated.
 
 Workgroup TensorViews are compile-time kernel state, not host-bound arguments.
 Required workgroup bytes and synchronization features are reflected only where
 backend/device capability validation needs them.
 
-## 10. Acceptance tests
+## 10. Conformance
 
-Acceptance requires:
-
-- static, dynamic, and mixed TensorView shape parsing and runtime matching;
-- strict Tensor versus TensorView host binding;
-- full-owner and explicit subview dispatch;
-- disjoint and overlapping views sharing one owner;
-- graphics Tensor attributes sourced from bound vertex storage;
-- multidimensional workgroup load/store and row-major projection;
-- workgroup storage of Scalar, Tensor, Tuple, and Struct Value elements;
-- rank-one and tuple atomic indexing with inferred scope;
-- independent allocations across multiple workgroups;
-- barrier-visible writes within one workgroup;
-- backend-independent verifier tests plus runtime parity on every available
-  CUDA, Vulkan, OpenGL, and DirectX backend;
-- rejection of old workgroup source names, old split workgroup IR, and old
-  serialized schemas.
+Tensor-family compile and runtime coverage is tracked by
+[`../testing/cross_backend_language_testing_plan.md`](../testing/cross_backend_language_testing_plan.md).

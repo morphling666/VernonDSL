@@ -1,0 +1,986 @@
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramVjp.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffRules.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonAutodiffUtils.h"
+#include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
+#include "mlir/IR/Verifier.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/ADT/StringMap.h"
+
+#include <algorithm>
+#include <limits>
+
+using namespace mlir;
+
+namespace mlir::vernon::program {
+namespace {
+
+FailureOr<Type> derivativeType(Type type, Operation *scope) {
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return failure();
+    return getAutodiffDerivativeType(type, module);
+}
+
+FailureOr<Type> cotangentType(Type type, Operation *scope) {
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return failure();
+    return getAutodiffDerivativeType(type, module, "read");
+}
+
+FailureOr<Type> gradientDestType(Type type, Operation *scope) {
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return failure();
+    return getAutodiffDerivativeType(type, module, "write");
+}
+
+ProgramLanguageAbi derivativeLanguageAbi(Type primalType, DictionaryAttr primalAttrs, Type derivativeType,
+                                         Operation *scope) {
+    ProgramLanguageAbi primalAbi = programLanguageAbiFromAttrs(primalAttrs, primalType);
+    ModuleOp module = scope->getParentOfType<ModuleOp>();
+    if (!module)
+        return {};
+    FailureOr<SmallVector<StringRef>> leaves =
+        getAutodiffDerivativeLogicalLeafDtypes(primalType, module, primalAbi.leaves);
+    if (failed(leaves))
+        return {};
+    ProgramLanguageAbi derivativeAbi;
+    derivativeAbi.leaves = std::move(*leaves);
+    if (derivativeAbi.leaves.size() == 1)
+        derivativeAbi.dtype = derivativeAbi.leaves.front();
+    if (failed(getAutodiffDerivativeValueLayout(primalType, derivativeType, module, derivativeAbi.leaves)))
+        return {};
+    return derivativeAbi;
+}
+
+ProgramLanguageAbi derivativeLanguageAbi(Value primal, Type derivativeType) {
+    if (primal.getType() == derivativeType)
+        return getProgramValueLanguageAbi(primal);
+    if (auto argument = dyn_cast<BlockArgument>(primal))
+        if (auto function = dyn_cast<func::FuncOp>(argument.getOwner()->getParentOp()))
+            return derivativeLanguageAbi(primal.getType(), function.getArgAttrDict(argument.getArgNumber()),
+                                         derivativeType, function);
+    return {};
+}
+
+Value createProgramIntrinsic(OpBuilder &builder, Location location, StringRef name, ValueRange operands,
+                             Type resultType, ArrayRef<NamedAttribute> attributes = {}) {
+    OperationState state(location, IntrinsicOp::getOperationName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttribute("name", builder.getStringAttr(name));
+    state.addAttributes(attributes);
+    return builder.create(state)->getResult(0);
+}
+
+SmallVector<int64_t, 3> linearizedLaunchGrid(Type type) {
+    auto view = dyn_cast<TensorViewType>(type);
+    if (!view)
+        return {1, 1, 1};
+    ArrayRef<int64_t> shape = view.getShape();
+    if (!llvm::all_of(shape, [](int64_t extent) { return extent >= 0; }))
+        return {1, 1, 1};
+    int64_t count = 1;
+    for (int64_t extent : shape) {
+        const int64_t factor = std::max<int64_t>(extent, 1);
+        if (count > std::numeric_limits<int64_t>::max() / factor)
+            return {1, 1, 1};
+        count *= factor;
+    }
+    return {count, 1, 1};
+}
+
+bool hasDynamicExtent(Type type) {
+    auto view = dyn_cast<TensorViewType>(type);
+    return view && llvm::any_of(view.getShape(), [](int64_t extent) { return extent < 0; });
+}
+
+Value createZero(OpBuilder &builder, Location location, Type type, Value like = {}) {
+    if (auto scalar = dyn_cast<FloatType>(type))
+        return arith::ConstantOp::create(builder, location, builder.getFloatAttr(scalar, 0.0));
+    if (isa<TensorViewType>(type)) {
+        Value zero = like && hasDynamicExtent(type)
+                         ? createProgramIntrinsic(builder, location, "zeros_like", like, type)
+                         : createProgramIntrinsic(builder, location, "zeros", {}, type);
+        if (like)
+            applyProgramLanguageAbi(zero.getDefiningOp(), derivativeLanguageAbi(like, type));
+        return zero;
+    }
+    if (isa<TensorType>(type)) {
+        Value zero = createProgramIntrinsic(builder, location, "zeros", {}, type);
+        if (like)
+            applyProgramLanguageAbi(zero.getDefiningOp(), derivativeLanguageAbi(like, type));
+        return zero;
+    }
+    auto tensor = dyn_cast<RankedTensorType>(type);
+    auto element = tensor ? dyn_cast<FloatType>(tensor.getElementType()) : FloatType{};
+    if (!tensor || !element || !tensor.hasStaticShape()) {
+        if (auto tuple = dyn_cast<TupleType>(type)) {
+            SmallVector<Value> elements;
+            for (Type elementType : tuple.getTypes()) {
+                Value elementValue = createZero(builder, location, elementType);
+                if (!elementValue)
+                    return {};
+                elements.push_back(elementValue);
+            }
+            return TupleCreateOp::create(builder, location, tuple, elements);
+        }
+        return {};
+    }
+    return arith::ConstantOp::create(builder, location,
+                                     DenseElementsAttr::get(tensor, builder.getFloatAttr(element, 0.0)));
+}
+
+Value createDestinationPassingCompute(OpBuilder &builder, Location location, StringRef callee, ValueRange operands,
+                                      ArrayRef<StringRef> operandNames, ArrayRef<StringRef> operandAccesses,
+                                      Type resultType, int64_t destOperand) {
+    OperationState state(location, ComputeOp::getOperationName());
+    state.addOperands(operands);
+    state.addTypes(resultType);
+    state.addAttribute("callee", builder.getStringAttr(callee));
+    state.addAttribute("grid", builder.getDenseI64ArrayAttr(linearizedLaunchGrid(resultType)));
+    state.addAttribute("features", builder.getArrayAttr({}));
+    state.addAttribute("operand_names",
+                       builder.getArrayAttr(llvm::map_to_vector(
+                           operandNames, [&](StringRef name) -> Attribute { return builder.getStringAttr(name); })));
+    state.addAttribute("result_names", builder.getArrayAttr({builder.getStringAttr("output")}));
+    state.addAttribute(kOperandAccessesAttrName,
+                       builder.getArrayAttr(llvm::map_to_vector(operandAccesses, [&](StringRef access) -> Attribute {
+                           return builder.getStringAttr(access);
+                       })));
+    state.addAttribute("vernon_program.result_resource_sources",
+                       builder.getDenseI64ArrayAttr(SmallVector<int64_t, 1>{destOperand}));
+    Value result = builder.create(state)->getResult(0);
+    applyProgramLanguageAbi(result.getDefiningOp(), getProgramValueLanguageAbi(operands[destOperand]));
+    return result;
+}
+
+Value copyValue(OpBuilder &builder, Location location, Value source, Type destType, Value like = {},
+                bool forceBoundaryCopy = false) {
+    if (source.getType() == destType && !forceBoundaryCopy)
+        return source;
+    if (!isa<TensorViewType>(source.getType()) || !isa<TensorViewType>(destType))
+        return {};
+    Value dest = createZero(builder, location, destType, like ? like : source);
+    if (!dest)
+        return {};
+    return createDestinationPassingCompute(builder, location, "vernon.builtin.copy", {source, dest},
+                                           {"source", "output"}, {"read", "write"}, destType, 1);
+}
+
+Value addValues(OpBuilder &builder, Location location, Value left, Value right) {
+    if (left.getType() != right.getType())
+        return {};
+    if (isa<TensorViewType>(left.getType())) {
+        Value dest = createZero(builder, location, left.getType(), left);
+        if (!dest)
+            return {};
+        return createDestinationPassingCompute(builder, location, "vernon.builtin.add", {left, right, dest},
+                                               {"left", "right", "output"}, {"read", "read", "write"}, left.getType(),
+                                               2);
+    }
+    if (isa<TensorType>(left.getType()))
+        return createProgramIntrinsic(builder, location, "add", {left, right}, left.getType());
+    auto tuple = dyn_cast<TupleType>(left.getType());
+    if (!tuple)
+        return arith::AddFOp::create(builder, location, left, right);
+    SmallVector<Value> elements;
+    for (auto [index, elementType] : llvm::enumerate(tuple.getTypes())) {
+        IntegerAttr indexAttr = builder.getI64IntegerAttr(index);
+        Value leftElement = TupleGetOp::create(builder, location, elementType, left, indexAttr);
+        Value rightElement = TupleGetOp::create(builder, location, elementType, right, indexAttr);
+        Value sum = addValues(builder, location, leftElement, rightElement);
+        if (!sum)
+            return {};
+        elements.push_back(sum);
+    }
+    return TupleCreateOp::create(builder, location, tuple, elements);
+}
+
+StringRef sourceName(func::FuncOp function, unsigned argument) {
+    if (auto name = function.getArgAttrOfType<StringAttr>(argument, "vernon.source_name"))
+        return name.getValue();
+    if (auto names = function->getAttrOfType<ArrayAttr>("vernon_program.argument_names");
+        names && argument < names.size())
+        if (auto name = dyn_cast<StringAttr>(names[argument]))
+            return name.getValue();
+    return {};
+}
+
+StringRef resultSourceName(func::FuncOp function, unsigned result) {
+    if (auto name = function.getResultAttrOfType<StringAttr>(result, "vernon.source_name"))
+        return name.getValue();
+    if (auto names = function->getAttrOfType<ArrayAttr>("vernon_program.result_names"); names && result < names.size())
+        if (auto name = dyn_cast<StringAttr>(names[result]))
+            return name.getValue();
+    return {};
+}
+
+bool selectsDifferentiableBoundaryLeaf(Type boundaryType, ModuleOp module, StringRef suffix) {
+    if (suffix.empty())
+        return succeeded(getAutodiffDerivativeType(boundaryType, module));
+    Type layoutType = boundaryType;
+    if (auto view = dyn_cast<TensorViewType>(layoutType))
+        layoutType = view.getElementType();
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(layoutType, module);
+    if (failed(layout))
+        return false;
+    for (const ValueAbiLeaf &leaf : layout->leaves) {
+        if (failed(getAutodiffDerivativeScalarType(leaf.scalarType)))
+            continue;
+        const std::string leafPath = appendValueAbiPath({}, leaf.path);
+        if (leafPath == suffix || StringRef(leafPath).starts_with((suffix + ".").str()))
+            return true;
+    }
+    return false;
+}
+
+bool nestedComputeEmitsVjp(ComputeOp operation, ArrayRef<unsigned> activeOperands) {
+    for (unsigned index : activeOperands) {
+        if (isWriteOnlyProgramOperand(operation, index))
+            continue;
+        if (succeeded(derivativeType(operation.getOperand(index).getType(), operation)))
+            return true;
+    }
+    return false;
+}
+
+FailureOr<Value> retargetForwardComputeWithTape(ComputeOp compute) {
+    OpBuilder builder(compute);
+    SmallVector<Type> resultTypes(compute.getResultTypes().begin(), compute.getResultTypes().end());
+    resultTypes.push_back(AdTapeType::get(compute.getContext()));
+    SmallVector<Attribute> resultNames(compute.getResultNames().begin(), compute.getResultNames().end());
+    resultNames.push_back(builder.getStringAttr("tape"));
+    OperationState state(compute.getLoc(), ComputeOp::getOperationName());
+    state.addOperands(compute.getOperands());
+    state.addTypes(resultTypes);
+    bool sawRoles = false;
+    bool sawSources = false;
+    for (NamedAttribute attribute : compute->getAttrs()) {
+        if (attribute.getName() == "callee") {
+            state.addAttribute("callee",
+                               builder.getStringAttr((Twine(compute.getCallee()) + ".forward_with_tape").str()));
+            continue;
+        }
+        if (attribute.getName() == "result_names") {
+            state.addAttribute("result_names", builder.getArrayAttr(resultNames));
+            continue;
+        }
+        if (attribute.getName() == "vernon_program.result_resource_sources") {
+            SmallVector<int64_t> sources(cast<DenseI64ArrayAttr>(attribute.getValue()).asArrayRef());
+            sources.push_back(-1);
+            state.addAttribute(attribute.getName(), builder.getDenseI64ArrayAttr(sources));
+            continue;
+        }
+        auto rows = dyn_cast<ArrayAttr>(attribute.getValue());
+        if (attribute.getName() == "vernon_program.result_autodiff_roles" && rows) {
+            SmallVector<Attribute> values(rows.begin(), rows.end());
+            values.push_back(builder.getStringAttr("tape"));
+            state.addAttribute(attribute.getName(), builder.getArrayAttr(values));
+            sawRoles = true;
+            continue;
+        }
+        if (attribute.getName() == "vernon_program.result_autodiff_sources" && rows) {
+            SmallVector<Attribute> values(rows.begin(), rows.end());
+            values.push_back(builder.getStringAttr("tape"));
+            state.addAttribute(attribute.getName(), builder.getArrayAttr(values));
+            sawSources = true;
+            continue;
+        }
+        if (attribute.getName() == "vernon_program.result_abi_leaf_dtypes" && rows) {
+            SmallVector<Attribute> values(rows.begin(), rows.end());
+            values.push_back(builder.getArrayAttr({}));
+            state.addAttribute(attribute.getName(), builder.getArrayAttr(values));
+            continue;
+        }
+        if (attribute.getName() == "vernon_program.result_accesses" && rows) {
+            SmallVector<Attribute> values(rows.begin(), rows.end());
+            values.push_back(builder.getStringAttr("write"));
+            state.addAttribute(attribute.getName(), builder.getArrayAttr(values));
+            continue;
+        }
+        state.addAttribute(attribute.getName(), attribute.getValue());
+    }
+    if (!sawRoles) {
+        SmallVector<Attribute> roles(compute.getNumResults(), builder.getStringAttr(""));
+        roles.push_back(builder.getStringAttr("tape"));
+        state.addAttribute("vernon_program.result_autodiff_roles", builder.getArrayAttr(roles));
+    }
+    if (!sawSources) {
+        SmallVector<Attribute> sources(compute.getNumResults(), builder.getStringAttr(""));
+        sources.push_back(builder.getStringAttr("tape"));
+        state.addAttribute("vernon_program.result_autodiff_sources", builder.getArrayAttr(sources));
+    }
+    Operation *replacement = builder.create(state);
+    for (auto [source, target] : llvm::zip(compute.getResults(), replacement->getResults().drop_back()))
+        source.replaceAllUsesWith(target);
+    compute.erase();
+    return replacement->getResult(replacement->getNumResults() - 1);
+}
+
+FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const AutodiffVjpBuildContext &context, Value tape,
+                                              llvm::function_ref<Value(Value)> lookupPrimal) {
+    OpBuilder &builder = context.builder;
+    SmallVector<Value> operands;
+    if (tape)
+        operands.push_back(tape);
+    llvm::append_range(operands, context.primalOperands);
+    llvm::append_range(operands, context.primalResults);
+    llvm::append_range(operands, context.resultCotangents);
+    SmallVector<unsigned> cotangentResults;
+    if (context.activeResultIndices.empty()) {
+        for (unsigned index = 0; index < operation.getNumResults(); ++index)
+            cotangentResults.push_back(index);
+    } else {
+        llvm::append_range(cotangentResults, context.activeResultIndices);
+    }
+    if (context.resultCotangents.size() != cotangentResults.size())
+        return operation.emitOpError("Program VJP cotangent count does not match active results");
+    SmallVector<Attribute> operandNames;
+    SmallVector<Attribute> operandRoles;
+    SmallVector<Attribute> operandSources;
+    SmallVector<Attribute> operandAccesses;
+    if (tape) {
+        operandNames.push_back(builder.getStringAttr("tape"));
+        operandRoles.push_back(builder.getStringAttr("tape"));
+        operandSources.push_back(builder.getStringAttr("tape"));
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+    for (auto [index, name] : llvm::enumerate(operation.getOperandNames())) {
+        operandNames.push_back(builder.getStringAttr(("primal." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("retained_primal"));
+        operandSources.push_back(name);
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+    for (Attribute name : operation.getResultNames()) {
+        operandNames.push_back(builder.getStringAttr(("result." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("retained_primal"));
+        operandSources.push_back(name);
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+    for (unsigned index : cotangentResults) {
+        if (index >= operation.getResultNames().size())
+            return operation.emitOpError("Program VJP cotangent does not name an active result");
+        Attribute name = operation.getResultNames()[index];
+        operandNames.push_back(builder.getStringAttr(("cotangent." + cast<StringAttr>(name).getValue()).str()));
+        operandRoles.push_back(builder.getStringAttr("cotangent"));
+        operandSources.push_back(name);
+        operandAccesses.push_back(builder.getStringAttr("read"));
+    }
+
+    SmallVector<Type> resultTypes;
+    SmallVector<Attribute> resultNames;
+    SmallVector<Attribute> resultRoles;
+    SmallVector<Attribute> resultDtypeRows;
+    SmallVector<int64_t> resultResourceSources;
+    SmallVector<Value> contributions(operation.getNumOperands());
+    for (unsigned index : context.activeOperandIndices) {
+        if (isWriteOnlyProgramOperand(operation, index))
+            continue;
+        FailureOr<Type> type = derivativeType(operation.getOperand(index).getType(), operation);
+        if (failed(type))
+            continue;
+        Attribute name = index < operation.getOperandNames().size() ? operation.getOperandNames()[index]
+                                                                    : builder.getStringAttr(std::to_string(index));
+        ProgramLanguageAbi abi;
+        if (isa<TensorViewType>(*type)) {
+            Value dest = createZero(builder, context.location, *type, context.getPrimalOperand(index));
+            if (!dest)
+                return operation.emitOpError("Program VJP cannot allocate a nested gradient dest");
+            resultResourceSources.push_back(static_cast<int64_t>(operands.size()));
+            operands.push_back(dest);
+            operandNames.push_back(builder.getStringAttr(nestedVjpGradientDestName(cast<StringAttr>(name).getValue())));
+            operandRoles.push_back(builder.getStringAttr("gradient"));
+            operandSources.push_back(name);
+            operandAccesses.push_back(builder.getStringAttr("write"));
+            abi = getProgramValueLanguageAbi(dest);
+        } else {
+            resultResourceSources.push_back(-1);
+            abi = derivativeLanguageAbi(context.getPrimalOperand(index), *type);
+        }
+        resultTypes.push_back(*type);
+        resultNames.push_back(name);
+        resultRoles.push_back(builder.getStringAttr("gradient"));
+        resultDtypeRows.push_back(programLanguageAbiLeafArray(builder.getContext(), abi));
+    }
+    if (resultTypes.empty())
+        return contributions;
+
+    OperationState state(context.location, ComputeOp::getOperationName());
+    state.addOperands(operands);
+    state.addTypes(resultTypes);
+    state.addAttribute("callee", builder.getStringAttr((Twine(operation.getCallee()) + ".vjp").str()));
+    state.addAttribute("grid", operation.getGridAttr());
+    if (auto controls = operation->getAttrOfType<DenseI64ArrayAttr>("vernon_program.grid_control_arguments")) {
+        SmallVector<int64_t> remapped;
+        remapped.reserve(controls.size());
+        for (int64_t argument : controls.asArrayRef()) {
+            if (argument < 0) {
+                remapped.push_back(-1);
+                continue;
+            }
+            func::FuncOp function = operation->getParentOfType<func::FuncOp>();
+            Value mapped = function && static_cast<unsigned>(argument) < function.getNumArguments()
+                               ? lookupPrimal(function.getArgument(static_cast<unsigned>(argument)))
+                               : Value{};
+            auto backwardArgument = dyn_cast_or_null<BlockArgument>(mapped);
+            if (!backwardArgument)
+                return operation.emitOpError("Program VJP cannot retain a dynamic dispatch control");
+            remapped.push_back(backwardArgument.getArgNumber());
+        }
+        state.addAttribute("vernon_program.grid_control_arguments", builder.getDenseI64ArrayAttr(remapped));
+    }
+    state.addAttribute("features", operation.getFeaturesAttr());
+    state.addAttribute("operand_names", builder.getArrayAttr(operandNames));
+    state.addAttribute(kOperandAccessesAttrName, builder.getArrayAttr(operandAccesses));
+    state.addAttribute("vernon_program.operand_autodiff_roles", builder.getArrayAttr(operandRoles));
+    state.addAttribute("vernon_program.operand_autodiff_sources", builder.getArrayAttr(operandSources));
+    state.addAttribute("result_names", builder.getArrayAttr(resultNames));
+    state.addAttribute("vernon_program.result_autodiff_roles", builder.getArrayAttr(resultRoles));
+    state.addAttribute("vernon_program.result_autodiff_sources", builder.getArrayAttr(resultNames));
+    state.addAttribute("vernon_program.result_abi_leaf_dtypes", builder.getArrayAttr(resultDtypeRows));
+    if (llvm::any_of(resultResourceSources, [](int64_t source) { return source >= 0; }))
+        state.addAttribute("vernon_program.result_resource_sources",
+                           builder.getDenseI64ArrayAttr(resultResourceSources));
+    for (StringRef name : {"constant_names", "constant_values"})
+        if (Attribute attribute = operation->getAttr(name))
+            state.addAttribute(name, attribute);
+    Operation *vjp = builder.create(state);
+    unsigned result = 0;
+    for (unsigned index : context.activeOperandIndices) {
+        if (isWriteOnlyProgramOperand(operation, index))
+            continue;
+        if (succeeded(derivativeType(operation.getOperand(index).getType(), operation)))
+            contributions[index] = vjp->getResult(result++);
+    }
+    return contributions;
+}
+
+FailureOr<SmallVector<int64_t>> broadcastBatchShape(ArrayRef<int64_t> left, ArrayRef<int64_t> right) {
+    SmallVector<int64_t> result(std::max(left.size(), right.size()), 1);
+    for (unsigned offset = 0; offset < result.size(); ++offset) {
+        const int64_t leftExtent = offset < left.size() ? left[left.size() - 1 - offset] : 1;
+        const int64_t rightExtent = offset < right.size() ? right[right.size() - 1 - offset] : 1;
+        if (leftExtent != rightExtent && leftExtent != 1 && rightExtent != 1)
+            return failure();
+        result[result.size() - 1 - offset] = std::max(leftExtent, rightExtent);
+    }
+    return result;
+}
+
+Value transposeLastTwo(OpBuilder &builder, Location location, Value input, RankedTensorType type) {
+    SmallVector<int64_t> permutation;
+    for (int64_t index = 0; index < type.getRank(); ++index)
+        permutation.push_back(index);
+    std::swap(permutation[permutation.size() - 2], permutation[permutation.size() - 1]);
+    SmallVector<int64_t> shape(type.getShape());
+    std::swap(shape[shape.size() - 2], shape[shape.size() - 1]);
+    NamedAttribute permutationAttribute(builder.getStringAttr("permutation"),
+                                        builder.getDenseI64ArrayAttr(permutation));
+    return createProgramIntrinsic(builder, location, "transpose", input,
+                                  RankedTensorType::get(shape, type.getElementType()), {permutationAttribute});
+}
+
+Value reduceSumToType(OpBuilder &builder, Location location, Value input, RankedTensorType type) {
+    return input.getType() == type ? input
+                                   : createProgramIntrinsic(builder, location, "reduce_sum_to_shape", input, type);
+}
+
+FailureOr<SmallVector<Value>> buildProgramMatmulVjp(IntrinsicOp operation, const AutodiffVjpBuildContext &context) {
+    if (operation.getNumOperands() != 2 || operation.getNumResults() != 1)
+        return operation.emitOpError("Program matmul VJP requires two operands and one result");
+    FailureOr<Type> leftDerivativeType = derivativeType(operation.getOperand(0).getType(), operation);
+    FailureOr<Type> rightDerivativeType = derivativeType(operation.getOperand(1).getType(), operation);
+    if (failed(leftDerivativeType) || failed(rightDerivativeType))
+        return operation.emitOpError("Program matmul VJP requires differentiable operands");
+    auto leftType = dyn_cast<RankedTensorType>(*leftDerivativeType);
+    auto rightType = dyn_cast<RankedTensorType>(*rightDerivativeType);
+    if (!leftType || !rightType || !leftType.hasStaticShape() || !rightType.hasStaticShape() ||
+        leftType.getRank() < 2 || rightType.getRank() < 2 || leftType.getElementType() != rightType.getElementType())
+        return operation.emitOpError("Program matmul VJP requires static floating-point matrix operands");
+    const int64_t rows = leftType.getDimSize(leftType.getRank() - 2);
+    const int64_t reduction = leftType.getDimSize(leftType.getRank() - 1);
+    const int64_t rightReduction = rightType.getDimSize(rightType.getRank() - 2);
+    const int64_t columns = rightType.getDimSize(rightType.getRank() - 1);
+    FailureOr<SmallVector<int64_t>> batchShape =
+        broadcastBatchShape(leftType.getShape().drop_back(2), rightType.getShape().drop_back(2));
+    if (failed(batchShape) || reduction != rightReduction)
+        return operation.emitOpError("Program matmul VJP received incompatible operand shapes");
+
+    Value left = context.getPrimalOperand(0);
+    Value right = context.getPrimalOperand(1);
+    Value seed = context.resultCotangents[0];
+    if (left.getType() != leftType)
+        left = createProgramIntrinsic(context.builder, context.location, "cast", left, leftType);
+    if (right.getType() != rightType)
+        right = createProgramIntrinsic(context.builder, context.location, "cast", right, rightType);
+    Value transposedRight = transposeLastTwo(context.builder, context.location, right, rightType);
+    Value transposedLeft = transposeLastTwo(context.builder, context.location, left, leftType);
+    SmallVector<int64_t> leftGradientShape(*batchShape);
+    leftGradientShape.append({rows, reduction});
+    SmallVector<int64_t> rightGradientShape(*batchShape);
+    rightGradientShape.append({reduction, columns});
+    auto leftGradientType = RankedTensorType::get(leftGradientShape, leftType.getElementType());
+    auto rightGradientType = RankedTensorType::get(rightGradientShape, rightType.getElementType());
+    Value leftGradient =
+        createProgramIntrinsic(context.builder, context.location, "matmul", {seed, transposedRight}, leftGradientType);
+    Value rightGradient =
+        createProgramIntrinsic(context.builder, context.location, "matmul", {transposedLeft, seed}, rightGradientType);
+    return SmallVector<Value>{reduceSumToType(context.builder, context.location, leftGradient, leftType),
+                              reduceSumToType(context.builder, context.location, rightGradient, rightType)};
+}
+
+} // namespace
+
+FailureOr<SmallVector<unsigned>> resolveProgramWrtBoundaryIndices(func::FuncOp primal,
+                                                                  ArrayRef<StringRef> publicPaths) {
+    llvm::StringMap<unsigned> boundaries;
+    for (unsigned index = 0; index < primal.getNumArguments(); ++index) {
+        StringRef name = sourceName(primal, index);
+        if (name.empty() || !boundaries.try_emplace(name, index).second) {
+            primal.emitError("Program VJP primal boundaries require unique source names");
+            return failure();
+        }
+    }
+    llvm::BitVector selected(primal.getNumArguments());
+    SmallVector<unsigned> indices;
+    for (StringRef path : publicPaths) {
+        auto [root, suffix] = path.split('.');
+        auto boundary = boundaries.find(root);
+        if (path.empty() || root.empty() || boundary == boundaries.end() ||
+            !selectsDifferentiableBoundaryLeaf(primal.getArgument(boundary->second).getType(),
+                                               primal->getParentOfType<ModuleOp>(), suffix)) {
+            primal.emitError("Program VJP wrt path does not identify a unique primal boundary");
+            return failure();
+        }
+        if (selected.test(boundary->second))
+            continue;
+        selected.set(boundary->second);
+        indices.push_back(boundary->second);
+    }
+    return indices;
+}
+
+FailureOr<SmallVector<unsigned>> resolveProgramCotangentBoundaryIndices(func::FuncOp primal,
+                                                                        ArrayRef<StringRef> publicPaths) {
+    llvm::StringMap<unsigned> boundaries;
+    for (unsigned index = 0; index < primal.getNumResults(); ++index) {
+        StringRef name = resultSourceName(primal, index);
+        if (name.empty() || !boundaries.try_emplace(name, index).second) {
+            primal.emitError("Program VJP primal results require unique source names");
+            return failure();
+        }
+    }
+    llvm::BitVector selected(primal.getNumResults());
+    SmallVector<unsigned> indices;
+    for (StringRef path : publicPaths) {
+        auto boundary = boundaries.end();
+        StringRef suffix;
+        for (auto candidate = boundaries.begin(); candidate != boundaries.end(); ++candidate) {
+            StringRef name = candidate->getKey();
+            if (path != name && !(path.starts_with(name) && path.size() > name.size() && path[name.size()] == '.'))
+                continue;
+            if (boundary == boundaries.end() || name.size() > boundary->getKey().size()) {
+                boundary = candidate;
+                suffix = path.size() == name.size() ? StringRef{} : path.drop_front(name.size() + 1);
+            }
+        }
+        if (path.empty() || boundary == boundaries.end() ||
+            !selectsDifferentiableBoundaryLeaf(primal.getResultTypes()[boundary->second],
+                                               primal->getParentOfType<ModuleOp>(), suffix)) {
+            primal.emitError("Program VJP output path does not identify a unique primal boundary");
+            return failure();
+        }
+        if (selected.test(boundary->second))
+            continue;
+        selected.set(boundary->second);
+        indices.push_back(boundary->second);
+    }
+    return indices;
+}
+
+LogicalResult buildProgramVjp(func::FuncOp primal, const ProgramVjpOptions &options) {
+    if (!llvm::hasSingleElement(primal.getBody()))
+        return primal.emitError("Program VJP requires one straight-line entry block");
+    auto returnOp = dyn_cast<func::ReturnOp>(primal.getBody().front().getTerminator());
+    if (!returnOp || returnOp.getNumOperands() == 0)
+        return primal.emitError("Program VJP requires differentiable function results");
+    if (options.wrtBoundaryIndices.empty())
+        return primal.emitError("Program VJP requires at least one wrt input");
+    if (options.forwardSymbol.empty() || options.backwardSymbol.empty() ||
+        options.forwardSymbol == options.backwardSymbol)
+        return primal.emitError("Program VJP requires distinct forward and backward symbols");
+
+    ModuleOp module = primal->getParentOfType<ModuleOp>();
+    if (module.lookupSymbol(options.forwardSymbol) || module.lookupSymbol(options.backwardSymbol))
+        return primal.emitError("Program VJP output symbol already exists");
+    if (primal.getBody()
+            .walk([](GraphicsOp operation) {
+                operation.emitOpError("is not differentiable");
+                return WalkResult::interrupt();
+            })
+            .wasInterrupted())
+        return failure();
+    SmallVector<Operation *> primalOperations;
+    for (Operation &operation : primal.getBody().front().without_terminator()) {
+        if (operation.getNumRegions() != 0)
+            return operation.emitError("Program VJP currently requires region-free semantic operators");
+        primalOperations.push_back(&operation);
+    }
+
+    llvm::BitVector selected(primal.getNumArguments());
+    SmallVector<unsigned> wrtIndices(options.wrtBoundaryIndices);
+    if (!options.wrtBoundaryPaths.empty() && options.wrtBoundaryPaths.size() != wrtIndices.size())
+        return primal.emitError("Program VJP wrt boundary paths do not match their selected inputs");
+    for (unsigned index : wrtIndices) {
+        if (index >= primal.getNumArguments() || selected.test(index))
+            return primal.emitError("Program VJP requires unique valid wrt boundary indices");
+        selected.set(index);
+    }
+    for (unsigned index : wrtIndices)
+        if (failed(derivativeType(primal.getArgument(index).getType(), primal)))
+            return primal.emitError("Program VJP wrt argument is not differentiable");
+    SmallVector<unsigned> cotangentIndices(options.cotangentBoundaryIndices);
+    if (cotangentIndices.empty())
+        for (unsigned index = 0; index < primal.getNumResults(); ++index)
+            cotangentIndices.push_back(index);
+    if (!options.cotangentBoundaryPaths.empty() && options.cotangentBoundaryPaths.size() != cotangentIndices.size())
+        return primal.emitError("Program VJP cotangent boundary paths do not match their selected outputs");
+    llvm::BitVector selectedCotangents(primal.getNumResults());
+    for (unsigned index : cotangentIndices) {
+        if (index >= primal.getNumResults() || selectedCotangents.test(index))
+            return primal.emitError("Program VJP requires unique valid output boundary indices");
+        selectedCotangents.set(index);
+        if (failed(cotangentType(primal.getResultTypes()[index], primal)))
+            return primal.emitError("Program VJP selected result is not differentiable");
+    }
+
+    OpBuilder moduleBuilder(primal);
+    IRMapping cloneMap;
+    auto forward = cast<func::FuncOp>(primal.clone(cloneMap));
+    forward.setSymName(options.forwardSymbol);
+    forward->setAttr("vernon_program.graph", moduleBuilder.getStringAttr("forward"));
+    forward->removeAttr("vernon.entry");
+    forward->removeAttr("vernon.stage");
+    moduleBuilder.insert(forward);
+
+    llvm::DenseSet<Operation *> activeNestedComputes;
+    {
+        DenseMap<Value, char> live;
+        for (unsigned index : cotangentIndices)
+            live[returnOp.getOperand(index)] = 1;
+        for (Operation *operation : llvm::reverse(primalOperations)) {
+            if (!llvm::any_of(operation->getResults(), [&](Value result) { return live.contains(result); }))
+                continue;
+            SmallVector<unsigned> activeOperands;
+            for (auto [index, operand] : llvm::enumerate(operation->getOperands())) {
+                if (isWriteOnlyProgramOperand(operation, index))
+                    continue;
+                live[operand] = 1;
+                if (succeeded(derivativeType(operand.getType(), operation)))
+                    activeOperands.push_back(static_cast<unsigned>(index));
+            }
+            if (auto compute = dyn_cast<ComputeOp>(operation);
+                compute && nestedComputeEmitsVjp(compute, activeOperands))
+                activeNestedComputes.insert(operation);
+        }
+    }
+    DenseMap<Operation *, Value> forwardTapes;
+    for (Operation *operation : primalOperations) {
+        auto compute = dyn_cast<ComputeOp>(operation);
+        if (!compute || !activeNestedComputes.contains(operation) || compute.getNumResults() == 0)
+            continue;
+        Value mapped = cloneMap.lookup(compute.getResult(0));
+        auto forwardCompute = mapped ? mapped.getDefiningOp<ComputeOp>() : ComputeOp{};
+        if (!forwardCompute)
+            return compute.emitOpError("Program VJP cannot find the cloned nested compute");
+        FailureOr<Value> tape = retargetForwardComputeWithTape(forwardCompute);
+        if (failed(tape))
+            return failure();
+        forwardTapes[operation] = *tape;
+    }
+
+    SmallVector<Value> retainedValues(forward.getArguments());
+    for (Operation &operation : forward.getBody().front().without_terminator())
+        retainedValues.append(operation.getResults().begin(), operation.getResults().end());
+    DenseMap<Value, Value> primalToForward;
+    for (auto [source, target] : llvm::zip_equal(primal.getArguments(), forward.getArguments()))
+        primalToForward[source] = target;
+    for (auto [primalOp, forwardOp] :
+         llvm::zip_equal(primal.getBody().front().without_terminator(), forward.getBody().front().without_terminator()))
+        for (unsigned index = 0; index < primalOp.getNumResults(); ++index)
+            primalToForward[primalOp.getResult(index)] = forwardOp.getResult(index);
+
+    SmallVector<Type> backwardArguments;
+    backwardArguments.reserve(retainedValues.size() + cotangentIndices.size());
+    for (Value retained : retainedValues)
+        backwardArguments.push_back(retained.getType());
+    for (unsigned index : cotangentIndices) {
+        FailureOr<Type> derivative = cotangentType(primal.getResultTypes()[index], primal);
+        if (failed(derivative)) {
+            forward.erase();
+            return primal.emitError("Program VJP selected result is not differentiable");
+        }
+        backwardArguments.push_back(*derivative);
+    }
+    SmallVector<Type> backwardResults;
+    for (unsigned index : wrtIndices)
+        backwardResults.push_back(*gradientDestType(primal.getArgument(index).getType(), primal));
+    auto backward = func::FuncOp::create(moduleBuilder, primal.getLoc(), options.backwardSymbol,
+                                         FunctionType::get(primal.getContext(), backwardArguments, backwardResults));
+    backward->setAttr("vernon_program.graph", moduleBuilder.getStringAttr("backward"));
+    bool committed = false;
+    auto cleanup = llvm::make_scope_exit([&] {
+        if (!committed) {
+            forward.erase();
+            backward.erase();
+        }
+    });
+
+    Block *entry = backward.addEntryBlock();
+    OpBuilder builder = OpBuilder::atBlockEnd(entry);
+    for (unsigned index = 0; index < retainedValues.size(); ++index) {
+        backward.setArgAttr(index, kCaptureForwardValueAttr, builder.getI32IntegerAttr(index));
+        applyProgramLanguageAbi(backward, index, getProgramValueLanguageAbi(retainedValues[index]), false);
+    }
+    for (auto [cotangent, index] : llvm::enumerate(cotangentIndices)) {
+        const unsigned argument = retainedValues.size() + cotangent;
+        const StringRef name = options.cotangentBoundaryPaths.empty()
+                                   ? resultSourceName(primal, index)
+                                   : StringRef(options.cotangentBoundaryPaths[cotangent]);
+        if (!name.empty())
+            backward.setArgAttr(argument, "vernon.source_name", builder.getStringAttr(name));
+        backward.setArgAttr(argument, "vernon.autodiff_role", builder.getStringAttr("cotangent"));
+        applyProgramLanguageAbi(backward, argument,
+                                derivativeLanguageAbi(primal.getResultTypes()[index], primal.getResultAttrDict(index),
+                                                      backward.getArgument(argument).getType(), primal),
+                                false);
+    }
+    for (auto [result, primalArgument] : llvm::enumerate(wrtIndices)) {
+        const StringRef name = options.wrtBoundaryPaths.empty() ? sourceName(primal, primalArgument)
+                                                                : StringRef(options.wrtBoundaryPaths[result]);
+        if (!name.empty())
+            backward.setResultAttr(result, "vernon.source_name", builder.getStringAttr(name));
+        backward.setResultAttr(result, "vernon.autodiff_role", builder.getStringAttr("gradient"));
+        applyProgramLanguageAbi(backward, static_cast<unsigned>(result),
+                                derivativeLanguageAbi(primal.getArgument(primalArgument).getType(),
+                                                      primal.getArgAttrDict(primalArgument),
+                                                      backward.getResultTypes()[result], primal),
+                                true);
+    }
+    IRMapping primals;
+    for (auto [source, target] :
+         llvm::zip_equal(retainedValues, entry->getArguments().take_front(retainedValues.size())))
+        primals.map(source, target);
+    const auto lookupPrimal = [&](Value primalValue) -> Value {
+        Value mapped = primalToForward.lookup(primalValue);
+        return mapped ? primals.lookup(mapped) : Value{};
+    };
+
+    DenseMap<Value, Value> adjoints;
+    const unsigned cotangentBase = retainedValues.size();
+    for (auto [cotangent, index] : llvm::enumerate(cotangentIndices)) {
+        Value result = returnOp.getOperand(index);
+        Value publicCotangent = entry->getArgument(cotangentBase + cotangent);
+        FailureOr<Type> interior = derivativeType(result.getType(), primal);
+        if (failed(interior))
+            return primal.emitError("Program VJP result is not differentiable");
+        Value seed = copyValue(builder, primal.getLoc(), publicCotangent, *interior, lookupPrimal(result));
+        if (!seed)
+            return primal.emitError("Program VJP cannot copy a public cotangent into an interior adjoint");
+        adjoints[result] = seed;
+    }
+    VernonAutodiffRuleRegistry registry = createDefaultAutodiffRuleRegistry();
+    for (Operation *operation : llvm::reverse(primalOperations)) {
+        bool active = llvm::any_of(operation->getResults(), [&](Value result) { return adjoints.contains(result); });
+        if (!active)
+            continue;
+        SmallVector<Value> primalOperands;
+        SmallVector<Value> primalResults;
+        SmallVector<Value> resultCotangents;
+        SmallVector<unsigned> activeOperands;
+        SmallVector<unsigned> activeResults;
+        for (auto [index, operand] : llvm::enumerate(operation->getOperands())) {
+            primalOperands.push_back(lookupPrimal(operand));
+            // Local VJP wrt is the callee's read inputs, not every involved
+            // buffer. Write-only dests are kernel outputs / cotangents.
+            if (isWriteOnlyProgramOperand(operation, index))
+                continue;
+            if (succeeded(derivativeType(operand.getType(), operation)))
+                activeOperands.push_back(index);
+        }
+        for (auto [index, result] : llvm::enumerate(operation->getResults())) {
+            primalResults.push_back(lookupPrimal(result));
+            // Nested VJP cotangents are the results that actually have an
+            // incoming adjoint. Zero-seeding inactive outputs is an upper
+            // bound that later ABI omit cannot delete from the value arena.
+            if (Value cotangent = adjoints.lookup(result)) {
+                resultCotangents.push_back(cotangent);
+                activeResults.push_back(static_cast<unsigned>(index));
+            }
+        }
+        if (resultCotangents.empty())
+            return operation->emitError("Program VJP active operation has no result cotangents");
+        AutodiffVjpBuildContext context{builder,          operation->getLoc(), primalOperands, primalResults,
+                                        resultCotangents, activeOperands,      activeResults};
+        FailureOr<SmallVector<Value>> contributions = failure();
+        if (auto compute = dyn_cast<ComputeOp>(operation)) {
+            Value tape;
+            if (Value forwardTape = forwardTapes.lookup(operation))
+                tape = primals.lookup(forwardTape);
+            contributions = buildComputeVjp(compute, context, tape, lookupPrimal);
+        } else if (auto intrinsic = dyn_cast<IntrinsicOp>(operation); intrinsic && intrinsic.getName() == "matmul") {
+            contributions = buildProgramMatmulVjp(intrinsic, context);
+        } else if (isa<arith::ConstantOp>(operation) ||
+                   (isa<IntrinsicOp>(operation) &&
+                    isProgramAllocIntrinsicName(cast<IntrinsicOp>(operation).getName()))) {
+            // Allocations and constants introduce a new owner or a literal. They
+            // do not depend on operand values, so result cotangents stop here.
+            continue;
+        } else {
+            const DifferentiationRule *rule = registry.lookup(operation);
+            if (!rule)
+                return operation->emitError("Program VJP has no registered differentiation rule");
+            contributions = rule->buildVjp(operation, context);
+        }
+        if (failed(contributions))
+            return failure();
+        for (auto [operand, contribution] : llvm::zip_equal(operation->getOperands(), *contributions)) {
+            if (!contribution)
+                continue;
+            Value previous = adjoints.lookup(operand);
+            Value accumulated =
+                previous ? addValues(builder, operation->getLoc(), previous, contribution) : contribution;
+            if (!accumulated)
+                return operation->emitError("Program VJP cannot accumulate derivative values");
+            adjoints[operand] = accumulated;
+        }
+    }
+
+    SmallVector<Value> gradients;
+    for (unsigned index : wrtIndices) {
+        Value primalArgument = primal.getArgument(index);
+        Value gradient = adjoints.lookup(primalArgument);
+        Type publicType = backwardResults[gradients.size()];
+        if (!gradient)
+            gradient = createZero(builder, primal.getLoc(), publicType, lookupPrimal(primalArgument));
+        else if (isa<TensorViewType>(publicType))
+            gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument), true);
+        else if (gradient.getType() != publicType)
+            gradient = copyValue(builder, primal.getLoc(), gradient, publicType, lookupPrimal(primalArgument));
+        if (!gradient)
+            return primal.emitError("Program VJP cannot create a public input gradient");
+        gradients.push_back(gradient);
+    }
+    func::ReturnOp::create(builder, primal.getLoc(), gradients);
+    llvm::BitVector unusedCaptures(backward.getNumArguments());
+    for (unsigned index = 0; index < retainedValues.size(); ++index)
+        if (backward.getArgument(index).use_empty())
+            unusedCaptures.set(index);
+    backward.walk([&](ComputeOp compute) {
+        if (auto controls = compute->getAttrOfType<DenseI64ArrayAttr>("vernon_program.grid_control_arguments"))
+            for (int64_t argument : controls.asArrayRef())
+                if (argument >= 0 && static_cast<unsigned>(argument) < unusedCaptures.size())
+                    unusedCaptures.reset(static_cast<unsigned>(argument));
+    });
+    if (unusedCaptures.any() && failed(backward.eraseArguments(unusedCaptures)))
+        return backward.emitError("cannot remove unused Program residual captures");
+    if (failed(verify(forward)) || failed(verify(backward)))
+        return primal.emitError("generated Program VJP graph failed verification");
+    primal.erase();
+    committed = true;
+    return success();
+}
+
+namespace {
+
+struct VernonProgramVjpPass final : PassWrapper<VernonProgramVjpPass, OperationPass<ModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(VernonProgramVjpPass)
+
+    VernonProgramVjpPass() = default;
+    VernonProgramVjpPass(const VernonProgramVjpPass &other) : PassWrapper(other), options(other.options) {}
+    explicit VernonProgramVjpPass(ProgramVjpOptions options) : options(std::move(options)) {}
+
+    StringRef getArgument() const final { return "vernon-program-vjp"; }
+    StringRef getDescription() const final { return "Derive a backward Program graph from a semantic forward graph"; }
+
+    void getDependentDialects(DialectRegistry &registry) const override {
+        registry.insert<arith::ArithDialect, func::FuncDialect, tensor::TensorDialect, VernonDialect,
+                        VernonProgramDialect>();
+    }
+
+    void runOnOperation() override {
+        ProgramVjpOptions selected = options;
+        if (selected.forwardSymbol == "forward" && !forward.empty())
+            selected.forwardSymbol = forward;
+        if (selected.backwardSymbol == "backward" && !backward.empty())
+            selected.backwardSymbol = backward;
+        SmallVector<func::FuncOp> primals;
+        getOperation().walk([&](func::FuncOp function) {
+            auto kind = function->getAttrOfType<StringAttr>("vernon_program.graph");
+            if (kind && kind.getValue() == "primal")
+                primals.push_back(function);
+        });
+        if (primals.size() != 1) {
+            getOperation().emitError(
+                "Program VJP requires exactly one function marked vernon_program.graph = \"primal\"");
+            return signalPassFailure();
+        }
+        if (selected.wrtBoundaryIndices.empty()) {
+            SmallVector<StringRef> publicPaths;
+            publicPaths.reserve(wrt.size());
+            for (const std::string &path : wrt)
+                publicPaths.push_back(path);
+            FailureOr<SmallVector<unsigned>> indices = resolveProgramWrtBoundaryIndices(primals.front(), publicPaths);
+            if (failed(indices))
+                return signalPassFailure();
+            selected.wrtBoundaryIndices = std::move(*indices);
+            selected.wrtBoundaryPaths.clear();
+            for (unsigned index : selected.wrtBoundaryIndices) {
+                const StringRef root = sourceName(primals.front(), index);
+                SmallVector<StringRef> paths;
+                for (const std::string &path : wrt)
+                    if (path == root ||
+                        (StringRef(path).starts_with(root) && path.size() > root.size() && path[root.size()] == '.'))
+                        paths.push_back(path);
+                if (paths.empty()) {
+                    primals.front().emitError("Program VJP selected boundary has no public path");
+                    return signalPassFailure();
+                }
+                selected.wrtBoundaryPaths.push_back(paths.size() == 1 ? paths.front().str() : root.str());
+            }
+        }
+        if (failed(buildProgramVjp(primals.front(), selected)))
+            signalPassFailure();
+    }
+
+    ProgramVjpOptions options;
+    ListOption<std::string> wrt{*this, "wrt", llvm::cl::desc("Program input names to differentiate"),
+                                llvm::cl::ZeroOrMore};
+    Option<std::string> forward{*this, "forward", llvm::cl::desc("Generated forward symbol"), llvm::cl::init("")};
+    Option<std::string> backward{*this, "backward", llvm::cl::desc("Generated backward symbol"), llvm::cl::init("")};
+};
+
+} // namespace
+
+std::unique_ptr<Pass> createVernonProgramVjpPass() { return std::make_unique<VernonProgramVjpPass>(); }
+
+std::unique_ptr<Pass> createVernonProgramVjpPass(ProgramVjpOptions options) {
+    return std::make_unique<VernonProgramVjpPass>(std::move(options));
+}
+
+void registerVernonProgramVjpPass() { PassRegistration<VernonProgramVjpPass>(); }
+
+} // namespace mlir::vernon::program

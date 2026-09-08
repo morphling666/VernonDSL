@@ -1,12 +1,16 @@
 #include "compiler_cuda.h"
 
+#include "VernonProgramCapabilities.h"
+#include "compiler_dispatch.h"
 #include "compiler_frontend.h"
+#include "compiler_reflection.h"
 
 #include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Pipelines/Passes.h"
 #include "mlir/Dialect/Linalg/Passes.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
@@ -38,16 +42,38 @@ struct KeepGpuModulesPass : public mlir::PassWrapper<KeepGpuModulesPass, mlir::O
 
 } // namespace
 
-bool compileCuda(PreparedModule &prepared, std::vector<Artifact> &artifacts, std::string &diagnostics) {
+bool compileCuda(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
+                 std::string &reflection, std::string &diagnostics) {
     mlir::MLIRContext &context = prepared.context();
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    mlir::FailureOr<TargetPreparationResult> preparedTarget =
+        prepareTargetModule(prepared, preparePortableTargetModule);
+    if (mlir::failed(preparedTarget))
+        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    if (moduleUsesF16(module.get())) {
+        const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
+        diagnostics = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
+        return false;
+    }
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(profile.accumulation));
+        passManager.addPass(mlir::vernon::createVernonVerifyGeneratedAccumulationPass(profile.accumulation));
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
+    mlir::FailureOr<std::string> targetReflection =
+        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    if (mlir::failed(targetReflection))
+        return false;
+    reflection = std::move(*targetReflection);
 
     mlir::PassManager passManager(&context);
     passManager.addPass(mlir::vernon::createVernonToGPUPass());
     passManager.addPass(std::make_unique<KeepGpuModulesPass>());
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true));
+    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUSynchronizationPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass());
     passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertElementwiseToLinalgPass());
     mlir::bufferization::OneShotBufferizePassOptions bufferizationOptions;

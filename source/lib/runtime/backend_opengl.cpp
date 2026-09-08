@@ -1,5 +1,6 @@
 #include "backend_opengl.h"
 
+#include "backend_stage_pipeline.h"
 #include "runtime_state.h"
 #include "tensor_bridge.h"
 

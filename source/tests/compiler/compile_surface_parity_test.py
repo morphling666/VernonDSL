@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 # pyright: reportMissingImports=false
-import base64
 import ctypes
 import hashlib
+import importlib
 import json
 import subprocess
 import sys
@@ -19,10 +19,13 @@ PROJECT_ROOT = Path(__file__).parents[3]
 PYTHON_TEST_ROOT = PROJECT_ROOT / "python" / "tests"
 sys.path.insert(0, str(PYTHON_TEST_ROOT))
 
-from vernon_dsl import _native as native  # noqa: E402
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION  # noqa: E402
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION  # noqa: E402
 
-NATIVE_PATH = Path(native.__file__).resolve()
+native = importlib.import_module("vernon_dsl._native")
+native_file = native.__file__
+if not isinstance(native_file, str):
+    raise RuntimeError("vernon_dsl._native has no filesystem location")
+NATIVE_PATH = Path(native_file).resolve()
 if len(sys.argv) >= 3:
     COMPILER_LIBRARY = Path(sys.argv.pop(1)).resolve()
     COMPILE_CLI = Path(sys.argv.pop(1)).resolve()
@@ -37,21 +40,20 @@ else:
     )
 
 import vernon_dsl as vd  # noqa: E402
+import vernon_dsl._program_assets.compile_orchestration as compile_orchestration_module  # noqa: E402
 import vernon_dsl._runtime.session as runtime_module  # noqa: E402
-import vernon_dsl._shader_assets.cooking as shader_assets_module  # noqa: E402
-from pipeline_asset_fixture import (  # noqa: E402
+from program_asset_fixture import (  # noqa: E402
     OFFSET,
     scale,
     solid_fragment,
     triangle_vertex,
 )
-from vernon_dsl._runtime.resources import _bind_native_argument  # noqa: E402
 from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonical_json  # noqa: E402
 from vernon_dsl.compiler import compile_file  # noqa: E402
-from vernon_dsl.pipeline_asset_cli import main as pipeline_asset_main  # noqa: E402
-from vernon_dsl.pipeline_assets import cook_pipeline_asset  # noqa: E402
+from vernon_dsl.program_asset_cli import main as program_asset_main  # noqa: E402
+from vernon_dsl.program_assets import cook_program_asset  # noqa: E402
 
-FIXTURE = PYTHON_TEST_ROOT / "pipeline_asset_fixture.py"
+FIXTURE = PYTHON_TEST_ROOT / "program_asset_fixture.py"
 GOLDEN = json.loads(
     (PROJECT_ROOT / "source" / "tests" / "fixtures" / "compile_parity_golden.json").read_text(encoding="utf-8")
 )
@@ -169,28 +171,6 @@ class _DirectCompiler:
             self.library.vernonCompileResultDestroy(result)
 
 
-def _artifact_bytes(bundle: dict[str, object], stage_id: str, root: Path | None = None) -> bytes:
-    stage = bundle["stage_artifacts"][stage_id]  # type: ignore[index]
-    artifact = stage["artifact"]  # type: ignore[index]
-    if artifact["storage"] == "external":
-        assert root is not None
-        return (root / artifact["path"]).read_bytes()
-    if artifact["encoding"] == "base64":
-        return base64.b64decode(artifact["data"], validate=True)
-    return artifact["data"].encode("utf-8")
-
-
-def _logical_stage(bundle: dict[str, object], stage_id: str) -> dict[str, object]:
-    stage = dict(bundle["stage_artifacts"][stage_id])  # type: ignore[index]
-    artifact = stage["artifact"]  # type: ignore[index]
-    stage["artifact"] = {
-        "format": artifact["format"],
-        "size": artifact["size"],
-        "sha256": artifact["sha256"],
-    }
-    return stage
-
-
 def _assert_content_hash(test: unittest.TestCase, bundle: dict[str, object]) -> None:
     unhashed = dict(bundle)
     digest = unhashed.pop("content_hash")
@@ -269,7 +249,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     self.assertEqual(cli_reflection, direct_reflection)
                     self.assertEqual(cli_artifacts, direct_artifacts)
                     self.assertEqual(owning_reflection["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-                    self.assertEqual(owning_reflection["pipeline_version"], PIPELINE_VERSION)
+                    self.assertEqual(owning_reflection["program_version"], PROGRAM_VERSION)
                     self.assertEqual(owning_reflection["target"]["kind"], target_name)
                     if glsl_version:
                         self.assertEqual(owning_reflection["target"]["options"]["version"], glsl_version)
@@ -303,15 +283,23 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
                 class PipelineCapture:
                     def __init__(self) -> None:
-                        self.bundles: list[tuple[bytes, tuple[str, ...]]] = []
+                        self.loads: list[bytes] = []
 
-                    def load_pipeline(self, data: bytes, features: list[str]) -> object:
-                        self.bundles.append((bytes(data), tuple(features)))
+                    def load_in_memory_program(
+                        self,
+                        manifest: bytes,
+                        directory: str,
+                        compiled_stages: object,
+                    ) -> object:
+                        del directory, compiled_stages
+                        self.loads.append(bytes(manifest))
                         return object()
 
                 capture = PipelineCapture()
-                runtime_module.Pipeline._cache.clear()
                 pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
+                position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
+                target = vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16))})
+                render_pass = vd.render_pass(target)
                 with mock.patch.multiple(
                     runtime_module,
                     _architecture=architecture,
@@ -319,12 +307,13 @@ class CompileSurfaceParityTests(unittest.TestCase):
                     _api_version=api_version,
                     _runtime_generation=101,
                 ):
-                    compiled = pipeline._compile({})
-                    repeated = pipeline._compile({})
+                    compiled = pipeline._compile({"position": position}, render_pass, None, None)
+                    repeated = pipeline._compile({"position": position}, render_pass, None, None)
                 self.assertIs(compiled, repeated)
                 self.assertEqual(pipeline.compile_count, 1)
-                interactive = json.loads(compiled.bundle)
-                self.assertEqual(capture.bundles, [(compiled.bundle, ("OFFSET",))])
+                deployment = compiled.specialization.deployment
+                self.assertTrue(deployment.manifest)
+                self.assertEqual(capture.loads, [deployment.manifest])
 
                 compile_calls = 0
 
@@ -336,6 +325,12 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         nonlocal compile_calls
                         compile_calls += 1
                         return self.compiler.compile_program_result(*args, **kwargs)
+
+                    def plan_program_result(self, *args: object, **kwargs: object) -> object:
+                        return self.compiler.plan_program_result(*args, **kwargs)
+
+                    def finalize_program_result(self, *args: object, **kwargs: object) -> object:
+                        return self.compiler.finalize_program_result(*args, **kwargs)
 
                 proxy = SimpleNamespace(
                     Target=native.Target,
@@ -355,60 +350,40 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 if target_name == "opengl":
                     cli_arguments.extend(["--opengl-version", "330"])
                 with (
-                    mock.patch.object(shader_assets_module, "_native_module", return_value=proxy),
+                    mock.patch.object(compile_orchestration_module, "_native_module", return_value=proxy),
                     mock.patch("subprocess.run", side_effect=AssertionError("offline cooking spawned a subprocess")),
                 ):
-                    manifest_path = cook_pipeline_asset(
-                        pipeline_asset=f"{FIXTURE}:triangle_asset",
+                    manifest_path = cook_program_asset(
+                        program_asset=f"{FIXTURE}:triangle_asset",
                         output=cooked_dir,
                         target=(OpenGLTargetOptions(version=330) if target_name == "opengl" else VulkanTargetOptions()),
                     )
-                    cli_status = pipeline_asset_main(cli_arguments)
+                    cli_status = program_asset_main(cli_arguments)
                 self.assertEqual(cli_status, 0)
                 # Two stage/feature specializations per cook. The unchanged
                 # fragment artifact is deduplicated after compilation.
                 self.assertEqual(compile_calls, 8)
                 cooked = json.loads(manifest_path.read_text(encoding="utf-8"))
-                cli_cooked = json.loads((cli_dir / "cli.pipeline.json").read_text(encoding="utf-8"))
+                cli_cooked = json.loads((cli_dir / "cli.program.json").read_text(encoding="utf-8"))
                 self.assertEqual(cooked, cli_cooked)
                 self.assertEqual(cooked["target"], {"kind": target_name, "options": target_options})
                 self.assertNotIn("targets", cooked)
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
-                self.assertEqual(cooked["features"], GOLDEN["graphics"]["features"])
+                self.assertNotIn("features", cooked)
                 selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
-                interactive_variant = interactive["variants"][0]
-                self.assertEqual(interactive_variant["key"], ["OFFSET"])
-                self.assertEqual(interactive_variant["parameters"], selected["parameters"])
-                self.assertEqual(interactive_variant["outputs"], selected["outputs"])
-                self.assertEqual(interactive_variant["program"], selected["program"])
-                self.assertEqual(
-                    [(row["name"], row["slot"], row["kind"]) for row in selected["parameters"]],
-                    [(row["name"], row["slot"], row["kind"]) for row in GOLDEN["graphics"]["parameters"]],
-                )
-                self.assertEqual(selected["outputs"], GOLDEN["graphics"]["outputs"])
+                self.assertNotIn("parameters", selected)
+                self.assertNotIn("outputs", selected)
+                self.assertNotIn("stage_artifacts", selected)
                 program = selected["program"]
-                interactive_program = interactive_variant["program"]
-                self.assertEqual(program, interactive_program)
-                for stage_name in ("vertex", "fragment"):
-                    stage_id = program[stage_name]
-                    self.assertEqual(
-                        _logical_stage(cooked, stage_id),
-                        _logical_stage(interactive, stage_id),
-                    )
-                    cooked_bytes = _artifact_bytes(cooked, stage_id, cooked_dir)
-                    interactive_bytes = _artifact_bytes(interactive, stage_id)
-                    self.assertEqual(cooked_bytes, interactive_bytes)
-                    self.assertEqual(
-                        hashlib.sha256(cooked_bytes).hexdigest(),
-                        cooked["stage_artifacts"][stage_id]["artifact"]["sha256"],
-                    )
+                self.assertIn("abi", program)
+                self.assertIn("graphs", program)
+                self.assertIn("stages", program)
+                self.assertIn("artifacts", selected["artifact_system"])
                 _assert_content_hash(self, cooked)
-                _assert_content_hash(self, interactive)
 
     def test_cpu_owning_program_and_kernel_execution_match_and_cache(self) -> None:
         source = np.array((1.0, 2.0, 3.0, 4.0), dtype=np.float32)
-        frontend_tensor = vd.storage.from_numpy(source)
-        frontend, _, _, _ = scale._lower((frontend_tensor, 2.5))
+        frontend = scale._lower().frontend
         program = native.Compiler().compile_program_result(frontend.mlir, native.Target.CPU)
         self.assertTrue(program.ok, program.diagnostics)
         reflection = json.loads(program.reflection)
@@ -421,10 +396,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
         direct_kernel = direct_runtime.load_cpu_entry(program, "scale")
         direct_values = vd.storage.from_numpy(source)
         direct_builder = direct_kernel.invocation_builder()
-        _bind_native_argument(direct_builder, direct_kernel.parameters[0], direct_values)
-        _bind_native_argument(direct_builder, direct_kernel.parameters[1], 2.5)
-        direct_builder.grid(4, 1, 1).invoke()
-        direct_runtime.synchronize()
+        direct_builder.host_tensor(direct_kernel.parameters[0].name, direct_values._native_host_array())
+        direct_builder.host_tensor(direct_kernel.parameters[1].name, np.asarray(np.float32(2.5)))
+        direct_builder.grid(4, 1, 1).submit().wait()
         direct_result = direct_values.to_numpy()
 
         runtime_module.Kernel.clear_cache()

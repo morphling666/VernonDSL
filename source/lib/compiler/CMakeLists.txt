@@ -23,17 +23,10 @@ if(NOT MLIR_DIR)
         "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/mlir"
         CACHE PATH "Directory containing MLIRConfig.cmake" FORCE)
 endif()
-if(NOT LLD_DIR)
-    set(LLD_DIR
-        "${VERNON_REPOSITORY_ROOT}/llvm-project/install/lib/cmake/lld"
-        CACHE PATH "Directory containing LLDConfig.cmake" FORCE)
-endif()
 find_package(MLIR REQUIRED CONFIG)
-find_package(LLD REQUIRED CONFIG)
 
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
-message(STATUS "Using LLDConfig.cmake in: ${LLD_DIR}")
 
 list(
     APPEND
@@ -58,8 +51,7 @@ target_include_directories(
     INTERFACE "${VERNON_SOURCE_DIR}/include"
               "${CMAKE_CURRENT_BINARY_DIR}/include"
               ${LLVM_INCLUDE_DIRS}
-              ${MLIR_INCLUDE_DIRS}
-              ${LLD_INCLUDE_DIRS})
+              ${MLIR_INCLUDE_DIRS})
 if(NOT LLVM_ENABLE_RTTI)
     if(MSVC)
         target_compile_options(VernonCompilerBuildHeaders INTERFACE /GR-)
@@ -72,6 +64,8 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/CompilerTargets.cmake")
 foreach(
     _vernon_compiler_target IN
     ITEMS MLIRVernonDialect
+          MLIRVernonProgramDialect
+          MLIRVernonProgramTransforms
           MLIRVernonTransforms
           VernonDSLCompiler
           vernon-compile-packaging
@@ -81,6 +75,21 @@ foreach(
     target_include_directories(${_vernon_compiler_target} BEFORE PRIVATE "${VERNON_SOURCE_DIR}/include"
                                                                          "${CMAKE_CURRENT_BINARY_DIR}/include")
 endforeach()
+
+# Keep compiler-layer unit tests independent from the compiler shared library while exposing the same MLIR build
+# environment through one target.
+add_library(VernonCompilerTestSupport INTERFACE)
+target_link_directories(VernonCompilerTestSupport INTERFACE ${LLVM_LIBRARY_DIRS})
+target_link_libraries(
+    VernonCompilerTestSupport
+    INTERFACE VernonCompilerBuildHeaders
+              MLIRArithDialect
+              MLIRControlFlowDialect
+              MLIRFuncDialect
+              MLIRParser
+              MLIRSCFDialect
+              MLIRVernonDialect
+              MLIRVernonProgramDialect)
 
 # The combined build registers tests after Runtime and Python targets exist. Register here only when the compiler is
 # configured as a standalone project.

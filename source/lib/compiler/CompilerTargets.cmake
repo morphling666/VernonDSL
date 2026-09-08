@@ -1,6 +1,10 @@
 add_subdirectory("${VERNON_SOURCE_DIR}/include/mlir/Dialect/Vernon"
                  "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Dialect/Vernon")
 add_subdirectory("${VERNON_SOURCE_DIR}/lib/Dialect/Vernon" "${CMAKE_CURRENT_BINARY_DIR}/lib/Dialect/Vernon")
+add_subdirectory("${VERNON_SOURCE_DIR}/include/mlir/Dialect/VernonProgram"
+                 "${CMAKE_CURRENT_BINARY_DIR}/include/mlir/Dialect/VernonProgram")
+add_subdirectory("${VERNON_SOURCE_DIR}/lib/Dialect/VernonProgram"
+                 "${CMAKE_CURRENT_BINARY_DIR}/lib/Dialect/VernonProgram")
 include("${VERNON_REPOSITORY_ROOT}/cmake/IncludeDxc.cmake")
 
 add_library(
@@ -12,10 +16,32 @@ add_library(
     compiler_dxc.cpp
     compiler_frontend.cpp
     compiler_internal.cpp
+    compiler_json.cpp
+    compiler_program_abi.cpp
+    compiler_program_aggregation.cpp
+    compiler_program_assembly.cpp
+    compiler_program_boundary.cpp
+    compiler_program_builtin.cpp
+    compiler_program_capture.cpp
+    compiler_program_compute.cpp
+    compiler_program_derivative.cpp
+    compiler_program_finalization.cpp
+    compiler_program_graph.cpp
+    compiler_program_graphics.cpp
+    compiler_program_implementation.cpp
+    compiler_program_lowering.cpp
+    compiler_program_publication.cpp
+    compiler_program_reflection.cpp
+    compiler_program_serializer.cpp
+    compiler_program_stage.cpp
+    compiler_program_storage.cpp
+    compiler_program_tape.cpp
+    compiler_program_target_aggregation.cpp
     compiler_reflection.cpp
     compiler_spirv.cpp
     VernonCompiler.cpp
-    VernonCpuAbiWrapper.cpp)
+    VernonCpuAbiWrapper.cpp
+    VernonCpuHalfConversion.cpp)
 llvm_map_components_to_libnames(
     VERNON_LLVM_JIT_LIBS
     AllTargetsAsmParsers
@@ -25,7 +51,9 @@ llvm_map_components_to_libnames(
     AsmParser
     Core
     OrcJIT
+    Passes
     Target
+    TargetParser
     native)
 target_compile_definitions(VernonDSLCompiler PRIVATE VERNON_DSL_COMPILER_BUILD)
 if(MSVC)
@@ -48,6 +76,8 @@ target_link_libraries(
             MLIRControlFlowToLLVM
             MLIRConvertToLLVMPass
             MLIRVernonDialect
+            MLIRVernonProgramDialect
+            MLIRVernonProgramTransforms
             MLIRVernonTransforms
             MLIRFuncDialect
             MLIRFuncToLLVM
@@ -63,6 +93,7 @@ target_link_libraries(
             MLIRPass
             MLIRRegisterAllDialects
             MLIRRegisterAllExtensions
+            MLIRSCFTransforms
             MLIRSCFToControlFlow
             MLIRSPIRVDialect
             MLIRSPIRVSerialization
@@ -72,13 +103,6 @@ target_link_libraries(
             MLIRUBToLLVM
             MLIRVectorToLLVM
             ${VERNON_LLVM_JIT_LIBS})
-if(WIN32)
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldCOFF)
-elseif(APPLE)
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldMachO)
-else()
-    target_link_libraries(VernonDSLCompiler PRIVATE lldCommon lldELF)
-endif()
 target_link_libraries(VernonDSLCompiler PRIVATE spirv-cross-glsl spirv-cross-hlsl spirv-cross-msl)
 
 if(SKBUILD)

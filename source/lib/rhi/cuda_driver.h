@@ -1,8 +1,8 @@
 #ifndef VERNON_RHI_CUDA_DRIVER_H
 #define VERNON_RHI_CUDA_DRIVER_H
 
-#include "../platform/platform_library.h"
 #include "VernonRHI.h"
+#include "platform/platform_library.h"
 
 #include <cstddef>
 #include <mutex>
@@ -40,6 +40,7 @@ struct VERNON_RHI_CAPI Driver {
     using CopyDeviceToHost = Result (*)(void *, DevicePointer, size_t);
     using CopyHostToDeviceAsync = Result (*)(DevicePointer, const void *, size_t, Stream);
     using CopyDeviceToHostAsync = Result (*)(void *, DevicePointer, size_t, Stream);
+    using CopyDeviceToDeviceAsync = Result (*)(DevicePointer, DevicePointer, size_t, Stream);
     using ModuleLoadData = Result (*)(Module *, const void *, unsigned, int *, void **);
     using ModuleGetFunction = Result (*)(Function *, Module, const char *);
     using ModuleUnload = Result (*)(Module);
@@ -78,6 +79,7 @@ struct VERNON_RHI_CAPI Driver {
     CopyDeviceToHost copyDeviceToHost{};
     CopyHostToDeviceAsync copyHostToDeviceAsync{};
     CopyDeviceToHostAsync copyDeviceToHostAsync{};
+    CopyDeviceToDeviceAsync copyDeviceToDeviceAsync{};
     ModuleLoadData moduleLoadData{};
     ModuleGetFunction moduleGetFunction{};
     ModuleUnload moduleUnload{};

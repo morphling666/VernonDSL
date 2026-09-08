@@ -3,12 +3,13 @@
 
 #include "VernonCommon.h"
 #include "VernonGraphicsState.h"
+#include "VernonTextureTypes.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-enum { VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8 };
+enum { VERNON_RUNTIME_PROVIDER_MAX_SHADER_STAGES = 8, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS = 8 };
 
 typedef enum VernonRuntimeProviderCapabilityBits {
     VERNON_RUNTIME_PROVIDER_COMPUTE = 1u << 0,
@@ -66,6 +67,17 @@ typedef enum VernonRuntimeProviderBindingValueFlags {
     VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE = 1u << 1
 } VernonRuntimeProviderBindingValueFlags;
 
+typedef enum VernonRuntimeProviderLoadOperation {
+    VERNON_RUNTIME_PROVIDER_LOAD_CLEAR = 0,
+    VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE = 1,
+    VERNON_RUNTIME_PROVIDER_LOAD_DISCARD = 2
+} VernonRuntimeProviderLoadOperation;
+
+typedef enum VernonRuntimeProviderStoreOperation {
+    VERNON_RUNTIME_PROVIDER_STORE_PRESERVE = 0,
+    VERNON_RUNTIME_PROVIDER_STORE_DISCARD = 1
+} VernonRuntimeProviderStoreOperation;
+
 typedef struct VernonRuntimeProviderShaderDescriptor {
     uint32_t struct_size;
     uint32_t stage;
@@ -90,10 +102,14 @@ typedef struct VernonRuntimeProviderBindingLayoutEntry {
     VernonRuntimeProviderBindingInterface interface_kind;
     VernonStringView name;
     uint32_t element_count;
+    /* OpenGL native-uniform column count; zero for buffered/non-OpenGL bindings. */
     uint32_t vector_count;
     uint32_t divisor;
     uint32_t element_alignment;
     uint32_t numeric_type;
+    VernonTextureDimension image_dimension;
+    VernonTextureFormat storage_image_format;
+    VernonImageSampleResultClass sample_result_class;
 } VernonRuntimeProviderBindingLayoutEntry;
 
 typedef struct VernonRuntimeProviderVertexAttribute {
@@ -129,9 +145,9 @@ typedef struct VernonRuntimeProviderPipelineDescriptor {
     uint32_t workgroup_size[3];
     const uint32_t *vertex_strides;
     size_t vertex_stride_count;
-    VernonRuntimeProviderRasterizationState rasterization;
-    VernonRuntimeProviderDepthStencilState depth_stencil;
-    const VernonRuntimeProviderColorBlendState *color_blends;
+    VernonRasterizationState rasterization;
+    VernonDepthStencilState depth_stencil;
+    const VernonColorBlendState *color_blends;
     size_t color_blend_count;
     uint32_t reserved[4];
 } VernonRuntimeProviderPipelineDescriptor;
@@ -143,15 +159,49 @@ typedef struct VernonRuntimeProviderResourceReference {
     uint64_t size;
 } VernonRuntimeProviderResourceReference;
 
+typedef struct VernonRuntimeProviderInlineValue {
+    const void *data;
+    size_t size;
+} VernonRuntimeProviderInlineValue;
+
+typedef struct VernonRuntimeProviderBufferReference {
+    VernonRuntimeProviderResourceReference resource;
+    uint32_t stride;
+} VernonRuntimeProviderBufferReference;
+
+typedef struct VernonRuntimeProviderImageReference {
+    VernonRuntimeProviderResourceReference view;
+} VernonRuntimeProviderImageReference;
+
+typedef struct VernonRuntimeProviderSamplerReference {
+    VernonRuntimeProviderResourceReference resource;
+} VernonRuntimeProviderSamplerReference;
+
 typedef struct VernonRuntimeProviderBindingValue {
     uint32_t slot;
     VernonRuntimeProviderBindingKind kind;
-    VernonRuntimeProviderResourceReference resource;
-    const void *inline_data;
-    size_t inline_size;
     uint32_t flags;
-    uint32_t stride;
+    union {
+        VernonRuntimeProviderInlineValue inline_value;
+        VernonRuntimeProviderBufferReference buffer;
+        VernonRuntimeProviderImageReference image;
+        VernonRuntimeProviderSamplerReference sampler;
+    } payload;
 } VernonRuntimeProviderBindingValue;
+
+typedef enum VernonRuntimeProviderImageResourceKind {
+    VERNON_RUNTIME_PROVIDER_IMAGE_OWNER = 0,
+    VERNON_RUNTIME_PROVIDER_IMAGE_VIEW = 1
+} VernonRuntimeProviderImageResourceKind;
+
+typedef struct VernonRuntimeProviderImageDescription {
+    uint32_t struct_size;
+    VernonImageDescriptor image;
+    VernonImageViewDescriptor view;
+    uint64_t parent_identity;
+    VernonRuntimeProviderImageResourceKind resource_kind;
+    uint32_t reserved[3];
+} VernonRuntimeProviderImageDescription;
 
 typedef struct VernonRuntimeProviderBindingSetDescriptor {
     uint32_t struct_size;
@@ -173,9 +223,9 @@ typedef struct VernonRuntimeProviderDispatchDescriptor {
 
 typedef struct VernonRuntimeProviderColorAttachment {
     uint32_t location;
-    VernonRuntimeProviderResourceReference image;
-    uint32_t load_operation;
-    uint32_t store_operation;
+    VernonRuntimeProviderResourceReference view;
+    VernonRuntimeProviderLoadOperation load_operation;
+    VernonRuntimeProviderStoreOperation store_operation;
     float clear_color[4];
 } VernonRuntimeProviderColorAttachment;
 
@@ -189,9 +239,9 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
     uint32_t first_instance;
     const VernonRuntimeProviderColorAttachment *color_attachments;
     size_t color_attachment_count;
-    VernonRuntimeProviderResourceReference depth_stencil_attachment;
-    uint32_t depth_load_operation;
-    uint32_t depth_store_operation;
+    VernonRuntimeProviderResourceReference depth_stencil_view;
+    VernonRuntimeProviderLoadOperation depth_load_operation;
+    VernonRuntimeProviderStoreOperation depth_store_operation;
     float clear_depth;
     uint32_t viewport[4];
     uint32_t scissor[4];
@@ -199,8 +249,8 @@ typedef struct VernonRuntimeProviderDrawDescriptor {
     VernonRuntimeProviderResourceReference index_buffer;
     uint32_t index_count;
     uint32_t index_type;
-    uint32_t stencil_load_operation;
-    uint32_t stencil_store_operation;
+    VernonRuntimeProviderLoadOperation stencil_load_operation;
+    VernonRuntimeProviderStoreOperation stencil_store_operation;
     uint32_t clear_stencil;
     uint32_t stencil_reference;
     uint32_t render_area[4];
@@ -229,6 +279,8 @@ typedef struct VernonRuntimeDeviceProvider {
 
     VernonStatus (*retain_resource)(void *user_data, VernonRuntimeProviderResourceReference resource);
     void (*release_resource)(void *user_data, VernonRuntimeProviderResourceReference resource);
+    VernonStatus (*describe_image)(void *user_data, VernonRuntimeProviderResourceReference view,
+                                   VernonRuntimeProviderImageDescription *description);
     VernonStatus (*create_binding_set)(void *user_data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
                                        VernonRuntimeProviderObject *bindings);
     VernonStatus (*update_binding_set)(void *user_data, VernonRuntimeProviderObject bindings,

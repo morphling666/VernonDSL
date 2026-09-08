@@ -23,10 +23,10 @@ vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint
                                       VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
 }
 
-VernonPipelineParameterView parameter(VernonLoadedPipeline *pipeline, const char *name) {
-    VernonPipelineParameterView result{};
+VernonProgramParameterView parameter(VernonProgramExecutable *pipeline, const char *name) {
+    VernonProgramParameterView result{};
     const VernonStringView view{name, std::char_traits<char>::length(name)};
-    EXPECT_EQ(vernonRuntimeLoadedPipelineFindParameter(pipeline, view, &result), VERNON_STATUS_OK) << name;
+    EXPECT_EQ(vernonRuntimeProgramExecutableFindParameter(pipeline, view, &result), VERNON_STATUS_OK) << name;
     return result;
 }
 
@@ -55,13 +55,13 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     VernonRuntimeContext *runtime = context.runtime;
     ASSERT_TRUE(runtime);
     const std::string bundleDirectory = manifestPath.parent_path().u8string();
-    VernonPipelineBundleLoadOptions options{};
+    VernonProgramBundleLoadOptions options{};
     options.struct_size = sizeof(options);
     options.bundle_directory = bundleDirectory.c_str();
-    VernonPipelineBundle *loaded =
-        vernonRuntimeLoadPipelineBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
+    VernonProgramBundle *loaded =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_TRUE(loaded);
-    VernonLoadedPipeline *pipeline = vernonRuntimeResolvePipeline(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
     const VernonStringView resolveError = vernonRuntimeGetLastError(runtime);
     ASSERT_TRUE(pipeline) << (resolveError.data ? std::string(resolveError.data, resolveError.size) : std::string{});
 
@@ -83,6 +83,9 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         uploads[index] = {sizeof(VernonRhiImageUploadDescriptor),
                           0,
                           static_cast<uint32_t>(index),
+                          0,
+                          0,
+                          0,
                           1,
                           1,
                           1,
@@ -97,6 +100,12 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
 
     auto color = createTexture2D(context, 32, 32);
     auto bloom = createTexture2D(context, 32, 32);
+    const auto cubeView =
+        vernon::tests::createImageView(context, cube, VERNON_RHI_IMAGE_CUBE, VERNON_RHI_FORMAT_RGBA8_UNORM, 1, 6);
+    const auto colorView =
+        vernon::tests::createImageView(context, color, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    const auto bloomView =
+        vernon::tests::createImageView(context, bloom, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
     ASSERT_NE(color.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
     ASSERT_NE(bloom.handle.index, VERNON_RHI_INVALID_HANDLE_INDEX);
 
@@ -107,15 +116,15 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     constexpr std::array<float, 16> identity = {
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
     };
-    const VernonPipelineParameterView positionParameter = parameter(pipeline, "aPos");
-    const VernonPipelineParameterView cubeParameter = parameter(pipeline, "cubeMap");
-    const VernonPipelineParameterView modelParameter = parameter(pipeline, "model");
-    const VernonPipelineParameterView projectionParameter = parameter(pipeline, "projection");
-    const VernonPipelineParameterView viewParameter = parameter(pipeline, "view");
+    const VernonProgramParameterView positionParameter = parameter(pipeline, "aPos");
+    const VernonProgramParameterView cubeParameter = parameter(pipeline, "cubeMap");
+    const VernonProgramParameterView modelParameter = parameter(pipeline, "model");
+    const VernonProgramParameterView projectionParameter = parameter(pipeline, "projection");
+    const VernonProgramParameterView viewParameter = parameter(pipeline, "view");
 
-    std::array<VernonPipelineArgument, 5> arguments{};
+    std::array<VernonProgramArgument, 5> arguments{};
     arguments[0].slot = positionParameter.slot;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = vertices.reference;
@@ -126,12 +135,10 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     arguments[0].tensor.byte_strides = vertexStrides;
     arguments[0].tensor.byte_size = sizeof(positions);
     arguments[1].slot = cubeParameter.slot;
-    arguments[1].kind = VERNON_PIPELINE_TEXTURE;
-    arguments[1].texture = {
-        VERNON_TEXTURE_RGBA8_UNORM, VERNON_ACCESS_READ, VERNON_TEXTURE_CUBE, 1, 1, 1, cube.reference,
-        sampler.reference};
+    arguments[1].kind = VERNON_PROGRAM_IMAGE;
+    arguments[1].image = {cubeView.reference};
     for (size_t index = 2; index < arguments.size(); ++index) {
-        arguments[index].kind = VERNON_PIPELINE_TENSOR;
+        arguments[index].kind = VERNON_PROGRAM_TENSOR;
         arguments[index].tensor.struct_size = sizeof(VernonTensorView);
         arguments[index].tensor.storage = VERNON_TENSOR_HOST;
         arguments[index].tensor.host_data = identity.data();
@@ -147,29 +154,30 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     arguments[4].slot = viewParameter.slot;
 
     const VernonColorAttachment attachments[] = {
-        {0, color.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM},
-        {1, bloom.reference, 32, 32, VERNON_TEXTURE_RGBA8_UNORM},
+        {0, colorView.reference},
+        {1, bloomView.reference},
     };
-    VernonPipelineInvocation invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
-    invocation.arguments = arguments.data();
-    invocation.argument_count = arguments.size();
-    invocation.color_attachments = attachments;
-    invocation.color_attachment_count = std::size(attachments);
-    invocation.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
-    invocation.vertex_count = 3;
-    invocation.instance_count = 1;
-    const VernonStatus invokeStatus = vernonRuntimePipelineInvoke(pipeline, &invocation);
+    const vernon::tests::CanonicalGraphicsControls graphics(attachments, std::size(attachments), 3);
+    const VernonStatus invokeStatus =
+        vernon::tests::completeCanonicalInvocation(pipeline, arguments.data(), arguments.size(), graphics);
     expectRuntimeOk(runtime, invokeStatus);
     ASSERT_EQ(invokeStatus, VERNON_STATUS_OK);
 
     std::vector<uint8_t> colorPixels(32 * 32 * 4);
     std::vector<uint8_t> bloomPixels(32 * 32 * 4);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, color.handle, colorPixels.data(), colorPixels.size()),
-              VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceDownloadImage(context.device, bloom.handle, bloomPixels.data(), bloomPixels.size()),
-              VERNON_RHI_STATUS_OK);
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = 32;
+    download.height = 32;
+    download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_RGBA;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(context.device, color.handle, &download, colorPixels.data(), colorPixels.size()),
+        VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(
+        vernonRhiDeviceDownloadImage(context.device, bloom.handle, &download, bloomPixels.data(), bloomPixels.size()),
+        VERNON_RHI_STATUS_OK);
     const size_t center = (16 * 32 + 16) * 4;
     EXPECT_NEAR(colorPixels[center], 64, 10);
     EXPECT_NEAR(colorPixels[center + 1], 200, 10);
@@ -180,13 +188,16 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     EXPECT_LT(bloomPixels[center + 2], 10);
     EXPECT_GT(bloomPixels[center + 3], 240);
 
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, bloomView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, colorView.handle), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(context.device, cubeView.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, bloom.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, color.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroySampler(context.device, sampler.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyImage(context.device, cube.handle), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, vertices.handle), VERNON_RHI_STATUS_OK);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
-    vernonRuntimePipelineBundleDestroy(loaded);
+    vernonRuntimeProgramExecutableDestroy(pipeline);
+    vernonRuntimeProgramBundleDestroy(loaded);
     ASSERT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
     vernonRhiDestroyDevice(context.device);
 }

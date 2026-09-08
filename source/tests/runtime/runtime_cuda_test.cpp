@@ -51,6 +51,7 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     "entries": [{
       "name": "scale",
       "workgroup_size": [4, 1, 1],
+      "dispatch_contract": {"unit_grid_axes": [], "requires_unit_workgroup": false},
       "physical_layouts": {
         "cuda_kernel_parameter": {"profile":"cuda_kernel_parameter","packing":"kernel_parameters"}
       },
@@ -77,15 +78,15 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
       ]
     }]
   })";
-    VernonLoadedPipeline *pipeline =
+    VernonStageExecutable *pipeline =
         vernonRuntimeLoadArtifact(runtime, ptx, std::strlen(ptx), reflection, std::strlen(reflection), "scale", 5);
     ASSERT_TRUE(pipeline);
     const float factor = 2.0f;
     const uint64_t shape[]{4};
     const int64_t strides[]{sizeof(float)};
-    VernonPipelineArgument arguments[2]{};
+    VernonProgramArgument arguments[2]{};
     arguments[0].slot = 0;
-    arguments[0].kind = VERNON_PIPELINE_TENSOR;
+    arguments[0].kind = VERNON_PROGRAM_TENSOR;
     arguments[0].tensor.struct_size = sizeof(VernonTensorView);
     arguments[0].tensor.storage = VERNON_TENSOR_RHI_RESOURCE;
     arguments[0].tensor.resource = buffer.reference;
@@ -96,26 +97,25 @@ TEST(RuntimeCuda, CopiesAndInvokesDirectComputePipeline) {
     arguments[0].tensor.byte_strides = strides;
     arguments[0].tensor.byte_size = sizeof(output);
     arguments[1].slot = 1;
-    arguments[1].kind = VERNON_PIPELINE_TENSOR;
+    arguments[1].kind = VERNON_PROGRAM_TENSOR;
     arguments[1].tensor.struct_size = sizeof(VernonTensorView);
     arguments[1].tensor.storage = VERNON_TENSOR_HOST;
     arguments[1].tensor.host_data = &factor;
     arguments[1].tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_F32);
     arguments[1].tensor.access = VERNON_ACCESS_READ;
     arguments[1].tensor.byte_size = sizeof(factor);
-    VernonPipelineInvocation invocation{};
+    VernonStageInvocationDescriptor invocation{};
     invocation.struct_size = sizeof(invocation);
-    invocation.abi_version = VERNON_PIPELINE_VERSION;
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
     invocation.arguments = arguments;
     invocation.argument_count = 2;
     invocation.compute_grid = {4, 1, 1};
-    ASSERT_TRUE(vernonRuntimePipelineInvoke(pipeline, &invocation) == VERNON_STATUS_OK);
-    ASSERT_TRUE(vernonRuntimeSynchronize(runtime) == VERNON_STATUS_OK);
+    ASSERT_TRUE(vernon::tests::completeSubmission(pipeline, &invocation) == VERNON_STATUS_OK);
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(context.device, buffer.handle, 0, output, sizeof(output)),
               VERNON_RHI_STATUS_OK);
     for (int index = 0; index < 4; ++index)
         ASSERT_TRUE(output[index] == static_cast<float>(index) * factor);
-    vernonRuntimeLoadedPipelineDestroy(pipeline);
+    vernonRuntimeStageExecutableDestroy(pipeline);
 
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     ASSERT_TRUE(vernonRuntimeDestroy(runtime) == VERNON_STATUS_OK);

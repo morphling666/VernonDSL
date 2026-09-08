@@ -13,9 +13,9 @@ _GLSL_VERSION = re.compile(r"^#version\s+(\d{3})(?:\s+(es|core|compatibility))?\
 def _single(values: Iterable[Any], name: str) -> Any:
     unique = {value for value in values}
     if len(unique) != 1:
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError(f"pipeline stages have inconsistent {name}")
+        raise ProgramCompileError(f"Program stages have inconsistent {name}")
     return next(iter(unique))
 
 
@@ -35,28 +35,28 @@ def _glsl_requirement(stage: Any) -> tuple[int, str]:
         first_line = ""
     match = _GLSL_VERSION.fullmatch(first_line)
     if not match:
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError(f"{stage.target.target} artifact has no canonical #version directive")
+        raise ProgramCompileError(f"{stage.target.target} artifact has no canonical #version directive")
     profile = match.group(2) or ("es" if stage.target.target == "opengles" else "core")
     if (stage.target.target == "opengles") != (profile == "es"):
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError(f"{stage.target.target} artifact has incompatible GLSL profile {profile}")
+        raise ProgramCompileError(f"{stage.target.target} artifact has incompatible GLSL profile {profile}")
     return int(match.group(1)), profile
 
 
 def _spirv_version(stage: Any) -> tuple[int, int]:
     data = stage.artifact.data
     if len(data) < 8:
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError("Vulkan artifact has no SPIR-V header")
+        raise ProgramCompileError("Vulkan artifact has no SPIR-V header")
     magic, version = struct.unpack_from("<II", data)
     if magic != 0x07230203:
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError("Vulkan artifact has an invalid SPIR-V magic number")
+        raise ProgramCompileError("Vulkan artifact has an invalid SPIR-V magic number")
     return ((version >> 16) & 0xFF, (version >> 8) & 0xFF)
 
 
@@ -69,9 +69,9 @@ def _ptx_requirements(stage: Any) -> tuple[tuple[int, int], tuple[int, int], int
     target = _PTX_TARGET.search(source)
     address_size = _PTX_ADDRESS_SIZE.search(source)
     if not version or not target or not address_size:
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError("CUDA artifact has an incomplete PTX header")
+        raise ProgramCompileError("CUDA artifact has an incomplete PTX header")
     sm = int(target.group(1))
     return (
         (int(version.group(1)), int(version.group(2))),
@@ -90,9 +90,9 @@ def _metal_version(stage: Any, name: str) -> tuple[int, int]:
         or len(value) != 2
         or any(not isinstance(part, int) or isinstance(part, bool) or part < 0 for part in value)
     ):
-        from .types import PipelineCompileError
+        from .types import ProgramCompileError
 
-        raise PipelineCompileError(f"Metal compiler reflection has no valid {name}")
+        raise ProgramCompileError(f"Metal compiler reflection has no valid {name}")
     return (value[0], value[1])
 
 
@@ -132,16 +132,16 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
     elif target == "directx":
         for stage in stage_values:
             if len(stage.artifact.data) < 4 or stage.artifact.data[:4] != b"DXBC" or stage.artifact.format != "dxil":
-                from .types import PipelineCompileError
+                from .types import ProgramCompileError
 
-                raise PipelineCompileError("DirectX runtime artifact is not a DXIL container")
+                raise ProgramCompileError("DirectX runtime artifact is not a DXIL container")
         shader_model = _single(
             (stage.target.options.get("shader_model", 60) for stage in stage_values), "HLSL Shader Models"
         )
         if not isinstance(shader_model, int) or shader_model < 60:
-            from .types import PipelineCompileError
+            from .types import ProgramCompileError
 
-            raise PipelineCompileError("DirectX runtime requires Shader Model 6.0 or newer")
+            raise ProgramCompileError("DirectX runtime requires Shader Model 6.0 or newer")
         result["api_version"] = [12, 0]
         result["minimum_feature_level"] = [11, 0]
         result["shader_model"] = [shader_model // 10, shader_model % 10]
@@ -156,18 +156,18 @@ def runtime_requirements(target: str, stages: Iterable[Any]) -> dict[str, Any] |
     elif target == "metal":
         platform = _single((stage.target.options.get("platform") for stage in stage_values), "Apple Metal platforms")
         if platform not in {"macos", "ios"}:
-            from .types import PipelineCompileError
+            from .types import ProgramCompileError
 
-            raise PipelineCompileError("Metal runtime requires apple_platform 'macos' or 'ios'")
+            raise ProgramCompileError("Metal runtime requires apple_platform 'macos' or 'ios'")
         msl_version = _single((_metal_version(stage, "msl_version") for stage in stage_values), "MSL versions")
         minimum_os_version = _single(
             (_metal_version(stage, "minimum_os_version") for stage in stage_values), "Metal minimum OS versions"
         )
         required_os = (15, 0) if platform == "ios" else (11, 0)
         if msl_version != (2, 4) or minimum_os_version < required_os:
-            from .types import PipelineCompileError
+            from .types import ProgramCompileError
 
-            raise PipelineCompileError("Metal compiler reflection contains unsupported runtime requirements")
+            raise ProgramCompileError("Metal compiler reflection contains unsupported runtime requirements")
         result["apple_platform"] = platform
         result["msl_version"] = list(msl_version)
         result["minimum_os_version"] = list(minimum_os_version)

@@ -1,9 +1,11 @@
 #include "runtime_pipeline_backend.h"
 
 #if defined(VERNON_HAS_METAL_RUNTIME)
-#include "../rhi/rhi_internal.h"
 #include "VernonRuntimeRHIAdapter.h"
 #include "backend_metal.h"
+#include "pipeline_metadata.h"
+#include "prepared_graphics_draw.h"
+#include "rhi/rhi_internal.h"
 
 #include <nlohmann/json.hpp>
 
@@ -23,7 +25,7 @@ namespace {
 
 VernonStatus fail(VernonRuntimeContext &context, std::string error,
                   VernonStatus status = VERNON_STATUS_INVALID_ARGUMENT) {
-    context.error = std::move(error);
+    invocationDiagnostic(context) = std::move(error);
     return status;
 }
 
@@ -34,32 +36,20 @@ struct MetalResourceLocation {
     uint32_t count{};
 };
 
-bool resolveMetalResourceLocation(const nlohmann::json &reflection, const std::string &entry, const char *stage,
-                                  const char *kind, uint32_t set, uint32_t binding, MetalResourceLocation &output,
-                                  std::string &error, const std::string *name = nullptr) {
-    const auto slots = reflection.find("metal_resource_slots");
-    if (slots == reflection.end() || !slots->is_array()) {
-        error = "Metal reflection has no argument-buffer resource sidecar";
-        return false;
-    }
+bool resolveMetalResourceLocation(const std::vector<NativeResourceSlot> &slots, const std::string &entry,
+                                  const char *stage, const char *kind, uint32_t set, uint32_t binding,
+                                  MetalResourceLocation &output, std::string &error,
+                                  const std::string *name = nullptr) {
     bool found = false;
-    for (const auto &slot : *slots) {
-        if (!slot.is_object() || slot.value("entry_point", std::string()) != entry ||
-            slot.value("stage", std::string()) != stage || slot.value("kind", std::string()) != kind ||
-            (name && slot.value("name", std::string()) != *name) ||
-            (set != UINT32_MAX && slot.value("set", UINT32_MAX) != set) ||
-            (binding != UINT32_MAX && slot.value("binding", UINT32_MAX) != binding))
+    for (const NativeResourceSlot &slot : slots) {
+        if (slot.entry != entry || slot.stage != stage || slot.kind != kind || (name && slot.name != *name) ||
+            (set != UINT32_MAX && slot.set != set) || (binding != UINT32_MAX && slot.binding != binding))
             continue;
-        if (!slot.contains("argument_buffer_index") || !slot.contains("member_id") ||
-            !slot.contains("direct_buffer_index")) {
-            error = "Metal reflection uses the obsolete direct-resource slot contract";
-            return false;
-        }
         MetalResourceLocation location;
-        location.argumentBufferIndex = slot.value("argument_buffer_index", UINT32_MAX);
-        location.memberId = slot.value("member_id", UINT32_MAX);
-        location.directBufferIndex = slot.value("direct_buffer_index", UINT32_MAX);
-        location.count = slot.value("count", 0u);
+        location.argumentBufferIndex = slot.argumentBufferIndex;
+        location.memberId = slot.memberId;
+        location.directBufferIndex = slot.directBufferIndex;
+        location.count = slot.count;
         const bool descriptor = set != UINT32_MAX;
         const bool validDescriptor = location.argumentBufferIndex < 8 && location.memberId != UINT32_MAX &&
                                      location.directBufferIndex == UINT32_MAX;
@@ -85,35 +75,22 @@ struct MetalArgumentBufferUsage {
     bool writableTexture{};
 };
 
-bool collectMetalArgumentBufferUsage(const nlohmann::json &reflection, const std::string &entry, const char *stage,
-                                     MetalArgumentBufferUsage &usage, std::string &error) {
-    const auto slots = reflection.find("metal_resource_slots");
-    if (slots == reflection.end() || !slots->is_array()) {
-        error = "Metal reflection has no argument-buffer resource sidecar";
-        return false;
-    }
-    for (const auto &slot : *slots) {
-        if (!slot.is_object() || slot.value("entry_point", std::string()) != entry ||
-            slot.value("stage", std::string()) != stage)
+bool collectMetalArgumentBufferUsage(const std::vector<NativeResourceSlot> &slots, const std::string &entry,
+                                     const char *stage, MetalArgumentBufferUsage &usage, std::string &error) {
+    for (const NativeResourceSlot &slot : slots) {
+        if (slot.entry != entry || slot.stage != stage)
             continue;
-        if (!slot.contains("argument_buffer_index") || !slot.contains("member_id") ||
-            !slot.contains("direct_buffer_index")) {
-            error = "Metal reflection uses the obsolete direct-resource slot contract";
-            return false;
-        }
-        const uint64_t count = slot.value("count", 0u);
-        if (!count) {
+        if (!slot.count) {
             error = "Metal reflection contains a zero-sized resource binding";
             return false;
         }
-        const std::string kind = slot.value("kind", std::string());
-        if (kind == "uniform_buffer" || kind == "storage_buffer")
-            usage.buffers += count;
-        else if (kind == "sampled_image" || kind == "storage_image") {
-            usage.textures += count;
-            usage.writableTexture |= kind == "storage_image";
-        } else if (kind == "sampler")
-            usage.samplers += count;
+        if (slot.kind == "uniform_buffer" || slot.kind == "storage_buffer")
+            usage.buffers += slot.count;
+        else if (slot.kind == "sampled_image" || slot.kind == "storage_image") {
+            usage.textures += slot.count;
+            usage.writableTexture |= slot.kind == "storage_image";
+        } else if (slot.kind == "sampler")
+            usage.samplers += slot.count;
     }
     return true;
 }
@@ -152,25 +129,20 @@ bool validateMetalArgumentBufferLimitsForTesting(uint64_t buffers, uint64_t text
 #endif
 }
 
-bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
+bool resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                          VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
-    if (variant.compute.empty()) {
-        const Stage &vertex = bundle.stages.at(variant.vertex);
-        const Stage &fragment = bundle.stages.at(variant.fragment);
-        const nlohmann::json vertexReflection = nlohmann::json::parse(vertex.reflection, nullptr, false);
-        const nlohmann::json fragmentReflection = nlohmann::json::parse(fragment.reflection, nullptr, false);
-        if (vertexReflection.is_discarded() || fragmentReflection.is_discarded()) {
-            bundle.context->error = "Metal graphics reflection is invalid";
-            return false;
-        }
+    if (plan.compute.empty()) {
+        const LoadedStageArtifact &vertex = inputs.artifacts.at(plan.vertex);
+        const LoadedStageArtifact &fragment = inputs.artifacts.at(plan.fragment);
         MetalArgumentBufferUsage argumentBufferUsage;
-        if (!collectMetalArgumentBufferUsage(vertexReflection, vertex.entry, "vertex", argumentBufferUsage,
-                                             bundle.context->error) ||
-            !collectMetalArgumentBufferUsage(fragmentReflection, fragment.entry, "fragment", argumentBufferUsage,
-                                             bundle.context->error) ||
-            !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
-                                              metalState(*bundle.context).argumentBufferEncodingSupported,
-                                              bundle.context->error))
+        if (!collectMetalArgumentBufferUsage(vertex.nativeSlots, vertex.entry, "vertex", argumentBufferUsage,
+                                             invocationDiagnostic(*inputs.context)) ||
+            !collectMetalArgumentBufferUsage(fragment.nativeSlots, fragment.entry, "fragment", argumentBufferUsage,
+                                             invocationDiagnostic(*inputs.context)) ||
+            !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
+                                              metalState(*inputs.context).argumentBufferEncodingSupported,
+                                              invocationDiagnostic(*inputs.context)))
             return false;
         struct Candidate {
             VernonRuntimeProviderBindingLayoutEntry layout{};
@@ -194,12 +166,14 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             candidate.binding.externalSlot = parameter.slot;
             candidate.binding.descriptorSet = use.descriptorSet;
             candidate.binding.descriptorBinding = use.binding;
-            const Stage &nativeStage = use.stage == "vertex" ? vertex : fragment;
-            const nlohmann::json &nativeReflection = use.stage == "vertex" ? vertexReflection : fragmentReflection;
+            const LoadedStageArtifact &nativeStage = use.stage == "vertex" ? vertex : fragment;
+            const std::vector<NativeResourceSlot> &nativeSlots =
+                use.stage == "vertex" ? vertex.nativeSlots : fragment.nativeSlots;
             auto resolveDescriptor = [&](const char *kind) {
                 MetalResourceLocation location;
-                if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), kind,
-                                                  use.descriptorSet, use.binding, location, bundle.context->error))
+                if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), kind,
+                                                  use.descriptorSet, use.binding, location,
+                                                  invocationDiagnostic(*inputs.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -207,10 +181,10 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 return true;
             };
             if (parameter.kind == "sampler") {
-                if (use.sampledTextureBindings.empty())
+                if (use.sampledImageBindings.empty())
                     return false;
-                for (size_t index = 0; index < use.sampledTextureBindings.size(); ++index) {
-                    const SampledTextureBinding &binding = use.sampledTextureBindings[index];
+                for (size_t index = 0; index < use.sampledImageBindings.size(); ++index) {
+                    const SampledImageBinding &binding = use.sampledImageBindings[index];
                     Candidate sampler = candidate;
                     if (index != 0) {
                         if (nextProviderSlot == UINT32_MAX)
@@ -224,9 +198,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     sampler.binding.descriptorSet = binding.descriptorSet;
                     sampler.binding.descriptorBinding = binding.binding;
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(), "sampler",
+                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(), "sampler",
                                                       binding.descriptorSet, binding.binding, location,
-                                                      bundle.context->error))
+                                                      invocationDiagnostic(*inputs.context)))
                         return false;
                     sampler.layout.set = location.argumentBufferIndex;
                     sampler.layout.binding = location.memberId;
@@ -237,60 +211,44 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 }
                 return true;
             }
-            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout &&
-                use.physicalValueLayout->transport == "storage_buffer" && parameter.elementLayout.byteSize &&
-                use.binding != UINT32_MAX) {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
-                candidate.layout.element_size = parameter.elementLayout.byteSize;
-                candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
-                candidate.layout.set = use.descriptorSet;
-                candidate.layout.binding = use.binding;
-                candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_STORAGE;
-                if (!resolveDescriptor("storage_buffer"))
-                    return false;
-            } else if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.physicalValueLayout) {
+            if (parameter.kind == "tensor" && use.interfaceKind == "uniform" && use.interfacePlan &&
+                use.interfacePlan->root) {
                 const auto &shape = use.shape.empty() ? parameter.shape : use.shape;
                 const std::optional<VernonDataType> dtype = pipelineDataType(use.dtype);
-                uint64_t count = 1;
-                for (uint64_t dimension : shape) {
-                    if (!dimension || count > UINT32_MAX / dimension)
-                        return false;
-                    count *= dimension;
-                }
-                if (!dtype || !use.physicalValueLayout->size || use.physicalValueLayout->size > UINT32_MAX ||
-                    !use.physicalValueLayout->alignment || use.physicalValueLayout->alignment > UINT32_MAX)
+                if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
+                    !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
                     return false;
-                candidate.layout.kind = use.physicalValueLayout->transport == "uniform_buffer"
-                                            ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
-                candidate.layout.element_size = static_cast<uint32_t>(use.physicalValueLayout->size);
+                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
+                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
-                candidate.layout.element_count = static_cast<uint32_t>(count);
-                candidate.layout.vector_count = shape.size() == 2 ? static_cast<uint32_t>(shape[0]) : 1;
-                candidate.layout.element_alignment = static_cast<uint32_t>(use.physicalValueLayout->alignment);
+                candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = internal ? MetalPipelineState::GraphicsBinding::RESOLUTION
                                                     : MetalPipelineState::GraphicsBinding::EXTERNAL_UNIFORM;
-                candidate.binding.packing.elementSize = dataTypeSize(*dtype);
-                candidate.binding.packing.shape = shape;
-                candidate.binding.packing.byteSize = candidate.layout.element_size;
-                for (uint64_t stride : use.physicalValueLayout->byteStrides) {
-                    if (stride > SIZE_MAX)
-                        return false;
-                    candidate.binding.packing.byteStrides.push_back(static_cast<size_t>(stride));
-                }
-                if (candidate.binding.packing.byteStrides.size() != shape.size())
+                const ValueLayout &canonical = parameter.valueLayout ? *parameter.valueLayout : parameter.elementLayout;
+                std::optional<TensorCopyPlan> packing =
+                    parameter.valueLayout
+                        ? compileWholeValueCopyPlan(pipelineValueLayout(canonical), *use.interfacePlan->root)
+                        : compileElementStreamCopyPlan(pipelineValueLayout(canonical), shape, *use.interfacePlan->root);
+                if (!packing || packing->elementSize != canonical.byteSize)
                     return false;
+                candidate.binding.packing = std::move(*packing);
                 candidate.binding.storage.resize(candidate.layout.element_size);
                 if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
                     if (!resolveDescriptor("uniform_buffer"))
                         return false;
+                } else if (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
+                    if (!resolveDescriptor("storage_buffer"))
+                        return false;
                 } else {
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(nativeReflection, nativeStage.entry, use.stage.c_str(),
+                    const std::string inlineName = !use.uniformName.empty() ? use.uniformName : parameter.name;
+                    if (!resolveMetalResourceLocation(nativeSlots, nativeStage.entry, use.stage.c_str(),
                                                       "inline_constant", UINT32_MAX, UINT32_MAX, location,
-                                                      bundle.context->error, &parameter.name))
+                                                      invocationDiagnostic(*inputs.context), &inlineName))
                         return false;
                     candidate.layout.set = UINT32_MAX;
                     candidate.layout.binding = location.directBufferIndex;
@@ -311,13 +269,17 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                                                     leaf.byteOffset});
                 }
                 candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX;
-            } else if (parameter.kind == "texture" && use.interfaceKind == "resource") {
-                candidate.layout.kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+            } else if (parameter.kind == "image" && use.interfaceKind == "resource") {
+                const bool storage = parameter.bindingRole == "storage";
+                candidate.layout.kind =
+                    storage ? VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE : VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+                if (!configureImageBindingLayout(parameter, candidate.layout))
+                    return false;
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_RESOURCE;
                 candidate.layout.set = use.descriptorSet;
                 candidate.layout.binding = use.binding;
                 candidate.binding.source = MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE;
-                if (!resolveDescriptor("sampled_image"))
+                if (!resolveDescriptor(storage ? "storage_image" : "sampled_image"))
                     return false;
             } else {
                 return false;
@@ -326,7 +288,7 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             return true;
         };
         bool supported = true;
-        for (const Parameter &parameter : variant.parameters) {
+        for (const Parameter &parameter : plan.parameters) {
             for (const ParameterUse &use : parameter.uses)
                 if (!addUse(parameter, use, false)) {
                     supported = false;
@@ -335,15 +297,16 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             if (!supported)
                 break;
         }
-        for (const Parameter &parameter : variant.internalParameters)
+        for (const Parameter &parameter : plan.runtimeParameters)
             for (const ParameterUse &use : parameter.uses)
                 if (!supported || !addUse(parameter, use, true)) {
                     supported = false;
                     break;
                 }
         if (!supported) {
-            if (bundle.context->error.empty())
-                bundle.context->error = "Metal RuntimeCore graphics path does not support this parameter layout";
+            if (invocationDiagnostic(*inputs.context).empty())
+                invocationDiagnostic(*inputs.context) =
+                    "Metal RuntimeCore graphics path does not support this parameter layout";
             return false;
         }
         std::sort(candidates.begin(), candidates.end(),
@@ -385,29 +348,29 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
         descriptor.topology = VERNON_TOPOLOGY_TRIANGLE_LIST;
         descriptor.sample_count = 1;
         const VernonStatus status =
-            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*bundle.context).adapter),
+            vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
                                              &descriptor, &state->rhiGraphicsPipeline);
         if (status != VERNON_STATUS_OK) {
             const VernonStringView providerError =
-                vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-            bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                       : "failed to prepare Metal provider graphics pipeline";
+                vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+            invocationDiagnostic(*inputs.context) = providerError.data
+                                                        ? std::string(providerError.data, providerError.size)
+                                                        : "failed to prepare Metal provider graphics pipeline";
             return false;
         }
         installRuntimeBackendState(pipeline, state.release());
         return true;
     }
-    const Stage &stage = bundle.stages.at(variant.compute);
-    const nlohmann::json parsed = nlohmann::json::parse(stage.reflection, nullptr, false);
+    const LoadedStageArtifact &stage = inputs.artifacts.at(plan.compute);
     ReflectedEntry reflection;
-    if (parsed.is_discarded() ||
-        !parseReflection(parsed, stage.entry, reflection, VERNON_RUNTIME_METAL, bundle.context->error))
+    if (!resolveStageReflection(stage, VERNON_RUNTIME_METAL, reflection, invocationDiagnostic(*inputs.context)))
         return false;
     MetalArgumentBufferUsage argumentBufferUsage;
-    if (!collectMetalArgumentBufferUsage(parsed, stage.entry, "compute", argumentBufferUsage, bundle.context->error) ||
-        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*bundle.context).argumentBuffersTier,
-                                          metalState(*bundle.context).argumentBufferEncodingSupported,
-                                          bundle.context->error))
+    if (!collectMetalArgumentBufferUsage(stage.nativeSlots, stage.entry, "compute", argumentBufferUsage,
+                                         invocationDiagnostic(*inputs.context)) ||
+        !validateMetalArgumentBufferUsage(argumentBufferUsage, metalState(*inputs.context).argumentBuffersTier,
+                                          metalState(*inputs.context).argumentBufferEncodingSupported,
+                                          invocationDiagnostic(*inputs.context)))
         return false;
 
     struct Candidate {
@@ -425,14 +388,14 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
             flattenedBinding +=
                 static_cast<uint32_t>(std::max(reflection.arguments[index].storageLeaves.size(), size_t{1}));
     }
-    for (const Parameter &parameter : variant.parameters)
+    for (const Parameter &parameter : plan.parameters)
         internalSlot = std::max(internalSlot, parameter.slot);
-    for (const Parameter &parameter : variant.parameters) {
+    for (const Parameter &parameter : plan.parameters) {
         for (const ParameterUse &use : parameter.uses) {
-            if (use.stage != "compute" && use.stage != variant.compute)
+            if (use.stage != "compute" && use.stage != plan.compute)
                 continue;
             if (use.index >= reflection.arguments.size()) {
-                bundle.context->error = "Metal parameter use exceeds reflected argument table";
+                invocationDiagnostic(*inputs.context) = "Metal parameter use exceeds reflected argument table";
                 return false;
             }
             const ReflectedArgument &argument = reflection.arguments[use.index];
@@ -441,26 +404,36 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                 Candidate candidate;
                 candidate.layout.slot = leafIndex == 0 ? parameter.slot : ++internalSlot;
                 candidate.layout.set = argument.descriptorSet;
-                candidate.layout.binding = argument.storageLeaves.size() <= 1
+                candidate.layout.binding = argument.storageLeaves.empty()
                                                ? argumentBindings[use.index] + static_cast<uint32_t>(leafIndex)
                                                : argument.storageLeaves[leafIndex].binding;
-                candidate.layout.kind = argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                                                  : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                candidate.layout.kind = parameter.kind == "image"   ? (parameter.bindingRole == "sampled"
+                                                                           ? VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE
+                                                                           : VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE)
+                                        : argument.kind == "tensor" ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
+                                                                    : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                configureComputeValueStorage(use, candidate.layout);
                 candidate.layout.stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
                 candidate.layout.access = parameter.access == "read" ? 1u : parameter.access == "write" ? 2u : 3u;
+                if (parameter.kind == "image" && !configureImageBindingLayout(parameter, candidate.layout))
+                    return false;
                 candidate.layout.array_count = 1;
                 candidate.layout.argument_index = use.index;
                 candidate.layout.element_size = static_cast<uint32_t>(
-                    argument.storageLeaves.empty()
-                        ? (argument.kind == "tensor" ? argument.tensorElementSize : argument.physical.size)
-                        : argument.storageLeaves[leafIndex].elementSize);
+                    argument.storageLeaves.empty() ? (parameter.kind == "image"   ? 1
+                                                      : argument.kind == "tensor" ? argument.tensorElementSize
+                                                                                  : argument.physical.size)
+                                                   : argument.storageLeaves[leafIndex].elementSize);
                 candidate.resourceOffset = 0;
                 candidate.source = {ComputeBindingSourceKind::Argument, use.index, 0};
                 MetalResourceLocation location;
+                const char *resourceKind =
+                    parameter.kind == "image" ? (parameter.bindingRole == "sampled" ? "sampled_image" : "storage_image")
+                                              : "storage_buffer";
                 if (candidate.layout.binding == UINT32_MAX || candidate.layout.element_size == 0 ||
-                    !resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
+                    !resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", resourceKind,
                                                   candidate.layout.set, candidate.layout.binding, location,
-                                                  bundle.context->error))
+                                                  invocationDiagnostic(*inputs.context)))
                     return false;
                 candidate.layout.set = location.argumentBufferIndex;
                 candidate.layout.binding = location.memberId;
@@ -481,8 +454,9 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
                     candidate.layout.element_size = 4;
                     candidate.source = {kind, use.index, dimension};
                     MetalResourceLocation location;
-                    if (!resolveMetalResourceLocation(parsed, stage.entry, "compute", "storage_buffer",
-                                                      candidate.layout.set, binding, location, bundle.context->error))
+                    if (!resolveMetalResourceLocation(stage.nativeSlots, stage.entry, "compute", "storage_buffer",
+                                                      candidate.layout.set, binding, location,
+                                                      invocationDiagnostic(*inputs.context)))
                         return false;
                     candidate.layout.set = location.argumentBufferIndex;
                     candidate.layout.binding = location.memberId;
@@ -532,25 +506,26 @@ bool resolveMetalPipeline(VernonPipelineBundle &bundle, const Variant &variant, 
     descriptor.binding_count = state->rhiComputeLayout.size();
     std::copy_n(state->rhiComputeWorkgroup, 3, descriptor.workgroup_size);
     const VernonStatus status =
-        vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*bundle.context).adapter),
+        vernonRuntimeCorePreparePipeline(vernonRuntimeRhiAdapterGetProvider(metalState(*inputs.context).adapter),
                                          &descriptor, &state->rhiComputePipeline);
     if (status != VERNON_STATUS_OK) {
-        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*bundle.context).adapter);
-        bundle.context->error = providerError.data ? std::string(providerError.data, providerError.size)
-                                                   : "failed to prepare Metal provider compute pipeline";
+        const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(metalState(*inputs.context).adapter);
+        invocationDiagnostic(*inputs.context) = providerError.data
+                                                    ? std::string(providerError.data, providerError.size)
+                                                    : "failed to prepare Metal provider compute pipeline";
         return false;
     }
     installRuntimeBackendState(pipeline, state.release());
     return true;
 #else
-    (void)bundle;
-    (void)variant;
+    (void)inputs;
+    (void)plan;
     (void)pipeline;
     return false;
 #endif
 }
 
-void destroyMetalPipeline(VernonLoadedPipeline &pipeline) {
+void destroyMetalPipeline(VernonStageExecutable &pipeline) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     vernonRuntimeCoreBindingsDestroy(state.rhiComputeBindings);
@@ -563,7 +538,8 @@ void destroyMetalPipeline(VernonLoadedPipeline &pipeline) {
 #endif
 }
 
-VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeMetalGraphicsPipeline(VernonStageExecutable &pipeline,
+                                         const VernonStageInvocationDescriptor &invocation,
                                          const PlannedGraphicsInvocation &plan) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
@@ -579,57 +555,57 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
         value.kind = layout.kind;
         if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_VERTEX) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value || !found->second->tensor.byte_strides ||
                 found->second->tensor.byte_strides[0] <= 0)
                 return fail(*pipeline.context, "Metal RHI vertex argument is missing or invalid");
-            value.resource = found->second->tensor.resource;
-            value.resource.offset += found->second->tensor.byte_offset;
-            value.stride = static_cast<uint32_t>(found->second->tensor.byte_strides[0]);
+            value.payload.buffer.resource = found->second->tensor.resource;
+            value.payload.buffer.resource.offset += found->second->tensor.byte_offset;
+            value.payload.buffer.stride = static_cast<uint32_t>(found->second->tensor.byte_strides[0]);
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_STORAGE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR ||
                 found->second->tensor.storage != VERNON_TENSOR_RHI_RESOURCE ||
                 !found->second->tensor.resource.resource.value)
                 return fail(*pipeline.context, "Metal RHI storage argument is missing");
-            value.resource = found->second->tensor.resource;
-            value.resource.offset += found->second->tensor.byte_offset;
+            value.payload.buffer.resource = found->second->tensor.resource;
+            value.payload.buffer.resource.offset += found->second->tensor.byte_offset;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_TEXTURE) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TEXTURE ||
-                !found->second->texture.resource.resource.value)
-                return fail(*pipeline.context, "Metal RHI texture argument is missing");
-            value.resource = found->second->texture.resource;
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_IMAGE ||
+                !found->second->image.view.resource.value)
+                return fail(*pipeline.context, "Metal RHI image argument is missing");
+            value.payload.image.view = found->second->image.view;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::EXTERNAL_SAMPLER) {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_SAMPLER ||
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_SAMPLER ||
                 !found->second->resource.resource.value)
                 return fail(*pipeline.context, "Metal RHI sampler argument is missing");
-            value.resource = found->second->resource;
+            value.payload.sampler.resource = found->second->resource;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::IMPLICIT_SAMPLER) {
             const auto sampled = plan.sampledResources.find({prepared.descriptorSet, prepared.descriptorBinding});
             if (sampled == plan.sampledResources.end())
                 return fail(*pipeline.context, "Metal RHI implicit sampler binding is missing");
             if (sampled->second.samplerResource.resource.value)
-                value.resource = sampled->second.samplerResource;
+                value.payload.sampler.resource = sampled->second.samplerResource;
             else
                 value.flags = VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE;
         } else if (prepared.source == MetalPipelineState::GraphicsBinding::RESOLUTION) {
             std::memcpy(prepared.storage.data(), plan.resolution.data(),
                         std::min(prepared.storage.size(), sizeof(plan.resolution)));
-            value.inline_data = prepared.storage.data();
-            value.inline_size = prepared.storage.size();
+            value.payload.inline_value.data = prepared.storage.data();
+            value.payload.inline_value.size = prepared.storage.size();
         } else {
             const auto found = plan.arguments.find(prepared.externalSlot);
-            if (found == plan.arguments.end() || found->second->kind != VERNON_PIPELINE_TENSOR)
+            if (found == plan.arguments.end() || found->second->kind != VERNON_PROGRAM_TENSOR)
                 return fail(*pipeline.context, "Metal RHI uniform argument is missing");
             const std::optional<std::vector<uint8_t>> packed = packTensor(found->second->tensor, prepared.packing);
             if (!packed || packed->size() != prepared.storage.size())
                 return fail(*pipeline.context, "Metal RHI uniform Tensor is invalid");
             prepared.storage = *packed;
-            value.inline_data = prepared.storage.data();
-            value.inline_size = prepared.storage.size();
+            value.payload.inline_value.data = prepared.storage.data();
+            value.payload.inline_value.size = prepared.storage.size();
         }
     }
     VernonStatus status =
@@ -641,58 +617,29 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to update Metal RHI graphics bindings",
+                    providerError.data && providerError.size ? std::string(providerError.data, providerError.size)
+                                                             : "failed to update Metal RHI graphics bindings",
                     status);
     }
-    if (plan.attachments.empty() || plan.attachments.size() > 8)
-        return fail(*pipeline.context, "Metal RHI draw requires one to eight color attachments");
-    std::array<VernonRuntimeProviderColorAttachment, 8> attachments{};
     std::vector<uint32_t> formats;
     formats.reserve(plan.attachments.size());
     for (size_t index = 0; index < plan.attachments.size(); ++index) {
-        const VernonColorAttachment &source = *plan.attachments[index];
-        attachments[index].location = source.location;
-        attachments[index].image = source.resource;
-        attachments[index].load_operation = source.load_operation;
-        attachments[index].store_operation = source.store_operation;
-        std::copy(std::begin(source.clear_color), std::end(source.clear_color), attachments[index].clear_color);
-        const uint32_t format = rhi::metalImagePixelFormat(pipeline.context->rhiDevice, source.resource.resource.value);
+        const uint32_t format = rhi::metalTexturePixelFormat(plan.attachmentFormats[index]);
         if (!format)
             return fail(*pipeline.context, "Metal RHI color attachment is stale");
         formats.push_back(format);
     }
-    VernonRuntimeProviderResourceReference depthAttachment{};
     uint32_t depthFormat = 0;
     if (plan.depthAttachment) {
-        depthAttachment = plan.depthAttachment->resource;
-        depthFormat = rhi::metalImagePixelFormat(pipeline.context->rhiDevice, depthAttachment.resource.value);
+        depthFormat = rhi::metalTexturePixelFormat(plan.depthFormat);
         if (!depthFormat)
             return fail(*pipeline.context, "Metal RHI depth attachment is stale");
     }
-    PlannedGraphicsState graphicsState;
-    const bool hasStencil = plan.depthAttachment && plan.depthAttachment->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT;
-    if (!planGraphicsState(invocation, formats.size(), plan.depthAttachment != nullptr, hasStencil, graphicsState,
-                           pipeline.context->error))
+    PreparedGraphicsDraw prepared;
+    if (!prepareGraphicsDraw(invocation, plan, std::move(formats), depthFormat, state.rhiGraphicsLayout,
+                             state.rhiGraphicsValues, prepared, invocationDiagnostic(*pipeline.context)))
         return VERNON_STATUS_INVALID_ARGUMENT;
-    std::vector<uint32_t> vertexStrides;
-    for (size_t index = 0; index < state.rhiGraphicsLayout.size(); ++index) {
-        if (state.rhiGraphicsLayout[index].kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-            continue;
-        const uint32_t binding = state.rhiGraphicsLayout[index].binding;
-        if (vertexStrides.size() <= binding)
-            vertexStrides.resize(binding + 1);
-        vertexStrides[binding] = state.rhiGraphicsValues[index].stride;
-    }
-    GraphicsVariantKey variantKey{static_cast<uint32_t>(invocation.topology),
-                                  formats,
-                                  depthFormat,
-                                  1,
-                                  vertexStrides,
-                                  graphicsState.rasterization,
-                                  graphicsState.depthStencil,
-                                  graphicsState.colorBlends};
-    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, variantKey, state.rhiGraphicsVariant);
+    status = ensureGraphicsVariant(state.rhiGraphicsPipeline, prepared.variantKey, state.rhiGraphicsVariant);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
@@ -700,47 +647,13 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
                                        : "failed to prepare Metal RHI graphics variant",
                     status);
     }
-    const bool hasViewport = invocation.viewport[2] && invocation.viewport[3];
-    VernonRuntimeCoreDrawInvocation draw{};
-    draw.struct_size = sizeof(draw);
-    draw.command_encoder = invocation.command_encoder;
-    draw.vertex_count = plan.vertexCount;
-    draw.instance_count = plan.instanceCount;
-    draw.color_attachments = attachments.data();
-    draw.color_attachment_count = plan.attachments.size();
-    draw.depth_stencil_attachment = depthAttachment;
-    draw.depth_load_operation =
-        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->load_operation) : VERNON_RHI_LOAD_DISCARD;
-    draw.depth_store_operation =
-        plan.depthAttachment ? static_cast<uint32_t>(plan.depthAttachment->store_operation) : VERNON_RHI_STORE_DISCARD;
-    draw.clear_depth = plan.depthAttachment ? plan.depthAttachment->clear_depth : 1.0f;
-    draw.stencil_load_operation =
-        hasStencil ? static_cast<uint32_t>(plan.depthAttachment->stencil_load_operation) : VERNON_RHI_LOAD_DISCARD;
-    draw.stencil_store_operation =
-        hasStencil ? static_cast<uint32_t>(plan.depthAttachment->stencil_store_operation) : VERNON_RHI_STORE_DISCARD;
-    draw.clear_stencil = hasStencil ? plan.depthAttachment->clear_stencil : 0;
-    draw.stencil_reference = graphicsState.stencilReference;
-    draw.viewport[0] = hasViewport ? invocation.viewport[0] : 0;
-    draw.viewport[1] = hasViewport ? invocation.viewport[1] : 0;
-    draw.viewport[2] = hasViewport ? invocation.viewport[2] : plan.attachmentWidth;
-    draw.viewport[3] = hasViewport ? invocation.viewport[3] : plan.attachmentHeight;
-    const bool hasScissor = invocation.scissor[2] && invocation.scissor[3];
-    for (size_t index = 0; index < 4; ++index)
-        draw.scissor[index] = hasScissor ? invocation.scissor[index] : draw.viewport[index];
-    draw.topology = invocation.topology;
-    if (plan.indexBinding) {
-        draw.index_buffer = plan.indexBinding->resource;
-        draw.index_buffer.offset += plan.indexBinding->offset;
-        draw.index_count = plan.indexBinding->index_count;
-        draw.index_type = plan.indexBinding->type;
-    }
     status = vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(state.rhiGraphicsVariant.handle,
-                                                                  state.rhiGraphicsBindings, &draw);
+                                                                  state.rhiGraphicsBindings, &prepared.invocation);
     if (status != VERNON_STATUS_OK) {
         const VernonStringView providerError = vernonRuntimeRhiAdapterGetLastError(&adapter);
         return fail(*pipeline.context,
-                    providerError.data ? std::string(providerError.data, providerError.size)
-                                       : "failed to encode Metal RHI draw",
+                    providerError.data && providerError.size ? std::string(providerError.data, providerError.size)
+                                                             : "failed to encode Metal RHI draw",
                     status);
     }
     return VERNON_STATUS_OK;
@@ -752,7 +665,7 @@ VernonStatus invokeMetalGraphicsPipeline(VernonLoadedPipeline &pipeline, const V
 #endif
 }
 
-VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &launch) {
+VernonStatus invokeMetalComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &launch) {
 #if defined(VERNON_HAS_METAL_RUNTIME)
     MetalPipelineState &state = runtimeBackendState<MetalPipelineState>(pipeline);
     VernonRuntimeRhiAdapter &adapter = *metalState(*pipeline.context).adapter;
@@ -771,20 +684,33 @@ VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const Pl
             if (!descriptor || *descriptor < INT32_MIN || *descriptor > INT32_MAX)
                 return fail(*pipeline.context, "Metal TensorView descriptor exceeds the shader index range");
             state.rhiComputeDescriptorValues[index] = static_cast<int32_t>(*descriptor);
-            value.inline_data = &state.rhiComputeDescriptorValues[index];
-            value.inline_size = sizeof(int32_t);
+            value.payload.inline_value.data = &state.rhiComputeDescriptorValues[index];
+            value.payload.inline_value.size = sizeof(int32_t);
             continue;
         }
         if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            if (argument.kind != ComputeLaunchArgumentKind::Tensor || !argument.resource.resource.value)
+            if (layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM) {
+                if (!bindComputeValueStorage(layout, argument, value))
+                    return fail(*pipeline.context, "Metal prepared Value storage binding has invalid bytes");
+                continue;
+            }
+            const auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
+            if (!tensor || !tensor->resource.resource.value)
                 return fail(*pipeline.context, "Metal prepared storage binding requires an RHI Tensor");
-            value.resource = argument.resource;
-            value.resource.offset += state.rhiComputeResourceOffsets[index];
+            value.payload.buffer.resource = tensor->resource;
+            value.payload.buffer.resource.offset += state.rhiComputeResourceOffsets[index];
+        } else if (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE ||
+                   layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
+            const auto *image = std::get_if<ComputeImageArgument>(&argument);
+            if (!image || !image->view.resource.value)
+                return fail(*pipeline.context, "Metal prepared image binding requires an RHI Texture");
+            value.payload.image.view = image->view;
         } else {
-            if (argument.kind != ComputeLaunchArgumentKind::Scalar || !argument.scalarData || !argument.scalarSize)
+            const auto *scalar = std::get_if<ComputeScalarArgument>(&argument);
+            if (!scalar || !scalar->data || !scalar->size)
                 return fail(*pipeline.context, "Metal prepared inline binding requires packed host data");
-            value.inline_data = argument.scalarData;
-            value.inline_size = argument.scalarSize;
+            value.payload.inline_value.data = scalar->data;
+            value.payload.inline_value.size = scalar->size;
         }
     }
     VernonStatus status =
@@ -800,9 +726,7 @@ VernonStatus invokeMetalComputePipeline(VernonLoadedPipeline &pipeline, const Pl
                                        : "failed to prepare Metal invocation bindings",
                     status);
     }
-    const uint32_t groups[3]{(launch.grid.x - 1) / state.rhiComputeWorkgroup[0] + 1,
-                             (launch.grid.y - 1) / state.rhiComputeWorkgroup[1] + 1,
-                             (launch.grid.z - 1) / state.rhiComputeWorkgroup[2] + 1};
+    const uint32_t groups[3]{launch.grid.x, launch.grid.y, launch.grid.z};
     status = vernonRuntimeCoreEncodeDispatch(state.rhiComputePipeline, state.rhiComputeBindings, launch.commandEncoder,
                                              groups, nullptr, 0);
     if (status != VERNON_STATUS_OK) {

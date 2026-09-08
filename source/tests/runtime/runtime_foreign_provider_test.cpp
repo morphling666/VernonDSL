@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdint>
 
 namespace {
@@ -29,7 +30,7 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     mock.capabilities = capabilities;
     VernonRuntimeDeviceProvider provider{};
     provider.struct_size = sizeof(provider);
-    provider.abi_version = VERNON_PIPELINE_VERSION;
+    provider.abi_version = VERNON_PROGRAM_VERSION;
     provider.user_data = &mock;
     provider.get_capabilities = [](void *data) -> uint32_t { return static_cast<MockProvider *>(data)->capabilities; };
     provider.get_device_identity = [](void *) -> VernonRuntimeProviderDeviceIdentity { return {11, 22, 33}; };
@@ -61,6 +62,47 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     };
     provider.release_resource = [](void *data, VernonRuntimeProviderResourceReference) {
         ++static_cast<MockProvider *>(data)->releasedResources;
+    };
+    provider.describe_image = [](void *, VernonRuntimeProviderResourceReference resource,
+                                 VernonRuntimeProviderImageDescription *description) {
+        if (!description || description->struct_size < sizeof(*description))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        description->image = {VERNON_TEXTURE_2D,
+                              {16, 16, 1},
+                              VERNON_TEXTURE_RGBA8_UNORM,
+                              1,
+                              1,
+                              1,
+                              VERNON_IMAGE_SAMPLED | VERNON_IMAGE_STORAGE};
+        description->view = {VERNON_TEXTURE_2D, VERNON_TEXTURE_RGBA8_UNORM, {0, 1, 0, 1, VERNON_IMAGE_ASPECT_COLOR}};
+        description->parent_identity = 100;
+        description->resource_kind = VERNON_RUNTIME_PROVIDER_IMAGE_VIEW;
+        if (resource.identity == 101)
+            description->view.dimension = VERNON_TEXTURE_3D;
+        else if (resource.identity == 102)
+            description->image.usage = VERNON_IMAGE_SAMPLED;
+        else if (resource.identity == 103) {
+            description->image.format = VERNON_TEXTURE_D32_FLOAT;
+            description->image.usage = VERNON_IMAGE_SAMPLED;
+            description->view.format = VERNON_TEXTURE_D32_FLOAT;
+            description->view.subresources.aspects = VERNON_IMAGE_ASPECT_DEPTH;
+        } else if (resource.identity == 104)
+            description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+        else if (resource.identity == 105) {
+            description->image.format = VERNON_TEXTURE_D32_FLOAT;
+            description->image.usage = VERNON_IMAGE_DEPTH_STENCIL_ATTACHMENT;
+            description->view.format = VERNON_TEXTURE_D32_FLOAT;
+            description->view.subresources.aspects = VERNON_IMAGE_ASPECT_DEPTH;
+        } else if (resource.identity == 106) {
+            description->image.usage = VERNON_IMAGE_COLOR_ATTACHMENT;
+            description->resource_kind = VERNON_RUNTIME_PROVIDER_IMAGE_OWNER;
+        } else if (resource.identity == 107) {
+            description->view.format = VERNON_TEXTURE_D32_FLOAT;
+            description->view.subresources.aspects = VERNON_IMAGE_ASPECT_DEPTH;
+        }
+        if (resource.identity >= 104)
+            description->parent_identity = resource.identity;
+        return VERNON_STATUS_OK;
     };
     provider.create_binding_set = [](void *data, const VernonRuntimeProviderBindingSetDescriptor *,
                                      VernonRuntimeProviderObject *bindings) {
@@ -147,6 +189,45 @@ VernonRuntimeCorePipelineDescriptor graphicsPipelineDescriptor() {
     return descriptor;
 }
 
+VernonRuntimeCorePipelineDescriptor imagePipelineDescriptor() {
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    static const std::array<VernonRuntimeProviderBindingLayoutEntry, 2> bindings = [] {
+        std::array<VernonRuntimeProviderBindingLayoutEntry, 2> result{};
+        result[0].slot = 0;
+        result[0].kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+        result[0].stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+        result[0].access = 1;
+        result[0].array_count = 1;
+        result[0].image_dimension = VERNON_TEXTURE_2D;
+        result[0].sample_result_class = VERNON_IMAGE_SAMPLE_FLOAT;
+        result[1].slot = 1;
+        result[1].kind = VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+        result[1].stage_mask = VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
+        result[1].access = 2;
+        result[1].array_count = 1;
+        result[1].image_dimension = VERNON_TEXTURE_2D;
+        result[1].storage_image_format = VERNON_TEXTURE_RGBA8_UNORM;
+        return result;
+    }();
+    descriptor.bindings = bindings.data();
+    descriptor.binding_count = bindings.size();
+    return descriptor;
+}
+
+TEST(RuntimeForeignProvider, RejectsProvidersWithoutLifecycleCallbacks) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline{};
+
+    provider.retain_resource = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
+    provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    provider.release_resource = nullptr;
+    EXPECT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(pipeline, nullptr);
+}
+
 TEST(RuntimeForeignProvider, PreparesBindsAndEncodesWithNumericSlots) {
     MockProvider mock;
     VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
@@ -156,7 +237,10 @@ TEST(RuntimeForeignProvider, PreparesBindsAndEncodesWithNumericSlots) {
     ASSERT_NE(pipeline, nullptr);
     EXPECT_EQ(vernonRuntimeCorePipelineGetDeviceIdentity(pipeline).device_id, 22u);
 
-    const VernonRuntimeProviderBindingValue value{0, VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER, {99, {100}, 0, 4096}};
+    VernonRuntimeProviderBindingValue value{};
+    value.slot = 0;
+    value.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    value.payload.buffer.resource = {99, {100}, 0, 4096};
     VernonRuntimeCoreBindings *bindings = nullptr;
     ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
     const uint32_t groups[3]{4, 2, 1};
@@ -186,6 +270,39 @@ TEST(RuntimeForeignProvider, RejectsCapabilitiesBeforePreparation) {
     EXPECT_EQ(mock.pipelinePreparations, 0u);
 }
 
+TEST(RuntimeForeignProvider, ValidatesSampledAndStorageImagesFromProviderDescriptors) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    VernonRuntimeCorePipelineDescriptor descriptor = imagePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+
+    std::array<VernonRuntimeProviderBindingValue, 2> values{};
+    values[0].slot = 0;
+    values[0].kind = VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE;
+    values[0].payload.image.view = {100, {1}, 0, 0};
+    values[1].slot = 1;
+    values[1].kind = VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+    values[1].payload.image.view = {100, {2}, 0, 0};
+    VernonRuntimeCoreBindings *bindings = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, values.data(), values.size(), &bindings), VERNON_STATUS_OK);
+
+    values[0].payload.image.view.identity = 101;
+    EXPECT_EQ(vernonRuntimeCoreUpdateBindings(bindings, values.data(), values.size()), VERNON_STATUS_INVALID_ARGUMENT);
+    // Ordinary sampling of a depth-format view still produces floating-point shader values.
+    values[0].payload.image.view.identity = 103;
+    EXPECT_EQ(vernonRuntimeCoreUpdateBindings(bindings, values.data(), values.size()), VERNON_STATUS_OK);
+    values[0].payload.image.view.identity = 107;
+    EXPECT_EQ(vernonRuntimeCoreUpdateBindings(bindings, values.data(), values.size()), VERNON_STATUS_INVALID_ARGUMENT);
+    values[0].payload.image.view.identity = 100;
+    values[1].payload.image.view.identity = 102;
+    EXPECT_EQ(vernonRuntimeCoreUpdateBindings(bindings, values.data(), values.size()), VERNON_STATUS_INVALID_ARGUMENT);
+
+    vernonRuntimeCoreBindingsDestroy(bindings);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+    EXPECT_EQ(mock.retainedResources, mock.releasedResources);
+}
+
 TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     MockProvider mock;
     VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
@@ -197,7 +314,7 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
 
     const uint32_t formats[]{3};
     const uint32_t strides[]{12};
-    VernonRuntimeProviderColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     VernonRuntimeCoreGraphicsCompatibility compatibility{};
     compatibility.struct_size = sizeof(compatibility);
@@ -250,6 +367,34 @@ TEST(RuntimeForeignProvider, CachesGraphicsVariantsByCompatibility) {
     vernonRuntimeCorePipelineDestroy(pipeline);
 }
 
+TEST(RuntimeForeignProvider, ValidatesAttachmentViewsBeforeEncoding) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_GRAPHICS);
+    VernonRuntimeCorePipelineDescriptor descriptor = graphicsPipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderColorAttachment color{};
+    color.view = {104, {1}, 0, 0};
+    VernonRuntimeCoreDrawInvocation draw{};
+    draw.struct_size = sizeof(draw);
+    draw.vertex_count = 3;
+    draw.instance_count = 1;
+    draw.color_attachments = &color;
+    draw.color_attachment_count = 1;
+    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_OK);
+
+    color.view.identity = 100;
+    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+    color.view.identity = 106;
+    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_INVALID_ARGUMENT);
+
+    color.view.identity = 104;
+    draw.depth_stencil_view = {105, {2}, 0, 0};
+    EXPECT_EQ(vernonRuntimeCoreEncodeDrawInvocation(pipeline, nullptr, &draw), VERNON_STATUS_OK);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+}
+
 TEST(RuntimeForeignProvider, ReleasesPartiallyPreparedGraphicsVariant) {
     MockProvider mock;
     mock.failedPipelinePreparation = 2;
@@ -258,7 +403,7 @@ TEST(RuntimeForeignProvider, ReleasesPartiallyPreparedGraphicsVariant) {
     VernonRuntimeCorePipeline *pipeline = nullptr;
     ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
     const uint32_t format[]{3};
-    VernonRuntimeProviderColorBlendState blend{};
+    VernonColorBlendState blend{};
     blend.write_mask = VERNON_RHI_COLOR_WRITE_ALL;
     VernonRuntimeCoreGraphicsCompatibility compatibility{};
     compatibility.struct_size = sizeof(compatibility);

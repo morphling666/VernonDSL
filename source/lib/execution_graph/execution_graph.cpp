@@ -1,9 +1,12 @@
 #include "VernonExecutionGraph.h"
 
-#include "../rhi/rhi_internal.h"
+#include "execution_graph_checkpoint_planner_internal.h"
+#include "rhi/rhi_internal.h"
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <queue>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,26 +15,66 @@ namespace vernon::execution {
 namespace {
 
 bool writes(AccessMode access) { return access != AccessMode::Read; }
+bool reads(AccessMode access) { return access != AccessMode::Write; }
+
+struct DerivativeEndpointHash {
+    size_t operator()(const DerivativeEndpointKey &endpoint) const {
+        return (static_cast<size_t>(endpoint.kind) << 32u) ^ endpoint.id;
+    }
+};
+
+ImageUseRole imageRole(VernonRhiResourceState state) {
+    switch (state) {
+    case VERNON_RHI_STATE_SHADER_READ:
+        return ImageUseRole::Sampled;
+    case VERNON_RHI_STATE_SHADER_WRITE:
+        return ImageUseRole::Storage;
+    case VERNON_RHI_STATE_COLOR_ATTACHMENT:
+        return ImageUseRole::ColorAttachment;
+    case VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT:
+        return ImageUseRole::DepthAttachment;
+    case VERNON_RHI_STATE_TRANSFER_SOURCE:
+    case VERNON_RHI_STATE_TRANSFER_DESTINATION:
+        return ImageUseRole::Transfer;
+    default:
+        return ImageUseRole::None;
+    }
+}
+
+bool intervalsOverlap(uint32_t leftBase, uint32_t leftCount, uint32_t rightBase, uint32_t rightCount) {
+    const uint64_t leftEnd = leftCount == UINT32_MAX ? UINT64_MAX : uint64_t{leftBase} + leftCount;
+    const uint64_t rightEnd = rightCount == UINT32_MAX ? UINT64_MAX : uint64_t{rightBase} + rightCount;
+    return uint64_t{leftBase} < rightEnd && uint64_t{rightBase} < leftEnd;
+}
+
+bool usesOverlap(const ResourceUse &left, const ResourceUse &right) {
+    if (left.resource.id != right.resource.id)
+        return false;
+    if (left.resource.kind != ResourceKind::Image || left.imageRole == ImageUseRole::None ||
+        right.imageRole == ImageUseRole::None)
+        return true;
+    const auto &a = left.imageSubresources;
+    const auto &b = right.imageSubresources;
+    return (a.aspects & b.aspects) != 0 &&
+           intervalsOverlap(a.base_mip_level, a.mip_level_count, b.base_mip_level, b.mip_level_count) &&
+           intervalsOverlap(a.base_array_layer, a.array_layer_count, b.base_array_layer, b.array_layer_count);
+}
 
 uint64_t handleKey(uint32_t index, uint32_t generation) { return (static_cast<uint64_t>(generation) << 32u) | index; }
 
 std::atomic<uint64_t> nextGraphIdentity{1};
+std::mutex executionSessionRegistryMutex;
+std::unordered_map<uint64_t, std::weak_ptr<std::recursive_mutex>> executionSessions;
 
-uint32_t accessBits(const ResourceUse &use) {
-    const bool reads = use.access != AccessMode::Write;
-    const bool writesResource = use.access != AccessMode::Read;
-    if (use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_COLOR_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_COLOR_WRITE : 0);
-    if (use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT)
-        return (reads ? VERNON_RHI_ACCESS_DEPTH_STENCIL_READ : 0) |
-               (writesResource ? VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE : 0);
-    if (use.state == VERNON_RHI_STATE_TRANSFER_SOURCE)
-        return VERNON_RHI_ACCESS_TRANSFER_READ;
-    if (use.state == VERNON_RHI_STATE_TRANSFER_DESTINATION)
-        return VERNON_RHI_ACCESS_TRANSFER_WRITE;
-    if (use.state == VERNON_RHI_STATE_SHADER_READ || use.state == VERNON_RHI_STATE_SHADER_WRITE)
-        return (reads ? VERNON_RHI_ACCESS_SHADER_READ : 0) | (writesResource ? VERNON_RHI_ACCESS_SHADER_WRITE : 0);
-    return VERNON_RHI_ACCESS_NONE;
+std::shared_ptr<std::recursive_mutex> executionSession(VernonRhiDevice device) {
+    const uint64_t key = handleKey(device.index, device.generation);
+    std::lock_guard<std::mutex> lock(executionSessionRegistryMutex);
+    if (const auto found = executionSessions.find(key); found != executionSessions.end())
+        if (auto existing = found->second.lock())
+            return existing;
+    auto created = std::make_shared<std::recursive_mutex>();
+    executionSessions[key] = created;
+    return created;
 }
 
 bool sameView(const GraphImage &left, const GraphImage &right) {
@@ -54,7 +97,7 @@ bool attachmentUse(const ResourceUse &use) {
 bool hasUnrepresentableHazard(const RenderPass &left, const RenderPass &right) {
     for (const ResourceUse &first : left.uses())
         for (const ResourceUse &second : right.uses())
-            if (first.resource.id == second.resource.id && (writes(first.access) || writes(second.access)) &&
+            if (usesOverlap(first, second) && (writes(first.access) || writes(second.access)) &&
                 !(attachmentUse(first) && attachmentUse(second) && first.state == second.state))
                 return true;
     return false;
@@ -74,7 +117,9 @@ bool compatible(const RenderPass &left, const RenderPass &right) {
         const auto &previous = *left.depthAttachment();
         const auto &next = *right.depthAttachment();
         if (!sameView(previous.image, next.image) || previous.readOnlyDepth != next.readOnlyDepth ||
-            previous.readOnlyStencil != next.readOnlyStencil || !preservesBoundary(previous.depthStore, next.depthLoad))
+            previous.readOnlyStencil != next.readOnlyStencil ||
+            !preservesBoundary(previous.depthStore, next.depthLoad) ||
+            !preservesBoundary(previous.stencilStore, next.stencilLoad))
             return false;
     }
     return std::equal(left.renderAreaData(), left.renderAreaData() + 4, right.renderAreaData());
@@ -82,9 +127,74 @@ bool compatible(const RenderPass &left, const RenderPass &right) {
 
 } // namespace
 
+class DeviceExecutionSession::Impl {
+public:
+    explicit Impl(VernonRhiDevice device) {
+        if (vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandIndependentRecording)
+            return;
+        mutex = executionSession(device);
+        lock = std::unique_lock<std::recursive_mutex>(*mutex);
+    }
+
+private:
+    std::shared_ptr<std::recursive_mutex> mutex;
+    std::unique_lock<std::recursive_mutex> lock;
+};
+
+DeviceExecutionSession::DeviceExecutionSession(VernonRhiDevice device) : impl_(std::make_unique<Impl>(device)) {}
+DeviceExecutionSession::~DeviceExecutionSession() = default;
+DeviceExecutionSession::DeviceExecutionSession(DeviceExecutionSession &&) noexcept = default;
+DeviceExecutionSession &DeviceExecutionSession::operator=(DeviceExecutionSession &&) noexcept = default;
+
+bool GraphCheckpointResource::copyRangeTo(uint64_t offset, void *destination, uint64_t rangeByteSize,
+                                          std::string &error) const {
+    if (offset || rangeByteSize != byteSize()) {
+        error = "checkpoint resource does not support partial copies";
+        return false;
+    }
+    return copyTo(destination, rangeByteSize, error);
+}
+
+bool GraphCheckpointResource::copyRangeFrom(uint64_t offset, const void *source, uint64_t rangeByteSize,
+                                            std::string &error) {
+    if (offset || rangeByteSize != byteSize()) {
+        error = "checkpoint resource does not support partial copies";
+        return false;
+    }
+    return copyFrom(source, rangeByteSize, error);
+}
+
+bool GraphCheckpointResource::copyRangesTo(const std::vector<GraphByteRange> &ranges, void *packedDestination,
+                                           std::string &error) const {
+    auto *destination = static_cast<std::byte *>(packedDestination);
+    for (const GraphByteRange &range : ranges) {
+        if (!copyRangeTo(range.offset, destination, range.byteSize, error))
+            return false;
+        destination += range.byteSize;
+    }
+    return true;
+}
+
+bool GraphCheckpointResource::copyRangesFrom(const std::vector<GraphByteRange> &ranges, const void *packedSource,
+                                             std::string &error) {
+    const auto *source = static_cast<const std::byte *>(packedSource);
+    for (const GraphByteRange &range : ranges) {
+        if (!copyRangeFrom(range.offset, source, range.byteSize, error))
+            return false;
+        source += range.byteSize;
+    }
+    return true;
+}
+
 ExecutionPass::ExecutionPass(std::string name) : name_(std::move(name)) {}
 
+void ExecutionPass::ensureMutable() const {
+    if (frozen_)
+        throw std::logic_error("cannot mutate a pass owned by a compiled execution graph");
+}
+
 void ExecutionPass::dependsOn(ExecutionPass &dependency) {
+    ensureMutable();
     if (std::find(dependencies_.begin(), dependencies_.end(), &dependency) == dependencies_.end()) {
         dependencies_.push_back(&dependency);
         if (owner_)
@@ -93,28 +203,104 @@ void ExecutionPass::dependsOn(ExecutionPass &dependency) {
 }
 
 void ExecutionPass::setFlags(uint32_t flags) {
-    if (flags_ == flags)
+    ensureMutable();
+    if (declaring_) {
+        flags_ = flags;
         return;
+    }
+    if (configuredFlags_ == flags && flags_ == flags)
+        return;
+    configuredFlags_ = flags;
     flags_ = flags;
     if (owner_)
         owner_->dirty_ = true;
 }
 
 void ExecutionPass::read(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
     uses_.push_back({resource, AccessMode::Read, state, stageMask});
 }
 
+void ExecutionPass::read(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
+    uses_.push_back({resource, AccessMode::Read, state, stageMask, imageRole(state), resource.subresources, resource});
+}
+
 void ExecutionPass::write(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
     uses_.push_back({resource, AccessMode::Write, state, stageMask});
 }
 
+void ExecutionPass::write(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
+    uses_.push_back({resource, AccessMode::Write, state, stageMask, imageRole(state), resource.subresources, resource});
+}
+
 void ExecutionPass::readWrite(GraphResource resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
     uses_.push_back({resource, AccessMode::ReadWrite, state, stageMask});
 }
 
-void ExecutionPass::resetDeclaration() { uses_.clear(); }
+void ExecutionPass::readWrite(GraphImage resource, VernonRhiResourceState state, uint32_t stageMask) {
+    ensureMutable();
+    uses_.push_back(
+        {resource, AccessMode::ReadWrite, state, stageMask, imageRole(state), resource.subresources, resource});
+}
+void ExecutionPass::resetDeclaration() {
+    uses_.clear();
+    flags_ = configuredFlags_;
+    declaring_ = true;
+}
+void ExecutionPass::finishDeclaration() { declaring_ = false; }
+
+const std::shared_ptr<const ExecutionBindingValue> &ExecutionBindings::at(ExecutionParameter parameter) const {
+    if (parameter.graphIdentity != graphIdentity_ || parameter.id >= values_.size() || !values_[parameter.id])
+        throw std::invalid_argument("execution parameter does not belong to this binding snapshot");
+    return values_[parameter.id];
+}
+
+ExecutionBindingsBuilder::ExecutionBindingsBuilder(uint64_t graphIdentity, size_t parameterCount)
+    : graphIdentity_(graphIdentity), values_(parameterCount) {}
+
+void ExecutionBindingsBuilder::set(ExecutionParameter parameter, std::shared_ptr<const ExecutionBindingValue> value) {
+    if (parameter.graphIdentity != graphIdentity_ || parameter.id >= values_.size())
+        throw std::invalid_argument("execution parameter does not belong to this binding builder");
+    if (!value)
+        throw std::invalid_argument("execution parameter binding value must not be null");
+    if (values_[parameter.id] == value)
+        return;
+    values_[parameter.id] = std::move(value);
+    cached_.reset();
+}
+
+std::shared_ptr<const ExecutionBindings> ExecutionBindingsBuilder::snapshot() const {
+    if (std::any_of(values_.begin(), values_.end(), [](const auto &value) { return !value; }))
+        throw std::invalid_argument("execution parameter bindings are incomplete");
+    if (!cached_)
+        cached_ = std::shared_ptr<const ExecutionBindings>(new ExecutionBindings(graphIdentity_, values_));
+    return cached_;
+}
+
+bool ExecutionResources::buffer(GraphBuffer resource, VernonRhiBuffer &output) const {
+    output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    if (resource.kind != ResourceKind::Buffer || resource.id >= resources_.size() || resource.id >= buffers_.size())
+        return false;
+    const GraphResource &resolved = resources_[resource.id];
+    if (resolved.graphIdentity != resource.graphIdentity || resolved.kind != ResourceKind::Buffer ||
+        buffers_[resource.id].index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        return false;
+    output = buffers_[resource.id];
+    return true;
+}
+
+const std::shared_ptr<const ExecutionBindingValue> &ExecutionResources::binding(ExecutionParameter parameter) const {
+    if (!bindings_)
+        throw std::invalid_argument("execution submission has no parameter bindings");
+    return bindings_->at(parameter);
+}
 
 void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) {
+    ensureMutable();
     auto value = attachment;
     value.location = location;
     colors_.push_back(value);
@@ -125,40 +311,155 @@ void RenderPass::color(uint32_t location, const ColorAttachmentUse &attachment) 
 }
 
 void RenderPass::depth(const DepthStencilAttachmentUse &attachment) {
+    ensureMutable();
     depth_ = std::make_unique<DepthStencilAttachmentUse>(attachment);
-    if (((attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT ||
-          attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) &&
-         attachment.readOnlyDepth) ||
-        (attachment.readOnlyDepth && attachment.readOnlyStencil))
+    const bool hasStencil = attachment.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    if (attachment.readOnlyDepth && (!hasStencil || attachment.readOnlyStencil))
         read(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
     else
         readWrite(attachment.image, VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT);
 }
 
 void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+    ensureMutable();
     renderArea_[0] = x;
     renderArea_[1] = y;
     renderArea_[2] = width;
     renderArea_[3] = height;
 }
 
+ExecutionGraph::ExecutionGraph() : graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
-    : device_(device), graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
+    : provider_(detail::ExecutionProvider::Rhi), device_(device),
+      graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
+
+void ExecutionGraph::planAutodiffCheckpoints(uint64_t memoryBudget) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    autodiffMemoryBudget_ = memoryBudget;
+    hasAutodiffSchedule_ = true;
+    dirty_ = true;
+}
+
+void ExecutionGraph::setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    for (uint32_t index = 0; index < nodes.size(); ++index) {
+        if (nodes[index].id != index)
+            throw std::invalid_argument("explicit reverse command node IDs must be dense and ordered");
+        for (uint32_t dependency : nodes[index].dependencies)
+            if (dependency >= index)
+                throw std::invalid_argument("explicit reverse command dependencies must precede their consumer");
+    }
+    explicitReverseNodes_ = std::move(nodes);
+    hasAutodiffSchedule_ = true;
+    dirty_ = true;
+}
+
+bool ExecutionGraph::validate(std::string &error) { return buildPlan(error); }
+
+void ExecutionGraph::setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
+                                          std::vector<NamedDerivativeEndpoint> objectives) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    differentiableInputs_ = std::move(differentiableInputs);
+    objectives_ = std::move(objectives);
+    dirty_ = true;
+}
+
 ExecutionGraph::~ExecutionGraph() {
-    for (const ResourceRecord &record : resourceRecords_)
-        if (record.resourceKey && record.resourceKey != UINT64_MAX)
+    for (const detail::ExecutionResourceRecord &record : resourceRecords_) {
+        if (provider_ == detail::ExecutionProvider::Rhi && record.graphOwned)
+            vernonRhiDeviceDestroyBuffer(device_, record.buffer);
+        if (provider_ == detail::ExecutionProvider::Rhi)
+            for (uint64_t viewKey : record.imageViewKeys)
+                vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
+        if (provider_ == detail::ExecutionProvider::Rhi && record.resourceKey)
             vernon::rhi::releaseResource(device_,
                                          record.resource.kind == ResourceKind::Buffer
                                              ? vernon::rhi::ResourceKind::Buffer
                                              : vernon::rhi::ResourceKind::Image,
                                          record.resourceKey);
+    }
 }
 
-GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
+ExecutionParameter ExecutionGraph::parameter(std::string name) {
+    if (compiled_)
+        throw std::logic_error("cannot mutate a compiled execution graph builder");
+    if (name.empty())
+        throw std::invalid_argument("execution parameter name must not be empty");
+    if (parameterIds_.find(name) != parameterIds_.end())
+        throw std::invalid_argument("execution parameter name must be unique");
+    const uint32_t id = static_cast<uint32_t>(parameterNames_.size());
+    parameterIds_.emplace(name, id);
+    parameterNames_.push_back(std::move(name));
+    dirty_ = true;
+    return {id, graphIdentity_};
+}
+
+GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported,
+                                             std::shared_ptr<GraphCheckpointResource> checkpoint) {
+    if (compiled_ || !identity || provider_ != detail::ExecutionProvider::Cpu)
+        return {};
+    if (const auto found = importedHostBuffers_.find(identity); found != importedHostBuffers_.end()) {
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
+        record.exported = record.exported || exported;
+        if (checkpoint) {
+            if (record.checkpoint && record.checkpoint != checkpoint)
+                return {};
+            record.checkpoint = std::move(checkpoint);
+        }
+        GraphBuffer result;
+        result.id = found->second;
+        result.kind = ResourceKind::Buffer;
+        result.graphIdentity = graphIdentity_;
+        return result;
+    }
+    GraphBuffer result;
+    result.id = static_cast<uint32_t>(resources_.size());
+    result.kind = ResourceKind::Buffer;
+    result.graphIdentity = graphIdentity_;
+    resources_.push_back(result);
+    resourceRecords_.push_back({result, exported});
+    resourceRecords_.back().resourceKey = identity;
+    resourceRecords_.back().checkpoint = std::move(checkpoint);
+    importedHostBuffers_.emplace(identity, result.id);
+    dirty_ = true;
+    return result;
+}
+
+VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
+                                             bool exported) {
+    output = {};
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    VernonRhiBuffer buffer{};
+    const VernonRhiStatus status = vernonRhiDeviceCreateBuffer(device_, &descriptor, &buffer);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
+    output = importBuffer(buffer, exported);
+    if (output.id >= resourceRecords_.size()) {
+        (void)vernonRhiDeviceDestroyBuffer(device_, buffer);
+        output = {};
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    resourceRecords_[output.id].graphOwned = true;
+    return VERNON_RHI_STATUS_OK;
+}
+
+GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported,
+                                         std::shared_ptr<GraphCheckpointResource> checkpoint) {
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
+        return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
     if (const auto found = importedBuffers_.find(key); found != importedBuffers_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
         record.exported = record.exported || exported;
+        if (checkpoint) {
+            if (record.checkpoint && record.checkpoint != checkpoint)
+                return {};
+            record.checkpoint = std::move(checkpoint);
+        }
         GraphBuffer result;
         result.id = found->second;
         result.kind = ResourceKind::Buffer;
@@ -166,92 +467,138 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported) 
         result.handle = buffer;
         return result;
     }
+    const uint64_t resourceKey = vernon::rhi::bufferResource(device_, buffer);
+    if (!resourceKey || !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey))
+        return {};
     GraphBuffer result;
     result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Buffer;
     result.graphIdentity = graphIdentity_;
     result.handle = buffer;
+    try {
+        resources_.reserve(resources_.size() + 1);
+        resourceRecords_.reserve(resourceRecords_.size() + 1);
+        importedBuffers_.reserve(importedBuffers_.size() + 1);
+        if (!importedBuffers_.emplace(key, result.id).second) {
+            vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+            return {};
+        }
+    } catch (const std::bad_alloc &) {
+        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+        return {};
+    }
     resources_.push_back(result);
     resourceRecords_.push_back({result, exported});
-    importedBuffers_.emplace(key, result.id);
     resourceRecords_.back().buffer = buffer;
-    if (!vernon::rhi::deviceExists(device_)) {
-        resourceRecords_.back().resourceKey = UINT64_MAX;
-        dirty_ = true;
-        return result;
-    }
-    resourceRecords_.back().resourceKey = vernon::rhi::bufferResource(device_, buffer);
-    if (!resourceRecords_.back().resourceKey ||
-        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceRecords_.back().resourceKey))
-        resourceRecords_.back().resourceKey = 0;
+    resourceRecords_.back().resourceKey = resourceKey;
+    resourceRecords_.back().checkpoint = std::move(checkpoint);
     dirty_ = true;
     return result;
 }
 
-GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, VernonRhiFormat format,
-                                       uint32_t width, uint32_t height, uint32_t layers, uint32_t samples,
-                                       bool exported) {
-    const uint64_t key = handleKey(image.index, image.generation);
-    if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
-        ResourceRecord &record = resourceRecords_[found->second];
-        record.exported = record.exported || exported;
-        GraphImage result;
-        result.id = found->second;
-        result.kind = ResourceKind::Image;
-        result.graphIdentity = graphIdentity_;
-        result.handle = image;
-        result.view = view;
-        result.format = format;
-        result.width = width;
-        result.height = height;
-        result.layers = layers;
-        result.samples = samples;
-        return result;
-    }
+GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
+    if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
+        return {};
+    const uint64_t imageKey = vernon::rhi::imageResource(device_, image);
+    const uint64_t viewKey = vernon::rhi::imageViewResource(device_, view);
+    VernonRhiImageDescriptor imageDescriptor{};
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    uint64_t parentKey{};
+    if (!imageKey || !viewKey ||
+        !vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey) ||
+        parentKey != imageKey)
+        return {};
     GraphImage result;
-    result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Image;
     result.graphIdentity = graphIdentity_;
     result.handle = image;
     result.view = view;
-    result.format = format;
-    result.width = width;
-    result.height = height;
-    result.layers = layers;
-    result.samples = samples;
-    resources_.push_back(result);
-    resourceRecords_.push_back({result, exported});
-    importedImages_.emplace(key, result.id);
-    resourceRecords_.back().image = image;
-    if (!vernon::rhi::deviceExists(device_)) {
-        resourceRecords_.back().resourceKey = UINT64_MAX;
-        dirty_ = true;
+    result.format = viewDescriptor.format;
+    result.width = std::max(imageDescriptor.width >> viewDescriptor.base_mip_level, 1u);
+    result.height = std::max(imageDescriptor.height >> viewDescriptor.base_mip_level, 1u);
+    result.layers = viewDescriptor.array_layer_count;
+    result.samples = imageDescriptor.sample_count;
+    result.subresources = {viewDescriptor.base_mip_level, viewDescriptor.mip_level_count,
+                           viewDescriptor.base_array_layer, viewDescriptor.array_layer_count, viewDescriptor.aspects};
+    const uint64_t key = handleKey(image.index, image.generation);
+    if (const auto found = importedImages_.find(key); found != importedImages_.end()) {
+        detail::ExecutionResourceRecord &record = resourceRecords_[found->second];
+        result.id = found->second;
+        if (std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey) ==
+            record.imageViewKeys.end()) {
+            try {
+                record.imageViewKeys.reserve(record.imageViewKeys.size() + 1);
+            } catch (const std::bad_alloc &) {
+                return {};
+            }
+            if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey))
+                return {};
+            record.imageViewKeys.push_back(viewKey);
+        }
+        record.exported |= exported;
         return result;
     }
-    resourceRecords_.back().resourceKey = vernon::rhi::imageResource(device_, image);
-    if (!resourceRecords_.back().resourceKey ||
-        !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, resourceRecords_.back().resourceKey))
-        resourceRecords_.back().resourceKey = 0;
+    try {
+        resources_.reserve(resources_.size() + 1);
+        resourceRecords_.reserve(resourceRecords_.size() + 1);
+        importedImages_.reserve(importedImages_.size() + 1);
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+    result.id = static_cast<uint32_t>(resources_.size());
+    detail::ExecutionResourceRecord record{result, exported};
+    record.image = image;
+    record.resourceKey = imageKey;
+    try {
+        record.imageViewKeys.push_back(viewKey);
+        if (!importedImages_.emplace(key, result.id).second)
+            return {};
+    } catch (const std::bad_alloc &) {
+        return {};
+    }
+    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, imageKey)) {
+        importedImages_.erase(key);
+        return {};
+    }
+    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey)) {
+        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Image, imageKey);
+        importedImages_.erase(key);
+        return {};
+    }
+    resources_.push_back(result);
+    resourceRecords_.push_back(std::move(record));
     dirty_ = true;
     return result;
 }
 
-bool ExecutionGraph::compile(std::string &error) {
+bool ExecutionGraph::buildPlan(std::string &error) {
     error.clear();
+    if (compiled_) {
+        error = "execution graph builder was already compiled";
+        return false;
+    }
     schedule_.clear();
     scopes_.clear();
+    autodiffInitialResources_.clear();
+    autodiffInitialRanges_.clear();
+    autodiffTransactionResources_.clear();
+    autodiffTransactionRanges_.clear();
+    autodiffRestorationResources_.clear();
+    autodiffRestorationRanges_.clear();
     bool compiled = false;
     struct FailedCompileCleanup {
         std::vector<uint32_t> &schedule;
         std::vector<CompiledScope> &scopes;
+        AutodiffDagCheckpointPlan &autodiffCheckpointPlan;
         bool &compiled;
         ~FailedCompileCleanup() {
             if (!compiled) {
                 schedule.clear();
                 scopes.clear();
+                autodiffCheckpointPlan = {};
             }
         }
-    } cleanup{schedule_, scopes_, compiled};
+    } cleanup{schedule_, scopes_, autodiffCheckpointPlan_, compiled};
     const size_t count = passes_.size();
     std::unordered_map<ExecutionPass *, uint32_t> indices;
     for (uint32_t index = 0; index < count; ++index) {
@@ -262,7 +609,13 @@ bool ExecutionGraph::compile(std::string &error) {
             render->depth_.reset();
             std::fill(std::begin(render->renderArea_), std::end(render->renderArea_), 0);
         }
-        passes_[index]->declare();
+        try {
+            passes_[index]->declare();
+        } catch (...) {
+            passes_[index]->finishDeclaration();
+            throw;
+        }
+        passes_[index]->finishDeclaration();
         if (auto *render = dynamic_cast<RenderPass *>(passes_[index].get())) {
             std::sort(render->colors_.begin(), render->colors_.end(),
                       [](const auto &left, const auto &right) { return left.location < right.location; });
@@ -274,7 +627,7 @@ bool ExecutionGraph::compile(std::string &error) {
             }
         }
     }
-    if (!validate(error))
+    if (!validateDeclarations(error))
         return false;
 
     std::vector<std::vector<bool>> edges(count, std::vector<bool>(count));
@@ -296,13 +649,29 @@ bool ExecutionGraph::compile(std::string &error) {
         for (uint32_t right = left + 1; right < count; ++right)
             for (const ResourceUse &first : passes_[left]->uses_)
                 for (const ResourceUse &second : passes_[right]->uses_)
-                    if (first.resource.id == second.resource.id && (writes(first.access) || writes(second.access)))
+                    if (usesOverlap(first, second) && (writes(first.access) || writes(second.access)))
                         edges[left][right] = true;
 
     std::vector<bool> live(count);
     std::vector<uint32_t> work;
+    std::unordered_set<uint32_t> objectiveProducers;
+    for (const NamedDerivativeEndpoint &objective : objectives_) {
+        if (objective.endpoint.kind != DerivativeEndpointKind::Resource)
+            continue;
+        for (uint32_t index = count; index-- > 0;) {
+            const bool writesObjective =
+                std::any_of(passes_[index]->uses_.begin(), passes_[index]->uses_.end(), [&](const ResourceUse &use) {
+                    return writes(use.access) && use.resource.id == objective.endpoint.id;
+                });
+            if (writesObjective) {
+                objectiveProducers.insert(index);
+                break;
+            }
+        }
+    }
     for (uint32_t index = 0; index < count; ++index) {
-        bool root = (passes_[index]->flags() & (PassNeverCull | PassSideEffect)) != 0;
+        bool root = (passes_[index]->flags() & (PassNeverCull | PassSideEffect)) != 0 ||
+                    objectiveProducers.find(index) != objectiveProducers.end();
         for (const ResourceUse &use : passes_[index]->uses_)
             if (writes(use.access) && use.resource.id < resourceRecords_.size() &&
                 resourceRecords_[use.resource.id].exported)
@@ -344,6 +713,482 @@ bool ExecutionGraph::compile(std::string &error) {
         error = "execution graph contains a dependency cycle";
         return false;
     }
+    autodiffCheckpointPlan_ = {};
+    std::vector<std::vector<GraphByteRange>> restorationRangesByResource(resourceRecords_.size());
+    std::vector<std::vector<GraphByteRange>> transactionRangesByResource(resourceRecords_.size());
+    std::vector<bool> wholeResourceTransaction(resourceRecords_.size());
+    std::unordered_set<uint32_t> transactionResources;
+    bool transactionCheckpointable = true;
+    for (uint32_t passIndex : schedule_) {
+        auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+        DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+        for (const ResourceUse &use : passes_[passIndex]->uses()) {
+            if (!writes(use.access))
+                continue;
+            transactionResources.insert(use.resource.id);
+            const auto &checkpoint = resourceRecords_[use.resource.id].checkpoint;
+            if (!checkpoint) {
+                transactionCheckpointable = false;
+                continue;
+            }
+            if (wholeResourceTransaction[use.resource.id])
+                continue;
+            bool hasDeclaration = false;
+            if (differentiable)
+                for (const PassWriteFootprint &footprint : differentiable->writeFootprints())
+                    if (footprint.resource == use.resource.id) {
+                        hasDeclaration = true;
+                        if (footprint.ranges.empty()) {
+                            wholeResourceTransaction[use.resource.id] = true;
+                            transactionRangesByResource[use.resource.id].clear();
+                            break;
+                        }
+                        transactionRangesByResource[use.resource.id].insert(
+                            transactionRangesByResource[use.resource.id].end(), footprint.ranges.begin(),
+                            footprint.ranges.end());
+                    }
+            if (!hasDeclaration) {
+                wholeResourceTransaction[use.resource.id] = true;
+                transactionRangesByResource[use.resource.id].clear();
+            }
+        }
+    }
+    uint64_t transactionBytes = 0;
+    for (uint32_t resourceId : transactionResources) {
+        const auto &checkpoint = resourceRecords_[resourceId].checkpoint;
+        if (!checkpoint)
+            continue;
+        auto &ranges = transactionRangesByResource[resourceId];
+        if (wholeResourceTransaction[resourceId]) {
+            ranges = {{0, checkpoint->byteSize()}};
+        } else {
+            for (const GraphByteRange &range : ranges)
+                if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                    range.byteSize > checkpoint->byteSize() - range.offset) {
+                    error = "autodiff transaction footprint exceeds its bound resource";
+                    return false;
+                }
+            std::sort(ranges.begin(), ranges.end(), [](const GraphByteRange &left, const GraphByteRange &right) {
+                return left.offset < right.offset;
+            });
+            std::vector<GraphByteRange> merged;
+            for (const GraphByteRange &range : ranges) {
+                if (!merged.empty() && range.offset <= merged.back().offset + merged.back().byteSize) {
+                    const uint64_t end =
+                        std::max(merged.back().offset + merged.back().byteSize, range.offset + range.byteSize);
+                    merged.back().byteSize = end - merged.back().offset;
+                } else
+                    merged.push_back(range);
+            }
+            ranges = std::move(merged);
+        }
+        for (const GraphByteRange &range : ranges)
+            if (range.byteSize > std::numeric_limits<uint64_t>::max() - transactionBytes) {
+                error = "autodiff transaction snapshot size overflows";
+                return false;
+            } else
+                transactionBytes += range.byteSize;
+    }
+    if (hasAutodiffSchedule_) {
+        std::vector<detail::AutodiffDagNode> autodiffNodes;
+        std::vector<uint32_t> scheduleOffsets(passes_.size(), UINT32_MAX);
+        for (uint32_t offset = 0; offset < schedule_.size(); ++offset)
+            scheduleOffsets[schedule_[offset]] = offset;
+        autodiffNodes.reserve(schedule_.size());
+        std::vector<uint32_t> lastWriter(resourceRecords_.size(), UINT32_MAX);
+        std::vector<uint32_t> lastOutput(resourceRecords_.size(), UINT32_MAX);
+        std::vector<uint32_t> writeEpochs(resourceRecords_.size());
+        std::unordered_set<uint32_t> initialResources;
+        std::vector<bool> wholeInitialRead(resourceRecords_.size());
+        std::vector<std::vector<GraphByteRange>> initialReadRanges(resourceRecords_.size());
+        std::unordered_set<DerivativeEndpointKey, DerivativeEndpointHash> backwardValueEndpoints;
+        uint64_t backwardValueBytes = 0;
+        for (uint32_t offset = 0; offset < schedule_.size(); ++offset) {
+            const uint32_t passIndex = schedule_[offset];
+            detail::AutodiffDagNode node;
+            for (uint32_t predecessor = 0; predecessor < passes_.size(); ++predecessor)
+                if (edges[predecessor][passIndex] && scheduleOffsets[predecessor] != UINT32_MAX)
+                    node.predecessors.push_back(scheduleOffsets[predecessor]);
+            auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+            DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+            if (!differentiable) {
+                error = "automatic autodiff checkpoint planning requires differentiable compute passes";
+                return false;
+            }
+            node.residualBytes = differentiable->estimatedResidualBytes();
+            node.retainedAllocationBytes = differentiable->estimatedRetainedAllocationBytes();
+            node.forwardPeakBytes = std::max(node.retainedAllocationBytes, differentiable->estimatedForwardPeakBytes());
+            node.replayCost = differentiable->replayCost();
+            node.resourceReloadCost = differentiable->resourceReloadCost();
+            node.recomputationCost = differentiable->recomputationCost();
+            node.deterministicReductionLegal = differentiable->deterministicReductionLegal();
+            node.replayable = differentiable->supportsReplay() && !(passes_[passIndex]->flags() & PassSideEffect);
+            const auto accountBackwardEndpoint = [&](const PassDerivativeMapping &mapping) {
+                if (!backwardValueEndpoints.insert(mapping.endpoint).second)
+                    return true;
+                uint64_t bytes = 16;
+                if (mapping.endpoint.kind == DerivativeEndpointKind::Resource) {
+                    if (mapping.endpoint.id >= resourceRecords_.size())
+                        return false;
+                    const auto &checkpoint = resourceRecords_[mapping.endpoint.id].checkpoint;
+                    if (!checkpoint || checkpoint->byteSize() > UINT64_MAX / 2)
+                        return false;
+                    bytes = checkpoint->byteSize() * 2;
+                }
+                if (bytes > UINT64_MAX - backwardValueBytes)
+                    return false;
+                backwardValueBytes += bytes;
+                return true;
+            };
+            for (const PassDerivativeMapping &mapping : differentiable->gradientMappings())
+                if (!accountBackwardEndpoint(mapping)) {
+                    error = "autodiff backward value estimate is invalid or overflows";
+                    return false;
+                }
+            for (const PassDerivativeMapping &mapping : differentiable->cotangentMappings())
+                if (!accountBackwardEndpoint(mapping)) {
+                    error = "autodiff backward value estimate is invalid or overflows";
+                    return false;
+                }
+            if (!differentiable->hasCheckpointPlanningMetadata()) {
+                error = "differentiable pass '" + passes_[passIndex]->name() +
+                        "' has no compiler-derived checkpoint planning metadata";
+                return false;
+            }
+            if (std::any_of(passes_[passIndex]->uses().begin(), passes_[passIndex]->uses().end(),
+                            [](const ResourceUse &use) { return use.resource.kind == ResourceKind::Image; })) {
+                error = "automatic autodiff resource-version planning does not support image resources";
+                return false;
+            }
+            for (const ResourceUse &use : passes_[passIndex]->uses()) {
+                if (!reads(use.access))
+                    continue;
+                const AutodiffResourceVersion inputVersion{use.resource.id, writeEpochs[use.resource.id]};
+                if (std::find_if(node.inputs.begin(), node.inputs.end(), [&](const AutodiffResourceVersion &version) {
+                        return version.resource == inputVersion.resource && version.epoch == inputVersion.epoch;
+                    }) == node.inputs.end())
+                    node.inputs.push_back(inputVersion);
+                const uint32_t producer = lastWriter[use.resource.id];
+                if (producer == UINT32_MAX) {
+                    initialResources.insert(use.resource.id);
+                    if (!wholeInitialRead[use.resource.id]) {
+                        bool hasDeclaration = false;
+                        for (const PassWriteFootprint &footprint : differentiable->readFootprints())
+                            if (footprint.resource == use.resource.id) {
+                                hasDeclaration = true;
+                                if (footprint.ranges.empty()) {
+                                    wholeInitialRead[use.resource.id] = true;
+                                    initialReadRanges[use.resource.id].clear();
+                                    break;
+                                }
+                                initialReadRanges[use.resource.id].insert(initialReadRanges[use.resource.id].end(),
+                                                                          footprint.ranges.begin(),
+                                                                          footprint.ranges.end());
+                            }
+                        if (!hasDeclaration) {
+                            wholeInitialRead[use.resource.id] = true;
+                            initialReadRanges[use.resource.id].clear();
+                        }
+                    }
+                } else {
+                    const uint32_t outputIndex = lastOutput[use.resource.id];
+                    if (outputIndex >= autodiffNodes[producer].outputs.size()) {
+                        error = "autodiff value producer has an invalid output";
+                        return false;
+                    }
+                    auto &consumers = autodiffNodes[producer].outputs[outputIndex].consumers;
+                    if (std::find(consumers.begin(), consumers.end(), offset) == consumers.end())
+                        consumers.push_back(offset);
+                }
+            }
+            std::unordered_set<std::string> primalPaths;
+            for (const PassPrimalResourceMapping &required : differentiable->requiredPrimalResources()) {
+                if (required.path.empty() || required.resource >= resourceRecords_.size() ||
+                    !primalPaths.insert(required.path).second) {
+                    error = "differentiable pass '" + passes_[passIndex]->name() +
+                            "' has an invalid required primal resource mapping";
+                    return false;
+                }
+                const bool readable = std::any_of(
+                    passes_[passIndex]->uses().begin(), passes_[passIndex]->uses().end(),
+                    [&](const ResourceUse &use) { return use.resource.id == required.resource && reads(use.access); });
+                if (!readable) {
+                    error = "differentiable pass '" + passes_[passIndex]->name() +
+                            "' requires a primal resource that is not read by the pass";
+                    return false;
+                }
+                node.requiredVersions.push_back({required.path,
+                                                 {required.resource, writeEpochs[required.resource]},
+                                                 lastWriter[required.resource]});
+            }
+            std::unordered_set<uint32_t> writtenResources;
+            for (const ResourceUse &use : passes_[passIndex]->uses()) {
+                if (!writes(use.access) || !writtenResources.insert(use.resource.id).second)
+                    continue;
+                const detail::ExecutionResourceRecord &record = resourceRecords_[use.resource.id];
+                detail::AutodiffDagOutput output;
+                if (writeEpochs[use.resource.id] == UINT32_MAX) {
+                    error = "autodiff resource write epoch overflows";
+                    return false;
+                }
+                output.version = {use.resource.id, ++writeEpochs[use.resource.id]};
+                output.checkpointable = static_cast<bool>(record.checkpoint);
+                if (record.checkpoint) {
+                    output.byteSize = record.checkpoint->byteSize();
+                    output.alignment = record.checkpoint->alignment();
+                    if (!output.alignment || (output.alignment & (output.alignment - 1))) {
+                        error = "automatic autodiff checkpoint resource has invalid alignment";
+                        return false;
+                    }
+                }
+                lastWriter[use.resource.id] = offset;
+                lastOutput[use.resource.id] = static_cast<uint32_t>(node.outputs.size());
+                node.outputs.push_back(std::move(output));
+            }
+            autodiffNodes.push_back(std::move(node));
+        }
+        uint64_t initialStateBytes = 0;
+        bool initialStateCheckpointable = true;
+        std::vector<bool> wholeResourceRestoration = std::move(wholeInitialRead);
+        restorationRangesByResource = std::move(initialReadRanges);
+        bool restorationCheckpointable = true;
+        std::unordered_set<uint32_t> restorationResources(initialResources.begin(), initialResources.end());
+        for (uint32_t resourceId : initialResources)
+            if (!resourceRecords_[resourceId].checkpoint)
+                restorationCheckpointable = false;
+        for (uint32_t passIndex : schedule_) {
+            auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+            DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+            for (const ResourceUse &use : passes_[passIndex]->uses()) {
+                if (!writes(use.access))
+                    continue;
+                const auto &checkpoint = resourceRecords_[use.resource.id].checkpoint;
+                if (!checkpoint) {
+                    restorationCheckpointable = false;
+                    continue;
+                }
+                restorationResources.insert(use.resource.id);
+                if (wholeResourceRestoration[use.resource.id])
+                    continue;
+                bool hasDeclaration = false;
+                if (differentiable)
+                    for (const PassWriteFootprint &footprint : differentiable->writeFootprints())
+                        if (footprint.resource == use.resource.id) {
+                            hasDeclaration = true;
+                            if (footprint.ranges.empty()) {
+                                wholeResourceRestoration[use.resource.id] = true;
+                                restorationRangesByResource[use.resource.id].clear();
+                                break;
+                            }
+                            for (const GraphByteRange &range : footprint.ranges) {
+                                if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                                    range.byteSize > checkpoint->byteSize() - range.offset) {
+                                    error = "autodiff write footprint exceeds its bound resource";
+                                    return false;
+                                }
+                                restorationRangesByResource[use.resource.id].push_back(range);
+                            }
+                        }
+                if (!hasDeclaration) {
+                    wholeResourceRestoration[use.resource.id] = true;
+                    restorationRangesByResource[use.resource.id].clear();
+                    continue;
+                }
+            }
+        }
+        uint64_t restorationBytes = 0;
+        for (uint32_t resourceId : restorationResources) {
+            const auto &checkpoint = resourceRecords_[resourceId].checkpoint;
+            if (!checkpoint)
+                continue;
+            auto &ranges = restorationRangesByResource[resourceId];
+            if (wholeResourceRestoration[resourceId]) {
+                ranges = {{0, checkpoint->byteSize()}};
+            } else {
+                for (const GraphByteRange &range : ranges)
+                    if (!range.byteSize || range.offset > checkpoint->byteSize() ||
+                        range.byteSize > checkpoint->byteSize() - range.offset) {
+                        error = "autodiff resource footprint exceeds its bound resource";
+                        return false;
+                    }
+                std::sort(ranges.begin(), ranges.end(), [](const GraphByteRange &left, const GraphByteRange &right) {
+                    return left.offset < right.offset;
+                });
+                std::vector<GraphByteRange> merged;
+                for (const GraphByteRange &range : ranges) {
+                    if (!merged.empty() && range.offset <= merged.back().offset + merged.back().byteSize) {
+                        const uint64_t end =
+                            std::max(merged.back().offset + merged.back().byteSize, range.offset + range.byteSize);
+                        merged.back().byteSize = end - merged.back().offset;
+                    } else
+                        merged.push_back(range);
+                }
+                ranges = std::move(merged);
+            }
+            for (const GraphByteRange &range : ranges)
+                if (range.byteSize > std::numeric_limits<uint64_t>::max() - restorationBytes) {
+                    error = "autodiff final-state restoration size overflows";
+                    return false;
+                } else
+                    restorationBytes += range.byteSize;
+            if (initialResources.find(resourceId) != initialResources.end()) {
+                autodiffInitialResources_.push_back(resourceId);
+                autodiffInitialRanges_.push_back(ranges);
+                for (const GraphByteRange &range : ranges)
+                    if (range.byteSize > std::numeric_limits<uint64_t>::max() - initialStateBytes) {
+                        error = "autodiff initial-state checkpoint size overflows";
+                        return false;
+                    } else
+                        initialStateBytes += range.byteSize;
+            }
+        }
+        uint64_t explicitTemporaryBytes = 0;
+        uint64_t explicitResidualBytes = 0;
+        uint64_t explicitReplayCost = 0;
+        for (const ExplicitReverseCommandNode &node : explicitReverseNodes_) {
+            explicitTemporaryBytes = std::max(explicitTemporaryBytes, node.temporaryBytes);
+            if (node.residualBytes > std::numeric_limits<uint64_t>::max() - explicitResidualBytes) {
+                error = "explicit reverse command residual storage overflows";
+                return false;
+            }
+            explicitResidualBytes += node.residualBytes;
+            if (node.replayCost > std::numeric_limits<uint64_t>::max() - explicitReplayCost) {
+                error = "explicit reverse command replay cost overflows";
+                return false;
+            }
+            explicitReplayCost += node.replayCost;
+        }
+        if (explicitResidualBytes > std::numeric_limits<uint64_t>::max() - backwardValueBytes ||
+            explicitTemporaryBytes >
+                std::numeric_limits<uint64_t>::max() - backwardValueBytes - explicitResidualBytes) {
+            error = "explicit reverse command temporary storage overflows";
+            return false;
+        }
+        backwardValueBytes += explicitResidualBytes + explicitTemporaryBytes;
+        if (!detail::planDagAutodiffCheckpoints(autodiffNodes, autodiffMemoryBudget_, autodiffCheckpointPlan_, error,
+                                                initialStateBytes, initialStateCheckpointable, restorationBytes,
+                                                restorationCheckpointable, transactionBytes, transactionCheckpointable,
+                                                backwardValueBytes))
+            return false;
+        if (explicitReplayCost > std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.replayCost) {
+            error = "combined reverse replay cost overflows";
+            return false;
+        }
+        if (explicitResidualBytes >
+                std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.logicalResidualBytes ||
+            explicitResidualBytes >
+                std::numeric_limits<uint64_t>::max() - autodiffCheckpointPlan_.retainedAllocationBytes) {
+            error = "combined reverse residual storage overflows";
+            return false;
+        }
+        autodiffCheckpointPlan_.replayCost += explicitReplayCost;
+        autodiffCheckpointPlan_.logicalResidualBytes += explicitResidualBytes;
+        autodiffCheckpointPlan_.retainedAllocationBytes += explicitResidualBytes;
+    }
+    const auto validEndpoint = [&](const DerivativeEndpointKey &endpoint) {
+        return endpoint.kind == DerivativeEndpointKind::Resource ? endpoint.id < resources_.size()
+                                                                 : endpoint.id < parameterNames_.size();
+    };
+    std::unordered_set<std::string> endpointNames;
+    std::unordered_set<DerivativeEndpointKey, DerivativeEndpointHash> declaredEndpoints;
+    for (const NamedDerivativeEndpoint &input : differentiableInputs_)
+        if (input.name.empty() || !endpointNames.insert(input.name).second ||
+            !declaredEndpoints.insert(input.endpoint).second || !validEndpoint(input.endpoint)) {
+            error = "execution graph contains an invalid differentiable input endpoint";
+            return false;
+        }
+    endpointNames.clear();
+    declaredEndpoints.clear();
+    for (const NamedDerivativeEndpoint &objective : objectives_)
+        if (objective.name.empty() || !endpointNames.insert(objective.name).second ||
+            !declaredEndpoints.insert(objective.endpoint).second ||
+            objective.endpoint.kind != DerivativeEndpointKind::Resource || !validEndpoint(objective.endpoint)) {
+            error = "execution graph contains an invalid objective endpoint";
+            return false;
+        }
+    for (uint32_t passIndex : schedule_) {
+        auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+        DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+        if (!differentiable)
+            continue;
+        std::unordered_set<std::string> derivativePaths;
+        for (const PassDerivativeMapping &mapping : differentiable->gradientMappings())
+            if (mapping.path.empty() || !derivativePaths.insert(mapping.path).second ||
+                !validEndpoint(mapping.endpoint)) {
+                error = "differentiable pass '" + passes_[passIndex]->name() + "' has an invalid gradient endpoint";
+                return false;
+            }
+        derivativePaths.clear();
+        for (const PassDerivativeMapping &mapping : differentiable->cotangentMappings())
+            if (mapping.path.empty() || !derivativePaths.insert(mapping.path).second ||
+                mapping.endpoint.kind != DerivativeEndpointKind::Resource || !validEndpoint(mapping.endpoint)) {
+                error = "differentiable pass '" + passes_[passIndex]->name() + "' has an invalid cotangent endpoint";
+                return false;
+            }
+    }
+    std::unordered_set<DerivativeEndpointKey, DerivativeEndpointHash> activeEndpoints;
+    for (const NamedDerivativeEndpoint &objective : objectives_)
+        activeEndpoints.insert(objective.endpoint);
+    for (uint32_t scheduleOffset = static_cast<uint32_t>(schedule_.size()); scheduleOffset-- > 0;) {
+        const uint32_t passIndex = schedule_[scheduleOffset];
+        auto *compute = dynamic_cast<ComputePass *>(passes_[passIndex].get());
+        DifferentiablePass *differentiable = compute ? compute->differentiable() : nullptr;
+        if (!differentiable) {
+            for (const ResourceUse &use : passes_[passIndex]->uses())
+                if (writes(use.access) &&
+                    activeEndpoints.find(DerivativeEndpointKey{DerivativeEndpointKind::Resource, use.resource.id}) !=
+                        activeEndpoints.end()) {
+                    error =
+                        "non-differentiable pass '" + passes_[passIndex]->name() + "' lies on an active graph VJP path";
+                    return false;
+                }
+            continue;
+        }
+        const bool active =
+            std::any_of(differentiable->cotangentMappings().begin(), differentiable->cotangentMappings().end(),
+                        [&](const PassDerivativeMapping &mapping) {
+                            return activeEndpoints.find(mapping.endpoint) != activeEndpoints.end();
+                        });
+        if (!active)
+            continue;
+        for (const PassDerivativeMapping &mapping : differentiable->cotangentMappings())
+            activeEndpoints.erase(mapping.endpoint);
+        for (const PassDerivativeMapping &mapping : differentiable->gradientMappings())
+            activeEndpoints.insert(mapping.endpoint);
+    }
+    if (!differentiableInputs_.empty() && !objectives_.empty()) {
+        std::unordered_set<uint32_t> restorationResources;
+        if (hasAutodiffSchedule_ && !autodiffCheckpointPlan_.cuts.empty())
+            for (uint32_t resourceId : autodiffInitialResources_)
+                if (restorationResources.insert(resourceId).second) {
+                    autodiffRestorationResources_.push_back(resourceId);
+                    autodiffRestorationRanges_.push_back(restorationRangesByResource[resourceId]);
+                }
+        std::unordered_set<uint32_t> publishedTransactionResources;
+        for (uint32_t passIndex : schedule_)
+            for (const ResourceUse &use : passes_[passIndex]->uses())
+                if (writes(use.access)) {
+                    if (publishedTransactionResources.insert(use.resource.id).second) {
+                        autodiffTransactionResources_.push_back(use.resource.id);
+                        autodiffTransactionRanges_.push_back(transactionRangesByResource[use.resource.id]);
+                    }
+                    if (hasAutodiffSchedule_ && !autodiffCheckpointPlan_.cuts.empty() &&
+                        restorationResources.insert(use.resource.id).second) {
+                        autodiffRestorationResources_.push_back(use.resource.id);
+                        autodiffRestorationRanges_.push_back(restorationRangesByResource[use.resource.id]);
+                    }
+                }
+        for (uint32_t resourceId : autodiffTransactionResources_)
+            if (!resourceRecords_[resourceId].checkpoint) {
+                error = "graph VJP forward transaction requires checkpointable writable resources";
+                return false;
+            }
+        for (uint32_t resourceId : autodiffRestorationResources_)
+            if (!resourceRecords_[resourceId].checkpoint) {
+                error = "graph VJP replay restoration requires checkpointable resources";
+                return false;
+            }
+    }
 
     for (uint32_t passIndex : schedule_) {
         auto *render = dynamic_cast<RenderPass *>(passes_[passIndex].get());
@@ -364,331 +1209,30 @@ bool ExecutionGraph::compile(std::string &error) {
         }
         scopes_.push_back({render != nullptr, {passIndex}});
     }
-    struct LastUse {
-        ResourceUse use;
-        bool present{};
-    };
-    std::vector<LastUse> lastUses(resources_.size());
+    std::vector<uint32_t> passScopes(passes_.size(), UINT32_MAX);
+    for (uint32_t scopeIndex = 0; scopeIndex < scopes_.size(); ++scopeIndex)
+        for (uint32_t passIndex : scopes_[scopeIndex].passIndices)
+            passScopes[passIndex] = scopeIndex;
+    for (uint32_t predecessor = 0; predecessor < passes_.size(); ++predecessor)
+        for (uint32_t dependent = 0; dependent < passes_.size(); ++dependent) {
+            if (!edges[predecessor][dependent])
+                continue;
+            const uint32_t predecessorScope = passScopes[predecessor];
+            const uint32_t dependentScope = passScopes[dependent];
+            if (predecessorScope == UINT32_MAX || dependentScope == UINT32_MAX || predecessorScope == dependentScope)
+                continue;
+            scopes_[dependentScope].predecessors.push_back(predecessorScope);
+        }
     for (CompiledScope &scope : scopes_) {
-        std::vector<ResourceUse> firstUses(resources_.size());
-        std::vector<ResourceUse> finalUses(resources_.size());
-        std::vector<bool> firstUsePresent(resources_.size());
-        std::vector<bool> finalUsePresent(resources_.size());
-        for (uint32_t passIndex : scope.passIndices) {
-            const uint32_t stageMask = dynamic_cast<ComputePass *>(passes_[passIndex].get())
-                                           ? VERNON_RHI_STAGE_COMPUTE
-                                           : VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
-            for (const ResourceUse &use : passes_[passIndex]->uses_) {
-                ResourceUse effective = use;
-                if (!effective.stageMask && (effective.state == VERNON_RHI_STATE_SHADER_READ ||
-                                             effective.state == VERNON_RHI_STATE_SHADER_WRITE))
-                    effective.stageMask = stageMask;
-                if (!firstUsePresent[use.resource.id]) {
-                    firstUses[use.resource.id] = effective;
-                    firstUsePresent[use.resource.id] = true;
-                }
-                finalUses[use.resource.id] = effective;
-                finalUsePresent[use.resource.id] = true;
-            }
-        }
-        for (uint32_t resourceId = 0; resourceId < firstUses.size(); ++resourceId) {
-            if (!firstUsePresent[resourceId])
-                continue;
-            const ResourceUse &use = firstUses[resourceId];
-            const LastUse &previous = lastUses[resourceId];
-            if (!previous.present ||
-                (previous.use.state == use.state && !writes(previous.use.access) && !writes(use.access)))
-                continue;
-            VernonRhiBarrier barrier{};
-            barrier.struct_size = sizeof(barrier);
-            barrier.source_stage_mask = previous.use.stageMask;
-            barrier.destination_stage_mask = use.stageMask;
-            barrier.source_access = accessBits(previous.use);
-            barrier.destination_access = accessBits(use);
-            barrier.old_state = previous.use.state;
-            barrier.new_state = use.state;
-            const ResourceRecord &record = resourceRecords_[resourceId];
-            barrier.is_image = record.resource.kind == ResourceKind::Image;
-            if (barrier.is_image)
-                barrier.image = record.image;
-            else
-                barrier.buffer = record.buffer;
-            scope.barriers.push_back(barrier);
-        }
-        for (uint32_t resourceId = 0; resourceId < finalUses.size(); ++resourceId)
-            if (finalUsePresent[resourceId])
-                lastUses[resourceId] = {finalUses[resourceId], true};
+        std::sort(scope.predecessors.begin(), scope.predecessors.end());
+        scope.predecessors.erase(std::unique(scope.predecessors.begin(), scope.predecessors.end()),
+                                 scope.predecessors.end());
     }
-    if (!validate(error))
+    if (!validateDeclarations(error))
         return false;
     dirty_ = false;
     compiled = true;
     return true;
-}
-
-bool ExecutionGraph::validate(std::string &error) const {
-    for (size_t index = 0; index < resourceRecords_.size(); ++index)
-        if (!resourceRecords_[index].resourceKey) {
-            error = "execution graph resource " + std::to_string(index) + " is stale";
-            return false;
-        }
-    const auto validateResource = [&](const std::string &passName, const GraphResource &resource) {
-        if (resource.graphIdentity != graphIdentity_ || resource.id >= resources_.size() ||
-            resources_[resource.id].graphIdentity != graphIdentity_ || resources_[resource.id].kind != resource.kind) {
-            error = "pass '" + passName + "' references resource " + std::to_string(resource.id) +
-                    " from another execution graph";
-            return false;
-        }
-        return true;
-    };
-    const auto validLoad = [](VernonRhiLoadOperation operation) {
-        return operation >= VERNON_RHI_LOAD_CLEAR && operation <= VERNON_RHI_LOAD_DISCARD;
-    };
-    const auto validStore = [](VernonRhiStoreOperation operation) {
-        return operation >= VERNON_RHI_STORE_PRESERVE && operation <= VERNON_RHI_STORE_DISCARD;
-    };
-    const auto validateImage = [&](const std::string &passName, const GraphImage &image) {
-        if (!validateResource(passName, image) || image.kind != ResourceKind::Image)
-            return false;
-        const ResourceRecord &record = resourceRecords_[image.id];
-        if (record.image.index != image.handle.index || record.image.generation != image.handle.generation ||
-            image.view.index == static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX) || !image.width ||
-            !image.height || !image.layers || !image.samples || image.format == VERNON_RHI_FORMAT_UNDEFINED) {
-            error = "pass '" + passName + "' contains an invalid image resource " + std::to_string(image.id);
-            return false;
-        }
-        return true;
-    };
-    std::unordered_set<const ExecutionPass *> owned;
-    std::unordered_set<std::string> names;
-    for (const auto &pass : passes_) {
-        if (!pass || pass->name().empty() || !names.insert(pass->name()).second) {
-            error = "execution graph pass names must be non-empty and unique";
-            return false;
-        }
-        owned.insert(pass.get());
-        for (const ResourceUse &use : pass->uses_) {
-            if (!validateResource(pass->name(), use.resource))
-                return false;
-            const uint32_t validStages = VERNON_RHI_STAGE_COMPUTE | VERNON_RHI_STAGE_VERTEX | VERNON_RHI_STAGE_FRAGMENT;
-            if ((use.stageMask & ~validStages) != 0 || use.state <= VERNON_RHI_STATE_UNDEFINED ||
-                use.state > VERNON_RHI_STATE_PRESENT ||
-                (use.stageMask != 0 && use.state != VERNON_RHI_STATE_SHADER_READ &&
-                 use.state != VERNON_RHI_STATE_SHADER_WRITE) ||
-                (use.state == VERNON_RHI_STATE_TRANSFER_SOURCE && use.access != AccessMode::Read) ||
-                (use.state == VERNON_RHI_STATE_TRANSFER_DESTINATION && use.access == AccessMode::Read) ||
-                (use.state == VERNON_RHI_STATE_SHADER_READ && writes(use.access)) ||
-                (use.state == VERNON_RHI_STATE_SHADER_WRITE && !writes(use.access)) ||
-                (use.state == VERNON_RHI_STATE_PRESENT && use.access != AccessMode::Read) ||
-                ((use.state == VERNON_RHI_STATE_COLOR_ATTACHMENT ||
-                  use.state == VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT || use.state == VERNON_RHI_STATE_PRESENT) &&
-                 use.resource.kind != ResourceKind::Image)) {
-                error = "pass '" + pass->name() + "' declares an incompatible state/access for resource " +
-                        std::to_string(use.resource.id);
-                return false;
-            }
-        }
-        const auto *render = dynamic_cast<const RenderPass *>(pass.get());
-        if (!render)
-            continue;
-        if ((render->colors_.empty() && !render->depth_) || render->colors_.size() > 8) {
-            error = "render pass '" + pass->name() + "' must declare between one and eight attachments";
-            return false;
-        }
-        uint32_t width = 0;
-        uint32_t height = 0;
-        uint32_t layers = 0;
-        uint32_t samples = 0;
-        std::unordered_set<uint32_t> locations;
-        std::unordered_set<uint32_t> attachmentResources;
-        for (const ColorAttachmentUse &color : render->colors_) {
-            if (!validateImage(pass->name(), color.image))
-                return false;
-            if (color.image.format == VERNON_RHI_FORMAT_D32_FLOAT ||
-                color.image.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT || color.location >= 8 ||
-                !locations.insert(color.location).second || !attachmentResources.insert(color.image.id).second ||
-                !validLoad(color.load) || !validStore(color.store)) {
-                error = "render pass '" + pass->name() + "' contains invalid color attachment resource " +
-                        std::to_string(color.image.id);
-                return false;
-            }
-            if (!width) {
-                width = color.image.width;
-                height = color.image.height;
-                layers = color.image.layers;
-                samples = color.image.samples;
-            } else if (width != color.image.width || height != color.image.height || layers != color.image.layers ||
-                       samples != color.image.samples) {
-                error = "render pass '" + pass->name() + "' color attachment resource " +
-                        std::to_string(color.image.id) + " has an incompatible extent or sample count";
-                return false;
-            }
-        }
-        if (render->depth_) {
-            const DepthStencilAttachmentUse &depth = *render->depth_;
-            if (!validateImage(pass->name(), depth.image))
-                return false;
-            if ((depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT &&
-                 depth.image.format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT) ||
-                !attachmentResources.insert(depth.image.id).second || !validLoad(depth.depthLoad) ||
-                !validStore(depth.depthStore) || !validLoad(depth.stencilLoad) || !validStore(depth.stencilStore) ||
-                depth.clearDepth < 0.0f || depth.clearDepth > 1.0f ||
-                (depth.image.format == VERNON_RHI_FORMAT_D32_FLOAT &&
-                 (depth.stencilLoad != VERNON_RHI_LOAD_DISCARD || depth.stencilStore != VERNON_RHI_STORE_DISCARD ||
-                  depth.clearStencil != 0)) ||
-                (depth.readOnlyDepth &&
-                 (depth.depthLoad == VERNON_RHI_LOAD_CLEAR || depth.depthStore == VERNON_RHI_STORE_DISCARD))) {
-                error = "render pass '" + pass->name() + "' contains invalid depth attachment resource " +
-                        std::to_string(depth.image.id);
-                return false;
-            }
-            if (!width) {
-                width = depth.image.width;
-                height = depth.image.height;
-                layers = depth.image.layers;
-                samples = depth.image.samples;
-            } else if (width != depth.image.width || height != depth.image.height || layers != depth.image.layers ||
-                       samples != depth.image.samples) {
-                error = "render pass '" + pass->name() + "' depth attachment resource " +
-                        std::to_string(depth.image.id) + " is incompatible with its colors";
-                return false;
-            }
-        }
-        if (!render->renderArea_[2] || !render->renderArea_[3] || render->renderArea_[0] > width ||
-            render->renderArea_[1] > height || render->renderArea_[2] > width - render->renderArea_[0] ||
-            render->renderArea_[3] > height - render->renderArea_[1]) {
-            const uint32_t resourceId =
-                !render->colors_.empty() ? render->colors_.front().image.id : render->depth_->image.id;
-            error = "render pass '" + pass->name() + "' render area exceeds attachment resource " +
-                    std::to_string(resourceId);
-            return false;
-        }
-    }
-    for (const auto &pass : passes_)
-        for (const ExecutionPass *dependency : pass->dependencies_)
-            if (!owned.count(dependency)) {
-                error = "pass '" + pass->name() + "' has an external dependency";
-                return false;
-            }
-    for (const CompiledScope &scope : scopes_)
-        if (scope.passIndices.empty()) {
-            error = "compiled execution scope is empty";
-            return false;
-        }
-    return true;
-}
-
-VernonRhiStatus ExecutionGraph::execute() {
-    lastStats_ = {};
-    std::string error;
-    if ((dirty_ && !compile(error)) || !validate(error))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
-    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
-    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
-    VernonRhiCommandEncoder native{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRhiStatus status = vernonRhiDeviceCreateCommandEncoder(device_, &encoderDescriptor, &native);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    ExecutionResources resources(resources_);
-    for (const CompiledScope &scope : scopes_) {
-        if (!scope.barriers.empty()) {
-            status = vernonRhiCommandEncoderBarrier(device_, native, scope.barriers.data(), scope.barriers.size());
-            if (status != VERNON_RHI_STATUS_OK)
-                break;
-        }
-        if (scope.rendering) {
-            auto *first = static_cast<RenderPass *>(passes_[scope.passIndices.front()].get());
-            auto *last = static_cast<RenderPass *>(passes_[scope.passIndices.back()].get());
-            std::vector<VernonRhiColorAttachment> colors;
-            colors.reserve(first->colors_.size());
-            for (size_t index = 0; index < first->colors_.size(); ++index) {
-                const auto &begin = first->colors_[index];
-                const auto &finish = last->colors_[index];
-                VernonRhiColorAttachment attachment{};
-                attachment.view = begin.image.view;
-                attachment.location = begin.location;
-                attachment.initial_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
-                attachment.final_state = VERNON_RHI_STATE_COLOR_ATTACHMENT;
-                attachment.load_operation = begin.load;
-                attachment.store_operation = finish.store;
-                std::copy(std::begin(begin.clear), std::end(begin.clear), attachment.clear_color);
-                colors.push_back(attachment);
-            }
-            VernonRhiDepthStencilAttachment depth{};
-            if (first->depth_) {
-                depth.view = first->depth_->image.view;
-                depth.initial_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
-                depth.final_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
-                depth.depth_load_operation = first->depth_->depthLoad;
-                depth.depth_store_operation = last->depth_->depthStore;
-                depth.clear_depth = first->depth_->clearDepth;
-                depth.stencil_load_operation = first->depth_->stencilLoad;
-                depth.stencil_store_operation = last->depth_->stencilStore;
-                depth.clear_stencil = first->depth_->clearStencil;
-                depth.read_only_depth = first->depth_->readOnlyDepth;
-                depth.read_only_stencil = first->depth_->readOnlyStencil;
-            }
-            VernonRhiRenderingDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.color_attachments = colors.data();
-            descriptor.color_attachment_count = colors.size();
-            descriptor.depth_stencil_attachment = first->depth_ ? &depth : nullptr;
-            descriptor.offset_x = first->renderArea_[0];
-            descriptor.offset_y = first->renderArea_[1];
-            descriptor.width = first->renderArea_[2];
-            descriptor.height = first->renderArea_[3];
-            descriptor.layers =
-                !first->colors_.empty() ? first->colors_.front().image.layers : first->depth_->image.layers;
-            status = vernonRhiCommandEncoderBeginRendering(device_, native, &descriptor);
-            if (status != VERNON_RHI_STATUS_OK)
-                break;
-            GraphicsEncoder encoder(device_, native);
-            for (size_t scopeIndex = 0; scopeIndex < scope.passIndices.size(); ++scopeIndex) {
-                auto *renderPass = static_cast<RenderPass *>(passes_[scope.passIndices[scopeIndex]].get());
-                if (scopeIndex) {
-                    for (const auto &color : renderPass->colors_)
-                        if (color.load == VERNON_RHI_LOAD_CLEAR) {
-                            status = vernonRhiCommandEncoderClearColorAttachment(device_, native, color.location,
-                                                                                 color.clear);
-                            if (status != VERNON_RHI_STATUS_OK)
-                                break;
-                        }
-                    if (status == VERNON_RHI_STATUS_OK && renderPass->depth_) {
-                        uint32_t aspects = 0;
-                        if (renderPass->depth_->depthLoad == VERNON_RHI_LOAD_CLEAR)
-                            aspects |= VERNON_RHI_ATTACHMENT_DEPTH;
-                        if (renderPass->depth_->stencilLoad == VERNON_RHI_LOAD_CLEAR)
-                            aspects |= VERNON_RHI_ATTACHMENT_STENCIL;
-                        if (aspects)
-                            status = vernonRhiCommandEncoderClearDepthStencilAttachment(
-                                device_, native, renderPass->depth_->clearDepth, renderPass->depth_->clearStencil,
-                                aspects);
-                    }
-                }
-                if (status == VERNON_RHI_STATUS_OK)
-                    status = renderPass->execute(encoder, resources);
-                if (status != VERNON_RHI_STATUS_OK)
-                    break;
-            }
-            const VernonRhiStatus endStatus = vernonRhiCommandEncoderEndRendering(device_, native);
-            if (status == VERNON_RHI_STATUS_OK)
-                status = endStatus;
-        } else {
-            ComputeEncoder encoder(device_, native);
-            status = static_cast<ComputePass *>(passes_[scope.passIndices.front()].get())->execute(encoder, resources);
-        }
-        if (status != VERNON_RHI_STATUS_OK)
-            break;
-    }
-    if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiCommandEncoderFinish(device_, native);
-    if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiDeviceSubmit(device_, native);
-    if (status == VERNON_RHI_STATUS_OK)
-        status = vernonRhiCommandEncoderGetStats(device_, native, &lastStats_);
-    const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyCommandEncoder(device_, native);
-    return status == VERNON_RHI_STATUS_OK ? destroyStatus : status;
 }
 
 } // namespace vernon::execution

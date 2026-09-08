@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import weakref
 from dataclasses import dataclass
 from typing import Any
 
+from .autodiff import invalidate_loaded_vjps
 from .kernel import Kernel
 from .pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
-from .resources import TensorLayout, TensorStorage, TensorView, Texture
+from .tensor import TensorLayout, TensorStorage, TensorView
+from .texture import Texture
 
 try:
     from .. import _native
@@ -38,6 +41,7 @@ _owned_opengl_context: Any | None = None
 _runtime_generation = 0
 _api_version: tuple[int, int] | None = None
 _external_opengl_contexts: dict[_Architecture, tuple[int, int, int, tuple[int, int]]] = {}
+_runtime_submissions: weakref.WeakSet[Any] = weakref.WeakSet()
 _runtime_children: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
@@ -47,21 +51,15 @@ class RuntimeUnavailableError(RuntimeError):
 
 def _release_runtime() -> None:
     global _native_runtime, _rhi_host, _owned_opengl_context
-    Kernel.invalidate_loaded()
-    for compiled in Pipeline._cache.values():
-        compiled.native = None
+    # Collect dead module/program cycles while their native runtime is still
+    # valid. Otherwise their native wrappers can be finalized during a later
+    # compiler call, after the runtime they borrowed from has been replaced.
+    gc.collect()
+    for submission in list(_runtime_submissions):
+        submission._release_runtime_native()
     for child in list(_runtime_children):
-        if hasattr(child, "_native_buffer"):
-            child._native_buffer = None
-        if hasattr(child, "_native_texture"):
-            child._native_texture = None
-        if hasattr(child, "_native_sampler"):
-            child._native_sampler = None
-        if hasattr(child, "_dispose_native"):
-            child._dispose_native()
-        if hasattr(child, "_compiled"):
-            child._compiled = None
-            child._compiled_generation = -1
+        child._release_runtime_native()
+    invalidate_loaded_vjps()
     _native_runtime = None
     _rhi_host = None
     _owned_opengl_context = None

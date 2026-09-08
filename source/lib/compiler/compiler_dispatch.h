@@ -2,6 +2,7 @@
 
 #include "VernonCompiler.h"
 #include "compiler_internal.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 
 #include <cstddef>
 #include <string>
@@ -33,16 +34,22 @@ struct CudaCompileOptions {};
 using CompileOptions = std::variant<CpuCodegenOptions, OpenGLCompileOptions, VulkanCompileOptions, MetalCompileOptions,
                                     DirectXCompileOptions, CudaCompileOptions>;
 
+struct TargetProfile {
+    VernonTarget target{VERNON_TARGET_CPU};
+    mlir::vernon::AccumulationTargetCapabilities accumulation;
+};
+
 VernonTargetCapabilities targetCapabilities(VernonTarget target);
 
 VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options, std::string &diagnostics);
 CompileOptions defaultCompileOptions(VernonTarget target);
 VernonTarget compileTargetKind(const CompileOptions &options);
+TargetProfile resolveTargetProfile(const CompileOptions &options);
 
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
-                           std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &cpuExecution);
+                           std::string &reflection, std::string &diagnostics,
+                           const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution);
 
-bool linkCpuHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics);
 VernonCpuEntryPoint findCompiledCpuEntry(const CpuExecutionState *execution, std::string_view entry);
 
 } // namespace vernon::compiler

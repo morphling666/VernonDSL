@@ -215,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         command.append("-DCMAKE_BUILD_TYPE=Release")
     command.extend(
         [
-            "-DLLVM_ENABLE_PROJECTS=mlir;lld",
+            "-DLLVM_ENABLE_PROJECTS=mlir",
             f"-DLLVM_TARGETS_TO_BUILD={';'.join(targets)}",
             "-DLLVM_ENABLE_ASSERTIONS=OFF",
             "-DLLVM_INCLUDE_TESTS=OFF",

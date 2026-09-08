@@ -32,27 +32,27 @@ def copy_static_tensor_value(
     matrix_product = matrix_left * matrix_right
     invocation = gid[0]
     if invocation == 0:
-        output[0] = singleton[0]
+        output[invocation] = singleton[0]
     if invocation == 1:
-        output[1] = weights[0, 0, 0]
+        output[invocation] = weights[0, 0, 0]
     if invocation == 2:
-        output[2] = weights[1, 0, 1]
+        output[invocation] = weights[1, 0, 1]
     if invocation == 3:
-        output[3] = weights[1, 1, 1]
+        output[invocation] = weights[1, 1, 1]
     if invocation == 4:
-        output[4] = doubled[1, 1, 0]
+        output[invocation] = doubled[1, 1, 0]
     if invocation == 5:
-        output[5] = large[1, 2, 4]
+        output[invocation] = large[1, 2, 4]
     if invocation == 6:
-        output[6] = quad[3]
+        output[invocation] = quad[3]
     if invocation == 7:
-        output[7] = matrix_product[0, 0]
+        output[invocation] = matrix_product[0, 0]
     if invocation == 8:
-        output[8] = matrix_product[0, 1]
+        output[invocation] = matrix_product[0, 1]
     if invocation == 9:
-        output[9] = matrix_product[1, 0]
+        output[invocation] = matrix_product[1, 0]
     if invocation == 10:
-        output[10] = matrix_product[1, 1]
+        output[invocation] = matrix_product[1, 1]
 
 
 @vd.vertex
@@ -201,6 +201,15 @@ def cube_direction_fragment(
     sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
 ) -> vd.Vector[vd.f32, 4]:
     return vd.texture_sample(image, sampler, direction)
+
+
+@vd.fragment
+def volume_coordinate_fragment(
+    coordinate: Annotated[vd.Vector[vd.f32, 3], vd.uniform()],
+    image: Annotated[vd.Texture["3d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> vd.Vector[vd.f32, 4]:
+    return vd.texture_sample(image, sampler, coordinate)
 
 
 @vd.fragment

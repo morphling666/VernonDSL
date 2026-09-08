@@ -1,0 +1,187 @@
+#ifndef VERNON_RUNTIME_TARGET_BINDING_PLAN_H
+#define VERNON_RUNTIME_TARGET_BINDING_PLAN_H
+
+#include "VernonRuntime.h"
+#include "pipeline_metadata.h"
+#include "program_execution_manifest.h"
+#include "shape_layout.h"
+#include "stage_artifact.h"
+#include "stage_binding_plan.h"
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace vernon::runtime::program {
+
+enum class SourceRepresentation {
+    WholeValueBytes,
+    ElementStream,
+    TensorViewDescriptor,
+    ResourceHandle,
+    SystemValue,
+    ImplicitSampler,
+};
+
+/* True when the runtime supplies the binding itself, so it projects no Program Value and has no parameter. */
+inline bool internalSource(SourceRepresentation source) {
+    return source == SourceRepresentation::SystemValue || source == SourceRepresentation::ImplicitSampler;
+}
+
+enum class TargetCarrier {
+    InlineValue,
+    UniformBuffer,
+    StorageBuffer,
+    VertexBuffer,
+    IndexBuffer,
+    Image,
+    Sampler,
+    Attachment,
+};
+
+enum class CarrierSemantic {
+    Value,
+    Resource,
+    Tape,
+};
+
+enum class ViewAxisSource {
+    LogicalAxis,
+    Constant,
+    InvocationLinearCarrier,
+};
+
+enum class DispatchMapping {
+    StaticGrid,
+    FirstTensorElementCount,
+};
+
+struct ViewAxisTransform {
+    ViewAxisSource source{ViewAxisSource::LogicalAxis};
+    uint32_t logicalAxis{};
+    uint64_t constantExtent{1};
+    bool zeroStride{};
+};
+
+struct ViewTransform {
+    std::vector<ViewAxisTransform> axes;
+};
+
+struct ProgramProjection {
+    uint32_t value{UINT32_MAX};
+    std::optional<size_t> leaf;
+    uint32_t physicalLeaf{};
+    ValueBindingDirection direction{ValueBindingDirection::Input};
+};
+
+struct PhysicalEndpointProjection {
+    size_t carrierByteSize{};
+    size_t carrierAlignment{};
+    size_t leafByteOffset{};
+    size_t leafByteSize{};
+};
+
+struct TargetEndpointIdentity {
+    std::string module;
+    std::string interfaceKind;
+    uint32_t index{};
+    uint32_t portableSlot{UINT32_MAX};
+    std::string access;
+};
+
+struct TargetNativeLocation {
+    uint32_t descriptorSet{UINT32_MAX};
+    uint32_t binding{UINT32_MAX};
+    uint32_t location{UINT32_MAX};
+};
+
+struct TargetPhysicalTransport {
+    vernon::runtime::InterfacePlan targetAbi;
+    TargetNativeLocation native;
+};
+
+struct TargetBinding {
+    TargetEndpointIdentity endpoint;
+    ProgramProjection projection;
+    SourceRepresentation source{SourceRepresentation::ResourceHandle};
+    TargetCarrier carrier{TargetCarrier::StorageBuffer};
+    CarrierSemantic semantic{CarrierSemantic::Resource};
+    std::optional<vernon::program_plan::TapeCarrier> tapeCarrier;
+    std::string name;
+    std::string sourceName;
+    std::string kind;
+    std::string reflectedKind;
+    std::string role;
+    std::string access;
+    std::string dimension;
+    std::string imageFormat;
+    std::string builtin;
+    std::optional<ViewTransform> viewTransform;
+    std::optional<CanonicalValueType> valueType;
+    shape::DeclaredShape shape;
+    std::vector<int64_t> viewShape;
+    std::optional<vernon::runtime::ValueLayout> wholeValueLayout;
+    vernon::runtime::ValueLayout elementLayout;
+    std::optional<PhysicalEndpointProjection> endpointProjection;
+    std::optional<TargetPhysicalTransport> transport;
+    TargetNativeLocation native;
+    std::vector<vernon::runtime::AttributeLeaf> attributeLeaves;
+    std::vector<vernon::runtime::SampledImageBinding> sampledImageBindings;
+    std::vector<vernon::runtime::ReflectedStorageLeaf> storageLeaves;
+    std::optional<vernon::runtime::TensorViewDescriptorUse> tensorViewDescriptor;
+    vernon::runtime::PhysicalArgumentLayout physical;
+    std::string writeFootprintKind;
+    std::vector<uint32_t> writeFootprintIndices;
+    uint32_t divisor{};
+};
+
+struct TargetOutput {
+    uint32_t location{};
+    std::string type;
+};
+
+struct TargetModule {
+    std::string role;
+    std::string entryPoint;
+    std::string format;
+};
+
+struct TargetBindingPlan {
+    VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
+    std::string operation;
+    std::string topology;
+    uint32_t workgroupSize[3]{1, 1, 1};
+    vernon::runtime::DispatchContract dispatch;
+    uint64_t packedArgumentsSize{};
+    uint64_t packedResultsSize{};
+    std::vector<TargetBinding> bindings;
+    std::vector<TargetOutput> outputs;
+    std::vector<TargetModule> modules;
+    std::vector<vernon::runtime::TensorViewWriteFootprint> readFootprints;
+    std::vector<vernon::runtime::TensorViewWriteFootprint> writeFootprints;
+    std::vector<vernon::runtime::NativeResourceSlot> nativeSlots;
+    DispatchMapping dispatchMapping{DispatchMapping::StaticGrid};
+};
+
+struct ResolvedExecutableNode {
+    std::string graph;
+    const Node *node{};
+    const ResolvedStage *stage{};
+    TargetBindingPlan plan;
+};
+
+struct ResolvedExecutablePlan {
+    std::vector<ResolvedExecutableNode> nodes;
+};
+
+vernon::runtime::ValueLayout materializeValueLayout(const ValueLayout &layout, std::string logicalType = {});
+bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, const ResolvedStage &stage,
+                            VernonRuntimeBackend backend, TargetBindingPlan &plan, Diagnostic &diagnostic);
+bool buildResolvedExecutablePlan(const ResolvedProgram &program, VernonRuntimeBackend backend,
+                                 ResolvedExecutablePlan &plan, Diagnostic &diagnostic);
+bool buildStageBindingPlan(const TargetBindingPlan &plan, vernon::runtime::StageBindingPlan &view,
+                           vernon::runtime::ReflectedEntry &reflection, Diagnostic &diagnostic);
+
+} // namespace vernon::runtime::program
+
+#endif

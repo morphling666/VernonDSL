@@ -110,6 +110,19 @@ template <typename Op> struct ElementwisePattern final : OpConversionPattern<Op>
     }
 };
 
+template <typename Op> struct UnaryElementwisePattern final : OpConversionPattern<Op> {
+    using OpConversionPattern<Op>::OpConversionPattern;
+    using OpAdaptor = typename Op::Adaptor;
+
+    LogicalResult matchAndRewrite(Op op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+        Type resultType = this->getTypeConverter()->convertType(op.getResult().getType());
+        if (!resultType || resultType == op.getResult().getType())
+            return failure();
+        rewriter.replaceOpWithNewOp<Op>(op, resultType, adaptor.getOperands().front());
+        return success();
+    }
+};
+
 SmallVector<Value> flattenConstructOperands(Location location, ValueRange operands,
                                             ConversionPatternRewriter &rewriter) {
     SmallVector<Value> elements;
@@ -165,6 +178,41 @@ struct IntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
                     vector::ExtractOp::create(rewriter, location, adaptor.getOperands()[0], *sourceIndex));
             }
             rewriter.replaceOpWithNewOp<vector::FromElementsOp>(op, resultType, elements);
+            return success();
+        }
+        if (name == "reduce_sum_to_shape") {
+            auto sourceType = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
+            auto source = dyn_cast_if_present<VectorType>(adaptor.getOperands()[0].getType());
+            if (!sourceType || !source || !sourceType.hasStaticShape())
+                return failure();
+            auto resultTensorType = dyn_cast<RankedTensorType>(op.getResult().getType());
+            ArrayRef<int64_t> resultShape = resultTensorType ? resultTensorType.getShape() : ArrayRef<int64_t>{};
+            Type elementType = sourceType.getElementType();
+            SmallVector<Value> sums;
+            int64_t resultCount = resultTensorType ? resultTensorType.getNumElements() : 1;
+            sums.reserve(resultCount);
+            auto zero = arith::ConstantOp::create(rewriter, location, rewriter.getZeroAttr(elementType));
+            for (int64_t index = 0; index < resultCount; ++index)
+                sums.push_back(zero);
+            for (int64_t sourceIndex = 0; sourceIndex < sourceType.getNumElements(); ++sourceIndex) {
+                int64_t resultIndex = 0;
+                if (resultTensorType) {
+                    FailureOr<int64_t> mapped =
+                        getStaticBroadcastLinearIndex(resultShape, sourceType.getShape(), sourceIndex);
+                    if (failed(mapped))
+                        return rewriter.notifyMatchFailure(op, "invalid reduction broadcast shape");
+                    resultIndex = *mapped;
+                }
+                Value element = vector::ExtractOp::create(rewriter, location, adaptor.getOperands()[0], sourceIndex);
+                sums[resultIndex] = arith::AddFOp::create(rewriter, location, sums[resultIndex], element);
+            }
+            Type convertedResult = getTypeConverter()->convertType(op.getResult().getType());
+            if (auto resultVector = dyn_cast_if_present<VectorType>(convertedResult))
+                rewriter.replaceOpWithNewOp<vector::FromElementsOp>(op, resultVector, sums);
+            else if (convertedResult == elementType)
+                rewriter.replaceOp(op, sums.front());
+            else
+                return failure();
             return success();
         }
         if (name == "dot") {
@@ -324,7 +372,8 @@ void populateVernonSharedValuePatterns(TypeConverter &converter, RewritePatternS
         .add<ConstantPattern, FromElementsPattern, SplatPattern, ExtractPattern, IntrinsicPattern, SwizzlePattern,
              ElementwisePattern<arith::AddFOp>, ElementwisePattern<arith::SubFOp>, ElementwisePattern<arith::MulFOp>,
              ElementwisePattern<arith::DivFOp>, ElementwisePattern<arith::AddIOp>, ElementwisePattern<arith::SubIOp>,
-             ElementwisePattern<arith::MulIOp>>(converter, context);
+             ElementwisePattern<arith::MulIOp>, UnaryElementwisePattern<arith::ExtFOp>,
+             UnaryElementwisePattern<arith::TruncFOp>>(converter, context);
 }
 
 void populateVernonSharedValueStructuralTypeConversions(TypeConverter &converter, RewritePatternSet &patterns,

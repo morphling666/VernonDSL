@@ -1,0 +1,130 @@
+#include "compiler_program_assembly.h"
+
+#include "compiler_program_abi.h"
+#include "compiler_program_serializer.h"
+
+#include "llvm/ADT/Twine.h"
+
+#include <optional>
+#include <utility>
+
+namespace vernon::compiler {
+
+bool assembleCanonicalProgram(const llvm::json::Object &rawSignature,
+                              const std::vector<CanonicalProgramGraph> &selectedGraphs, llvm::json::Object stages,
+                              llvm::json::Array storages, llvm::json::Array values,
+                              std::map<std::string, llvm::json::Array> canonicalNodesByGraph,
+                              const std::map<int64_t, int64_t> &storageByValue, const std::set<int64_t> &capturedValues,
+                              llvm::json::Object &program, std::string &error) {
+    llvm::json::Array canonicalGraphs;
+    std::set<int64_t> publicArgumentValues;
+    for (llvm::StringRef field : {"inputs", "cotangents"})
+        if (const llvm::json::Array *rows = rawSignature.getArray(field))
+            for (const llvm::json::Value &rowValue : *rows)
+                if (const llvm::json::Object *row = rowValue.getAsObject())
+                    if (std::optional<int64_t> value = row->getInteger("value"))
+                        publicArgumentValues.insert(*value);
+    for (const CanonicalProgramGraph &view : selectedGraphs) {
+        llvm::json::Array graphInputs;
+        size_t userSlot = 0;
+        size_t controlAxis = 0;
+        std::set<int64_t> invocationControls;
+        for (const llvm::json::Object *node : view.nodes) {
+            if (node->getString("kind") == "render")
+                continue;
+            if (const llvm::json::Array *grid = node->getArray("grid"))
+                for (const llvm::json::Value &componentValue : *grid)
+                    if (const llvm::json::Object *component = componentValue.getAsObject())
+                        if (const llvm::json::Object *control = component->getObject("control"))
+                            if (const std::optional<int64_t> value = control->getInteger("value"))
+                                invocationControls.insert(*value);
+        }
+        for (int64_t valueId : view.arguments) {
+            if (publicArgumentValues.count(valueId)) {
+                for (llvm::json::Value &value : values)
+                    if (llvm::json::Object *row = value.getAsObject(); row && row->getInteger("id") == valueId)
+                        if (llvm::json::Object *origin = row->getObject("origin");
+                            origin && origin->getString("tag") == "argument" && origin->getString("graph") == view.name)
+                            (*origin)["slot"] = static_cast<int64_t>(userSlot);
+                graphInputs.emplace_back(llvm::json::Object{
+                    {"tag", "user_input"}, {"value", valueId}, {"slot", static_cast<int64_t>(userSlot++)}});
+            } else if (invocationControls.count(valueId)) {
+                if (controlAxis >= 3) {
+                    error = "canonical Program graph has more than three invocation grid controls";
+                    return false;
+                }
+                graphInputs.emplace_back(llvm::json::Object{
+                    {"tag", "invocation_control"}, {"value", valueId}, {"axis", static_cast<int64_t>(controlAxis++)}});
+            } else
+                graphInputs.emplace_back(llvm::json::Object{{"tag", "control"}, {"value", valueId}});
+        }
+        for (const llvm::json::Value &rowValue : values) {
+            const llvm::json::Object *row = rowValue.getAsObject();
+            const llvm::json::Object *origin = row ? row->getObject("origin") : nullptr;
+            if (!origin || origin->getString("tag") != "allocation" || origin->getString("graph") != view.name)
+                continue;
+            const int64_t valueId = row->getInteger("id").value_or(-1);
+            const auto storage = storageByValue.find(valueId);
+            if (storage == storageByValue.end()) {
+                error = ("allocation origin has no Storage for value " + llvm::Twine(valueId) + " '" +
+                         row->getString("name").value_or("") + "' type '" + row->getString("type").value_or("") + "'")
+                            .str();
+                return false;
+            }
+            graphInputs.emplace_back(
+                llvm::json::Object{{"tag", "allocation"}, {"value", valueId}, {"storage", storage->second}});
+        }
+        llvm::json::Array graphOutputs;
+        for (int64_t value : view.results)
+            graphOutputs.emplace_back(
+                llvm::json::Object{{"tag", "user_output"}, {"value", value}, {"disposition", "transfer"}});
+        llvm::json::Array captures;
+        if (view.direction == "backward")
+            for (int64_t value : capturedValues)
+                captures.emplace_back(llvm::json::Object{{"value", value}});
+        canonicalGraphs.emplace_back(llvm::json::Object{{"name", view.name},
+                                                        {"direction", view.direction},
+                                                        {"inputs", std::move(graphInputs)},
+                                                        {"captures", std::move(captures)},
+                                                        {"outputs", std::move(graphOutputs)},
+                                                        {"nodes", std::move(canonicalNodesByGraph[view.name])}});
+    }
+
+    const auto signatureRows = [&](llvm::StringRef field, bool output) {
+        llvm::json::Array result;
+        if (const llvm::json::Array *rows = rawSignature.getArray(field))
+            for (const llvm::json::Value &rowValue : *rows)
+                if (const llvm::json::Object *row = rowValue.getAsObject()) {
+                    llvm::json::Object binding{{"path", row->getString("path").value_or("").str()},
+                                               {"value", row->getInteger("value").value_or(-1)}};
+                    if (output)
+                        binding["disposition"] = "transfer";
+                    result.emplace_back(std::move(binding));
+                }
+        return result;
+    };
+    llvm::json::Object signature{
+        {"inputs", signatureRows("inputs", false)},
+        {"outputs", signatureRows("outputs", true)},
+        {"cotangents", signatureRows("cotangents", false)},
+        {"gradients", signatureRows("gradients", true)},
+    };
+    llvm::json::Object abi;
+    if (!buildCanonicalProgramAbi(signature, values, storages, canonicalGraphs, abi, error))
+        return false;
+    std::optional<llvm::json::Object> residualContract;
+    if (selectedGraphs.size() > 1) {
+        llvm::json::Array residualCaptures;
+        for (int64_t value : capturedValues)
+            residualCaptures.emplace_back(llvm::json::Object{
+                {"value", value},
+                {"replay", llvm::json::Object{
+                               {"legal", false}, {"required_values", llvm::json::Array()}, {"cost", int64_t{0}}}}});
+        residualContract = llvm::json::Object{{"captures", std::move(residualCaptures)}};
+    }
+    program = serializeCanonicalProgram({std::move(stages), std::move(storages), std::move(values),
+                                         std::move(canonicalGraphs), std::move(abi), std::move(residualContract)});
+    return true;
+}
+
+} // namespace vernon::compiler

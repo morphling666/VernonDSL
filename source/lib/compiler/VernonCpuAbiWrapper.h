@@ -13,8 +13,14 @@ class Module;
 namespace vernon {
 
 enum class CpuAbiArgumentKind {
-    Direct,
+    CanonicalValue,
+    OpaqueScalar,
     TensorView,
+};
+
+struct CpuCallLanePacking {
+    uint64_t offset;
+    uint64_t size;
 };
 
 struct CpuAbiArgumentPacking {
@@ -22,7 +28,9 @@ struct CpuAbiArgumentPacking {
     uint64_t size;
     CpuAbiArgumentKind kind;
     uint32_t tensorRank;
+    std::string builtin;
     std::vector<uint64_t> tensorLeafElementSizes;
+    std::vector<CpuCallLanePacking> callLanes;
 };
 
 struct CpuAbiWrapperMetadata {
@@ -30,7 +38,9 @@ struct CpuAbiWrapperMetadata {
     std::vector<CpuAbiArgumentPacking> sourceArguments;
     uint64_t argumentsSize;
     uint64_t resultsSize;
+    std::vector<CpuCallLanePacking> resultCallLanes;
     bool requiresTextureCallbacks;
+    bool requiresPhases;
     std::string exportedWrapperSymbol;
 };
 

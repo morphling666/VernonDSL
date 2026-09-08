@@ -244,6 +244,26 @@ struct GpuTensorShapeIntrinsicPattern final : OpConversionPattern<IntrinsicOp> {
     bool useSpirv;
 };
 
+struct GpuTextureIntrinsicTypePattern final : OpConversionPattern<IntrinsicOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(IntrinsicOp op, OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (op.getName() != "texture_load" && op.getName() != "texture_store")
+            return failure();
+        SmallVector<Type> resultTypes;
+        if (failed(getTypeConverter()->convertTypes(op->getResultTypes(), resultTypes)))
+            return failure();
+        OperationState state(op.getLoc(), IntrinsicOp::getOperationName());
+        state.addOperands(adaptor.getOperands());
+        state.addTypes(resultTypes);
+        state.addAttribute("name", rewriter.getStringAttr(op.getName()));
+        Operation *replacement = rewriter.create(state);
+        rewriter.replaceOp(op, replacement->getResults());
+        return success();
+    }
+};
+
 struct GpuFlatTensorConstructPattern final : OpConversionPattern<IntrinsicOp> {
     GpuFlatTensorConstructPattern(TypeConverter &converter, MLIRContext *context, bool useSpirv)
         : OpConversionPattern(converter, context, PatternBenefit(3)), useSpirv(useSpirv) {}
@@ -727,6 +747,7 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
                                                                                      useSpirvTupleAbi);
         patterns.add<GpuTensorShapeIntrinsicPattern, GpuFlatTensorConstructPattern, GpuFlatTensorFromElementsPattern,
                      GpuFlatTensorSplatPattern, GpuFlatTensorExtractPattern>(converter, context, useSpirvTupleAbi);
+        patterns.add<GpuTextureIntrinsicTypePattern>(converter, context);
         patterns.add<GpuFlatTensorElementwisePattern<arith::AddFOp>, GpuFlatTensorElementwisePattern<arith::SubFOp>,
                      GpuFlatTensorElementwisePattern<arith::MulFOp>, GpuFlatTensorElementwisePattern<arith::DivFOp>,
                      GpuFlatTensorElementwisePattern<arith::AddIOp>, GpuFlatTensorElementwisePattern<arith::SubIOp>,
@@ -754,6 +775,9 @@ struct VernonLowerGPUTensorsPass final : PassWrapper<VernonLowerGPUTensorsPass, 
             [&](Operation *operation) { return converter.isLegal(operation); });
         target.addDynamicallyLegalOp<gpu::GPUFuncOp>(
             [&](gpu::GPUFuncOp op) { return converter.isSignatureLegal(op.getFunctionType()); });
+        target.addDynamicallyLegalOp<IntrinsicOp>([&](IntrinsicOp op) {
+            return (op.getName() == "texture_load" || op.getName() == "texture_store") && converter.isLegal(op);
+        });
         target.markUnknownOpDynamicallyLegal([&](Operation *operation) { return converter.isLegal(operation); });
         populateVernonSharedValueStructuralTypeConversions(converter, patterns, target);
 

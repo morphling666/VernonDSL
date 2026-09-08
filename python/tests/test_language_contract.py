@@ -9,7 +9,7 @@ from unittest import mock
 
 import vernon_dsl as vd
 from vernon_dsl import CompileError, Compiler, compile_source
-from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.abi import attribute_layout, value_leaves
 from vernon_dsl.frontend.analysis import dump_typed_model, typed_effect_data, typed_model_data
@@ -60,6 +60,24 @@ class LanguageVersionTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertFalse(hasattr(vd, name))
 
+    def test_callback_execution_graph_api_is_removed(self) -> None:
+        retired = (
+            "CompiledExecutionGraph",
+            "ComputeEncoder",
+            "ComputePass",
+            "ExecutionGraph",
+            "ExecutionPass",
+            "GraphicsEncoder",
+            "PipelineInvocation",
+            "VjpComputePass",
+        )
+        for name in retired:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(vd, name))
+                self.assertFalse(hasattr(vd.runtime, name))
+        self.assertFalse(hasattr(vd.Kernel, "invocation"))
+        self.assertFalse(hasattr(vd.Pipeline, "invocation"))
+
     def test_tensor_values_and_tensor_view_resources_are_distinct(self) -> None:
         element = ConcreteType("scalar", "f32")
         tensor = ConcreteType("tensor", "Tensor", (element, 4))
@@ -101,13 +119,15 @@ class LanguageVersionTests(unittest.TestCase):
             ),
             ("f32", "f64", "f32", "f64"),
         )
+        rank_zero = value_leaves(ConcreteType("tensor", "Tensor", (f32,)), fields.__getitem__)
+        self.assertEqual([(leaf.dtype, leaf.scalar_count, leaf.shape) for leaf in rank_zero], [("f32", 1, ())])
 
         output = compile_source(
             "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
             "abi_layout.py",
         )
         self.assertIn(f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64", output)
-        self.assertIn(f"vernon.pipeline_version = {PIPELINE_VERSION} : i64", output)
+        self.assertIn(f"vernon.program_version = {PROGRAM_VERSION} : i64", output)
         self.assertIn('abi_leaf_dtypes = ["f32", "f64"]', output)
         self.assertNotIn("abi_alignment", output)
         self.assertNotIn("abi_field_offsets", output)
@@ -123,6 +143,7 @@ class LanguageVersionTests(unittest.TestCase):
         )
         self.assertIn("vernon.shared", shared_output)
         self.assertIn('vernon.abi_leaf_dtypes = ["f32", "i32", "f32", "i32"]', shared_output)
+        self.assertIn('vernon.element_abi_leaf_dtypes = ["f32", "i32"]', shared_output)
         self.assertNotIn("vernon.abi_alignment", shared_output)
         self.assertNotIn("vernon.abi_element_stride", shared_output)
         self.assertNotIn("vernon.abi_size", shared_output)
@@ -195,7 +216,7 @@ class LanguageVersionTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result.semantic_inputs["compiler_contract_version"], COMPILER_CONTRACT_VERSION)
-            self.assertEqual(result.semantic_inputs["pipeline_version"], PIPELINE_VERSION)
+            self.assertEqual(result.semantic_inputs["program_version"], PROGRAM_VERSION)
             self.assertEqual(result.semantic_inputs["captured_constants"], [["LIMIT", "int", 3]])
 
     def test_semantic_identity_contains_concrete_helper_specializations(self) -> None:
@@ -377,6 +398,12 @@ class LanguageVersionTests(unittest.TestCase):
             second = Compiler().compile_request(FrontendCompileRequest(path, "main"))
 
         function = next(function for function in first.typed_functions if function.symbol == "main")
+        gid = next(parameter for parameter in function.parameters if parameter.name == "gid")
+        self.assertEqual(gid.builtin, "global_invocation_id")
+        self.assertEqual(
+            typed_model_data((function,))[0]["parameters"][2]["interface"],
+            [{"kind": "builtin", "arguments": ["global_invocation_id"]}],
+        )
         read_static, write_dynamic, branch = function.body
         self.assertEqual(
             read_static.effects,
@@ -649,6 +676,19 @@ class LanguageVersionTests(unittest.TestCase):
             ],
         )
 
+    def test_rank_zero_workgroup_storage_models_one_scalar(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@kernel\n"
+            "def scalar_shared(output: TensorView[f32, (), write]) -> None:\n"
+            "    value = workgroup_storage(f32, shape=())\n"
+            "    value[()] = 3.0\n"
+            "    workgroup_barrier()\n"
+            "    output[()] = value[()]\n",
+            "rank_zero_workgroup.py",
+        )
+        self.assertIn('!vernon.tensor_view<f32, [], "read_write", "workgroup">', output)
+
     def test_rank_two_aggregate_workgroup_storage_uses_typed_tensor_view_ops(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
@@ -670,7 +710,7 @@ class LanguageVersionTests(unittest.TestCase):
         self.assertNotIn("strides = array", output)
 
     def test_aggregate_workgroup_limit_includes_physical_leaf_alignment(self) -> None:
-        with self.assertRaisesRegex(CompileError, "16 KiB allocation limit"):
+        with self.assertRaisesRegex(CompileError, "portable 16 KiB workgroup storage limit"):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@struct\n"
@@ -685,7 +725,7 @@ class LanguageVersionTests(unittest.TestCase):
             )
 
     def test_workgroup_limit_accumulates_all_kernel_allocations(self) -> None:
-        with self.assertRaisesRegex(CompileError, "combined workgroup_storage exceeds"):
+        with self.assertRaisesRegex(CompileError, "portable 16 KiB workgroup storage limit"):
             compile_source(
                 "from vernon_dsl import *\n"
                 "@kernel\n"
@@ -798,18 +838,22 @@ class LanguageVersionTests(unittest.TestCase):
                 "invalid_workgroup.py",
             )
 
-    def test_pure_helper_rejects_propagated_storage_effects(self) -> None:
-        with self.assertRaisesRegex(CompileError, "pure helper 'copy' has Storage effects"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@func\n"
-                "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    output[0] = source[0]\n"
-                "@kernel\n"
-                "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
-                "    copy(output, source)\n",
-                "effectful_helper.py",
-            )
+    def test_parameter_bound_storage_helper_effects_propagate(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def copy(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    output[0] = source[0]\n"
+            "@kernel\n"
+            "def main(output: TensorView[f32, (dyn,), write], source: TensorView[f32, (dyn,), read]) -> None:\n"
+            "    copy(output, source)\n",
+            "effectful_helper.py",
+        )
+        self.assertIn("func.call @copy", output)
+        self.assertIn('"vernon.load"', output)
+        self.assertIn('"vernon.store"', output)
+        self.assertIn('owner = "output"', output)
+        self.assertIn('owner = "source"', output)
 
     def test_helper_call_rejects_known_incompatible_aliases(self) -> None:
         with self.assertRaisesRegex(CompileError, "helper call 'combine' has incompatible aliased Storage effects"):
@@ -1081,6 +1125,56 @@ class LanguageVersionTests(unittest.TestCase):
                     f"invalid_{keyword}.py",
                 )
 
+    def test_loop_else_lowers_normal_and_break_paths(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def loop_else(limit: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for index in range(limit):\n"
+            "        if index >= 3:\n"
+            "            break\n"
+            "        result += 1\n"
+            "    else:\n"
+            "        result += 10\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(limit: i32) -> i32:\n"
+            "    return loop_else(limit)\n",
+            "loop_else.py",
+        )
+        self.assertIn("scf.while", output)
+        self.assertGreaterEqual(output.count("scf.if"), 2)
+        self.assertIn("arith.cmpi ne", output)
+        self.assertIn("vernon.loop_control_index", output)
+
+    def test_nested_continue_and_multiple_loop_returns_lower_to_carried_state(self) -> None:
+        output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def nested_control(x: f32, limit: i32) -> f32:\n"
+            "    result = x\n"
+            "    for outer in range(limit):\n"
+            "        for inner in range(4):\n"
+            "            if inner < 2:\n"
+            "                continue\n"
+            "            if result > 8.0:\n"
+            "                return result\n"
+            "            result *= x\n"
+            "        if result < -8.0:\n"
+            "            return -result\n"
+            "    return result\n"
+            "@fragment\n"
+            "def main(x: f32, limit: i32) -> f32:\n"
+            "    return nested_control(x, limit)\n",
+            "nested_loop_returns.py",
+        )
+        self.assertGreaterEqual(output.count("scf.while"), 2)
+        self.assertIn("arith.select", output)
+        self.assertGreaterEqual(output.count("arith.cmpi eq"), 2)
+        self.assertGreaterEqual(output.count("vernon.loop_control_index"), 2)
+        self.assertGreaterEqual(output.count("vernon.return_flag_index"), 2)
+
     def test_dynamic_range_contract_and_type_rules(self) -> None:
         output = compile_source(
             "from vernon_dsl import *\n"
@@ -1088,7 +1182,7 @@ class LanguageVersionTests(unittest.TestCase):
             "def total(start: i32, stop: i32, step: i32) -> i32:\n"
             "    result = 0\n"
             "    for index in range(start, stop, step):\n"
-            "        result += i32(index)\n"
+            "        result += index\n"
             "    return result\n",
             "dynamic_range.py",
         )
@@ -1106,9 +1200,24 @@ class LanguageVersionTests(unittest.TestCase):
             "    return result\n",
             "float_range.py",
         )
-        self.assertIn("arith.index_cast", float_output)
+        self.assertIn("scf.for", float_output)
+        self.assertIn("index to i32", float_output)
         self.assertIn("arith.sitofp", float_output)
-        self.assertNotIn("index to f32", float_output)
+
+        natural_output = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def natural(width: i32) -> i32:\n"
+            "    result = 0\n"
+            "    for x in range(width):\n"
+            "        if x + 1 == width or 0 == x or x % 2 == 0:\n"
+            "            result += x\n"
+            "    return i32(f32(result))\n",
+            "natural_range.py",
+        )
+        self.assertIn("arith.remsi", natural_output)
+        self.assertIn("arith.sitofp", natural_output)
+        self.assertIn("arith.fptosi", natural_output)
 
         with self.assertRaisesRegex(CompileError, "range step must not be zero"):
             compile_source(
@@ -1117,7 +1226,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def zero_step() -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(0, 4, 0):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "zero_range.py",
             )
@@ -1129,7 +1238,7 @@ class LanguageVersionTests(unittest.TestCase):
                 "def unsigned_range(stop: u32) -> i32:\n"
                 "    result = 0\n"
                 "    for index in range(stop):\n"
-                "        result += i32(index)\n"
+                "        result += index\n"
                 "    return result\n",
                 "unsigned_range.py",
             )
@@ -1523,6 +1632,16 @@ class NumericInferenceTests(unittest.TestCase):
         )
         self.assertIn("tensor<2x2x1xf64>", output)
         self.assertIn('name = "construct"', output)
+
+        scalar = compile_source(
+            "from vernon_dsl import *\n"
+            "@func\n"
+            "def scalar_tensor(value: f64) -> Tensor[f64, ()]:\n"
+            "    return Tensor(value)\n",
+            "rank_zero_tensor_constructor.py",
+        )
+        self.assertIn("tensor<f64>", scalar)
+        self.assertIn('name = "construct"', scalar)
 
         with self.assertRaisesRegex(CompileError, "non-empty rectangular"):
             compile_source(

@@ -2,26 +2,41 @@
 #define VERNON_RUNTIME_COMPUTE_LAUNCH_PLANNER_H
 
 #include "VernonRuntime.h"
-#include "pipeline_manifest.h"
+#include "stage_binding_plan.h"
+#include "tensor_bridge.h"
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace vernon::runtime {
 
-enum class ComputeLaunchArgumentKind { Tensor, Scalar };
-
-struct ComputeLaunchArgument {
-    ComputeLaunchArgumentKind kind{ComputeLaunchArgumentKind::Tensor};
+struct ComputeTensorArgument {
     VernonRuntimeProviderResourceReference resource{};
     const void *hostData{};
     size_t hostSize{};
-    const void *scalarData{};
-    size_t scalarSize{};
     const VernonTensorView *tensorView{};
+    const void *tensorViewData{};
+    size_t tensorViewSize{};
 };
+
+struct ComputeImageArgument {
+    VernonRuntimeProviderResourceReference view{};
+};
+
+struct ComputeScalarArgument {
+    const void *data{};
+    size_t size{};
+};
+
+struct ComputeSamplerArgument {
+    VernonRuntimeProviderResourceReference resource{};
+};
+
+using ComputeLaunchArgument =
+    std::variant<ComputeTensorArgument, ComputeImageArgument, ComputeScalarArgument, ComputeSamplerArgument>;
 
 enum class ComputeBindingSourceKind { Argument, TensorOffset, TensorExtent, TensorStride };
 
@@ -31,9 +46,16 @@ struct ComputeBindingSource {
     uint32_t dimension{};
 };
 
+struct ResultCommitPlan {
+    size_t storageIndex{};
+    VernonTensorView destination{};
+    TensorCopyPlan layout;
+};
+
 struct PlannedComputeLaunch {
     std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
+    std::vector<ResultCommitPlan> resultCommits;
     VernonLaunchSize grid{};
     VernonRuntimeProviderObject commandEncoder{};
 };
@@ -41,8 +63,9 @@ struct PlannedComputeLaunch {
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
                                                      const ComputeBindingSource &source);
 
-bool planComputeInvocation(const Variant &variant, const VernonPipelineInvocation &invocation,
+bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error);
+bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error);
 
 } // namespace vernon::runtime
 

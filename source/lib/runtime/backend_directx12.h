@@ -8,7 +8,7 @@
 #include "tensor_bridge.h"
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-#include "../rhi/directx12_backend.h"
+#include "rhi/directx12_backend.h"
 #include <d3d12.h>
 #endif
 
@@ -42,7 +42,7 @@ struct DirectX12PipelineState {
         };
         Source source{};
         uint32_t externalSlot{};
-        TensorPackingLayout packing;
+        TensorCopyPlan packing;
         std::vector<uint8_t> storage;
     };
 

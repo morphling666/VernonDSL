@@ -48,6 +48,7 @@ bool Driver::load() {
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToHost, "cuMemcpyDtoH");
     VERNON_LOAD_CUDA_VERSIONED(copyHostToDeviceAsync, "cuMemcpyHtoDAsync");
     VERNON_LOAD_CUDA_VERSIONED(copyDeviceToHostAsync, "cuMemcpyDtoHAsync");
+    VERNON_LOAD_CUDA_VERSIONED(copyDeviceToDeviceAsync, "cuMemcpyDtoDAsync");
     VERNON_LOAD_CUDA(moduleLoadData, "cuModuleLoadDataEx");
     VERNON_LOAD_CUDA(moduleGetFunction, "cuModuleGetFunction");
     VERNON_LOAD_CUDA(moduleUnload, "cuModuleUnload");

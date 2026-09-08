@@ -49,7 +49,7 @@ def abs(value: Any) -> Any:
 
 
 def dot(left: Any, right: Any) -> Any:
-    return np.dot(left, right)
+    return np.sum(np.asarray(left) * np.asarray(right))
 
 
 def cross(left: Any, right: Any) -> Any:
@@ -112,6 +112,16 @@ def texture_sample(texture: Any, *arguments: Any) -> Any:
 def texture_size(texture: Any, lod: Any | None = None) -> Any:
     del texture, lod
     return _raise_device_only("texture_size")
+
+
+def texture_load(texture: Any, coordinates: Any) -> Any:
+    del texture, coordinates
+    return _raise_device_only("texture_load")
+
+
+def texture_store(texture: Any, coordinates: Any, value: Any) -> None:
+    del texture, coordinates, value
+    _raise_device_only("texture_store")
 
 
 def workgroup_storage(element_type: Any, *, shape: tuple[int, ...]) -> Any:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import json
+import dataclasses
+import gc
 import types
 import unittest
+import weakref
 from unittest import mock
 
 import numpy as np
@@ -49,52 +51,196 @@ from pipeline_shader import (
     translated_vertex,
     triangle_vertex,
     u32_attribute_vertex,
+    volume_coordinate_fragment,
 )
 
 
-def render_target(texture: vd.Texture) -> vd.RenderTarget:
-    return vd.RenderTarget(shape=texture.shape).attach_color(0, texture)
+def render_target(texture: vd.Texture) -> vd.RenderPass:
+    return vd.render_pass(
+        vd.RenderTarget.from_attachments(colors={0: texture}),
+        color=vd.clear((0.0, 0.0, 0.0, 0.0)),
+    )
 
 
-def mrt_target(color: vd.Texture, object_id: vd.Texture) -> vd.RenderTarget:
-    return vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
+def mrt_target(color: vd.Texture, object_id: vd.Texture) -> vd.RenderPass:
+    return vd.render_pass(
+        vd.RenderTarget.from_attachments(colors={0: color, 1: object_id}),
+        colors={
+            0: vd.clear((0.0, 0.0, 0.0, 0.0)),
+            1: vd.clear((0.0, 0.0, 0.0, 0.0)),
+        },
+    )
 
 
 class RenderTargetTests(unittest.TestCase):
-    def test_attachment_validation(self) -> None:
+    def test_render_target_use_is_immutable_and_complete(self) -> None:
+        target = vd.RenderTarget.create(
+            shape=(16, 16),
+            color_formats={0: vd.rgba8_unorm},
+            depth_format=vd.d32_float,
+        )
+        use = vd.render_pass(
+            target,
+            color=vd.clear((0.1, 0.2, 0.3, 1.0)),
+            depth=vd.preserve(),
+            render_area=(1, 2, 8, 9),
+        )
+
+        self.assertIs(use.target, target)
+        self.assertEqual(use.colors[0][0], 0)
+        self.assertEqual(use.colors[0][1].clear_value, (0.1, 0.2, 0.3, 1.0))
+        self.assertEqual(use.render_area, (1, 2, 8, 9))
+        self.assertFalse(hasattr(target, "attach_color"))
+        self.assertFalse(hasattr(target, "attach_depth"))
+        with self.assertRaisesRegex(TypeError, "either color or colors"):
+            vd.render_pass(target, color=vd.load(), colors={0: vd.load()})
+
+    def test_graphics_values_are_typed_and_immutable(self) -> None:
+        state = vd.graphics_state(
+            topology=vd.lines,
+            rasterization=vd.RasterizationState(cull_mode=vd.CullMode.BACK),
+            depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+            color_blends={0: vd.ColorBlendState(enabled=True)},
+        )
+        self.assertIs(state.topology, vd.lines)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            state.topology = vd.points  # type: ignore[misc]
+
+        indices = vd.storage.from_numpy(np.array((0, 1, 2, 2, 3, 0), dtype=np.uint32))
+        view = indices.view(shape=(3,), strides=(1,), offset=2)
+        indexed = vd.index_buffer(view)
+        self.assertIs(indexed.view.owner, indices)
+        self.assertEqual(indexed.count, 3)
+        self.assertEqual(indexed.view.access, "read")
+        with self.assertRaisesRegex(TypeError, "rank-one u32"):
+            vd.index_buffer(vd.storage.zeros(dtype=vd.f32, shape=(3,)))
+
+    def test_from_attachments_views_ownership_and_validation(self) -> None:
         color = vd.Texture.zeros(shape=(16, 16))
-        with self.assertRaisesRegex(ValueError, "two positive dimensions"):
-            vd.RenderTarget(shape=(16, 0))
+        color_view = color.view()
+        depth = vd.Texture.device(shape=color.shape, format=vd.d32_float)
+        depth_view = depth.view()
+        target = vd.RenderTarget.from_attachments(colors={0: color_view}, depth=depth_view)
+
+        self.assertEqual(target.shape, color.shape)
+        self.assertIs(target.color_view(0), color_view)
+        self.assertIs(target.color_texture(0), color)
+        self.assertIs(target.depth_view, depth_view)
+        self.assertIs(target.depth_texture, depth)
+        with self.assertRaisesRegex(ValueError, "not occupied"):
+            target.color_view(1)
+        with self.assertRaisesRegex(ValueError, "not occupied"):
+            target.color_texture(1)
+        with self.assertRaisesRegex(RuntimeError, "no depth attachment"):
+            _ = vd.RenderTarget.from_attachments(colors={0: color}).depth_view
+
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            vd.RenderTarget.from_attachments(colors={})
         with self.assertRaisesRegex(ValueError, "dimensions"):
-            vd.RenderTarget(shape=(16, 16)).attach_color(0, vd.Texture.zeros(shape=(8, 16)))
-
-        target = vd.RenderTarget(shape=(16, 16)).attach_color(0, color)
-        with self.assertRaisesRegex(ValueError, "already occupied"):
-            target.attach_color(0, color)
+            vd.RenderTarget.from_attachments(colors={0: color, 1: vd.Texture.zeros(shape=(8, 16))})
         with self.assertRaisesRegex(ValueError, "non-negative"):
-            target.attach_color(-1, color)
+            vd.RenderTarget.from_attachments(colors={-1: color})
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            vd.RenderTarget.from_attachments(colors={True: color})
+        with self.assertRaisesRegex(ValueError, "two-dimensional color"):
+            vd.RenderTarget.from_attachments(colors={0: depth})
+        with self.assertRaisesRegex(ValueError, "two-dimensional depth"):
+            vd.RenderTarget.from_attachments(colors={}, depth=color)
+        with self.assertRaisesRegex(ValueError, "color_attachment usage"):
+            vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16), usage=("sampled",))})
+        with self.assertRaisesRegex(ValueError, "depth_stencil_attachment usage"):
+            vd.RenderTarget.from_attachments(
+                colors={},
+                depth=vd.Texture.device(shape=(16, 16), format=vd.d32_float, usage=("sampled",)),
+            )
 
-        target.attach_depth(format=vd.depth32)
-        with self.assertRaisesRegex(ValueError, "already has"):
-            target.attach_depth(format=vd.depth32)
-
-    def test_generic_depth_and_cube_texture_validation(self) -> None:
-        depth = vd.Texture.zeros(shape=(16, 16), format=vd.depth32)
-        target = vd.RenderTarget(shape=depth.shape).attach_depth(texture=depth)
+    def test_create_owned_attachments_and_transfer_validation(self) -> None:
+        target = vd.RenderTarget.create(
+            shape=(16, 16),
+            color_formats={0: vd.rgba16_float, 3: vd.r32_float},
+            depth_format=vd.d32_float,
+        )
+        depth = target.depth_texture
         self.assertEqual(target.shape, (16, 16))
-        self.assertEqual(depth.to_numpy().dtype, np.float32)
+        self.assertEqual(target.color_view(0).format, vd.rgba16_float)
+        self.assertEqual(target.color_texture(3).format, vd.r32_float)
+        self.assertIs(target.color_view(0).owner, target.color_texture(0))
+        self.assertIs(target.depth_view.owner, depth)
+        self.assertEqual(depth.shape, (16, 16))
+        target_reference = weakref.ref(target)
+        del target
+        gc.collect()
+        self.assertIsNone(target_reference())
+        self.assertEqual(depth.format, vd.d32_float)
+        with self.assertRaisesRegex(RuntimeError, "transfer_destination"):
+            depth.copy_from_numpy(np.zeros((16, 16), dtype=np.float32))
+        with self.assertRaisesRegex(RuntimeError, "transfer_source"):
+            depth.to_numpy()
+        with self.assertRaisesRegex(ValueError, "2 positive dimensions"):
+            vd.RenderTarget.create(shape=(16, 0))
+        with self.assertRaisesRegex(ValueError, "two-dimensional color"):
+            vd.RenderTarget.create(shape=(16, 16), color_formats={0: vd.d32_float})
+        with self.assertRaisesRegex(ValueError, "two-dimensional depth"):
+            vd.RenderTarget.create(shape=(16, 16), color_formats={}, depth_format=vd.rgba8_unorm)
+        with self.assertRaisesRegex(ValueError, "exactly one mip"):
+            vd.RenderTarget.from_attachments(
+                colors={0: vd.Texture.zeros(shape=(16, 16), mip_levels=2)},
+            )
 
         faces = np.zeros((6, 8, 8, 4), dtype=np.uint8)
         cube = vd.Texture.cube(faces)
         self.assertEqual(cube.shape, (8, 8))
         np.testing.assert_array_equal(cube.to_numpy(), faces)
 
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            vd.RenderTarget(shape=(16, 16)).attach_depth()
-        with self.assertRaisesRegex(ValueError, "exactly one"):
-            vd.RenderTarget(shape=(16, 16)).attach_depth(format=vd.depth32, texture=depth)
         with self.assertRaisesRegex(ValueError, "6"):
             vd.Texture.cube(np.zeros((5, 8, 8, 4), dtype=np.uint8))
+
+    def test_three_dimensional_texture_storage(self) -> None:
+        source = np.arange(3 * 4 * 5 * 4, dtype=np.uint8).reshape(3, 4, 5, 4)
+        texture = vd.Texture.from_numpy(source, dimension="3d")
+        self.assertEqual(texture.shape, (3, 4, 5))
+        np.testing.assert_array_equal(texture.to_numpy(), source)
+
+        replacement = np.full_like(source, 23)
+        texture.copy_from_numpy(replacement)
+        np.testing.assert_array_equal(texture.to_numpy(), replacement)
+        self.assertEqual(vd.Texture.zeros(shape=(2, 3, 4), dimension="3d").shape, (2, 3, 4))
+
+        with self.assertRaisesRegex(ValueError, "3 positive dimensions"):
+            vd.Texture.zeros(shape=(3, 4), dimension="3d")
+        with self.assertRaisesRegex(ValueError, "two-dimensional"):
+            vd.RenderTarget.from_attachments(colors={0: texture})
+
+    def test_texture_formats_mips_and_subregions(self) -> None:
+        texture = vd.Texture.zeros(
+            shape=(4, 6, 8),
+            dimension="3d",
+            format=vd.rgba32_float,
+            mip_levels=4,
+            usage=("sampled", "storage", "transfer_source", "transfer_destination"),
+        )
+        self.assertEqual(texture.format, vd.rgba32_float)
+        self.assertEqual(texture.dimension, "3d")
+        self.assertEqual(texture.mip_levels, 4)
+        self.assertIn("storage", texture.usage)
+
+        region = np.full((1, 2, 3, 4), 7.0, dtype=np.float32)
+        texture.upload(region, mip_level=0, origin=(2, 1, 4))
+        expected = np.zeros((4, 6, 8, 4), dtype=np.float32)
+        expected[2:3, 1:3, 4:7] = 7.0
+        np.testing.assert_array_equal(texture.download(), expected)
+
+        mip = np.full((2, 3, 4, 4), 2.0, dtype=np.float32)
+        texture.upload(mip, mip_level=1)
+        np.testing.assert_array_equal(texture.download(mip_level=1), mip)
+
+        cube = vd.Texture.cube(np.zeros((6, 4, 4, 4), dtype=np.uint8), mip_levels=2)
+        cube.upload(np.full((6, 2, 2, 4), 9, dtype=np.uint8), mip_level=1)
+        np.testing.assert_array_equal(cube.download(mip_level=1), np.full((6, 2, 2, 4), 9, dtype=np.uint8))
+
+        storage_only = vd.Texture.zeros(shape=(2, 2), usage=("storage",))
+        with self.assertRaisesRegex(RuntimeError, "transfer_source"):
+            storage_only.download()
 
 
 def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
@@ -109,9 +255,26 @@ def assert_depth_attachment_selects_nearest(test: unittest.TestCase) -> None:
         np.array(((1.0, 0.0, 0.0, 1.0),) * 3 + ((0.0, 1.0, 0.0, 1.0),) * 3, dtype=np.float32)
     )
     target = vd.Texture.zeros(shape=(32, 32))
-    attachments = render_target(target).attach_depth(format=vd.depth32)
+    attachments = vd.RenderTarget.from_attachments(
+        colors={0: target},
+        depth=vd.Texture.device(shape=target.shape, format=vd.d32_float),
+    )
 
-    vd.pipeline(depth_vertex, depth_fragment)(position=positions, color=colors, target=attachments)
+    vd.pipeline(
+        depth_vertex,
+        depth_fragment,
+        state=vd.graphics_state(
+            depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+        ),
+    )(
+        position=positions,
+        color=colors,
+        render_pass=vd.render_pass(
+            attachments,
+            color=vd.clear((0.0, 0.0, 0.0, 0.0)),
+            depth=vd.clear_depth(1.0),
+        ),
+    )
 
     pixel = target.to_numpy()[16, 16]
     test.assertGreater(int(pixel[0]), 240)
@@ -133,7 +296,7 @@ def assert_rank_three_tensor_attribute_renders(test: unittest.TestCase) -> None:
     vd.pipeline(rank_three_tensor_attribute_vertex, solid_fragment)(
         value=view,
         projection=vd.storage.from_numpy(projection),
-        target=render_target(target),
+        render_pass=render_target(target),
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
@@ -179,7 +342,7 @@ def assert_aggregate_attribute_renders(test: unittest.TestCase) -> None:
     )
     target = vd.Texture.zeros(shape=(32, 32))
     vd.pipeline(aggregate_triangle_vertex, solid_fragment)(
-        vertex=vertices, aggregate=aggregate, target=render_target(target)
+        vertex=vertices, aggregate=aggregate, render_pass=render_target(target)
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
@@ -204,7 +367,7 @@ def assert_small_multidimensional_aggregate_attribute_renders(test: unittest.Tes
     )
     target = vd.Texture.zeros(shape=(32, 32))
     vd.pipeline(small_multidimensional_aggregate_attribute_vertex, solid_fragment)(
-        values=values, target=render_target(target)
+        values=values, render_pass=render_target(target)
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
@@ -221,7 +384,9 @@ def assert_oversized_aggregate_attribute_reports_location_limit(test: unittest.T
     )
     target = vd.Texture.zeros(shape=(8, 8))
     with test.assertRaisesRegex(RuntimeError, "location or format capabilities"):
-        vd.pipeline(oversized_aggregate_attribute_vertex, solid_fragment)(values=values, target=render_target(target))
+        vd.pipeline(oversized_aggregate_attribute_vertex, solid_fragment)(
+            values=values, render_pass=render_target(target)
+        )
 
 
 def assert_instanced_mat4_tensor_attribute_renders(test: unittest.TestCase) -> None:
@@ -232,7 +397,7 @@ def assert_instanced_mat4_tensor_attribute_renders(test: unittest.TestCase) -> N
     vd.pipeline(instanced_tensor_transform_vertex, solid_fragment)(
         position=positions,
         transform=vd.storage.from_numpy(transforms),
-        target=render_target(target),
+        render_pass=render_target(target),
     )
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[16, 25, 0]), 240)
@@ -259,9 +424,9 @@ def assert_formal_attribute_formats_render(
             render = vd.pipeline(vertex, solid_fragment)
             if name in unsupported:
                 with test.assertRaisesRegex((vd.CompileError, RuntimeError), "support|capabilit|format"):
-                    render(position=positions, value=values, target=render_target(target))
+                    render(position=positions, value=values, render_pass=render_target(target))
                 continue
-            render(position=positions, value=values, target=render_target(target))
+            render(position=positions, value=values, render_pass=render_target(target))
             test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
 
@@ -272,7 +437,7 @@ def assert_non_square_and_divisor_two_attributes_render(test: unittest.TestCase)
     vd.pipeline(non_square_attribute_vertex, solid_fragment)(
         position=positions,
         value=non_square,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
     test.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
@@ -281,7 +446,8 @@ def assert_non_square_and_divisor_two_attributes_render(test: unittest.TestCase)
     vd.pipeline(divisor_two_attribute_vertex, solid_fragment)(
         position=positions,
         offset=offsets,
-        target=render_target(target),
+        draw=vd.draw(instance_count=4),
+        render_pass=render_target(target),
     )
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[16, 8, 0]), 240)
@@ -297,7 +463,7 @@ def assert_matrix_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     vd.pipeline(matrix_vertex, solid_fragment)(
         position=positions,
         transform=transform,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     pixels = target.to_numpy()
@@ -318,7 +484,7 @@ def assert_mixed_uniform_layout_renders(test: unittest.TestCase) -> None:
         bias=np.float32(0.4),
         uv=np.array((0.45, 0.5), dtype=np.float32),
         texel=np.array((0.55, 0.6), dtype=np.float32),
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     np.testing.assert_allclose(
@@ -335,7 +501,7 @@ def assert_mixed_uniform_layout_renders(test: unittest.TestCase) -> None:
         bias=np.float32(0.2),
         uv=np.array((0.2, 0.3), dtype=np.float32),
         texel=np.array((0.4, 0.5), dtype=np.float32),
-        target=render_target(target),
+        render_pass=render_target(target),
     )
     np.testing.assert_allclose(
         target.to_numpy()[16, 16],
@@ -371,7 +537,7 @@ def assert_cube_faces_remain_distinct(test: unittest.TestCase) -> None:
             direction=np.ascontiguousarray(direction),
             image=image,
             sampler=sampler,
-            target=render_target(target),
+            render_pass=render_target(target),
         )
         np.testing.assert_array_equal(target.to_numpy()[4, 4], colors[face])
 
@@ -381,13 +547,33 @@ def assert_cube_faces_remain_distinct(test: unittest.TestCase) -> None:
         direction=np.array((1.0, 0.0, 0.99), dtype=np.float32),
         image=image,
         sampler=sampler,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
     seam_pixel = target.to_numpy()[4, 4]
     test.assertGreater(int(seam_pixel[0]), 240)
     test.assertLess(int(seam_pixel[1]), 16)
     test.assertGreater(int(seam_pixel[2]), 80)
     test.assertLess(int(seam_pixel[2]), 180)
+
+
+def assert_three_dimensional_texture_samples(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    colors = np.array(((255, 32, 16, 255), (24, 64, 255, 255)), dtype=np.uint8)
+    volume = np.broadcast_to(colors[:, None, None, :], (2, 2, 2, 4)).copy()
+    image = vd.Texture.from_numpy(volume, dimension="3d")
+    sampler = vd.sampler(address="clamp_to_edge")
+    render = vd.pipeline(triangle_vertex, volume_coordinate_fragment)
+
+    for layer, color in enumerate(colors):
+        target = vd.Texture.zeros(shape=(8, 8))
+        render(
+            position=positions,
+            coordinate=np.array((0.5, 0.5, (layer + 0.5) / len(colors)), dtype=np.float32),
+            image=image,
+            sampler=sampler,
+            render_pass=render_target(target),
+        )
+        np.testing.assert_allclose(target.to_numpy()[4, 4], color, atol=1)
 
 
 def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
@@ -402,7 +588,7 @@ def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
         base_sampler=vd.sampler(),
         optional_image=optional_image,
         optional_sampler=vd.sampler(),
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     np.testing.assert_array_equal(target.to_numpy()[4, 4], np.array((0, 255, 0, 255), dtype=np.uint8))
@@ -414,7 +600,7 @@ def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
         base_sampler=vd.sampler(),
         optional_image=optional_image,
         optional_sampler=vd.sampler(),
-        target=render_target(enabled_target),
+        render_pass=render_target(enabled_target),
     )
     np.testing.assert_array_equal(enabled_target.to_numpy()[4, 4], np.array((255, 0, 0, 255), dtype=np.uint8))
 
@@ -424,7 +610,7 @@ def assert_mat2_uniform_transforms_vertices(test: unittest.TestCase) -> None:
     transform = np.array(((0.5, 0.0), (0.0, 1.0)), dtype=np.float32)
     target = vd.Texture.zeros(shape=(64, 64))
 
-    vd.pipeline(mat2_vertex, solid_fragment)(position=positions, transform=transform, target=render_target(target))
+    vd.pipeline(mat2_vertex, solid_fragment)(position=positions, transform=transform, render_pass=render_target(target))
 
     pixels = target.to_numpy()
     test.assertGreater(int(pixels[32, 32, 0]), 240)
@@ -438,7 +624,7 @@ def assert_rank_three_uniform_renders(test: unittest.TestCase) -> None:
     target = vd.Texture.zeros(shape=(32, 32))
 
     vd.pipeline(triangle_vertex, static_tensor_fragment)(
-        position=positions, weights=weights, target=render_target(target)
+        position=positions, weights=weights, render_pass=render_target(target)
     )
 
     pixel = target.to_numpy()[16, 16]
@@ -458,7 +644,7 @@ def assert_matrix_elementwise_multiply_renders(test: unittest.TestCase) -> None:
         position=positions,
         left=left,
         right=right,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     np.testing.assert_allclose(
@@ -485,7 +671,7 @@ def assert_numpy_tensor_vertex_renders(test: unittest.TestCase) -> None:
         offset_left=offset_left,
         offset_right=offset_right,
         transform=transform,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     pixels = target.to_numpy()
@@ -507,7 +693,7 @@ def assert_numpy_tensor_fragment_renders(test: unittest.TestCase) -> None:
         broadcast_right=broadcast_right,
         matmul_left=matmul_left,
         matmul_right=matmul_right,
-        target=render_target(target),
+        render_pass=render_target(target),
     )
 
     broadcasted = broadcast_left + broadcast_right
@@ -541,7 +727,7 @@ def assert_static_tensor_compute_argument(test: unittest.TestCase) -> None:
         large,
         matrix_left,
         matrix_right,
-        grid=(11, 1, 1),
+        grid=(3, 1, 1),
     )
 
     np.testing.assert_allclose(
@@ -709,7 +895,9 @@ class OpenGLPipelineTests(unittest.TestCase):
         values = vd.storage.from_numpy(np.zeros((3, 8, 8, 4), dtype=np.float32))
         target = vd.Texture.zeros(shape=(8, 8))
         with self.assertRaisesRegex(RuntimeError, "location or format capabilities"):
-            vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(value=values, target=render_target(target))
+            vd.pipeline(oversized_tensor_attribute_vertex, solid_fragment)(
+                value=values, render_pass=render_target(target)
+            )
 
     def setUp(self) -> None:
         try:
@@ -732,7 +920,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         target = vd.Texture.zeros(shape=(64, 64))
 
         attachments = render_target(target)
-        render(position=positions, target=attachments)
+        render(position=positions, render_pass=attachments)
         pixels = target.to_numpy()
 
         self.assertEqual(tuple(pixels[0, 0]), (0, 0, 0, 0))
@@ -741,8 +929,48 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(center[1]), 40)
         self.assertEqual(int(center[2]), 0)
         self.assertGreater(int(center[3]), 240)
-        render(position=positions, target=attachments)
+        second_target = vd.Texture.zeros(shape=(32, 32))
+        render(position=positions, render_pass=render_target(second_target))
         self.assertEqual(render.compile_count, 1)
+        self.assertGreater(int(second_target.to_numpy()[16, 16, 0]), 240)
+
+    def test_explicit_graphics_controls_reuse_compiled_specialization(self) -> None:
+        render = vd.pipeline(triangle_vertex, solid_fragment)
+        positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+        target = vd.Texture.zeros(shape=(32, 32))
+        render_pass = render_target(target)
+        dynamic_state = vd.dynamic_state(viewport=(0, 0, 32, 32))
+        render(
+            position=positions,
+            render_pass=render_pass,
+            dynamic_state=dynamic_state,
+        )
+        compiled = next(iter(render._specializations.values()))
+        initial_telemetry = dict(compiled.specialization.binding_telemetry)
+        target.upload(np.zeros((32, 32, 4), dtype=np.uint8))
+        render(position=positions, render_pass=render_pass, dynamic_state=dynamic_state)
+        reused_telemetry = dict(compiled.specialization.binding_telemetry)
+        self.assertEqual(reused_telemetry["prepare_count"], initial_telemetry["prepare_count"])
+        self.assertEqual(reused_telemetry["upload_bytes"], initial_telemetry["upload_bytes"])
+        self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
+
+        invalid = vd.RenderTarget.from_attachments(
+            colors={0: vd.Texture.zeros(shape=(16, 16)), 1: vd.Texture.zeros(shape=(16, 16))}
+        )
+        with self.assertRaisesRegex(ValueError, "exactly match"):
+            render(
+                position=positions,
+                render_pass=vd.render_pass(
+                    invalid,
+                    colors={
+                        0: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                        1: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                    },
+                ),
+            )
+        target.upload(np.zeros((32, 32, 4), dtype=np.uint8))
+        render(position=positions, render_pass=render_pass, dynamic_state=dynamic_state)
+        self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
     def test_depth_attachment_selects_nearest_fragment(self) -> None:
         assert_depth_attachment_selects_nearest(self)
@@ -755,6 +983,9 @@ class OpenGLPipelineTests(unittest.TestCase):
 
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
+
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
@@ -796,7 +1027,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         offset = vd.storage.from_numpy(np.array((2.0, 0.0), dtype=np.float32))
         target = vd.Texture.zeros(shape=(64, 64))
 
-        render(position=positions, offset=offset, target=render_target(target))
+        render(position=positions, offset=offset, render_pass=render_target(target))
 
         self.assertEqual(tuple(target.to_numpy()[32, 32]), (0, 0, 0, 0))
 
@@ -808,7 +1039,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
-        render(position=positions, target=render_target(target))
+        render(position=positions, render_pass=render_target(target))
         self.assertGreater(int(target.to_numpy()[8, 8, 0]), 240)
 
     @staticmethod
@@ -831,8 +1062,8 @@ class OpenGLPipelineTests(unittest.TestCase):
         arguments = {
             "position": positions,
             "offset": offsets,
-            "indices": indices,
-            "target": mrt_target(color, object_id),
+            "draw": vd.draw(index_buffer=vd.index_buffer(indices), instance_count=2),
+            "render_pass": mrt_target(color, object_id),
         }
         render(**arguments)
         color_pixels = color.to_numpy()
@@ -844,9 +1075,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertGreater(int(color_pixels[32, 19, 2]), 240)
         self.assertGreater(int(id_pixels[32, 19, 0]), 240)
         self.assertGreater(int(id_pixels[32, 19, 1]), 40)
-        self.assertEqual(indices._allocation_count, 1)
         render(**arguments)
-        self.assertEqual(indices._allocation_count, 1)
         self.assertEqual(render.compile_count, 1)
 
     def test_feature_and_advanced_draw_validation(self) -> None:
@@ -855,23 +1084,28 @@ class OpenGLPipelineTests(unittest.TestCase):
         object_id = vd.Texture.zeros(shape=(32, 32))
         render = vd.pipeline(advanced_vertex, advanced_fragment, features=("PICKING", "PICKING"))
         with self.assertRaisesRegex(ValueError, "exactly match"):
-            render(position=positions, offset=offsets, indices=indices, target=render_target(color))
+            render(
+                position=positions,
+                offset=offsets,
+                draw=vd.draw(index_buffer=vd.index_buffer(indices)),
+                render_pass=render_target(color),
+            )
         with self.assertRaisesRegex(ValueError, "dimensions"):
-            vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, vd.Texture.zeros(shape=(16, 16)))
+            vd.RenderTarget.from_attachments(colors={0: color, 1: vd.Texture.zeros(shape=(16, 16))})
         with self.assertRaisesRegex(RuntimeError, "shape"):
             render(
                 position=positions,
                 offset=vd.storage.zeros(dtype=vd.f32, shape=(3, 3)),
-                indices=indices,
-                target=mrt_target(color, object_id),
+                draw=vd.draw(index_buffer=vd.index_buffer(indices)),
+                render_pass=mrt_target(color, object_id),
             )
         unknown = vd.pipeline(advanced_vertex, advanced_fragment, features={"UNKNOWN"})
         with self.assertRaisesRegex(vd.CompileError, "undeclared feature"):
             unknown(
                 position=positions,
                 offset=offsets,
-                indices=indices,
-                target=mrt_target(color, object_id),
+                draw=vd.draw(index_buffer=vd.index_buffer(indices)),
+                render_pass=mrt_target(color, object_id),
             )
 
     def test_layout_view_and_topologies(self) -> None:
@@ -882,7 +1116,9 @@ class OpenGLPipelineTests(unittest.TestCase):
             )
         )
         target = vd.Texture.zeros(shape=(32, 32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=interleaved.swizzle("yz"), target=render_target(target))
+        vd.pipeline(triangle_vertex, solid_fragment)(
+            position=interleaved.swizzle("yz"), render_pass=render_target(target)
+        )
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         vertices = vd.TensorStorage.zeros(dtype=InterleavedVertex, shape=(3,))
@@ -890,16 +1126,20 @@ class OpenGLPipelineTests(unittest.TestCase):
             np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32)
         )
         target = vd.Texture.zeros(shape=(32, 32))
-        vd.pipeline(triangle_vertex, solid_fragment)(position=vertices.field("position"), target=render_target(target))
+        vd.pipeline(triangle_vertex, solid_fragment)(
+            position=vertices.field("position"), render_pass=render_target(target)
+        )
         self.assertGreater(int(target.to_numpy()[16, 16, 0]), 240)
 
         line_positions = vd.storage.from_numpy(np.array(((-0.5, 0.0), (0.5, 0.0)), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(
-            position=line_positions, target=render_target(target), topology=vd.lines
+        vd.pipeline(triangle_vertex, solid_fragment, state=vd.graphics_state(topology=vd.lines))(
+            position=line_positions,
+            render_pass=render_target(target),
         )
         point_positions = vd.storage.from_numpy(np.array(((0.0, 0.0),), dtype=np.float32))
-        vd.pipeline(triangle_vertex, solid_fragment)(
-            position=point_positions, target=render_target(target), topology=vd.points
+        vd.pipeline(triangle_vertex, solid_fragment, state=vd.graphics_state(topology=vd.points))(
+            position=point_positions,
+            render_pass=render_target(target),
         )
 
 
@@ -959,7 +1199,7 @@ class VulkanPipelineTests(unittest.TestCase):
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(64, 64))
         render = vd.pipeline(triangle_vertex, solid_fragment)
-        render(position=positions, target=render_target(target))
+        render(position=positions, render_pass=render_target(target))
         pixels = target.to_numpy()
         self.assertGreater(int(pixels[32, 32, 0]), 240)
         np.testing.assert_allclose(positions.to_numpy()[:, 0], np.array((-0.75, 0.75, 0.0), dtype=np.float32))
@@ -976,6 +1216,9 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
+
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
@@ -1004,7 +1247,7 @@ class VulkanPipelineTests(unittest.TestCase):
         color = vd.storage.from_numpy(np.array((0.8, 0.7, 0.2, 1.0), dtype=np.float32))
 
         vd.pipeline(translated_vertex, colored_fragment)(
-            position=self._triangle(), offset=offset, color=color, target=render_target(target)
+            position=self._triangle(), offset=offset, color=color, render_pass=render_target(target)
         )
         pixels = target.to_numpy()
 
@@ -1016,52 +1259,38 @@ class VulkanPipelineTests(unittest.TestCase):
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(16, 16))
-        with (
-            mock.patch(
-                "subprocess.run",
-                side_effect=AssertionError("subprocess prohibited"),
-            ),
-            mock.patch(
-                "vernon_dsl._runtime.pipeline.build_bundle_plan",
-                wraps=pipeline_module.build_bundle_plan,
-            ) as planner,
+        self.assertFalse(hasattr(pipeline_module, "build_bundle_plan"))
+        with mock.patch(
+            "subprocess.run",
+            side_effect=AssertionError("subprocess prohibited"),
         ):
-            render(position=positions, target=render_target(target))
-        planner.assert_called_once()
+            render(position=positions, render_pass=render_target(target))
+        compiled = next(iter(render._specializations.values()))
+        self.assertGreater(len(compiled.specialization.executable.program_abi["boundary_slots"]), 0)
+        self.assertEqual(len(compiled.invocation.graph.operations), 1)
 
-    def test_bundle_parameter_output_layout_and_reinit_cache(self) -> None:
+    def test_program_abi_keeps_attachments_as_invocation_controls(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = self._triangle()
         target = vd.Texture.zeros(shape=(16, 16))
         attachments = render_target(target)
-        render(position=positions, target=attachments)
-        compiled = render._compiled
-        self.assertIsNotNone(compiled)
-        assert compiled is not None
-        self.assertTrue(callable(compiled.native.invoke))
+        render(position=positions, render_pass=attachments)
+        compiled = next(iter(render._specializations.values()))
+        native = compiled.specialization.executable
         self.assertEqual(
-            [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in compiled.native.parameters],
-            [("position", 0, (2,))],
+            [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in native.parameters],
+            [("position", 0, (0, 2))],
         )
         self.assertEqual(
-            [(output.name, output.location) for output in compiled.native.outputs],
-            [("output_0", 0)],
+            [(slot["path"], slot["slot"]) for slot in native.program_abi["boundary_slots"] if slot["role"] == "output"],
+            [],
         )
-        with self.assertRaisesRegex(ValueError, "different reflected kind"):
-            compiled.native.invocation_builder().rhi_texture(0, target._resident_texture())
-        bundle = json.loads(compiled.bundle)
-        variant = bundle["variants"][0]
-        self.assertEqual(
-            [(row["name"], row["slot"], row["kind"]) for row in variant["parameters"]],
-            [("position", 0, "tensor")],
-        )
-        self.assertEqual(
-            [(row["name"], row["location"], row["type"]) for row in variant["outputs"]],
-            [("output_0", 0, "tensor<4xf32>")],
-        )
+        operation = compiled.invocation.graph.operations[0]
+        self.assertEqual(len(operation.attachment_names), 1)
+        self.assertEqual(len(operation.outputs), 1)
         self.assertEqual(render.compile_count, 1)
         vd.init(arch=vd.vulkan)
-        render(position=positions, target=attachments)
+        render(position=positions, render_pass=attachments)
         self.assertEqual(render.compile_count, 1)
 
     def test_indexed_instanced_mrt(self) -> None:
@@ -1072,8 +1301,8 @@ class VulkanPipelineTests(unittest.TestCase):
         render(
             position=positions,
             offset=offsets,
-            indices=indices,
-            target=mrt_target(color, object_id),
+            draw=vd.draw(index_buffer=vd.index_buffer(indices), instance_count=2),
+            render_pass=mrt_target(color, object_id),
         )
         self.assertGreater(int(color.to_numpy()[32, 19, 2]), 240)
         self.assertGreater(int(object_id.to_numpy()[32, 19, 0]), 240)
@@ -1083,7 +1312,7 @@ class VulkanPipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "software rasterizer"):
             vd.pipeline(triangle_vertex, solid_fragment)(
                 position=self._triangle(),
-                target=render_target(vd.Texture.zeros(shape=(8, 8))),
+                render_pass=render_target(vd.Texture.zeros(shape=(8, 8))),
             )
 
 
@@ -1120,6 +1349,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_cube_faces_remain_distinct(self) -> None:
         assert_cube_faces_remain_distinct(self)
+
+    def test_three_dimensional_texture_samples(self) -> None:
+        assert_three_dimensional_texture_samples(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)

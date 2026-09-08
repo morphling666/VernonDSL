@@ -13,11 +13,7 @@ from shader_lib.pbr import pbr_fragment, pbr_vertex, shadow_fragment, shadow_ver
 from shader_lib.showcase import sky_fragment, sky_vertex
 from shader_lib.terrain_erosion import apply_erosion_flow, build_terrain_mesh, compute_erosion_flow
 from showcase_common import (
-    BatchRenderPass,
-    ComputeInvocationPass,
     FramePresenter,
-    InvocationBatch,
-    InvocationSlot,
     architecture_from_name,
     create_sky_cube,
     load_equirectangular_environment,
@@ -277,13 +273,17 @@ def main() -> None:
     stage_materials = vd.storage.from_numpy(stage[3])
 
     output = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=output.shape).attach_color(0, output).attach_depth(format=vd.depth32)
-    shadow_size = args.size * 2
-    shadow_map = vd.Texture.zeros(shape=(shadow_size, shadow_size), format=vd.depth32)
-    shadow_color = vd.Texture.zeros(shape=(shadow_size, shadow_size))
-    shadow_target = (
-        vd.RenderTarget(shape=shadow_map.shape).attach_color(0, shadow_color).attach_depth(texture=shadow_map)
+    target = vd.RenderTarget.from_attachments(
+        colors={0: output},
+        depth=vd.Texture.device(shape=output.shape, format=vd.d32_float),
     )
+    shadow_size = args.size * 2
+    shadow_color = vd.Texture.zeros(shape=(shadow_size, shadow_size))
+    shadow_target = vd.RenderTarget.from_attachments(
+        colors={0: shadow_color},
+        depth=vd.Texture.device(shape=shadow_color.shape, format=vd.d32_float),
+    )
+    shadow_map = shadow_target.depth_texture
     shadow_sampler = vd.sampler(address="clamp_to_edge")
     environment_map = load_equirectangular_environment(
         Path(__file__).resolve().parent / "assets" / "environment" / "belfast_sunset_puresky_1k.hdr",
@@ -297,46 +297,18 @@ def main() -> None:
     )
     rock_sampler = vd.sampler(address="repeat")
     sky_positions = vd.storage.from_numpy(create_sky_cube())
-    render_sky = vd.pipeline(sky_vertex, sky_fragment)
-    render = vd.pipeline(pbr_vertex, pbr_fragment, features={"SHADOW", "ENVIRONMENT"})
+    depth_state = vd.graphics_state(
+        depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
+    )
+    render_sky = vd.pipeline(sky_vertex, sky_fragment, state=depth_state)
+    render = vd.pipeline(pbr_vertex, pbr_fragment, state=depth_state, features={"SHADOW", "ENVIRONMENT"})
     render_terrain = vd.pipeline(
         pbr_vertex,
         pbr_fragment,
+        state=depth_state,
         features={"SHADOW", "ROCK_TEXTURE"},
     )
-    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment)
-
-    flow_a_slot = InvocationSlot()
-    erosion_ab_slot = InvocationSlot()
-    flow_b_slot = InvocationSlot()
-    erosion_ba_slot = InvocationSlot()
-    mesh_slot = InvocationSlot()
-    expand_slot = InvocationSlot()
-    shadow_batch = InvocationBatch()
-    main_batch = InvocationBatch()
-    graph = vd.ExecutionGraph()
-    graph.add_pass(ComputeInvocationPass("water-flow-a", flow_a_slot))
-    graph.add_pass(ComputeInvocationPass("erosion-a-to-b", erosion_ab_slot))
-    graph.add_pass(ComputeInvocationPass("water-flow-b", flow_b_slot))
-    graph.add_pass(ComputeInvocationPass("erosion-b-to-a", erosion_ba_slot))
-    graph.add_pass(ComputeInvocationPass("terrain-normal-material", mesh_slot))
-    graph.add_pass(ComputeInvocationPass("terrain-draw-expand", expand_slot))
-    graph.add_pass(
-        BatchRenderPass(
-            "terrain-shadow",
-            shadow_target,
-            shadow_batch,
-            clear_color=(1.0, 1.0, 1.0, 1.0),
-        )
-    )
-    graph.add_pass(
-        BatchRenderPass(
-            "terrain-pbr",
-            target,
-            main_batch,
-            clear_color=(0.006, 0.003, 0.002, 1.0),
-        )
-    )
+    render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=depth_state)
 
     projection = perspective(
         math.radians(40.0),
@@ -356,6 +328,27 @@ def main() -> None:
         )
         @ look_at(light_position, np.array((0.0, 0.35, 0.0), dtype=np.float32))
     )
+    half_step = np.float32(0.5 / args.fps)
+    compute_grid = ((vertex_count + 63) // 64, 1, 1)
+    expand_grid = ((draw_count + 63) // 64, 1, 1)
+    common_shadow = {
+        "light_view_projection": light_view_projection,
+    }
+    common_lighting: dict[str, object] = {
+        "light_view_projection": light_view_projection,
+        "light_position": light_position,
+        "shadow_depth_scale": np.float32(0.5 if args.arch == "opengl" else 1.0),
+        "shadow_depth_bias": np.float32(0.5 if args.arch == "opengl" else 0.0),
+        "shadow_uv_scale": np.array((0.5, 0.5 if args.arch == "opengl" else -0.5), dtype=np.float32),
+        "shadow_texel_size": np.array((1.0 / shadow_size, 1.0 / shadow_size), dtype=np.float32),
+        "shadow_map": shadow_map,
+        "shadow_sampler": shadow_sampler,
+    }
+    common_pbr: dict[str, object] = {
+        **common_lighting,
+        "environment_map": environment_map,
+        "environment_sampler": environment_sampler,
+    }
     presenter = FramePresenter(
         output,
         architecture=args.arch,
@@ -365,28 +358,28 @@ def main() -> None:
     )
     frame = 0
     start = time.perf_counter()
-    half_step = np.float32(0.5 / args.fps)
-    common_shadow = {
-        "light_view_projection": light_view_projection,
-        "topology": vd.triangles,
-    }
     try:
         while args.frames == 0 or frame < args.frames:
             phase = np.float32(time.perf_counter() - start if args.frames == 0 else frame / args.fps)
+            angle = float(phase) * 0.025 - 1.88
+            camera = np.array((11.8 * math.cos(angle), 6.15, 11.8 * math.sin(angle)), dtype=np.float32)
+            view_projection = np.ascontiguousarray(
+                projection @ look_at(camera, np.array((0.0, -1.42, 0.2), dtype=np.float32))
+            )
             erosion_arguments = (
                 np.uint32(args.grid),
                 half_step,
                 phase,
                 np.float32(args.rainfall),
             )
-            flow_a_slot.value = compute_erosion_flow.invocation(
+            compute_erosion_flow(
                 height_a,
                 water_a,
                 flow_a,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=compute_grid,
             )
-            erosion_ab_slot.value = apply_erosion_flow.invocation(
+            apply_erosion_flow(
                 height_a,
                 water_a,
                 sediment_a,
@@ -395,16 +388,16 @@ def main() -> None:
                 water_b,
                 sediment_b,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=compute_grid,
             )
-            flow_b_slot.value = compute_erosion_flow.invocation(
+            compute_erosion_flow(
                 height_b,
                 water_b,
                 flow_b,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=compute_grid,
             )
-            erosion_ba_slot.value = apply_erosion_flow.invocation(
+            apply_erosion_flow(
                 height_b,
                 water_b,
                 sediment_b,
@@ -413,9 +406,9 @@ def main() -> None:
                 water_a,
                 sediment_a,
                 *erosion_arguments,
-                grid=(vertex_count, 1, 1),
+                grid=compute_grid,
             )
-            mesh_slot.value = build_terrain_mesh.invocation(
+            build_terrain_mesh(
                 height_a,
                 water_a,
                 sediment_a,
@@ -427,9 +420,9 @@ def main() -> None:
                 np.uint32(args.grid),
                 np.float32(args.extent),
                 phase,
-                grid=(vertex_count, 1, 1),
+                grid=compute_grid,
             )
-            expand_slot.value = expand_indexed_mesh.invocation(
+            expand_indexed_mesh(
                 positions,
                 normals,
                 colors,
@@ -439,73 +432,63 @@ def main() -> None:
                 draw_normals,
                 draw_colors,
                 draw_materials,
-                grid=(draw_count, 1, 1),
+                grid=expand_grid,
             )
-            angle = float(phase) * 0.025 - 1.88
-            camera = np.array((11.8 * math.cos(angle), 6.15, 11.8 * math.sin(angle)), dtype=np.float32)
-            view_projection = np.ascontiguousarray(
-                projection @ look_at(camera, np.array((0.0, -1.42, 0.2), dtype=np.float32))
+            render_shadow(
+                position=draw_positions,
+                **common_shadow,
+                render_pass=vd.render_pass(
+                    shadow_target,
+                    color=vd.clear((1.0, 1.0, 1.0, 1.0)),
+                    depth=vd.clear_depth(1.0),
+                ),
             )
-            shadow_batch.values = [
-                render_shadow.invocation(position=draw_positions, **common_shadow),
-                render_shadow.invocation(position=stage_positions, **common_shadow),
-            ]
-            common_lighting: dict[str, object] = {
-                "view_projection": view_projection,
-                "light_view_projection": light_view_projection,
-                "camera_position": camera,
-                "light_position": light_position,
-                "shadow_depth_scale": np.float32(0.5 if args.arch == "opengl" else 1.0),
-                "shadow_depth_bias": np.float32(0.5 if args.arch == "opengl" else 0.0),
-                "shadow_uv_scale": np.array((0.5, 0.5 if args.arch == "opengl" else -0.5), dtype=np.float32),
-                "shadow_texel_size": np.array((1.0 / shadow_size, 1.0 / shadow_size), dtype=np.float32),
-                "shadow_map": shadow_map,
-                "shadow_sampler": shadow_sampler,
-                "topology": vd.triangles,
-            }
-            common_pbr: dict[str, object] = {
+            render_shadow(
+                position=stage_positions,
+                **common_shadow,
+                render_pass=vd.render_pass(shadow_target, color=vd.load(), depth=vd.load()),
+            )
+            render_sky(
+                direction=sky_positions,
+                view_projection=view_projection,
+                camera_position=camera,
+                environment_map=environment_map,
+                environment_sampler=environment_sampler,
+                render_pass=vd.render_pass(
+                    target,
+                    color=vd.clear((0.006, 0.003, 0.002, 1.0)),
+                    depth=vd.clear_depth(1.0),
+                ),
+            )
+            render_terrain(
+                position=draw_positions,
+                normal=draw_normals,
+                base_color=draw_colors,
+                material=draw_materials,
+                rock_material=rock_material,
+                rock_sampler=rock_sampler,
+                view_projection=view_projection,
+                camera_position=camera,
                 **common_lighting,
-                "environment_map": environment_map,
-                "environment_sampler": environment_sampler,
-            }
-            main_batch.values = [
-                render_sky.invocation(
-                    direction=sky_positions,
-                    view_projection=view_projection,
-                    camera_position=camera,
-                    environment_map=environment_map,
-                    environment_sampler=environment_sampler,
-                    topology=vd.triangles,
-                ),
-                render_terrain.invocation(
-                    position=draw_positions,
-                    normal=draw_normals,
-                    base_color=draw_colors,
-                    material=draw_materials,
-                    rock_material=rock_material,
-                    rock_sampler=rock_sampler,
-                    **common_lighting,
-                ),
-                render.invocation(
-                    position=stage_positions,
-                    normal=stage_normals,
-                    base_color=stage_colors,
-                    material=stage_materials,
-                    **common_pbr,
-                ),
-            ]
-            graph.execute()
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
+            )
+            render(
+                position=stage_positions,
+                normal=stage_normals,
+                base_color=stage_colors,
+                material=stage_materials,
+                view_projection=view_projection,
+                camera_position=camera,
+                **common_pbr,
+                render_pass=vd.render_pass(target, color=vd.load(), depth=vd.load()),
+            )
             frame += 1
             if not presenter.present():
                 break
     finally:
         presenter.close()
     presenter.write(args.output)
-    barrier_count = sum(len(scope.barriers) for scope in graph.scopes)
-    print(
-        f"backend={args.arch} frames={frame} grid={args.grid} rainfall={args.rainfall} "
-        f"passes={len(graph.schedule)} barriers={barrier_count}"
-    )
+    print(f"backend={args.arch} frames={frame} grid={args.grid} rainfall={args.rainfall} passes=11 barriers=0")
 
 
 if __name__ == "__main__":

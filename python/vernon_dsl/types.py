@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import builtins
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
+
+from ._dtypes import NUMPY_DTYPE_BY_SCALAR
 
 
 def _host_dtype(values: tuple[Any, ...]) -> np.dtype[Any]:
@@ -78,92 +80,175 @@ class Tuple(_TypeConstructor):
         return builtins.tuple(values)
 
 
-class Tensor:
+class Tensor(np.ndarray[Any, Any]):
     """Construct an immutable rectangular host Tensor Value."""
 
     @classmethod
-    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
+    def __class_getitem__(cls, arguments: Any) -> Any:
         if not isinstance(arguments, tuple):
             arguments = (arguments,)
-        return TypeExpr("Tensor", arguments)
+        return TypeExpr(cls.__name__, arguments)
 
-    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
-        def shape_and_values(current: Any) -> tuple[tuple[int, ...], tuple[Any, ...]]:
-            if isinstance(current, np.ndarray):
-                if current.ndim == 0:
-                    return (), (current[()],)
-                return current.shape, tuple(current.reshape(-1))
-            if not isinstance(current, (list, builtins.tuple)):
-                return (), (current,)
-            if not current:
-                raise TypeError("Tensor requires a non-empty rectangular sequence")
-            children = tuple(shape_and_values(value) for value in current)
-            child_shape = children[0][0]
-            if any(shape != child_shape for shape, _ in children[1:]):
-                raise TypeError("Tensor requires a non-empty rectangular sequence")
-            return (len(current), *child_shape), tuple(
-                component for _, components in children for component in components
-            )
+    def __new__(cls, values: Any) -> Tensor:
+        shape, components = cls._shape_and_values(values)
+        return cls._from_components(components, shape)
 
-        shape, components = shape_and_values(values)
-        if not shape:
-            raise TypeError("Tensor requires a non-empty rectangular sequence")
-        return _host_tensor("Tensor", components, shape)
+    def __array_finalize__(self, source: np.ndarray[Any, Any] | None) -> None:
+        del source
+
+    @classmethod
+    def _shape_and_values(cls, current: Any) -> tuple[tuple[int, ...], tuple[Any, ...]]:
+        if isinstance(current, np.ndarray):
+            if current.ndim == 0:
+                return (), (current[()],)
+            return current.shape, tuple(current.reshape(-1))
+        if not isinstance(current, (list, builtins.tuple)):
+            return (), (current,)
+        if not current:
+            raise TypeError(f"{cls.__name__} requires a non-empty rectangular sequence")
+        children = tuple(cls._shape_and_values(value) for value in current)
+        child_shape = children[0][0]
+        if any(shape != child_shape for shape, _ in children[1:]):
+            raise TypeError(f"{cls.__name__} requires a non-empty rectangular sequence")
+        return (len(current), *child_shape), tuple(component for _, components in children for component in components)
+
+    @classmethod
+    def _from_components(cls, components: tuple[Any, ...], shape: tuple[int, ...]) -> Self:
+        return _host_tensor(cls.__name__, components, shape).view(cls)
+
+    @classmethod
+    def _result(cls, value: Any) -> Self:
+        result = np.asarray(value).view(cls)
+        result.setflags(write=False)
+        return result
+
+    def __getitem__(self, index: Any) -> Any:
+        return super().__getitem__(index)
+
+    def __add__(self, other: Any) -> Any:
+        return self._result(np.asarray(self) + other)
+
+    def __radd__(self, other: Any) -> Any:
+        return self._result(other + np.asarray(self))
+
+    def __sub__(self, other: Any) -> Any:
+        return self._result(np.asarray(self) - other)
+
+    def __rsub__(self, other: Any) -> Any:
+        return self._result(other - np.asarray(self))
+
+    def __mul__(self, other: Any) -> Any:
+        return self._result(np.asarray(self) * other)
+
+    def __rmul__(self, other: Any) -> Any:
+        return self._result(other * np.asarray(self))
+
+    def __truediv__(self, other: Any) -> Any:
+        return self._result(np.asarray(self) / other)
+
+    def __neg__(self) -> Any:
+        return self._result(-np.asarray(self))
 
 
-class Vector:
+class Vector(Tensor):
     """Construct an immutable rank-one host value from an iterable."""
 
-    @classmethod
-    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
-        if not isinstance(arguments, tuple):
-            arguments = (arguments,)
-        return TypeExpr("Vector", arguments)
-
-    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+    def __new__(cls, values: Any) -> Vector:
         components = tuple(values)
         size = sum(np.asarray(component).size for component in components)
-        return _host_tensor("Vector", components, (size,))
+        return cls._from_components(components, (size,))
+
+    @property
+    def x(self) -> Any:
+        return self[0]
+
+    @property
+    def y(self) -> Any:
+        return self[1]
+
+    @property
+    def z(self) -> Any:
+        return self[2]
+
+    @property
+    def w(self) -> Any:
+        return self[3]
+
+    @property
+    def xy(self) -> Vector:
+        return self._result(self[:2])
+
+    @property
+    def xyz(self) -> Vector:
+        return self._result(self[:3])
+
+    @property
+    def xyzw(self) -> Vector:
+        return self._result(self[:4])
 
 
-class Matrix:
+class Matrix(Tensor):
     """Construct an immutable rank-two host value from nested iterables."""
 
-    @classmethod
-    def __class_getitem__(cls, arguments: Any) -> TypeExpr:
-        if not isinstance(arguments, tuple):
-            arguments = (arguments,)
-        return TypeExpr("Matrix", arguments)
-
-    def __new__(cls, values: Any) -> np.ndarray[Any, Any]:
+    def __new__(cls, values: Any) -> Matrix:
         rows = tuple(tuple(row) for row in values)
         if not rows or not rows[0] or any(len(row) != len(rows[0]) for row in rows):
             raise TypeError("Matrix requires a non-empty rectangular sequence")
-        return _host_tensor("Matrix", tuple(value for row in rows for value in row), (len(rows), len(rows[0])))
+        return cls._from_components(
+            tuple(value for row in rows for value in row),
+            (len(rows), len(rows[0])),
+        )
 
 
-@dataclass(frozen=True)
-class _Scalar:
+class _Scalar(type):
     name: str
 
-    def __call__(self, value: Any) -> Any:
-        dtypes = {
-            "bool": np.bool_,
-            "i32": np.int32,
-            "u32": np.uint32,
-            "f16": np.float16,
-            "f32": np.float32,
-            "f64": np.float64,
-        }
-        return dtypes[self.name](value)
+    def __new__(
+        cls,
+        class_name: str,
+        bases: tuple[type[Any], ...] = (),
+        namespace: dict[str, Any] | None = None,
+    ) -> _Scalar:
+        resolved_namespace = {"name": class_name} if namespace is None else namespace
+        return super().__new__(cls, class_name, bases, resolved_namespace)
+
+    def __init__(
+        cls,
+        class_name: str,
+        bases: tuple[type[Any], ...] = (),
+        namespace: dict[str, Any] | None = None,
+    ) -> None:
+        resolved_namespace = {"name": class_name} if namespace is None else namespace
+        super().__init__(class_name, bases, resolved_namespace)
+
+    def __call__(cls, value: Any) -> Any:
+        return NUMPY_DTYPE_BY_SCALAR[cls.name].type(value)
 
 
-bool = _Scalar("bool")
-i32 = _Scalar("i32")
-u32 = _Scalar("u32")
-f16 = _Scalar("f16")
-f32 = _Scalar("f32")
-f64 = _Scalar("f64")
+class bool(np.bool_, metaclass=_Scalar):
+    name = "bool"
+
+
+class i32(np.int32, metaclass=_Scalar):
+    name = "i32"
+
+
+class u32(np.uint32, metaclass=_Scalar):
+    name = "u32"
+
+
+class f16(np.float16, metaclass=_Scalar):
+    name = "f16"
+
+
+class f32(np.float32, metaclass=_Scalar):
+    name = "f32"
+
+
+class f64(np.float64, metaclass=_Scalar):
+    name = "f64"
+
+
 Sampler = TypeExpr("Sampler")
 
 

@@ -53,8 +53,12 @@ def cube_map_fragment(
     return CubeMapFragmentOutput(color, bloom_color)
 
 
-cube_map_asset = vd.pipeline_asset(
+cube_map_asset = vd.program_asset(
     id="pipelines/cube_map",
-    program=(cube_map_vertex, cube_map_fragment),
+    program=vd.pipeline(
+        cube_map_vertex,
+        cube_map_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm, 1: vd.rgba8_unorm}),
+    ),
     variants=((),),
 )

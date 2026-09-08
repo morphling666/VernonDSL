@@ -9,6 +9,8 @@ from typing import Annotated
 
 import vernon_dsl as vd
 
+from .fullscreen import fullscreen_vertex
+
 
 @vd.struct
 class DistanceEstimate:
@@ -198,3 +200,14 @@ def mandelbulb_fragment(
         ]
     )
     return vd.Vector([gamma, 1.0])
+
+
+mandelbulb_asset = vd.program_asset(
+    id="examples/external_engine/mandelbulb",
+    program=vd.pipeline(
+        fullscreen_vertex,
+        mandelbulb_fragment,
+        targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+    ),
+    variants=((),),
+)

@@ -218,7 +218,7 @@ def main() -> None:
 
     color = vd.Texture.zeros(shape=(args.size, args.size))
     object_id = vd.Texture.zeros(shape=(args.size, args.size))
-    target = vd.RenderTarget(shape=color.shape).attach_color(0, color).attach_color(1, object_id)
+    target = vd.RenderTarget.from_attachments(colors={0: color, 1: object_id})
     frame = 0
     color_image: np.ndarray | None = None
     id_image: np.ndarray | None = None
@@ -238,9 +238,17 @@ def main() -> None:
                 position=positions,
                 offset=offsets,
                 tint=tint_bindings[binding_index],
-                indices=index_bindings[binding_index],
-                topology=vd.triangles,
-                target=target,
+                draw=vd.draw(
+                    index_buffer=vd.index_buffer(index_bindings[binding_index]),
+                    instance_count=args.instances,
+                ),
+                render_pass=vd.render_pass(
+                    target,
+                    colors={
+                        0: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                        1: vd.clear((0.0, 0.0, 0.0, 0.0)),
+                    },
+                ),
             )
 
             color_rgba = color.to_numpy()

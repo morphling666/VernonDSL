@@ -9,7 +9,9 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <limits>
 #include <optional>
+#include <set>
 #include <utility>
 
 namespace vernon::compiler {
@@ -72,6 +74,51 @@ llvm::StringRef artifactFormat(llvm::StringRef filename) {
     return "unknown";
 }
 
+bool validatePortableComputeSlots(const llvm::json::Object &root, std::string &diagnostics) {
+    const llvm::json::Array *entries = root.getArray("entries");
+    if (!entries)
+        return true;
+    for (const llvm::json::Value &entryValue : *entries) {
+        const llvm::json::Object *entry = entryValue.getAsObject();
+        if (!entry || entry->getString("stage") != "compute")
+            continue;
+        const llvm::json::Array *arguments = entry->getArray("arguments");
+        if (!arguments)
+            continue;
+        std::set<uint64_t> slots;
+        for (const llvm::json::Value &argumentValue : *arguments) {
+            const llvm::json::Object *argument = argumentValue.getAsObject();
+            if (!argument)
+                continue;
+            if (std::optional<int64_t> binding = argument->getInteger("vernon.binding"); binding && *binding >= 0)
+                slots.insert(static_cast<uint64_t>(*binding));
+            if (const llvm::json::Array *leaves = argument->getArray("storage_leaves"))
+                for (const llvm::json::Value &leafValue : *leaves)
+                    if (const llvm::json::Object *leaf = leafValue.getAsObject())
+                        if (std::optional<int64_t> binding = leaf->getInteger("binding"); binding && *binding >= 0)
+                            slots.insert(static_cast<uint64_t>(*binding));
+            if (const llvm::json::Object *descriptor = argument->getObject("tensor_view_descriptor")) {
+                if (std::optional<int64_t> binding = descriptor->getInteger("offset_binding"); binding && *binding >= 0)
+                    slots.insert(static_cast<uint64_t>(*binding));
+                for (llvm::StringRef field : {"extent_bindings", "stride_bindings"}) {
+                    if (const llvm::json::Array *bindings = descriptor->getArray(field))
+                        for (const llvm::json::Value &value : *bindings)
+                            if (std::optional<int64_t> binding = value.getAsInteger(); binding && *binding >= 0)
+                                slots.insert(static_cast<uint64_t>(*binding));
+                }
+            }
+        }
+        uint64_t expected = 0;
+        for (uint64_t slot : slots) {
+            if (slot != expected++) {
+                diagnostics = "compute interface does not implement contiguous portable ABI slots";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 bool addArtifactTable(std::string &reflection, std::string &diagnostics, const std::vector<Artifact> &artifacts,
@@ -87,10 +134,12 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
         diagnostics = "compiler reflection root must be a JSON object";
         return false;
     }
+    if (!validatePortableComputeSlots(*root, diagnostics))
+        return false;
 
     const VernonTarget target = compileTargetKind(compileOptions);
     (*root)["compiler_contract_version"] = int64_t{VERNON_COMPILER_CONTRACT_VERSION};
-    (*root)["pipeline_version"] = int64_t{VERNON_PIPELINE_VERSION};
+    (*root)["program_version"] = int64_t{VERNON_PROGRAM_VERSION};
     llvm::json::Object options;
     llvm::json::Object output;
     if (const auto *cpu = std::get_if<CpuCodegenOptions>(&compileOptions)) {
@@ -155,6 +204,7 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
         }
     }
     (*root)["artifacts"] = std::move(table);
+    llvm::json::Object implementationMetadata;
     if (target == VERNON_TARGET_METAL) {
         llvm::json::Array slots;
         for (const TargetResourceSlot &slot : targetResourceSlots) {
@@ -171,8 +221,10 @@ bool addArtifactTable(std::string &reflection, std::string &diagnostics, const s
             row["count"] = static_cast<int64_t>(slot.count);
             slots.emplace_back(std::move(row));
         }
-        (*root)["metal_resource_slots"] = std::move(slots);
+        implementationMetadata["resource_slots"] = std::move(slots);
     }
+    (*root)["implementation"] =
+        llvm::json::Object{{"target", targetName(target).str()}, {"metadata", std::move(implementationMetadata)}};
 
     reflection.clear();
     llvm::raw_string_ostream stream(reflection);

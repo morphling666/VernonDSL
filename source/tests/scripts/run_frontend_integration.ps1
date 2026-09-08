@@ -24,11 +24,11 @@ $env:PYTHONPATH = Join-Path $ProjectRoot "python"
 
 Push-Location $ProjectRoot
 try {
-  $versions = & uv run --frozen python -c "from vernon_dsl._versions import *; print(f'{COMPILER_CONTRACT_VERSION},{PIPELINE_VERSION}')"
+  $versions = & uv run --frozen python -c "from vernon_dsl._versions import *; print(f'{COMPILER_CONTRACT_VERSION},{PROGRAM_VERSION}')"
   if ($LASTEXITCODE -ne 0) {
     throw "Reading Python frontend versions failed"
   }
-  $compilerContractVersion, $pipelineVersion = $versions.Trim().Split(",")
+  $compilerContractVersion, $programVersion = $versions.Trim().Split(",")
 
   & uv run --frozen python -m vernon_dsl.cli $inputPath -o $outputPath
   if ($LASTEXITCODE -ne 0) {
@@ -96,7 +96,7 @@ try {
   $openGlReflection = Get-Content (Join-Path $openGlOutput "reflection.json") -Raw |
     ConvertFrom-Json
   if ($openGlReflection.compiler_contract_version -ne [int]$compilerContractVersion -or
-      $openGlReflection.pipeline_version -ne [int]$pipelineVersion -or
+      $openGlReflection.program_version -ne [int]$programVersion -or
       $openGlReflection.target.kind -ne "opengl" -or
       $openGlReflection.target.options.version -ne 330 -or
       $openGlReflection.artifacts.Count -ne 2 -or

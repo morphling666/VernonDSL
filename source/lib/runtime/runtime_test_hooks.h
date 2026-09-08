@@ -38,9 +38,9 @@ struct DirectX12DepthStencilStateStats {
 };
 
 VERNON_RUNTIME_CAPI VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
-                                                                         const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline);
-VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline);
+                                                                         const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI uint32_t getDirectX12LastStencilReference(const VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI DirectX12DepthStencilStateStats
 getDirectX12DepthStencilStateStats(const VernonRuntimeContext *context);

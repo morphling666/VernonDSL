@@ -1,6 +1,7 @@
 #include "VernonRHI.h"
 #include "rhi/rhi_internal.h"
 #include "rhi/vulkan_backend.h"
+#include "runtime_rhi_test_utils.h"
 #include "vernon_test_support.h"
 
 #include <gtest/gtest.h>
@@ -109,7 +110,12 @@ TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
     VernonRhiImage image{};
     ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
     float depth{};
-    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
+    VernonRhiImageDownloadDescriptor download{};
+    download.struct_size = sizeof(download);
+    download.width = download.height = download.depth = 1;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, &depth, sizeof(depth)), VERNON_RHI_STATUS_OK)
         << vernon::test::text(vernonRhiDeviceGetLastError(device));
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
@@ -151,10 +157,10 @@ TEST(VulkanOwnedDevice, TransitionsPackedDepthStencilImageWithBothAspects) {
     barrier.new_state = VERNON_RHI_STATE_DEPTH_STENCIL_ATTACHMENT;
     barrier.image = image;
     barrier.is_image = 1;
+    barrier.image_subresources = {0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_DEPTH};
     EXPECT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceSubmit(device, encoder), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernon::tests::completeSubmission(device, encoder), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 }
@@ -195,7 +201,9 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     deviceDescriptor.physical_device = owner.physicalDevice;
     deviceDescriptor.device = owner.device;
     deviceDescriptor.queue = owner.queue;
-    deviceDescriptor.command_buffer = owner.frame.command;
+    ASSERT_FALSE(owner.availableCommandFrames.empty());
+    const VkCommandBuffer borrowedCommand = owner.availableCommandFrames.front().command;
+    deviceDescriptor.command_buffer = borrowedCommand;
     deviceDescriptor.queue_family_index = owner.queueFamily;
     deviceDescriptor.queue_capabilities = VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
     const VernonRhiDevice device = vernonRhiCreateBorrowedVulkanDevice(&deviceDescriptor);
@@ -233,9 +241,11 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     imageViewDescriptor.image_view = handleBits(image.view);
     imageViewDescriptor.descriptor.struct_size = sizeof(imageViewDescriptor.descriptor);
     imageViewDescriptor.descriptor.image = importedImage;
+    imageViewDescriptor.descriptor.dimension = VERNON_RHI_IMAGE_2D;
     imageViewDescriptor.descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
     imageViewDescriptor.descriptor.mip_level_count = 1;
     imageViewDescriptor.descriptor.array_layer_count = 1;
+    imageViewDescriptor.descriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView importedImageView{};
     ASSERT_EQ(vernonRhiVulkanDeviceImportBorrowedImageView(device, &imageViewDescriptor, &importedImageView),
               VERNON_RHI_STATUS_OK);
@@ -244,7 +254,7 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     EXPECT_EQ(vernonRhiVulkanDeviceGetBorrowedQueue(device, &native), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(native, owner.queue);
     EXPECT_EQ(vernonRhiVulkanDeviceGetBorrowedCommandBuffer(device, &native), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(native, owner.frame.command);
+    EXPECT_EQ(native, borrowedCommand);
     uint64_t nativeBits = 0;
     EXPECT_EQ(vernonRhiVulkanDeviceGetBufferNativeHandle(device, importedBuffer, &nativeBits), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(nativeBits, handleBits(buffer.buffer));
@@ -253,9 +263,23 @@ TEST(VulkanNativeInterop, BorrowsObjectsWithoutOwningTheirLifetime) {
     EXPECT_EQ(vernonRhiDeviceGetImageViewNativeHandle(device, importedImageView, &nativeBits), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(nativeBits, handleBits(image.view));
 
-    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, importedImageView), VERNON_RHI_STATUS_OK);
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    VernonRhiCommandEncoder encoder{};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletionState completionState{};
+    ASSERT_EQ(vernonRhiCompletionGetState(device, completion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(completionState, VERNON_RHI_COMPLETION_PENDING);
+    ASSERT_EQ(vernonRhiCompletionSignal(device, completion, VERNON_RHI_STATUS_OK), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, importedImageView), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, importedImage), VERNON_RHI_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, importedBuffer), VERNON_RHI_STATUS_OK);
     vernonRhiDestroyDevice(device);
 

@@ -2,6 +2,7 @@
 #define VERNON_C_COMPILER_H
 
 #include "VernonCommon.h"
+#include "VernonCpuWorkgroupABI.h"
 
 #if defined(_WIN32) && defined(VERNON_DSL_COMPILER_BUILD)
 #define VERNON_DSL_CAPI __declspec(dllexport)
@@ -18,6 +19,17 @@ extern "C" {
 typedef struct VernonCompilerContext VernonCompilerContext;
 typedef struct VernonCompileResult VernonCompileResult;
 
+typedef struct VernonCpuRuntimeHelpersV1 {
+    size_t struct_size;
+    uint64_t (*workgroup_address)(uint64_t, uint64_t, uint64_t, uint64_t);
+    uint64_t (*lane_address)(uint64_t, uint64_t, uint64_t, uint64_t);
+    void (*workgroup_barrier)(uint64_t);
+    bool (*workgroup_is_leader)(void);
+} VernonCpuRuntimeHelpersV1;
+
+VERNON_DSL_CAPI VernonStatus vernonCompilerRegisterCpuRuntimeHelpersV1(VernonCompilerContext *context,
+                                                                       const VernonCpuRuntimeHelpersV1 *helpers);
+
 typedef enum VernonTarget {
     VERNON_TARGET_CPU = 0,
     VERNON_TARGET_OPENGL = 1,
@@ -32,7 +44,8 @@ typedef struct VernonTargetCapabilities {
     uint8_t available;
     uint8_t supports_graphics;
     uint8_t supports_compute;
-    uint8_t reserved;
+    uint8_t supports_device_storage_atomics;
+    uint8_t supports_f32_device_atomic_add;
 } VernonTargetCapabilities;
 
 typedef enum VernonMetalPlatform { VERNON_METAL_PLATFORM_MACOS = 0, VERNON_METAL_PLATFORM_IOS = 1 } VernonMetalPlatform;
@@ -80,6 +93,22 @@ typedef struct VernonCompileOptions {
     VernonTargetCompileOptions as;
 } VernonCompileOptions;
 
+typedef struct VernonCompiledKernel {
+    VernonStringView request_id;
+    VernonStringView stage_id;
+    VernonStringView entry;
+    VernonStringView reflection;
+} VernonCompiledKernel;
+
+/* Graphics image/attachment extents only. Compute TensorView dyn extents are
+ * resolved at bind from the borrowed buffer; do not pass them as shape facts. */
+typedef struct VernonProgramShapeFact {
+    VernonStringView request_id;
+    VernonStringView parameter;
+    const uint64_t *extents;
+    size_t rank;
+} VernonProgramShapeFact;
+
 VERNON_DSL_CAPI VernonCompilerContext *vernonCompilerCreate(void);
 VERNON_DSL_CAPI void vernonCompilerDestroy(VernonCompilerContext *context);
 
@@ -96,12 +125,16 @@ VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlir(VernonCompilerCon
 VERNON_DSL_CAPI VernonCompileResult *vernonCompilerCompileMlirWithOptions(VernonCompilerContext *context,
                                                                           const char *source, size_t source_size,
                                                                           const VernonCompileOptions *options);
-/*
- * Finalizes a host relocatable object into a temporary-loadable native
- * library. The result contains exactly one DLL/so/dylib artifact.
- */
-VERNON_DSL_CAPI VernonCompileResult *vernonCompilerLinkHostObject(VernonCompilerContext *context, const void *object,
-                                                                  size_t object_size);
+VERNON_DSL_CAPI VernonCompileResult *vernonCompilerPlanProgram(VernonCompilerContext *context, const char *program,
+                                                               size_t program_size);
+VERNON_DSL_CAPI VernonCompileResult *vernonCompilerFinalizeProgram(VernonCompilerContext *context, const char *plan,
+                                                                   size_t plan_size,
+                                                                   const VernonCompiledKernel *kernels,
+                                                                   size_t kernel_count);
+VERNON_DSL_CAPI VernonCompileResult *
+vernonCompilerFinalizeProgramWithShapes(VernonCompilerContext *context, const char *plan, size_t plan_size,
+                                        const VernonCompiledKernel *kernels, size_t kernel_count,
+                                        const VernonProgramShapeFact *shape_facts, size_t shape_fact_count);
 
 VERNON_DSL_CAPI void vernonCompileResultDestroy(VernonCompileResult *result);
 VERNON_DSL_CAPI VernonStatus vernonCompileResultGetStatus(const VernonCompileResult *result);

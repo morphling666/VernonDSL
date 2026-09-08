@@ -1,6 +1,9 @@
+#include "VernonExecutionGraph.h"
 #include "VernonRuntimeRHIAdapter.h"
 
 #include <gtest/gtest.h>
+
+#include <array>
 
 namespace {
 
@@ -11,6 +14,105 @@ struct BackendCase {
 };
 
 class RhiResourceLifetime : public testing::TestWithParam<BackendCase> {};
+
+TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
+    const BackendCase test = GetParam();
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 32;
+    bufferDescriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer buffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &buffer), VERNON_RHI_STATUS_OK);
+
+    std::array<uint8_t, 32> contents{};
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 3> first{1, 2, 3};
+    const std::array<uint8_t, 4> second{4, 5, 6, 7};
+    const std::array<VernonRhiBufferUploadRange, 2> valid{
+        VernonRhiBufferUploadRange{4, first.data(), first.size()},
+        VernonRhiBufferUploadRange{20, second.data(), second.size()},
+    };
+    ASSERT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, valid.data(), valid.size()), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    const std::array<uint8_t, 3> actualFirst{contents[4], contents[5], contents[6]};
+    const std::array<uint8_t, 4> actualSecond{contents[20], contents[21], contents[22], contents[23]};
+    EXPECT_EQ(actualFirst, first);
+    EXPECT_EQ(actualSecond, second);
+    std::array<uint8_t, 3> partialDownload{};
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 4, partialDownload.data(), partialDownload.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(partialDownload, first);
+
+    const std::array<uint8_t, 2> rejected{9, 9};
+    const std::array<VernonRhiBufferUploadRange, 2> invalid{
+        VernonRhiBufferUploadRange{0, rejected.data(), rejected.size()},
+        VernonRhiBufferUploadRange{31, rejected.data(), rejected.size()},
+    };
+    EXPECT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, invalid.data(), invalid.size()),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(contents[0], 0);
+    EXPECT_EQ(contents[1], 0);
+    EXPECT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, nullptr, 0), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuffers) {
+    const BackendCase test = GetParam();
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_STORAGE;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+
+    VernonRhiBuffer imported{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &imported), VERNON_RHI_STATUS_OK);
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        const vernon::execution::GraphBuffer first = graph.importBuffer(imported);
+        const vernon::execution::GraphBuffer second = graph.importBuffer(imported);
+        EXPECT_EQ(first.id, second.id);
+    }
+    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, imported), 1u);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, imported), VERNON_RHI_STATUS_OK);
+
+    VernonRhiBuffer owned{};
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        vernon::execution::GraphBuffer graphBuffer;
+        ASSERT_EQ(graph.createBuffer(bufferDescriptor, graphBuffer), VERNON_RHI_STATUS_OK);
+        owned = graphBuffer.handle;
+        const vernon::execution::GraphBuffer duplicate = graph.importBuffer(owned);
+        EXPECT_EQ(graphBuffer.id, duplicate.id);
+        EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 1u);
+    }
+    EXPECT_EQ(vernonRhiDeviceIsBufferValid(device, owned), 0u);
+
+    VernonRhiBuffer recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, owned.index);
+    EXPECT_NE(recycled.generation, owned.generation);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
 
 TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
     const BackendCase test = GetParam();
@@ -156,11 +258,134 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
     vernonRhiDestroyDevice(device);
 }
 
+TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
+    const BackendCase test = GetParam();
+    if (!test.supportsImages)
+        GTEST_SKIP() << test.name << " does not expose images";
+
+    VernonRhiOwnedDeviceDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&descriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, test.backend);
+    ASSERT_NE(adapter, nullptr);
+    const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = imageDescriptor.height = 4;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 2;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    viewDescriptor.base_mip_level = 1;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+    VernonRuntimeProviderResourceReference reference{};
+    ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &reference), VERNON_STATUS_OK);
+    ASSERT_EQ(provider->retain_resource(provider->user_data, reference), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+
+    VernonRuntimeProviderImageDescription description{};
+    description.struct_size = sizeof(description);
+    ASSERT_EQ(provider->describe_image(provider->user_data, reference, &description), VERNON_STATUS_OK);
+    EXPECT_NE(description.parent_identity, 0u);
+    EXPECT_EQ(description.view.subresources.base_mip_level, 1u);
+    EXPECT_EQ(description.view.subresources.mip_level_count, 1u);
+
+    VernonRhiImage replacement{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_NE(replacement.index, image.index);
+    provider->release_resource(provider->user_data, reference);
+    VernonRhiImage recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, image.index);
+    EXPECT_NE(recycled.generation, image.generation);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRuntimeRhiAdapterDestroy(adapter);
+    vernonRhiDestroyDevice(device);
+}
+
+TEST_P(RhiResourceLifetime, ExecutionGraphRetainsImportedImageViewAndParent) {
+    const BackendCase test = GetParam();
+    if (!test.supportsImages)
+        GTEST_SKIP() << test.name << " does not expose images";
+
+    VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
+    deviceDescriptor.struct_size = sizeof(deviceDescriptor);
+    deviceDescriptor.backend = test.backend;
+    const VernonRhiDevice device = vernonRhiCreateDevice(&deviceDescriptor);
+    if (device.index == VERNON_RHI_INVALID_HANDLE_INDEX)
+        GTEST_SKIP() << test.name << " is unavailable";
+
+    VernonRhiImageDescriptor imageDescriptor{};
+    imageDescriptor.struct_size = sizeof(imageDescriptor);
+    imageDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    imageDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    imageDescriptor.width = imageDescriptor.height = 4;
+    imageDescriptor.depth = 1;
+    imageDescriptor.mip_levels = 1;
+    imageDescriptor.array_layers = 1;
+    imageDescriptor.sample_count = 1;
+    imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
+    VernonRhiImage image{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &image), VERNON_RHI_STATUS_OK);
+
+    VernonRhiImageViewDescriptor viewDescriptor{};
+    viewDescriptor.struct_size = sizeof(viewDescriptor);
+    viewDescriptor.image = image;
+    viewDescriptor.dimension = VERNON_RHI_IMAGE_2D;
+    viewDescriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
+    viewDescriptor.mip_level_count = 1;
+    viewDescriptor.array_layer_count = 1;
+    viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
+    VernonRhiImageView view{};
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
+
+    VernonRhiImage replacement{};
+    {
+        vernon::execution::ExecutionGraph graph(device);
+        const vernon::execution::GraphImage imported = graph.importImage(image, view);
+        ASSERT_NE(imported.id, UINT32_MAX);
+        ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &replacement), VERNON_RHI_STATUS_OK);
+        EXPECT_NE(replacement.index, image.index);
+    }
+
+    VernonRhiImage recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateImage(device, &imageDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, image.index);
+    EXPECT_NE(recycled.generation, image.generation);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, replacement), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
+}
+
 INSTANTIATE_TEST_SUITE_P(GpuBackends, RhiResourceLifetime,
                          testing::Values(BackendCase{VERNON_RHI_BACKEND_CUDA, "CUDA", false},
                                          BackendCase{VERNON_RHI_BACKEND_VULKAN, "Vulkan", true},
                                          BackendCase{VERNON_RHI_BACKEND_DIRECTX12, "DirectX12", true},
-                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true}),
+                                         BackendCase{VERNON_RHI_BACKEND_METAL, "Metal", true},
+                                         BackendCase{VERNON_RHI_BACKEND_OPENGL, "OpenGL", true}),
                          [](const testing::TestParamInfo<BackendCase> &info) { return info.param.name; });
 
 } // namespace

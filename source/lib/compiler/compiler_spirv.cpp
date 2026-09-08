@@ -1,15 +1,19 @@
 #include "compiler_spirv.h"
 
+#include "VernonProgramCapabilities.h"
+#include "compiler_dispatch.h"
 #include "compiler_frontend.h"
+#include "compiler_reflection.h"
 
-#include "mlir/Conversion/MathToSPIRV/MathToSPIRVPass.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/SCF/Transforms/Passes.h"
 #include "mlir/Dialect/SPIRV/IR/SPIRVOps.h"
 #include "mlir/Dialect/SPIRV/IR/TargetAndABI.h"
 #include "mlir/Dialect/SPIRV/Transforms/Passes.h"
-#include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerSynchronization.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
@@ -173,55 +177,75 @@ bool materializeImageQuerySizeLod(llvm::SmallVectorImpl<uint32_t> &words, size_t
 namespace vernon::compiler {
 namespace {
 
-bool containsF16(mlir::Type type) {
-    if (type.isF16())
-        return true;
-    if (auto shaped = mlir::dyn_cast<mlir::ShapedType>(type))
-        return containsF16(shaped.getElementType());
-    if (auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(type))
-        return containsF16(view.getElementType());
-    if (auto function = mlir::dyn_cast<mlir::FunctionType>(type))
-        return llvm::any_of(function.getInputs(), containsF16) || llvm::any_of(function.getResults(), containsF16);
-    return false;
+mlir::spirv::TargetEnvAttr targetEnv(mlir::MLIRContext *context, bool requireF32AtomicAdd) {
+    llvm::SmallVector<mlir::spirv::Capability> capabilities{mlir::spirv::Capability::Shader};
+    llvm::SmallVector<mlir::spirv::Extension> extensions;
+    if (requireF32AtomicAdd) {
+        capabilities.push_back(mlir::spirv::Capability::AtomicFloat32AddEXT);
+        extensions.push_back(mlir::spirv::Extension::SPV_EXT_shader_atomic_float_add);
+    }
+    auto triple = mlir::spirv::VerCapExtAttr::get(mlir::spirv::Version::V_1_3, capabilities, extensions, context);
+    return mlir::spirv::TargetEnvAttr::get(
+        triple, mlir::spirv::getDefaultResourceLimits(context), mlir::spirv::ClientAPI::Vulkan,
+        mlir::spirv::Vendor::Unknown, mlir::spirv::DeviceType::Unknown, mlir::spirv::TargetEnvAttr::kUnknownDeviceID);
 }
 
-bool moduleUsesF16(mlir::ModuleOp module) {
-    bool usesF16 = false;
-    module.walk([&](mlir::Operation *operation) {
-        usesF16 = usesF16 || llvm::any_of(operation->getOperandTypes(), containsF16) ||
-                  llvm::any_of(operation->getResultTypes(), containsF16);
-        for (mlir::Region &region : operation->getRegions())
-            for (mlir::Block &block : region)
-                usesF16 = usesF16 || llvm::any_of(block.getArgumentTypes(), containsF16);
-        return usesF16 ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
-    });
-    return usesF16;
-}
+struct AttachGpuSpirvTargetPass
+    : public mlir::PassWrapper<AttachGpuSpirvTargetPass, mlir::OperationPass<mlir::gpu::GPUModuleOp>> {
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AttachGpuSpirvTargetPass)
+
+    explicit AttachGpuSpirvTargetPass(bool requireF32AtomicAdd) : requireF32AtomicAdd(requireF32AtomicAdd) {}
+    AttachGpuSpirvTargetPass(const AttachGpuSpirvTargetPass &other)
+        : PassWrapper(other), requireF32AtomicAdd(other.requireF32AtomicAdd) {}
+
+    void runOnOperation() override {
+        getOperation()->setAttr(mlir::spirv::getTargetEnvAttrName(), targetEnv(&getContext(), requireF32AtomicAdd));
+    }
+
+    bool requireF32AtomicAdd{};
+};
 
 struct AttachSpirvTargetPass
     : public mlir::PassWrapper<AttachSpirvTargetPass, mlir::OperationPass<mlir::spirv::ModuleOp>> {
     MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AttachSpirvTargetPass)
 
+    explicit AttachSpirvTargetPass(bool requireF32AtomicAdd) : requireF32AtomicAdd(requireF32AtomicAdd) {}
+    AttachSpirvTargetPass(const AttachSpirvTargetPass &other)
+        : PassWrapper(other), requireF32AtomicAdd(other.requireF32AtomicAdd) {}
+
     void runOnOperation() override {
         mlir::spirv::ModuleOp module = getOperation();
-        auto triple = mlir::spirv::VerCapExtAttr::get(mlir::spirv::Version::V_1_3, {mlir::spirv::Capability::Shader},
-                                                      llvm::ArrayRef<mlir::spirv::Extension>(), module.getContext());
-        module->setAttr(mlir::spirv::getTargetEnvAttrName(),
-                        mlir::spirv::TargetEnvAttr::get(
-                            triple, mlir::spirv::getDefaultResourceLimits(module.getContext()),
-                            mlir::spirv::ClientAPI::Vulkan, mlir::spirv::Vendor::Unknown,
-                            mlir::spirv::DeviceType::Unknown, mlir::spirv::TargetEnvAttr::kUnknownDeviceID));
+        module->setAttr(mlir::spirv::getTargetEnvAttrName(), targetEnv(module.getContext(), requireF32AtomicAdd));
     }
+
+    bool requireF32AtomicAdd{};
 };
 
 } // namespace
 
-bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Artifact> &artifacts,
-                  std::string &diagnostics) {
+bool compileSpirv(PreparedModule &prepared, const TargetProfile &profile, std::vector<Artifact> &artifacts,
+                  std::string &reflection, std::string &diagnostics) {
     mlir::MLIRContext &context = prepared.context();
+    const VernonTarget target = profile.target;
     mlir::ScopedDiagnosticHandler handler(
         &context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
-    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+    mlir::FailureOr<TargetPreparationResult> preparedTarget =
+        prepareTargetModule(prepared, preparePortableTargetModule);
+    if (mlir::failed(preparedTarget))
+        return false;
+    mlir::OwningOpRef<mlir::ModuleOp> module = std::move(preparedTarget->module);
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addPass(mlir::vernon::createVernonLowerAccumulationPass(profile.accumulation));
+        passManager.addPass(mlir::vernon::createVernonVerifyGeneratedAccumulationPass(profile.accumulation));
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
+    mlir::FailureOr<std::string> targetReflection =
+        buildReflection(*module, prepared.logicalReflection(), preparedTarget->entries, preparedTarget->provenance);
+    if (mlir::failed(targetReflection))
+        return false;
+    reflection = std::move(*targetReflection);
     bool requiresRuntimeContractViolation = false;
     module->walk([&](mlir::cf::AssertOp) { requiresRuntimeContractViolation = true; });
     if (requiresRuntimeContractViolation) {
@@ -229,23 +253,38 @@ bool compileSpirv(PreparedModule &prepared, VernonTarget target, std::vector<Art
                       "runtime contract violation for step=0";
         return false;
     }
-    if (target == VERNON_TARGET_VULKAN && moduleUsesF16(module.get())) {
-        diagnostics = "Vulkan target does not support f16 until shaderFloat16 and 16-bit storage features are enabled";
+    if (moduleUsesF16(module.get())) {
+        const program_capabilities::Entry &capability = program_capabilities::get(program_capabilities::Id::GpuF16);
+        diagnostics = std::string(capability.diagnosticCode) + ": " + std::string(capability.diagnostic);
         return false;
     }
 
-    mlir::PassManager passManager(&context);
-    passManager.addPass(mlir::vernon::createVernonToGPUPass(true));
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerSynchronizationPass(true, true));
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
-    passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::createConvertMathToSPIRVPass());
-    passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
-    passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));
-    passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
-    passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>());
-    passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVUpdateVCEPass());
-    if (mlir::failed(passManager.run(*module)))
-        return false;
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addNestedPass<mlir::func::FuncOp>(mlir::createForToWhileLoopPass());
+        passManager.addPass(mlir::vernon::createVernonToGPUPass(true, true));
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
+    bool requireF32AtomicAdd = false;
+    module->walk([&](mlir::Operation *operation) {
+        auto implementation = operation->getAttrOfType<mlir::StringAttr>(mlir::vernon::kAtomicImplementationAttrName);
+        requireF32AtomicAdd |= implementation && implementation.getValue() == mlir::vernon::kNativeAtomicImplementation;
+    });
+    {
+        mlir::PassManager passManager(&context);
+        passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUSynchronizationPass(true));
+        passManager.addNestedPass<mlir::gpu::GPUModuleOp>(
+            std::make_unique<AttachGpuSpirvTargetPass>(requireF32AtomicAdd));
+        passManager.addNestedPass<mlir::gpu::GPUModuleOp>(mlir::vernon::createVernonLowerGPUTensorsPass(true));
+        passManager.addPass(mlir::vernon::createVernonConvertGPUToSPIRVPass());
+        passManager.addPass(mlir::vernon::createVernonToSPIRVPass(target == VERNON_TARGET_VULKAN));
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVLowerABIAttributesPass());
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(std::make_unique<AttachSpirvTargetPass>(requireF32AtomicAdd));
+        passManager.addNestedPass<mlir::spirv::ModuleOp>(mlir::spirv::createSPIRVUpdateVCEPass());
+        if (mlir::failed(passManager.run(*module)))
+            return false;
+    }
 
     llvm::SmallVector<mlir::spirv::ModuleOp> spirvModules;
     module->walk([&](mlir::spirv::ModuleOp spirvModule) { spirvModules.push_back(spirvModule); });

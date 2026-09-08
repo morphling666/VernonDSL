@@ -35,6 +35,7 @@ namespace mlir::vernon {
 inline constexpr llvm::StringLiteral kEntryAttrName = "vernon.entry";
 inline constexpr llvm::StringLiteral kStageAttrName = "vernon.stage";
 inline constexpr llvm::StringLiteral kWorkgroupSizeAttrName = "vernon.workgroup_size";
+inline constexpr llvm::StringLiteral kDispatchContractAttrName = "vernon.dispatch_contract";
 inline constexpr llvm::StringLiteral kInterfaceAttrName = "vernon.interface";
 inline constexpr llvm::StringLiteral kLocationAttrName = "vernon.location";
 inline constexpr llvm::StringLiteral kBuiltinAttrName = "vernon.builtin";

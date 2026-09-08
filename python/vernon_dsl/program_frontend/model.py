@@ -1,0 +1,78 @@
+"""Immutable program-level IR, separate from kernel function IR."""
+
+from __future__ import annotations
+
+import hashlib
+from dataclasses import dataclass
+
+from ..frontend.model import ConcreteType
+
+
+@dataclass(frozen=True)
+class ProgramType:
+    logical: ConcreteType
+
+
+@dataclass(frozen=True)
+class MlirValue:
+    name: str
+    type: ProgramType
+    role: str
+    primal: int
+
+
+@dataclass(frozen=True)
+class MlirOperation:
+    id: int
+    kind: str
+    name: str
+    operands: tuple[tuple[str, str], ...]
+    results: tuple[tuple[str, str], ...]
+    attributes: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ProgramImplementation:
+    callee: str
+    entry: str
+    kind: str
+    mlir: str
+    host_constants: tuple[tuple[str, int | float | bool], ...] = ()
+    graphics_stages: tuple[tuple[str, str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ParsedProgram:
+    """Compiler inputs derived from one canonical captured OperationGraph."""
+
+    mlir: str
+    implementations: tuple[ProgramImplementation, ...] = ()
+    provenance: tuple[str, ...] = ()
+    vjp_wrt: tuple[str, ...] = ()
+    structs: tuple[tuple[str, tuple[tuple[str, ConcreteType], ...]], ...] = ()
+
+    @property
+    def identity(self) -> str:
+        digest = hashlib.sha256(self.mlir.encode("utf-8"))
+        for implementation in self.implementations:
+            digest.update(implementation.callee.encode("utf-8"))
+            digest.update(implementation.entry.encode("utf-8"))
+            digest.update(implementation.kind.encode("utf-8"))
+            digest.update(implementation.mlir.encode("utf-8"))
+            for name, value in implementation.host_constants:
+                digest.update(name.encode("utf-8"))
+                digest.update(repr(value).encode("utf-8"))
+            for role, entry, mlir in implementation.graphics_stages:
+                digest.update(role.encode("utf-8"))
+                digest.update(entry.encode("utf-8"))
+                digest.update(mlir.encode("utf-8"))
+        return digest.hexdigest()
+
+
+__all__ = [
+    "MlirOperation",
+    "MlirValue",
+    "ParsedProgram",
+    "ProgramImplementation",
+    "ProgramType",
+]

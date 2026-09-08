@@ -21,6 +21,7 @@ from .lowering_types import DslType, FunctionSignature, ModuleContext, Value, el
 from .model import (
     AccessMode,
     ConcreteType,
+    InterfaceMetadata,
     StorageEffect,
     StorageOwnerKind,
     StorageRegionKind,
@@ -32,10 +33,11 @@ from .numeric_lowering import lower_binary, lower_compare, lower_constant, lower
 from .resource_lowering import lower_texture_sample, lower_texture_size
 from .storage_lowering import (
     lower_buffer_index,
+    lower_shape_attribute,
     lower_storage_store,
     lower_tensor_view_indices,
 )
-from .type_parser import AnnotatedType, Metadata
+from .type_parser import AnnotatedType
 from .type_solver import can_convert
 
 _SWIZZLES = set("xyzwrgba")
@@ -58,6 +60,7 @@ class _FunctionEmitter:
         typed_function: TypedFunctionInstance,
         stage: str | None,
         workgroup_size: tuple[int, int, int] | None,
+        planning_policy: str | None = None,
     ):
         self.context = context
         self.node = typed_function.source
@@ -70,6 +73,7 @@ class _FunctionEmitter:
         self._index_typed_statements(typed_function.body)
         self.stage = stage
         self.workgroup_size = workgroup_size
+        self.planning_policy = planning_policy
         self.lines: list[str] = []
         self.indent = 1
         self.next_value = 0
@@ -160,7 +164,7 @@ class _FunctionEmitter:
                 raise self.context.error(
                     self.node, f"output field '{field_name}' is not a numeric shader interface value: {error}"
                 ) from None
-            metadata = (*annotation.metadata, Metadata("attribute", (next_location, 0)))
+            metadata = (*annotation.metadata, InterfaceMetadata("attribute", (next_location, 0)))
             planned.append((field_name, AnnotatedType(annotation.type, metadata)))
             next_location += span
         return tuple(planned)
@@ -253,13 +257,10 @@ class _FunctionEmitter:
                 assert isinstance(element_type, DslType)
                 if element_type.kind == "scalar":
                     attributes.append(f'vernon.dtype = "{element_type.name}"')
-                attributes.extend(
-                    attribute.replace("vernon.abi_", "vernon.element_abi_")
-                    for attribute in self._abi_attributes(element_type)
-                )
+                attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
             if emit_value_abi_metadata and value_type.kind in {"scalar", "tensor", "tuple", "struct"}:
                 attributes.extend(self._abi_attributes(value_type))
-            if value_type.kind == "tensor_view":
+            if value_type.kind in {"tensor_view", "texture"} and self.stage is not None:
                 has_explicit_binding = any(attribute.startswith("vernon.binding") for attribute in attributes)
                 attributes = [
                     attribute
@@ -306,6 +307,8 @@ class _FunctionEmitter:
         if self.stage:
             function_attributes.append("vernon.entry")
             function_attributes.append(f'vernon.stage = "{self.stage}"')
+            if self.planning_policy is not None:
+                function_attributes.append(f'vernon.ad.planning_policy = "{self.planning_policy}"')
             reflected_effects: list[str] = []
             for effect in self.typed_function.effects:
                 if not isinstance(effect, StorageEffect) or effect.owner.kind is not StorageOwnerKind.PARAMETER:
@@ -317,7 +320,9 @@ class _FunctionEmitter:
                 ]
                 if effect.region.kind is StorageRegionKind.ELEMENT:
                     indices = ", ".join(str(index) for index in effect.region.indices)
-                    fields.append(f"indices = array<i64: {indices}>")
+                    fields.append(f"indices = array<i64: {indices}>" if indices else "indices = array<i64>")
+                if effect.atomic:
+                    fields.append("atomic = true")
                 reflected_effects.append("{" + ", ".join(fields) + "}")
             function_attributes.append(f"vernon.storage_effects = [{', '.join(reflected_effects)}]")
         elif emit_value_abi_metadata:
@@ -350,12 +355,20 @@ class _FunctionEmitter:
         if value_type.kind not in {"scalar", "tensor", "tuple", "struct"}:
             return []
 
+        attributes = [self._abi_leaf_dtypes_attribute(value_type, "vernon.abi_leaf_dtypes")]
+        if value_type.kind == "tensor":
+            element_type = value_type.arguments[0]
+            assert isinstance(element_type, DslType)
+            attributes.append(self._abi_leaf_dtypes_attribute(element_type, "vernon.element_abi_leaf_dtypes"))
+        return attributes
+
+    def _abi_leaf_dtypes_attribute(self, value_type: DslType, attribute: str) -> str:
         def fields(name: str) -> tuple[tuple[str, DslType], ...]:
             return tuple((field_name, annotation.type) for field_name, annotation in self.context.structs[name])
 
         leaves = value_leaves(value_type, fields)
         leaf_dtypes = ", ".join(f'"{leaf.dtype}"' for leaf in leaves)
-        return [f"vernon.abi_leaf_dtypes = [{leaf_dtypes}]"]
+        return f"{attribute} = [{leaf_dtypes}]"
 
     def _append_generated_arguments(self, arguments: list[str]) -> None:
         for sampler_plan in self.interface_plan.implicit_samplers:
@@ -388,8 +401,15 @@ class _FunctionEmitter:
             ]
             if contract.builtin is not None:
                 attributes.append(f'vernon.builtin = "{contract.builtin}"')
-            else:
-                attributes.append('vernon.dtype = "f32"')
+            if value_type.kind == "scalar":
+                attributes.append(f'vernon.dtype = "{value_type.name}"')
+                attributes.append(self._abi_leaf_dtypes_attribute(value_type, "vernon.abi_leaf_dtypes"))
+            elif value_type.kind == "tensor":
+                element_type = value_type.arguments[0]
+                assert isinstance(element_type, DslType)
+                if element_type.kind == "scalar":
+                    attributes.append(f'vernon.dtype = "{element_type.name}"')
+                attributes.extend(self._abi_attributes(value_type))
             arguments.append(f"{value.name}: {value.type.mlir} {{{', '.join(attributes)}}}")
 
     def _line(self, text: str) -> None:
@@ -402,7 +422,7 @@ class _FunctionEmitter:
 
     @staticmethod
     def _metadata_attributes(
-        metadata: Iterable[Metadata],
+        metadata: Iterable[InterfaceMetadata],
         *,
         stage: str | None,
         is_result: bool,
@@ -497,6 +517,7 @@ class _FunctionEmitter:
                     ast.Sub: "sub",
                     ast.Mult: "mul",
                     ast.Div: "div",
+                    ast.FloorDiv: "floordiv",
                     ast.Mod: "mod",
                     ast.Pow: "pow",
                 }.get(type(node.op)),
@@ -821,17 +842,23 @@ class _FunctionEmitter:
             for argument in arguments[1:]:
                 self._require_same_type(node, arguments[0].type, argument.type)
             return self._intrinsic(node, name, arguments, typed_call.type)
-        if name in {"dot", "cross"}:
+        if name == "dot":
             if len(arguments) != 2:
-                raise self.context.error(node, f"{name} requires two vector arguments")
+                raise self.context.error(node, "dot requires two Tensor arguments")
+            self._require_same_type(node, arguments[0].type, arguments[1].type)
+            tensor = arguments[0].type
+            if tensor.kind != "tensor" or len(tensor.arguments) < 2 or not tensor.is_float:
+                raise self.context.error(node, "dot requires equal floating-point Tensors")
+            return self._intrinsic(node, name, arguments, typed_call.type)
+        if name == "cross":
+            if len(arguments) != 2:
+                raise self.context.error(node, "cross requires two vector arguments")
             self._require_same_type(node, arguments[0].type, arguments[1].type)
             vector = arguments[0].type
             if vector.kind != "tensor" or len(vector.arguments) != 2 or not vector.is_float:
-                raise self.context.error(node, f"{name} requires floating-point vectors")
-            if name == "cross" and vector.arguments[1] != 3:
+                raise self.context.error(node, "cross requires floating-point vectors")
+            if vector.arguments[1] != 3:
                 raise self.context.error(node, "cross requires three-component vectors")
-            element = vector.arguments[0]
-            assert isinstance(element, DslType)
             return self._intrinsic(node, name, arguments, typed_call.type)
         if name == "norm":
             if len(arguments) != 1 or arguments[0].type.kind != "tensor" or not arguments[0].type.is_float:
@@ -878,6 +905,15 @@ class _FunctionEmitter:
             return lower_texture_sample(self, node, arguments, typed_call.type)
         if name == "texture_size":
             return lower_texture_size(self, node, arguments, typed_call.type)
+        if name == "texture_load":
+            return self._intrinsic(node, name, arguments, typed_call.type)
+        if name == "texture_store":
+            operand_types = ", ".join(argument.type.mlir for argument in arguments)
+            self._line(
+                f'"vernon.intrinsic"({", ".join(argument.name for argument in arguments)}) '
+                f'{{name = "texture_store"}} : ({operand_types}) -> ()'
+            )
+            return Value("", typed_call.type)
         if name in self.context.structs:
             fields = self.context.structs[name]
             if len(arguments) != len(fields):
@@ -888,7 +924,7 @@ class _FunctionEmitter:
             # Entry-point structs are interface aggregates flattened by the
             # frontend. Materializing them would leave an otherwise dead
             # custom struct operation for SPIR-V lowering.
-            if self.stage is not None and self.signature.result == result_type:
+            if self._entry_result_fields() is not None and self.signature.result == result_type:
                 return Value("", result_type, tuple(arguments))
             result = self._fresh()
             self._line(
@@ -991,6 +1027,8 @@ class _FunctionEmitter:
 
     def _attribute(self, node: ast.Attribute) -> Value:
         value = self._expression(node.value)
+        if node.attr == "shape":
+            return lower_shape_attribute(self, node, value)
         if value.type.kind == "struct":
             fields = self.context.structs[value.type.name]
             field_names = [name for name, _ in fields]
@@ -1014,7 +1052,9 @@ class _FunctionEmitter:
             indices = [
                 "xyzw".find(character) if character in "xyzw" else "rgba".find(character) for character in node.attr
             ]
-            if any(index >= int(shape[0]) for index in indices):
+            extent = shape[0]
+            assert isinstance(extent, int)
+            if any(index >= extent for index in indices):
                 raise self.context.error(node, f"swizzle '{node.attr}' is out of bounds")
             canonical_mask = "".join("xyzw"[index] for index in indices)
             element = value.type.arguments[0]

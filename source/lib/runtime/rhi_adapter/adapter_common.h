@@ -53,10 +53,27 @@ struct VernonRuntimeRhiAdapter {
 
 namespace vernon::runtime::rhi_adapter {
 
-inline constexpr uint64_t kRhiResourceKindMask = 3;
+inline constexpr uint64_t kRhiResourceKindMask = 7;
 inline constexpr uint64_t kRhiImageResource = 1;
 inline constexpr uint64_t kRhiSamplerResource = 2;
 inline constexpr uint64_t kRhiBufferResource = 3;
+inline constexpr uint64_t kRhiImageViewResource = 4;
+
+inline bool isRhiImageReference(VernonRuntimeProviderResourceReference resource) {
+    const uint64_t kind = resource.identity & kRhiResourceKindMask;
+    return kind == kRhiImageResource || kind == kRhiImageViewResource;
+}
+
+inline bool isRhiImageViewReference(VernonRuntimeProviderResourceReference resource) {
+    return (resource.identity & kRhiResourceKindMask) == kRhiImageViewResource;
+}
+
+inline bool packedUniformBytes(VernonRuntimeProviderBindingKind kind,
+                               VernonRuntimeProviderBindingInterface interfaceKind) {
+    return kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE || kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
+           (kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
+            interfaceKind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM);
+}
 
 template <typename Object> VernonRuntimeProviderObject toHandle(Object *object) {
     return {static_cast<uint64_t>(reinterpret_cast<uintptr_t>(object))};
@@ -72,6 +89,13 @@ void setBackendError(std::string &error, const char *message) noexcept;
 bool retainRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
 void releaseRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
 uint64_t resolveRhiResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource);
+bool describeRhiImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
+                      VernonRhiImageDescriptor &descriptor);
+VernonStatus describeProviderImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderResourceReference resource,
+                                   VernonRuntimeProviderImageDescription &description);
+VernonStatus describeProviderImageCallback(void *data, VernonRuntimeProviderResourceReference resource,
+                                           VernonRuntimeProviderImageDescription *description);
+const VernonRuntimeProviderResourceReference *providerBindingResource(const VernonRuntimeProviderBindingValue &value);
 uint64_t nativeCommandEncoder(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
 bool commandEncoderRendering(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
 bool commandEncoderHasRenderingDescriptor(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder);
@@ -89,6 +113,7 @@ bool recordCommandWriteResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeP
                                 VernonRuntimeProviderResourceReference resource);
 bool retainCommandResource(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
                            VernonRuntimeProviderResourceReference resource);
+bool validCommonDrawDescriptor(const VernonRuntimeProviderDrawDescriptor *descriptor);
 bool deferCommandCleanup(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,
                          uint64_t object, void (*cleanup)(void *, uint64_t));
 bool deferCommandRollback(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder, void *context,

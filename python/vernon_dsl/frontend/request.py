@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..ad import ProgramTransformSpec
 from .analysis import typed_effect_data
-from .model import TypedFunctionInstance
+from .autodiff_profiles import AutodiffProfilePlan
+from .model import ConcreteType, TypedFunctionInstance
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,8 @@ class FrontendCompileRequest:
     tensor_shapes: tuple[tuple[str, str, tuple[int, ...]], ...] = ()
     captured_constants: tuple[tuple[str, int | float | bool], ...] = ()
     workgroup_size: tuple[int, int, int] | None = None
+    program_transform: ProgramTransformSpec | None = None
+    autodiff_planning_policy: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_path", Path(self.source_path).resolve())
@@ -33,6 +37,8 @@ class FrontendCompileRequest:
             "captured_constants",
             tuple(sorted(self.captured_constants, key=lambda value: value[0])),
         )
+        if self.autodiff_planning_policy not in {None, "min_memory", "balanced", "min_runtime"}:
+            raise ValueError("autodiff planning policy must be 'min_memory', 'balanced', or 'min_runtime'")
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,9 @@ class FrontendCompileResult:
     request: FrontendCompileRequest
     helper_specializations: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = ()
     typed_functions: tuple[TypedFunctionInstance, ...] = ()
+    autodiff_profiles: AutodiffProfilePlan | None = None
+    entry_workgroup_size: tuple[int, int, int] | None = None
+    structs: tuple[tuple[str, tuple[tuple[str, ConcreteType], ...]], ...] = ()
 
     @property
     def semantic_inputs(self) -> dict[str, Any]:
@@ -53,7 +62,7 @@ class FrontendCompileResult:
         )
         return {
             "compiler_contract_version": COMPILER_CONTRACT_VERSION,
-            "pipeline_version": PIPELINE_VERSION,
+            "program_version": PROGRAM_VERSION,
             "entry": self.request.entry,
             "enabled_features": list(self.request.enabled_features),
             "tensor_shapes": [[name, dtype, list(shape)] for name, dtype, shape in self.request.tensor_shapes],
@@ -67,4 +76,11 @@ class FrontendCompileResult:
             ],
             "entry_effects": ([typed_effect_data(effect) for effect in entry.effects] if entry is not None else []),
             "dependencies": [[path, digest] for path, digest in self.dependencies],
+            "program_transform": (
+                self.request.program_transform.to_dict() if self.request.program_transform is not None else None
+            ),
+            "autodiff_planning_policy": self.request.autodiff_planning_policy,
+            "autodiff_profiles": (
+                self.autodiff_profiles.manifest_dict() if self.autodiff_profiles is not None else None
+            ),
         }

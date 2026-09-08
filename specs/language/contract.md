@@ -39,6 +39,8 @@ semantics.
 
 `bool`, `i32`, `u32`, `f16`, `f32`, and `f64` are scalar Values. Python `int`
 and `float` are annotation and explicit-cast aliases for `i32` and `f32`.
+Language `u32` is ABI metadata; MLIR storage is signless `i32`. See
+[compiler design](../compiler/design.md#mlir-storage-vs-language-abi-dtype).
 
 Integer and floating literals remain contextual until constraints are solved.
 Unconstrained literals default to `i32` and `f32`. Safe implicit conversions
@@ -180,8 +182,17 @@ signed element strides, and offset are dispatch descriptor values, and every
 logical index is projected to the owner's physical element index before
 backend lowering.
 
+Do not feed `TensorStorage`, `TensorView`, or `GraphBuffer` extents into
+kernel `_lower`, `specialize`, or compute `finalize` `shape_facts`. Annotation
+static extents may be recorded in the Program. `vd.dyn` stays `-1` on the
+Value shape; borrowed Storage does not invent a compile-time byte length.
+C++ bind/invoke reads shape, strides, offset, and byte length from the bound
+buffer. Python must not paper over GPU `finalize` by baking a launch shape
+into the native artifact. Graphics `shape_facts` exist only for
+image/attachment extents.
+
 Language-level typed shape, strides, and offset use units of the recursively
-resolved leaf element. Compiler reflection and `PIPELINE_VERSION` manifests
+resolved leaf element. Compiler reflection and `PROGRAM_VERSION` manifests
 record static shape constraints and descriptor binding positions, never
 concrete dispatch values. Runtime descriptors record byte strides and byte
 offsets after Tensor and Struct layout is resolved. Runtime validation performs
@@ -263,11 +274,37 @@ allocation, failure, and synchronization policies remain explicit.
 
 ## 4. Resource types
 
-`Texture` and `Sampler` are opaque Resource handles. Texture queries and
-sampling use resource-specific operations; they are not ordinary TensorView
-loads or stores. Sampler state is separate from sampled storage. Resource
-format, dimensions, binding, and backend capabilities are validated at entry
-interfaces and reflected in pipeline metadata.
+`Texture` and `Sampler` are opaque Resource handles. A sampled texture is
+`Texture[dimension, sample_type]`, where `dimension` is `2d`, `3d`, or `cube`
+and `sample_type` is `f32`, `i32`, or `u32`. A storage texture is
+`Texture[dimension, format, access]`, where `dimension` is `2d` or `3d`,
+`access` is `read`, `write`, or `read_write`, and format is one of
+`r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
+`rgba16_float`, or `rgba32_float`.
+
+Texture queries and sampling use resource-specific operations; they are not
+ordinary TensorView loads or stores. Sampler state is separate from sampled
+storage. Resource format, dimensions, binding, and backend capabilities are
+validated at entry interfaces and reflected in pipeline metadata.
+
+The supported texture operation regions are:
+
+- `texture_sample(texture, coordinates)` and
+  `texture_sample(texture, sampler, coordinates)` use implicit LOD and are
+  fragment-only;
+- `texture_sample(texture, coordinates, lod)` uses an implicit sampler and is
+  valid in vertex and fragment stages;
+- `texture_sample(texture, sampler, coordinates, lod)` is valid in compute,
+  vertex, and fragment stages;
+- `texture_size(texture[, lod])` is valid in vertex and fragment stages and
+  requires an integer scalar LOD when present;
+- `texture_load` and `texture_store` operate on storage Textures with integer
+  coordinates and enforce the declared read/write access.
+
+Sampling coordinates are floating Tensor Values with rank determined by the
+Texture dimension, and sampling LOD is a floating Scalar. One Texture entry
+parameter cannot mix implicit and explicit sampler forms in the same stage.
+Implicit sampling creates a deterministic sampler interface binding.
 
 ## 5. Ownership, borrowing, and effects
 
@@ -285,13 +322,14 @@ Typed semantic nodes record effects independently from types:
 - `barrier(ordering, scope)`;
 - Resource-specific query/sample effects.
 
-`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` initially
-accept i32/u32 writable `TensorView` elements. A rank-one atomic accepts one
-scalar index; a higher-rank atomic requires a tuple containing exactly one
-index per dimension. Scope is inferred from the Storage address space:
-workgroup storage uses workgroup scope and device storage uses device scope.
-Device-scope TensorView atomics are supported by CPU, CUDA, and Vulkan; other
-targets reject them during capability validation.
+`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` accept i32/u32
+writable `TensorView` elements. `atomic_add` additionally accepts f32/f64 when
+the selected target profile has a legal native or integer-compare-exchange
+implementation for that type and scope. A rank-one atomic accepts one scalar
+index; a higher-rank atomic requires a tuple containing exactly one index per
+dimension. Scope is inferred from the Storage address space: workgroup storage
+uses workgroup scope and device storage uses device scope. Unsupported
+type/scope/target combinations are rejected during capability validation.
 The source ordering is `relaxed`: a backend may emit a stronger ordering when
 its legal lowering cannot represent relaxed ordering, but must never weaken a
 requested ordering.
@@ -299,17 +337,38 @@ Read/write effects include projected regions where statically known, and an
 atomic read-modify-write also marks its owner writable for runtime
 synchronization. Unknown overlap is conservatively aliasing.
 
-Ordinary `@func` code has no Storage, atomic, or barrier effects. It may read
-Resources passed explicitly as parameters; those effects propagate through the
-call graph and are checked against the concrete entry stage. Shared
-`@func(shared=True)` code remains host/device-pure and cannot use device-only
-Resource operations. Kernels and graphics entries may perform effects allowed
-by their stage and parameter access modes. Host runtime allocation, uploads, dispatch,
-downloads, and resource lifetime are not parsed device-language expressions.
-Multi-program ordering, render-pass state, resource transitions, and
-cross-backend synchronization are Runtime host-orchestration semantics,
-specified by `VernonExecutionGraph` in `specs/runtime/design.md`. They are not
-current language semantics.
+Every compute entry carries a compiler-derived `vernon.dispatch_contract`.
+Its `unit_grid_axes` and `requires_unit_workgroup` constraints are residual
+conditions of the ordinary-write injectivity proof. The lemmas (affine
+unique-axis, unsigned mixed-radix, workgroup leader, and the serialized
+single-invocation fallback) are
+[`compiler/invocation_index_ownership.md`](../compiler/invocation_index_ownership.md).
+All public direct, cooked,
+AOT, graph, and autodiff dispatch paths validate this contract before
+allocation, staging, mutation, or submission. A failed constraint is an error;
+the runtime never serializes the dispatch. Constant ordinary writes therefore
+require a unit grid and unit workgroup, while unconstrained multi-invocation
+accumulation must use a formal accumulation or atomic operation.
+
+TensorView bounds, writable injectivity, physical identity, and overlap use
+the shared native validation model. Distinct allocation identities and
+non-overlapping byte spans prove disjointness; regular strided views may also
+use stride-lattice congruence. An unproven writable overlap is rejected.
+Semantic acceptance never depends on enumerating elements or on an
+element-count threshold.
+
+Ordinary `@func` code may carry Storage and Resource effects through explicit
+parameters and may use atomics or barriers where their concrete entry stage
+permits them. Those effects propagate through the call graph and are checked
+against parameter access and the concrete entry stage. Shared
+`@func(shared=True)` code remains host/device-pure and cannot use Storage or
+device-only Resource operations. Kernels and graphics entries may perform
+effects allowed by their stage and parameter access modes. Host runtime
+allocation, uploads, dispatch, downloads, and resource lifetime are not parsed
+device-language expressions.
+Multi-node ordering, render state, resource transitions, and cross-backend
+synchronization are canonical Program and Runtime Command DAG semantics. They
+are not shader-language semantics.
 
 ## 6. Functions, interfaces, and specialization
 
@@ -343,22 +402,21 @@ a host-bound vertex stream, and a `Tensor[..., uniform()]` is an immutable
 Value even if a backend uses a buffer physically. Direct shader addressing,
 stores, and atomics require `TensorView[..., resource()]`.
 
-A persistent `PipelineAsset` wraps exactly one executable pipeline. Its
-`program=` is either one `@kernel` entry or a non-empty tuple containing only
-graphics entries. Kernel programs are compute-only; graphics stage tuples form
-graphics-only Pipelines. Compute and graphics entries cannot be mixed in one
-pipeline.
+A persistent `ProgramAsset` wraps exactly one executable Program. Its
+`program=` is a compute Kernel, a `vd.pipeline(...)` graphics pipeline, an
+initialized Module, or a supported explicit Program transform. Standalone
+compute and graphics executables normalize to one-node Programs. Modules may
+compose compute and graphics Nodes in one static Program DAG.
 
 Each graphics entry carries an explicit stage kind. A target-independent stage
-registry validates tuple topology and ordering. The registered graphics
-topology is `vertex -> fragment`. Future stage additions can extend topology
-validation without changing `PipelineAsset` syntax; such changes are covered by
-`COMPILER_CONTRACT_VERSION`.
+registry validates `vd.pipeline(...)` topology and ordering. The registered
+graphics topology is `vertex -> fragment`. Future stage additions can extend
+topology validation through a versioned compiler contract.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
 same closed stage/direction/type registry. `vd.feature` is the single
-compile-time specialization mechanism for program code. `PipelineAsset`
+compile-time specialization mechanism for program code. `ProgramAsset`
 explicitly enumerates accepted canonical feature combinations through
 `variants=`; there is no independent public shader-variant selector. Feature
 values and `When` branches are compile-time specialization inputs, not runtime
@@ -381,7 +439,7 @@ Project processing order is:
 7. validate target capabilities and materialize artifacts.
 
 Semantic cache identity includes `COMPILER_CONTRACT_VERSION`,
-`PIPELINE_VERSION`, all source dependency
+`PROGRAM_VERSION`, all source dependency
 digests, entry, enabled features, concrete shapes and interfaces, captured
 constants, workgroup size, helper specializations, and derivative-transform
 identity. Diagnostics include source path, one-based line and column, and a
@@ -391,12 +449,16 @@ stable reason string.
 
 The current core statement subset is `pass`, expression statements, simple local or
 indexed assignment, annotated assignment, augmented assignment, `return`,
-`if`, `range` loops, `while`, `break`, and `continue`. Return may terminate a
-nested structured region; break and continue target the nearest enclosing loop.
+`if`, `range` loops, `while`, loop `else`, `break`, and `continue`. Return may
+terminate a nested structured region; break and continue target the nearest
+enclosing loop.
 
 The expression subset includes names, numeric and Boolean literals, arithmetic,
-unary operations, one comparison, calls, supported attributes, indexing,
-Tensor/Tuple/Struct construction, and constant Tuple indexing.
+unary operations, one comparison, calls, indexing, Tensor/Tuple/Struct
+construction, and constant Tuple indexing. Supported attributes are immutable
+Struct fields, `.shape` on rank-one-or-greater Tensor/TensorView values, and
+rank-one Tensor swizzles over `xyzw`/`rgba`; color aliases canonicalize to the
+corresponding positional mask.
 
 The portable floating-point math surface includes `sin`, `cos`, `acos`,
 `atan2`, `exp`, `log`, `sqrt`, `floor`, `abs`, `min`, `max`, `pow`, and
@@ -405,9 +467,10 @@ The portable floating-point math surface includes `sin`, `cos`, `acos`,
 
 Tuple destructuring, short-circuit `and`/`or`, conditional expressions,
 dynamic `range`, `break`, `continue`, and nested/early return are implemented
-current phases under `COMPILER_CONTRACT_VERSION`. Autodiff coverage
-for Phase 5B control flow remains deferred until derivative and tape policies
-land. Chained comparisons, recursion, dynamic allocation, exceptions,
+current phases under `COMPILER_CONTRACT_VERSION`. Compute autodiff accepts
+pure-Value early returns and literal-bounded loops with one dynamic leading
+`if condition: break` guard; general dynamic `range`, `while`, `continue`, and
+loop-local return remain deferred. Chained comparisons, recursion, dynamic allocation, exceptions,
 generators, arbitrary classes, Python list/dict semantics, and Python object
 mutation remain deferred.
 
@@ -419,8 +482,8 @@ a runtime contract violation and must never silently execute zero iterations.
 Fixed-width overflow must terminate the range rather than wrap into an
 unbounded loop. A target without a legal contract-violation mechanism must
 reject dynamic step values during capability validation. Phase 5B control flow
-is outside the accepted autodiff domain until separate derivative and tape
-policies are specified.
+outside the accepted compute-autodiff subset above remains deferred until
+separate derivative and tape policies are specified.
 
 Frontend acceptance guarantees well-typed Vernon IR, not that every target
 implements every operation. Unsupported target/type/stage combinations fail
@@ -428,65 +491,59 @@ explicitly and never silently narrow or change semantics.
 
 ## 8. First-order autodiff
 
-Autodiff transforms specialized, validated typed IR; it never executes Python
-to trace a function. V4 defines:
+The complete normative design is
+[`../autodiff/contract.md`](../autodiff/contract.md).
+Autodiff transforms specialized, validated typed IR and never executes Python
+to trace a function.
 
-- `jvp(f, primals, tangents)` for first-order forward mode;
-- `vjp(f, primals)` for a primal result and first-order pullback;
-- `grad(f)` for scalar-output reverse-mode gradients;
-- `value_and_grad(f)` for a primal value and gradient;
-- `stop_gradient(value)` as an explicit zero-tangent boundary;
-- versioned custom JVP and VJP rules with validated primal, tangent, and
-  adjoint signatures.
+The initial public reverse-mode surface is one transform:
+`vd.ad.vjp(program, wrt=..., outputs=..., planning_policy=...)`. It produces a
+program whose execution returns primal outputs and a pullback. `outputs` may
+select public output paths and `planning_policy` selects a supported
+deterministic planning policy; neither is a custom derivative-rule surface.
+Applying the pullback to explicit output cotangents returns gradients for the
+canonical input paths selected by `wrt`.
+One floating Scalar output may omit its cotangent and uses seed `1`.
+Tensor/aggregate outputs may not omit cotangents and are never implicitly
+reduced.
 
-The future autodiff graph is a compiler-internal `ProgramGraph` for one
-specialized Kernel or graphics Pipeline program. Its nodes and edges represent
-typed value flow, control flow, Storage effects, and differentiation
-dependencies inside that program. It is not a host orchestration graph and
-does not order PipelineAssets, dispatches, render passes, or backend
-transitions.
+Authored Kernel and graphics entry signatures do not change. The language has
+no `grad_or_not`, `requires_grad`, implicit `.grad`, global gradient clearing,
+or context that silently executes backward work. `program_asset()` remains the
+only cookable declaration; a VJP is represented by a declarative
+`ProgramExpression` in its `program=` operand.
 
 Floating-point Scalar leaves are differentiable. Tensor, Tuple, and Struct
-Values derive tangent and adjoint structure recursively from their leaves.
-Integer, Boolean, Storage, Resource, sampler, and opaque leaves are
-non-differentiable unless a custom operation rule explicitly handles them.
-Derivative Values have ordinary deterministic Value types; dual numbers are
-not embedded into Tensor element types.
+Values derive adjoint structure recursively from floating leaves. Floating
+Scalar and immutable Tensor gradients are ordinary Values. A differentiated
+TensorView or mutable Storage input produces newly owned gradient Storage.
+The backward compiler ABI receives that Storage as a writable TensorView
+argument, with dynamic extents preserved in its descriptor; it is not returned
+as a fixed-shape Value.
+Integer, Boolean, Resource handle, sampler state, and opaque leaves are
+non-differentiable unless a custom operation rule consumes them without
+requesting a gradient. Gradients never change primal type or identity.
 
-`TensorStorage.grad` denotes separately allocated companion storage managed by
-the runtime. It is never an autodiff object embedded in a Tensor dtype and
-never changes primal storage identity.
+The compiler-internal `ProgramGraph` for one specialized program represents
+typed Value flow, structured control flow, Storage effects, aliases, saved
+Values, and reverse dependencies. It is not a host orchestration graph.
+Stateful differentiation requires legal mutation functionalization, bounded
+tape, effect-preserving reverse traversal, alias/race validation, and
+deterministic or capability-checked gather/scatter accumulation.
 
-The initial accepted domain is pure, non-recursive `@func` code with validated
-numeric operations and structured first-order control flow explicitly covered
-by derivative rules. Arithmetic, casts, Tensor construction, `matmul`, and
-supported math intrinsics must define behavior at non-differentiable points.
-Analytical results are checked against finite differences and supported
-backends are compared with CPU reference behavior.
+Arithmetic, casts, Tensor construction, `matmul`, and supported math intrinsics
+use versioned built-in VJP rules. Graphics Program VJP is not a supported
+capability and is rejected during Program capture. There is no public graphics
+custom-rule API in this contract. Texture handles and sampler state remain
+non-differentiable.
 
-Nested or higher-order transforms are rejected by the current contract. This includes
-`grad(grad(f))`, Hessians, Hessian-vector products, and differentiating a
-generated pullback. Generated derivative IR remains typed so a future language
-version may lift this restriction without changing the Value/Storage model.
+Applying `vd.ad.vjp` to a Module produces explicit forward, backward, and
+residual Program topology. Runtime executes that topology without a separate
+host pass graph.
 
-Stateful-kernel autodiff is not part of the initial implementation. It
-requires all of the following before acceptance:
-
-- functionalization of local mutation and Storage writes;
-- alias and race validation;
-- gather/scatter adjoints and deterministic or atomic accumulation;
-- branch/loop tape layout, bounded-loop rules, checkpointing, and
-  recomputation policy;
-- explicit primal and gradient storage bindings;
-- a typed program-internal graph capable of effect-preserving reverse traversal
-  and tape planning.
-
-Texture sampling requires custom gradient rules that distinguish coordinate,
-texel, and sampler inputs. Sampler state is non-differentiable. Rasterization,
-visibility, depth tests, blending decisions, and discontinuous material
-branches are non-differentiable unless explicit custom primitives define their
-derivatives. Differentiating fragment arithmetic alone does not imply
-differentiable rendering.
+JVP, full-Jacobian materialization, convenience `grad` aliases, implicit
+gradient accumulation, nested transforms, Hessians, and Hessian-vector
+products are outside the initial public surface.
 
 ## 9. Legacy migration
 
@@ -514,10 +571,10 @@ cache identity.
 | Ownership | Runtime `Tensor`; removed `Buffer` | `TensorStorage`, borrowed `TensorView`, runtime-only `vd.interop.RawBuffer` escape hatch | General allocator model |
 | Layout | Backend/runtime details | Dense strided views, AoS field projections, explicit alias rules | Transparent sparse layouts and SNode trees |
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
-| Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, and typed barriers | Additional atomic types/orderings and full race model |
-| Autodiff | Not implemented | First-order pure typed-IR JVP/VJP/grad | Higher-order and stateful-kernel AD |
+| Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, capability-checked f32/f64 atomic add, and typed barriers | Additional atomic operations/orderings and full race model |
+| Autodiff | No public transform | First-order compute Program VJP over typed Programs and stateful Kernels; graphics paths fail closed | Graphics VJP/custom rules, JVP, full Jacobians, convenience aliases, and higher-order AD |
 | Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
-| Rendering | Typed graphics stages, textures, samplers | Same model with explicit Resource and derivative boundaries | General differentiable rasterization |
+| Rendering | Typed graphics stages, textures, samplers | Same model with versioned rasterization/visibility/depth/blend/texture VJP boundaries | Graphics derivatives without explicit accepted custom rules |
 
 ## 11. Workload expressiveness
 
@@ -547,8 +604,9 @@ The current `COMPILER_CONTRACT_VERSION` may be declared implemented only when:
 - rank-1 Tensor replacement of Array is consistent across constructors,
   interfaces, reflection, and diagnostics;
 - Resource operations remain distinct from Storage operations;
-- first-order transforms, custom rules, rejection of higher-order transforms,
-  and non-differentiable boundaries have deterministic tests;
+- first-order transforms, built-in versioned rules, rejection of public custom
+  rules and higher-order transforms, and non-differentiable boundaries have
+  deterministic tests;
 - v3 migration diagnostics and compatibility aliases are versioned;
 - unsupported target combinations fail explicitly;
 - cache identity and generated symbols remain deterministic;

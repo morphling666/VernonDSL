@@ -12,10 +12,11 @@ namespace vernon::compiler {
 
 class PreparedModule;
 
-bool compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options, std::vector<Artifact> &artifacts,
-                std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &execution);
+enum class CpuCompileResult { Success, VerificationFailure, CodegenFailure };
 
-bool linkHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics);
+CpuCompileResult compileCpu(PreparedModule &prepared, const CpuCodegenOptions &options,
+                            std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics,
+                            const VernonCpuRuntimeHelpersV1 *runtimeHelpers, CpuExecutionStatePtr &execution);
 
 VernonCpuEntryPoint findCpuEntry(const CpuExecutionState *execution, std::string_view name);
 

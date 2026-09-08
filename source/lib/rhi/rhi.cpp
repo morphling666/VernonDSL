@@ -68,8 +68,10 @@ VernonStringView vernon::rhi::deviceCreationError() { return {creationError.data
 void vernon::rhi::destroyDevice(VernonRhiDevice device) {
     if (deviceHasActiveCommandEncoder(device))
         return;
+    drainDeviceCompletions(device);
     if (const BackendDispatch *backend = dispatch(device))
         backend->destroyDevice(device);
+    forgetDeviceCommandLimits(device);
 }
 
 VernonStringView vernon::rhi::deviceLastError(VernonRhiDevice device) {
@@ -114,6 +116,12 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice device,
 extern "C" VernonRhiStatus vernonRhiDeviceUploadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer, uint64_t offset,
                                                        const void *source, uint64_t size) {
     VERNON_DISPATCH_STATUS(device, uploadBuffer, buffer, offset, source, size);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceUploadBufferRanges(VernonRhiDevice device, VernonRhiBuffer buffer,
+                                                             const VernonRhiBufferUploadRange *ranges,
+                                                             size_t rangeCount) {
+    VERNON_DISPATCH_STATUS(device, uploadBufferRanges, buffer, ranges, rangeCount);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
@@ -166,9 +174,10 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice device, Ve
     VERNON_DISPATCH_STATUS(device, uploadImage, image, uploads, uploadCount);
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image, void *destination,
-                                                        size_t size) {
-    VERNON_DISPATCH_STATUS(device, downloadImage, image, destination, size);
+extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image,
+                                                        const VernonRhiImageDownloadDescriptor *descriptor,
+                                                        void *destination, size_t size) {
+    VERNON_DISPATCH_STATUS(device, downloadImage, image, descriptor, destination, size);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceGenerateImageMipmaps(VernonRhiDevice device, VernonRhiImage image) {
@@ -221,6 +230,11 @@ uint64_t vernon::rhi::imageResource(VernonRhiDevice device, VernonRhiImage image
     return backend && backend->imageResource ? backend->imageResource(device, image) : 0;
 }
 
+uint64_t vernon::rhi::imageViewResource(VernonRhiDevice device, VernonRhiImageView view) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->imageViewResource ? backend->imageViewResource(device, view) : 0;
+}
+
 uint64_t vernon::rhi::samplerResource(VernonRhiDevice device, VernonRhiSampler sampler) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->samplerResource ? backend->samplerResource(device, sampler) : 0;
@@ -236,6 +250,18 @@ uint64_t vernon::rhi::resolveResource(VernonRhiDevice device, ResourceKind kind,
     return backend && backend->resolveResource ? backend->resolveResource(device, kind, key) : 0;
 }
 
+bool vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key, VernonRhiImageDescriptor &descriptor) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->describeImageResource && backend->describeImageResource(device, key, &descriptor);
+}
+
+bool vernon::rhi::describeImageViewResource(VernonRhiDevice device, uint64_t key, VernonRhiImageViewDescriptor &view,
+                                            VernonRhiImageDescriptor &image, uint64_t &parentKey) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->describeImageViewResource &&
+           backend->describeImageViewResource(device, key, &view, &image, &parentKey);
+}
+
 void vernon::rhi::releaseResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {
     if (const BackendDispatch *backend = dispatch(device))
         if (backend->releaseResource)
@@ -247,15 +273,29 @@ bool vernon::rhi::beginCommandRecording(VernonRhiDevice device, uint64_t &native
     return backend && backend->beginCommands && backend->beginCommands(device, native, backendKind);
 }
 
-bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native, bool computeWrites, bool &completed) {
+uint32_t vernon::rhi::deviceCommandCapabilities(VernonRhiDevice device) {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->submitCommands && backend->submitCommands(device, native, computeWrites, completed);
+    if (!backend)
+        return 0;
+    return backend->commandCapabilitiesForDevice ? backend->commandCapabilitiesForDevice(device)
+                                                 : backend->commandCapabilities;
 }
 
-void vernon::rhi::completeBorrowedCommandRecording(VernonRhiDevice device, uint64_t native) {
-    if (const BackendDispatch *backend = dispatch(device))
-        if (backend->completeBorrowedCommands)
-            backend->completeBorrowedCommands(device, native);
+bool vernon::rhi::submitCommandRecording(VernonRhiDevice device, uint64_t native, bool computeWrites, bool &completed,
+                                         bool &externalCompletion) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->submitCommands &&
+           backend->submitCommands(device, native, computeWrites, completed, externalCompletion);
+}
+
+bool vernon::rhi::pollCommandRecording(VernonRhiDevice device, uint64_t native, bool &completed, bool &succeeded) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->pollCommands && backend->pollCommands(device, native, completed, succeeded);
+}
+
+bool vernon::rhi::completeCommandRecording(VernonRhiDevice device, uint64_t native) {
+    const BackendDispatch *backend = dispatch(device);
+    return backend && backend->completeBorrowedCommands && backend->completeBorrowedCommands(device, native);
 }
 
 void vernon::rhi::abandonCommandRecording(VernonRhiDevice device, uint64_t native) {
@@ -272,6 +312,32 @@ VernonRhiStatus vernon::rhi::recordBarriers(VernonRhiDevice device, uint64_t enc
     if (!backend->recordBarriers)
         return VERNON_RHI_STATUS_UNSUPPORTED;
     return backend->recordBarriers(device, encoderKey, native, barriers, barrierCount)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus vernon::rhi::recordBufferCopy(VernonRhiDevice device, uint64_t native, VernonRhiBuffer source,
+                                              uint64_t sourceOffset, VernonRhiBuffer destination,
+                                              uint64_t destinationOffset, uint64_t size) {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordBufferCopy)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordBufferCopy(device, native, source, sourceOffset, destination, destinationOffset, size)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus vernon::rhi::recordImageCopy(VernonRhiDevice device, uint64_t encoderKey, uint64_t native,
+                                             VernonRhiImage source, VernonRhiImage destination,
+                                             const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!backend->recordImageCopy || !backend->supportsImageCopy || !backend->supportsImageCopy(device))
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    return backend->recordImageCopy(device, encoderKey, native, source, destination, regions, regionCount)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }

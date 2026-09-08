@@ -53,6 +53,11 @@ def lower_aggregate_constructor(emitter: AggregateEmitter, node: ast.Call, name:
             for value in sequence.elts
         ]
         return emitter._intrinsic(node, "construct", values, result_type)
+    if name == "Tensor" and not isinstance(node.args[0], (ast.List, ast.Tuple)):
+        result_type = emitter._typed_expression(node).type
+        constructor_element_type = element_type(result_type)
+        value = emitter._coerce_implicit(node.args[0], emitter._expression(node.args[0]), constructor_element_type)
+        return emitter._intrinsic(node, "construct", [value], result_type)
     literal = rectangular_literal(node.args[0])
     if literal is None:
         raise emitter.context.error(node, f"{name} requires a non-empty rectangular sequence literal")

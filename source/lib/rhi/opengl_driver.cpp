@@ -43,6 +43,10 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(bindBuffer, "glBindBuffer");
     LOAD(bufferData, "glBufferData");
     LOAD(bufferSubData, "glBufferSubData");
+    driver.copyBufferSubData = reinterpret_cast<decltype(driver.copyBufferSubData)>(
+        callbacks.get_proc_address(callbacks.user_data, "glCopyBufferSubData"));
+    driver.copyImageSubData = reinterpret_cast<decltype(driver.copyImageSubData)>(
+        callbacks.get_proc_address(callbacks.user_data, "glCopyImageSubData"));
     LOAD(mapBufferRange, "glMapBufferRange");
     LOAD(unmapBuffer, "glUnmapBuffer");
     LOAD(bindBufferBase, "glBindBufferBase");
@@ -59,6 +63,7 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(deleteFramebuffers, "glDeleteFramebuffers");
     LOAD(bindFramebuffer, "glBindFramebuffer");
     LOAD(framebufferTexture2D, "glFramebufferTexture2D");
+    LOAD(framebufferTextureLayer, "glFramebufferTextureLayer");
     LOAD(checkFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(drawBuffers, "glDrawBuffers");
     LOAD(readBuffer, "glReadBuffer");
@@ -123,6 +128,10 @@ bool loadDriver(const VernonOpenGLContextCallbacks &callbacks, Driver &driver, s
     LOAD(genTextures, "glGenTextures");
     LOAD(deleteTextures, "glDeleteTextures");
     LOAD(bindTexture, "glBindTexture");
+    driver.textureView = reinterpret_cast<decltype(driver.textureView)>(
+        callbacks.get_proc_address(callbacks.user_data, "glTextureView"));
+    driver.bindImageTexture = reinterpret_cast<decltype(driver.bindImageTexture)>(
+        callbacks.get_proc_address(callbacks.user_data, "glBindImageTexture"));
     LOAD(texImage2D, "glTexImage2D");
     LOAD(texImage3D, "glTexImage3D");
     LOAD(texSubImage2D, "glTexSubImage2D");

@@ -7,7 +7,7 @@
 TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     VernonRuntimeCreateOptions options{};
     VernonOpenGLContextCallbacks callbacks{};
-    VernonPipelineBundleLoadOptions bundleOptions{};
+    VernonProgramBundleLoadOptions bundleOptions{};
     VernonCpuInvocation invocation{};
 
     options.struct_size = sizeof(options);
@@ -30,14 +30,18 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     EXPECT_EQ(vernonRuntimeGetLastError(context).size, 0);
 
     constexpr char malformedBundle[] = "{";
-    constexpr char diagnosticPrefix[] = "invalid pipeline bundle:";
+    constexpr char diagnosticPrefix[] = "invalid Program bundle:";
     bundleOptions.bundle_directory = ".";
-    EXPECT_EQ(vernonRuntimeLoadPipelineBundleWithOptions(context, malformedBundle, sizeof(malformedBundle) - 1,
-                                                         &bundleOptions),
+    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, malformedBundle, sizeof(malformedBundle) - 1,
+                                                        &bundleOptions),
               nullptr);
     const VernonStringView diagnostic = vernonRuntimeGetLastError(context);
     ASSERT_GE(diagnostic.size, sizeof(diagnosticPrefix) - 1);
     EXPECT_EQ(std::strncmp(diagnostic.data, diagnosticPrefix, sizeof(diagnosticPrefix) - 1), 0);
+    const VernonRuntimeCapabilities refreshed = vernonRuntimeGetContextCapabilities(context);
+    EXPECT_TRUE(refreshed.available);
+    EXPECT_EQ(refreshed.diagnostic.size, 0);
+    EXPECT_EQ(vernonRuntimeGetLastError(context).size, 0);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 
     context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -45,6 +49,6 @@ TEST(RuntimeCommonApi, InitializesOptionsAndReportsErrors) {
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 
     VernonRuntimeBackend target = VERNON_RUNTIME_CPU;
-    EXPECT_EQ(vernonRuntimePipelineBundleInspectTarget(malformedBundle, sizeof(malformedBundle) - 1, &target),
+    EXPECT_EQ(vernonRuntimeProgramBundleInspectTarget(malformedBundle, sizeof(malformedBundle) - 1, &target),
               VERNON_STATUS_PARSE_ERROR);
 }

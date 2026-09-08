@@ -19,14 +19,21 @@
 extern "C" {
 #endif
 
-enum { VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX };
+enum { VERNON_RHI_INVALID_HANDLE_INDEX = UINT32_MAX, VERNON_RHI_MAX_COLOR_ATTACHMENTS = 8 };
 
 typedef enum VernonRhiStatus {
     VERNON_RHI_STATUS_OK = 0,
     VERNON_RHI_STATUS_INVALID_ARGUMENT = 1,
     VERNON_RHI_STATUS_UNSUPPORTED = 2,
-    VERNON_RHI_STATUS_INTERNAL_ERROR = 3
+    VERNON_RHI_STATUS_INTERNAL_ERROR = 3,
+    VERNON_RHI_STATUS_RESOURCE_EXHAUSTED = 4
 } VernonRhiStatus;
+
+typedef enum VernonRhiCompletionState {
+    VERNON_RHI_COMPLETION_PENDING = 0,
+    VERNON_RHI_COMPLETION_SUCCEEDED = 1,
+    VERNON_RHI_COMPLETION_FAILED = 2
+} VernonRhiCompletionState;
 
 #define VERNON_RHI_DECLARE_HANDLE(Name)                                                                                \
     typedef struct Name {                                                                                              \
@@ -163,7 +170,9 @@ typedef enum VernonRhiImageDimension {
 
 typedef enum VernonRhiImageDataType {
     VERNON_RHI_IMAGE_DATA_UINT8 = 0,
-    VERNON_RHI_IMAGE_DATA_FLOAT32 = 1
+    VERNON_RHI_IMAGE_DATA_FLOAT16 = 1,
+    VERNON_RHI_IMAGE_DATA_FLOAT32 = 2,
+    VERNON_RHI_IMAGE_DATA_UINT32 = 3
 } VernonRhiImageDataType;
 
 typedef enum VernonRhiImageDataFormat {
@@ -207,6 +216,12 @@ typedef enum VernonRhiAttachmentAspectBits {
     VERNON_RHI_ATTACHMENT_DEPTH = 1u << 0,
     VERNON_RHI_ATTACHMENT_STENCIL = 1u << 1
 } VernonRhiAttachmentAspectBits;
+
+typedef enum VernonRhiImageAspectBits {
+    VERNON_RHI_IMAGE_ASPECT_COLOR = 1u << 0,
+    VERNON_RHI_IMAGE_ASPECT_DEPTH = 1u << 1,
+    VERNON_RHI_IMAGE_ASPECT_STENCIL = 1u << 2
+} VernonRhiImageAspectBits;
 
 typedef struct VernonRhiDeviceIdentity {
     uint64_t adapter_id;
@@ -254,6 +269,12 @@ typedef struct VernonRhiBufferDescriptor {
     uint32_t reserved[4];
 } VernonRhiBufferDescriptor;
 
+typedef struct VernonRhiBufferUploadRange {
+    uint64_t offset;
+    const void *source;
+    uint64_t size;
+} VernonRhiBufferUploadRange;
+
 typedef struct VernonRhiImageDescriptor {
     uint32_t struct_size;
     VernonRhiImageDimension dimension;
@@ -268,15 +289,25 @@ typedef struct VernonRhiImageDescriptor {
     uint32_t reserved[4];
 } VernonRhiImageDescriptor;
 
+typedef struct VernonRhiImageSubresourceRange {
+    uint32_t base_mip_level;
+    uint32_t mip_level_count;
+    uint32_t base_array_layer;
+    uint32_t array_layer_count;
+    uint32_t aspects;
+} VernonRhiImageSubresourceRange;
+
 typedef struct VernonRhiImageViewDescriptor {
     uint32_t struct_size;
     VernonRhiImage image;
+    VernonRhiImageDimension dimension;
     VernonRhiFormat format;
     uint32_t base_mip_level;
     uint32_t mip_level_count;
     uint32_t base_array_layer;
     uint32_t array_layer_count;
-    uint32_t reserved[4];
+    uint32_t aspects;
+    uint32_t reserved[3];
 } VernonRhiImageViewDescriptor;
 
 typedef struct VernonRhiSamplerDescriptor {
@@ -295,6 +326,9 @@ typedef struct VernonRhiImageUploadDescriptor {
     uint32_t struct_size;
     uint32_t mip_level;
     uint32_t array_layer;
+    uint32_t offset_x;
+    uint32_t offset_y;
+    uint32_t offset_z;
     uint32_t width;
     uint32_t height;
     uint32_t depth;
@@ -303,6 +337,40 @@ typedef struct VernonRhiImageUploadDescriptor {
     const void *data;
     uint32_t reserved[4];
 } VernonRhiImageUploadDescriptor;
+
+typedef struct VernonRhiImageDownloadDescriptor {
+    uint32_t struct_size;
+    uint32_t mip_level;
+    uint32_t array_layer;
+    uint32_t offset_x;
+    uint32_t offset_y;
+    uint32_t offset_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    VernonRhiImageDataFormat destination_format;
+    VernonRhiImageDataType destination_type;
+    uint32_t reserved[4];
+} VernonRhiImageDownloadDescriptor;
+
+typedef struct VernonRhiImageCopyRegion {
+    uint32_t struct_size;
+    uint32_t source_mip_level;
+    uint32_t source_array_layer;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t source_z;
+    uint32_t destination_mip_level;
+    uint32_t destination_array_layer;
+    uint32_t destination_x;
+    uint32_t destination_y;
+    uint32_t destination_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth;
+    uint32_t aspects;
+    uint32_t reserved[4];
+} VernonRhiImageCopyRegion;
 
 typedef struct VernonRhiShaderModuleDescriptor {
     uint32_t struct_size;
@@ -356,9 +424,9 @@ typedef struct VernonRhiGraphicsPipelineDescriptor {
     size_t color_format_count;
     VernonRhiFormat depth_stencil_format;
     uint32_t sample_count;
-    VernonRhiRasterizationState rasterization;
-    VernonRhiDepthStencilState depth_stencil;
-    const VernonRhiColorBlendState *color_blends;
+    VernonRasterizationState rasterization;
+    VernonDepthStencilState depth_stencil;
+    const VernonColorBlendState *color_blends;
     size_t color_blend_count;
     uint32_t reserved[4];
 } VernonRhiGraphicsPipelineDescriptor;
@@ -429,12 +497,14 @@ typedef struct VernonRhiCommandEncoderDescriptor {
     uint32_t reserved[4];
 } VernonRhiCommandEncoderDescriptor;
 
-typedef struct VernonRhiCompletionDescriptor {
+typedef struct VernonRhiCommandLimits {
     uint32_t struct_size;
-    uint64_t initial_value;
-    uint32_t host_visible;
-    uint32_t reserved[4];
-} VernonRhiCompletionDescriptor;
+    uint32_t max_active_recordings;
+    uint32_t max_in_flight_submissions;
+    uint32_t max_live_completions;
+    uint64_t max_upload_bytes;
+    uint64_t reserved[3];
+} VernonRhiCommandLimits;
 
 typedef struct VernonRhiBarrier {
     uint32_t struct_size;
@@ -449,7 +519,8 @@ typedef struct VernonRhiBarrier {
         VernonRhiImage image;
     };
     uint32_t is_image;
-    uint32_t reserved[4];
+    VernonRhiImageSubresourceRange image_subresources;
+    uint32_t reserved[3];
 } VernonRhiBarrier;
 
 typedef struct VernonRhiCommandEncoderStats {
@@ -546,7 +617,9 @@ VERNON_RHI_CAPI VernonRhiDevice vernonRhiCreateOpenGLDevice(const VernonOpenGLCo
                                                             uint32_t embedded_profile);
 VERNON_RHI_CAPI void vernonRhiDestroyDevice(VernonRhiDevice device);
 VERNON_RHI_CAPI VernonStringView vernonRhiDeviceGetLastError(VernonRhiDevice device);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSynchronize(VernonRhiDevice device);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
+                                                                const VernonRhiCommandLimits *limits);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice device, VernonRhiCommandLimits *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
                                                                     const VernonRhiCommandEncoderDescriptor *descriptor,
                                                                     VernonRhiCommandEncoder *output);
@@ -554,6 +627,21 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDe
                                                                      VernonRhiCommandEncoder encoder);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
                                                                const VernonRhiBarrier *barriers, size_t barrier_count);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice device,
+                                                                  VernonRhiCommandEncoder encoder,
+                                                                  VernonRhiBuffer source, uint64_t source_offset,
+                                                                  VernonRhiBuffer destination,
+                                                                  uint64_t destination_offset, uint64_t size);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice device,
+                                                                 VernonRhiCommandEncoder encoder, VernonRhiImage source,
+                                                                 VernonRhiImage destination,
+                                                                 const VernonRhiImageCopyRegion *regions,
+                                                                 size_t region_count);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice device,
+                                                                    VernonRhiCommandEncoder encoder,
+                                                                    VernonRhiBuffer destination,
+                                                                    uint64_t destination_offset, const void *source,
+                                                                    uint64_t size);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
                                                                       VernonRhiCommandEncoder encoder,
                                                                       const VernonRhiRenderingDescriptor *descriptor);
@@ -569,14 +657,26 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachme
                                                                                    uint32_t clear_stencil,
                                                                                    uint32_t aspects);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder);
-VERNON_RHI_CAPI VernonRhiStatus vernonRhiCommandEncoderGetStats(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                                VernonRhiCommandEncoderStats *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                      VernonRhiCompletion *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                            VernonRhiCompletionState *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionWait(VernonRhiDevice device, VernonRhiCompletion completion);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                          VernonRhiStatus result);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice device,
+                                                                   VernonRhiCompletion completion,
+                                                                   VernonRhiCommandEncoderStats *output);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice device,
+                                                                 VernonRhiCompletion completion);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceCreateBuffer(VernonRhiDevice device,
                                                             const VernonRhiBufferDescriptor *descriptor,
                                                             VernonRhiBuffer *output);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
                                                             uint64_t offset, const void *source, uint64_t size);
+VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadBufferRanges(VernonRhiDevice device, VernonRhiBuffer buffer,
+                                                                  const VernonRhiBufferUploadRange *ranges,
+                                                                  size_t range_count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
                                                               uint64_t offset, void *destination, uint64_t size);
 VERNON_RHI_CAPI uint32_t vernonRhiDeviceIsBufferValid(VernonRhiDevice device, VernonRhiBuffer buffer);
@@ -592,6 +692,7 @@ VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceUploadImage(VernonRhiDevice devic
                                                            const VernonRhiImageUploadDescriptor *uploads,
                                                            size_t upload_count);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, VernonRhiImage image,
+                                                             const VernonRhiImageDownloadDescriptor *descriptor,
                                                              void *destination, size_t size);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceGenerateImageMipmaps(VernonRhiDevice device, VernonRhiImage image);
 VERNON_RHI_CAPI VernonRhiStatus vernonRhiDeviceBindImage(VernonRhiDevice device, VernonRhiImage image,

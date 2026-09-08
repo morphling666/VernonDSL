@@ -13,13 +13,11 @@ namespace vernon::tools {
 struct PackagingOptions {
     std::optional<std::filesystem::path> outputDirectory;
     std::optional<std::filesystem::path> reflectionPath;
-    std::optional<std::filesystem::path> computeBundlePath;
     std::optional<std::string> targetTriple;
-    bool hostRuntimeBundle{};
 };
 
-VernonStatus packageCompileResult(VernonCompilerContext *context, const VernonCompileResult *result,
-                                  VernonTarget target, const PackagingOptions &options, std::ostream &standardOutput,
+VernonStatus packageCompileResult(const VernonCompileResult *result, VernonTarget target,
+                                  const PackagingOptions &options, std::ostream &standardOutput,
                                   std::ostream &standardError);
 
 } // namespace vernon::tools

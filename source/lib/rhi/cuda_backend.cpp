@@ -1,7 +1,9 @@
 #include "cuda_backend.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <utility>
 #include <vector>
@@ -136,6 +138,39 @@ Result DeviceState::upload(DevicePointer destination, const void *source, size_t
     return status;
 }
 
+Result DeviceState::uploadRanges(DevicePointer destination, const VernonRhiBufferUploadRange *ranges,
+                                 size_t rangeCount) {
+    if (!destination || !ranges || rangeCount == 0)
+        return kInvalidValue;
+    size_t stagingSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        if (ranges[index].size > (std::numeric_limits<size_t>::max)() - stagingSize)
+            return kInvalidValue;
+        stagingSize += static_cast<size_t>(ranges[index].size);
+    }
+    Result status = makeCurrent();
+    if (status != kSuccess)
+        return status;
+    PinnedBlock *staging = acquirePinned(stagingSize, status);
+    if (!staging)
+        return status;
+    size_t stagingOffset = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const size_t size = static_cast<size_t>(ranges[index].size);
+        auto *source = static_cast<std::byte *>(staging->data) + stagingOffset;
+        std::memcpy(source, ranges[index].source, size);
+        status = driver().copyHostToDeviceAsync(destination + ranges[index].offset, source, size, stream);
+        if (status != kSuccess)
+            break;
+        stagingOffset += size;
+    }
+    const Result synchronizationStatus = driver().streamSynchronize(stream);
+    if (status == kSuccess)
+        status = synchronizationStatus;
+    releasePinned(*staging);
+    return status;
+}
+
 Result DeviceState::download(void *destination, DevicePointer source, size_t size) {
     if (!destination || !source || size == 0)
         return kInvalidValue;
@@ -152,6 +187,13 @@ Result DeviceState::download(void *destination, DevicePointer source, size_t siz
         std::memcpy(destination, staging->data, size);
     releasePinned(*staging);
     return status;
+}
+
+Result DeviceState::copy(DevicePointer destination, DevicePointer source, size_t size) {
+    if (!destination || !source || !size)
+        return kInvalidValue;
+    Result status = makeCurrent();
+    return status == kSuccess ? driver().copyDeviceToDeviceAsync(destination, source, size, stream) : status;
 }
 
 Result PreparedFunction::create(DeviceState &device, const void *artifact, size_t artifactSize, const char *entry) {

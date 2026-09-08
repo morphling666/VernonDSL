@@ -4,15 +4,26 @@
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Support/Alignment.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <algorithm>
 #include <limits>
 
 namespace mlir::vernon {
 
+bool containsLogicalAutodiffHandle(Type type) {
+    if (isa<AdTapeType, AdRegionHeaderType>(type))
+        return true;
+    if (auto tuple = dyn_cast<TupleType>(type))
+        return llvm::any_of(tuple.getTypes(), containsLogicalAutodiffHandle);
+    return false;
+}
+
 FailureOr<ResolvedStructFields> resolveNamedStructFields(StructType structure, ModuleOp module) {
+    if (!module)
+        return failure();
     StructDeclOp declaration;
     for (StructDeclOp candidate : module.getOps<StructDeclOp>()) {
         if (candidate.getSymName() == structure.getName()) {
@@ -53,10 +64,35 @@ FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolveStructFields(Struct
 
 namespace {
 
+struct NodeProjection {
+    uint64_t size{};
+    uint64_t alignment{};
+    SmallVector<uint64_t> byteStrides;
+    SmallVector<uint64_t> childOffsets;
+
+    NodeProjection() = default;
+    NodeProjection(uint64_t size, uint64_t alignment, SmallVector<uint64_t> byteStrides = {},
+                   SmallVector<uint64_t> childOffsets = {})
+        : size(size), alignment(alignment), byteStrides(std::move(byteStrides)), childOffsets(std::move(childOffsets)) {
+    }
+};
+
 struct PlannedLayout {
     ValueAbiLayout layout;
     std::string canonical;
+    std::shared_ptr<CanonicalAbiNode> root;
 };
+
+FailureOr<NodeProjection> projectNode(const CanonicalAbiNode &canonical, PhysicalAbiProfile profile);
+std::shared_ptr<const ByteTransportNode> buildTransportTree(const CanonicalAbiNode &canonical,
+                                                            const NodeProjection &physical, PhysicalAbiProfile profile,
+                                                            uint64_t byteOffset);
+
+std::string hashCanonical(StringRef canonical) {
+    llvm::SHA256 hash;
+    hash.update(canonical);
+    return llvm::toHex(hash.final(), true);
+}
 
 FailureOr<uint64_t> checkedAlign(uint64_t value, uint64_t alignment) {
     if (alignment == 0 || value > std::numeric_limits<uint64_t>::max() - (alignment - 1))
@@ -68,21 +104,6 @@ FailureOr<uint64_t> checkedMultiply(uint64_t left, uint64_t right) {
     if (right != 0 && left > std::numeric_limits<uint64_t>::max() / right)
         return failure();
     return left * right;
-}
-
-FailureOr<SmallVector<uint64_t>> rowMajorStrides(ArrayRef<int64_t> shape, uint64_t elementStride) {
-    SmallVector<uint64_t> strides(shape.size());
-    uint64_t stride = elementStride;
-    for (size_t dimension = shape.size(); dimension-- > 0;) {
-        if (shape[dimension] <= 0)
-            return failure();
-        strides[dimension] = stride;
-        FailureOr<uint64_t> next = checkedMultiply(stride, static_cast<uint64_t>(shape[dimension]));
-        if (failed(next))
-            return failure();
-        stride = *next;
-    }
-    return strides;
 }
 
 bool isCompatibleLogicalDtype(Type scalar, StringRef dtype) {
@@ -107,112 +128,12 @@ void prependPath(ValueAbiLeaf &leaf, ArrayRef<ValueAbiPathComponent> prefix) {
 
 FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs);
 
-FailureOr<PhysicalValueAbiLayout> planCudaValue(Type type, ModuleOp module, SmallVectorImpl<StringRef> &activeStructs) {
-    if (type.isIndex())
-        return PhysicalValueAbiLayout{8, 8, {}, {0}};
-    if (type.isIntOrFloat()) {
-        const uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
-        return PhysicalValueAbiLayout{size, size, {}, {0}};
-    }
-
-    Type tensorElement;
-    ArrayRef<int64_t> tensorShape;
-    bool registerTensor = false;
-    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        if (!tensor.hasStaticShape() || !tensor.getElementType().isIntOrFloat())
-            return failure();
-        tensorElement = tensor.getElementType();
-        tensorShape = tensor.getShape();
-        registerTensor = tensor.getNumElements() <= 16;
-    } else if (auto tensor = dyn_cast<TensorType>(type)) {
-        tensorElement = tensor.getElementType();
-        tensorShape = tensor.getShape();
-    } else if (auto vector = dyn_cast<VectorType>(type)) {
-        tensorElement = vector.getElementType();
-        tensorShape = vector.getShape();
-        registerTensor = true;
-    }
-    if (tensorElement) {
-        FailureOr<PhysicalValueAbiLayout> element = planCudaValue(tensorElement, module, activeStructs);
-        if (failed(element))
-            return failure();
-        FailureOr<SmallVector<uint64_t>> strides =
-            rowMajorStrides(tensorShape, llvm::alignTo(element->size, element->alignment));
-        if (failed(strides))
-            return failure();
-        uint64_t count = 1;
-        for (int64_t extent : tensorShape) {
-            if (extent <= 0)
-                return failure();
-            FailureOr<uint64_t> next = checkedMultiply(count, static_cast<uint64_t>(extent));
-            if (failed(next))
-                return failure();
-            count = *next;
-        }
-        FailureOr<uint64_t> size = checkedMultiply(llvm::alignTo(element->size, element->alignment), count);
-        if (failed(size))
-            return failure();
-        uint64_t alignment = element->alignment;
-        if (registerTensor && count > 1) {
-            alignment = element->size;
-            while (alignment < *size && alignment < 16)
-                alignment *= 2;
-            alignment = std::min<uint64_t>(alignment, 16);
-        }
-        return PhysicalValueAbiLayout{*size, alignment, std::move(*strides), std::move(element->elementLeafOffsets)};
-    }
-
-    SmallVector<Type> fields;
-    std::optional<StringRef> activeName;
-    if (auto tuple = dyn_cast<TupleType>(type)) {
-        fields.append(tuple.getTypes().begin(), tuple.getTypes().end());
-    } else if (auto structure = dyn_cast<StructType>(type)) {
-        if (llvm::is_contained(activeStructs, structure.getName()))
-            return failure();
-        FailureOr<ResolvedStructFields> resolved = resolveNamedStructFields(structure, module);
-        if (failed(resolved))
-            return failure();
-        activeStructs.push_back(structure.getName());
-        activeName = structure.getName();
-        for (const ResolvedStructField &field : resolved->fields)
-            fields.push_back(field.type);
-    } else {
-        return failure();
-    }
-
-    uint64_t size = 0;
-    uint64_t alignment = 1;
-    SmallVector<uint64_t> leafOffsets;
-    for (Type field : fields) {
-        FailureOr<PhysicalValueAbiLayout> child = planCudaValue(field, module, activeStructs);
-        if (failed(child)) {
-            if (activeName)
-                activeStructs.pop_back();
-            return failure();
-        }
-        FailureOr<uint64_t> offset = checkedAlign(size, child->alignment);
-        if (failed(offset) || child->size > std::numeric_limits<uint64_t>::max() - *offset) {
-            if (activeName)
-                activeStructs.pop_back();
-            return failure();
-        }
-        for (uint64_t leafOffset : child->elementLeafOffsets)
-            leafOffsets.push_back(*offset + leafOffset);
-        size = *offset + child->size;
-        alignment = std::max(alignment, child->alignment);
-    }
-    if (activeName)
-        activeStructs.pop_back();
-    FailureOr<uint64_t> finalSize = checkedAlign(size, alignment);
-    if (failed(finalSize))
-        return failure();
-    return PhysicalValueAbiLayout{*finalSize, alignment, {}, std::move(leafOffsets)};
-}
-
-FailureOr<PlannedLayout> planProduct(ArrayRef<ResolvedStructField> fields, StringRef kind, ModuleOp module,
+FailureOr<PlannedLayout> planProduct(Type type, ArrayRef<ResolvedStructField> fields, StringRef kind, ModuleOp module,
                                      SmallVectorImpl<StringRef> &activeStructs) {
     PlannedLayout result;
     result.layout.alignment = 1;
+    auto root = std::make_shared<CanonicalAbiNode>();
+    root->kind = CanonicalAbiNodeKind::Product;
     uint64_t offset = 0;
     std::string fieldCanonical;
     llvm::raw_string_ostream fieldStream(fieldCanonical);
@@ -225,6 +146,7 @@ FailureOr<PlannedLayout> planProduct(ArrayRef<ResolvedStructField> fields, Strin
             return failure();
         offset = *aligned;
         result.layout.fieldOffsets.push_back(offset);
+        root->children.push_back(child->root);
         for (ValueAbiLeaf leaf : child->layout.leaves) {
             leaf.byteOffset += offset;
             ValueAbiPathComponent component = kind.starts_with("struct") ? ValueAbiPathComponent::getField(field.name)
@@ -247,10 +169,15 @@ FailureOr<PlannedLayout> planProduct(ArrayRef<ResolvedStructField> fields, Strin
            << ')';
     stream.flush();
     result.canonical = std::move(canonical);
+    root->type = type;
+    root->size = result.layout.size;
+    root->alignment = result.layout.alignment;
+    root->childOffsets = result.layout.fieldOffsets;
+    result.root = std::move(root);
     return result;
 }
 
-FailureOr<PlannedLayout> planTensor(Type element, ArrayRef<int64_t> shape, ModuleOp module,
+FailureOr<PlannedLayout> planTensor(Type container, Type element, ArrayRef<int64_t> shape, ModuleOp module,
                                     SmallVectorImpl<StringRef> &activeStructs) {
     if (shape.empty())
         return failure();
@@ -306,6 +233,15 @@ FailureOr<PlannedLayout> planTensor(Type element, ArrayRef<int64_t> shape, Modul
     stream << "],stride=" << *stride << ",size=" << *size << ",element=" << child->canonical << ')';
     stream.flush();
     result.canonical = std::move(canonical);
+    auto root = std::make_shared<CanonicalAbiNode>();
+    root->kind = CanonicalAbiNodeKind::Array;
+    root->type = container;
+    root->size = result.layout.size;
+    root->alignment = result.layout.alignment;
+    root->shape.assign(shape.begin(), shape.end());
+    root->elementStride = result.layout.elementStride;
+    root->children.push_back(child->root);
+    result.root = std::move(root);
     return result;
 }
 
@@ -314,40 +250,54 @@ FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<S
         if (!(type.isInteger(1) || type.isInteger(32) || type.isF16() || type.isF32() || type.isF64()))
             return failure();
         uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
-        StringRef name;
-        if (type.isInteger(1))
-            name = "bool";
-        else if (auto integer = dyn_cast<IntegerType>(type))
-            name = integer.isUnsigned() ? "u32" : "i32";
-        else if (type.isF16())
-            name = "f16";
-        else if (type.isF32())
-            name = "f32";
-        else if (type.isF64())
-            name = "f64";
-        else
+        StringRef storage;
+        std::string languageDtype;
+        if (type.isInteger(1)) {
+            storage = "bool";
+            languageDtype = "bool";
+        } else if (type.isInteger(32)) {
+            // Signless i32 is storage only. Language i32/u32 is applied later.
+            storage = "i32";
+        } else if (type.isF16()) {
+            storage = "f16";
+            languageDtype = "f16";
+        } else if (type.isF32()) {
+            storage = "f32";
+            languageDtype = "f32";
+        } else if (type.isF64()) {
+            storage = "f64";
+            languageDtype = "f64";
+        } else {
             return failure();
+        }
         std::string canonical;
         llvm::raw_string_ostream stream(canonical);
-        stream << "scalar(" << name << ',' << size << ',' << size << ')';
+        stream << "scalar(" << storage << ',' << size << ',' << size << ')';
         stream.flush();
-        return PlannedLayout{ValueAbiLayout{size, size, {}, std::nullopt, {{{}, {}, type, name.str(), 0, 1}}, {}},
-                             std::move(canonical)};
+        auto root = std::make_shared<CanonicalAbiNode>();
+        root->kind = CanonicalAbiNodeKind::Scalar;
+        root->type = type;
+        root->representation = storage.str();
+        root->size = size;
+        root->alignment = size;
+        return PlannedLayout{
+            ValueAbiLayout{size, size, {}, std::nullopt, {{{}, {}, type, std::move(languageDtype), 0, 1}}, {}, {}},
+            std::move(canonical), std::move(root)};
     }
     if (auto tensor = dyn_cast<RankedTensorType>(type)) {
         if (!tensor.hasStaticShape())
             return failure();
-        return planTensor(tensor.getElementType(), tensor.getShape(), module, activeStructs);
+        return planTensor(type, tensor.getElementType(), tensor.getShape(), module, activeStructs);
     }
     if (auto vector = dyn_cast<VectorType>(type))
-        return planTensor(vector.getElementType(), vector.getShape(), module, activeStructs);
+        return planTensor(type, vector.getElementType(), vector.getShape(), module, activeStructs);
     if (auto tensor = dyn_cast<TensorType>(type))
-        return planTensor(tensor.getElementType(), tensor.getShape(), module, activeStructs);
+        return planTensor(type, tensor.getElementType(), tensor.getShape(), module, activeStructs);
     if (auto tuple = dyn_cast<TupleType>(type)) {
         SmallVector<ResolvedStructField> fields;
         for (auto [index, element] : llvm::enumerate(tuple.getTypes()))
             fields.push_back({std::to_string(index), element});
-        return planProduct(fields, "tuple", module, activeStructs);
+        return planProduct(type, fields, "tuple", module, activeStructs);
     }
     auto structure = dyn_cast<StructType>(type);
     if (!structure || llvm::is_contained(activeStructs, structure.getName()))
@@ -357,7 +307,7 @@ FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<S
         return failure();
     activeStructs.push_back(structure.getName());
     std::string kind = ("struct(" + structure.getName() + ")").str();
-    FailureOr<PlannedLayout> result = planProduct(fields->fields, kind, module, activeStructs);
+    FailureOr<PlannedLayout> result = planProduct(type, fields->fields, kind, module, activeStructs);
     activeStructs.pop_back();
     if (succeeded(result)) {
         for (StructDeclOp declaration : module.getOps<StructDeclOp>()) {
@@ -380,6 +330,42 @@ FailureOr<PlannedLayout> planValue(Type type, ModuleOp module, SmallVectorImpl<S
     return result;
 }
 
+FailureOr<ValueAbiLayout> finishLayout(PlannedLayout planned, bool requireLanguageIntegers) {
+    for (ValueAbiLeaf &leaf : planned.layout.leaves) {
+        if (!leaf.scalarType.isInteger(32))
+            continue;
+        if (leaf.dtype.empty()) {
+            if (requireLanguageIntegers)
+                return failure();
+            leaf.dtype = "i32";
+        }
+    }
+    llvm::SHA256 hash;
+    hash.update(planned.canonical);
+    hash.update("|dtypes=");
+    for (auto [index, leaf] : llvm::enumerate(planned.layout.leaves)) {
+        if (index != 0)
+            hash.update(",");
+        hash.update(leaf.dtype);
+    }
+    planned.layout.layoutHash = llvm::toHex(hash.final(), true);
+    planned.layout.tree = CanonicalAbiTree{planned.root};
+    return std::move(planned.layout);
+}
+
+LogicalResult applyLogicalLeafDtypes(ValueAbiLayout &layout, ArrayRef<StringRef> logicalLeafDtypes) {
+    if (logicalLeafDtypes.empty())
+        return success();
+    if (logicalLeafDtypes.size() != layout.leaves.size())
+        return failure();
+    for (auto [leaf, dtype] : llvm::zip_equal(layout.leaves, logicalLeafDtypes)) {
+        if (!isCompatibleLogicalDtype(leaf.scalarType, dtype))
+            return failure();
+        leaf.dtype = dtype.str();
+    }
+    return success();
+}
+
 } // namespace
 
 ValueAbiPathComponent ValueAbiPathComponent::getField(StringRef name) { return ValueAbiPathComponent{name.str(), 0}; }
@@ -393,224 +379,447 @@ FailureOr<ValueAbiLayout> getValueAbiLayout(Type type, ModuleOp module, ArrayRef
     FailureOr<PlannedLayout> planned = planValue(type, module, activeStructs);
     if (failed(planned))
         return failure();
-    if (!logicalLeafDtypes.empty()) {
-        // Signless i32 cannot recover the source i32/u32 distinction. Apply
-        // validated frontend metadata before hashing or exposing ABI leaves.
-        if (logicalLeafDtypes.size() != planned->layout.leaves.size())
-            return failure();
-        for (auto [leaf, dtype] : llvm::zip_equal(planned->layout.leaves, logicalLeafDtypes)) {
-            if (!isCompatibleLogicalDtype(leaf.scalarType, dtype))
-                return failure();
-            leaf.dtype = dtype.str();
+    if (failed(applyLogicalLeafDtypes(planned->layout, logicalLeafDtypes)))
+        return failure();
+    return finishLayout(std::move(*planned), /*requireLanguageIntegers=*/true);
+}
+
+FailureOr<ValueAbiLayout> getValueStorageLayout(Type type, ModuleOp module) {
+    SmallVector<StringRef> activeStructs;
+    FailureOr<PlannedLayout> planned = planValue(type, module, activeStructs);
+    if (failed(planned))
+        return failure();
+    return finishLayout(std::move(*planned), /*requireLanguageIntegers=*/false);
+}
+
+LogicalResult rebaseValueAbiLayout(ValueAbiLayout &layout, const ValueAbiLayout &sourcePaths,
+                                   StringRef logicalIdentity) {
+    if (logicalIdentity.empty() || layout.leaves.size() != sourcePaths.leaves.size())
+        return failure();
+    llvm::SHA256 hash;
+    hash.update("value-abi-v1|");
+    hash.update(logicalIdentity);
+    hash.update("|size=");
+    hash.update(std::to_string(layout.size));
+    hash.update("|alignment=");
+    hash.update(std::to_string(layout.alignment));
+    for (auto [leaf, source] : llvm::zip_equal(layout.leaves, sourcePaths.leaves)) {
+        leaf.path = source.path;
+        hash.update("|leaf=");
+        for (const ValueAbiPathComponent &component : leaf.path) {
+            if (component.field) {
+                hash.update(".");
+                hash.update(*component.field);
+            } else {
+                hash.update("[");
+                hash.update(std::to_string(component.index));
+                hash.update("]");
+            }
+        }
+        hash.update(":");
+        hash.update(leaf.dtype);
+        hash.update(":");
+        hash.update(std::to_string(leaf.byteOffset));
+        hash.update(":");
+        hash.update(std::to_string(leaf.scalarCount));
+        for (uint64_t extent : leaf.shape) {
+            hash.update("x");
+            hash.update(std::to_string(extent));
         }
     }
-    llvm::SHA256 hash;
-    hash.update(planned->canonical);
-    hash.update("|dtypes=");
-    for (auto [index, leaf] : llvm::enumerate(planned->layout.leaves)) {
-        if (index != 0)
-            hash.update(",");
-        hash.update(leaf.dtype);
-    }
-    planned->layout.layoutHash = llvm::toHex(hash.final(), true);
-    return std::move(planned->layout);
+    layout.layoutHash = llvm::toHex(hash.final(), true);
+    return success();
 }
+
+FailureOr<CpuCallPlan> getCpuCallPlan(Type type, ModuleOp module, ArrayRef<StringRef> logicalLeafDtypes) {
+    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module, logicalLeafDtypes);
+    if (failed(layout))
+        return failure();
+
+    CpuCallPlan plan;
+    plan.layout = std::move(*layout);
+    for (auto [leafIndex, leaf] : llvm::enumerate(plan.layout.leaves)) {
+        const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
+        if (leaf.scalarCount == 0 || leaf.byteOffset > plan.layout.size)
+            return failure();
+        FailureOr<uint64_t> leafSize = checkedMultiply(scalarSize, leaf.scalarCount);
+        if (failed(leafSize) || *leafSize > plan.layout.size - leaf.byteOffset)
+            return failure();
+        for (uint64_t scalarIndex = 0; scalarIndex < leaf.scalarCount; ++scalarIndex) {
+            CpuCallLane lane;
+            lane.leafIndex = leafIndex;
+            lane.scalarIndex = scalarIndex;
+            plan.lanes.push_back(std::move(lane));
+        }
+    }
+    if (plan.lanes.empty() && plan.layout.size != 0)
+        return failure();
+    if (!plan.layout.tree.root)
+        return failure();
+    FailureOr<NodeProjection> projection = projectNode(*plan.layout.tree.root, PhysicalAbiProfile::HostValue);
+    if (failed(projection))
+        return failure();
+    plan.root = buildTransportTree(*plan.layout.tree.root, *projection, PhysicalAbiProfile::HostValue, 0);
+    if (!plan.root)
+        return failure();
+    return plan;
+}
+
+bool isCpuOpaqueAbiType(Type type) { return type.isIndex() || isa<TextureType, SamplerType>(type); }
 
 LogicalResult verifyValueAbiType(Type type, ModuleOp module) {
-    return success(succeeded(getValueAbiLayout(type, module)));
+    return success(succeeded(getValueStorageLayout(type, module)));
 }
 
-FailureOr<PhysicalValueAbiLayout> planPhysicalBytes(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+namespace {
+
+FailureOr<SmallVector<uint64_t>> rowMajorStrides(ArrayRef<uint64_t> shape, uint64_t elementStride) {
+    SmallVector<uint64_t> strides(shape.size());
+    uint64_t stride = elementStride;
+    for (size_t dimension = shape.size(); dimension-- > 0;) {
+        if (shape[dimension] == 0)
+            return failure();
+        strides[dimension] = stride;
+        FailureOr<uint64_t> next = checkedMultiply(stride, shape[dimension]);
+        if (failed(next))
+            return failure();
+        stride = *next;
+    }
+    return strides;
+}
+
+NodeProjection canonicalNodeProjection(const CanonicalAbiNode &canonical) {
+    if (canonical.kind != CanonicalAbiNodeKind::Array)
+        return {canonical.size, canonical.alignment, {}, canonical.childOffsets};
+    SmallVector<uint64_t> strides;
+    if (canonical.elementStride)
+        if (FailureOr<SmallVector<uint64_t>> computed = rowMajorStrides(canonical.shape, *canonical.elementStride);
+            succeeded(computed))
+            strides = std::move(*computed);
+    return {canonical.size, canonical.alignment, std::move(strides), {}};
+}
+
+uint32_t scalarBitWidth(const CanonicalAbiNode &canonical) {
+    if (canonical.type) {
+        Type scalar = canonical.type;
+        if (auto tensor = dyn_cast<RankedTensorType>(canonical.type))
+            scalar = tensor.getElementType();
+        else if (auto vector = dyn_cast<VectorType>(canonical.type))
+            scalar = vector.getElementType();
+        if (scalar.isIntOrFloat())
+            return scalar.getIntOrFloatBitWidth();
+    }
+    if (canonical.representation == "bool")
+        return 1;
+    if (canonical.representation == "f16")
+        return 16;
+    if (canonical.representation == "f32" || canonical.representation == "i32" || canonical.representation == "u32")
+        return 32;
+    if (canonical.representation == "f64")
+        return 64;
+    return 0;
+}
+
+bool isIndex(const CanonicalAbiNode &canonical) {
+    return canonical.representation == "index" || (canonical.type && canonical.type.isIndex());
+}
+
+bool isRankedTensor(const CanonicalAbiNode &canonical) {
+    return canonical.type && isa<RankedTensorType>(canonical.type);
+}
+
+bool isVectorOrTensor(const CanonicalAbiNode &canonical) {
+    return canonical.type && (isa<RankedTensorType>(canonical.type) || isa<VectorType>(canonical.type));
+}
+
+FailureOr<NodeProjection> projectNode(const CanonicalAbiNode &canonical, PhysicalAbiProfile profile) {
     if (profile == PhysicalAbiProfile::Count)
         return failure();
-    if (profile == PhysicalAbiProfile::HostValue) {
-        if (type.isIndex())
-            return PhysicalValueAbiLayout{8, 8};
-        if (isa<TensorViewType, TextureType, SamplerType>(type))
-            return PhysicalValueAbiLayout{8, 8};
-
-        FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
-        if (failed(logical))
-            return failure();
-        PhysicalValueAbiLayout result{logical->size, logical->alignment};
-        if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-            // CPU tensor values lower to LLVM vectors/aggregates. Keep the
-            // wrapper packing alignment identical to that lowered ABI while
-            // retaining the target-independent logical Value layout above.
-            result.alignment = result.size >= 16 ? 16 : result.size >= 8 ? 8 : 4;
-            FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
-            if (failed(element))
-                return failure();
-            FailureOr<SmallVector<uint64_t>> strides =
-                rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
-            if (failed(strides))
-                return failure();
-            result.byteStrides = std::move(*strides);
-        } else if (auto tensor = dyn_cast<TensorType>(type)) {
-            FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
-            if (failed(element))
-                return failure();
-            FailureOr<SmallVector<uint64_t>> strides =
-                rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
-            if (failed(strides))
-                return failure();
-            result.byteStrides = std::move(*strides);
-        }
-        return result;
-    }
+    if (profile == PhysicalAbiProfile::HostValue)
+        return canonicalNodeProjection(canonical);
+    if (canonical.kind == CanonicalAbiNodeKind::Product)
+        return NodeProjection{canonical.size, canonical.alignment, {}, canonical.childOffsets};
 
     if (profile == PhysicalAbiProfile::CudaKernelParameter) {
-        SmallVector<StringRef> activeStructs;
-        return planCudaValue(type, module, activeStructs);
+        if (canonical.kind == CanonicalAbiNodeKind::Scalar)
+            return NodeProjection{canonical.size, canonical.alignment};
+        if (canonical.children.size() != 1)
+            return failure();
+        FailureOr<NodeProjection> element = projectNode(*canonical.children.front(), profile);
+        if (failed(element))
+            return failure();
+        FailureOr<uint64_t> aligned = checkedAlign(element->size, element->alignment);
+        if (failed(aligned))
+            return failure();
+        FailureOr<SmallVector<uint64_t>> strides = rowMajorStrides(canonical.shape, *aligned);
+        if (failed(strides))
+            return failure();
+        uint64_t count = 1;
+        for (uint64_t extent : canonical.shape) {
+            FailureOr<uint64_t> next = checkedMultiply(count, extent);
+            if (failed(next))
+                return failure();
+            count = *next;
+        }
+        FailureOr<uint64_t> size = checkedMultiply(*aligned, count);
+        if (failed(size))
+            return failure();
+        uint64_t alignment = element->alignment;
+        if (isVectorOrTensor(canonical) && count > 1 && count <= 16) {
+            alignment = element->size;
+            while (alignment < *size && alignment < 16)
+                alignment *= 2;
+            alignment = std::min<uint64_t>(alignment, 16);
+        }
+        return NodeProjection{*size, alignment, std::move(*strides)};
     }
 
     if (profile == PhysicalAbiProfile::OpenGLNativeUniform) {
-        if (type.isIntOrFloat()) {
-            const uint64_t size = std::max<uint64_t>(type.getIntOrFloatBitWidth() / 8, 1);
-            return PhysicalValueAbiLayout{size, size};
+        if (canonical.kind == CanonicalAbiNodeKind::Scalar && !isIndex(canonical)) {
+            const uint64_t size = std::max<uint64_t>(scalarBitWidth(canonical) / 8, 1);
+            return NodeProjection{size, size};
         }
-        auto tensor = dyn_cast<RankedTensorType>(type);
-        if (!tensor || !tensor.hasStaticShape() || tensor.getRank() > 2 || !tensor.getElementType().isIntOrFloat())
+        if (!isRankedTensor(canonical) || canonical.shape.size() > 2)
             return failure();
-        const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
-        if (tensor.getRank() == 0)
-            return PhysicalValueAbiLayout{elementSize, elementSize};
-        if (tensor.getRank() == 1) {
-            const uint64_t count = static_cast<uint64_t>(tensor.getDimSize(0));
-            return PhysicalValueAbiLayout{count * elementSize, elementSize, {elementSize}};
-        }
-        const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
-        const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
-        return PhysicalValueAbiLayout{rows * columns * elementSize, elementSize, {elementSize, rows * elementSize}};
+        const uint64_t elementSize = std::max<uint64_t>(scalarBitWidth(canonical) / 8, 1);
+        if (canonical.shape.empty())
+            return NodeProjection{elementSize, elementSize};
+        if (canonical.shape.size() == 1)
+            return NodeProjection{canonical.shape[0] * elementSize, elementSize, {elementSize}};
+        const uint64_t rows = canonical.shape[0];
+        const uint64_t columns = canonical.shape[1];
+        return NodeProjection{rows * columns * elementSize, elementSize, {elementSize, rows * elementSize}};
     }
 
     if (profile == PhysicalAbiProfile::DirectXConstantBuffer) {
-        if (auto tensor = dyn_cast<RankedTensorType>(type);
-            tensor && tensor.hasStaticShape() && tensor.getRank() == 2 && tensor.getElementType().isIntOrFloat()) {
-            const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
-            const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
-            const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
-            const uint64_t rowStride = std::max<uint64_t>(columns * elementSize, 16);
-            return PhysicalValueAbiLayout{rows * rowStride, 16, {rowStride, elementSize}};
+        if (isRankedTensor(canonical) && canonical.shape.size() == 2) {
+            const uint64_t elementSize = std::max<uint64_t>(scalarBitWidth(canonical) / 8, 1);
+            const uint64_t rows = canonical.shape[0];
+            const uint64_t columns = canonical.shape[1];
+            FailureOr<uint64_t> rowStride = checkedAlign(columns * elementSize, 16);
+            if (failed(rowStride))
+                return failure();
+            return NodeProjection{rows * *rowStride, 16, {*rowStride, elementSize}};
         }
     }
 
     const bool std430 = profile == PhysicalAbiProfile::VulkanStd430StorageBuffer ||
                         profile == PhysicalAbiProfile::VulkanPushConstant ||
                         profile == PhysicalAbiProfile::MetalConstantBuffer;
-    if (type.isIndex())
-        return PhysicalValueAbiLayout{4, 4};
-    if (auto tensor = dyn_cast<RankedTensorType>(type)) {
-        if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
-            !tensor.getElementType().isIntOrFloat())
-            return failure();
-        const uint64_t elementSize = std::max<uint64_t>(tensor.getElementType().getIntOrFloatBitWidth() / 8, 1);
-        if (tensor.getRank() == 0)
-            return PhysicalValueAbiLayout{elementSize, elementSize};
-        if (tensor.getRank() == 1 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4) {
-            const uint64_t count = static_cast<uint64_t>(tensor.getDimSize(0));
-            const uint64_t alignment = (count == 2 ? 2 : 4) * elementSize;
-            return PhysicalValueAbiLayout{count * elementSize, alignment, {elementSize}};
+    if (isIndex(canonical))
+        return NodeProjection{4, 4};
+    if (isRankedTensor(canonical)) {
+        const uint64_t elementSize = std::max<uint64_t>(scalarBitWidth(canonical) / 8, 1);
+        if (canonical.shape.empty())
+            return NodeProjection{elementSize, elementSize};
+        if (canonical.shape.size() == 1 && canonical.shape[0] >= 2 && canonical.shape[0] <= 4) {
+            const uint64_t count = canonical.shape[0];
+            return NodeProjection{count * elementSize, (count == 2 ? 2 : 4) * elementSize, {elementSize}};
         }
-        if (tensor.getRank() == 2 && tensor.getDimSize(0) >= 2 && tensor.getDimSize(0) <= 4 &&
-            tensor.getDimSize(1) >= 2 && tensor.getDimSize(1) <= 4) {
-            const uint64_t rows = static_cast<uint64_t>(tensor.getDimSize(0));
-            const uint64_t columns = static_cast<uint64_t>(tensor.getDimSize(1));
+        if (canonical.shape.size() == 2 && canonical.shape[0] >= 2 && canonical.shape[0] <= 4 &&
+            canonical.shape[1] >= 2 && canonical.shape[1] <= 4) {
+            const uint64_t rows = canonical.shape[0];
+            const uint64_t columns = canonical.shape[1];
             const uint64_t vectorAlignment = (rows == 2 ? 2 : 4) * elementSize;
             const uint64_t columnAlignment = std430 ? vectorAlignment : std::max<uint64_t>(vectorAlignment, 16);
-            const uint64_t stride = llvm::alignTo(rows * elementSize, columnAlignment);
-            return PhysicalValueAbiLayout{stride * columns, columnAlignment, {elementSize, stride}};
+            FailureOr<uint64_t> stride = checkedAlign(rows * elementSize, columnAlignment);
+            if (failed(stride))
+                return failure();
+            return NodeProjection{*stride * columns, columnAlignment, {elementSize, *stride}};
         }
 
         uint64_t size = elementSize;
         uint64_t alignment = elementSize;
         SmallVector<uint64_t> reversedStrides;
-        for (int64_t extent : llvm::reverse(tensor.getShape())) {
+        for (auto extent = canonical.shape.rbegin(); extent != canonical.shape.rend(); ++extent) {
             if (!std430)
                 alignment = std::max<uint64_t>(alignment, 16);
             FailureOr<uint64_t> stride = checkedAlign(size, alignment);
-            FailureOr<uint64_t> next = succeeded(stride) ? checkedMultiply(*stride, static_cast<uint64_t>(extent))
-                                                         : FailureOr<uint64_t>(failure());
+            FailureOr<uint64_t> next =
+                succeeded(stride) ? checkedMultiply(*stride, *extent) : FailureOr<uint64_t>(failure());
             if (failed(next))
                 return failure();
             reversedStrides.push_back(*stride);
             size = *next;
         }
-        return PhysicalValueAbiLayout{size, alignment,
-                                      SmallVector<uint64_t>(reversedStrides.rbegin(), reversedStrides.rend())};
+        return NodeProjection{size, alignment, SmallVector<uint64_t>(reversedStrides.rbegin(), reversedStrides.rend())};
     }
 
-    FailureOr<ValueAbiLayout> logical = getValueAbiLayout(type, module);
-    if (failed(logical))
-        return failure();
-    PhysicalValueAbiLayout result{logical->size, logical->alignment};
-    if (auto tensor = dyn_cast<TensorType>(type)) {
-        FailureOr<ValueAbiLayout> element = getValueAbiLayout(tensor.getElementType(), module);
+    NodeProjection result{canonical.size, canonical.alignment,
+                          canonical.elementStride ? SmallVector<uint64_t>{*canonical.elementStride}
+                                                  : SmallVector<uint64_t>{}};
+    if (canonical.kind == CanonicalAbiNodeKind::Array) {
+        if (canonical.children.size() != 1)
+            return failure();
+        FailureOr<NodeProjection> element = projectNode(*canonical.children.front(), profile);
         if (failed(element))
             return failure();
-        FailureOr<SmallVector<uint64_t>> strides =
-            rowMajorStrides(tensor.getShape(), llvm::alignTo(element->size, element->alignment));
+        FailureOr<uint64_t> aligned = checkedAlign(element->size, element->alignment);
+        if (failed(aligned))
+            return failure();
+        FailureOr<SmallVector<uint64_t>> strides = rowMajorStrides(canonical.shape, *aligned);
         if (failed(strides))
             return failure();
         result.byteStrides = std::move(*strides);
+        uint64_t count = 1;
+        for (uint64_t extent : canonical.shape) {
+            FailureOr<uint64_t> next = checkedMultiply(count, extent);
+            if (failed(next))
+                return failure();
+            count = *next;
+        }
+        FailureOr<uint64_t> size = checkedMultiply(*aligned, count);
+        if (failed(size))
+            return failure();
+        result.size = *size;
+        result.alignment = element->alignment;
     }
     return result;
 }
 
-FailureOr<PhysicalValueAbiPlan> getPhysicalValueAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+std::pair<uint64_t, uint64_t> hostPointerLayout(ModuleOp module) {
+    const auto layoutAttribute = module->getAttrOfType<StringAttr>("llvm.data_layout");
+    const llvm::DataLayout layout(layoutAttribute ? layoutAttribute.getValue() : StringRef());
+    return {layout.getPointerSize(), layout.getPointerABIAlignment(0).value()};
+}
+
+std::shared_ptr<const ByteTransportNode> buildTransportTree(const CanonicalAbiNode &canonical,
+                                                            const NodeProjection &physical, PhysicalAbiProfile profile,
+                                                            uint64_t byteOffset) {
+    auto node = std::make_shared<ByteTransportNode>();
+    node->kind = canonical.kind == CanonicalAbiNodeKind::Product ? ByteTransportNodeKind::Product
+                 : canonical.kind == CanonicalAbiNodeKind::Array ? ByteTransportNodeKind::Array
+                                                                 : ByteTransportNodeKind::Scalar;
+    node->representation = canonical.kind == CanonicalAbiNodeKind::Scalar && isIndex(canonical) &&
+                                   profile != PhysicalAbiProfile::HostValue &&
+                                   profile != PhysicalAbiProfile::CudaKernelParameter
+                               ? "i32"
+                               : canonical.representation;
+    node->byteOffset = byteOffset;
+    node->size = physical.size;
+    node->alignment = physical.alignment;
+    node->shape.assign(canonical.shape.begin(), canonical.shape.end());
+    node->byteStrides.assign(physical.byteStrides.begin(), physical.byteStrides.end());
+    if (canonical.kind == CanonicalAbiNodeKind::Product) {
+        for (size_t index = 0; index < canonical.children.size(); ++index) {
+            const CanonicalAbiNode &child = *canonical.children[index];
+            NodeProjection childLayout = canonicalNodeProjection(child);
+            if (index >= physical.childOffsets.size())
+                return {};
+            node->children.push_back(buildTransportTree(child, childLayout, profile, physical.childOffsets[index]));
+        }
+    } else if (canonical.kind == CanonicalAbiNodeKind::Array && !canonical.children.empty()) {
+        const CanonicalAbiNode &child = *canonical.children.front();
+        FailureOr<NodeProjection> childLayout = projectNode(child, profile);
+        if (failed(childLayout))
+            return {};
+        node->children.push_back(buildTransportTree(child, *childLayout, profile, 0));
+    }
+    return node;
+}
+
+} // namespace
+
+FailureOr<BackendInterfaceAbiPlan> getBackendInterfaceAbiPlan(Type type, ModuleOp module, PhysicalAbiProfile profile,
+                                                              ArrayRef<StringRef> logicalLeafDtypes) {
     if (auto view = dyn_cast<TensorViewType>(type)) {
-        FailureOr<ValueAbiLayout> element = getValueAbiLayout(view.getElementType(), module);
-        if (failed(element))
+        if (failed(getValueStorageLayout(view.getElementType(), module)))
             return failure();
         switch (profile) {
-        case PhysicalAbiProfile::HostValue:
-            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{
+        case PhysicalAbiProfile::HostValue: {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{
                 PhysicalResourceAbiKind::TensorViewDescriptor,
-                8 * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), 8, std::move(*element)}};
+                pointerSize * (2 + 2 * static_cast<uint64_t>(view.getShape().size())), pointerAlignment}};
+        }
         case PhysicalAbiProfile::CudaKernelParameter:
-            return PhysicalValueAbiPlan{
-                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0, std::move(*element)}};
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::CudaStorageLeaves, 0, 0}};
         case PhysicalAbiProfile::VulkanStd140UniformBuffer:
         case PhysicalAbiProfile::VulkanStd430StorageBuffer:
         case PhysicalAbiProfile::VulkanPushConstant:
         case PhysicalAbiProfile::OpenGLNativeUniform:
         case PhysicalAbiProfile::DirectXConstantBuffer:
         case PhysicalAbiProfile::MetalConstantBuffer:
-            return PhysicalValueAbiPlan{
-                PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsStorageLeaves, 0, 0, std::move(*element)}};
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsStorageLeaves, 0, 0}};
         case PhysicalAbiProfile::Count:
             return failure();
         }
     }
     if (isa<TextureType>(type)) {
-        if (profile == PhysicalAbiProfile::HostValue)
-            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile == PhysicalAbiProfile::HostValue) {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{
+                ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, pointerSize, pointerAlignment}};
+        }
         if (profile != PhysicalAbiProfile::CudaKernelParameter)
-            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsTexture}};
-        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"texture_argument"}};
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsTexture, 0, 0}};
+        return BackendInterfaceAbiPlan{UnsupportedBackendInterfaceAbi{"texture_argument"}};
     }
     if (isa<SamplerType>(type)) {
-        if (profile == PhysicalAbiProfile::HostValue)
-            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::HostPointer, 8, 8}};
+        if (profile == PhysicalAbiProfile::HostValue) {
+            const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+            return BackendInterfaceAbiPlan{
+                ResourceBindingPlan{PhysicalResourceAbiKind::HostPointer, pointerSize, pointerAlignment}};
+        }
         if (profile != PhysicalAbiProfile::CudaKernelParameter)
-            return PhysicalValueAbiPlan{PhysicalResourceAbiLayout{PhysicalResourceAbiKind::GraphicsSampler}};
-        return PhysicalValueAbiPlan{UnsupportedPhysicalValueAbi{"sampler_argument"}};
+            return BackendInterfaceAbiPlan{ResourceBindingPlan{PhysicalResourceAbiKind::GraphicsSampler, 0, 0}};
+        return BackendInterfaceAbiPlan{UnsupportedBackendInterfaceAbi{"sampler_argument"}};
     }
-    FailureOr<PhysicalValueAbiLayout> bytes = planPhysicalBytes(type, module, profile);
-    if (failed(bytes))
+    if (type.isIndex()) {
+        const auto [pointerSize, pointerAlignment] = hostPointerLayout(module);
+        CanonicalAbiNode canonical;
+        canonical.kind = CanonicalAbiNodeKind::Scalar;
+        canonical.type = type;
+        canonical.representation = "index";
+        canonical.size = pointerSize;
+        canonical.alignment = pointerAlignment;
+        const std::string layoutHash =
+            hashCanonical("scalar(index," + std::to_string(pointerSize) + "," + std::to_string(pointerAlignment) + ")");
+        FailureOr<NodeProjection> projection = projectNode(canonical, profile);
+        if (failed(projection))
+            return failure();
+        std::shared_ptr<const ByteTransportNode> root = buildTransportTree(canonical, *projection, profile, 0);
+        if (profile == PhysicalAbiProfile::CudaKernelParameter)
+            return BackendInterfaceAbiPlan{KernelParameterPlan{layoutHash, std::move(root)}};
+        return BackendInterfaceAbiPlan{ByteTransportPlan{profile, layoutHash, std::move(root)}};
+    }
+    FailureOr<ValueAbiLayout> canonical = getValueAbiLayout(type, module, logicalLeafDtypes);
+    if (failed(canonical) || !canonical->tree.root)
         return failure();
-    return PhysicalValueAbiPlan{std::move(*bytes)};
+    FailureOr<NodeProjection> projection = projectNode(*canonical->tree.root, profile);
+    if (failed(projection))
+        return failure();
+    std::shared_ptr<const ByteTransportNode> root = buildTransportTree(*canonical->tree.root, *projection, profile, 0);
+    if (!root)
+        return failure();
+    if (profile == PhysicalAbiProfile::CudaKernelParameter)
+        return BackendInterfaceAbiPlan{KernelParameterPlan{canonical->layoutHash, std::move(root)}};
+    if (profile == PhysicalAbiProfile::OpenGLNativeUniform)
+        return BackendInterfaceAbiPlan{NativeUniformPlan{canonical->layoutHash, std::move(root)}};
+    return BackendInterfaceAbiPlan{ByteTransportPlan{profile, canonical->layoutHash, std::move(root)}};
 }
 
-FailureOr<PhysicalValueAbiLayout> getPhysicalValueAbiLayout(Type type, ModuleOp module, PhysicalAbiProfile profile) {
-    FailureOr<PhysicalValueAbiPlan> plan = getPhysicalValueAbiPlan(type, module, profile);
-    if (failed(plan))
+FailureOr<ByteTransportPlan> getByteTransportPlan(Type type, ModuleOp module, PhysicalAbiProfile profile) {
+    if (type.isIndex()) {
+        FailureOr<BackendInterfaceAbiPlan> plan = getBackendInterfaceAbiPlan(type, module, profile);
+        if (failed(plan))
+            return failure();
+        if (auto *bytes = std::get_if<ByteTransportPlan>(&*plan))
+            return *bytes;
         return failure();
-    if (auto *bytes = std::get_if<PhysicalValueAbiLayout>(&*plan))
-        return *bytes;
-    if (auto *resource = std::get_if<PhysicalResourceAbiLayout>(&*plan); resource && resource->handleSize != 0)
-        return PhysicalValueAbiLayout{resource->handleSize, resource->handleAlignment};
-    return failure();
+    }
+    FailureOr<ValueAbiLayout> storage = getValueStorageLayout(type, module);
+    if (failed(storage) || !storage->tree.root)
+        return failure();
+    FailureOr<NodeProjection> projection = projectNode(*storage->tree.root, profile);
+    if (failed(projection))
+        return failure();
+    std::shared_ptr<const ByteTransportNode> root = buildTransportTree(*storage->tree.root, *projection, profile, 0);
+    if (!root)
+        return failure();
+    if (profile == PhysicalAbiProfile::CudaKernelParameter || profile == PhysicalAbiProfile::OpenGLNativeUniform)
+        return failure();
+    return ByteTransportPlan{profile, storage->layoutHash, std::move(root)};
 }
 
 FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorViewType view, ModuleOp module) {
@@ -620,7 +829,7 @@ FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorVi
     if (view.getShape().empty() || llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
         return failure();
 
-    FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
     if (failed(layout))
         return failure();
 

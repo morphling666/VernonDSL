@@ -7,6 +7,8 @@ extern "C" {
 #endif
 
 typedef struct VernonPythonValueAbiPlan VernonPythonValueAbiPlan;
+typedef struct VernonPythonStructuredVjp VernonPythonStructuredVjp;
+typedef struct VernonPythonProgramBuiltin VernonPythonProgramBuiltin;
 
 typedef struct VernonPythonValueAbiNodeView {
     uint64_t byte_size;
@@ -24,6 +26,38 @@ typedef struct VernonPythonValueAbiPlanView {
     size_t node_count;
 } VernonPythonValueAbiPlanView;
 
+typedef struct VernonPythonNamedMetricView {
+    VernonStringView name;
+    uint64_t value;
+} VernonPythonNamedMetricView;
+
+typedef struct VernonPythonStructuredVjpView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView forward_module;
+    VernonStringView backward_module;
+    uint64_t tape_bytes;
+    uint64_t active_operation_count;
+    uint64_t recomputation_cost;
+    const VernonStringView *derivative_rules;
+    size_t derivative_rule_count;
+    const VernonStringView *required_primal_paths;
+    size_t required_primal_path_count;
+    const VernonPythonNamedMetricView *source_kind_counts;
+    size_t source_kind_count;
+    const VernonPythonNamedMetricView *cost_components;
+    size_t cost_component_count;
+    VernonStringView selected_policy;
+    uint32_t whole_dispatch_retention_permitted;
+} VernonPythonStructuredVjpView;
+
+typedef struct VernonPythonProgramBuiltinView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView entry;
+    VernonStringView module;
+} VernonPythonProgramBuiltinView;
+
 /*
  * Private bridge for the in-tree Python extension. It is exported from the
  * compiler DLL but is not installed and is not part of the public C ABI.
@@ -34,6 +68,40 @@ VERNON_DSL_CAPI VernonPythonValueAbiPlan *vernonCompilerPlanPythonValueAbi(Verno
 VERNON_DSL_CAPI void vernonCompilerDestroyPythonValueAbiPlan(VernonPythonValueAbiPlan *plan);
 VERNON_DSL_CAPI VernonPythonValueAbiPlanView
 vernonCompilerGetPythonValueAbiPlanView(const VernonPythonValueAbiPlan *plan);
+
+VERNON_DSL_CAPI VernonPythonStructuredVjp *
+vernonCompilerBuildPythonStructuredVjp(VernonStringView module, VernonStringView entry,
+                                       const VernonStringView *wrt_paths, size_t wrt_path_count,
+                                       const VernonStringView *output_paths, size_t output_path_count,
+                                       VernonStringView forward_symbol, VernonStringView backward_symbol);
+VERNON_DSL_CAPI VernonStatus vernonCompilerFinalizePythonStructuredVjp(VernonPythonStructuredVjp *result,
+                                                                       VernonStringView profiles_identity);
+VERNON_DSL_CAPI void vernonCompilerDestroyPythonStructuredVjp(VernonPythonStructuredVjp *result);
+VERNON_DSL_CAPI VernonPythonStructuredVjpView
+vernonCompilerGetPythonStructuredVjpView(const VernonPythonStructuredVjp *result);
+
+VERNON_DSL_CAPI VernonPythonProgramBuiltin *
+vernonCompilerBuildPythonProgramBuiltin(VernonStringView operation, VernonStringView element_type, uint32_t rank,
+                                        const VernonStringView *leaf_dtypes, size_t leaf_dtype_count);
+VERNON_DSL_CAPI void vernonCompilerDestroyPythonProgramBuiltin(VernonPythonProgramBuiltin *result);
+VERNON_DSL_CAPI VernonPythonProgramBuiltinView
+vernonCompilerGetPythonProgramBuiltinView(const VernonPythonProgramBuiltin *result);
+
+typedef struct VernonPythonSpecializedKernel VernonPythonSpecializedKernel;
+
+typedef struct VernonPythonSpecializedKernelView {
+    VernonStatus status;
+    VernonStringView diagnostics;
+    VernonStringView module;
+} VernonPythonSpecializedKernelView;
+
+VERNON_DSL_CAPI VernonPythonSpecializedKernel *
+vernonCompilerSpecializeKernelHostConstants(VernonStringView module, VernonStringView entry,
+                                            const VernonStringView *names, const int32_t *kinds,
+                                            const int64_t *integers, const double *floats, size_t count);
+VERNON_DSL_CAPI void vernonCompilerDestroySpecializedKernel(VernonPythonSpecializedKernel *result);
+VERNON_DSL_CAPI VernonPythonSpecializedKernelView
+vernonCompilerGetSpecializedKernelView(const VernonPythonSpecializedKernel *result);
 
 #ifdef __cplusplus
 }

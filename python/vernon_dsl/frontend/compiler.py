@@ -4,16 +4,18 @@ import ast
 from pathlib import Path
 from typing import Iterable
 
+from ..ad import ProgramTransformSpec
 from ..diagnostics import CompileError, SourceLocation
 from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
+from .autodiff_profiles import AutodiffProfilePlan
 from .cache import frontend_cache
 from .emission import emit_mlir_module
 from .lowering import _FunctionEmitter
 from .lowering_types import DslType, FunctionSignature, ModuleContext
-from .model import ConcreteType, is_abi_stable_value
+from .model import AccessMode, ConcreteType, StorageEffect, StorageOwnerKind, StorageRegionKind, is_abi_stable_value
 from .monomorphize import infer_and_monomorphize_helpers
 from .request import FrontendCompileRequest, FrontendCompileResult
 from .specialization import specialize_frontend_source
@@ -32,6 +34,8 @@ class Compiler:
         enabled_features: tuple[str, ...] = (),
         runtime_entry: str | None = None,
         runtime_workgroup_size: tuple[int, int, int] | None = None,
+        program_transform: ProgramTransformSpec | None = None,
+        autodiff_planning_policy: str | None = None,
     ) -> str:
         """Compile an already loaded module without entry-specialization caching."""
         try:
@@ -46,17 +50,36 @@ class Compiler:
         self._collect_struct_names(module, context)
         type_parser = TypeParser(context)
         self._collect_structs(module, context, type_parser)
+        self._structs = tuple(
+            (
+                name,
+                tuple((field_name, annotation.type) for field_name, annotation in fields),
+            )
+            for name, fields in sorted(context.structs.items())
+        )
         self._validate_entry_annotations(module, context)
         module = infer_and_monomorphize_helpers(
             module,
             lambda annotation: type_parser.parse(annotation).type,
+            lambda annotation: type_parser.parse(annotation).metadata,
             context.error,
             tuple(sorted(enabled_features)),
         )
         self._helper_specializations = tuple(getattr(module, "_vernon_helper_specializations", ()))
         self._typed_functions = tuple(getattr(module, "_vernon_typed_functions", ()))
+        self._entry_workgroup_size: tuple[int, int, int] | None = None
         context.typed_functions = {function.symbol: function for function in self._typed_functions}
         self._collect_signatures(module, context, type_parser)
+        self._autodiff_profiles: AutodiffProfilePlan | None = None
+        if program_transform is not None:
+            self._validate_program_transform(program_transform, runtime_entry, context)
+            assert runtime_entry is not None
+            entry_node = next(
+                node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == runtime_entry
+            )
+            entry_stage, _ = self._decorator(entry_node, context)
+            if entry_stage != "compute":
+                raise context.error(entry_node, "autodiff currently requires a compute entry")
 
         def emit_function(node: ast.FunctionDef) -> list[str]:
             stage, workgroup_size = self._decorator(node, context)
@@ -64,6 +87,8 @@ class Compiler:
                 if stage != "compute":
                     raise context.error(node, "runtime workgroup size applies only to compute entries")
                 workgroup_size = runtime_workgroup_size
+            if node.name == runtime_entry:
+                self._entry_workgroup_size = workgroup_size
             annotations = [type_parser.parse(argument.annotation) for argument in node.args.args]
             return _FunctionEmitter(
                 context,
@@ -73,6 +98,13 @@ class Compiler:
                 context.typed_functions[node.name],
                 stage,
                 workgroup_size,
+                (
+                    program_transform.planning_policy
+                    if program_transform is not None and node.name == runtime_entry
+                    else autodiff_planning_policy
+                    if node.name == runtime_entry
+                    else None
+                ),
             ).emit()
 
         return emit_mlir_module(
@@ -83,22 +115,37 @@ class Compiler:
             structs=context.structs,
             emit_function=emit_function,
             error=context.error,
+            program_transform=program_transform,
+            autodiff_profiles=self._autodiff_profiles,
         )
 
-    def compile_file(self, input_path: str | Path, *, features: Iterable[str] = (), entry: str | None = None) -> str:
+    def compile_file(
+        self,
+        input_path: str | Path,
+        *,
+        features: Iterable[str] = (),
+        entry: str | None = None,
+        program_transform: ProgramTransformSpec | None = None,
+    ) -> str:
         """Compile one entry with caching, or an uncached whole module when entry is omitted."""
         path = Path(input_path)
         enabled_features = tuple(sorted(set(features)))
         if entry is None:
+            if program_transform is not None:
+                raise ValueError("program transforms require one specialized entry")
             project = load_project(path, enabled_features, entry)
             return self.compile(project.source, str(path), project.dependencies, project.features, enabled_features)
-        return self.compile_request(FrontendCompileRequest(path, entry, enabled_features)).mlir
+        return self.compile_request(
+            FrontendCompileRequest(path, entry, enabled_features, program_transform=program_transform)
+        ).mlir
 
     def compile_request(self, request: FrontendCompileRequest) -> FrontendCompileResult:
         cached = frontend_cache.get(request)
         if cached is not None:
             self._helper_specializations = cached.helper_specializations
             self._typed_functions = cached.typed_functions
+            self._autodiff_profiles = cached.autodiff_profiles
+            self._entry_workgroup_size = cached.entry_workgroup_size
             return cached
 
         project = load_project(request.source_path, request.enabled_features, request.entry)
@@ -111,6 +158,8 @@ class Compiler:
             enabled_features=request.enabled_features,
             runtime_entry=request.entry,
             runtime_workgroup_size=request.workgroup_size,
+            program_transform=request.program_transform,
+            autodiff_planning_policy=request.autodiff_planning_policy,
         )
         result = FrontendCompileResult(
             mlir,
@@ -120,6 +169,9 @@ class Compiler:
             request,
             self._helper_specializations,
             self._typed_functions,
+            self._autodiff_profiles,
+            self._entry_workgroup_size,
+            self._structs,
         )
         frontend_cache.put(request, result, project.dependency_files)
         return result
@@ -128,6 +180,94 @@ class Compiler:
     def clear_cache() -> None:
         frontend_cache.clear()
         clear_project_cache()
+
+    @staticmethod
+    def _validate_program_transform(
+        transform: ProgramTransformSpec,
+        runtime_entry: str | None,
+        context: ModuleContext,
+    ) -> None:
+        if runtime_entry is None:
+            raise ValueError("program transforms require one specialized entry")
+        function = context.typed_functions.get(runtime_entry)
+        if function is None:
+            raise ValueError(f"program transform entry '{runtime_entry}' has no typed function")
+        unsupported_effects = [
+            effect
+            for effect in function.effects
+            if not isinstance(effect, StorageEffect)
+            or effect.owner.kind is not StorageOwnerKind.PARAMETER
+            or effect.region.kind not in {StorageRegionKind.ELEMENT, StorageRegionKind.UNKNOWN}
+        ]
+        if unsupported_effects:
+            raise context.error(
+                function.source,
+                "Storage VJP requires static effects or analyzable parallel TensorView parameter effects",
+            )
+
+        def floating_leaves(value_type: ConcreteType) -> int:
+            if value_type.kind == "scalar":
+                return int(value_type.is_float)
+            if value_type.kind in {"tensor", "tensor_view"}:
+                element = value_type.arguments[0]
+                return floating_leaves(element) if isinstance(element, ConcreteType) else 0
+            if value_type.kind == "tuple":
+                return sum(floating_leaves(item) for item in value_type.arguments if isinstance(item, ConcreteType))
+            if value_type.kind == "struct":
+                return sum(floating_leaves(field.type) for _, field in context.structs[value_type.name])
+            return 0
+
+        if function.result_type is not None:
+            raise context.error(
+                function.source, "compute kernels must return None; VJP objectives are writable Storage"
+            )
+        typed_parameters = {parameter.name: parameter for parameter in function.parameters}
+
+        def resolve_path(path: str, *, role: str) -> ConcreteType:
+            components = path.split(".")
+            parameter = typed_parameters.get(components[0])
+            if parameter is None:
+                raise context.error(function.source, f"VJP {role} path '{path}' names no entry parameter")
+            if parameter.builtin is not None:
+                raise context.error(function.source, f"VJP {role} path '{path}' names a builtin parameter")
+            value_type = parameter.type
+            for component in components[1:]:
+                if value_type.kind == "struct":
+                    fields = dict(context.structs[value_type.name])
+                    field = fields.get(component)
+                    if field is None:
+                        raise context.error(function.source, f"VJP {role} path '{path}' names no Struct field")
+                    value_type = field.type
+                elif value_type.kind == "tuple" and component.isdigit():
+                    index = int(component)
+                    nested = value_type.arguments[index] if index < len(value_type.arguments) else None
+                    if not isinstance(nested, ConcreteType):
+                        raise context.error(function.source, f"VJP {role} path '{path}' has an invalid Tuple index")
+                    value_type = nested
+                else:
+                    raise context.error(function.source, f"VJP {role} path '{path}' does not resolve to a projection")
+            return value_type
+
+        for path in transform.wrt:
+            value_type = resolve_path(path, role="wrt")
+            if value_type.kind in {"struct", "tuple"}:
+                raise context.error(
+                    function.source,
+                    f"VJP wrt path '{path}' must resolve to one differentiable Scalar or Tensor leaf (or TensorView)",
+                )
+            if not floating_leaves(value_type):
+                raise context.error(function.source, f"VJP wrt path '{path}' has no differentiable floating leaves")
+        if not transform.output_cotangents:
+            raise context.error(function.source, "compute VJP requires non-empty writable Storage outputs")
+        for path in transform.output_cotangents:
+            value_type = resolve_path(path, role="output")
+            parameter = typed_parameters[path.split(".", 1)[0]]
+            if value_type.kind != "tensor_view":
+                raise context.error(function.source, f"VJP output path '{path}' must resolve to TensorView Storage")
+            if parameter.access is AccessMode.READ:
+                raise context.error(function.source, f"VJP output path '{path}' must be writable")
+            if not floating_leaves(value_type):
+                raise context.error(function.source, f"VJP output path '{path}' has no differentiable floating leaves")
 
     @staticmethod
     def _validate_entry_annotations(module: ast.Module, context: ModuleContext) -> None:
@@ -327,5 +467,11 @@ def compile_source(source: str, filename: str = "<string>") -> str:
     return Compiler().compile(source, filename)
 
 
-def compile_file(input_path: str | Path, *, features: Iterable[str] = (), entry: str | None = None) -> str:
-    return Compiler().compile_file(input_path, features=features, entry=entry)
+def compile_file(
+    input_path: str | Path,
+    *,
+    features: Iterable[str] = (),
+    entry: str | None = None,
+    program_transform: ProgramTransformSpec | None = None,
+) -> str:
+    return Compiler().compile_file(input_path, features=features, entry=entry, program_transform=program_transform)

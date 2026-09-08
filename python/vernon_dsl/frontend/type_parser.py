@@ -6,7 +6,7 @@ from typing import Protocol
 
 from ..language.ast_utils import dotted_name, subscript_items
 from ..language.scalar_types import SCALAR_ALIASES, SCALAR_TYPES
-from .model import ConcreteType, is_abi_stable_value, semantic_category
+from .model import ConcreteType, InterfaceMetadata, is_abi_stable_value, semantic_category
 
 
 class TypeContext(Protocol):
@@ -16,15 +16,9 @@ class TypeContext(Protocol):
 
 
 @dataclass(frozen=True)
-class Metadata:
-    kind: str
-    arguments: tuple[int | str, ...]
-
-
-@dataclass(frozen=True)
 class AnnotatedType:
     type: ConcreteType
-    metadata: tuple[Metadata, ...] = ()
+    metadata: tuple[InterfaceMetadata, ...] = ()
 
 
 class TypeParser:
@@ -91,27 +85,48 @@ class TypeParser:
                 raise self.context.error(node, "TensorView requires an element type, shape, and access mode")
             element = self.parse_type(items[0])
             self._require_storage_element(items[0], element, "TensorView")
-            if not isinstance(items[1], ast.Tuple) or not items[1].elts:
-                raise self.context.error(items[1], "TensorView shape must be a non-empty tuple")
+            if not isinstance(items[1], ast.Tuple):
+                raise self.context.error(items[1], "TensorView shape must be a tuple")
             shape = tuple(self._tensor_view_extent(item) for item in items[1].elts)
             access = self._string_or_name(items[2], "TensorView access")
             if access not in {"read", "write", "read_write"}:
                 raise self.context.error(items[2], "TensorView access must be read, write, or read_write")
             return ConcreteType("tensor_view", "TensorView", (element, shape, access, "device"))
         if constructor == "Texture":
-            if len(items) != 2:
-                raise self.context.error(node, "Texture requires a dimension and element type")
+            if len(items) not in {2, 3}:
+                raise self.context.error(
+                    node,
+                    "Texture requires dimension and sample type, or dimension, storage format, and access",
+                )
             dimension = self._string_or_name(items[0], "texture dimension")
             if dimension not in {"2d", "3d", "cube"}:
                 raise self.context.error(
                     items[0],
                     "texture dimension must be one of '2d', '3d', or 'cube'",
                 )
-            return ConcreteType(
-                "texture",
-                "Texture",
-                (dimension, self.parse_type(items[1])),
-            )
+            if len(items) == 2:
+                element = self.parse_type(items[1])
+                if element.kind != "scalar" or element.name not in {"f32", "i32", "u32"}:
+                    raise self.context.error(items[1], "sampled Texture type must be f32, i32, or u32")
+                return ConcreteType("texture", "Texture", (dimension, element, "unknown", "sampled"))
+            if dimension == "cube":
+                raise self.context.error(items[0], "storage Texture dimension must be '2d' or '3d'")
+            format_name = self._string_or_name(items[1], "storage texture format")
+            if format_name not in {
+                "r8_unorm",
+                "r16_float",
+                "r32_float",
+                "rg8_unorm",
+                "rgba8_unorm",
+                "rgba16_float",
+                "rgba32_float",
+            }:
+                raise self.context.error(items[1], "unsupported storage texture format")
+            access = self._string_or_name(items[2], "storage Texture access")
+            if access not in {"read", "write", "read_write"}:
+                raise self.context.error(items[2], "storage Texture access must be read, write, or read_write")
+            element = ConcreteType("scalar", "f32")
+            return ConcreteType("texture", "Texture", (dimension, element, format_name, access))
         raise self.context.error(node, f"unknown DSL type constructor '{constructor}'")
 
     def _require_storage_element(self, node: ast.AST, element: ConcreteType, constructor: str) -> None:
@@ -161,7 +176,7 @@ class TypeParser:
             return value.split(".")[-1]
         raise self.context.error(node, f"{description} must be a string literal or name")
 
-    def _metadata(self, node: ast.AST) -> Metadata:
+    def _metadata(self, node: ast.AST) -> InterfaceMetadata:
         if not isinstance(node, ast.Call):
             raise self.context.error(node, "DSL annotation metadata must be a call")
         kind = (dotted_name(node.func) or "").split(".")[-1]
@@ -214,4 +229,4 @@ class TypeParser:
                 raise self.context.error(node, "attribute location must be non-negative")
             if not isinstance(divisor, int) or divisor < 0:
                 raise self.context.error(node, "attribute divisor must be non-negative")
-        return Metadata(kind, tuple(parsed))
+        return InterfaceMetadata(kind, tuple(parsed))

@@ -55,7 +55,7 @@ class ConcreteType:
                 shape = ", ".join(str(value) for value in self.arguments[1:])
                 return f"!vernon.tensor<{element.mlir}, [{shape}]>"
             dimensions = "x".join(str(value) for value in self.arguments[1:])
-            return f"tensor<{dimensions}x{element.mlir}>"
+            return f"tensor<{dimensions + 'x' if dimensions else ''}{element.mlir}>"
         if self.kind == "tuple":
             elements = self.arguments
             assert all(isinstance(element, ConcreteType) for element in elements)
@@ -77,9 +77,9 @@ class ConcreteType:
             dimensions = ", ".join(str(-1 if extent == "?" else extent) for extent in shape)
             return f'!vernon.tensor_view<{element.mlir}, [{dimensions}], "{access}", "{address_space}">'
         if self.kind == "texture":
-            dimension, element = self.arguments
+            dimension, element, format_name, access = self.arguments
             assert isinstance(element, ConcreteType)
-            return f'!vernon.texture<"{dimension}", {element.mlir}>'
+            return f'!vernon.texture<"{dimension}", {element.mlir}, "{format_name}", "{access}">'
         if self.kind == "sampler":
             return "!vernon.sampler"
         raise AssertionError(f"unknown type kind {self.kind}")
@@ -158,10 +158,26 @@ class TypedExpression:
 
 
 @dataclass(frozen=True)
+class InterfaceMetadata:
+    kind: str
+    arguments: tuple[int | str, ...]
+
+
+@dataclass(frozen=True)
 class TypedParameter:
     name: str
     type: ConcreteType
     access: AccessMode = AccessMode.READ
+    interface: tuple[InterfaceMetadata, ...] = ()
+
+    @property
+    def builtin(self) -> str | None:
+        values = tuple(str(item.arguments[0]) for item in self.interface if item.kind == "builtin" and item.arguments)
+        if not values:
+            return None
+        if len(values) != 1:
+            raise ValueError(f"typed parameter '{self.name}' has multiple builtin interfaces")
+        return values[0]
 
 
 class Effect(Enum):
@@ -207,6 +223,7 @@ class StorageEffect:
     kind: StorageEffectKind
     owner: StorageOwner
     region: StorageRegion
+    atomic: bool = False
 
 
 @dataclass(frozen=True)
@@ -271,6 +288,16 @@ class BranchMerge:
 
 
 @dataclass(frozen=True)
+class StorageActivitySummary:
+    readable_roots: frozenset[str]
+    writable_roots: frozenset[str]
+    output_dependencies: tuple[tuple[str, frozenset[str]], ...]
+
+    def dependencies_for(self, output: str) -> frozenset[str]:
+        return dict(self.output_dependencies).get(output, frozenset())
+
+
+@dataclass(frozen=True)
 class TypedStatement:
     source: ast.stmt
     termination: Termination
@@ -317,9 +344,12 @@ class TypedFunctionInstance:
     body: tuple[TypedStatement, ...] = ()
     parameters: tuple[TypedParameter, ...] = ()
     effects: tuple[TypedEffect, ...] = ()
+    storage_activity: StorageActivitySummary | None = None
 
     @property
-    def specialization_key(self) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
+    def specialization_key(
+        self,
+    ) -> tuple[str, tuple[ConcreteType, ...], tuple[str, ...]]:
         return self.qualified_name, self.argument_types, self.enabled_features
 
 
@@ -329,6 +359,7 @@ SemanticValue = (
     | AtomicEffect
     | BarrierEffect
     | EffectScope
+    | InterfaceMetadata
     | MemoryOrdering
     | TypedExpression
     | TypedParameter
@@ -339,6 +370,7 @@ SemanticValue = (
     | TypedEffect
     | LValue
     | BranchMerge
+    | StorageActivitySummary
     | TypedStatement
     | TypedFunctionInstance
     | Any

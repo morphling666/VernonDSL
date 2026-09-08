@@ -1,0 +1,22 @@
+#ifndef VERNON_EXTERNAL_ENGINE_EMBEDDED_BUNDLES_H
+#define VERNON_EXTERNAL_ENGINE_EMBEDDED_BUNDLES_H
+
+#include <cstddef>
+
+namespace vernon_external_engine::cpu_bundle {
+inline constexpr char kManifest[] =
+    R"vernon_cpu(@VERNON_EXTERNAL_ENGINE_CPU_MANIFEST@)vernon_cpu";
+inline constexpr std::size_t kManifestSize = sizeof(kManifest) - 1;
+inline constexpr char kCookedDirectory[] =
+    R"vernon_cpu_path(@VERNON_EXTERNAL_ENGINE_CPU_RUNTIME_DIR@)vernon_cpu_path";
+} // namespace vernon_external_engine::cpu_bundle
+
+namespace vernon_external_engine::graphics_bundle {
+inline constexpr char kManifest[] =
+    R"vernon_graphics(@VERNON_EXTERNAL_ENGINE_GRAPHICS_MANIFEST@)vernon_graphics";
+inline constexpr std::size_t kManifestSize = sizeof(kManifest) - 1;
+inline constexpr char kCookedDirectory[] =
+    R"vgpath(@VERNON_EXTERNAL_ENGINE_GRAPHICS_RUNTIME_DIR@)vgpath";
+} // namespace vernon_external_engine::graphics_bundle
+
+#endif

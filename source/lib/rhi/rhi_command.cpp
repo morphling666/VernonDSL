@@ -1,9 +1,12 @@
 #include "VernonRHI.h"
 
+#include "image_data_layout.h"
+#include "logical_resource_record.h"
 #include "rhi_internal.h"
 
 #include <algorithm>
 #include <array>
+#include <condition_variable>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -73,8 +76,8 @@ struct EncoderSlot {
     uint32_t renderWidth{};
     uint32_t renderHeight{};
     uint32_t renderLayers{};
-    std::array<uint64_t, 8> colorTargets{};
-    std::array<uint64_t, 8> colorResources{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTargets{};
+    std::array<uint64_t, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorResources{};
     uint64_t depthTarget{};
     uint64_t depthResource{};
     uint32_t generation{1};
@@ -87,8 +90,7 @@ struct EncoderSlot {
     bool hasRenderingDescriptor{};
     bool finished{};
     bool failed{};
-    bool submitted{};
-    bool submissionCompleted{};
+    bool exclusiveDeviceSlot{};
     std::vector<ColorOperation> colorOperations;
     DepthOperation depthOperation;
     std::vector<Cleanup> cleanups;
@@ -97,31 +99,125 @@ struct EncoderSlot {
     std::unordered_set<ActionIdentity, ActionIdentityHash> rollbackIdentities;
     std::unordered_set<RetainedResource, RetainedResourceHash> retainedResources;
     std::unordered_set<RetainedResource, RetainedResourceHash> pendingWriteResources;
+    uint64_t admittedUploadBytes{};
     bool unknownPendingWrites{};
+};
+
+struct CompletionSlot {
+    std::mutex mutex;
+    std::condition_variable condition;
+    VernonRhiDevice device{};
+    VernonRhiBackend backend{VERNON_RHI_BACKEND_CUDA};
+    uint64_t native{};
+    VernonRhiCommandEncoderStats stats{};
+    VernonRhiCompletionState state{VERNON_RHI_COMPLETION_PENDING};
+    VernonRhiStatus result{VERNON_RHI_STATUS_OK};
+    bool externalSignalRequired{};
+    bool backendRetirementRequired{};
+    bool observing{};
+    bool finalized{};
+    bool admissionHeld{};
+    std::vector<EncoderSlot::Cleanup> cleanups;
+    std::unordered_set<EncoderSlot::RetainedResource, EncoderSlot::RetainedResourceHash> retainedResources;
+    uint64_t admittedUploadBytes{};
 };
 
 std::mutex registryMutex;
 std::vector<std::shared_ptr<EncoderSlot>> encoderSlots;
 std::vector<uint32_t> encoderGenerations;
 std::vector<uint32_t> freeEncoderIndices;
-std::unordered_map<uint64_t, uint32_t> activeEncoderByDevice;
+std::unordered_map<uint64_t, size_t> activeEncoderCounts;
+std::vector<std::shared_ptr<CompletionSlot>> completionSlots;
+std::vector<uint32_t> completionGenerations;
+std::vector<uint32_t> freeCompletionIndices;
+std::unordered_map<uint64_t, size_t> inFlightSubmissionCounts;
+std::unordered_map<uint64_t, uint64_t> admittedUploadBytes;
+std::unordered_map<uint64_t, VernonRhiCommandLimits> commandLimits;
+constexpr VernonRhiCommandLimits defaultCommandLimits{
+    sizeof(VernonRhiCommandLimits), 8, 8, 64, 64u * 1024u * 1024u, {0, 0, 0}};
 
 template <typename Handle> bool validHandle(Handle handle) {
     return handle.index != VERNON_RHI_INVALID_HANDLE_INDEX && handle.generation != 0;
 }
 
 template <typename Handle> uint64_t logicalResourceKey(Handle handle) {
-    return validHandle(handle)
-               ? (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1)
-               : 0;
+    return validHandle(handle) ? vernon::rhi::encodeResourceKey(handle) : 0;
 }
 
 bool sameDevice(VernonRhiDevice left, VernonRhiDevice right) {
     return left.index == right.index && left.generation == right.generation;
 }
 
-uint64_t deviceKey(VernonRhiDevice device) {
-    return (static_cast<uint64_t>(device.generation) << 32) | (static_cast<uint64_t>(device.index) + 1);
+uint64_t deviceKey(VernonRhiDevice device) { return vernon::rhi::encodeResourceKey(device); }
+
+VernonRhiCommandLimits commandLimitsLocked(VernonRhiDevice device) {
+    const auto found = commandLimits.find(deviceKey(device));
+    return found == commandLimits.end() ? defaultCommandLimits : found->second;
+}
+
+VernonRhiStatus reserveSubmission(VernonRhiDevice device) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    const uint64_t key = deviceKey(device);
+    const auto found = inFlightSubmissionCounts.find(key);
+    if (found != inFlightSubmissionCounts.end() &&
+        found->second >= commandLimitsLocked(device).max_in_flight_submissions)
+        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+    try {
+        ++inFlightSubmissionCounts[key];
+    } catch (const std::bad_alloc &) {
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+void releaseSubmission(VernonRhiDevice device) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    const auto found = inFlightSubmissionCounts.find(deviceKey(device));
+    if (found != inFlightSubmissionCounts.end() && found->second && --found->second == 0)
+        inFlightSubmissionCounts.erase(found);
+}
+
+VernonRhiStatus reserveUploadBytes(const std::shared_ptr<EncoderSlot> &slot, uint64_t size) {
+    std::lock_guard<std::mutex> slotGuard(slot->mutex);
+    if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> registryGuard(registryMutex);
+    const uint64_t key = deviceKey(slot->device);
+    const auto found = admittedUploadBytes.find(key);
+    const uint64_t current = found == admittedUploadBytes.end() ? 0 : found->second;
+    const uint64_t maximum = commandLimitsLocked(slot->device).max_upload_bytes;
+    if (size > maximum || current > maximum - size)
+        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+    try {
+        admittedUploadBytes[key] = current + size;
+    } catch (const std::bad_alloc &) {
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    slot->admittedUploadBytes += size;
+    return VERNON_RHI_STATUS_OK;
+}
+
+void releaseUploadBytes(VernonRhiDevice device, uint64_t size) {
+    if (!size)
+        return;
+    std::lock_guard<std::mutex> guard(registryMutex);
+    const auto found = admittedUploadBytes.find(deviceKey(device));
+    if (found == admittedUploadBytes.end())
+        return;
+    if (found->second <= size)
+        admittedUploadBytes.erase(found);
+    else
+        found->second -= size;
+}
+
+void releaseEncoderUploadBytes(const std::shared_ptr<EncoderSlot> &slot, uint64_t size) {
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (size > slot->admittedUploadBytes)
+            size = slot->admittedUploadBytes;
+        slot->admittedUploadBytes -= size;
+    }
+    releaseUploadBytes(slot->device, size);
 }
 
 std::shared_ptr<EncoderSlot> lookup(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
@@ -141,6 +237,100 @@ std::shared_ptr<EncoderSlot> lookupKey(VernonRhiDevice device, uint64_t key) {
     return lookup(device, {static_cast<uint32_t>(encodedIndex - 1), generation});
 }
 
+std::shared_ptr<CompletionSlot> lookup(VernonRhiDevice device, VernonRhiCompletion completion) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    if (completion.index >= completionSlots.size() || completion.index >= completionGenerations.size() ||
+        completionGenerations[completion.index] != completion.generation)
+        return {};
+    const auto &slot = completionSlots[completion.index];
+    return slot && sameDevice(slot->device, device) ? slot : std::shared_ptr<CompletionSlot>{};
+}
+
+bool registerCompletion(const std::shared_ptr<CompletionSlot> &slot, VernonRhiCompletion &completion) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    size_t liveCompletions = 0;
+    for (const auto &candidate : completionSlots)
+        if (candidate && sameDevice(candidate->device, slot->device))
+            ++liveCompletions;
+    if (liveCompletions >= commandLimitsLocked(slot->device).max_live_completions)
+        return false;
+    uint32_t index{};
+    if (freeCompletionIndices.empty()) {
+        index = static_cast<uint32_t>(completionSlots.size());
+        try {
+            completionSlots.push_back(slot);
+            completionGenerations.push_back(1);
+        } catch (...) {
+            if (completionSlots.size() > index)
+                completionSlots.pop_back();
+            throw;
+        }
+    } else {
+        index = freeCompletionIndices.back();
+        freeCompletionIndices.pop_back();
+        completionSlots[index] = slot;
+    }
+    completion = {index, completionGenerations[index]};
+    return true;
+}
+
+void unregisterCompletion(uint32_t index, const std::shared_ptr<CompletionSlot> &slot) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    if (index >= completionSlots.size() || completionSlots[index] != slot)
+        return;
+    completionSlots[index].reset();
+    uint32_t &generation = completionGenerations[index];
+    if (++generation == 0)
+        generation = 1;
+    freeCompletionIndices.push_back(index);
+}
+
+VernonRhiStatus observeCompletion(const std::shared_ptr<CompletionSlot> &slot) {
+    std::vector<EncoderSlot::Cleanup> cleanups;
+    std::unordered_set<EncoderSlot::RetainedResource, EncoderSlot::RetainedResourceHash> resources;
+    bool retireBackend{};
+    bool backendCompleted{true};
+    bool releaseAdmission{};
+    uint64_t uploadBytes{};
+    {
+        std::unique_lock lock(slot->mutex);
+        slot->condition.wait(lock, [&] {
+            return !slot->observing && (!slot->externalSignalRequired || slot->state != VERNON_RHI_COMPLETION_PENDING);
+        });
+        if (slot->finalized)
+            return slot->result;
+        slot->observing = true;
+        retireBackend = slot->backendRetirementRequired;
+    }
+    if (retireBackend)
+        backendCompleted = vernon::rhi::completeCommandRecording(slot->device, slot->native);
+    {
+        std::lock_guard lock(slot->mutex);
+        if (!backendCompleted) {
+            slot->state = VERNON_RHI_COMPLETION_FAILED;
+            slot->result = VERNON_RHI_STATUS_INTERNAL_ERROR;
+        } else if (slot->state == VERNON_RHI_COMPLETION_PENDING) {
+            slot->state = VERNON_RHI_COMPLETION_SUCCEEDED;
+        }
+        cleanups = std::move(slot->cleanups);
+        resources = std::move(slot->retainedResources);
+        uploadBytes = std::exchange(slot->admittedUploadBytes, 0);
+        slot->backendRetirementRequired = false;
+        slot->finalized = true;
+        slot->observing = false;
+        releaseAdmission = std::exchange(slot->admissionHeld, false);
+    }
+    slot->condition.notify_all();
+    for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
+        cleanup->function(cleanup->context, cleanup->object);
+    for (const auto &resource : resources)
+        vernon::rhi::releaseResource(slot->device, resource.kind, resource.key);
+    releaseUploadBytes(slot->device, uploadBytes);
+    if (releaseAdmission)
+        releaseSubmission(slot->device);
+    return slot->result;
+}
+
 void unregisterEncoder(uint32_t index, const std::shared_ptr<EncoderSlot> &slot) {
     std::lock_guard<std::mutex> guard(registryMutex);
     if (index >= encoderSlots.size() || encoderSlots[index] != slot)
@@ -150,16 +340,9 @@ void unregisterEncoder(uint32_t index, const std::shared_ptr<EncoderSlot> &slot)
     if (++generation == 0)
         generation = 1;
     freeEncoderIndices.push_back(index);
-    const auto active = activeEncoderByDevice.find(deviceKey(slot->device));
-    if (active != activeEncoderByDevice.end() && active->second == index)
-        activeEncoderByDevice.erase(active);
-}
-
-void releaseActiveEncoder(uint32_t index, const std::shared_ptr<EncoderSlot> &slot) {
-    std::lock_guard<std::mutex> guard(registryMutex);
-    const auto active = activeEncoderByDevice.find(deviceKey(slot->device));
-    if (active != activeEncoderByDevice.end() && active->second == index)
-        activeEncoderByDevice.erase(active);
+    const auto active = activeEncoderCounts.find(deviceKey(slot->device));
+    if (active != activeEncoderCounts.end() && active->second && --active->second == 0)
+        activeEncoderCounts.erase(active);
 }
 
 bool validLoad(VernonRhiLoadOperation operation) {
@@ -171,7 +354,8 @@ bool validStore(VernonRhiStoreOperation operation) {
 }
 
 bool validRendering(const VernonRhiRenderingDescriptor &descriptor) {
-    if (!descriptor.width || !descriptor.height || !descriptor.layers || descriptor.color_attachment_count > 8 ||
+    if (!descriptor.width || !descriptor.height || !descriptor.layers ||
+        descriptor.color_attachment_count > VERNON_RHI_MAX_COLOR_ATTACHMENTS ||
         (descriptor.color_attachment_count && !descriptor.color_attachments))
         return false;
     for (size_t index = 0; index < descriptor.color_attachment_count; ++index) {
@@ -198,7 +382,45 @@ bool validRendering(const VernonRhiRenderingDescriptor &descriptor) {
 
 bool vernon::rhi::deviceHasActiveCommandEncoder(VernonRhiDevice device) {
     std::lock_guard<std::mutex> guard(registryMutex);
-    return activeEncoderByDevice.count(deviceKey(device)) != 0;
+    const auto found = activeEncoderCounts.find(deviceKey(device));
+    return found != activeEncoderCounts.end() && found->second != 0;
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceSetCommandLimits(VernonRhiDevice device,
+                                                           const VernonRhiCommandLimits *limits) {
+    if (!limits || limits->struct_size < sizeof(*limits) || !limits->max_active_recordings ||
+        !limits->max_in_flight_submissions || !limits->max_live_completions || !limits->max_upload_bytes ||
+        !vernon::rhi::deviceExists(device))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(registryMutex);
+    const uint64_t key = deviceKey(device);
+    const auto active = activeEncoderCounts.find(key);
+    const auto submitted = inFlightSubmissionCounts.find(key);
+    const auto uploads = admittedUploadBytes.find(key);
+    if ((active != activeEncoderCounts.end() && active->second) ||
+        (submitted != inFlightSubmissionCounts.end() && submitted->second) ||
+        (uploads != admittedUploadBytes.end() && uploads->second))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    for (const auto &completion : completionSlots)
+        if (completion && sameDevice(completion->device, device))
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    try {
+        VernonRhiCommandLimits normalized = *limits;
+        normalized.struct_size = sizeof(normalized);
+        std::fill(std::begin(normalized.reserved), std::end(normalized.reserved), uint64_t{0});
+        commandLimits[key] = normalized;
+    } catch (const std::bad_alloc &) {
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceGetCommandLimits(VernonRhiDevice device, VernonRhiCommandLimits *output) {
+    if (!output || output->struct_size < sizeof(*output) || !vernon::rhi::deviceExists(device))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(registryMutex);
+    *output = commandLimitsLocked(device);
+    return VERNON_RHI_STATUS_OK;
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice device,
@@ -214,9 +436,16 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice d
     try {
         slot = std::make_shared<EncoderSlot>();
         slot->device = device;
+        slot->exclusiveDeviceSlot =
+            !(vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandIndependentRecording);
         std::lock_guard<std::mutex> guard(registryMutex);
-        if (activeEncoderByDevice.count(deviceKey(device)))
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        const auto active = activeEncoderCounts.find(deviceKey(device));
+        if (active != activeEncoderCounts.end() && active->second) {
+            if (slot->exclusiveDeviceSlot)
+                return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+            if (active->second >= commandLimitsLocked(device).max_active_recordings)
+                return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+        }
         bool appended = false;
         if (freeEncoderIndices.empty()) {
             index = static_cast<uint32_t>(encoderSlots.size());
@@ -236,7 +465,7 @@ extern "C" VernonRhiStatus vernonRhiDeviceCreateCommandEncoder(VernonRhiDevice d
         }
         slot->generation = encoderGenerations[index];
         try {
-            activeEncoderByDevice.emplace(deviceKey(device), index);
+            ++activeEncoderCounts[deviceKey(device)];
         } catch (...) {
             encoderSlots[index].reset();
             if (appended) {
@@ -279,11 +508,10 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDevice 
 
     VernonRhiDevice recordedDevice{};
     uint64_t native{};
-    bool submitted{};
-    bool submissionCompleted{};
     std::vector<EncoderSlot::Cleanup> cleanups;
     std::vector<EncoderSlot::Cleanup> rollbacks;
     std::unordered_set<EncoderSlot::RetainedResource, EncoderSlot::RetainedResourceHash> resources;
+    uint64_t uploadBytes{};
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         if (!slot->alive || slot->initializing || slot->busy || slot->rendering)
@@ -291,22 +519,19 @@ extern "C" VernonRhiStatus vernonRhiDeviceDestroyCommandEncoder(VernonRhiDevice 
         slot->alive = false;
         recordedDevice = slot->device;
         native = slot->native;
-        submitted = slot->submitted;
-        submissionCompleted = slot->submissionCompleted;
         cleanups = std::move(slot->cleanups);
         rollbacks = std::move(slot->rollbacks);
         resources = std::move(slot->retainedResources);
+        uploadBytes = std::exchange(slot->admittedUploadBytes, 0);
     }
-    if (!submitted) {
-        vernon::rhi::abandonCommandRecording(recordedDevice, native);
-        for (auto rollback = rollbacks.rbegin(); rollback != rollbacks.rend(); ++rollback)
-            rollback->function(rollback->context, rollback->object);
-    } else if (!submissionCompleted)
-        vernon::rhi::completeBorrowedCommandRecording(recordedDevice, native);
+    vernon::rhi::abandonCommandRecording(recordedDevice, native);
+    for (auto rollback = rollbacks.rbegin(); rollback != rollbacks.rend(); ++rollback)
+        rollback->function(rollback->context, rollback->object);
     for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
         cleanup->function(cleanup->context, cleanup->object);
     for (const auto &resource : resources)
         vernon::rhi::releaseResource(recordedDevice, resource.kind, resource.key);
+    releaseUploadBytes(recordedDevice, uploadBytes);
     unregisterEncoder(encoder.index, slot);
     return VERNON_RHI_STATUS_OK;
 }
@@ -323,14 +548,20 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
         VERNON_RHI_ACCESS_DEPTH_STENCIL_READ | VERNON_RHI_ACCESS_DEPTH_STENCIL_WRITE | VERNON_RHI_ACCESS_VERTEX_READ |
         VERNON_RHI_ACCESS_INDEX_READ | VERNON_RHI_ACCESS_INDIRECT_READ | VERNON_RHI_ACCESS_HOST_READ |
         VERNON_RHI_ACCESS_HOST_WRITE;
+    constexpr uint32_t allAspects =
+        VERNON_RHI_IMAGE_ASPECT_COLOR | VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL;
     for (size_t index = 0; index < barrierCount; ++index)
         if (barriers[index].struct_size < sizeof(VernonRhiBarrier) ||
             barriers[index].old_state > VERNON_RHI_STATE_PRESENT ||
             barriers[index].new_state > VERNON_RHI_STATE_PRESENT || barriers[index].is_image > 1 ||
             (barriers[index].source_stage_mask & ~allStages) || (barriers[index].destination_stage_mask & ~allStages) ||
-            (barriers[index].source_access & ~allAccess) || (barriers[index].destination_access & ~allAccess))
+            (barriers[index].source_access & ~allAccess) || (barriers[index].destination_access & ~allAccess) ||
+            (barriers[index].is_image &&
+             (!barriers[index].image_subresources.mip_level_count ||
+              !barriers[index].image_subresources.array_layer_count || !barriers[index].image_subresources.aspects ||
+              (barriers[index].image_subresources.aspects & ~allAspects))))
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const uint64_t key = (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1);
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
     for (size_t index = 0; index < barrierCount; ++index) {
         const vernon::rhi::ResourceKind kind =
             barriers[index].is_image ? vernon::rhi::ResourceKind::Image : vernon::rhi::ResourceKind::Buffer;
@@ -365,6 +596,183 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderBarrier(VernonRhiDevice device
             slot->failed = true;
     }
     return recordStatus;
+}
+
+extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyBuffer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                             VernonRhiBuffer source, uint64_t sourceOffset,
+                                                             VernonRhiBuffer destination, uint64_t destinationOffset,
+                                                             uint64_t size) {
+    auto slot = lookup(device, encoder);
+    if (!slot || !validHandle(source) || !validHandle(destination) || !size)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
+    const uint64_t sourceResource = logicalResourceKey(source);
+    const uint64_t destinationResource = logicalResourceKey(destination);
+    if (!vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Buffer, sourceResource) ||
+        !vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Buffer, destinationResource))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        slot->busy = true;
+        native = slot->native;
+    }
+    const VernonRhiStatus recordStatus =
+        vernon::rhi::recordBufferCopy(device, native, source, sourceOffset, destination, destinationOffset, size);
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        slot->busy = false;
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Buffer, destinationResource});
+        else
+            slot->failed = true;
+    }
+    return recordStatus;
+}
+
+namespace {
+
+bool imageCopyBoxValid(const VernonRhiImageDescriptor &image, uint32_t mip, uint32_t layer, uint32_t x, uint32_t y,
+                       uint32_t z, uint32_t width, uint32_t height, uint32_t depth) {
+    if (mip >= image.mip_levels || layer >= image.array_layers || !width || !height || !depth)
+        return false;
+    const uint32_t mipWidth = vernon::rhi::imageMipExtent(image.width, mip);
+    const uint32_t mipHeight = vernon::rhi::imageMipExtent(image.height, mip);
+    const uint32_t mipDepth =
+        image.dimension == VERNON_RHI_IMAGE_3D ? vernon::rhi::imageMipExtent(image.depth, mip) : 1;
+    return x < mipWidth && width <= mipWidth - x && y < mipHeight && height <= mipHeight - y && z < mipDepth &&
+           depth <= mipDepth - z && (image.dimension == VERNON_RHI_IMAGE_3D || (z == 0 && depth == 1));
+}
+
+bool intervalsOverlap(uint32_t firstOffset, uint32_t firstSize, uint32_t secondOffset, uint32_t secondSize) {
+    return uint64_t{firstOffset} < uint64_t{secondOffset} + secondSize &&
+           uint64_t{secondOffset} < uint64_t{firstOffset} + firstSize;
+}
+
+bool imageCopyBoxesOverlap(const VernonRhiImageCopyRegion &first, bool firstSource,
+                           const VernonRhiImageCopyRegion &second, bool secondSource) {
+    const uint32_t firstMip = firstSource ? first.source_mip_level : first.destination_mip_level;
+    const uint32_t firstLayer = firstSource ? first.source_array_layer : first.destination_array_layer;
+    const uint32_t firstX = firstSource ? first.source_x : first.destination_x;
+    const uint32_t firstY = firstSource ? first.source_y : first.destination_y;
+    const uint32_t firstZ = firstSource ? first.source_z : first.destination_z;
+    const uint32_t secondMip = secondSource ? second.source_mip_level : second.destination_mip_level;
+    const uint32_t secondLayer = secondSource ? second.source_array_layer : second.destination_array_layer;
+    const uint32_t secondX = secondSource ? second.source_x : second.destination_x;
+    const uint32_t secondY = secondSource ? second.source_y : second.destination_y;
+    const uint32_t secondZ = secondSource ? second.source_z : second.destination_z;
+    return firstMip == secondMip && firstLayer == secondLayer && (first.aspects & second.aspects) &&
+           intervalsOverlap(firstX, first.width, secondX, second.width) &&
+           intervalsOverlap(firstY, first.height, secondY, second.height) &&
+           intervalsOverlap(firstZ, first.depth, secondZ, second.depth);
+}
+
+bool validateImageCopies(VernonRhiDevice device, VernonRhiImage source, VernonRhiImage destination,
+                         const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    VernonRhiImageDescriptor sourceDescriptor{};
+    VernonRhiImageDescriptor destinationDescriptor{};
+    const uint64_t sourceResource = vernon::rhi::imageResource(device, source);
+    const uint64_t destinationResource = vernon::rhi::imageResource(device, destination);
+    if (!sourceResource || !destinationResource ||
+        !vernon::rhi::describeImageResource(device, sourceResource, sourceDescriptor) ||
+        !vernon::rhi::describeImageResource(device, destinationResource, destinationDescriptor) ||
+        sourceDescriptor.format != destinationDescriptor.format ||
+        sourceDescriptor.dimension != destinationDescriptor.dimension ||
+        sourceDescriptor.sample_count != destinationDescriptor.sample_count ||
+        !(sourceDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(destinationDescriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) || sourceResource == destinationResource)
+        return false;
+    const uint32_t availableAspects = vernon::rhi::imageFormatAspects(sourceDescriptor.format);
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        if (region.struct_size < sizeof(region) || !region.aspects || (region.aspects & ~availableAspects) ||
+            std::any_of(
+                std::begin(region.reserved), std::end(region.reserved), [](uint32_t value) { return value != 0; }) ||
+            !imageCopyBoxValid(sourceDescriptor, region.source_mip_level, region.source_array_layer, region.source_x,
+                               region.source_y, region.source_z, region.width, region.height, region.depth) ||
+            !imageCopyBoxValid(destinationDescriptor, region.destination_mip_level, region.destination_array_layer,
+                               region.destination_x, region.destination_y, region.destination_z, region.width,
+                               region.height, region.depth))
+            return false;
+        for (size_t previous = 0; previous < index; ++previous)
+            if (imageCopyBoxesOverlap(regions[previous], false, region, false))
+                return false;
+    }
+    return true;
+}
+
+} // namespace
+
+extern "C" VernonRhiStatus vernonRhiCommandEncoderCopyImage(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                            VernonRhiImage source, VernonRhiImage destination,
+                                                            const VernonRhiImageCopyRegion *regions,
+                                                            size_t regionCount) {
+    auto slot = lookup(device, encoder);
+    if (!slot || !validHandle(source) || !validHandle(destination) || !regionCount || !regions ||
+        !validateImageCopies(device, source, destination, regions, regionCount))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const uint64_t key = vernon::rhi::encodeResourceKey(encoder);
+    const uint64_t sourceResource = logicalResourceKey(source);
+    const uint64_t destinationResource = logicalResourceKey(destination);
+    if (!vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Image, sourceResource) ||
+        !vernon::rhi::retainCommandResource(device, key, vernon::rhi::ResourceKind::Image, destinationResource))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->alive || slot->initializing || slot->busy || slot->rendering || slot->finished || slot->failed)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        slot->busy = true;
+        native = slot->native;
+    }
+    const VernonRhiStatus recordStatus =
+        vernon::rhi::recordImageCopy(device, key, native, source, destination, regions, regionCount);
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        slot->busy = false;
+        if (recordStatus == VERNON_RHI_STATUS_OK)
+            slot->pendingWriteResources.insert({vernon::rhi::ResourceKind::Image, destinationResource});
+        else
+            slot->failed = true;
+    }
+    return recordStatus;
+}
+
+extern "C" VernonRhiStatus vernonRhiCommandEncoderUploadBuffer(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                               VernonRhiBuffer destination, uint64_t destinationOffset,
+                                                               const void *source, uint64_t size) {
+    if (!source || !size)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto slot = lookup(device, encoder);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VernonRhiStatus status = reserveUploadBytes(slot, size);
+    if (status != VERNON_RHI_STATUS_OK)
+        return status;
+    VernonRhiBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = size;
+    descriptor.alignment = 4;
+    descriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE;
+    descriptor.memory_class = VERNON_RHI_MEMORY_UPLOAD;
+    VernonRhiBuffer staging{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    status = vernonRhiDeviceCreateBuffer(device, &descriptor, &staging);
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiDeviceUploadBuffer(device, staging, 0, source, size);
+    bool recorded = false;
+    if (status == VERNON_RHI_STATUS_OK)
+        status = vernonRhiCommandEncoderCopyBuffer(device, encoder, staging, 0, destination, destinationOffset, size);
+    recorded = status == VERNON_RHI_STATUS_OK;
+    if (staging.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+        const VernonRhiStatus destroyStatus = vernonRhiDeviceDestroyBuffer(device, staging);
+        if (status == VERNON_RHI_STATUS_OK)
+            status = destroyStatus;
+    }
+    if (!recorded)
+        releaseEncoderUploadBytes(slot, size);
+    return status;
 }
 
 extern "C" VernonRhiStatus vernonRhiCommandEncoderBeginRendering(VernonRhiDevice device,
@@ -453,8 +861,18 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearColorAttachment(VernonRhi
     if (!slot || !clearColor)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering || location >= 8)
+    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || location >= 8)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!slot->backendRendering) {
+        const auto operation = std::find_if(slot->colorOperations.begin(), slot->colorOperations.end(),
+                                            [location](const auto &value) { return value.location == location; });
+        if (operation == slot->colorOperations.end())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        operation->load = VERNON_RHI_LOAD_CLEAR;
+        std::copy(clearColor, clearColor + 4, operation->clear.begin());
+        ++slot->stats.clear_count;
+        return VERNON_RHI_STATUS_OK;
+    }
     const VernonRhiStatus status = vernon::rhi::clearCommandColor(
         device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
         slot->renderHeight, slot->renderLayers, slot->colorTargets[location], location, clearColor);
@@ -473,8 +891,22 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderClearDepthStencilAttachment(Ve
         (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || !slot->rendering || slot->finished || !slot->backendRendering)
+    if (!slot->alive || slot->busy || !slot->rendering || slot->finished)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!slot->backendRendering) {
+        if (!slot->depthOperation.present)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        if (aspects & VERNON_RHI_ATTACHMENT_DEPTH) {
+            slot->depthOperation.depthLoad = VERNON_RHI_LOAD_CLEAR;
+            slot->depthOperation.clearDepth = clearDepth;
+        }
+        if (aspects & VERNON_RHI_ATTACHMENT_STENCIL) {
+            slot->depthOperation.stencilLoad = VERNON_RHI_LOAD_CLEAR;
+            slot->depthOperation.clearStencil = clearStencil;
+        }
+        ++slot->stats.clear_count;
+        return VERNON_RHI_STATUS_OK;
+    }
     const VernonRhiStatus status = vernon::rhi::clearCommandDepthStencil(
         device, slot->native, slot->backend, slot->backendRendering, slot->renderX, slot->renderY, slot->renderWidth,
         slot->renderHeight, slot->renderLayers, slot->depthTarget, clearDepth, clearStencil, aspects);
@@ -495,59 +927,173 @@ extern "C" VernonRhiStatus vernonRhiCommandEncoderFinish(VernonRhiDevice device,
     return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
+extern "C" VernonRhiStatus vernonRhiDeviceSubmit(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
+                                                 VernonRhiCompletion *output) {
+    if (output)
+        *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     auto slot = lookup(device, encoder);
-    if (!slot)
+    if (!slot || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const VernonRhiStatus admissionStatus = reserveSubmission(device);
+    if (admissionStatus != VERNON_RHI_STATUS_OK)
+        return admissionStatus;
+    std::shared_ptr<CompletionSlot> completion;
+    VernonRhiCompletion handle{};
+    try {
+        completion = std::make_shared<CompletionSlot>();
+        completion->device = device;
+        if (!registerCompletion(completion, handle)) {
+            releaseSubmission(device);
+            return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+        }
+    } catch (const std::bad_alloc &) {
+        releaseSubmission(device);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
     uint64_t native{};
     bool computeWrites{};
     bool completed{};
-    std::vector<EncoderSlot::Cleanup> cleanups;
-    std::unordered_set<EncoderSlot::RetainedResource, EncoderSlot::RetainedResourceHash> resources;
+    bool externalCompletion{};
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
-        if (!slot->alive || slot->initializing || slot->busy || !slot->finished || slot->submitted || slot->failed)
+        if (!slot->alive || slot->initializing || slot->busy || !slot->finished || slot->failed) {
+            unregisterCompletion(handle.index, completion);
+            releaseSubmission(device);
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        }
         slot->busy = true;
         native = slot->native;
         computeWrites = slot->unknownPendingWrites || !slot->pendingWriteResources.empty();
     }
-    const bool submitted = vernon::rhi::submitCommandRecording(device, native, computeWrites, completed);
+    const bool submitted =
+        vernon::rhi::submitCommandRecording(device, native, computeWrites, completed, externalCompletion);
     {
         std::lock_guard<std::mutex> guard(slot->mutex);
         slot->busy = false;
         if (submitted) {
-            slot->submitted = true;
-            slot->submissionCompleted = completed;
+            slot->alive = false;
             slot->rollbacks.clear();
             ++slot->stats.submission_count;
-        } else
+            completion->backend = slot->backend;
+            completion->native = slot->native;
+            completion->stats = slot->stats;
+            completion->state = completed ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_PENDING;
+            completion->externalSignalRequired = externalCompletion;
+            completion->backendRetirementRequired = !completed;
+            completion->admissionHeld = true;
+            completion->cleanups = std::move(slot->cleanups);
+            completion->retainedResources = std::move(slot->retainedResources);
+            completion->admittedUploadBytes = std::exchange(slot->admittedUploadBytes, 0);
+        } else {
             slot->failed = true;
-        if (submitted && completed) {
-            cleanups = std::move(slot->cleanups);
-            resources = std::move(slot->retainedResources);
         }
     }
-    if (submitted && completed) {
-        releaseActiveEncoder(encoder.index, slot);
-        for (auto cleanup = cleanups.rbegin(); cleanup != cleanups.rend(); ++cleanup)
-            cleanup->function(cleanup->context, cleanup->object);
-        for (const auto &resource : resources)
-            vernon::rhi::releaseResource(device, resource.kind, resource.key);
+    if (!submitted) {
+        unregisterCompletion(handle.index, completion);
+        releaseSubmission(device);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
-    return submitted ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    unregisterEncoder(encoder.index, slot);
+    *output = handle;
+    if (completed)
+        (void)observeCompletion(completion);
+    return VERNON_RHI_STATUS_OK;
 }
 
-extern "C" VernonRhiStatus vernonRhiCommandEncoderGetStats(VernonRhiDevice device, VernonRhiCommandEncoder encoder,
-                                                           VernonRhiCommandEncoderStats *output) {
-    auto slot = lookup(device, encoder);
+extern "C" VernonRhiStatus vernonRhiCompletionGetState(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                       VernonRhiCompletionState *output) {
+    auto slot = lookup(device, completion);
+    if (!slot || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    bool shouldPoll{};
+    bool shouldFinalize{};
+    uint64_t native{};
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        shouldPoll = slot->state == VERNON_RHI_COMPLETION_PENDING && !slot->externalSignalRequired &&
+                     slot->backendRetirementRequired;
+        shouldFinalize = slot->state != VERNON_RHI_COMPLETION_PENDING && !slot->finalized;
+        native = slot->native;
+    }
+    if (shouldPoll) {
+        bool completed{};
+        bool succeeded{};
+        if (vernon::rhi::pollCommandRecording(device, native, completed, succeeded) && completed) {
+            std::lock_guard<std::mutex> guard(slot->mutex);
+            if (slot->state == VERNON_RHI_COMPLETION_PENDING) {
+                slot->state = succeeded ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_FAILED;
+                slot->result = succeeded ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+            }
+            shouldFinalize = true;
+        }
+    }
+    if (shouldFinalize)
+        (void)observeCompletion(slot);
+    std::lock_guard<std::mutex> guard(slot->mutex);
+    *output = slot->state;
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VernonRhiStatus vernonRhiCompletionWait(VernonRhiDevice device, VernonRhiCompletion completion) {
+    auto slot = lookup(device, completion);
+    return slot ? observeCompletion(slot) : VERNON_RHI_STATUS_INVALID_ARGUMENT;
+}
+
+extern "C" VernonRhiStatus vernonRhiCompletionSignal(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                     VernonRhiStatus result) {
+    auto slot = lookup(device, completion);
+    if (!slot || static_cast<uint32_t>(result) > static_cast<uint32_t>(VERNON_RHI_STATUS_RESOURCE_EXHAUSTED))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    {
+        std::lock_guard<std::mutex> guard(slot->mutex);
+        if (!slot->externalSignalRequired || slot->state != VERNON_RHI_COMPLETION_PENDING)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        slot->result = result;
+        slot->state = result == VERNON_RHI_STATUS_OK ? VERNON_RHI_COMPLETION_SUCCEEDED : VERNON_RHI_COMPLETION_FAILED;
+    }
+    slot->condition.notify_all();
+    return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VernonRhiStatus vernonRhiCompletionGetCommandStats(VernonRhiDevice device, VernonRhiCompletion completion,
+                                                              VernonRhiCommandEncoderStats *output) {
+    auto slot = lookup(device, completion);
     if (!slot || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = slot->stats;
     return VERNON_RHI_STATUS_OK;
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceDestroyCompletion(VernonRhiDevice device, VernonRhiCompletion completion) {
+    auto slot = lookup(device, completion);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    const VernonRhiStatus status = observeCompletion(slot);
+    unregisterCompletion(completion.index, slot);
+    return status;
+}
+
+void vernon::rhi::drainDeviceCompletions(VernonRhiDevice device) {
+    std::vector<std::pair<uint32_t, std::shared_ptr<CompletionSlot>>> pending;
+    {
+        std::lock_guard<std::mutex> guard(registryMutex);
+        for (uint32_t index = 0; index < completionSlots.size(); ++index)
+            if (completionSlots[index] && sameDevice(completionSlots[index]->device, device))
+                pending.emplace_back(index, completionSlots[index]);
+    }
+    for (const auto &[index, completion] : pending) {
+        (void)observeCompletion(completion);
+        unregisterCompletion(index, completion);
+    }
+}
+
+void vernon::rhi::forgetDeviceCommandLimits(VernonRhiDevice device) {
+    std::lock_guard<std::mutex> guard(registryMutex);
+    const uint64_t key = deviceKey(device);
+    commandLimits.erase(key);
+    inFlightSubmissionCounts.erase(key);
+    admittedUploadBytes.erase(key);
 }
 
 uint64_t vernon::rhi::commandEncoderKey(VernonRhiDevice device, VernonRhiCommandEncoder encoder) {
@@ -555,9 +1101,7 @@ uint64_t vernon::rhi::commandEncoderKey(VernonRhiDevice device, VernonRhiCommand
     if (!slot)
         return 0;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    return slot->alive && !slot->initializing
-               ? (static_cast<uint64_t>(encoder.generation) << 32) | (static_cast<uint64_t>(encoder.index) + 1)
-               : 0;
+    return slot->alive && !slot->initializing ? vernon::rhi::encodeResourceKey(encoder) : 0;
 }
 
 uint64_t vernon::rhi::commandEncoderNative(VernonRhiDevice device, uint64_t key, VernonRhiBackend backend) {
@@ -724,7 +1268,7 @@ bool vernon::rhi::deferCommandCleanup(VernonRhiDevice device, uint64_t key, void
     if (!slot)
         return false;
     std::lock_guard<std::mutex> guard(slot->mutex);
-    if (!slot->alive || slot->busy || slot->finished)
+    if (!slot->alive || slot->finished)
         return false;
     if (object == 0) {
         const EncoderSlot::ActionIdentity identity{context, cleanup};
@@ -774,7 +1318,7 @@ bool vernon::rhi::deferCommandRollback(VernonRhiDevice device, uint64_t key, voi
 bool vernon::rhi::setCommandRenderingTargets(VernonRhiDevice device, uint64_t key, const uint64_t *colors,
                                              const uint64_t *resources, size_t colorCount, uint64_t depth,
                                              uint64_t depthResource) {
-    if (colorCount > 8 || (colorCount && (!colors || !resources)))
+    if (colorCount > VERNON_RHI_MAX_COLOR_ATTACHMENTS || (colorCount && (!colors || !resources)))
         return false;
     auto slot = lookupKey(device, key);
     if (!slot)

@@ -7,17 +7,26 @@
 
 namespace vernon::rhi {
 
-enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3 };
+enum class ResourceKind : uint32_t { Buffer = 1, Image = 2, Sampler = 3, ImageView = 4 };
 enum CommandRenderingKind : uint32_t {
     CommandRenderingDynamic = 1,
     CommandRenderingRenderPass = 2,
     CommandRenderingStateless = 3
+};
+enum BackendCommandCapabilityBits : uint32_t {
+    BackendCommandIndependentRecording = 1u << 0,
+    BackendCommandConcurrentSubmission = 1u << 1,
+    BackendCommandTimelineCompletion = 1u << 2,
+    BackendCommandGpuTimestamps = 1u << 3,
+    BackendCommandExplicitComputeDependencies = 1u << 4,
 };
 
 struct BackendDispatch {
     // Optional operations are null when the backend does not expose that
     // resource or command capability; the entry layer reports unsupported.
     VernonRhiBackend backend;
+    uint32_t commandCapabilities;
+    uint32_t (*commandCapabilitiesForDevice)(VernonRhiDevice);
     bool (*ownsDevice)(VernonRhiDevice);
     VernonRhiDevice (*createOwnedDevice)(const VernonRhiOwnedDeviceDescriptor *);
     void (*destroyDevice)(VernonRhiDevice);
@@ -27,6 +36,7 @@ struct BackendDispatch {
 
     VernonRhiStatus (*createBuffer)(VernonRhiDevice, const VernonRhiBufferDescriptor *, VernonRhiBuffer *);
     VernonRhiStatus (*uploadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, const void *, uint64_t);
+    VernonRhiStatus (*uploadBufferRanges)(VernonRhiDevice, VernonRhiBuffer, const VernonRhiBufferUploadRange *, size_t);
     VernonRhiStatus (*downloadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, void *, uint64_t);
     VernonRhiStatus (*destroyBuffer)(VernonRhiDevice, VernonRhiBuffer);
     uint32_t (*isBufferValid)(VernonRhiDevice, VernonRhiBuffer);
@@ -35,7 +45,8 @@ struct BackendDispatch {
     VernonRhiStatus (*createImage)(VernonRhiDevice, const VernonRhiImageDescriptor *, VernonRhiImage *);
     VernonRhiStatus (*setImageSampler)(VernonRhiDevice, VernonRhiImage, const VernonRhiSamplerDescriptor *);
     VernonRhiStatus (*uploadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageUploadDescriptor *, size_t);
-    VernonRhiStatus (*downloadImage)(VernonRhiDevice, VernonRhiImage, void *, size_t);
+    VernonRhiStatus (*downloadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageDownloadDescriptor *, void *,
+                                     size_t);
     VernonRhiStatus (*generateImageMipmaps)(VernonRhiDevice, VernonRhiImage);
     VernonRhiStatus (*bindImage)(VernonRhiDevice, VernonRhiImage, uint32_t);
     VernonRhiStatus (*destroyImage)(VernonRhiDevice, VernonRhiImage);
@@ -51,13 +62,19 @@ struct BackendDispatch {
     uint64_t (*samplerResource)(VernonRhiDevice, VernonRhiSampler);
     bool (*retainResource)(VernonRhiDevice, ResourceKind, uint64_t);
     uint64_t (*resolveResource)(VernonRhiDevice, ResourceKind, uint64_t);
+    bool (*describeImageResource)(VernonRhiDevice, uint64_t, VernonRhiImageDescriptor *);
     void (*releaseResource)(VernonRhiDevice, ResourceKind, uint64_t);
 
     bool (*beginCommands)(VernonRhiDevice, uint64_t &, VernonRhiBackend &);
-    bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &);
-    void (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
+    bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &, bool &);
+    bool (*pollCommands)(VernonRhiDevice, uint64_t, bool &, bool &);
+    bool (*completeBorrowedCommands)(VernonRhiDevice, uint64_t);
     void (*abandonCommands)(VernonRhiDevice, uint64_t);
     bool (*recordBarriers)(VernonRhiDevice, uint64_t, uint64_t, const VernonRhiBarrier *, size_t);
+    bool (*recordBufferCopy)(VernonRhiDevice, uint64_t, VernonRhiBuffer, uint64_t, VernonRhiBuffer, uint64_t, uint64_t);
+    bool (*supportsImageCopy)(VernonRhiDevice);
+    bool (*recordImageCopy)(VernonRhiDevice, uint64_t, uint64_t, VernonRhiImage, VernonRhiImage,
+                            const VernonRhiImageCopyRegion *, size_t);
     bool (*endRendering)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t, uint32_t, const uint64_t *,
                          size_t, uint64_t, uint64_t);
     bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t, uint32_t,
@@ -69,12 +86,17 @@ struct BackendDispatch {
     VernonRhiStatus (*createImageView)(VernonRhiDevice, const VernonRhiImageViewDescriptor *, VernonRhiImageView *);
     VernonRhiStatus (*destroyImageView)(VernonRhiDevice, VernonRhiImageView);
     VernonRhiStatus (*getImageViewNativeHandle)(VernonRhiDevice, VernonRhiImageView, uint64_t *);
+    uint64_t (*imageViewResource)(VernonRhiDevice, VernonRhiImageView);
+    bool (*describeImageViewResource)(VernonRhiDevice, uint64_t, VernonRhiImageViewDescriptor *,
+                                      VernonRhiImageDescriptor *, uint64_t *);
 };
 
 void setDeviceCreationError(std::string error);
 const BackendDispatch &openGLBackendDispatch();
 VERNON_RHI_CAPI bool deferCommandRollback(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
                                           void (*rollback)(void *, uint64_t));
+VERNON_RHI_CAPI bool deferCommandCleanup(VernonRhiDevice device, uint64_t encoderKey, void *context, uint64_t object,
+                                         void (*cleanup)(void *, uint64_t));
 #if defined(VERNON_HAS_CUDA_RHI)
 const BackendDispatch &cudaBackendDispatch();
 #endif

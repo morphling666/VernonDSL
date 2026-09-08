@@ -8,7 +8,8 @@ class Pass;
 
 namespace vernon {
 
-std::unique_ptr<Pass> createVernonLowerSynchronizationPass(bool gpu = false, bool spirv = false);
+std::unique_ptr<Pass> createVernonLowerCPUSynchronizationPass();
+std::unique_ptr<Pass> createVernonLowerGPUSynchronizationPass(bool spirv = false);
 
 } // namespace vernon
 } // namespace mlir

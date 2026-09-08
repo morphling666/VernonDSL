@@ -1,11 +1,11 @@
-#include "../../rhi/rhi_internal.h"
+#include "rhi/rhi_internal.h"
 #include "adapter_common.h"
 #include "adapter_internal.h"
 
 #if defined(VERNON_HAS_METAL_RHI)
 
-#include "../../rhi/metal_backend.h"
-#include "../metal_runtime_capabilities.h"
+#include "rhi/metal_backend.h"
+#include "runtime/metal_runtime_capabilities.h"
 
 #include <algorithm>
 #include <atomic>
@@ -94,7 +94,7 @@ struct PreparedPipeline {
     id<MTLComputePipelineState> compute;
     id<MTLRenderPipelineState> render;
     id<MTLDepthStencilState> depthStencil;
-    std::array<MTLPixelFormat, 8> colorFormats{};
+    std::array<MTLPixelFormat, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorFormats{};
     MTLPixelFormat depthFormat{MTLPixelFormatInvalid};
     size_t colorFormatCount{};
     uint32_t sampleCount{1};
@@ -429,7 +429,7 @@ MTLColorWriteMask colorWriteMask(uint32_t mask) {
     return result;
 }
 
-bool configureStencilFace(const VernonRuntimeProviderStencilFaceState &source,
+bool configureStencilFace(const VernonStencilFaceState &source,
                           MTLStencilDescriptor *destination) {
     MTLCompareFunction compare{};
     MTLStencilOperation stencilFail{}, depthFail{}, pass{};
@@ -711,8 +711,7 @@ VernonStatus encodeArgumentBuffers(VernonRuntimeRhiAdapter &adapter, const std::
                     slot.layout.set != argumentBuffer.index)
                     continue;
                 const uint32_t member = slot.layout.binding;
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                     [argumentBuffer.encoder setBuffer:slot.inlineBuffer offset:0 atIndex:member];
                     continue;
                 }
@@ -761,26 +760,25 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto &value = values[valueIndices[index]];
         if (value.kind != slot.layout.kind)
             return fail(adapter, "Metal binding kind does not match the prepared layout");
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
-            if (!value.inline_data || value.inline_size != slot.layout.element_size)
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
+            if (!value.payload.inline_value.data || value.payload.inline_value.size != slot.layout.element_size)
                 return fail(adapter, "Metal inline binding has an invalid physical size");
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                    (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE)) {
-            if (value.resource.resource.value)
+            if (value.payload.sampler.resource.resource.value)
                 return fail(adapter, "Metal default sampler binding also supplied a resource");
         } else {
-            const uint64_t expectedKind = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
-                                                  slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
-                                              ? kRhiImageResource
-                                          : slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER
-                                              ? kRhiSamplerResource
-                                              : kRhiBufferResource;
-            if ((value.resource.identity & kRhiResourceKindMask) != expectedKind ||
-                !resolveRhiResource(adapter, value.resource))
+            const auto *resource = providerBindingResource(value);
+            const bool image = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
+                               slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
+            const uint64_t expectedKind =
+                slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource : kRhiBufferResource;
+            if (!resource || (image ? !isRhiImageReference(*resource)
+                                    : (resource->identity & kRhiResourceKindMask) != expectedKind) ||
+                !resolveRhiResource(adapter, *resource))
                 return fail(adapter,
                             "Metal resource binding has the wrong type, is stale, or belongs to another device");
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value.stride == 0)
+            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && value.payload.buffer.stride == 0)
                 return fail(adapter, "Metal vertex binding has no stride");
         }
     }
@@ -788,27 +786,29 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
     for (size_t index = 0; index < updatedSlots.size(); ++index) {
         auto &slot = updatedSlots[index];
         const auto &value = values[valueIndices[index]];
-        if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-            slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+        if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             slot.resource = {};
-            slot.inlineStorage.assign(static_cast<const uint8_t *>(value.inline_data),
-                                      static_cast<const uint8_t *>(value.inline_data) + value.inline_size);
+            slot.inlineStorage.assign(static_cast<const uint8_t *>(value.payload.inline_value.data),
+                                      static_cast<const uint8_t *>(value.payload.inline_value.data) +
+                                          value.payload.inline_value.size);
             if (isArgumentResource(slot.layout)) {
-                slot.inlineBuffer = [metalDevice(adapter).device newBufferWithLength:value.inline_size
+                slot.inlineBuffer = [metalDevice(adapter).device newBufferWithLength:value.payload.inline_value.size
                                                                              options:MTLResourceStorageModeShared];
                 if (!slot.inlineBuffer)
                     return fail(adapter, "Metal inline argument-buffer resource allocation failed",
                                 VERNON_STATUS_INTERNAL_ERROR);
-                std::memcpy(slot.inlineBuffer.contents, value.inline_data, value.inline_size);
+                std::memcpy(slot.inlineBuffer.contents, value.payload.inline_value.data,
+                            value.payload.inline_value.size);
             } else {
                 slot.inlineBuffer = nil;
             }
             slot.defaultSampler = nil;
         } else {
-            slot.resource = value.resource;
+            const auto *resource = providerBindingResource(value);
+            slot.resource = resource ? *resource : VernonRuntimeProviderResourceReference{};
             slot.inlineStorage.clear();
             slot.inlineBuffer = nil;
-            slot.stride = value.stride;
+            slot.stride = value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER ? value.payload.buffer.stride : 0;
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                 (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE)) {
                 if (!slot.defaultSampler) {
@@ -921,15 +921,13 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
             if ((slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) == 0)
                 continue;
             if (!isArgumentResource(slot.layout)) {
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER)
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind))
                     [encoder setBytes:slot.inlineStorage.data()
                                length:slot.inlineStorage.size()
                               atIndex:slot.layout.binding];
                 continue;
             }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                 [encoder useResource:slot.inlineBuffer usage:MTLResourceUsageRead];
                 continue;
             }
@@ -1017,15 +1015,14 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     PreparedPipeline *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     PreparedBindingSet *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
     MTLPrimitiveType primitive{};
-    if (!descriptor || descriptor->struct_size < sizeof(*descriptor) || !pipeline || !pipeline->graphics ||
+    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics ||
         !pipeline->render || (!bindings && descriptor->bindings.value) ||
         (bindings && bindings->layout != pipeline->layout) ||
         (!bindings && pipeline->layout && !pipeline->layout->entries.empty()) ||
-        !primitiveType(descriptor->topology, primitive) || descriptor->color_attachment_count == 0 ||
-        descriptor->color_attachment_count > 8 || !descriptor->color_attachments ||
+        !primitiveType(descriptor->topology, primitive) ||
         descriptor->color_attachment_count != pipeline->colorFormatCount ||
-        (descriptor->depth_stencil_attachment.resource.value && !pipeline->depthStencil) ||
-        (!descriptor->depth_stencil_attachment.resource.value && pipeline->depthStencil) ||
+        (descriptor->depth_stencil_view.resource.value && !pipeline->depthStencil) ||
+        (!descriptor->depth_stencil_view.resource.value && pipeline->depthStencil) ||
         descriptor->instance_count == 0 || (!descriptor->index_count && descriptor->vertex_count == 0))
         return fail(adapter, "Metal adapter received an invalid or unsupported draw");
     const uint64_t native = nativeCommandEncoder(adapter, commandEncoder);
@@ -1034,18 +1031,18 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         return fail(adapter, "Metal draw command encoder is invalid");
     rhi::metal::RenderingState requested;
     requested.colorCount = descriptor->color_attachment_count;
-    requested.hasDepth = descriptor->depth_stencil_attachment.resource.value != 0;
+    requested.hasDepth = descriptor->depth_stencil_view.resource.value != 0;
     MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
-    std::array<uint64_t, 8> renderTargets{};
-    std::array<uint64_t, 8> renderResources{};
-    std::array<bool, 8> seenLocations{};
+    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderTargets{};
+    std::array<uint64_t, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> renderResources{};
+    std::array<bool, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> seenLocations{};
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
         const auto &source = descriptor->color_attachments[index];
         if (source.location >= pipeline->colorFormatCount || seenLocations[source.location] ||
-            !retainCommandResource(adapter, commandEncoder, source.image))
+            !retainCommandResource(adapter, commandEncoder, source.view))
             return fail(adapter, "Metal draw contains an invalid color attachment");
         seenLocations[source.location] = true;
-        const uint64_t resolved = resolveRhiResource(adapter, source.image);
+        const uint64_t resolved = resolveRhiResource(adapter, source.view);
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
         if (!texture || texture.pixelFormat != pipeline->colorFormats[source.location] ||
             texture.sampleCount != pipeline->sampleCount)
@@ -1062,8 +1059,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         attachment.loadAction = loadAction(load);
         attachment.storeAction = storeAction(store);
         attachment.clearColor = MTLClearColorMake(clear[0], clear[1], clear[2], clear[3]);
-        requested.colors[source.location] = {source.image.identity,
-                                             source.image.resource.value,
+        requested.colors[source.location] = {source.view.identity,
+                                             source.view.resource.value,
                                              source.location,
                                              static_cast<uint32_t>(texture.pixelFormat),
                                              static_cast<uint32_t>(load),
@@ -1076,9 +1073,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     uint64_t depthTarget = 0;
     uint64_t depthResource = 0;
     if (requested.hasDepth) {
-        if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_attachment))
+        if (!retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
             return fail(adapter, "Metal draw contains an invalid depth attachment");
-        const uint64_t resolved = resolveRhiResource(adapter, descriptor->depth_stencil_attachment);
+        const uint64_t resolved = resolveRhiResource(adapter, descriptor->depth_stencil_view);
         id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(resolved));
         if (!texture || texture.pixelFormat != pipeline->depthFormat || texture.sampleCount != pipeline->sampleCount)
             return fail(adapter, "Metal draw contains an incompatible depth attachment");
@@ -1107,8 +1104,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                    clearStencil != 0) {
             return fail(adapter, "Metal draw requests stencil operations for a depth-only attachment");
         }
-        requested.depth = {descriptor->depth_stencil_attachment.identity,
-                           descriptor->depth_stencil_attachment.resource.value,
+        requested.depth = {descriptor->depth_stencil_view.identity,
+                           descriptor->depth_stencil_view.resource.value,
                            0,
                            static_cast<uint32_t>(texture.pixelFormat),
                            static_cast<uint32_t>(depthLoad),
@@ -1174,8 +1171,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
             const bool vertexStage = (slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_VERTEX) != 0;
             const bool fragmentStage = (slot.layout.stage_mask & VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT) != 0;
             if (!isArgumentResource(slot.layout)) {
-                if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                    slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+                if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                     if (vertexStage)
                         [encoder setVertexBytes:slot.inlineStorage.data()
                                          length:slot.inlineStorage.size()
@@ -1195,8 +1191,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                 [encoder setVertexBuffer:buffer offset:slot.resource.offset atIndex:index];
                 continue;
             }
-            if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE ||
-                slot.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER) {
+            if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
                 [encoder useResource:slot.inlineBuffer
                                usage:MTLResourceUsageRead
                               stages:renderStages(slot.layout.stage_mask)];
@@ -1285,7 +1280,7 @@ void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
 
 void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.struct_size = sizeof(adapter.provider);
-    adapter.provider.abi_version = VERNON_PIPELINE_VERSION;
+    adapter.provider.abi_version = VERNON_PROGRAM_VERSION;
     adapter.provider.user_data = &adapter;
     adapter.provider.get_capabilities = getCapabilities;
     adapter.provider.get_device_identity = getDeviceIdentity;
@@ -1294,6 +1289,7 @@ void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.prepare_pipeline = preparePipeline;
     adapter.provider.retain_resource = retainResource;
     adapter.provider.release_resource = releaseResource;
+    adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindingSet;
     adapter.provider.update_binding_set = updateBindingSet;
     adapter.provider.encode_dispatch = encodeDispatch;

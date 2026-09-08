@@ -42,7 +42,7 @@ def resources(
             '!vernon.tensor_view<!vernon.struct<"Vertex">, [-1], "read", "device">',
             output,
         )
-        self.assertIn('!vernon.texture<"2d", f32>', output)
+        self.assertIn('!vernon.texture<"2d", f32, "unknown", "sampled">', output)
         self.assertIn('vernon.interface = "resource"', output)
         self.assertIn("vernon.set = 1 : i64", output)
         self.assertIn("vernon.location = 5 : i64", output)
@@ -65,7 +65,7 @@ def sample(
     return texture_sample(image, sampler, uv)
 """
             output = compile_source(source, f"texture_{dimension}.py")
-            self.assertIn(f'!vernon.texture<"{dimension}", f32>', output)
+            self.assertIn(f'!vernon.texture<"{dimension}", f32, "unknown", "sampled">', output)
             self.assertIn('name = "texture_sample"', output)
 
     def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
@@ -87,6 +87,31 @@ def sample(image: Texture["cube", f32], sampler: Sampler,
 """
         with self.assertRaisesRegex(CompileError, "3-component"):
             compile_source(invalid_coordinates, "bad_coordinates.py")
+
+    def test_storage_texture_uses_unified_texture_annotation(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@kernel
+def store(
+    image: Annotated[Texture["3d", rgba32_float, write], resource(set=0, binding=0)],
+    coordinate: Vector[i32, 3],
+    value: Vector[f32, 4],
+) -> None:
+    texture_store(image, coordinate, value)
+"""
+        output = compile_source(source, "storage_texture.py")
+        self.assertIn('!vernon.texture<"3d", f32, "rgba32_float", "write">', output)
+        self.assertIn('name = "texture_store"', output)
+
+        invalid = """
+from vernon_dsl import *
+@kernel
+def bad(image: Texture["cube", rgba32_float, write]) -> None:
+    pass
+"""
+        with self.assertRaisesRegex(CompileError, "storage Texture dimension"):
+            compile_source(invalid, "bad_storage_texture.py")
 
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """
@@ -118,7 +143,10 @@ def explicit_sample(
         self.assertEqual(output.count('name = "texture_size"'), 2)
         self.assertEqual(output.count('vernon.implicit = "sampler"'), 1)
         self.assertNotIn('vernon.implicit = "texture_size"', output)
-        self.assertIn('(!vernon.texture<"2d", f32>, !vernon.sampler, tensor<2xf32>, f32)', output)
+        self.assertIn(
+            '(!vernon.texture<"2d", f32, "unknown", "sampled">, !vernon.sampler, tensor<2xf32>, f32)',
+            output,
+        )
         explicit_only = compile_source(
             """
 from vernon_dsl import *
@@ -472,7 +500,7 @@ def update(
         self.assertIn('"vernon.swizzle"', output)
         self.assertIn('"vernon.load"', output)
         self.assertIn('"vernon.store"', output)
-        self.assertIn("scf.while", output)
+        self.assertIn("scf.for", output)
 
     def test_if_merges_existing_values(self) -> None:
         source = """
@@ -516,6 +544,106 @@ def bad(x: f32) -> f32:
         self.assertIn("scf.while", output)
         self.assertIn("arith.subf", output)
 
+    def test_canonical_ranges_lower_to_scf_for(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def sum_nested(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        for j in range(1, stop, 1):
+            result = result + i + j
+    return result
+"""
+        output = compile_source(source, "canonical_ranges.py")
+        self.assertEqual(output.count("scf.for"), 2)
+        self.assertNotIn("scf.while", output)
+
+    def test_noncanonical_ranges_remain_scf_while(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def dynamic_step(stop: i32, step: i32) -> i32:
+    result = 0
+    for i in range(0, stop, step):
+        result = result + i
+    return result
+
+@func
+def negative_step(stop: i32) -> i32:
+    result = 0
+    for i in range(stop, 0, -1):
+        result = result + i
+    return result
+
+@func
+def static_stride(stop: i32) -> i32:
+    result = 0
+    for i in range(0, stop, 2):
+        result = result + i
+    return result
+
+@func
+def exits(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i > 2:
+            break
+        result = result + i
+    return result
+
+@func
+def continues(stop: i32) -> i32:
+    result = 0
+    for i in range(stop):
+        if i < 2:
+            continue
+        result = result + i
+    return result
+
+@func
+def early_return(stop: i32) -> i32:
+    for i in range(stop):
+        if i > 2:
+            return i
+    return stop
+"""
+        output = compile_source(source, "noncanonical_ranges.py")
+        self.assertEqual(output.count("scf.while"), 6)
+        self.assertNotIn("scf.for", output)
+
+    def test_canonical_range_else_is_unconditional(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def range_else(stop: i32) -> i32:
+    result = 1
+    for i in range(stop):
+        result = result + i
+    else:
+        result = result + 7
+    return result
+"""
+        output = compile_source(source, "range_else.py")
+        self.assertIn("scf.for", output)
+        self.assertNotIn("vernon.loop_control_index", output)
+
+    def test_canonical_induction_preserves_storage_index(self) -> None:
+        source = """
+from vernon_dsl import *
+
+@func
+def fill(values: TensorView[f32, (dyn,), write]) -> None:
+    for i in range(0, 4):
+        values[i] = 1.0
+"""
+        output = compile_source(source, "canonical_storage_index.py")
+        self.assertIn("scf.for", output)
+        self.assertEqual(output.count("arith.index_cast"), 3)
+
     def test_output_is_deterministic(self) -> None:
         source = """
 from vernon_dsl import *
@@ -539,6 +667,34 @@ def main(value: f32) -> f32:
 
 
 class ModuleGraphTests(unittest.TestCase):
+    def test_dsl_entry_can_share_a_module_with_host_program_code(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "application.py"
+            path.write_text(
+                "from dataclasses import dataclass\n"
+                "from functools import cache\n"
+                "import json\n"
+                "from vernon_dsl import TensorView, dyn, f32, kernel, write\n"
+                "@dataclass\n"
+                "class Options:\n"
+                "    scale: float\n"
+                "@cache\n"
+                "def host_value() -> float:\n"
+                "    def nested() -> float:\n"
+                "        return json.loads('1.0')\n"
+                "    return nested()\n"
+                "@kernel\n"
+                "def main(output: TensorView[f32, (dyn,), write]) -> None:\n"
+                "    output[0] = 2.0\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(path)
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("host_value", output)
+            self.assertNotIn("Options", output)
+
     def test_project_local_helper_is_namespaced_and_hashed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -568,16 +724,43 @@ class ModuleGraphTests(unittest.TestCase):
             self.assertIn("lighting.py=", output)
             self.assertIn("shader.py=", output)
 
+    def test_unreferenced_project_import_is_not_loaded_or_hashed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unused = root / "unused.py"
+            shader = root / "shader.py"
+            unused.write_text("this is not valid Python !!!\n", encoding="utf-8")
+            shader.write_text(
+                "from unused import missing\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+
+            output = compile_file(shader, entry="main")
+
+            self.assertIn("func.func @main", output)
+            self.assertNotIn("unused.py=", output)
+
     def test_import_cycle_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "a.py").write_text("from b import helper\n", encoding="utf-8")
+            (root / "a.py").write_text(
+                "from b import helper\n"
+                "from vernon_dsl import f32, fragment\n"
+                "@fragment\n"
+                "def main(value: f32) -> f32:\n"
+                "    return helper(value)\n",
+                encoding="utf-8",
+            )
             (root / "b.py").write_text(
                 "from a import main\n"
-                "from vernon_dsl import func\n"
+                "from vernon_dsl import f32, func\n"
                 "@func\n"
                 "def helper(value: f32) -> f32:\n"
-                "    return value\n",
+                "    return main(value)\n",
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(CompileError, "import cycle"):

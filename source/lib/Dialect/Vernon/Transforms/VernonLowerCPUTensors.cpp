@@ -20,6 +20,53 @@
 namespace mlir::vernon {
 namespace {
 
+struct HostAggregateType {
+    LLVM::LLVMStructType type;
+    SmallVector<int64_t> fieldIndices;
+};
+
+FailureOr<HostAggregateType> getHostAggregateType(Type source, const TypeConverter &converter, ModuleOp module) {
+    SmallVector<Type> fields;
+    if (auto tuple = dyn_cast<TupleType>(source)) {
+        fields.append(tuple.getTypes().begin(), tuple.getTypes().end());
+    } else if (auto structure = dyn_cast<StructType>(source)) {
+        FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> resolved = resolveStructFields(structure, module);
+        if (failed(resolved))
+            return failure();
+        fields = std::move(resolved->second);
+    } else {
+        return failure();
+    }
+    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(source, module);
+    if (failed(layout) || layout->fieldOffsets.size() != fields.size())
+        return failure();
+
+    SmallVector<Type> elements;
+    SmallVector<int64_t> fieldIndices;
+    uint64_t offset = 0;
+    Type byte = IntegerType::get(source.getContext(), 8);
+    for (auto [index, field] : llvm::enumerate(fields)) {
+        const uint64_t fieldOffset = layout->fieldOffsets[index];
+        if (fieldOffset < offset)
+            return failure();
+        if (fieldOffset != offset)
+            elements.push_back(LLVM::LLVMArrayType::get(byte, fieldOffset - offset));
+        fieldIndices.push_back(static_cast<int64_t>(elements.size()));
+        Type converted = converter.convertType(field);
+        FailureOr<ValueAbiLayout> fieldLayout = getValueStorageLayout(field, module);
+        if (!converted || failed(fieldLayout))
+            return failure();
+        elements.push_back(converted);
+        offset = fieldOffset + fieldLayout->size;
+    }
+    if (layout->size < offset)
+        return failure();
+    if (layout->size != offset)
+        elements.push_back(LLVM::LLVMArrayType::get(byte, layout->size - offset));
+    return HostAggregateType{LLVM::LLVMStructType::getLiteral(source.getContext(), elements, true),
+                             std::move(fieldIndices)};
+}
+
 struct ReturnPattern final : OpConversionPattern<func::ReturnOp> {
     using OpConversionPattern::OpConversionPattern;
 
@@ -54,61 +101,85 @@ struct ResourceIntrinsicTypePattern final : OpConversionPattern<IntrinsicOp> {
 };
 
 struct TupleCreatePattern final : OpConversionPattern<TupleCreateOp> {
-    using OpConversionPattern::OpConversionPattern;
+    TupleCreatePattern(TypeConverter &converter, MLIRContext *context, ModuleOp module)
+        : OpConversionPattern(converter, context), module(module) {}
 
     LogicalResult matchAndRewrite(TupleCreateOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        Type converted = getTypeConverter()->convertType(op.getResult().getType());
-        auto structType = dyn_cast_if_present<LLVM::LLVMStructType>(converted);
-        if (!structType)
+        FailureOr<HostAggregateType> aggregate =
+            getHostAggregateType(op.getResult().getType(), *getTypeConverter(), module);
+        if (failed(aggregate) || aggregate->fieldIndices.size() != adaptor.getElements().size())
             return failure();
-        Value aggregate = LLVM::UndefOp::create(rewriter, op.getLoc(), structType);
+        Value result = LLVM::UndefOp::create(rewriter, op.getLoc(), aggregate->type);
         for (auto [index, element] : llvm::enumerate(adaptor.getElements()))
-            aggregate = LLVM::InsertValueOp::create(rewriter, op.getLoc(), aggregate, element,
-                                                    ArrayRef<int64_t>{static_cast<int64_t>(index)});
-        rewriter.replaceOp(op, aggregate);
+            result = LLVM::InsertValueOp::create(rewriter, op.getLoc(), result, element,
+                                                 ArrayRef<int64_t>{aggregate->fieldIndices[index]});
+        rewriter.replaceOp(op, result);
         return success();
     }
+
+private:
+    ModuleOp module;
 };
 
 struct TupleGetPattern final : OpConversionPattern<TupleGetOp> {
-    using OpConversionPattern::OpConversionPattern;
+    TupleGetPattern(TypeConverter &converter, MLIRContext *context, ModuleOp module)
+        : OpConversionPattern(converter, context), module(module) {}
 
     LogicalResult matchAndRewrite(TupleGetOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        FailureOr<HostAggregateType> aggregate =
+            getHostAggregateType(op.getInput().getType(), *getTypeConverter(), module);
+        if (failed(aggregate) || op.getIndex() >= aggregate->fieldIndices.size())
+            return failure();
         rewriter.replaceOpWithNewOp<LLVM::ExtractValueOp>(op, adaptor.getInput(),
-                                                          ArrayRef<int64_t>{static_cast<int64_t>(op.getIndex())});
+                                                          ArrayRef<int64_t>{aggregate->fieldIndices[op.getIndex()]});
         return success();
     }
+
+private:
+    ModuleOp module;
 };
 
 struct StructCreatePattern final : OpConversionPattern<StructCreateOp> {
-    using OpConversionPattern::OpConversionPattern;
+    StructCreatePattern(TypeConverter &converter, MLIRContext *context, ModuleOp module)
+        : OpConversionPattern(converter, context), module(module) {}
 
     LogicalResult matchAndRewrite(StructCreateOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
-        auto structType =
-            dyn_cast_if_present<LLVM::LLVMStructType>(getTypeConverter()->convertType(op.getResult().getType()));
-        if (!structType)
+        FailureOr<HostAggregateType> aggregate =
+            getHostAggregateType(op.getResult().getType(), *getTypeConverter(), module);
+        if (failed(aggregate) || aggregate->fieldIndices.size() != adaptor.getFields().size())
             return failure();
-        Value aggregate = LLVM::UndefOp::create(rewriter, op.getLoc(), structType);
+        Value result = LLVM::UndefOp::create(rewriter, op.getLoc(), aggregate->type);
         for (auto [index, field] : llvm::enumerate(adaptor.getFields()))
-            aggregate = LLVM::InsertValueOp::create(rewriter, op.getLoc(), aggregate, field,
-                                                    ArrayRef<int64_t>{static_cast<int64_t>(index)});
-        rewriter.replaceOp(op, aggregate);
+            result = LLVM::InsertValueOp::create(rewriter, op.getLoc(), result, field,
+                                                 ArrayRef<int64_t>{aggregate->fieldIndices[index]});
+        rewriter.replaceOp(op, result);
         return success();
     }
+
+private:
+    ModuleOp module;
 };
 
 struct StructGetPattern final : OpConversionPattern<StructGetOp> {
-    using OpConversionPattern::OpConversionPattern;
+    StructGetPattern(TypeConverter &converter, MLIRContext *context, ModuleOp module)
+        : OpConversionPattern(converter, context), module(module) {}
 
     LogicalResult matchAndRewrite(StructGetOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const override {
+        FailureOr<HostAggregateType> aggregate =
+            getHostAggregateType(op.getInput().getType(), *getTypeConverter(), module);
+        if (failed(aggregate) || op.getIndex() >= aggregate->fieldIndices.size())
+            return failure();
         rewriter.replaceOpWithNewOp<LLVM::ExtractValueOp>(op, adaptor.getInput(),
-                                                          ArrayRef<int64_t>{static_cast<int64_t>(op.getIndex())});
+                                                          ArrayRef<int64_t>{aggregate->fieldIndices[op.getIndex()]});
         return success();
     }
+
+private:
+    ModuleOp module;
 };
 
 struct AggregateTensorConstructPattern final : OpConversionPattern<IntrinsicOp> {
@@ -194,11 +265,9 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
         TypeConverter converter;
         // CPU value tensors preserve their complete static shape.
         addVernonSharedValueTypeConversions(converter);
-        converter.addConversion([&converter](TupleType tuple) -> std::optional<Type> {
-            SmallVector<Type> elements;
-            if (failed(converter.convertTypes(tuple.getTypes(), elements)))
-                return std::nullopt;
-            return LLVM::LLVMStructType::getLiteral(tuple.getContext(), elements, true);
+        converter.addConversion([&converter, module](TupleType tuple) -> std::optional<Type> {
+            FailureOr<HostAggregateType> aggregate = getHostAggregateType(tuple, converter, module);
+            return succeeded(aggregate) ? std::optional<Type>(aggregate->type) : std::nullopt;
         });
         converter.addConversion([&converter](TensorType tensor) -> std::optional<Type> {
             Type element = converter.convertType(tensor.getElementType());
@@ -210,32 +279,37 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
             return LLVM::LLVMArrayType::get(element, count);
         });
         converter.addConversion([&converter, module](StructType structure) -> std::optional<Type> {
-            FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields = resolveStructFields(structure, module);
-            if (failed(fields))
-                return std::nullopt;
-            SmallVector<Type> converted;
-            if (failed(converter.convertTypes(fields->second, converted)))
-                return std::nullopt;
-            return LLVM::LLVMStructType::getLiteral(structure.getContext(), converted, true);
+            FailureOr<HostAggregateType> aggregate = getHostAggregateType(structure, converter, module);
+            return succeeded(aggregate) ? std::optional<Type>(aggregate->type) : std::nullopt;
         });
         converter.addConversion(
             [module](TensorViewType view, SmallVectorImpl<Type> &types) -> std::optional<LogicalResult> {
                 if (view.getElementType().isIntOrFloat())
                     return std::nullopt;
-                FailureOr<ValueAbiLayout> layout = getValueAbiLayout(view.getElementType(), module);
-                if (failed(layout))
-                    return failure();
-                for (const ValueAbiLeaf &leaf : layout->leaves)
-                    types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.scalarType));
+                if (view.getAddressSpace() == "workgroup") {
+                    FailureOr<WorkgroupPhysicalStoragePlan> plan = getWorkgroupPhysicalStoragePlan(view, module);
+                    if (failed(plan))
+                        return failure();
+                    for (const WorkgroupPhysicalLeaf &leaf : plan->leaves)
+                        types.push_back(TensorViewType::get(view.getContext(), leaf.scalarType,
+                                                            {static_cast<int64_t>(leaf.scalarCount)}, "read_write",
+                                                            "workgroup"));
+                } else {
+                    FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);
+                    if (failed(layout))
+                        return failure();
+                    for (const ValueAbiLeaf &leaf : layout->leaves)
+                        types.push_back(MemRefType::get({ShapedType::kDynamic}, leaf.scalarType));
+                }
                 return success();
             });
 
         RewritePatternSet patterns(context);
         populateVernonSharedValuePatterns(converter, patterns);
-        patterns
-            .add<ResourceIntrinsicTypePattern, ReturnPattern, AggregateTensorConstructPattern,
-                 AggregateTensorGetPattern, StructCreatePattern, StructGetPattern, TupleCreatePattern, TupleGetPattern>(
-                converter, context);
+        patterns.add<ResourceIntrinsicTypePattern, ReturnPattern, AggregateTensorConstructPattern,
+                     AggregateTensorGetPattern>(converter, context);
+        patterns.add<StructCreatePattern, StructGetPattern, TupleCreatePattern, TupleGetPattern>(converter, context,
+                                                                                                 module);
         populateCpuAggregateTensorViewPatterns(converter, patterns, module);
         populateFunctionOpInterfaceTypeConversionPattern(func::FuncOp::getOperationName(), patterns, converter);
 
@@ -255,7 +329,10 @@ struct VernonLowerCPUTensorsPass final : PassWrapper<VernonLowerCPUTensorsPass, 
         });
         target.addDynamicallyLegalOp<LoadOp, StoreOp, PhysicalLoadOp, PhysicalStoreOp, PhysicalAtomicOp>(
             [&](Operation *operation) { return converter.isLegal(operation); });
-        target.addIllegalOp<SwizzleOp, StructCreateOp, StructGetOp, TupleCreateOp, TupleGetOp>();
+        target.addDynamicallyLegalOp<WorkgroupAllocOp>(
+            [&](WorkgroupAllocOp operation) { return converter.isLegal(operation.getOperation()); });
+        target.addIllegalOp<SwizzleOp, StructCreateOp, StructGetOp, TupleCreateOp, TupleGetOp, ReduceSumOp,
+                            ScatterAddOp>();
         populateVernonSharedValueStructuralTypeConversions(converter, patterns, target);
 
         if (failed(applyPartialConversion(getOperation(), target, std::move(patterns)))) {

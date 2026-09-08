@@ -5,118 +5,145 @@
 #include "compiler_cuda.h"
 #include "compiler_dxc.h"
 #include "compiler_frontend.h"
+#include "compiler_reflection.h"
 #include "compiler_spirv.h"
 #include "compiler_spirv_cross.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
 #include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
+#include "llvm/ADT/STLExtras.h"
 
 #include <cstring>
 #include <string>
 
 namespace vernon::compiler {
+
 namespace {
 
 std::string copyStringView(VernonStringView value) {
     return value.data && value.size ? std::string(value.data, value.size) : std::string();
 }
 
-bool validateTargetCapabilities(PreparedModule &prepared, VernonTarget target, std::string &diagnostics) {
-    mlir::OwningOpRef<mlir::ModuleOp> module = prepared.clone();
+bool containsBackendLocalTapeHandle(mlir::Type type) {
+    if (mlir::isa<mlir::vernon::AdTapeType, mlir::vernon::AdRegionHeaderType>(type))
+        return true;
+    if (auto tuple = mlir::dyn_cast<mlir::TupleType>(type))
+        return llvm::any_of(tuple.getTypes(), containsBackendLocalTapeHandle);
+    return false;
+}
+
+VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
+#if !defined(VERNON_DXC_EXECUTABLE)
+    if (target == VERNON_TARGET_DIRECTX)
+        return {};
+#endif
+    switch (target) {
+    case VERNON_TARGET_CPU:
+        return {1, 1, 1, 1, 1};
+    case VERNON_TARGET_VULKAN:
+        return {1, 1, 1, 1, 0};
+    case VERNON_TARGET_CUDA:
+        return {1, 0, 1, 1, 1};
+    case VERNON_TARGET_OPENGL:
+    case VERNON_TARGET_OPENGL_ES:
+    case VERNON_TARGET_METAL:
+    case VERNON_TARGET_DIRECTX:
+        return {1, 1, 1, 1, 0};
+    }
+    return {};
+}
+
+bool validateTargetCapabilities(PreparedModule &prepared, const TargetProfile &profile, std::string &diagnostics) {
+    mlir::ModuleOp module = prepared.logicalModule();
+    const VernonTarget target = profile.target;
+    const VernonTargetCapabilities capabilities = queryTargetCapabilities(target);
     bool usesDeviceAtomics = false;
-    module->walk([&](mlir::vernon::PhysicalAtomicOp atomic) {
-        auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
-        usesDeviceAtomics |= view && view.getAddressSpace() == "device";
+    bool usesFloatDeviceAtomics = false;
+    bool cpuSynchronizationUnsupported = false;
+    bool cudaDeviceBarrier = false;
+    module.walk([&](mlir::Operation *operation) {
+        mlir::Value atomicStorage;
+        if (auto atomic = mlir::dyn_cast<mlir::vernon::AtomicOp>(operation))
+            atomicStorage = atomic.getStorage();
+        else if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation))
+            atomicStorage = atomic.getStorage();
+        if (atomicStorage) {
+            auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomicStorage.getType());
+            usesDeviceAtomics |= view && view.getAddressSpace() == "device";
+            usesFloatDeviceAtomics |= view && view.getAddressSpace() == "device" && view.getElementType().isF32();
+            if (!view)
+                cpuSynchronizationUnsupported = true;
+            if (view && view.getAddressSpace() == "device")
+                return;
+        }
+        if (auto barrier = mlir::dyn_cast<mlir::vernon::BarrierOp>(operation);
+            barrier && barrier.getScope() == "device") {
+            cudaDeviceBarrier = true;
+            cpuSynchronizationUnsupported = true;
+        }
     });
-    if (usesDeviceAtomics && target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA &&
-        target != VERNON_TARGET_VULKAN) {
-        diagnostics = "device-scope storage TensorView atomics are supported only by CPU, CUDA, and Vulkan targets";
+    if (usesFloatDeviceAtomics &&
+        profile.accumulation.device.f32 == mlir::vernon::AtomicAddImplementation::Unsupported) {
+        diagnostics = "device-scope f32 atomic add has no legal implementation in the target profile";
         return false;
     }
-    if (target != VERNON_TARGET_CPU && target != VERNON_TARGET_CUDA)
-        return true;
-    if (target == VERNON_TARGET_CPU) {
-        bool invalid = false;
-        module->walk([&](mlir::Operation *operation) {
-            if (invalid ||
-                !mlir::isa<mlir::vernon::WorkgroupAllocOp, mlir::vernon::PhysicalAtomicOp, mlir::vernon::BarrierOp>(
-                    operation))
-                return;
-            if (auto atomic = mlir::dyn_cast<mlir::vernon::PhysicalAtomicOp>(operation); atomic) {
-                auto view = mlir::dyn_cast<mlir::vernon::TensorViewType>(atomic.getStorage().getType());
-                if (!view) {
-                    diagnostics = "physical atomic storage operand is not a TensorView";
-                    invalid = true;
-                    return;
-                }
-                if (view.getAddressSpace() == "device")
-                    return;
-            }
-            mlir::func::FuncOp function = operation->getParentOfType<mlir::func::FuncOp>();
-            auto size = function ? function->getAttrOfType<mlir::DenseI32ArrayAttr>("vernon.workgroup_size") : nullptr;
-            if (!size || size.size() != 3 || size[0] != 1 || size[1] != 1 || size[2] != 1)
-                invalid = true;
-        });
-        if (invalid)
-            diagnostics =
-                "CPU reference synchronization requires workgroup_size=(1, 1, 1); use a GPU target for cooperative "
-                "workgroups";
-        return !invalid;
+    if (usesDeviceAtomics && !capabilities.supports_device_storage_atomics) {
+        diagnostics = "device-scope storage TensorView atomics require a target storage-atomic capability";
+        return false;
     }
-    for (mlir::func::FuncOp function : module->getOps<mlir::func::FuncOp>()) {
-        auto entry = function->getAttrOfType<mlir::UnitAttr>("vernon.entry");
-        if (!entry)
-            continue;
-        auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
-        if (!stage || stage.getValue() != "compute") {
-            diagnostics = "CUDA target capability rejects non-compute entry '" + function.getSymName().str() + "'";
+    if (target == VERNON_TARGET_CPU && cpuSynchronizationUnsupported) {
+        diagnostics = "CPU target does not support cross-workgroup device barriers; split the work into multiple "
+                      "kernel launches";
+        return false;
+    }
+    if (target == VERNON_TARGET_CUDA) {
+        if (cudaDeviceBarrier) {
+            diagnostics = "CUDA target capability rejects device-scope barriers; use workgroup_barrier";
             return false;
         }
-        for (unsigned index = 0; index < function.getNumArguments(); ++index) {
-            if (function.getArgAttrDict(index).get("vernon.builtin"))
+        for (mlir::func::FuncOp function : module.getOps<mlir::func::FuncOp>()) {
+            if (!function->hasAttr("vernon.entry"))
                 continue;
-            mlir::FailureOr<mlir::vernon::PhysicalValueAbiPlan> plan = mlir::vernon::getPhysicalValueAbiPlan(
-                function.getArgumentTypes()[index], *module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter);
-            if (mlir::failed(plan)) {
-                diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
+            auto stage = function->getAttrOfType<mlir::StringAttr>("vernon.stage");
+            if (!stage || stage.getValue() != "compute") {
+                diagnostics = "CUDA target capability rejects non-compute entry '" + function.getSymName().str() + "'";
                 return false;
             }
-            const auto *unsupported = std::get_if<mlir::vernon::UnsupportedPhysicalValueAbi>(&*plan);
-            if (!unsupported)
-                continue;
-            diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +
-                          std::to_string(index);
-            return false;
+            for (unsigned index = 0; index < function.getNumArguments(); ++index) {
+                if (function.getArgAttrDict(index).get("vernon.builtin") ||
+                    containsBackendLocalTapeHandle(function.getArgumentTypes()[index]))
+                    continue;
+                mlir::DictionaryAttr attrs = function.getArgAttrDict(index);
+                llvm::SmallVector<llvm::StringRef> logicalDtypes;
+                if (auto dtypes = attrs.getAs<mlir::ArrayAttr>("vernon.abi_leaf_dtypes"))
+                    for (mlir::Attribute dtype : dtypes)
+                        if (auto value = mlir::dyn_cast<mlir::StringAttr>(dtype))
+                            logicalDtypes.push_back(value.getValue());
+                if (logicalDtypes.empty())
+                    if (auto sugar = attrs.getAs<mlir::StringAttr>("vernon.dtype"); sugar && !sugar.getValue().empty())
+                        logicalDtypes.push_back(sugar.getValue());
+                mlir::FailureOr<mlir::vernon::BackendInterfaceAbiPlan> plan = mlir::vernon::getBackendInterfaceAbiPlan(
+                    function.getArgumentTypes()[index], module, mlir::vernon::PhysicalAbiProfile::CudaKernelParameter,
+                    logicalDtypes);
+                if (mlir::failed(plan)) {
+                    diagnostics = "CUDA target capability cannot plan compute argument #" + std::to_string(index);
+                    return false;
+                }
+                if (const auto *unsupported = std::get_if<mlir::vernon::UnsupportedBackendInterfaceAbi>(&*plan)) {
+                    diagnostics = "CUDA target capability '" + unsupported->reason + "' rejects compute argument #" +
+                                  std::to_string(index);
+                    return false;
+                }
+            }
         }
-    }
-    bool deviceBarrier = false;
-    module->walk([&](mlir::vernon::BarrierOp barrier) { deviceBarrier |= barrier.getScope() == "device"; });
-    if (deviceBarrier) {
-        diagnostics = "CUDA target capability rejects device-scope barriers; use workgroup_barrier";
-        return false;
     }
     return true;
 }
 
 } // namespace
 
-VernonTargetCapabilities targetCapabilities(VernonTarget target) {
-#if !defined(VERNON_DXC_EXECUTABLE)
-    if (target == VERNON_TARGET_DIRECTX)
-        return VernonTargetCapabilities{0, 0, 0, 0};
-#endif
-    if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_VULKAN)
-        return VernonTargetCapabilities{1, 1, 1, 0};
-    if (target == VERNON_TARGET_CUDA)
-        return VernonTargetCapabilities{1, 0, 1, 0};
-    if (target == VERNON_TARGET_OPENGL || target == VERNON_TARGET_OPENGL_ES || target == VERNON_TARGET_METAL ||
-        target == VERNON_TARGET_DIRECTX)
-        return VernonTargetCapabilities{1, 1, 1, 0};
-    // Do not advertise an IR-only path as a usable target; availability means
-    // the complete lowering and artifact pipeline is linked.
-    return VernonTargetCapabilities{0, 0, 0, 0};
-}
+VernonTargetCapabilities targetCapabilities(VernonTarget target) { return queryTargetCapabilities(target); }
 
 CompileOptions defaultCompileOptions(VernonTarget target) {
     switch (target) {
@@ -149,6 +176,31 @@ VernonTarget compileTargetKind(const CompileOptions &options) {
     if (std::holds_alternative<DirectXCompileOptions>(options))
         return VERNON_TARGET_DIRECTX;
     return VERNON_TARGET_CUDA;
+}
+
+TargetProfile resolveTargetProfile(const CompileOptions &options) {
+    using mlir::vernon::AggregateGradientStorage;
+    using mlir::vernon::AtomicAddImplementation;
+    TargetProfile profile;
+    profile.target = compileTargetKind(options);
+    profile.accumulation.aggregateGradientStorage = AggregateGradientStorage::InvocationPrivateStaging;
+    if (std::holds_alternative<CpuCodegenOptions>(options)) {
+        profile.accumulation.device = {AtomicAddImplementation::Native, AtomicAddImplementation::Native};
+        profile.accumulation.workgroup = {AtomicAddImplementation::Native, AtomicAddImplementation::Native};
+        return profile;
+    }
+    if (std::holds_alternative<CudaCompileOptions>(options)) {
+        profile.accumulation.device = {AtomicAddImplementation::Native, AtomicAddImplementation::Unsupported};
+        profile.accumulation.workgroup = {AtomicAddImplementation::Native, AtomicAddImplementation::Unsupported};
+        profile.accumulation.supportsWorkgroupReduction = true;
+        return profile;
+    }
+    profile.accumulation.device = {AtomicAddImplementation::IntegerCompareExchange,
+                                   AtomicAddImplementation::Unsupported};
+    profile.accumulation.workgroup = {AtomicAddImplementation::IntegerCompareExchange,
+                                      AtomicAddImplementation::Unsupported};
+    profile.accumulation.supportsWorkgroupReduction = true;
+    return profile;
 }
 
 VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOptions &options,
@@ -203,16 +255,25 @@ VernonStatus parseCompileOptions(const VernonCompileOptions &source, CompileOpti
 }
 
 VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options, std::vector<Artifact> &artifacts,
-                           std::string &reflection, std::string &diagnostics, CpuExecutionStatePtr &cpuExecution) {
-    const VernonTarget target = compileTargetKind(options);
+                           std::string &reflection, std::string &diagnostics,
+                           const VernonCpuRuntimeHelpersV1 *cpuRuntimeHelpers, CpuExecutionStatePtr &cpuExecution) {
+    const TargetProfile profile = resolveTargetProfile(options);
+    const VernonTarget target = profile.target;
     diagnostics.clear();
-    if (!validateTargetCapabilities(module, target, diagnostics)) {
+    if (!validateTargetCapabilities(module, profile, diagnostics)) {
         artifacts.clear();
         return VERNON_STATUS_UNSUPPORTED_TARGET;
     }
     if (target == VERNON_TARGET_CPU) {
         const auto &cpu = std::get<CpuCodegenOptions>(options);
-        if (!compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuExecution)) {
+        const CpuCompileResult result =
+            compileCpu(module, cpu, artifacts, reflection, diagnostics, cpuRuntimeHelpers, cpuExecution);
+        if (result != CpuCompileResult::Success) {
+            artifacts.clear();
+            return result == CpuCompileResult::VerificationFailure ? VERNON_STATUS_VERIFICATION_ERROR
+                                                                   : VERNON_STATUS_INTERNAL_ERROR;
+        }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -233,7 +294,7 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
                                                       ? std::get<MetalCompileOptions>(options).platform
                                                       : VERNON_METAL_PLATFORM_MACOS;
         std::vector<TargetResourceSlot> targetResourceSlots;
-        if (!compileSpirv(module, target, artifacts, diagnostics)) {
+        if (!compileSpirv(module, profile, artifacts, reflection, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -251,6 +312,10 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
             }
             artifacts = std::move(dxilArtifacts);
         }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         if (!addArtifactTable(reflection, diagnostics, artifacts, options, targetResourceSlots)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
@@ -258,7 +323,11 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
         return VERNON_STATUS_OK;
     }
     if (target == VERNON_TARGET_CUDA) {
-        if (!compileCuda(module, artifacts, diagnostics)) {
+        if (!compileCuda(module, profile, artifacts, reflection, diagnostics)) {
+            artifacts.clear();
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
+        if (!selectTargetPhysicalLayouts(reflection, target, diagnostics)) {
             artifacts.clear();
             return VERNON_STATUS_INTERNAL_ERROR;
         }
@@ -271,10 +340,6 @@ VernonStatus compileTarget(PreparedModule &module, const CompileOptions &options
     artifacts.clear();
     diagnostics = "the requested target lowering pipeline is not available";
     return VERNON_STATUS_UNSUPPORTED_TARGET;
-}
-
-bool linkCpuHostObject(const void *object, size_t objectSize, Artifact &artifact, std::string &diagnostics) {
-    return linkHostObject(object, objectSize, artifact, diagnostics);
 }
 
 VernonCpuEntryPoint findCompiledCpuEntry(const CpuExecutionState *execution, std::string_view entry) {

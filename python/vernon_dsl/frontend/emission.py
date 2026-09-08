@@ -4,9 +4,12 @@ import ast
 import json
 from collections.abc import Callable, Mapping
 
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..ad import ProgramTransformSpec
+from ..bundle import canonical_json
 from ..diagnostics import CompileError
 from .abi import value_leaves
+from .autodiff_profiles import AutodiffProfilePlan
 from .model import ConcreteType
 from .type_parser import AnnotatedType
 
@@ -20,11 +23,13 @@ def emit_mlir_module(
     structs: Mapping[str, tuple[tuple[str, AnnotatedType], ...]],
     emit_function: Callable[[ast.FunctionDef], list[str]],
     error: Callable[[ast.AST, str], CompileError],
+    program_transform: ProgramTransformSpec | None = None,
+    autodiff_profiles: AutodiffProfilePlan | None = None,
 ) -> str:
     attributes = [
         'vernon.frontend = "python"',
         f"vernon.compiler_contract_version = {COMPILER_CONTRACT_VERSION} : i64",
-        f"vernon.pipeline_version = {PIPELINE_VERSION} : i64",
+        f"vernon.program_version = {PROGRAM_VERSION} : i64",
     ]
     if dependencies:
         encoded = ", ".join(json.dumps(f"{path}={digest}") for path, digest in dependencies)
@@ -35,6 +40,14 @@ def emit_mlir_module(
     if enabled_features:
         variant = ", ".join(json.dumps(name) for name in sorted(enabled_features))
         attributes.append(f"vernon.variant_key = [{variant}]")
+    if program_transform is not None:
+        encoded_transform = json.dumps(canonical_json(program_transform.to_dict()))
+        attributes.append(f"vernon.program_transform = {encoded_transform}")
+        attributes.append(f'vernon.program_transform_identity = "{program_transform.identity}"')
+    if autodiff_profiles is not None:
+        encoded_profiles = json.dumps(canonical_json(autodiff_profiles.manifest_dict()))
+        attributes.append(f"vernon.ad_profiles = {encoded_profiles}")
+        attributes.append(f'vernon.ad_profiles_identity = "{autodiff_profiles.identity}"')
     body: list[str] = [f"module attributes {{{', '.join(attributes)}}} {{"]
 
     def struct_field_types(name: str) -> tuple[tuple[str, ConcreteType], ...]:

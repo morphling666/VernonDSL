@@ -56,7 +56,7 @@ def main() -> int:
             "def fill(output: vd.TensorView[vd.f32, (vd.dyn,), vd.write], "
             "gid: Annotated[vd.Tensor[vd.u32, (3,)], vd.builtin('global_invocation_id')]) -> None:\n"
             "    output[gid[0]] = 1.0\n"
-            "asset = vd.pipeline_asset(id='release/smoke', program=fill)\n",
+            "asset = vd.program_asset(id='release/smoke', program=fill)\n",
             encoding="utf-8",
         )
         cooked = root / "cooked"
@@ -64,7 +64,7 @@ def main() -> int:
             [
                 sys.executable,
                 "-m",
-                "vernon_dsl.pipeline_asset_cli",
+                "vernon_dsl.program_asset_cli",
                 f"{asset_source}:asset",
                 "--target",
                 "cpu",
@@ -73,7 +73,7 @@ def main() -> int:
             ],
             check=True,
         )
-        assert (cooked / "cooked.pipeline.json").stat().st_size > 0
+        assert (cooked / "cooked.program.json").stat().st_size > 0
     print(f"Installed VernonDSL {RELEASE_VERSION} CPU dispatch, frontend, cooker, and package checks passed.")
     return 0
 

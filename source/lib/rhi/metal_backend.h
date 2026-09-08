@@ -50,9 +50,9 @@ struct RenderAttachmentSignature {
 
 struct RenderingState {
     id<MTLRenderCommandEncoder> encoder;
-    std::array<id<MTLTexture>, 8> colorTextures{};
+    std::array<id<MTLTexture>, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colorTextures{};
     id<MTLTexture> depthStencilTexture;
-    std::array<RenderAttachmentSignature, 8> colors{};
+    std::array<RenderAttachmentSignature, VERNON_RHI_MAX_COLOR_ATTACHMENTS> colors{};
     RenderAttachmentSignature depth{};
     size_t colorCount{};
     bool hasDepth{};
@@ -70,13 +70,16 @@ struct VERNON_RHI_CAPI DeviceState {
     bool createBuffer(Buffer &buffer, const VernonRhiBufferDescriptor &descriptor, std::string &error);
     void destroyBuffer(Buffer &buffer);
     bool uploadBuffer(const Buffer &buffer, uint64_t offset, const void *source, uint64_t size, std::string &error);
+    bool uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges, size_t rangeCount,
+                            std::string &error);
     bool downloadBuffer(const Buffer &buffer, uint64_t offset, void *destination, uint64_t size, std::string &error);
 
     bool createImage(Image &image, const VernonRhiImageDescriptor &descriptor, std::string &error);
     void destroyImage(Image &image);
     bool uploadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
                      const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount, std::string &error);
-    bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor, void *destination, size_t size,
+    bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
+                       const VernonRhiImageDownloadDescriptor &download, void *destination, size_t size,
                        std::string &error);
     bool generateImageMipmaps(const Image &image, uint32_t mipLevels, std::string &error);
     bool createImageView(ImageView &view, const Image &image, const VernonRhiImageViewDescriptor &descriptor,
@@ -87,8 +90,13 @@ struct VERNON_RHI_CAPI DeviceState {
     void destroySampler(Sampler &sampler);
 
     bool beginCommands(uint64_t &native, std::string &error);
+    bool copyBuffer(uint64_t native, const Buffer &source, uint64_t sourceOffset, const Buffer &destination,
+                    uint64_t destinationOffset, uint64_t size, std::string &error);
+    bool copyImage(uint64_t native, const Image &source, const Image &destination,
+                   const VernonRhiImageCopyRegion *regions, size_t regionCount, std::string &error);
     bool submitCommands(uint64_t native, std::string &error);
-    void completeCommands(uint64_t native);
+    bool pollCommands(uint64_t native, bool &completed, bool &succeeded, std::string &error);
+    bool completeCommands(uint64_t native, std::string &error);
     void abandonCommands(uint64_t native);
 
     id<MTLDevice> device;

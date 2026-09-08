@@ -10,13 +10,22 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonConvertGPUToSPIRV.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonCpuPipeline.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonInlineHelpers.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerAccumulation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUResources.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCPUTensors.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerCUDAMath.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUAutodiff.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonLowerGPUTensors.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonStructuredVjp.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToGPU.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonToSpirv.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonValidation.h"
+#include "mlir/Dialect/Vernon/Transforms/VernonVerifyCPUAutodiffABI.h"
+#include "mlir/Dialect/VernonProgram/IR/VernonProgram.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramExecutable.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramImplementation.h"
+#include "mlir/Dialect/VernonProgram/Transforms/VernonProgramVjp.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -55,6 +64,7 @@ int main(int argc, char **argv) {
 
     // Your dialect
     registry.insert<vernon::VernonDialect>();
+    registry.insert<vernon::program::VernonProgramDialect>();
     registerAllExtensions(registry);
     vernon::registerVernonCpuPipelineDialects(registry);
 
@@ -70,15 +80,25 @@ int main(int argc, char **argv) {
     spirv::registerSPIRVPasses();
     // Register passes
     vernon::registerVernonValidatePass();
+    vernon::registerVernonVerifyCPUAutodiffABIPass();
     vernon::registerVernonInlineHelpersPass();
+    vernon::registerVernonStructuredVjpPass();
+    vernon::registerVernonLowerAccumulationPass();
+    vernon::registerVernonPrepareCPUAutodiffSignaturesPass();
+    vernon::registerVernonLowerCPUAutodiffPass();
+    vernon::registerVernonCPUAutodiffToLLVMPass();
     vernon::registerVernonLowerCPUTensorsPass();
     vernon::registerVernonLowerCPUResourcesPass();
     vernon::registerVernonCpuPassPipeline();
     vernon::registerVernonConvertGPUToSPIRVPass();
     vernon::registerVernonLowerCUDAMathPass();
+    vernon::registerVernonLowerGPUAutodiffPass();
     vernon::registerVernonLowerGPUTensorsPass();
     vernon::registerVernonToGPUPass();
     vernon::registerVernonToSPIRVPass();
+    vernon::program::registerVernonProgramBuildExecutablePass();
+    vernon::program::registerVernonProgramSelectImplementationsPass();
+    vernon::program::registerVernonProgramVjpPass();
 
     return failed(MlirOptMain(argc, argv, "Vernon optimizer\n", registry));
 }

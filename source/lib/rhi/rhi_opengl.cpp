@@ -1,5 +1,6 @@
 #include "backend_dispatch.h"
 #include "image_data_layout.h"
+#include "image_descriptor_validation.h"
 #include "logical_resource_record.h"
 #include "opengl_backend.h"
 #include "rhi_test_hooks.h"
@@ -17,7 +18,12 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
+
+namespace vernon::rhi {
+bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
+}
 
 namespace {
 
@@ -26,6 +32,7 @@ using vernon::rhi::opengl::Enum;
 using vernon::rhi::opengl::Image;
 using vernon::rhi::opengl::Int;
 using vernon::rhi::opengl::Size;
+using vernon::rhi::opengl::Uint;
 
 struct FormatInfo {
     Int internal{};
@@ -42,6 +49,19 @@ struct ImageSlot : vernon::rhi::LogicalResourceRecord {
     Enum target{};
 };
 
+struct IdentityImageViewBacking {};
+struct OwnedTextureViewBacking {
+    Image image;
+};
+using ImageViewBacking = std::variant<IdentityImageViewBacking, OwnedTextureViewBacking>;
+
+struct ImageViewSlot : vernon::rhi::LogicalResourceRecord {
+    ImageViewBacking backing;
+    VernonRhiImageViewDescriptor descriptor{};
+    uint64_t imageResource{};
+    Enum target{};
+};
+
 struct BufferSlot : vernon::rhi::LogicalResourceRecord {
     vernon::rhi::opengl::Buffer buffer;
     VernonRhiBufferDescriptor descriptor{};
@@ -55,6 +75,7 @@ struct OpenGLDevice {
     DeviceState state;
     std::vector<BufferSlot> buffers;
     std::vector<ImageSlot> images;
+    std::vector<ImageViewSlot> imageViews;
     std::vector<SamplerSlot> samplers;
     std::string error;
     std::mutex mutex;
@@ -69,9 +90,7 @@ std::vector<DeviceSlot> devices;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
-template <typename Handle> uint64_t resourceKey(Handle handle) {
-    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
-}
+template <typename Handle> uint64_t resourceKey(Handle handle) { return vernon::rhi::encodeResourceKey(handle); }
 
 bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
     const uint64_t encodedIndex = key & UINT32_MAX;
@@ -101,10 +120,6 @@ template <typename Slot> bool publicAlive(const Slot &slot) {
     return true;
 }
 
-std::optional<size_t> downloadSize(const VernonRhiImageDescriptor &descriptor) {
-    return vernon::rhi::simpleImageDownloadSize(descriptor);
-}
-
 std::shared_ptr<OpenGLDevice> lookupDevice(VernonRhiDevice handle) {
     std::lock_guard<std::mutex> guard(deviceMutex);
     if (handle.index >= devices.size())
@@ -117,6 +132,38 @@ ImageSlot *lookupImage(OpenGLDevice &device, VernonRhiImage handle) {
         return nullptr;
     ImageSlot &slot = device.images[handle.index];
     return slot.isPublic(handle.generation) ? &slot : nullptr;
+}
+
+ImageViewSlot *lookupImageView(OpenGLDevice &device, VernonRhiImageView handle) {
+    if (handle.index >= device.imageViews.size())
+        return nullptr;
+    ImageViewSlot &slot = device.imageViews[handle.index];
+    return slot.isPublic(handle.generation) ? &slot : nullptr;
+}
+
+ImageSlot *lookupImageViewParent(OpenGLDevice &device, const ImageViewSlot &view) {
+    return lookupResourceRecord(device.images, view.imageResource);
+}
+
+Uint imageViewName(OpenGLDevice &device, const ImageViewSlot &view) {
+    if (const auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing))
+        return owned->image.name;
+    const ImageSlot *parent = lookupImageViewParent(device, view);
+    return parent ? parent->image.name : 0;
+}
+
+void recycleImageView(OpenGLDevice &device, ImageViewSlot &view) {
+    const uint64_t parentKey = view.imageResource;
+    if (auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing)) {
+        device.state.destroyImage(owned->image);
+        view.backing.emplace<IdentityImageViewBacking>();
+    }
+    view.recycle();
+    ImageSlot *parent = lookupResourceRecord(device.images, parentKey);
+    if (parent && parent->release()) {
+        device.state.destroyImage(parent->image);
+        parent->recycle();
+    }
 }
 
 BufferSlot *lookupBuffer(OpenGLDevice &device, VernonRhiBuffer handle) {
@@ -141,6 +188,13 @@ void validate(const OpenGLDevice &device) {
     for (const ImageSlot &slot : device.images) {
         slot.validate();
         assert(slot.occupied == (slot.image.name != 0));
+    }
+    for (const ImageViewSlot &slot : device.imageViews) {
+        slot.validate();
+        const auto *owned = std::get_if<OwnedTextureViewBacking>(&slot.backing);
+        assert(slot.occupied || !owned);
+        assert(!owned || owned->image.name != 0);
+        assert(!slot.occupied || slot.imageResource != 0);
     }
     for (const SamplerSlot &slot : device.samplers) {
         slot.validate();
@@ -292,6 +346,10 @@ void destroyDevice(VernonRhiDevice handle) {
     for (BufferSlot &buffer : device->buffers)
         if (buffer.occupied)
             device->state.destroyBuffer(buffer.buffer);
+    for (ImageViewSlot &view : device->imageViews)
+        if (view.occupied)
+            if (auto *owned = std::get_if<OwnedTextureViewBacking>(&view.backing))
+                device->state.destroyImage(owned->image);
     for (ImageSlot &image : device->images)
         if (image.occupied)
             device->state.destroyImage(image.image);
@@ -321,7 +379,9 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
                              VernonRhiBuffer *output) {
 
     auto device = lookupDevice(handle);
-    if (!device || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0)
+    if (!device || !descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || descriptor->size == 0 ||
+        descriptor->size > (std::numeric_limits<size_t>::max)() ||
+        descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     uint32_t index = 0;
@@ -349,10 +409,38 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
     BufferSlot *slot = lookupBuffer(*device, buffer);
     if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
         return fail(*device, "OpenGL RHI buffer upload range is invalid");
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD && vernon::rhi::deviceHasActiveCommandEncoder(handle))
+        return fail(*device, "device-level OpenGL upload cannot execute while a command encoder is recording");
     return device->state.uploadBuffer(slot->buffer, static_cast<size_t>(offset), source, static_cast<size_t>(size),
                                       device->error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                   const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
+    auto device = lookupDevice(handle);
+    if (!device || !ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    BufferSlot *slot = lookupBuffer(*device, buffer);
+    if (!slot)
+        return fail(*device, "OpenGL RHI buffer upload handle is invalid");
+    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD && vernon::rhi::deviceHasActiveCommandEncoder(handle))
+        return fail(*device, "device-level OpenGL upload cannot execute while a command encoder is recording");
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
+            return fail(*device, "OpenGL RHI buffer upload range is invalid");
+    }
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferUploadRange &range = ranges[index];
+        if (!device->state.uploadBuffer(slot->buffer, static_cast<size_t>(range.offset), range.source,
+                                        static_cast<size_t>(range.size), device->error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
@@ -394,9 +482,13 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         (descriptor->width == descriptor->height && descriptor->depth == 1 && descriptor->array_layers == 6);
     const bool depthFormat =
         descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT || descriptor->format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    const bool validDimension =
+        (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->depth == 1 && descriptor->array_layers == 1) ||
+        (descriptor->dimension == VERNON_RHI_IMAGE_3D && descriptor->array_layers == 1) ||
+        descriptor->dimension == VERNON_RHI_IMAGE_CUBE;
     if (!target || !formatInfo(descriptor->format, format) || descriptor->width == 0 || descriptor->height == 0 ||
         descriptor->depth == 0 || descriptor->mip_levels == 0 || descriptor->sample_count != 1 || !validCube ||
-        (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
+        !validDimension || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return fail(*device, "OpenGL RHI image descriptor is invalid");
     uint32_t index = 0;
@@ -414,22 +506,25 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
     device->state.driver.genTextures(1, &slot.image.name);
     if (!slot.image.name)
         return fail(*device, "OpenGL RHI image allocation failed", VERNON_RHI_STATUS_INTERNAL_ERROR);
-    if ((descriptor->usage & (VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)) != 0) {
+    {
         auto &driver = device->state.driver;
         driver.bindTexture(target, slot.image.name);
-        if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
-            driver.texImage3D(target, 0, format.internal, static_cast<Size>(descriptor->width),
-                              static_cast<Size>(descriptor->height), static_cast<Size>(descriptor->depth), 0,
-                              format.external, format.allocationType, nullptr);
-        } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
-            for (uint32_t face = 0; face < 6; ++face)
-                driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, 0, format.internal,
-                                  static_cast<Size>(descriptor->width), static_cast<Size>(descriptor->height), 0,
+        for (uint32_t mip = 0; mip < descriptor->mip_levels; ++mip) {
+            const Size mipWidth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->width, mip));
+            const Size mipHeight = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->height, mip));
+            const Size mipDepth = static_cast<Size>(vernon::rhi::imageMipExtent(descriptor->depth, mip));
+            if (descriptor->dimension == VERNON_RHI_IMAGE_3D) {
+                driver.texImage3D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, mipDepth, 0,
                                   format.external, format.allocationType, nullptr);
-        } else {
-            driver.texImage2D(target, 0, format.internal, static_cast<Size>(descriptor->width),
-                              static_cast<Size>(descriptor->height), 0, format.external, format.allocationType,
-                              nullptr);
+            } else if (descriptor->dimension == VERNON_RHI_IMAGE_CUBE) {
+                for (uint32_t face = 0; face < 6; ++face)
+                    driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, static_cast<Int>(mip),
+                                      format.internal, mipWidth, mipHeight, 0, format.external, format.allocationType,
+                                      nullptr);
+            } else {
+                driver.texImage2D(target, static_cast<Int>(mip), format.internal, mipWidth, mipHeight, 0,
+                                  format.external, format.allocationType, nullptr);
+            }
         }
         driver.bindTexture(target, 0);
     }
@@ -489,77 +584,91 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
         driver.bindTexture(slot->target, 0);
         return fail(*device, "OpenGL RHI image storage format is invalid");
     }
-    if (uploadCount == 0 && (slot->descriptor.usage &
-                             (VERNON_RHI_IMAGE_COLOR_ATTACHMENT | VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)) != 0) {
-        if (slot->descriptor.dimension == VERNON_RHI_IMAGE_3D) {
-            driver.texImage3D(slot->target, 0, storageFormat.internal, static_cast<Size>(slot->descriptor.width),
-                              static_cast<Size>(slot->descriptor.height), static_cast<Size>(slot->descriptor.depth), 0,
-                              storageFormat.external, storageFormat.allocationType, nullptr);
-        } else if (slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE) {
-            for (uint32_t face = 0; face < 6; ++face)
-                driver.texImage2D(vernon::rhi::opengl::kTextureCubeMapPositiveX + face, 0, storageFormat.internal,
-                                  static_cast<Size>(slot->descriptor.width), static_cast<Size>(slot->descriptor.height),
-                                  0, storageFormat.external, storageFormat.allocationType, nullptr);
-        } else {
-            driver.texImage2D(slot->target, 0, storageFormat.internal, static_cast<Size>(slot->descriptor.width),
-                              static_cast<Size>(slot->descriptor.height), 0, storageFormat.external,
-                              storageFormat.allocationType, nullptr);
-        }
-    }
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const Enum sourceFormat = imageDataFormat(upload.source_format);
         const bool validLayer =
             slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE ? upload.array_layer < 6 : upload.array_layer == 0;
+        const bool validMip = upload.mip_level < slot->descriptor.mip_levels;
+        const uint32_t mipWidth = validMip ? vernon::rhi::imageMipExtent(slot->descriptor.width, upload.mip_level) : 0;
+        const uint32_t mipHeight =
+            validMip ? vernon::rhi::imageMipExtent(slot->descriptor.height, upload.mip_level) : 0;
+        const uint32_t mipDepth = !validMip ? 0
+                                  : slot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                      ? vernon::rhi::imageMipExtent(slot->descriptor.depth, upload.mip_level)
+                                      : slot->descriptor.depth;
         if (upload.struct_size < sizeof(upload) || upload.mip_level >= slot->descriptor.mip_levels ||
             upload.width == 0 || upload.height == 0 || upload.depth == 0 || !validLayer || !sourceFormat ||
-            upload.source_type > VERNON_RHI_IMAGE_DATA_FLOAT32) {
+            upload.offset_x >= mipWidth || upload.width > mipWidth - upload.offset_x || upload.offset_y >= mipHeight ||
+            upload.height > mipHeight - upload.offset_y || upload.offset_z >= mipDepth ||
+            upload.depth > mipDepth - upload.offset_z ||
+            !vernon::rhi::uploadLayoutMatches(slot->descriptor.format, upload.source_format, upload.source_type)) {
             driver.bindTexture(slot->target, 0);
             return fail(*device, "OpenGL RHI image upload descriptor is invalid");
         }
-        const Enum type = upload.source_type == VERNON_RHI_IMAGE_DATA_UINT8 ? 0x1401 : 0x1406;
+        const Enum type = upload.source_type == VERNON_RHI_IMAGE_DATA_UINT8              ? 0x1401
+                          : upload.source_type == VERNON_RHI_IMAGE_DATA_FLOAT16          ? 0x140B
+                          : upload.source_type == VERNON_RHI_IMAGE_DATA_FLOAT32          ? 0x1406
+                          : slot->descriptor.format == VERNON_RHI_FORMAT_R11G11B10_FLOAT ? 0x8C3B
+                                                                                         : 0x1405;
         if (slot->descriptor.dimension == VERNON_RHI_IMAGE_3D)
-            driver.texImage3D(slot->target, static_cast<Int>(upload.mip_level), storageFormat.internal,
-                              static_cast<Size>(upload.width), static_cast<Size>(upload.height),
-                              static_cast<Size>(upload.depth), 0, sourceFormat, type, upload.data);
+            driver.texSubImage3D(slot->target, static_cast<Int>(upload.mip_level), static_cast<Int>(upload.offset_x),
+                                 static_cast<Int>(upload.offset_y), static_cast<Int>(upload.offset_z),
+                                 static_cast<Size>(upload.width), static_cast<Size>(upload.height),
+                                 static_cast<Size>(upload.depth), sourceFormat, type, upload.data);
         else
-            driver.texImage2D(slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE
-                                  ? vernon::rhi::opengl::kTextureCubeMapPositiveX + upload.array_layer
-                                  : slot->target,
-                              static_cast<Int>(upload.mip_level), storageFormat.internal,
-                              static_cast<Size>(upload.width), static_cast<Size>(upload.height), 0, sourceFormat, type,
-                              upload.data);
+            driver.texSubImage2D(slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE
+                                     ? vernon::rhi::opengl::kTextureCubeMapPositiveX + upload.array_layer
+                                     : slot->target,
+                                 static_cast<Int>(upload.mip_level), static_cast<Int>(upload.offset_x),
+                                 static_cast<Int>(upload.offset_y), static_cast<Size>(upload.width),
+                                 static_cast<Size>(upload.height), sourceFormat, type, upload.data);
     }
     driver.bindTexture(slot->target, 0);
     return VERNON_RHI_STATUS_OK;
 }
 
-VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image, void *destination, size_t size) {
+VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
+                              const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
 
-    if (!destination)
+    if (!download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto device = lookupDevice(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     ImageSlot *slot = lookupImage(*device, image);
-    const auto expected = slot ? downloadSize(slot->descriptor) : std::nullopt;
+    const auto expected = slot ? imageDownloadByteSize(slot->descriptor, *download) : std::nullopt;
     FormatInfo format;
     if (!slot || !expected || size != *expected || !formatInfo(slot->descriptor.format, format))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (slot->descriptor.dimension == VERNON_RHI_IMAGE_3D)
+        return device->state.downloadImage3D(slot->image, static_cast<Int>(download->mip_level),
+                                             static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
+                                             static_cast<Int>(download->offset_z), static_cast<Size>(download->width),
+                                             static_cast<Size>(download->height), static_cast<Size>(download->depth),
+                                             format.external, format.allocationType, *expected / download->depth,
+                                             destination, device->error)
+                   ? VERNON_RHI_STATUS_OK
+                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const Enum target = slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE
+                            ? vernon::rhi::opengl::kTextureCubeMapPositiveX + download->array_layer
+                            : slot->target;
     if (slot->descriptor.format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
-        return device->state.downloadImage2D(slot->image, static_cast<Size>(slot->descriptor.width),
-                                             static_cast<Size>(slot->descriptor.height), format.external,
-                                             format.allocationType, destination, device->error)
+        return device->state.downloadImage2D(slot->image, target, static_cast<Int>(download->mip_level),
+                                             static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
+                                             static_cast<Size>(download->width), static_cast<Size>(download->height),
+                                             format.external, format.allocationType, destination, device->error)
                    ? VERNON_RHI_STATUS_OK
                    : VERNON_RHI_STATUS_INTERNAL_ERROR;
     std::vector<uint8_t> native(*expected);
-    if (!device->state.downloadImage2D(slot->image, static_cast<Size>(slot->descriptor.width),
-                                       static_cast<Size>(slot->descriptor.height), format.external,
-                                       format.allocationType, native.data(), device->error))
+    if (!device->state.downloadImage2D(slot->image, target, static_cast<Int>(download->mip_level),
+                                       static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
+                                       static_cast<Size>(download->width), static_cast<Size>(download->height),
+                                       format.external, format.allocationType, native.data(), device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     auto *output = static_cast<uint8_t *>(destination);
-    const size_t pixels = static_cast<size_t>(slot->descriptor.width) * slot->descriptor.height;
+    const size_t pixels = static_cast<size_t>(download->width) * download->height;
     for (size_t index = 0; index < pixels; ++index) {
         float depth{};
         uint32_t stencilWord{};
@@ -579,8 +688,11 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(device->mutex);
     ImageSlot *slot = lookupImage(*device, image);
-    if (!slot)
-        return fail(*device, "OpenGL RHI image handle is stale");
+    if (!slot || slot->descriptor.mip_levels < 2 || !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
+        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     device->state.makeCurrent();
     device->state.driver.bindTexture(slot->target, slot->image.name);
     device->state.driver.generateMipmap(slot->target);
@@ -699,6 +811,98 @@ VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage imag
     return VERNON_RHI_STATUS_OK;
 }
 
+VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
+                                VernonRhiImageView *output) {
+    auto device = lookupDevice(handle);
+    if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !output ||
+        !descriptor->mip_level_count || !descriptor->array_layer_count || !descriptor->aspects)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageSlot *parent = lookupImage(*device, descriptor->image);
+    FormatInfo format{};
+    if (!parent || !formatInfo(descriptor->format, format))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (!vernon::rhi::validImageViewDescriptor(parent->descriptor, *descriptor))
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (descriptor->dimension == VERNON_RHI_IMAGE_2D && descriptor->array_layer_count != 1)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!parent->retain())
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    uint32_t index = 0;
+    while (index < device->imageViews.size() && device->imageViews[index].occupied)
+        ++index;
+    if (index == device->imageViews.size()) {
+        try {
+            device->imageViews.emplace_back();
+        } catch (const std::bad_alloc &) {
+            parent->release();
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+    }
+    ImageViewSlot &slot = device->imageViews[index];
+    const bool identityView =
+        descriptor->format == parent->descriptor.format && descriptor->dimension == parent->descriptor.dimension &&
+        descriptor->aspects == vernon::rhi::imageFormatAspects(parent->descriptor.format) &&
+        descriptor->base_mip_level == 0 && descriptor->mip_level_count == parent->descriptor.mip_levels &&
+        descriptor->base_array_layer == 0 && descriptor->array_layer_count == parent->descriptor.array_layers;
+    slot.backing.emplace<IdentityImageViewBacking>();
+    if (!identityView) {
+        if (device->state.embeddedProfile || !device->state.driver.textureView) {
+            parent->release();
+            return VERNON_RHI_STATUS_UNSUPPORTED;
+        }
+        device->state.makeCurrent();
+        auto &owned = slot.backing.emplace<OwnedTextureViewBacking>();
+        device->state.driver.genTextures(1, &owned.image.name);
+        if (!owned.image.name) {
+            slot.backing.emplace<IdentityImageViewBacking>();
+            parent->release();
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        owned.image.imported = false;
+        slot.target = imageTarget(descriptor->dimension);
+        device->state.driver.textureView(owned.image.name, slot.target, parent->image.name, format.internal,
+                                         descriptor->base_mip_level, descriptor->mip_level_count,
+                                         descriptor->base_array_layer, descriptor->array_layer_count);
+    }
+    slot.target = imageTarget(descriptor->dimension);
+    slot.descriptor = *descriptor;
+    slot.imageResource = resourceKey(descriptor->image);
+    slot.publish();
+    *output = {index, slot.generation};
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView view) {
+    auto device = lookupDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageViewSlot *slot = lookupImageView(*device, view);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    slot->destroyPublicOwner();
+    if (slot->bindingReferences != 0)
+        return VERNON_RHI_STATUS_OK;
+    recycleImageView(*device, *slot);
+    validate(*device);
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view, uint64_t *output) {
+    auto device = lookupDevice(handle);
+    if (!device || !output)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageViewSlot *slot = lookupImageView(*device, view);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    *output = imageViewName(*device, *slot);
+    return VERNON_RHI_STATUS_OK;
+}
+
 VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
@@ -750,9 +954,11 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
     return false;
 }
 
-bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed) {
+bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites, bool &completed,
+                    bool &externalCompletion) {
 
     completed = false;
+    externalCompletion = false;
     if (auto device = lookupDevice(handle)) {
         if (native != reinterpret_cast<uintptr_t>(&device->state))
             return false;
@@ -772,10 +978,11 @@ bool submitCommands(VernonRhiDevice handle, uint64_t native, bool computeWrites,
     return false;
 }
 
-void completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
+bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
 
     (void)handle;
     (void)native;
+    return true;
 }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
@@ -849,6 +1056,56 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
         return true;
     }
     return false;
+}
+
+bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
+                      VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
+    auto device = lookupDevice(handle);
+    if (!device || native != reinterpret_cast<uintptr_t>(&device->state) || !size)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    BufferSlot *sourceSlot = lookupBuffer(*device, source);
+    BufferSlot *destinationSlot = lookupBuffer(*device, destination);
+    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->descriptor.size ||
+        size > sourceSlot->descriptor.size - sourceOffset || destinationOffset > destinationSlot->descriptor.size ||
+        size > destinationSlot->descriptor.size - destinationOffset)
+        return false;
+    return device->state.copyBuffer(sourceSlot->buffer, static_cast<size_t>(sourceOffset), destinationSlot->buffer,
+                                    static_cast<size_t>(destinationOffset), static_cast<size_t>(size), device->error);
+}
+
+bool supportsImageCopy(VernonRhiDevice handle) {
+    auto device = lookupDevice(handle);
+    return device && device->state.driver.copyImageSubData;
+}
+
+bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
+                     VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
+    auto device = lookupDevice(handle);
+    if (!device || native != reinterpret_cast<uintptr_t>(&device->state) || !regions || !regionCount)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    ImageSlot *sourceSlot = lookupImage(*device, source);
+    ImageSlot *destinationSlot = lookupImage(*device, destination);
+    if (!sourceSlot || !destinationSlot || !device->state.driver.copyImageSubData)
+        return false;
+    device->state.makeCurrent();
+    for (size_t index = 0; index < regionCount; ++index) {
+        const VernonRhiImageCopyRegion &region = regions[index];
+        const Int sourceZ = sourceSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                ? static_cast<Int>(region.source_z)
+                                : static_cast<Int>(region.source_array_layer);
+        const Int destinationZ = destinationSlot->descriptor.dimension == VERNON_RHI_IMAGE_3D
+                                     ? static_cast<Int>(region.destination_z)
+                                     : static_cast<Int>(region.destination_array_layer);
+        device->state.driver.copyImageSubData(
+            sourceSlot->image.name, sourceSlot->target, static_cast<Int>(region.source_mip_level),
+            static_cast<Int>(region.source_x), static_cast<Int>(region.source_y), sourceZ, destinationSlot->image.name,
+            destinationSlot->target, static_cast<Int>(region.destination_mip_level),
+            static_cast<Int>(region.destination_x), static_cast<Int>(region.destination_y), destinationZ,
+            static_cast<Size>(region.width), static_cast<Size>(region.height), static_cast<Size>(region.depth));
+    }
+    return true;
 }
 
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
@@ -941,6 +1198,15 @@ uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
     return 0;
 }
 
+uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
+    if (auto device = lookupDevice(handle)) {
+        std::lock_guard<std::mutex> guard(device->mutex);
+        if (lookupImageView(*device, view))
+            return resourceKey(view);
+    }
+    return 0;
+}
+
 uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
 
     if (auto device = lookupDevice(handle)) {
@@ -965,6 +1231,10 @@ bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
         ImageSlot *slot = lookupResourceRecord(device->images, key);
         return slot && slot->retain();
     }
+    if (kind == ResourceKind::ImageView) {
+        ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
+        return slot && slot->retain();
+    }
     SamplerSlot *slot = lookupResourceRecord(device->samplers, key);
     return slot && slot->retain();
 }
@@ -983,8 +1253,42 @@ uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key
         auto *slot = lookupResourceRecord(device->images, key);
         return slot && slot->occupied ? slot->image.name : 0;
     }
+    if (kind == ResourceKind::ImageView) {
+        auto *slot = lookupResourceRecord(device->imageViews, key);
+        return slot ? imageViewName(*device, *slot) : 0;
+    }
     auto *slot = lookupResourceRecord(device->samplers, key);
     return slot && slot->occupied ? slot->sampler.name : 0;
+}
+
+bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
+    auto device = lookupDevice(handle);
+    if (!device || !descriptor)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const ImageSlot *slot = lookupResourceRecord(device->images, key);
+    if (!slot || !slot->occupied)
+        return false;
+    *descriptor = slot->descriptor;
+    return true;
+}
+
+bool describeImageViewResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageViewDescriptor *view,
+                               VernonRhiImageDescriptor *image, uint64_t *parentKey) {
+    auto device = lookupDevice(handle);
+    if (!device || !view || !image || !parentKey)
+        return false;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    const ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
+    if (!slot)
+        return false;
+    const ImageSlot *parent = lookupResourceRecord(device->images, slot->imageResource);
+    if (!parent)
+        return false;
+    *view = slot->descriptor;
+    *image = parent->descriptor;
+    *parentKey = slot->imageResource;
+    return true;
 }
 
 void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
@@ -1009,6 +1313,13 @@ void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
         slot->recycle();
         return;
     }
+    if (kind == ResourceKind::ImageView) {
+        auto *slot = lookupResourceRecord(device->imageViews, key);
+        if (!slot || !slot->release())
+            return;
+        recycleImageView(*device, *slot);
+        return;
+    }
     auto *slot = lookupResourceRecord(device->samplers, key);
     if (!slot || !slot->release())
         return;
@@ -1022,6 +1333,8 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
     using namespace opengl_api;
     static const BackendDispatch dispatch{
         VERNON_RHI_BACKEND_OPENGL,
+        0,
+        nullptr,
         ownsDevice,
         createOwnedDevice,
         destroyDevice,
@@ -1030,6 +1343,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         deviceStateForBackend,
         createBuffer,
         uploadBuffer,
+        uploadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,
@@ -1051,16 +1365,26 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         samplerResource,
         retainResource,
         resolveResource,
+        describeImageResource,
         releaseResource,
         beginCommands,
         submitCommands,
+        nullptr,
         completeBorrowedCommands,
         abandonCommands,
         recordBarriers,
+        recordBufferCopy,
+        supportsImageCopy,
+        recordImageCopy,
         endRendering,
         clearColor,
         clearDepthStencil,
         nullptr,
+        createImageView,
+        destroyImageView,
+        getImageViewNativeHandle,
+        imageViewResource,
+        describeImageViewResource,
     };
     return dispatch;
 }

@@ -2,9 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from functools import update_wrapper
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, overload
+
+if TYPE_CHECKING:
+    from .runtime import Kernel
 
 _T = TypeVar("_T")
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 
 def _mark(value: _T, kind: str, **options: Any) -> _T:
@@ -47,7 +52,15 @@ def fragment(function: _T) -> _T:
     return ShaderFunction(function, "fragment")  # type: ignore[arg-type,return-value]
 
 
-def func(function: _T | None = None, *, shared: bool = False) -> _T | Callable[[_T], _T]:
+@overload
+def func(function: Callable[_P, _R], *, shared: bool = False) -> Callable[_P, _R]: ...
+
+
+@overload
+def func(function: None = None, *, shared: bool = False) -> Callable[[Callable[_P, _R]], Callable[_P, _R]]: ...
+
+
+def func(function: Callable[..., Any] | None = None, *, shared: bool = False) -> Any:
     """Declare a reusable stage-polymorphic shader helper."""
 
     def decorate(value: _T) -> _T:
@@ -56,7 +69,17 @@ def func(function: _T | None = None, *, shared: bool = False) -> _T | Callable[[
     return decorate(function) if function is not None else decorate
 
 
-def kernel(function: _T | None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> _T | Callable[[_T], _T]:
+@overload
+def kernel(function: Callable[..., Any], *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> Kernel: ...
+
+
+@overload
+def kernel(
+    function: None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)
+) -> Callable[[Callable[..., Any]], Kernel]: ...
+
+
+def kernel(function: Callable[..., Any] | None = None, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)) -> Any:
     """Declare a compute entry point."""
 
     def decorate(value: _T) -> _T:

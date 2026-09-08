@@ -28,7 +28,9 @@ struct VERNON_RHI_CAPI DeviceState {
     Result allocate(DevicePointer &pointer, size_t size) const;
     Result free(DevicePointer pointer) const;
     Result upload(DevicePointer destination, const void *source, size_t size);
+    Result uploadRanges(DevicePointer destination, const VernonRhiBufferUploadRange *ranges, size_t rangeCount);
     Result download(void *destination, DevicePointer source, size_t size);
+    Result copy(DevicePointer destination, DevicePointer source, size_t size);
 
     Device device{};
     Context context{};

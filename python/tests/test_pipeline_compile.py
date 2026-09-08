@@ -11,20 +11,25 @@ from vernon_dsl.bundle import (
     CompiledStage,
     MetalTargetOptions,
     OpenGLTargetOptions,
-    PipelineCompileError,
-    build_bundle_plan,
+    ProgramCompileError,
+    ProgramVariantPlan,
+    assign_parameter_slots,
+    build_program_manifest,
+    build_program_plan,
     canonical_json,
     compiled_stage_from_program,
     external_parameters,
-    inline_artifact_descriptor,
+    fragment_outputs,
+    internal_parameters,
     make_target_options,
-    materialize_bundle,
+    merge_internal_parameter_uses,
     merge_parameter_uses,
     parse_reflection_json,
     select_artifact,
     select_entry,
     serialize_bundle,
     validate_graphics_interfaces,
+    with_content_hash,
 )
 from vernon_dsl.bundle.requirements import runtime_requirements
 
@@ -43,23 +48,85 @@ def _scalar_layout(dtype: str) -> dict[str, object]:
     }
 
 
-def _physical_value_layout(
+def _vector_layout(dtype: str, shape: list[int]) -> dict[str, object]:
+    sizes = {"bool": 1, "i32": 4, "u32": 4, "f16": 2, "f32": 4, "f64": 8}
+    scalar = sizes[dtype]
+    count = 1
+    for extent in shape:
+        count *= extent
+    spelling = f"tensor<{'x'.join(str(extent) for extent in shape)}x{dtype}>"
+    canonical = f"tensor({spelling},{scalar * count},{scalar})|dtypes={dtype}"
+    return {
+        "logical_type": spelling,
+        "byte_size": scalar * count,
+        "alignment": scalar,
+        "layout_hash": hashlib.sha256(canonical.encode()).hexdigest(),
+        "leaves": [
+            {
+                "path": [],
+                "dtype": dtype,
+                "byte_offset": 0,
+                "scalar_count": count,
+                "shape": list(shape),
+            }
+        ],
+    }
+
+
+def _interface_plan(
     profile: str,
     size: int,
     alignment: int,
     byte_strides: list[int],
 ) -> dict[str, object]:
-    return {
-        "profile": profile,
+    kind = {
+        "host_value": "cpu_call",
+        "cuda_kernel_parameter": "kernel_parameter",
+        "opengl_native_uniform": "native_uniform",
+    }.get(profile, "byte_transport")
+    root = {
+        "kind": "scalar",
+        "representation": "f32",
+        "offset": 0,
         "size": size,
         "alignment": alignment,
-        "byte_strides": byte_strides,
+        "shape": [],
+        "byte_strides": [],
+        "children": [],
+    }
+    if byte_strides:
+        root = {
+            "kind": "array",
+            "representation": "",
+            "offset": 0,
+            "size": size,
+            "alignment": alignment,
+            "shape": [1] * len(byte_strides),
+            "byte_strides": byte_strides,
+            "children": [
+                {
+                    "kind": "scalar",
+                    "representation": "f32",
+                    "offset": 0,
+                    "size": byte_strides[-1],
+                    "alignment": min(alignment, byte_strides[-1]),
+                    "shape": [],
+                    "byte_strides": [],
+                    "children": [],
+                }
+            ],
+        }
+    return {
+        "kind": kind,
+        "profile": profile,
+        "canonical_layout_hash": "test-layout-hash",
+        "root": root,
     }
 
 
 def _physical_layouts(size: int, alignment: int, byte_strides: list[int]) -> dict[str, object]:
     return {
-        profile: _physical_value_layout(profile, size, alignment, byte_strides)
+        profile: _interface_plan(profile, size, alignment, byte_strides)
         for profile in (
             "host_value",
             "cuda_kernel_parameter",
@@ -110,7 +177,6 @@ def _stage(stage: str, artifact: bytes, interface: dict[str, object]) -> Compile
     }
     return CompiledStage(
         "module",
-        '{"id":"module"}',
         entry,
         stage,
         OpenGLTargetOptions(version=330),
@@ -201,7 +267,7 @@ class PipelineCompileTests(unittest.TestCase):
             metadata={},
             interface={},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "incomplete PTX header"):
+        with self.assertRaisesRegex(ProgramCompileError, "incomplete PTX header"):
             runtime_requirements("cuda", [stage])
 
         metal_stage = SimpleNamespace(
@@ -212,7 +278,7 @@ class PipelineCompileTests(unittest.TestCase):
             metadata={},
             interface={},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "no valid msl_version"):
+        with self.assertRaisesRegex(ProgramCompileError, "no valid msl_version"):
             runtime_requirements("metal", [metal_stage])
         metal_stage.target.options = {}
         metal_stage.reflection = {
@@ -222,7 +288,7 @@ class PipelineCompileTests(unittest.TestCase):
                 "output": {"language": "msl", "version": [2, 4], "minimum_os_version": [11, 0]},
             }
         }
-        with self.assertRaisesRegex(PipelineCompileError, "requires apple_platform"):
+        with self.assertRaisesRegex(ProgramCompileError, "requires apple_platform"):
             runtime_requirements("metal", [metal_stage])
 
     def test_compiled_stage_uses_reflected_target_options(self) -> None:
@@ -256,7 +322,6 @@ class PipelineCompileTests(unittest.TestCase):
         compiled = compiled_stage_from_program(
             program,
             module="module",
-            module_manifest="manifest",
             entry="main",
             target=MetalTargetOptions(),
         )
@@ -264,18 +329,30 @@ class PipelineCompileTests(unittest.TestCase):
         requirements = runtime_requirements("metal", [compiled])
         self.assertEqual(requirements["minimum_os_version"], [15, 0])
 
-    def test_runtime_requirements_change_content_hash_but_not_stage_identity(self) -> None:
-        stage = _stage("compute", b"#version 430\nvoid main() {}", {"workgroup_size": [1, 1, 1]})
-        plan = build_bundle_plan("requirements/hash", stage.target, (), [((), {"compute": stage})])
-        logical = plan.logical_dict()
-        content_hash = hashlib.sha256(canonical_json(logical).encode("utf-8")).hexdigest()
-        changed = json.loads(json.dumps(logical))
-        changed["runtime_requirements"]["glsl_version"] = 440
-        changed_hash = hashlib.sha256(canonical_json(changed).encode("utf-8")).hexdigest()
-
-        self.assertNotEqual(content_hash, changed_hash)
-        self.assertEqual(set(logical["stage_artifacts"]), {stage.id})
-        self.assertEqual(set(changed["stage_artifacts"]), {stage.id})
+    def test_program_variant_plan_rejects_nullable_and_legacy_shapes(self) -> None:
+        with self.assertRaises(TypeError):
+            ProgramVariantPlan(key=(), stage_implementations={})  # type: ignore[call-arg]
+        with self.assertRaises(TypeError):
+            ProgramVariantPlan(  # type: ignore[call-arg]
+                key=(),
+                program={},
+                stage_implementations={},
+                canonical_program=None,
+            )
+        with self.assertRaisesRegex(ProgramCompileError, "non-contract root members"):
+            ProgramVariantPlan(
+                (),
+                {
+                    "stages": {},
+                    "parameters": [],
+                    "storages": [],
+                    "values": [],
+                    "graphs": [],
+                    "abi": {},
+                    "shape_symbols": [],
+                },
+                {},
+            )
 
     def test_native_options_are_scoped_to_the_selected_target(self) -> None:
         self.assertEqual(OpenGLTargetOptions(version=330).native_options, {"options": {"version": 330}})
@@ -294,13 +371,13 @@ class PipelineCompileTests(unittest.TestCase):
             MetalTargetOptions(platform="ios").native_options,
             {"options": {"platform": "ios"}},
         )
-        with self.assertRaisesRegex(PipelineCompileError, "invalid vulkan target options"):
+        with self.assertRaisesRegex(ProgramCompileError, "invalid vulkan target options"):
             make_target_options("vulkan", {"processor": "generic"})
-        with self.assertRaisesRegex(PipelineCompileError, "invalid metal target options"):
+        with self.assertRaisesRegex(ProgramCompileError, "invalid metal target options"):
             make_target_options("metal", {"shader_model": 60})
-        with self.assertRaisesRegex(PipelineCompileError, "shader model must be 6.0 or newer"):
+        with self.assertRaisesRegex(ProgramCompileError, "shader model must be 6.0 or newer"):
             make_target_options("directx", {"shader_model": 55})
-        with self.assertRaisesRegex(PipelineCompileError, "macos.*ios"):
+        with self.assertRaisesRegex(ProgramCompileError, "macos.*ios"):
             MetalTargetOptions(platform="tvos")
 
     def test_generated_sampler_and_resolution_are_internal(self) -> None:
@@ -312,10 +389,12 @@ class PipelineCompileTests(unittest.TestCase):
                     "arguments": [
                         {
                             "index": 0,
-                            "kind": "texture",
-                            "type": "!vernon.texture<2d, f32>",
+                            "kind": "image",
+                            "type": '!vernon.texture<"2d", f32, "unknown", "sampled">',
                             "dtype": "f32",
                             "dimension": "2d",
+                            "binding_role": "sampled",
+                            "sample_result_class": "float",
                             "vernon.source_name": "image",
                             "vernon.interface": "resource",
                             "vernon.set": 0,
@@ -329,7 +408,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "vernon.interface": "resource",
                             "vernon.implicit": "sampler",
                             "vernon.implicit_texture": "image",
-                            "sampled_texture_bindings": [
+                            "sampled_image_bindings": [
                                 {
                                     "set": 0,
                                     "binding": 3,
@@ -338,14 +417,14 @@ class PipelineCompileTests(unittest.TestCase):
                         },
                         {
                             "index": 2,
-                            "kind": "scalar",
+                            "kind": "tensor",
                             "type": "tensor<2xf32>",
+                            "shape": [2],
                             "element_layout": _scalar_layout("f32"),
+                            "value_layout": _vector_layout("f32", [2]),
                             "vernon.source_name": "__resolution",
-                            "vernon.interface": "uniform",
+                            "vernon.interface": "system_value",
                             "vernon.implicit": "resolution",
-                            "value_transport": "push_constant",
-                            "physical_layouts": _physical_layouts(8, 8, [4]),
                         },
                     ],
                 },
@@ -353,60 +432,27 @@ class PipelineCompileTests(unittest.TestCase):
         }
         external = external_parameters(records)
         self.assertEqual(set(external), {"image"})
-        fragment = _stage("fragment", b"fragment", records["fragment"]["interface"])
-        vertex = _stage(
-            "vertex",
-            b"vertex",
-            {
-                "arguments": [],
-                "results": [],
-            },
-        )
-        plan = build_bundle_plan(
-            "pipeline",
-            fragment.target,
-            (),
-            [
-                (
-                    (),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        variant = plan.variants[0].to_dict()
-        self.assertEqual([row["name"] for row in variant["parameters"]], ["image"])
+        internal = internal_parameters(records)
+        self.assertEqual([merge_parameter_uses(name, external[name])["name"] for name in external], ["image"])
         self.assertEqual(
-            [(row["source"], row.get("system_value")) for row in variant["internal_parameters"]],
+            [
+                (row["source"], row.get("system_value"))
+                for row in (merge_internal_parameter_uses(name, internal[name]) for name in sorted(internal))
+            ],
             [("implicit_sampler", None), ("system_value", "resolution")],
         )
 
         unpaired = json.loads(json.dumps(records))
-        del unpaired["fragment"]["interface"]["arguments"][1]["sampled_texture_bindings"]
-        unpaired_fragment = _stage("fragment", b"fragment", unpaired["fragment"]["interface"])
-        with self.assertRaisesRegex(PipelineCompileError, "no reflected sampled texture binding"):
-            build_bundle_plan(
-                "pipeline",
-                fragment.target,
-                (),
-                [
-                    (
-                        (),
-                        {
-                            "vertex": vertex,
-                            "fragment": unpaired_fragment,
-                        },
-                    )
-                ],
-            )
+        del unpaired["fragment"]["interface"]["arguments"][1]["sampled_image_bindings"]
+        with self.assertRaisesRegex(ProgramCompileError, "no reflected sampled image binding"):
+            values = internal_parameters(unpaired)
+            merge_internal_parameter_uses("__image_sampler", values["__image_sampler"])
 
         legacy = json.loads(json.dumps(records))
         sampler = legacy["fragment"]["interface"]["arguments"][1]
         del sampler["vernon.implicit"]
         sampler["vernon.compiler_generated"] = True
-        with self.assertRaisesRegex(PipelineCompileError, "legacy compiler-generated"):
+        with self.assertRaisesRegex(ProgramCompileError, "legacy compiler-generated"):
             external_parameters(legacy)
 
     def test_explicit_sampler_remains_external(self) -> None:
@@ -422,7 +468,7 @@ class PipelineCompileTests(unittest.TestCase):
                             "type": "!vernon.sampler",
                             "vernon.source_name": "linear_sampler",
                             "vernon.interface": "resource",
-                            "sampled_texture_bindings": [
+                            "sampled_image_bindings": [
                                 {
                                     "set": 0,
                                     "binding": 1,
@@ -444,6 +490,7 @@ class PipelineCompileTests(unittest.TestCase):
                     "arguments": [
                         {
                             "index": 0,
+                            "kind": "tensor_value",
                             "type": "tensor<4x4xf32>",
                             "element_layout": _scalar_layout("f32"),
                             "vernon.source_name": "material",
@@ -460,14 +507,8 @@ class PipelineCompileTests(unittest.TestCase):
         uses = external_parameters(records)["material"]
         self.assertEqual(uses[0]["uniform_name"], "material._m0")
         self.assertEqual(
-            uses[0]["physical_value_layout"],
-            {
-                "profile": "vulkan_std140_uniform_buffer",
-                "transport": "uniform_buffer",
-                "size": 64,
-                "alignment": 16,
-                "byte_strides": [16, 4],
-            },
+            uses[0]["interface_plan"],
+            _interface_plan("vulkan_std140_uniform_buffer", 64, 16, [16, 4]),
         )
 
     def test_reflected_static_tensor_layout_is_normalized_for_runtime(self) -> None:
@@ -497,14 +538,8 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["weights"][0]
         self.assertEqual(
-            use["physical_value_layout"],
-            {
-                "profile": "vulkan_std140_uniform_buffer",
-                "transport": "uniform_buffer",
-                "size": 120,
-                "alignment": 4,
-                "byte_strides": [60, 20, 4],
-            },
+            use["interface_plan"],
+            _interface_plan("vulkan_std140_uniform_buffer", 120, 4, [60, 20, 4]),
         )
 
     def test_reflected_aggregate_tensor_uses_explicit_storage_buffer_layout(self) -> None:
@@ -543,14 +578,8 @@ class PipelineCompileTests(unittest.TestCase):
         }
         use = external_parameters(records)["aggregate"][0]
         self.assertEqual(
-            use["physical_value_layout"],
-            {
-                "profile": "vulkan_std430_storage_buffer",
-                "transport": "storage_buffer",
-                "size": 1056,
-                "alignment": 4,
-                "byte_strides": [528, 176, 44],
-            },
+            use["interface_plan"],
+            _interface_plan("vulkan_std430_storage_buffer", 1056, 4, [528, 176, 44]),
         )
 
     def test_compute_tensor_resource_is_normalized_to_storage(self) -> None:
@@ -590,10 +619,10 @@ class PipelineCompileTests(unittest.TestCase):
             use["tensor_view_descriptor"],
             {"rank": 2, "offset_binding": 1, "extent_bindings": [2, 3], "stride_bindings": [4, 5]},
         )
-        self.assertNotIn("physical_value_layout", use)
+        self.assertNotIn("interface_plan", use)
 
         del records["compute"]["interface"]["arguments"][0]["vernon.binding"]
-        with self.assertRaisesRegex(PipelineCompileError, "missing reflected set/binding"):
+        with self.assertRaisesRegex(ProgramCompileError, "missing reflected set/binding"):
             external_parameters(records)
 
     def test_parameter_merge_and_slot_layout_are_exact(self) -> None:
@@ -650,7 +679,7 @@ class PipelineCompileTests(unittest.TestCase):
             "interface": "storage",
             "access": "read",
         }
-        with self.assertRaisesRegex(PipelineCompileError, "must use device address space"):
+        with self.assertRaisesRegex(ProgramCompileError, "must use device address space"):
             merge_parameter_uses("missing_address_space", [tensor_view_use])
         tensor_view_use["address_space"] = "device"
         self.assertEqual(
@@ -673,6 +702,7 @@ class PipelineCompileTests(unittest.TestCase):
                     },
                     {
                         "index": 1,
+                        "kind": "scalar",
                         "type": "f32",
                         "vernon.source_name": "alpha",
                         "vernon.interface": "uniform",
@@ -713,28 +743,32 @@ class PipelineCompileTests(unittest.TestCase):
                 ],
             },
         )
-        plan = build_bundle_plan(
-            "pipeline",
-            vertex.target,
-            (),
-            [
-                (
-                    (),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        parameters = plan.variants[0].to_dict()["parameters"]
+        records = {
+            "vertex": {
+                "entry": vertex.entry,
+                "target": vertex.target.target,
+                "interface": dict(vertex.interface),
+            },
+            "fragment": {
+                "entry": fragment.entry,
+                "target": fragment.target.target,
+                "interface": dict(fragment.interface),
+            },
+        }
+        external = external_parameters(records)
+        slots = assign_parameter_slots((records,))
+        parameters = []
+        for name in sorted(external, key=slots.__getitem__):
+            parameter = merge_parameter_uses(name, external[name])
+            parameter["slot"] = slots[name]
+            parameters.append(parameter)
         self.assertEqual([(row["name"], row["slot"]) for row in parameters], [("alpha", 0), ("z_position", 1)])
         self.assertEqual(
             parameters[0]["uses"][0]["uniform_name"],
             "alpha",
         )
 
-    def test_variant_steps_outputs_and_graphics_interface_are_exact(self) -> None:
+    def test_graphics_outputs_and_interface_are_exact(self) -> None:
         vertex = _stage(
             "vertex",
             b"vertex",
@@ -770,42 +804,23 @@ class PipelineCompileTests(unittest.TestCase):
                 ],
             },
         )
-        plan = build_bundle_plan(
-            "pipeline",
-            vertex.target,
-            ("B", "A", "A"),
-            [
-                (
-                    ("A",),
-                    {
-                        "vertex": vertex,
-                        "fragment": fragment,
-                    },
-                )
-            ],
-        )
-        self.assertEqual(plan.features, ("A", "B"))
+        records = {
+            "vertex": {"interface": dict(vertex.interface)},
+            "fragment": {"interface": dict(fragment.interface)},
+        }
+        validate_graphics_interfaces("vertex", records["vertex"], "fragment", records["fragment"])
         self.assertEqual(
-            plan.variants[0].to_dict(),
-            {
-                "key": ["A"],
-                "program": {
-                    "fragment": fragment.id,
-                    "vertex": vertex.id,
-                },
-                "parameters": [],
-                "outputs": [
-                    {
-                        "name": "output_0",
-                        "kind": "texture",
-                        "dtype": "f32",
-                        "shape": [4],
-                        "access": "write",
-                        "location": 0,
-                        "type": "tensor<4xf32>",
-                    }
-                ],
-            },
+            fragment_outputs(records),
+            [
+                {
+                    "name": "output_0",
+                    "kind": "image",
+                    "dtype": "f32",
+                    "shape": [4],
+                    "access": "write",
+                    "location": 0,
+                }
+            ],
         )
 
     def test_stage_identity_and_hashing_are_deterministic(self) -> None:
@@ -838,10 +853,9 @@ class PipelineCompileTests(unittest.TestCase):
         self.assertEqual(stage.id, repeated.id)
         self.assertNotEqual(stage.id, changed.id)
 
-        plan = build_bundle_plan("pipeline", stage.target, (), [((), {"compute": stage})])
-        inline = materialize_bundle(plan, {stage.id: inline_artifact_descriptor(stage.artifact)})
-        encoded = serialize_bundle(inline)
-        self.assertEqual(encoded, serialize_bundle(inline))
+        document = with_content_hash({"type": "program", "id": "deterministic"})
+        encoded = serialize_bundle(document)
+        self.assertEqual(encoded, serialize_bundle(document))
         document = json.loads(encoded)
         unhashed = dict(document)
         digest = unhashed.pop("content_hash")
@@ -850,36 +864,79 @@ class PipelineCompileTests(unittest.TestCase):
             hashlib.sha256(canonical_json(unhashed).encode("utf-8")).hexdigest(),
         )
 
-    def test_inline_and_external_storage_preserve_logical_plan(self) -> None:
-        stage = _stage(
-            "compute",
-            b"artifact",
-            {
-                "arguments": [],
-                "results": [],
+    def test_program_manifest_has_exact_canonical_envelope(self) -> None:
+        reflection = {
+            "required_features": [],
+            "endpoints": [],
+            "compute": {
+                "workgroup_size": [1, 1, 1],
+                "subgroup": None,
+                "capabilities": ["direct_dispatch"],
             },
+        }
+        contract = {"operation": "compute", "reflection": reflection}
+        contract_hash = hashlib.sha256(canonical_json(contract).encode()).hexdigest()
+        artifact = CompiledArtifact("glsl", b"#version 430\nvoid main() {}", "main.glsl")
+        stage = CompiledStage(
+            "module",
+            "main",
+            "compute",
+            OpenGLTargetOptions(version=430),
+            {"required_features": []},
+            {"workgroup_size": [1, 1, 1]},
+            artifact,
+            {"program_contracts": {"main": contract}},
         )
-        plan = build_bundle_plan("pipeline", stage.target, ("FEATURE",), [(("FEATURE",), {"compute": stage})])
-        inline = materialize_bundle(plan, {stage.id: inline_artifact_descriptor(stage.artifact)})
-        external = materialize_bundle(
+        program = {
+            "stages": {"main": {"operation": "compute", "contract_hash": contract_hash}},
+            "parameters": [],
+            "storages": [],
+            "values": [],
+            "graphs": [
+                {
+                    "name": "forward",
+                    "direction": "forward",
+                    "inputs": [],
+                    "captures": [],
+                    "outputs": [],
+                    "nodes": [],
+                }
+            ],
+            "abi": {"boundary_slots": [], "derivative_projections": [], "tape_plans": []},
+        }
+        plan = build_program_plan("program", stage.target, [(("FEATURE",), {"main": stage}, program)])
+        manifest = build_program_manifest(
             plan,
             {
                 stage.id: {
                     "format": "glsl",
                     "storage": "external",
-                    "path": f"artifacts/{stage.artifact.sha256}.glsl",
-                    "size": len(stage.artifact.data),
-                    "sha256": stage.artifact.sha256,
+                    "path": f"artifacts/{artifact.sha256}.glsl",
+                    "size": len(artifact.data),
+                    "sha256": artifact.sha256,
                 }
             },
         )
-        self.assertEqual(set(inline["stage_artifacts"]), set(external["stage_artifacts"]))
-        self.assertEqual(inline["variants"], external["variants"])
-        inline_record = dict(inline["stage_artifacts"][stage.id])
-        external_record = dict(external["stage_artifacts"][stage.id])
-        inline_record.pop("artifact")
-        external_record.pop("artifact")
-        self.assertEqual(inline_record, external_record)
+        self.assertEqual(
+            set(manifest),
+            {
+                "compiler_contract_version",
+                "program_version",
+                "type",
+                "id",
+                "target",
+                "blobs",
+                "variants",
+                "content_hash",
+            },
+        )
+        variant = manifest["variants"][0]
+        self.assertEqual(set(variant), {"key", "program", "artifact_system"})
+        self.assertEqual(set(variant["artifact_system"]), {"runtime_requirements", "artifacts"})
+        self.assertEqual(set(variant["artifact_system"]["artifacts"]), {"main"})
+        self.assertNotIn("stage_bindings", variant)
+        self.assertNotIn("blobs", variant["artifact_system"])
+        self.assertNotIn("target", variant["artifact_system"])
 
     def test_reflection_selection_and_error_cases(self) -> None:
         reflection = parse_reflection_json(
@@ -889,9 +946,9 @@ class PipelineCompileTests(unittest.TestCase):
         )
         self.assertEqual(select_entry(reflection, "main")["stage"], "compute")
         self.assertEqual(select_artifact(reflection, "main", "compute")["filename"], "main.ptx")
-        with self.assertRaisesRegex(PipelineCompileError, "exactly one"):
+        with self.assertRaisesRegex(ProgramCompileError, "exactly one"):
             select_entry({"entries": []}, "missing")
-        with self.assertRaisesRegex(PipelineCompileError, "incompatible"):
+        with self.assertRaisesRegex(ProgramCompileError, "incompatible"):
             merge_parameter_uses(
                 "value",
                 [
@@ -915,7 +972,7 @@ class PipelineCompileTests(unittest.TestCase):
                     },
                 ],
             )
-        with self.assertRaisesRegex(PipelineCompileError, "mismatch"):
+        with self.assertRaisesRegex(ProgramCompileError, "mismatch"):
             validate_graphics_interfaces(
                 "vertex",
                 {
@@ -942,17 +999,6 @@ class PipelineCompileTests(unittest.TestCase):
                     }
                 },
             )
-        stage = _stage(
-            "compute",
-            b"x",
-            {
-                "arguments": [],
-                "results": [],
-            },
-        )
-        plan = build_bundle_plan("pipeline", stage.target, (), [((), {"compute": stage})])
-        with self.assertRaisesRegex(PipelineCompileError, "do not match planned"):
-            materialize_bundle(plan, {})
 
 
 if __name__ == "__main__":

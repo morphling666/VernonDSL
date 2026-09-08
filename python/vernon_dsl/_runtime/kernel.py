@@ -2,63 +2,53 @@ from __future__ import annotations
 
 import ast
 import atexit
+import dataclasses
 import hashlib
-import importlib
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Protocol
 
-import numpy as np
-
-from .._versions import COMPILER_CONTRACT_VERSION, PIPELINE_VERSION
-from ..bundle import canonical_json, make_target_options
+from .._dtypes import NUMPY_DTYPE_BY_SCALAR
+from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
-from ..frontend.model import AccessMode, ConcreteType, StorageEffect, StorageEffectKind
+from ..frontend.model import ConcreteType
+from ..host_values import pack_host_value
 from ..types import TypeExpr, _Scalar
-from .execution_graph import (
-    ComputeEncoder,
-    ComputePass,
-    ExecutionGraph,
-    ExecutionResources,
-    PipelineInvocation,
-)
-from .resources import TensorStorage, TensorView, _bind_native_argument, _dispatch_borrow_scope
+from .resource_common import _session_state
+from .tensor import TensorStorage, TensorView
+from .texture import _TextureResource
 
 
-def _session_state() -> Any:
-    return importlib.import_module("vernon_dsl._runtime.session")
+@dataclass(frozen=True)
+class _LoweredKernel:
+    """Source + annotations compiled to MLIR. No target, no runtime tensors."""
 
-
-class _ImmediateComputePass(ComputePass):
-    def __init__(self, name: str, invocation: PipelineInvocation):
-        super().__init__(name)
-        self._invocation = invocation
-
-    def declare(self) -> None:
-        self._invocation.declare(self)
-        self.side_effect = True
-
-    def execute(self, encoder: ComputeEncoder, resources: ExecutionResources) -> None:
-        self._invocation.encode(encoder, resources)
+    frontend: FrontendCompileResult
+    function: ast.FunctionDef
+    source: ast.FunctionDef
+    builtins: tuple[str, ...]
 
 
 @dataclass
 class _CompiledKernel:
-    mlir: str
-    function: ast.FunctionDef
     frontend: FrontendCompileResult
     builtin_names: tuple[str, ...]
-    writable_names: tuple[str, ...]
-    program: Any
+    invocation: Any
+    specialization: Any
     dependency_hashes: tuple[tuple[Path, str], ...] = ()
-    native: Any | None = None
-    native_generation: int = -1
+
+
+class _DependencyTracked(Protocol):
+    dependency_hashes: tuple[tuple[Path, str], ...]
 
 
 class Kernel:
+    """Device kernel: lower source to MLIR, specialize MLIR to a native artifact, bind tensors at launch."""
+
     _cache: ClassVar[dict[str, _CompiledKernel]] = {}
-    _dispatch_cache: ClassVar[dict[tuple[Any, ...], _CompiledKernel]] = {}
 
     def __init__(self, function: Any, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)):
         if len(workgroup_size) != 3 or any(not isinstance(value, int) or value <= 0 for value in workgroup_size):
@@ -77,13 +67,9 @@ class Kernel:
     @classmethod
     def clear_cache(cls) -> None:
         cls._cache.clear()
-        cls._dispatch_cache.clear()
+        from .autodiff import clear_vjp_cache
 
-    @classmethod
-    def invalidate_loaded(cls) -> None:
-        for compiled in cls._cache.values():
-            compiled.native = None
-            compiled.native_generation = -1
+        clear_vjp_cache()
 
     def _resolve_dependency(self, spelling: str) -> Path:
         path = Path(spelling)
@@ -102,7 +88,7 @@ class Kernel:
         )
 
     @staticmethod
-    def _dependencies_current(compiled: _CompiledKernel) -> bool:
+    def _dependencies_current(compiled: _DependencyTracked) -> bool:
         try:
             return all(
                 hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == digest
@@ -111,15 +97,8 @@ class Kernel:
         except OSError:
             return False
 
-    @staticmethod
-    def _argument_signature(value: Any) -> tuple[Any, ...]:
-        if isinstance(value, (TensorStorage, TensorView)):
-            return ("tensor",)
-        return ("value", type(value).__module__, type(value).__qualname__)
-
-    def _dispatch_key(
+    def _specialization_key(
         self,
-        arguments: tuple[Any, ...],
         features: tuple[str, ...],
         target: str,
         target_options: tuple[tuple[str, Any], ...],
@@ -140,25 +119,8 @@ class Kernel:
             target,
             target_options,
             features,
-            tuple(self._argument_signature(value) for value in arguments),
             constants,
         )
-
-    @staticmethod
-    def _load_native(compiled: _CompiledKernel, state: Any, entry: str) -> None:
-        if compiled.native is not None and compiled.native_generation == state._runtime_generation:
-            return
-        if state._architecture == state.cpu:
-            compiled.native = state._native_runtime.load_cpu_entry(compiled.program, entry)
-        else:
-            if len(compiled.program.artifacts) != 1:
-                raise RuntimeError("kernel compilation must produce exactly one artifact")
-            compiled.native = state._native_runtime.load(
-                compiled.program.artifacts[0][1],
-                compiled.program.reflection,
-                entry,
-            )
-        compiled.native_generation = state._runtime_generation
 
     @staticmethod
     def _annotation_name(node: ast.AST) -> str:
@@ -182,29 +144,6 @@ class Kernel:
                 for node in ast.walk(argument.annotation)
             )
         )
-
-    @staticmethod
-    def _writable_parameters(frontend: FrontendCompileResult) -> tuple[str, ...]:
-        entry = next(
-            (function for function in frontend.typed_functions if function.symbol == frontend.request.entry),
-            None,
-        )
-        if entry is None:
-            raise RuntimeError("compiled kernel has no typed entry function")
-        parameter_names = {parameter.name for parameter in entry.parameters}
-        writable = {
-            parameter.name
-            for parameter in entry.parameters
-            if parameter.type.kind == "tensor_view" and parameter.access is not AccessMode.READ
-        }
-        writable.update(
-            effect.owner.name
-            for effect in entry.effects
-            if isinstance(effect, StorageEffect)
-            and effect.kind is StorageEffectKind.WRITE
-            and effect.owner.name in parameter_names
-        )
-        return tuple(sorted(writable))
 
     @classmethod
     def _tensor_view_access(cls, annotation: ast.expr | None) -> str | None:
@@ -236,13 +175,11 @@ class Kernel:
             for argument in function.args.args
             if argument.arg in user_parameters
         }
-        normalized = tuple(
-            value._full_view(declared_access[name])
-            if isinstance(value, TensorStorage) and declared_access[name] is not None
-            else value
-            for name, value in zip(user_parameters, arguments, strict=True)
-        )
-        return user_parameters, normalized
+        normalized: list[Any] = []
+        for name, value in zip(user_parameters, arguments, strict=True):
+            access = declared_access[name]
+            normalized.append(value._full_view(access) if isinstance(value, TensorStorage) and access else value)
+        return user_parameters, tuple(normalized)
 
     def _validate_tensor_view_arguments(
         self,
@@ -257,19 +194,12 @@ class Kernel:
         if entry is None:
             raise RuntimeError("compiled kernel has no typed entry function")
         typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
-        scalar_dtypes = {
-            "bool": np.dtype(np.bool_),
-            "i32": np.dtype(np.int32),
-            "u32": np.dtype(np.uint32),
-            "f16": np.dtype(np.float16),
-            "f32": np.dtype(np.float32),
-            "f64": np.dtype(np.float64),
-        }
         access_compatibility = {
             "read": {"read", "read_write"},
             "write": {"write", "read_write"},
             "read_write": {"read_write"},
         }
+        annotations = inspect.get_annotations(self._function, eval_str=True)
 
         def dsl_signature(value_type: Any) -> Any:
             if value_type.kind == "scalar":
@@ -298,6 +228,14 @@ class Kernel:
                         runtime_signature(annotation.arguments[0]),
                         tuple(annotation.arguments[1]),
                     )
+                if annotation.name in {"Vector", "Matrix"}:
+                    rank = 1 if annotation.name == "Vector" else 2
+                    if len(annotation.arguments) == rank + 1:
+                        return (
+                            "tensor",
+                            runtime_signature(annotation.arguments[0]),
+                            tuple(annotation.arguments[1:]),
+                        )
             if isinstance(annotation, type) and getattr(annotation, "__vernon_dsl__", (None, {}))[0] == "struct":
                 return ("struct", annotation.__name__)
             return None
@@ -320,6 +258,17 @@ class Kernel:
                     continue
                 if isinstance(value, (TensorStorage, TensorView)):
                     raise TypeError(f"kernel argument {name!r} is runtime storage but its annotation is not TensorView")
+                if parameter.type.kind == "struct":
+                    annotation = annotations.get(name)
+                    if isinstance(value, Mapping):
+                        if runtime_signature(annotation) != dsl_signature(parameter.type):
+                            raise RuntimeError(f"kernel Struct argument {name!r} has an inconsistent host annotation")
+                        pack_host_value(annotation, value, name)
+                    elif runtime_signature(type(value)) != dsl_signature(parameter.type):
+                        raise TypeError(
+                            f"kernel Struct argument {name!r} has type {type(value).__name__}, "
+                            f"expected {parameter.type.name}"
+                        )
                 continue
             if not isinstance(value, TensorView):
                 raise TypeError(f"kernel argument {name!r} must be a TensorView")
@@ -328,6 +277,8 @@ class Kernel:
                 raise RuntimeError(f"kernel TensorView argument {name!r} has an unresolved element type")
             if not isinstance(shape, tuple):
                 raise RuntimeError(f"kernel TensorView argument {name!r} has an unresolved shape")
+            if not isinstance(declared_access, str):
+                raise RuntimeError(f"kernel TensorView argument {name!r} has unresolved access")
             if address_space != "device":
                 raise RuntimeError(f"kernel parameter {name!r} has non-device TensorView address space")
             if len(value.shape) != len(shape):
@@ -340,7 +291,7 @@ class Kernel:
                         f"kernel TensorView argument {name!r} dimension {dimension} is {actual}, expected {expected}"
                     )
             if element.kind == "scalar":
-                matches_element = value.dtype == scalar_dtypes[element.name]
+                matches_element = value.dtype == NUMPY_DTYPE_BY_SCALAR[element.name]
             else:
                 matches_element = runtime_signature(value.element_type) == dsl_signature(element)
             if not matches_element:
@@ -352,16 +303,37 @@ class Kernel:
                     f"kernel TensorView argument {name!r} access {value.access!r} does not satisfy {declared_access!r}"
                 )
 
+    def _bind_launch(self, lowered: _LoweredKernel, arguments: tuple[Any, ...]) -> None:
+        user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
+        self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
+
+    def _session_target(self) -> tuple[Any, Any, Any]:
+        state = _session_state()
+        if state._native is None or state._native_runtime is None:
+            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
+        target = {
+            state.cpu: state._native.Target.CPU,
+            state.cuda: state._native.Target.CUDA,
+            state.vulkan: state._native.Target.VULKAN,
+            state.directx: state._native.Target.DIRECTX,
+            state.metal: state._native.Target.METAL,
+            state.opengl: state._native.Target.OPENGL,
+            state.opengles: state._native.Target.OPENGL_ES,
+        }.get(state._architecture)
+        options = make_target_options(
+            state._architecture.name,
+            {"version": state._interactive_glsl_version()}
+            if state._architecture in {state.opengl, state.opengles}
+            else {},
+        )
+        return state, target, options
+
     def _lower(
         self,
-        arguments: tuple[Any, ...],
         features: tuple[str, ...] = (),
-    ) -> tuple[
-        FrontendCompileResult,
-        ast.FunctionDef,
-        tuple[str, ...],
-        dict[str, TensorStorage | TensorView],
-    ]:
+        *,
+        autodiff_planning_policy: str | None = None,
+    ) -> _LoweredKernel:
         source = self._file.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=str(self._file))
         function = next(
@@ -371,12 +343,6 @@ class Kernel:
         if function is None:
             raise RuntimeError("kernel functions must be top-level definitions in files")
         builtins = self._builtin_parameters(function)
-        user_parameters, normalized_arguments = self._normalize_arguments(function, builtins, arguments)
-        tensors = {
-            name: value
-            for name, value in zip(user_parameters, normalized_arguments, strict=True)
-            if isinstance(value, (TensorStorage, TensorView))
-        }
         loaded_names = {
             node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
         }
@@ -389,21 +355,17 @@ class Kernel:
             self._file,
             self._entry,
             features,
-            tuple(
-                (name, value.dtype.str, value.shape)
-                for name, value in tensors.items()
-                if isinstance(value, TensorStorage)
-            ),
+            (),
             constants,
             self._workgroup_size,
+            autodiff_planning_policy=autodiff_planning_policy,
         )
         frontend = Compiler().compile_request(request)
-        self._validate_tensor_view_arguments(frontend, user_parameters, normalized_arguments)
         specialized_tree = ast.parse(frontend.specialized_source, filename=str(self._file))
         specialized_function = next(
             node for node in specialized_tree.body if isinstance(node, ast.FunctionDef) and node.name == self._entry
         )
-        return frontend, specialized_function, builtins, tensors
+        return _LoweredKernel(frontend, specialized_function, function, builtins)
 
     def compile_artifact(self, *arguments: Any, target: str) -> tuple[bytes, str]:
         state = _session_state()
@@ -420,13 +382,15 @@ class Kernel:
         }
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
-        frontend, _, _, _ = self._lower(arguments)
+        lowered = self._lower()
+        if arguments:
+            self._bind_launch(lowered, arguments)
         options = make_target_options(
             target,
             {"version": 430} if target == "opengl" else {"version": 310} if target == "opengles" else {},
         )
         program = state._native.Compiler().compile_program_result(
-            frontend.mlir, targets[target], **options.native_options
+            lowered.frontend.mlir, targets[target], **options.native_options
         )
         if not program.ok:
             raise RuntimeError(program.diagnostics)
@@ -434,152 +398,124 @@ class Kernel:
             raise RuntimeError("kernel compilation must produce exactly one artifact")
         return bytes(program.artifacts[0][1]), str(program.reflection)
 
-    def _compile(self, arguments: tuple[Any, ...], features: tuple[str, ...] = ()) -> _CompiledKernel:
-        state = _session_state()
-        if state._native is None or state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
-        target = (
-            {
-                state.cpu: state._native.Target.CPU,
-                state.cuda: state._native.Target.CUDA,
-                state.vulkan: state._native.Target.VULKAN,
-                state.directx: state._native.Target.DIRECTX,
-                state.metal: state._native.Target.METAL,
-                state.opengl: state._native.Target.OPENGL,
-                state.opengles: state._native.Target.OPENGL_ES,
-            }.get(state._architecture)
-            if state._native is not None
-            else None
-        )
-        options = make_target_options(
-            state._architecture.name,
-            {"version": state._interactive_glsl_version()}
-            if state._architecture in {state.opengl, state.opengles}
-            else {},
-        )
-        dispatch_key = self._dispatch_key(arguments, features, options.target, tuple(sorted(options.options.items())))
-        cached = self._dispatch_cache.get(dispatch_key)
-        if cached is not None and self._dependencies_current(cached):
-            entry = next(
-                (function for function in cached.frontend.typed_functions if function.source.name == self._entry),
-                None,
-            )
-            if entry is None:
-                raise RuntimeError("compiled kernel has no typed entry function")
-            typed_parameters = {parameter.name: parameter for parameter in entry.parameters}
-            user_parameters = [
-                parameter.name for parameter in entry.parameters if parameter.name not in cached.builtin_names
-            ]
-            if len(arguments) != len(user_parameters):
-                raise TypeError(f"{self._entry} expects {len(user_parameters)} launch arguments")
-            normalized_arguments = tuple(
-                value._full_view(typed_parameters[name].type.arguments[2])
-                if isinstance(value, TensorStorage) and typed_parameters[name].type.kind == "tensor_view"
-                else value
-                for name, value in zip(user_parameters, arguments, strict=True)
-            )
-            self._validate_tensor_view_arguments(cached.frontend, user_parameters, normalized_arguments)
-            self._load_native(cached, state, self._entry)
-            return cached
-
-        frontend, function, builtins, _ = self._lower(arguments, features)
+    def specialize(
+        self,
+        features: tuple[str, ...] = (),
+        *,
+        lowered: _LoweredKernel | None = None,
+    ) -> _CompiledKernel:
+        lowered = lowered or self._lower(features)
+        frontend = lowered.frontend
+        state, target, options = self._session_target()
         key = hashlib.sha256(
             canonical_json(
                 {
                     "compiler_contract_version": COMPILER_CONTRACT_VERSION,
-                    "pipeline_version": PIPELINE_VERSION,
+                    "program_version": PROGRAM_VERSION,
                     "frontend": frontend.semantic_inputs,
                     "target": options.spec,
                 }
             ).encode()
         ).hexdigest()
         cached = self._cache.get(key)
-        if cached is None:
-            if target is None:
-                raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
-            program = state._native.Compiler().compile_program_result(frontend.mlir, target, **options.native_options)
-            if not program.ok:
-                raise RuntimeError(program.diagnostics)
-            cached = _CompiledKernel(
-                frontend.mlir,
-                function,
-                frontend,
-                builtins,
-                self._writable_parameters(frontend),
-                program,
-                self._dependency_hashes(frontend),
-            )
-            self._cache[key] = cached
-            self.compile_count += 1
-        elif not cached.dependency_hashes:
-            cached.dependency_hashes = self._dependency_hashes(frontend)
-        self._dispatch_cache[dispatch_key] = cached
-        self._load_native(cached, state, self._entry)
+        if cached is not None:
+            if not cached.dependency_hashes:
+                cached.dependency_hashes = self._dependency_hashes(frontend)
+            if self._dependencies_current(cached):
+                return cached
+            del self._cache[key]
+        if target is None:
+            raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
+        entry = next(
+            (function for function in frontend.typed_functions if function.source.name == self._entry),
+            None,
+        )
+        if entry is None or entry.storage_activity is None:
+            raise RuntimeError("compiled kernel has no typed storage activity")
+        annotations = inspect.get_annotations(self._function, eval_str=True)
+        parameter_names = tuple(
+            name for name in inspect.signature(self._function).parameters if name not in lowered.builtins
+        )
+        from ..frontend.runtime_types import runtime_parameter_descriptor
+        from ..program import _one_node_program
+
+        parameter_types: dict[str, Any] = {}
+        for name in parameter_names:
+            annotation = annotations.get(name)
+            if annotation is None:
+                raise TypeError(f"kernel argument {name!r} requires a runtime annotation")
+            parameter_types[name] = runtime_parameter_descriptor(annotation)
+        from ..types import u32
+
+        for axis in "xyz":
+            parameter_types[f"__grid_{axis}"] = runtime_parameter_descriptor(u32)
+
+        template, invocation, parsed = _one_node_program(
+            self,
+            parameter_types,
+            lambda capture, inputs: capture.capture_kernel(
+                self,
+                tuple(inputs[name] for name in parameter_names),
+                tuple(inputs[f"__grid_{axis}"] for axis in "xyz"),
+                features,
+                lowered=lowered,
+            ),
+            None,
+        )
+        from .program_autodiff import compile_program
+
+        try:
+            specialization = compile_program(parsed, template)
+        except ProgramCompileError as error:
+            raise RuntimeError(str(error)) from error
+        cached = _CompiledKernel(
+            frontend,
+            lowered.builtins,
+            invocation,
+            specialization,
+            self._dependency_hashes(frontend),
+        )
+        self._cache[key] = cached
+        self.compile_count += 1
         return cached
 
-    def _invoke_direct(
+    def _invoke(
         self,
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
         features: tuple[str, ...] = (),
-        encoder: ComputeEncoder | None = None,
     ) -> None:
-        state = _session_state()
-        compiled = self._compile(arguments, features)
-        user_parameters = [
-            argument.arg for argument in compiled.function.args.args if argument.arg not in compiled.builtin_names
-        ]
+        lowered = self._lower(features)
+        user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
+        self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
+        entry = next(function for function in lowered.frontend.typed_functions if function.source.name == self._entry)
+        writable = entry.storage_activity.writable_roots if entry.storage_activity is not None else frozenset()
         if grid is None:
             writable_shapes = {
                 value.shape
-                for name, value in zip(user_parameters, arguments, strict=True)
-                if name in compiled.writable_names and isinstance(value, (TensorStorage, TensorView))
+                for name, value in zip(user_parameters, normalized, strict=True)
+                if name in writable and isinstance(value, (TensorStorage, TensorView, _TextureResource))
             }
             if not writable_shapes:
                 raise TypeError("grid is required when no writable Tensor domain can be inferred")
             if len(writable_shapes) != 1:
                 raise ValueError("all writable Tensor arguments must have the same shape")
             shape = next(iter(writable_shapes))
-            if not 1 <= len(shape) <= 3:
-                raise ValueError("inferred compute grids require Tensor rank one through three")
-            grid = tuple(reversed(shape)) + (1,) * (3 - len(shape))
-        if len(grid) != 3 or any(not isinstance(value, int) or value <= 0 for value in grid):
+            if len(shape) > 3:
+                raise ValueError("inferred compute grids require Tensor rank zero through three")
+            extent = tuple(reversed(shape)) + (1,) * (3 - len(shape))
+            grid = (
+                (extent[0] + self._workgroup_size[0] - 1) // self._workgroup_size[0],
+                (extent[1] + self._workgroup_size[1] - 1) // self._workgroup_size[1],
+                (extent[2] + self._workgroup_size[2] - 1) // self._workgroup_size[2],
+            )
+        if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
             raise ValueError("grid must contain three positive integers")
-        if state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
-        if compiled.native is None:
-            raise RuntimeError("kernel native program is not loaded")
-        dispatch_borrows = [
-            (name, value, "write" if name in compiled.writable_names else "read")
-            for name, value in zip(user_parameters, arguments, strict=True)
-            if isinstance(value, (TensorStorage, TensorView))
-        ]
-        with _dispatch_borrow_scope(dispatch_borrows):
-            builder = compiled.native.invocation_builder()
-            static_tensor_names = {
-                argument.arg
-                for argument in compiled.function.args.args
-                if self._is_static_tensor_annotation(argument.annotation)
-            }
-            for user_name, parameter, value in zip(user_parameters, compiled.native.parameters, arguments, strict=True):
-                _bind_native_argument(
-                    builder,
-                    parameter,
-                    value,
-                    host_value=state._architecture == state.cuda and user_name in static_tensor_names,
-                )
-            builder.grid(*grid)
-            if encoder is None:
-                builder.invoke()
-            else:
-                builder.encode(encoder._native)
-            for name, value in zip(user_parameters, arguments, strict=True):
-                if (
-                    state._architecture != state.cpu
-                    and name in compiled.writable_names
-                    and isinstance(value, (TensorStorage, TensorView))
-                ):
-                    value._mark_device_dirty()
+        compiled = self.specialize(features, lowered=lowered)
+        actual = dict(zip(user_parameters, normalized, strict=True))
+        outputs = {name: actual[name] for name in compiled.invocation.outputs}
+        actual.update({f"__grid_{axis}": value for axis, value in zip("xyz", grid, strict=True)})
+        compiled.specialization.invoke(dataclasses.replace(compiled.invocation, inputs=actual, outputs=outputs))
 
     def __call__(
         self,
@@ -587,49 +523,7 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         features: tuple[str, ...] = (),
     ) -> None:
-        state = _session_state()
-        if state._architecture == state.cpu:
-            self._invoke_direct(tuple(arguments), grid, features)
-            return
-        invocation = self.invocation(*arguments, grid=grid, features=features)
-
-        graph = ExecutionGraph()
-        graph.add_pass(_ImmediateComputePass(f"{self.__name__} immediate", invocation))
-        try:
-            graph.execute()
-        finally:
-            graph._dispose_native()
-
-    def _declare_invocation(
-        self,
-        arguments: tuple[Any, ...],
-        features: tuple[str, ...],
-        execution_pass: ComputePass,
-    ) -> None:
-        state = _session_state()
-        compiled = self._compile(arguments, features)
-        for parameter, value in zip(compiled.native.parameters, arguments, strict=True):
-            if not isinstance(value, (TensorStorage, TensorView)):
-                continue
-            if parameter.access == state._native.ACCESS_READ:
-                execution_pass.read(value)
-            elif parameter.access == state._native.ACCESS_WRITE:
-                execution_pass.write(value)
-            else:
-                execution_pass.read_write(value)
-
-    def invocation(
-        self,
-        *arguments: Any,
-        grid: tuple[int, int, int] | None = None,
-        features: tuple[str, ...] = (),
-    ) -> PipelineInvocation:
-        captured = tuple(arguments)
-        return PipelineInvocation(
-            "compute",
-            lambda encoder: self._invoke_direct(captured, grid, features, encoder),
-            lambda execution_pass: self._declare_invocation(captured, features, execution_pass),
-        )
+        self._invoke(arguments, grid, features)
 
 
 atexit.register(Kernel.clear_cache)

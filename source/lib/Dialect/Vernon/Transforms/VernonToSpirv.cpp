@@ -3,6 +3,8 @@
 #include "mlir/Dialect/Vernon/Transforms/VernonSpirvMarkers.h"
 #include "mlir/Dialect/Vernon/Transforms/VernonTensorShapeSemantics.h"
 
+#include "VernonSpirvMath.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Math/IR/Math.h"
@@ -34,8 +36,8 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     if (!tensor.hasStaticShape() || llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
         !tensor.getElementType().isIntOrFloat())
         return failure();
-    FailureOr<PhysicalValueAbiLayout> layout =
-        getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
+    FailureOr<ByteTransportPlan> layout =
+        getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
     if (failed(layout))
         return failure();
     Type elementType = tensor.getElementType();
@@ -52,7 +54,7 @@ FailureOr<Type> convertTensorType(RankedTensorType tensor, ModuleOp module) {
     }
     Type result = elementType;
     for (size_t dimension = tensor.getRank(); dimension-- > 0;) {
-        uint64_t stride = layout->byteStrides[dimension];
+        uint64_t stride = layout->root->byteStrides[dimension];
         if (stride > std::numeric_limits<unsigned>::max())
             return failure();
         result = spirv::ArrayType::get(result, static_cast<unsigned>(tensor.getDimSize(dimension)),
@@ -66,9 +68,9 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
         llvm::any_of(tensor.getShape(), [](int64_t extent) { return extent <= 0; }) ||
         !tensor.getElementType().isIntOrFloat())
         return failure();
-    FailureOr<PhysicalValueAbiLayout> layout =
-        getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
-    if (failed(layout) || layout->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
+    FailureOr<ByteTransportPlan> layout =
+        getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
+    if (failed(layout) || layout->root->byteStrides.size() != static_cast<size_t>(tensor.getRank()))
         return failure();
     Type elementType = tensor.getElementType();
     if (auto integer = dyn_cast<IntegerType>(elementType))
@@ -77,7 +79,7 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
     if (!bitWidth || bitWidth % 8 != 0)
         return failure();
     const uint64_t elementSize = bitWidth / 8;
-    const uint64_t scalarStride = layout->byteStrides.back();
+    const uint64_t scalarStride = layout->root->byteStrides.back();
     if (scalarStride < elementSize || scalarStride % elementSize != 0)
         return failure();
     const uint64_t carrierComponents = scalarStride / elementSize;
@@ -103,7 +105,7 @@ FailureOr<Type> convertStd140TensorInterfaceType(RankedTensorType tensor, Module
         result = spirv::StructType::get(fields, offsets);
     }
     for (size_t dimension = tensor.getRank(); dimension-- > 0;) {
-        const uint64_t stride = layout->byteStrides[dimension];
+        const uint64_t stride = layout->root->byteStrides[dimension];
         if (stride > std::numeric_limits<unsigned>::max())
             return failure();
         result = spirv::ArrayType::get(result, static_cast<unsigned>(tensor.getDimSize(dimension)),
@@ -121,6 +123,23 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
                                                   .Default(std::nullopt);
         if (!dimension)
             return failure();
+        if (texture.getAccess() != "sampled") {
+            std::optional<spirv::ImageFormat> format =
+                llvm::StringSwitch<std::optional<spirv::ImageFormat>>(texture.getFormat())
+                    .Case("r8_unorm", spirv::ImageFormat::R8)
+                    .Case("r16_float", spirv::ImageFormat::R16f)
+                    .Case("r32_float", spirv::ImageFormat::R32f)
+                    .Case("rg8_unorm", spirv::ImageFormat::Rg8)
+                    .Case("rgba8_unorm", spirv::ImageFormat::Rgba8)
+                    .Case("rgba16_float", spirv::ImageFormat::Rgba16f)
+                    .Case("rgba32_float", spirv::ImageFormat::Rgba32f)
+                    .Default(std::nullopt);
+            if (!format || texture.getDimension() == "cube")
+                return failure();
+            return spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
+                                         spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
+                                         spirv::ImageSamplerUseInfo::NoSampler, *format);
+        }
         auto image = spirv::ImageType::get(texture.getElementType(), *dimension, spirv::ImageDepthInfo::NoDepth,
                                            spirv::ImageArrayedInfo::NonArrayed, spirv::ImageSamplingInfo::SingleSampled,
                                            spirv::ImageSamplerUseInfo::NeedSampler, spirv::ImageFormat::Unknown);
@@ -137,7 +156,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
                 return failure();
             elements.push_back(*converted);
         }
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
         if (failed(layout))
             return failure();
         SmallVector<uint32_t> offsets;
@@ -153,13 +172,13 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
         if (!module)
             return failure();
         FailureOr<Type> element = convertValueType(tensor.getElementType(), module);
-        FailureOr<PhysicalValueAbiLayout> layout =
-            getPhysicalValueAbiLayout(type, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
+        FailureOr<ByteTransportPlan> layout =
+            getByteTransportPlan(type, module, PhysicalAbiProfile::VulkanStd140UniformBuffer);
         FailureOr<int64_t> count = getStaticShapeElementCount(tensor.getShape());
-        if (failed(element) || failed(layout) || layout->byteStrides.empty() || failed(count) ||
+        if (failed(element) || failed(layout) || layout->root->byteStrides.empty() || failed(count) ||
             *count > static_cast<int64_t>(std::numeric_limits<unsigned>::max()))
             return failure();
-        uint64_t stride = layout->byteStrides.back();
+        uint64_t stride = layout->root->byteStrides.back();
         if (stride > std::numeric_limits<unsigned>::max())
             return failure();
         return spirv::ArrayType::get(*element, static_cast<unsigned>(*count), static_cast<unsigned>(stride));
@@ -168,7 +187,7 @@ FailureOr<Type> convertValueType(Type type, ModuleOp module = {}) {
         if (!module)
             return failure();
         FailureOr<std::pair<StructDeclOp, SmallVector<Type>>> fields = resolveStructFields(structure, module);
-        FailureOr<ValueAbiLayout> layout = getValueAbiLayout(type, module);
+        FailureOr<ValueAbiLayout> layout = getValueStorageLayout(type, module);
         if (failed(fields) || failed(layout))
             return failure();
         SmallVector<Type> elements;
@@ -210,30 +229,75 @@ Type applyInterfaceIntegerSignedness(Type type, DictionaryAttr attributes) {
     return type;
 }
 
+LogicalResult collectTransportScalarOffsets(const ByteTransportNode &node, uint64_t base,
+                                            SmallVectorImpl<uint64_t> &offsets) {
+    if (node.byteOffset > std::numeric_limits<uint64_t>::max() - base)
+        return failure();
+    const uint64_t offset = base + node.byteOffset;
+    if (node.kind == ByteTransportNodeKind::Scalar) {
+        offsets.push_back(offset);
+        return success();
+    }
+    if (node.kind == ByteTransportNodeKind::Product) {
+        for (const std::shared_ptr<const ByteTransportNode> &child : node.children)
+            if (failed(collectTransportScalarOffsets(*child, offset, offsets)))
+                return failure();
+        return success();
+    }
+    if (node.children.size() != 1 || node.shape.size() != node.byteStrides.size())
+        return failure();
+    SmallVector<uint64_t> indices(node.shape.size());
+    for (;;) {
+        uint64_t elementOffset = offset;
+        for (size_t dimension = 0; dimension < indices.size(); ++dimension) {
+            if (indices[dimension] >
+                (std::numeric_limits<uint64_t>::max() - elementOffset) / node.byteStrides[dimension])
+                return failure();
+            elementOffset += indices[dimension] * node.byteStrides[dimension];
+        }
+        if (failed(collectTransportScalarOffsets(*node.children.front(), elementOffset, offsets)))
+            return failure();
+        size_t dimension = indices.size();
+        while (dimension != 0) {
+            --dimension;
+            if (++indices[dimension] < node.shape[dimension])
+                break;
+            indices[dimension] = 0;
+        }
+        if (dimension == 0 && indices[0] == 0)
+            break;
+    }
+    return success();
+}
+
 FailureOr<Type> convertAggregateTensorStorageType(TensorType tensor, ModuleOp module) {
-    FailureOr<ValueAbiLayout> elementLayout = getValueAbiLayout(tensor.getElementType(), module);
-    FailureOr<PhysicalValueAbiLayout> physicalLayout =
-        getPhysicalValueAbiLayout(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
+    FailureOr<ValueAbiLayout> elementLayout = getValueStorageLayout(tensor.getElementType(), module);
+    FailureOr<ByteTransportPlan> physicalLayout =
+        getByteTransportPlan(tensor, module, PhysicalAbiProfile::VulkanStd430StorageBuffer);
     FailureOr<int64_t> count = getStaticShapeElementCount(tensor.getShape());
-    if (failed(elementLayout) || failed(physicalLayout) || physicalLayout->byteStrides.empty() || failed(count) ||
+    if (failed(elementLayout) || failed(physicalLayout) || physicalLayout->root->byteStrides.empty() || failed(count) ||
         *count <= 0 || *count > static_cast<int64_t>(std::numeric_limits<unsigned>::max()))
         return failure();
+    const ByteTransportNode &element = *physicalLayout->root->children.front();
+    SmallVector<uint64_t> physicalOffsets;
+    if (failed(collectTransportScalarOffsets(element, 0, physicalOffsets)))
+        return failure();
     SmallVector<Type> members;
-    SmallVector<uint32_t> offsets;
     for (const ValueAbiLeaf &leaf : elementLayout->leaves) {
         FailureOr<Type> scalar = convertValueType(leaf.scalarType, module);
-        const uint64_t scalarSize = std::max<uint64_t>(leaf.scalarType.getIntOrFloatBitWidth() / 8, 1);
         if (failed(scalar))
             return failure();
         for (uint64_t index = 0; index < leaf.scalarCount; ++index) {
-            const uint64_t offset = leaf.byteOffset + index * scalarSize;
-            if (offset > std::numeric_limits<uint32_t>::max())
-                return failure();
             members.push_back(*scalar);
-            offsets.push_back(static_cast<uint32_t>(offset));
         }
     }
-    const uint64_t stride = physicalLayout->byteStrides.back();
+    if (members.size() != physicalOffsets.size() ||
+        llvm::any_of(physicalOffsets, [](uint64_t offset) { return offset > std::numeric_limits<uint32_t>::max(); }))
+        return failure();
+    SmallVector<uint32_t> offsets;
+    llvm::transform(physicalOffsets, std::back_inserter(offsets),
+                    [](uint64_t offset) { return static_cast<uint32_t>(offset); });
+    const uint64_t stride = physicalLayout->root->byteStrides.back();
     if (members.empty() || stride > std::numeric_limits<unsigned>::max())
         return failure();
     Type record = spirv::StructType::get(members, offsets);
@@ -293,7 +357,7 @@ std::string uniqueInterfaceName(StringRef preferred, StringRef stage, llvm::Stri
     return candidate;
 }
 
-void appendMemberDecorations(OpBuilder &builder, uint32_t member, Type type, const PhysicalValueAbiLayout &layout,
+void appendMemberDecorations(OpBuilder &builder, uint32_t member, Type type, const ByteTransportNode &layout,
                              SmallVectorImpl<spirv::StructType::MemberDecorationInfo> &decorations) {
     if (isa<spirv::MatrixType>(type) && layout.byteStrides.size() == 2) {
         decorations.emplace_back(member, spirv::Decoration::MatrixStride,
@@ -304,7 +368,7 @@ void appendMemberDecorations(OpBuilder &builder, uint32_t member, Type type, con
 
 spirv::GlobalVariableOp createInterfaceVariable(OpBuilder &builder, Location location, StringRef name, Type valueType,
                                                 spirv::StorageClass storageClass, DictionaryAttr attributes,
-                                                const PhysicalValueAbiLayout *layout = nullptr) {
+                                                const ByteTransportNode *layout = nullptr) {
     auto pointerType = spirv::PointerType::get(valueType, storageClass);
     if (storageClass == spirv::StorageClass::Uniform || storageClass == spirv::StorageClass::PushConstant ||
         storageClass == spirv::StorageClass::StorageBuffer) {
@@ -815,6 +879,16 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
                                                            spirv::ImageOperandsAttr(), ValueRange{})
                 .getResult();
         }
+        if (intrinsic.getName() == "texture_load") {
+            Value image = mapped(intrinsic.getOperand(0));
+            Value coordinates = mapped(intrinsic.getOperand(1));
+            FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
+            if (!image || !coordinates || failed(resultType))
+                return failure();
+            return spirv::ImageReadOp::create(builder, location, *resultType, image, coordinates,
+                                              spirv::ImageOperandsAttr(), ValueRange{})
+                .getResult();
+        }
         if (intrinsic.getName() == "texture_size") {
             Value sampledImage = mapped(intrinsic.getOperand(0));
             FailureOr<Type> resultType = convertValueType(intrinsic.getResult().getType());
@@ -968,35 +1042,10 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
         FailureOr<Type> resultType = convertValueType(atan2.getType());
         if (!y || !x || failed(resultType))
             return failure();
-        return lowerCompositeElementwise(
-            location, *resultType, ArrayRef<Value>{y, x}, builder,
-            [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
-                auto floatType = dyn_cast<FloatType>(type);
-                if (!floatType)
-                    return failure();
-                Value zero = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, 0.0));
-                Value minusOne = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, -1.0));
-                Value one = spirv::ConstantOp::create(builder, location, type, builder.getFloatAttr(type, 1.0));
-                Value xx = spirv::FMulOp::create(builder, location, values[1], values[1]);
-                Value yy = spirv::FMulOp::create(builder, location, values[0], values[0]);
-                Value radiusSquared = spirv::FAddOp::create(builder, location, xx, yy);
-                OperationState sqrtState(location, "spirv.GL.Sqrt");
-                sqrtState.addOperands(radiusSquared);
-                sqrtState.addTypes(type);
-                Value radius = builder.create(sqrtState)->getResult(0);
-                Value cosine = spirv::FDivOp::create(builder, location, values[1], radius);
-                OperationState clampState(location, "spirv.GL.FClamp");
-                clampState.addOperands({cosine, minusOne, one});
-                clampState.addTypes(type);
-                Value clamped = builder.create(clampState)->getResult(0);
-                OperationState acosState(location, "spirv.GL.Acos");
-                acosState.addOperands(clamped);
-                acosState.addTypes(type);
-                Value angle = builder.create(acosState)->getResult(0);
-                Value negativeAngle = spirv::FSubOp::create(builder, location, zero, angle);
-                Value negativeY = spirv::FOrdLessThanOp::create(builder, location, values[0], zero);
-                return spirv::SelectOp::create(builder, location, type, negativeY, negativeAngle, angle).getResult();
-            });
+        return lowerCompositeElementwise(location, *resultType, ArrayRef<Value>{y, x}, builder,
+                                         [&](Type type, ArrayRef<Value> values) -> FailureOr<Value> {
+                                             return lowerAtan2ToSpirv(location, type, values[0], values[1], builder);
+                                         });
     }
 
     if (auto compare = dyn_cast<arith::CmpFOp>(operation)) {
@@ -1143,6 +1192,20 @@ FailureOr<Value> translateOperation(Operation &operation, OpBuilder &builder, IR
     return failure();
 }
 
+LogicalResult translateVoidOperation(Operation &operation, OpBuilder &builder, IRMapping &mapping) {
+    auto intrinsic = dyn_cast<IntrinsicOp>(operation);
+    if (!intrinsic || intrinsic.getName() != "texture_store" || intrinsic.getNumOperands() != 3)
+        return failure();
+    Value image = mapping.lookupOrNull(intrinsic.getOperand(0));
+    Value coordinates = mapping.lookupOrNull(intrinsic.getOperand(1));
+    Value texel = mapping.lookupOrNull(intrinsic.getOperand(2));
+    if (!image || !coordinates || !texel)
+        return failure();
+    spirv::ImageWriteOp::create(builder, operation.getLoc(), image, coordinates, texel, spirv::ImageOperandsAttr(),
+                                ValueRange{});
+    return success();
+}
+
 LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Block *functionEntry, IRMapping &mapping,
                                          SmallVectorImpl<Value> &yieldedValues, Value *condition = nullptr);
 
@@ -1259,6 +1322,12 @@ LogicalResult translateStraightLineBlock(Block &source, OpBuilder &builder, Bloc
                 mapping.map(sourceResult, translatedResult);
             continue;
         }
+        if (operation.getNumResults() == 0) {
+            if (failed(translateVoidOperation(operation, builder, mapping)))
+                return operation.emitError()
+                       << "operation cannot be translated inside structured control flow: " << operation.getName();
+            continue;
+        }
         FailureOr<Value> translated = translateOperation(operation, builder, mapping);
         if (failed(translated) || operation.getNumResults() != 1)
             return operation.emitError() << "operation cannot be translated inside structured control flow: "
@@ -1366,7 +1435,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         uint32_t argumentIndex;
         Type type;
         uint32_t offset;
-        PhysicalValueAbiLayout layout;
+        std::shared_ptr<const ByteTransportNode> layout;
     };
     SmallVector<PushConstantMember> pushConstantMembers;
     uint32_t pushConstantSize = 0;
@@ -1382,13 +1451,13 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         if (failed(converted))
             return source.emitError() << "cannot lower push-constant argument #" << index << " type " << type
                                       << " to SPIR-V";
-        FailureOr<PhysicalValueAbiLayout> layout =
-            getPhysicalValueAbiLayout(type, sourceModule, PhysicalAbiProfile::VulkanPushConstant);
+        FailureOr<ByteTransportPlan> layout =
+            getByteTransportPlan(type, sourceModule, PhysicalAbiProfile::VulkanPushConstant);
         if (failed(layout))
             return source.emitError() << "push-constant argument #" << index << " does not have a GPU interface layout";
-        pushConstantSize = llvm::alignTo(pushConstantSize, layout->alignment);
-        pushConstantMembers.push_back({static_cast<uint32_t>(index), *converted, pushConstantSize, *layout});
-        pushConstantSize += layout->size;
+        pushConstantSize = llvm::alignTo(pushConstantSize, layout->root->alignment);
+        pushConstantMembers.push_back({static_cast<uint32_t>(index), *converted, pushConstantSize, layout->root});
+        pushConstantSize += layout->root->size;
     }
     spirv::GlobalVariableOp pushConstantBlock;
     if (!pushConstantMembers.empty()) {
@@ -1398,7 +1467,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
         for (auto [member, value] : llvm::enumerate(pushConstantMembers)) {
             memberTypes.push_back(value.type);
             memberOffsets.push_back(value.offset);
-            appendMemberDecorations(moduleBuilder, static_cast<uint32_t>(member), value.type, value.layout,
+            appendMemberDecorations(moduleBuilder, static_cast<uint32_t>(member), value.type, *value.layout,
                                     memberDecorations);
         }
         SmallVector<spirv::StructType::StructDecorationInfo> structDecorations;
@@ -1439,7 +1508,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                      : kind.getValue() == "uniform" && useVulkanInterfaceAbi && !attrs.binding
                                          ? PhysicalAbiProfile::VulkanPushConstant
                                          : PhysicalAbiProfile::VulkanStd140UniformBuffer;
-        FailureOr<PhysicalValueAbiLayout> physicalLayout = getPhysicalValueAbiLayout(type, sourceModule, profile);
+        FailureOr<ByteTransportPlan> physicalLayout = getByteTransportPlan(type, sourceModule, profile);
         spirv::StorageClass storageClass = isa<TextureType>(type)         ? spirv::StorageClass::UniformConstant
                                            : kind.getValue() == "input"   ? spirv::StorageClass::Input
                                            : kind.getValue() == "uniform" ? (attrs.binding || useVulkanInterfaceAbi
@@ -1468,7 +1537,7 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                           << " requires a descriptor-backed canonical storage layout";
             auto global = createInterfaceVariable(moduleBuilder, source.getLoc(), name, *storageType,
                                                   spirv::StorageClass::StorageBuffer, argumentAttrs,
-                                                  succeeded(physicalLayout) ? &*physicalLayout : nullptr);
+                                                  succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr);
             inputs.push_back({global});
             inputMembers.push_back(std::nullopt);
             inputAttributes.push_back(false);
@@ -1519,9 +1588,9 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
                                               << " std140 Tensor interface argument #" << index;
                 interfaceType = *physicalType;
             }
-            globals.push_back(createInterfaceVariable(moduleBuilder, source.getLoc(), name, interfaceType, storageClass,
-                                                      argumentAttrs,
-                                                      succeeded(physicalLayout) ? &*physicalLayout : nullptr));
+            globals.push_back(createInterfaceVariable(
+                moduleBuilder, source.getLoc(), name, interfaceType, storageClass, argumentAttrs,
+                succeeded(physicalLayout) ? physicalLayout->root.get() : nullptr));
         }
         inputs.push_back(globals);
         inputMembers.push_back(std::nullopt);
@@ -1647,6 +1716,12 @@ LogicalResult lowerEntry(func::FuncOp source, spirv::ModuleOp target, OpBuilder 
             // the full composite would only create backend-local aggregate arrays.
             continue;
         }
+        if (operation.getNumResults() == 0) {
+            if (failed(translateVoidOperation(operation, bodyBuilder, mapping)))
+                return operation.emitError()
+                       << "operation '" << operation.getName() << "' is not supported by SPIR-V lowering";
+            continue;
+        }
         FailureOr<Value> translated = translateOperation(operation, bodyBuilder, mapping);
         if (failed(translated)) {
             if (auto intrinsic = dyn_cast<IntrinsicOp>(operation))
@@ -1720,20 +1795,20 @@ struct VernonToSPIRVPass : public PassWrapper<VernonToSPIRVPass, OperationPass<M
                     generatedBindings[function.getArgument(index)] = std::make_pair(0u, nextGeneratedBinding++);
                     continue;
                 }
-                FailureOr<PhysicalValueAbiLayout> layout =
-                    getPhysicalValueAbiLayout(type, module, PhysicalAbiProfile::VulkanPushConstant);
+                FailureOr<ByteTransportPlan> layout =
+                    getByteTransportPlan(type, module, PhysicalAbiProfile::VulkanPushConstant);
                 if (failed(layout)) {
                     function.emitError() << "cannot plan graphics inline layout for argument #" << index;
                     target.erase();
                     return signalPassFailure();
                 }
-                uint64_t offset = llvm::alignTo(inlineSize, layout->alignment);
+                uint64_t offset = llvm::alignTo(inlineSize, layout->root->alignment);
                 bool spill = (isa<RankedTensorType>(type) && cast<RankedTensorType>(type).getRank() > 2) ||
-                             offset > 128 || layout->size > 128 - std::min<uint64_t>(offset, 128);
+                             offset > 128 || layout->root->size > 128 - std::min<uint64_t>(offset, 128);
                 if (spill) {
                     generatedBindings[function.getArgument(index)] = std::make_pair(0u, nextGeneratedBinding++);
                 } else {
-                    inlineSize = offset + layout->size;
+                    inlineSize = offset + layout->root->size;
                 }
             }
         }

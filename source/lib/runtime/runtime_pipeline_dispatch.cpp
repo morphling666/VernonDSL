@@ -1,7 +1,10 @@
 #include "runtime_dispatch.h"
 
 #include "backend_opengl.h"
+#include "resolved_execution_plan.h"
 #include "runtime_pipeline_backend.h"
+
+#include <algorithm>
 
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
 #include "backend_directx12.h"
@@ -30,24 +33,31 @@
 
 namespace vernon::runtime {
 
-bool resolveBackendPipeline(VernonPipelineBundle &bundle, const Variant &variant, VernonLoadedPipeline &pipeline) {
-    if (bundle.context->backend == VERNON_RUNTIME_CPU)
-        return resolveCpuPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_CUDA)
-        return resolveCudaPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_VULKAN)
-        return resolveVulkanPipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_DIRECTX12)
-        return resolveDirectX12Pipeline(bundle, variant, pipeline);
-    if (bundle.context->backend == VERNON_RUNTIME_METAL)
-        return resolveMetalPipeline(bundle, variant, pipeline);
-    if (isOpenGLBackend(bundle.context->backend))
-        return resolveOpenGLPipeline(bundle, variant, pipeline);
-    bundle.context->error = "unsupported runtime pipeline backend";
+bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
+                            VernonStageExecutable &pipeline) {
+    std::string error;
+    if (!inputs.context || !validateStageBindingPlan(plan, error)) {
+        if (inputs.context)
+            invocationDiagnostic(*inputs.context) = std::move(error);
+        return false;
+    }
+    if (inputs.context->backend == VERNON_RUNTIME_CPU)
+        return resolveCpuPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_CUDA)
+        return resolveCudaPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_VULKAN)
+        return resolveVulkanPipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_DIRECTX12)
+        return resolveDirectX12Pipeline(inputs, plan, pipeline);
+    if (inputs.context->backend == VERNON_RUNTIME_METAL)
+        return resolveMetalPipeline(inputs, plan, pipeline);
+    if (isOpenGLBackend(inputs.context->backend))
+        return resolveOpenGLPipeline(inputs, plan, pipeline);
+    invocationDiagnostic(*inputs.context) = "unsupported runtime pipeline backend";
     return false;
 }
 
-void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
+void destroyBackendPipeline(VernonStageExecutable &pipeline) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU) {
         destroyCpuPipeline(pipeline);
     } else if (pipeline.context->backend == VERNON_RUNTIME_CUDA) {
@@ -64,7 +74,7 @@ void destroyBackendPipeline(VernonLoadedPipeline &pipeline) {
     destroyRuntimeBackendState(pipeline);
 }
 
-VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonPipelineInvocation &invocation,
+VernonStatus invokeBackendPipeline(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU || pipeline.context->backend == VERNON_RUNTIME_CUDA)
         return VERNON_STATUS_OK;
@@ -77,7 +87,7 @@ VernonStatus invokeBackendPipeline(VernonLoadedPipeline &pipeline, const VernonP
     return invokeOpenGLGraphicsPipeline(pipeline, invocation, plan);
 }
 
-VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const PlannedComputeLaunch &plan) {
+VernonStatus invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan) {
     if (pipeline.context->backend == VERNON_RUNTIME_CPU)
         return invokeCpuComputePipeline(pipeline, plan);
     if (pipeline.context->backend == VERNON_RUNTIME_CUDA)
@@ -93,32 +103,32 @@ VernonStatus invokeBackendComputePipeline(VernonLoadedPipeline &pipeline, const 
     return invokeOpenGLComputePipeline(pipeline, plan);
 }
 
-VernonStatus synchronizeBackend(VernonRuntimeContext &context) {
-    if (context.backend == VERNON_RUNTIME_CPU)
-        return VERNON_STATUS_OK;
-    switch (vernonRhiDeviceSynchronize(context.rhiDevice)) {
-    case VERNON_RHI_STATUS_OK:
-        return VERNON_STATUS_OK;
-    case VERNON_RHI_STATUS_INVALID_ARGUMENT:
-        return VERNON_STATUS_INVALID_ARGUMENT;
-    case VERNON_RHI_STATUS_UNSUPPORTED:
-        return VERNON_STATUS_UNSUPPORTED_TARGET;
-    case VERNON_RHI_STATUS_INTERNAL_ERROR:
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
-    return VERNON_STATUS_INTERNAL_ERROR;
+#if defined(VERNON_RUNTIME_TESTING)
+const VernonStageExecutable *resolvedGraphicsImplementation(const VernonProgramExecutable *pipeline) {
+    if (!pipeline)
+        return nullptr;
+    const program::ResolvedExecutionPlan &execution = *pipeline->executionPlan;
+    const auto stage = std::find_if(execution.stageCache.begin(), execution.stageCache.end(),
+                                    [](const std::shared_ptr<VernonStageExecutable> &candidate) {
+                                        return candidate && candidate->backendState &&
+                                               (!candidate->bindingProjection.vertex.empty() ||
+                                                !candidate->bindingProjection.fragment.empty());
+                                    });
+    return stage == execution.stageCache.end() ? nullptr : stage->get();
 }
 
-#if defined(VERNON_RUNTIME_TESTING)
 VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext *context,
-                                                     const VernonLoadedPipeline *pipeline) {
+                                                     const VernonProgramExecutable *pipeline) {
     VulkanGraphicsCacheStats result;
 #if defined(VERNON_HAS_VULKAN_RUNTIME)
     if (!context || !pipeline || pipeline->context != context || context->backend != VERNON_RUNTIME_VULKAN)
         return result;
+    const VernonStageExecutable *stage = resolvedGraphicsImplementation(pipeline);
+    if (!stage)
+        return result;
     const vernon::rhi::VulkanCacheStats rhiStats = vernon::rhi::getVulkanCacheStats(context->rhiDevice);
     result.defaultImplicitSamplerCreations = rhiStats.defaultImplicitSamplerCreations;
-    const VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(*pipeline);
+    const VulkanPipelineState &state = runtimeBackendState<VulkanPipelineState>(*stage);
     result.descriptorSetLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.pipelineLayoutCreations = state.rhiGraphicsPipeline ? 1 : 0;
     result.graphicsPipelineCreations = state.rhiGraphicsVariant.handle ? 1 : 0;
@@ -138,20 +148,22 @@ VulkanGraphicsCacheStats getVulkanGraphicsCacheStats(const VernonRuntimeContext 
     return result;
 }
 
-size_t getDirectX12GraphicsPipelineCreationCount(const VernonLoadedPipeline *pipeline) {
+size_t getDirectX12GraphicsPipelineCreationCount(const VernonProgramExecutable *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;
+    const VernonStageExecutable *stage = resolvedGraphicsImplementation(pipeline);
+    if (stage && stage->context && stage->context->backend == VERNON_RUNTIME_DIRECTX12)
+        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphicsVariant.handle ? 1 : 0;
 #else
     (void)pipeline;
 #endif
     return 0;
 }
 
-size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonLoadedPipeline *pipeline) {
+size_t getDirectX12GraphicsRootSignatureCreationCount(const VernonProgramExecutable *pipeline) {
 #if defined(VERNON_HAS_DIRECTX12_RUNTIME)
-    if (pipeline && pipeline->context && pipeline->context->backend == VERNON_RUNTIME_DIRECTX12)
-        return runtimeBackendState<DirectX12PipelineState>(*pipeline).rhiGraphicsVariant.handle ? 1 : 0;
+    const VernonStageExecutable *stage = resolvedGraphicsImplementation(pipeline);
+    if (stage && stage->context && stage->context->backend == VERNON_RUNTIME_DIRECTX12)
+        return runtimeBackendState<DirectX12PipelineState>(*stage).rhiGraphicsVariant.handle ? 1 : 0;
 #else
     (void)pipeline;
 #endif
