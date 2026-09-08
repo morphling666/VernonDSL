@@ -14,7 +14,10 @@ Implemented foundations include:
 - call-site specialization of `@func` helpers;
 - structured effects and expression/statement control flow;
 - dynamic range bounds, early return, break, and continue;
-- workgroup storage, relaxed i32/u32 atomics, and barriers in source and IR;
+- workgroup storage, relaxed i32/u32 atomics, capability-checked f32/f64
+  atomic add, and barriers in source and IR;
+- invocation-time shape, signed-stride, and offset descriptors for TensorView
+  without layout-specific artifact recompilation;
 - deterministic ABI, reflection, and target-specific lowering.
 
 These foundations are current behavior, not proof that all v4 runtime and
@@ -56,16 +59,6 @@ unchecked behavior cannot be implied by the version number.
   types before artifact or Runtime mutation.
 
 Unavailable devices remain explicit skips, not silent passes.
-
-### TensorView runtime layout
-
-- Decide whether v4 requires arbitrary runtime-strided multi-rank TensorViews.
-- If required, add one reflected hidden-layout ABI and implement it across
-  supported backends.
-- Otherwise retain the current AOT-specialization rule and make the limitation
-  explicit in diagnostics and the language contract.
-- Preserve bounds, injectivity, overlap, alias, access, and owner-lifetime
-  validation.
 
 ### Cross-backend acceptance
 

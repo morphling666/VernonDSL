@@ -74,6 +74,9 @@ Architecture and tutorials link to the contract instead of redefining fields.
 
 - [`testing/cross_backend_language_testing_plan.md`](testing/cross_backend_language_testing_plan.md)
   tracks contract-driven, capability-based language test normalization.
+- [`testing/language_feature_inventory.md`](testing/language_feature_inventory.md)
+  assigns stable test IDs, regions, capability requirements, layers, and
+  oracles to the supported language surface.
 - [`testing/program_acceptance.md`](testing/program_acceptance.md) defines
   permanent Kernel/Module/Program/VJP regression gates.
 - [`language/future_language_roadmap.md`](language/future_language_roadmap.md)

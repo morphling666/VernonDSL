@@ -34,19 +34,19 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
 - [x] Audit current compiler/runtime capability APIs, backend enumeration, CMake bundle generation, and skip behavior.
 - [x] Select contract-matrix coverage with important pairwise interactions.
 - [x] Select WASM as an independent required release gate.
-- [ ] Create a feature inventory from:
+- [x] Create a feature inventory from:
   - `specs/language/contract.md`
   - `specs/language/tensor_view.md`
   - `specs/language/future_language_roadmap.md`
   - `python/vernon_dsl/shader_contracts.py`
-- [ ] Give every supported language feature and region a stable test ID.
-- [ ] Record for every test ID:
+- [x] Give every supported language feature and region a stable test ID.
+- [x] Record for every test ID:
   - valid and invalid regions;
   - required compile capabilities;
   - required runtime capabilities;
   - required test layers;
   - expected diagnostic or runtime oracle.
-- [ ] Correct outdated language specification statements found during the inventory.
+- [x] Correct outdated language specification statements found during the inventory.
 
 ## Phase 1: Canonical backend test matrix
 
@@ -65,6 +65,7 @@ Backend artifacts remain target-specific, but fixture registration, manifest loo
   - storage buffers;
   - device atomics;
   - f32 atomic add;
+  - f64 atomic add;
   - texture and sampler operations;
   - minimum OpenGL/OpenGL ES API versions;
   - backend-specific ABI or interop capabilities.

@@ -24,7 +24,6 @@ Remaining declaration gates are defined in
 
 - complete cross-backend workgroup storage, barrier, and atomic execution
   evidence;
-- decide and document arbitrary runtime-strided multi-rank TensorView support;
 - complete contract-matrix coverage for every supported language region;
 - preserve deterministic semantic IR, cache identity, reflection, and target
   diagnostics.

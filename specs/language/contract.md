@@ -274,11 +274,37 @@ allocation, failure, and synchronization policies remain explicit.
 
 ## 4. Resource types
 
-`Texture` and `Sampler` are opaque Resource handles. Texture queries and
-sampling use resource-specific operations; they are not ordinary TensorView
-loads or stores. Sampler state is separate from sampled storage. Resource
-format, dimensions, binding, and backend capabilities are validated at entry
-interfaces and reflected in pipeline metadata.
+`Texture` and `Sampler` are opaque Resource handles. A sampled texture is
+`Texture[dimension, sample_type]`, where `dimension` is `2d`, `3d`, or `cube`
+and `sample_type` is `f32`, `i32`, or `u32`. A storage texture is
+`Texture[dimension, format, access]`, where `dimension` is `2d` or `3d`,
+`access` is `read`, `write`, or `read_write`, and format is one of
+`r8_unorm`, `r16_float`, `r32_float`, `rg8_unorm`, `rgba8_unorm`,
+`rgba16_float`, or `rgba32_float`.
+
+Texture queries and sampling use resource-specific operations; they are not
+ordinary TensorView loads or stores. Sampler state is separate from sampled
+storage. Resource format, dimensions, binding, and backend capabilities are
+validated at entry interfaces and reflected in pipeline metadata.
+
+The supported texture operation regions are:
+
+- `texture_sample(texture, coordinates)` and
+  `texture_sample(texture, sampler, coordinates)` use implicit LOD and are
+  fragment-only;
+- `texture_sample(texture, coordinates, lod)` uses an implicit sampler and is
+  valid in vertex and fragment stages;
+- `texture_sample(texture, sampler, coordinates, lod)` is valid in compute,
+  vertex, and fragment stages;
+- `texture_size(texture[, lod])` is valid in vertex and fragment stages and
+  requires an integer scalar LOD when present;
+- `texture_load` and `texture_store` operate on storage Textures with integer
+  coordinates and enforce the declared read/write access.
+
+Sampling coordinates are floating Tensor Values with rank determined by the
+Texture dimension, and sampling LOD is a floating Scalar. One Texture entry
+parameter cannot mix implicit and explicit sampler forms in the same stage.
+Implicit sampling creates a deterministic sampler interface binding.
 
 ## 5. Ownership, borrowing, and effects
 
@@ -296,13 +322,14 @@ Typed semantic nodes record effects independently from types:
 - `barrier(ordering, scope)`;
 - Resource-specific query/sample effects.
 
-`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` initially
-accept i32/u32 writable `TensorView` elements. A rank-one atomic accepts one
-scalar index; a higher-rank atomic requires a tuple containing exactly one
-index per dimension. Scope is inferred from the Storage address space:
-workgroup storage uses workgroup scope and device storage uses device scope.
-Device-scope TensorView atomics are supported by CPU, CUDA, and Vulkan; other
-targets reject them during capability validation.
+`atomic_add`, `atomic_min`, `atomic_max`, and `atomic_exchange` accept i32/u32
+writable `TensorView` elements. `atomic_add` additionally accepts f32/f64 when
+the selected target profile has a legal native or integer-compare-exchange
+implementation for that type and scope. A rank-one atomic accepts one scalar
+index; a higher-rank atomic requires a tuple containing exactly one index per
+dimension. Scope is inferred from the Storage address space: workgroup storage
+uses workgroup scope and device storage uses device scope. Unsupported
+type/scope/target combinations are rejected during capability validation.
 The source ordering is `relaxed`: a backend may emit a stronger ordering when
 its legal lowering cannot represent relaxed ordering, but must never weaken a
 requested ordering.
@@ -330,13 +357,15 @@ use stride-lattice congruence. An unproven writable overlap is rejected.
 Semantic acceptance never depends on enumerating elements or on an
 element-count threshold.
 
-Ordinary `@func` code has no Storage, atomic, or barrier effects. It may read
-Resources passed explicitly as parameters; those effects propagate through the
-call graph and are checked against the concrete entry stage. Shared
-`@func(shared=True)` code remains host/device-pure and cannot use device-only
-Resource operations. Kernels and graphics entries may perform effects allowed
-by their stage and parameter access modes. Host runtime allocation, uploads, dispatch,
-downloads, and resource lifetime are not parsed device-language expressions.
+Ordinary `@func` code may carry Storage and Resource effects through explicit
+parameters and may use atomics or barriers where their concrete entry stage
+permits them. Those effects propagate through the call graph and are checked
+against parameter access and the concrete entry stage. Shared
+`@func(shared=True)` code remains host/device-pure and cannot use Storage or
+device-only Resource operations. Kernels and graphics entries may perform
+effects allowed by their stage and parameter access modes. Host runtime
+allocation, uploads, dispatch, downloads, and resource lifetime are not parsed
+device-language expressions.
 Multi-node ordering, render state, resource transitions, and cross-backend
 synchronization are canonical Program and Runtime Command DAG semantics. They
 are not shader-language semantics.
@@ -420,12 +449,16 @@ stable reason string.
 
 The current core statement subset is `pass`, expression statements, simple local or
 indexed assignment, annotated assignment, augmented assignment, `return`,
-`if`, `range` loops, `while`, `break`, and `continue`. Return may terminate a
-nested structured region; break and continue target the nearest enclosing loop.
+`if`, `range` loops, `while`, loop `else`, `break`, and `continue`. Return may
+terminate a nested structured region; break and continue target the nearest
+enclosing loop.
 
 The expression subset includes names, numeric and Boolean literals, arithmetic,
-unary operations, one comparison, calls, supported attributes, indexing,
-Tensor/Tuple/Struct construction, and constant Tuple indexing.
+unary operations, one comparison, calls, indexing, Tensor/Tuple/Struct
+construction, and constant Tuple indexing. Supported attributes are immutable
+Struct fields, `.shape` on rank-one-or-greater Tensor/TensorView values, and
+rank-one Tensor swizzles over `xyzw`/`rgba`; color aliases canonicalize to the
+corresponding positional mask.
 
 The portable floating-point math surface includes `sin`, `cos`, `acos`,
 `atan2`, `exp`, `log`, `sqrt`, `floor`, `abs`, `min`, `max`, `pow`, and
@@ -464,9 +497,12 @@ Autodiff transforms specialized, validated typed IR and never executes Python
 to trace a function.
 
 The initial public reverse-mode surface is one transform:
-`vd.ad.vjp(program, wrt=..., rules=...)`. It produces a program whose execution
-returns primal outputs and a pullback. Applying the pullback to explicit output
-cotangents returns gradients for the canonical input paths selected by `wrt`.
+`vd.ad.vjp(program, wrt=..., outputs=..., planning_policy=...)`. It produces a
+program whose execution returns primal outputs and a pullback. `outputs` may
+select public output paths and `planning_policy` selects a supported
+deterministic planning policy; neither is a custom derivative-rule surface.
+Applying the pullback to explicit output cotangents returns gradients for the
+canonical input paths selected by `wrt`.
 One floating Scalar output may omit its cotangent and uses seed `1`.
 Tensor/aggregate outputs may not omit cotangents and are never implicitly
 reduced.
@@ -535,7 +571,7 @@ cache identity.
 | Ownership | Runtime `Tensor`; removed `Buffer` | `TensorStorage`, borrowed `TensorView`, runtime-only `vd.interop.RawBuffer` escape hatch | General allocator model |
 | Layout | Backend/runtime details | Dense strided views, AoS field projections, explicit alias rules | Transparent sparse layouts and SNode trees |
 | Aggregates | Nominal immutable Struct; Vector/Matrix constructors | Tensor, structural Tuple, nominal Struct; no Array | Enums and tagged unions |
-| Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, and typed barriers | Additional atomic types/orderings and full race model |
+| Effects | Typed read/write records | Region-aware reads/writes, relaxed i32/u32 atomics, capability-checked f32/f64 atomic add, and typed barriers | Additional atomic operations/orderings and full race model |
 | Autodiff | No public transform | First-order compute Program VJP over typed Programs and stateful Kernels; graphics paths fail closed | Graphics VJP/custom rules, JVP, full Jacobians, convenience aliases, and higher-order AD |
 | Control flow | Tuple destructuring, short-circuit expressions, early return, dynamic range, break, and continue | Current subset plus explicitly AD-covered flow | Unrestricted recursion and Python-only control flow |
 | Rendering | Typed graphics stages, textures, samplers | Same model with versioned rasterization/visibility/depth/blend/texture VJP boundaries | Graphics derivatives without explicit accepted custom rules |
@@ -568,8 +604,9 @@ The current `COMPILER_CONTRACT_VERSION` may be declared implemented only when:
 - rank-1 Tensor replacement of Array is consistent across constructors,
   interfaces, reflection, and diagnostics;
 - Resource operations remain distinct from Storage operations;
-- first-order transforms, custom rules, rejection of higher-order transforms,
-  and non-differentiable boundaries have deterministic tests;
+- first-order transforms, built-in versioned rules, rejection of public custom
+  rules and higher-order transforms, and non-differentiable boundaries have
+  deterministic tests;
 - v3 migration diagnostics and compatibility aliases are versioned;
 - unsupported target combinations fail explicitly;
 - cache identity and generated symbols remain deterministic;

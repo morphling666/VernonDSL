@@ -92,8 +92,8 @@ storage cell rather than an empty collection. Device code loads and stores it
 with `view[()]`; host code uses the same `view[()]` spelling or NumPy's 0-d
 `array[()]`/`item()` APIs. Its runtime descriptor has rank zero, null
 shape/stride arrays, and still carries the storage offset. Rank-zero
-`workgroup_storage` remains invalid because workgroup allocation requires an
-explicit positive physical extent.
+`workgroup_storage` is the corresponding one-cell workgroup allocation; the
+positive-extent rule applies to every dimension that is present.
 
 Shape is part of the source TensorView contract. Strides and offset are
 concrete view-layout metadata and do not participate in core source type
@@ -260,9 +260,12 @@ exactly one integer index per dimension. `atomic_add(storage[y, x], value)` is
 invalid because the subscript denotes an ordinary load, not an lvalue
 reference.
 
-The first atomic element set remains `i32` and `u32`. Wider integers and
-floating-point atomics require explicit backend capability contracts and are
-not emulated implicitly.
+All four atomic operations accept `i32` and `u32`. `atomic_add` also accepts
+`f32` and `f64` when the selected target profile declares a legal native or
+integer-compare-exchange implementation for that type and scope. Unsupported
+floating-point combinations are rejected during capability validation rather
+than silently narrowed or executed non-atomically. Wider integer atomics are
+not part of the current contract.
 
 Atomic scope is inferred from address space:
 
@@ -274,7 +277,11 @@ device TensorView    -> device scope
 Atomic scope is not a public argument. Atomic ordering remains represented in
 typed effects; initial public operations request `relaxed`, and a backend may
 strengthen but not weaken it. Barrier scope remains explicit because a barrier
-has no storage operand.
+has no storage operand. `vd.workgroup_barrier()` requests an acquire-release
+workgroup-scope barrier; `vd.storage_barrier()` requests an acquire-release
+device-scope barrier. Both are compute-only and accept no arguments. A target
+without a legal requested scope rejects the operation during capability
+validation.
 
 ## 8. Vernon IR contract
 
