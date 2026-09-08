@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
+#include "backend_test_matrix.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <algorithm>
@@ -12,13 +13,7 @@
 
 namespace {
 
-struct RhiBackendCase {
-    VernonRuntimeBackend runtime;
-    VernonTarget compiler;
-    const char *name;
-};
-
-class RhiRuntimeSynchronization : public testing::TestWithParam<RhiBackendCase> {};
+class RhiRuntimeSynchronization : public testing::TestWithParam<vernon::tests::BackendTestRow> {};
 
 std::string stringValue(VernonStringView value) {
     return value.data ? std::string(value.data, value.size) : std::string{};
@@ -170,27 +165,43 @@ TEST(CompilerRuntimeSynchronization, CpuArtifactCompilationDoesNotUseProcessGlob
 }
 
 TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) {
-    const RhiBackendCase backend = GetParam();
-    if (!vernonRuntimeGetCapabilities(backend.runtime).available)
-        GTEST_SKIP() << backend.name << " runtime backend is unavailable";
-
-    VernonCompilerContext *compiler = nullptr;
-    VernonCompileResult *compiled = compileSynchronization(backend.compiler, &compiler);
+    const vernon::tests::BackendTestRow backend = GetParam();
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    requirements.storageBuffers = true;
+    VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
+    const vernon::tests::BackendProbeResult compilerProbe =
+        vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+    if (!compilerProbe.available()) {
+        vernonCompilerDestroy(compiler);
+        GTEST_SKIP() << compilerProbe.reason;
+    }
+    VernonCompileResult *compiled =
+        vernonCompilerCompileMlir(compiler, synchronizationModule, sizeof(synchronizationModule) - 1, backend.compiler);
     ASSERT_NE(compiled, nullptr);
     ASSERT_EQ(vernonCompileResultGetStatus(compiled), VERNON_STATUS_OK)
         << stringValue(vernonCompileResultGetDiagnostics(compiled));
     ASSERT_EQ(vernonCompileResultGetArtifactCount(compiled), 1u);
 
-    auto context =
-        vernon::tests::createRhiRuntime(backend.runtime, nullptr, backend.runtime == VERNON_RUNTIME_DIRECTX12);
-    ASSERT_NE(context.runtime, nullptr);
+    vernon::tests::OwnedRhiRuntime owned(backend.runtime, nullptr, backend.runtime == VERNON_RUNTIME_DIRECTX12);
+    vernon::tests::RhiRuntime &context = owned.context();
+    const vernon::tests::BackendProbeResult runtimeProbe =
+        vernon::tests::probeRuntimeBackend(backend, requirements, context.runtime);
+    if (!runtimeProbe.available()) {
+        vernonCompileResultDestroy(compiled);
+        vernonCompilerDestroy(compiler);
+        if (runtimeProbe.skippable())
+            GTEST_SKIP() << runtimeProbe.reason;
+        FAIL() << runtimeProbe.reason;
+    }
     const VernonStringView artifact = vernonCompileResultGetArtifactData(compiled, 0);
     const VernonStringView reflection = vernonCompileResultGetReflection(compiled);
     VernonStageExecutable *pipeline =
         vernonRuntimeLoadArtifact(context.runtime, artifact.data, artifact.size, reflection.data, reflection.size,
                                   "synchronize", std::strlen("synchronize"));
-    ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(context.runtime));
+    ASSERT_NE(pipeline, nullptr) << stringValue(vernonRuntimeGetLastError(context.runtime))
+                                 << "\nreflection: " << stringValue(reflection);
 
     std::array<int32_t, 10> result{};
     vernon::tests::RhiBuffer buffer = vernon::tests::createBuffer(context, sizeof(result), alignof(int32_t),
@@ -225,17 +236,15 @@ TEST_P(RhiRuntimeSynchronization, ExecutesIndependentWorkgroupBarrierAndAtomic) 
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(context.device, buffer.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeStageExecutableDestroy(pipeline);
-    EXPECT_EQ(vernonRuntimeDestroy(context.runtime), VERNON_STATUS_OK);
-    vernonRhiDestroyDevice(context.device);
     vernonCompileResultDestroy(compiled);
     vernonCompilerDestroy(compiler);
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, RhiRuntimeSynchronization,
-                         testing::Values(RhiBackendCase{VERNON_RUNTIME_CUDA, VERNON_TARGET_CUDA, "CUDA"},
-                                         RhiBackendCase{VERNON_RUNTIME_VULKAN, VERNON_TARGET_VULKAN, "Vulkan"},
-                                         RhiBackendCase{VERNON_RUNTIME_OPENGL, VERNON_TARGET_OPENGL, "OpenGL"},
-                                         RhiBackendCase{VERNON_RUNTIME_DIRECTX12, VERNON_TARGET_DIRECTX, "DirectX"}),
-                         [](const testing::TestParamInfo<RhiBackendCase> &info) { return info.param.name; });
+                         testing::ValuesIn(vernon::tests::backendTestMatrix.begin() + 1,
+                                           vernon::tests::backendTestMatrix.end()),
+                         [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
+                             return std::string(info.param.name);
+                         });
 
 } // namespace

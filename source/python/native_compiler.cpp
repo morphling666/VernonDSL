@@ -11,6 +11,23 @@
 #include <algorithm>
 #include <string>
 
+namespace {
+
+nb::dict runtimeCapabilitiesDict(const VernonRuntimeCapabilities &capabilities) {
+    nb::dict result;
+    result["available"] = capabilities.available != 0;
+    result["compute"] = capabilities.supports_compute != 0;
+    result["graphics"] = capabilities.supports_graphics != 0;
+    result["storage_buffers"] = capabilities.supports_storage_buffers != 0;
+    result["api_version"] = nb::make_tuple(capabilities.api_version_major, capabilities.api_version_minor);
+    result["graphics_draw_abi_version"] = capabilities.graphics_draw_abi_version;
+    result["diagnostic"] =
+        std::string(capabilities.diagnostic.data ? capabilities.diagnostic.data : "", capabilities.diagnostic.size);
+    return result;
+}
+
+} // namespace
+
 void bindNativeCompiler(nb::module_ &module) {
     nb::class_<vernon::execution::detail::RhiCommandExecutionPlan>(module, "_CommandPlan").def(nb::init<>());
     nb::class_<vernon::execution::detail::RhiCommandPlanSink>(module, "_CommandPlanSink")
@@ -187,6 +204,10 @@ void bindNativeCompiler(nb::module_ &module) {
     nb::class_<RhiSampler>(module, "RhiSampler");
     nb::class_<Runtime>(module, "Runtime")
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
+        .def_prop_ro("capabilities",
+                     [](const Runtime &runtime) {
+                         return runtimeCapabilitiesDict(vernonRuntimeGetContextCapabilities(runtime.handle));
+                     })
         .def("load", &Runtime::load, nb::arg("artifact"), nb::arg("reflection"), nb::arg("entry"),
              nb::keep_alive<0, 1>())
         .def("load_cpu_entry", &Runtime::loadCpuEntry, nb::arg("program"), nb::arg("entry"), nb::keep_alive<0, 1>())
@@ -398,6 +419,9 @@ void bindNativeCompiler(nb::module_ &module) {
     module.attr("GRAPH_PASS_DERIVATIVE") = static_cast<uint32_t>(vernon::execution::PassDerivative);
     module.attr("TOPOLOGY_LINE_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_LINE_LIST);
     module.attr("TOPOLOGY_POINT_LIST") = static_cast<uint32_t>(VERNON_TOPOLOGY_POINT_LIST);
+    module.def("runtime_capabilities", [](VernonRuntimeBackend backend) {
+        return runtimeCapabilitiesDict(vernonRuntimeGetCapabilities(backend));
+    });
     module.def("runtime_available",
                [](VernonRuntimeBackend backend) { return vernonRuntimeGetCapabilities(backend).available != 0; });
 }

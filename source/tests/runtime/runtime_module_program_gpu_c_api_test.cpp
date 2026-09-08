@@ -1,3 +1,4 @@
+#include "../support/runtime_rhi_test_utils.h"
 #include "VernonRuntime.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/resolved_execution_plan.h"
@@ -17,51 +18,6 @@
 #include <vector>
 
 namespace {
-
-VernonRhiBackend rhiBackend(VernonRuntimeBackend backend) {
-    switch (backend) {
-    case VERNON_RUNTIME_CUDA:
-        return VERNON_RHI_BACKEND_CUDA;
-    case VERNON_RUNTIME_VULKAN:
-        return VERNON_RHI_BACKEND_VULKAN;
-    case VERNON_RUNTIME_DIRECTX12:
-        return VERNON_RHI_BACKEND_DIRECTX12;
-    case VERNON_RUNTIME_METAL:
-        return VERNON_RHI_BACKEND_METAL;
-    default:
-        return VERNON_RHI_BACKEND_OPENGL;
-    }
-}
-
-class OwnedGpuRuntime {
-public:
-    explicit OwnedGpuRuntime(VernonRuntimeBackend backend) {
-        if (backend == VERNON_RUNTIME_OPENGL || backend == VERNON_RUNTIME_OPENGL_ES) {
-            device_ = vernonRhiCreateOpenGLDevice(nullptr, backend == VERNON_RUNTIME_OPENGL_ES);
-        } else {
-            VernonRhiOwnedDeviceDescriptor descriptor{};
-            descriptor.struct_size = sizeof(descriptor);
-            descriptor.backend = rhiBackend(backend);
-            device_ = vernonRhiCreateDevice(&descriptor);
-        }
-        if (device_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-            runtime_ = vernonRuntimeCreateForRhiDevice(backend, device_);
-    }
-
-    ~OwnedGpuRuntime() {
-        if (runtime_)
-            (void)vernonRuntimeDestroy(runtime_);
-        if (device_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
-            (void)vernonRhiDestroyDevice(device_);
-    }
-
-    VernonRuntimeContext *runtime() const { return runtime_; }
-    VernonRhiDevice device() const { return device_; }
-
-private:
-    VernonRhiDevice device_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    VernonRuntimeContext *runtime_{};
-};
 
 std::string lastError(VernonRuntimeContext *context) {
     const VernonStringView error = vernonRuntimeGetLastError(context);
@@ -101,7 +57,7 @@ VernonProgramBindingToken bindingToken(const char *value) {
 }
 
 void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    OwnedGpuRuntime owned(backend);
+    vernon::tests::OwnedRhiRuntime owned(backend);
     VernonRuntimeContext *context = owned.runtime();
     if (!context)
         GTEST_SKIP() << "GPU backend is unavailable";
@@ -268,7 +224,7 @@ struct LoadedProgram {
     VernonProgramExecutable *executable{};
 };
 
-LoadedProgram loadProgram(OwnedGpuRuntime &owned, const std::filesystem::path &manifestPath) {
+LoadedProgram loadProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     std::ifstream input(manifestPath, std::ios::binary);
     if (!input)
         return {};
@@ -328,7 +284,7 @@ void destroyProgram(LoadedProgram &program) {
 }
 
 void runReusedStageModule(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    OwnedGpuRuntime owned(backend);
+    vernon::tests::OwnedRhiRuntime owned(backend);
     if (!owned.runtime())
         GTEST_SKIP() << "GPU backend is unavailable";
     LoadedProgram program = loadProgram(owned, manifestPath);
@@ -401,7 +357,7 @@ void runReusedStageModule(VernonRuntimeBackend backend, const std::filesystem::p
 }
 
 void runTensorViewChainModule(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    OwnedGpuRuntime owned(backend);
+    vernon::tests::OwnedRhiRuntime owned(backend);
     if (!owned.runtime())
         GTEST_SKIP() << "GPU backend is unavailable";
     LoadedProgram program = loadProgram(owned, manifestPath);
@@ -476,7 +432,7 @@ void runTensorViewChainModule(VernonRuntimeBackend backend, const std::filesyste
 }
 
 void runDynamicShapeGridReuse(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    OwnedGpuRuntime owned(backend);
+    vernon::tests::OwnedRhiRuntime owned(backend);
     if (!owned.runtime())
         GTEST_SKIP() << "GPU backend is unavailable";
     LoadedProgram program = loadProgram(owned, manifestPath);

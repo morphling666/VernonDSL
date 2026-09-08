@@ -795,8 +795,8 @@ if(TARGET VernonRuntime)
                         Vernon::Runtime
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
-            target_include_directories(VernonModuleProgramGpuRuntimeTests
-                                       PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib")
+            target_include_directories(VernonModuleProgramGpuRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                                  "${VERNON_TEST_ROOT}/support")
             add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
             if(VERNON_ENABLE_VULKAN_RUNTIME)
                 target_compile_definitions(

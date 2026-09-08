@@ -2,6 +2,7 @@
 
 #include "backend_cpu.h"
 #include "shape_layout.h"
+#include "target_implementation_metadata.h"
 
 #include <nlohmann/json.hpp>
 
@@ -363,6 +364,26 @@ bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact
     if (parsed.is_discarded())
         return false;
     const std::string entry(entryData, entrySize);
+    const auto implementation = parsed.find("implementation");
+    if (implementation == parsed.end()) {
+        if (context.backend == VERNON_RUNTIME_METAL) {
+            invocationDiagnostic(context) = "Metal compute reflection has no target implementation metadata";
+            return false;
+        }
+    } else {
+        if (!implementation->is_object() || !implementation->contains("target") ||
+            !(*implementation)["target"].is_string() || !implementation->contains("metadata")) {
+            invocationDiagnostic(context) = "compute reflection has invalid target implementation metadata";
+            return false;
+        }
+        const std::string target = (*implementation)["target"].get<std::string>();
+        std::string metadataError;
+        if (!parseTargetImplementationMetadata(target, (*implementation)["metadata"], stage.nativeSlots,
+                                               metadataError)) {
+            invocationDiagnostic(context) = std::move(metadataError);
+            return false;
+        }
+    }
     if (!materializeComputeEndpoint(parsed, entry, stagePlan, reflection, context.backend,
                                     invocationDiagnostic(context)))
         return false;

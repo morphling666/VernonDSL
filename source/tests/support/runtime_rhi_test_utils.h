@@ -1,7 +1,6 @@
 #ifndef VERNON_TESTS_SUPPORT_RUNTIME_RHI_TEST_UTILS_H
 #define VERNON_TESTS_SUPPORT_RUNTIME_RHI_TEST_UTILS_H
 
-#include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
 
 #include <algorithm>
@@ -9,7 +8,6 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace vernon::tests {
@@ -34,6 +32,27 @@ struct DerivativeLeafSetFixture {
 struct RhiRuntime {
     VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRuntimeContext *runtime{};
+};
+
+class OwnedRhiRuntime {
+public:
+    explicit OwnedRhiRuntime(VernonRuntimeBackend backend,
+                             const VernonOpenGLContextCallbacks *openglCallbacks = nullptr, bool forceSoftware = false);
+    ~OwnedRhiRuntime();
+
+    OwnedRhiRuntime(const OwnedRhiRuntime &) = delete;
+    OwnedRhiRuntime &operator=(const OwnedRhiRuntime &) = delete;
+    OwnedRhiRuntime(OwnedRhiRuntime &&) = delete;
+    OwnedRhiRuntime &operator=(OwnedRhiRuntime &&) = delete;
+
+    VernonRuntimeContext *get() const { return context_.runtime; }
+    VernonRuntimeContext *runtime() const { return context_.runtime; }
+    VernonRhiDevice device() const { return context_.device; }
+    RhiRuntime &context() { return context_; }
+    const RhiRuntime &context() const { return context_; }
+
+private:
+    RhiRuntime context_;
 };
 
 struct RhiBuffer {
@@ -406,6 +425,12 @@ inline void destroyRhiRuntime(RhiRuntime &context) {
         vernonRhiDestroyDevice(context.device);
     context = {};
 }
+
+inline OwnedRhiRuntime::OwnedRhiRuntime(VernonRuntimeBackend backend,
+                                        const VernonOpenGLContextCallbacks *openglCallbacks, bool forceSoftware)
+    : context_(createRhiRuntime(backend, openglCallbacks, forceSoftware)) {}
+
+inline OwnedRhiRuntime::~OwnedRhiRuntime() { destroyRhiRuntime(context_); }
 
 inline RhiBuffer createBuffer(RhiRuntime &context, uint64_t size, uint64_t alignment, uint32_t usage,
                               const void *initialData = nullptr) {

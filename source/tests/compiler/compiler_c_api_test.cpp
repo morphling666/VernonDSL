@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 #include "VernonCpuWorkgroupABI.h"
 #include "VernonVersions.h"
+#include "backend_test_matrix.h"
 #include "compiler_artifacts.h"
 #include "compiler_program_stage.h"
 #include "compiler_target_test_utils.h"
@@ -17,6 +18,27 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+TEST(CompilerBackendTestMatrix, EnumeratesCanonicalCompilerRuntimePairs) {
+    ASSERT_EQ(vernon::tests::backendTestMatrix.size(), 7u);
+    EXPECT_EQ(vernon::tests::backendTestMatrix.front().name, "CPU");
+    EXPECT_EQ(vernon::tests::backendTestMatrix.back().name, "OpenGLES");
+
+    VernonCompilerContext *compiler = vernonCompilerCreate();
+    ASSERT_NE(compiler, nullptr);
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    const vernon::tests::BackendProbeResult cpu =
+        vernon::tests::probeCompilerBackend(compiler, vernon::tests::backendTestMatrix.front(), requirements);
+    EXPECT_TRUE(cpu.available()) << cpu.reason;
+
+    requirements.graphics = true;
+    const vernon::tests::BackendProbeResult cuda =
+        vernon::tests::probeCompilerBackend(compiler, vernon::tests::backendTestMatrix[1], requirements);
+    EXPECT_EQ(cuda.kind, vernon::tests::BackendProbeKind::CapabilityUnsupported);
+    EXPECT_NE(cuda.reason.find("graphics"), std::string::npos);
+    vernonCompilerDestroy(compiler);
+}
 
 TEST(CompilerProgramAbi, RejectsGraphicsDtypeMismatchBeforeRuntime) {
     llvm::json::Array shape{int64_t{2}};

@@ -15,6 +15,7 @@ from aggregate_vertex_shader import (
     copy_complex_aggregate_tensor_view,
     inspect_multidimensional_aggregate_tensor_value,
 )
+from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.host_values import host_abi_layout
 
 
@@ -556,7 +557,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
     def _runtime_available(arch: object) -> bool:
         try:
             vd.init(arch=arch)  # type: ignore[arg-type]
-        except RuntimeError:
+        except RuntimeUnavailableError:
             vd.init(arch=vd.cpu)
             return False
         return True
