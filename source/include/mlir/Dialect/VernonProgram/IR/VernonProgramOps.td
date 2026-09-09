@@ -11,8 +11,8 @@ class VernonProgram_Op<string mnemonic, list<Trait> traits = []>
 def VernonProgram_ComputeOp : VernonProgram_Op<"compute"> {
   let summary = "Invoke a custom compute implementation";
   let arguments = (ins Variadic<AnyType>:$arguments, StrAttr:$callee,
-                       DenseI64ArrayAttr:$grid, StrArrayAttr:$features,
-                       StrArrayAttr:$operand_names, StrArrayAttr:$result_names);
+                       DenseI64ArrayAttr:$grid, StrArrayAttr:$operand_names,
+                       StrArrayAttr:$result_names);
   let results = (outs Variadic<AnyType>:$results);
   let hasVerifier = 1;
 }
@@ -27,8 +27,7 @@ def VernonProgram_GraphicsOp : VernonProgram_Op<"graphics"> {
     arguments named by `operand_names`.
   }];
   let arguments = (ins Variadic<AnyType>:$operands, StrAttr:$callee, StrAttr:$topology,
-                       StrArrayAttr:$features, StrArrayAttr:$operand_names,
-                       StrArrayAttr:$result_names,
+                       StrArrayAttr:$operand_names, StrArrayAttr:$result_names,
                        DefaultValuedAttr<I32Attr, "1">:$color_count);
   let results = (outs Variadic<AnyType>:$results);
   let extraClassDeclaration = [{

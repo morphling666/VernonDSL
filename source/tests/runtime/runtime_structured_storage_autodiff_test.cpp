@@ -37,7 +37,7 @@ TEST(RuntimeStructuredStorageAutodiff, ExecutesDynamicIndexMutationAndFreshStora
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{1, 1, 1, 3};
@@ -155,7 +155,7 @@ TEST(RuntimeStructuredStorageAutodiff, ReplayUsesRetainedCallerOwnedPrimalVersio
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{1, 1, 1, 3};
@@ -268,7 +268,7 @@ TEST(RuntimeStructuredStorageAutodiff, ZeroTapeBudgetRejectsForwardWithoutPublis
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const uint64_t storageShape[]{2, 1, 1, 3};

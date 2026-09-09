@@ -9,7 +9,7 @@ from pathlib import Path
 import cv2  # type: ignore[import-not-found]
 import numpy as np
 import vernon_dsl as vd
-from shader_lib.pbr import pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
+from shader_lib.pbr import ENVIRONMENT, SHADOW, pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
 
 
 @dataclass(frozen=True)
@@ -219,11 +219,11 @@ def main() -> None:
     shadow_sampler: object | None = None
     environment_map: object | None = None
     environment_sampler: object | None = None
-    features = {
-        feature
-        for feature, enabled in (
-            ("SHADOW", shadow_enabled),
-            ("ENVIRONMENT", environment_enabled),
+    specializations = {
+        specialization: True
+        for specialization, enabled in (
+            (SHADOW, shadow_enabled),
+            (ENVIRONMENT, environment_enabled),
         )
         if enabled
     }
@@ -242,7 +242,12 @@ def main() -> None:
         rasterization=vd.RasterizationState(cull_mode=vd.CullMode.BACK),
         depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
     )
-    render = vd.pipeline(pbr_vertex, pbr_fragment, state=opaque_state, features=features)
+    render = vd.pipeline(
+        pbr_vertex,
+        pbr_fragment,
+        state=opaque_state,
+        specializations=specializations,
+    )
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=opaque_state) if shadow_enabled else None
 
     projection = perspective(

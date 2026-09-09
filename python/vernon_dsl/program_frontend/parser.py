@@ -222,7 +222,6 @@ def _lower_forward_function(
                     (
                         ("callee", _quoted(node.name)),
                         ("topology", _quoted(topology)),
-                        ("features", _string_array(node.features)),
                         (
                             "operand_names",
                             _string_array(tuple(name for name, _ in shader_operands)),
@@ -303,7 +302,6 @@ def _lower_forward_function(
         compute_attributes: list[tuple[str, str]] = [
             ("callee", _quoted(node.name)),
             ("grid", _i64_array(tuple(static_grid))),
-            ("features", _string_array(node.features)),
             ("operand_names", _string_array(operand_names)),
             ("result_names", _string_array(result_names)),
             (
@@ -386,10 +384,11 @@ def parse_program(
             )
             implementations[operation.name] = implementation
             continue
-        frontend = operation.kernel._lower(
-            operation.features,
+        lowered = operation.kernel._lower(
+            operation.specializations,
             autodiff_planning_policy=autodiff_planning_policy,
-        ).frontend
+        )
+        frontend = lowered.frontend
         host_constants = _operation_host_constants(operation, invocation, value_input_ids)
         implementation = ProgramImplementation(
             operation.name,

@@ -91,7 +91,7 @@ void invokeAndExpectTriangle(VernonRuntimeBackend backend, const std::filesystem
 
     VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable), 1u);
 
@@ -215,7 +215,7 @@ void reuseGraphicsProgramAcrossExtentsAndDynamicStates(VernonRuntimeBackend back
     }
     VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
     VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
     ASSERT_NE(instance, nullptr);
@@ -377,8 +377,8 @@ void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesyste
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId scene{};
     VernonProgramNodeId overlay{};
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &scene), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &overlay), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &scene), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &overlay), VERNON_STATUS_OK);
     VernonProgramNodeBindingToken sceneOutput{sizeof(VernonProgramNodeBindingToken)};
     VernonProgramNodeBindingToken overlayOutput{sizeof(VernonProgramNodeBindingToken)};
     VernonProgramNodeBindingToken sceneVertices{sizeof(VernonProgramNodeBindingToken)};
@@ -406,7 +406,7 @@ void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesyste
     ASSERT_EQ(vernonRuntimeProgramGraphGetGraphicsNodeByIndex(graph, overlay, 0, &overlayGraphics), VERNON_STATUS_OK);
     EXPECT_EQ(sceneGraphics.node, scene);
     EXPECT_EQ(overlayGraphics.node, overlay);
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph);
     ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
     ASSERT_EQ(executable->executionPlan->graphicsScopeCandidates.size(), 2u);
     EXPECT_EQ(executable->executionPlan->graphicsScopeCandidates[0].region,
@@ -414,7 +414,7 @@ void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesyste
     vernonRuntimeProgramGraphDestroy(graph);
     graph = nullptr;
 
-    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(standalone, nullptr);
     VernonProgramParameterView verticesParameter{};
     ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(standalone, {"vertices", 8}, &verticesParameter),

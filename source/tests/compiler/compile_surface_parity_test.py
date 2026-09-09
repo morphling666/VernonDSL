@@ -296,7 +296,11 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         return object()
 
                 capture = PipelineCapture()
-                pipeline = vd.pipeline(triangle_vertex, solid_fragment, features={OFFSET.name})
+                pipeline = vd.pipeline(
+                    triangle_vertex,
+                    solid_fragment,
+                    specializations={OFFSET: True},
+                )
                 position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
                 target = vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16))})
                 render_pass = vd.render_pass(target)
@@ -370,7 +374,11 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 self.assertNotIn("targets", cooked)
                 self.assertEqual([variant["key"] for variant in cooked["variants"]], GOLDEN["graphics"]["variants"])
                 self.assertNotIn("features", cooked)
-                selected = next(variant for variant in cooked["variants"] if variant["key"] == ["OFFSET"])
+                selected = next(
+                    variant
+                    for variant in cooked["variants"]
+                    if variant["key"] == [{"name": "OFFSET", "value": {"tag": "bool", "value": True}}]
+                )
                 self.assertNotIn("parameters", selected)
                 self.assertNotIn("outputs", selected)
                 self.assertNotIn("stage_artifacts", selected)

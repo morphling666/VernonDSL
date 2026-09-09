@@ -108,8 +108,10 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             return mlir::failure();
         if ((semantic->kind == vernon::program::SemanticTypeKind::Tensor ||
              semantic->kind == vernon::program::SemanticTypeKind::TensorView) &&
-            semantic->elements.size() == 1)
-            *semantic = semantic->elements.front();
+            semantic->elements.size() == 1) {
+            vernon::program::SemanticType element = semantic->elements.front();
+            *semantic = std::move(element);
+        }
         std::string spelling = vernon::program::serializeSemanticType(*semantic);
         if (spelling.empty())
             return mlir::failure();
@@ -226,8 +228,10 @@ mlir::FailureOr<std::optional<ProgramReflection>> buildProgramReflection(mlir::M
             if (layoutType != type &&
                 (layoutSemantic.kind == vernon::program::SemanticTypeKind::Tensor ||
                  layoutSemantic.kind == vernon::program::SemanticTypeKind::TensorView) &&
-                layoutSemantic.elements.size() == 1)
-                layoutSemantic = layoutSemantic.elements.front();
+                layoutSemantic.elements.size() == 1) {
+                vernon::program::SemanticType element = layoutSemantic.elements.front();
+                layoutSemantic = std::move(element);
+            }
             mlir::FailureOr<mlir::vernon::ValueAbiLayout> plannedLayout =
                 mlir::vernon::getValueAbiLayout(layoutType, module, layoutDtypes);
             if (mlir::succeeded(plannedLayout))

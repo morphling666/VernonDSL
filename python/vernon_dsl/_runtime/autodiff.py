@@ -90,7 +90,7 @@ def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
             kernel,
             transform=expression.transform,
         )
-        _, _, output_recipe = _capture_recipes(capture, invocation.outputs)
+        _, output_recipe = _capture_recipes(capture, invocation.outputs)
         specialization = _CompiledKernelVjp(
             compile_program_autodiff(parsed, template),
             invocation,

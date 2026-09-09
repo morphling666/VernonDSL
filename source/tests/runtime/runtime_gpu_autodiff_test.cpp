@@ -245,7 +245,7 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr uint64_t shape[]{2, 2};
@@ -355,7 +355,7 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr uint64_t shape[]{2, 2};
@@ -460,7 +460,7 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr size_t laneCount = 8;
@@ -579,7 +579,7 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     constexpr size_t laneCount = 192;

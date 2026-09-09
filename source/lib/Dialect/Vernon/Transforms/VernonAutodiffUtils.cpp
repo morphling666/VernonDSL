@@ -119,9 +119,12 @@ FailureOr<SmallVector<StringRef>> getAutodiffDerivativeLogicalLeafDtypes(Type pr
     if (failed(primal) || (!logicalLeafDtypes.empty() && logicalLeafDtypes.size() != primal->leaves.size()))
         return failure();
     SmallVector<StringRef> projected;
-    for (auto [index, leaf] : llvm::enumerate(primal->leaves))
-        if (succeeded(getAutodiffDerivativeScalarType(leaf.scalarType)) && !logicalLeafDtypes.empty())
-            projected.push_back(logicalLeafDtypes[index]);
+    for (const ValueAbiLeaf &leaf : primal->leaves) {
+        FailureOr<Type> derivative = getAutodiffDerivativeScalarType(leaf.scalarType);
+        if (failed(derivative) || logicalLeafDtypes.empty())
+            continue;
+        projected.push_back(derivative->isF64() ? "f64" : "f32");
+    }
     return projected;
 }
 

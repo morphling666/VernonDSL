@@ -15,7 +15,7 @@ from shader_lib.ocean import (
     ocean_vertex,
     step_ocean,
 )
-from shader_lib.pbr import pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
+from shader_lib.pbr import ENVIRONMENT, SHADOW, pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
 from shader_lib.showcase import sky_fragment, sky_vertex
 from showcase_common import (
     FramePresenter,
@@ -186,7 +186,12 @@ def main() -> None:
     )
     render_sky = vd.pipeline(sky_vertex, sky_fragment, state=depth_state)
     render_ocean = vd.pipeline(ocean_vertex, ocean_fragment, state=depth_state)
-    render = vd.pipeline(pbr_vertex, pbr_fragment, state=depth_state, features={"SHADOW", "ENVIRONMENT"})
+    render = vd.pipeline(
+        pbr_vertex,
+        pbr_fragment,
+        state=depth_state,
+        specializations={SHADOW: True, ENVIRONMENT: True},
+    )
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=depth_state)
 
     projection = perspective(

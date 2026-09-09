@@ -97,7 +97,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
         std::fputc('\n', stderr);
     }
     ASSERT_TRUE(loaded);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
     ASSERT_TRUE(pipeline);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 3u);
     VernonProgramParameterView imageParameter{};
@@ -315,7 +315,7 @@ TEST(RuntimeVulkanPipeline, DispatchesComputeBundleThroughRuntimeCoreProvider) {
     VernonProgramBundle *loaded =
         vernonRuntimeLoadProgramBundleWithOptions(runtime, bundle.data(), bundle.size(), &options);
     ASSERT_NE(loaded, nullptr);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(loaded, nullptr);
     ASSERT_NE(pipeline, nullptr) << std::string(vernonRuntimeGetLastError(runtime).data,
                                                 vernonRuntimeGetLastError(runtime).size);
     VernonProgramParameterView valuesParameter{};

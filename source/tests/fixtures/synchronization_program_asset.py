@@ -25,5 +25,5 @@ def synchronize(
 asset = vd.program_asset(
     id="runtime/synchronization",
     program=synchronize,
-    variants=((),),
+    variants=({},),
 )

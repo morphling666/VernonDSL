@@ -60,5 +60,5 @@ cube_map_asset = vd.program_asset(
         cube_map_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm, 1: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )

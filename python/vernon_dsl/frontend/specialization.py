@@ -59,6 +59,11 @@ def specialize_frontend_source(source: str, request: FrontendCompileRequest) -> 
         annotation.slice = ast.Tuple(elts=items, ctx=ast.Load())
 
     constants = dict(request.captured_constants)
+    assignments = {assignment.name: assignment.value for assignment in request.specializations}
+    constants.update(
+        (local_name, assignments[specialization_name])
+        for local_name, specialization_name in request.specialization_bindings
+    )
 
     class ConstantSpecializer(ast.NodeTransformer):
         def visit_Name(self, node: ast.Name) -> ast.expr:

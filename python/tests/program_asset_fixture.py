@@ -98,7 +98,7 @@ matrix_asset = vd.program_asset(
         solid_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 signed_uniform_asset = vd.program_asset(
@@ -108,7 +108,7 @@ signed_uniform_asset = vd.program_asset(
         solid_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 unsigned_uniform_asset = vd.program_asset(
@@ -118,7 +118,7 @@ unsigned_uniform_asset = vd.program_asset(
         solid_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 indexed_asset = vd.program_asset(
@@ -128,7 +128,7 @@ indexed_asset = vd.program_asset(
         solid_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 explicit_sampler_asset = vd.program_asset(
@@ -138,7 +138,7 @@ explicit_sampler_asset = vd.program_asset(
         sampled_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 triangle_asset = vd.program_asset(
@@ -148,7 +148,7 @@ triangle_asset = vd.program_asset(
         solid_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((), (OFFSET,)),
+    variants=({}, {OFFSET: True}),
 )
 
 sampled_asset = vd.program_asset(
@@ -158,7 +158,7 @@ sampled_asset = vd.program_asset(
         sampled_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 sampled_depth_asset = vd.program_asset(
@@ -172,7 +172,7 @@ sampled_depth_asset = vd.program_asset(
         ),
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}, depth=vd.d32_float),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 resolution_asset = vd.program_asset(
@@ -182,7 +182,7 @@ resolution_asset = vd.program_asset(
         resolution_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 opengl_runtime_acceptance_asset = vd.program_asset(
@@ -192,17 +192,17 @@ opengl_runtime_acceptance_asset = vd.program_asset(
         opengl_runtime_acceptance_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 
 scale_asset = vd.program_asset(
     id="pipelines/scale",
     program=scale,
-    variants=((),),
+    variants=({},),
 )
 
 storage_image_asset = vd.program_asset(
     id="pipelines/storage_image",
     program=write_rgba32_storage_image,
-    variants=((),),
+    variants=({},),
 )

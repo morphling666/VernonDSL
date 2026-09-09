@@ -36,11 +36,16 @@ unless another public document explicitly says otherwise.
 
 ## Stability
 
-Patch releases preserve documented Python behavior and the application-facing
-C ABI described above. Runtime embedders rebuild from the bundled source for
-each VernonDSL release; ABI stability does not make binaries built from mixed
-release sources or headers compatible. Additive APIs may be introduced in
-minor releases. A public API is deprecated for at least one minor release
+Version 0.1.1 was preliminary and is not an API compatibility baseline for the
+canonical Program architecture. Version 0.1.2 removes its direct pipeline/Stage
+execution and public ExecutionGraph authoring surfaces without compatibility
+wrappers. Beginning with 0.1.2, patch releases preserve documented Python
+behavior and the application-facing C ABI described above.
+
+Runtime embedders rebuild from the bundled source for each VernonDSL release;
+ABI stability does not make binaries built from mixed release sources or
+headers compatible. Additive APIs may be introduced in minor releases. APIs
+first published in 0.1.2 or later are deprecated for at least one minor release
 before removal unless continued support would create a security or correctness
 defect.
 
@@ -54,10 +59,20 @@ Canonical Program execution uses bundle → executable → instance → invocati
 → bind → forward.
 `vernonRuntimeProgramInvocationForward` records, submits, and completes the
 resolved Program plan inside the Runtime; a Program caller does not provide a
-command encoder or submit descriptor. The independent direct-Stage facility may
-encode a `VernonStageExecutable` into an RHI command encoder for embedding in an
-external execution graph. RHI encoders are submitted with
-`vernonRhiDeviceSubmit`.
+command encoder or submit descriptor. Version 0.1.2 has no public direct-Stage
+loader, binding, submit, or encode facility and no public ExecutionGraph
+authoring model. Stage objects and the Command DAG are private post-resolution
+runtime implementation.
+
+`VernonProgramGraph` is the public pre-resolution composition builder. It adds
+loaded cooked Program bundles as node-scoped components, connects compatible
+symbolic graph Values and ordered Storage-version chains, and resolves to the
+same `VernonProgramExecutable` lifecycle. Node boundary and graphics-control
+tokens are stable and scoped. Graph Storage handles bind a shared resource
+once. Global resolve emits static graphics fusion-candidate regions;
+invocation materializes only their resolved fused or split paths. Only
+graph-level invocation forward submits work. ProgramGraph does not accept
+resolved executables, raw Stages, native resources, encoders, or callbacks.
 
 Borrowed Vulkan and DirectX 12 command targets are queued by their external
 owner. Their completions remain pending until that owner has observed its GPU

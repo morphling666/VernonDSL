@@ -677,17 +677,32 @@ class ModuleGraph:
             module.definitions[node.name] = node
 
     def _collect_feature(self, module: _Module, node: ast.Assign) -> None:
-        if not isinstance(node.value, ast.Call) or (_dotted_name(node.value.func) or "").split(".")[-1] != "feature":
+        if not isinstance(node.value, ast.Call):
             return
+        kind = (_dotted_name(node.value.func) or "").split(".")[-1]
+        is_feature = kind == "feature"
+        is_bool_specialization = (
+            kind == "specialization"
+            and len(node.value.args) == 2
+            and (_dotted_name(node.value.args[1]) or "").split(".")[-1] == "bool"
+        )
+        if not is_feature and not is_bool_specialization:
+            return
+        expected_arguments = 1 if is_feature else 2
         if (
             len(node.targets) != 1
             or not isinstance(node.targets[0], ast.Name)
-            or len(node.value.args) != 1
+            or len(node.value.args) != expected_arguments
             or node.value.keywords
             or not isinstance(node.value.args[0], ast.Constant)
             or not isinstance(node.value.args[0].value, str)
         ):
-            self._error(module, node, 'feature declaration must be NAME = feature("NAME")')
+            self._error(
+                module,
+                node,
+                'Boolean specialization declaration must be NAME = feature("NAME") '
+                'or NAME = specialization("NAME", bool)',
+            )
         local_name = node.targets[0].id
         feature_name = node.value.args[0].value
         if not feature_name or local_name in module.definitions or local_name in module.features:

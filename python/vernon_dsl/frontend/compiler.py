@@ -10,6 +10,7 @@ from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATORS, GRAPHICS_STAGES, STAGE_BY_DECORATOR
 from ..module_graph import clear_project_cache, load_project
 from ..struct_methods import normalize_struct_methods
+from ..types import SpecializationAssignment, enabled_features
 from .autodiff_profiles import AutodiffProfilePlan
 from .cache import frontend_cache
 from .emission import emit_mlir_module
@@ -136,7 +137,12 @@ class Compiler:
             project = load_project(path, enabled_features, entry)
             return self.compile(project.source, str(path), project.dependencies, project.features, enabled_features)
         return self.compile_request(
-            FrontendCompileRequest(path, entry, enabled_features, program_transform=program_transform)
+            FrontendCompileRequest(
+                path,
+                entry,
+                tuple(SpecializationAssignment(name, "bool", True) for name in enabled_features),
+                program_transform=program_transform,
+            )
         ).mlir
 
     def compile_request(self, request: FrontendCompileRequest) -> FrontendCompileResult:
@@ -148,14 +154,15 @@ class Compiler:
             self._entry_workgroup_size = cached.entry_workgroup_size
             return cached
 
-        project = load_project(request.source_path, request.enabled_features, request.entry)
+        selected_features = enabled_features(request.specializations)
+        project = load_project(request.source_path, selected_features, request.entry)
         specialized_source = specialize_frontend_source(project.source, request)
         mlir = self.compile(
             specialized_source,
             filename=str(request.source_path),
             dependencies=project.dependencies,
             declared_features=project.features,
-            enabled_features=request.enabled_features,
+            enabled_features=selected_features,
             runtime_entry=request.entry,
             runtime_workgroup_size=request.workgroup_size,
             program_transform=request.program_transform,

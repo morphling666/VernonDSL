@@ -23,6 +23,18 @@ from ..diagnostics import CompileError
 from ..language.ast_utils import dotted_name
 from ..language.stage_registry import ENTRY_DECORATOR_STAGES
 from ..module_graph import load_project, resolve_project_entry
+from ..types import (
+    Specialization,
+    SpecializationAssignment,
+    f32,
+    f64,
+    i32,
+    specialization_assignment,
+    u32,
+)
+from ..types import (
+    bool as bool_type,
+)
 from .declaration import VARIANT_CAP
 
 
@@ -31,7 +43,7 @@ class ProgramAssetLint:
     """What a Program Asset declaration says about itself without being run."""
 
     id: str
-    variants: tuple[tuple[str, ...], ...]
+    variants: tuple[tuple[SpecializationAssignment, ...], ...]
     entries: tuple[str, ...]
 
 
@@ -61,25 +73,38 @@ def _assigned_values(tree: ast.Module, name: str) -> list[ast.expr]:
     return values
 
 
-def _feature_bindings(tree: ast.Module) -> dict[str, str]:
-    bindings: dict[str, str] = {}
+def _specialization_bindings(tree: ast.Module) -> dict[str, Specialization]:
+    bindings: dict[str, Specialization] = {}
+    scalar_types = {"bool": bool_type, "i32": i32, "u32": u32, "f32": f32, "f64": f64}
     for statement in tree.body:
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
         value = statement.value
-        if not isinstance(value, ast.Call) or (dotted_name(value.func) or "").split(".")[-1] != "feature":
+        if not isinstance(value, ast.Call):
+            continue
+        kind = (dotted_name(value.func) or "").split(".")[-1]
+        if kind not in {"feature", "specialization"}:
             continue
         if (
-            len(value.args) != 1
-            or value.keywords
+            value.keywords
+            or not value.args
             or not isinstance(value.args[0], ast.Constant)
             or not isinstance(value.args[0].value, str)
         ):
-            raise ProgramCompileError("feature declarations used by Program Assets require one string literal")
+            raise ProgramCompileError("Program Asset specialization declarations require a literal name")
+        if kind == "feature":
+            if len(value.args) != 1:
+                raise ProgramCompileError("feature declarations require one string literal")
+            scalar_type = bool_type
+        else:
+            type_name = (dotted_name(value.args[1]) or "").split(".")[-1] if len(value.args) == 2 else ""
+            scalar_type = scalar_types.get(type_name)
+            if scalar_type is None:
+                raise ProgramCompileError("specialization declarations require bool, i32, u32, f32, or f64")
         targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
         if len(targets) != 1 or not isinstance(targets[0], ast.Name):
-            raise ProgramCompileError("feature declarations used by Program Assets require a simple name")
-        bindings[targets[0].id] = value.args[0].value
+            raise ProgramCompileError("Program Asset specialization declarations require a simple name")
+        bindings[targets[0].id] = Specialization(value.args[0].value, scalar_type)
     return bindings
 
 
@@ -143,24 +168,33 @@ def _resolved_entry(source_path: Path, entry: ast.expr) -> str:
     return entry.id
 
 
-def _linted_variants(tree: ast.Module, keywords: dict[str, ast.expr]) -> tuple[tuple[str, ...], ...]:
+def _linted_variants(
+    tree: ast.Module, keywords: dict[str, ast.expr]
+) -> tuple[tuple[SpecializationAssignment, ...], ...]:
     node = keywords.get("variants")
     if node is None:
         return ((),)
     if not isinstance(node, (ast.Tuple, ast.List)):
         raise ProgramCompileError("program_asset variants must be a tuple or list")
-    features = _feature_bindings(tree)
-    parsed: list[tuple[str, ...]] = []
+    specializations = _specialization_bindings(tree)
+    parsed: list[tuple[SpecializationAssignment, ...]] = []
     for row in node.elts:
-        if not isinstance(row, (ast.Tuple, ast.List)):
-            raise ProgramCompileError("each Program Asset variant must be a tuple or list")
-        if any(not isinstance(item, ast.Name) or item.id not in features for item in row.elts):
-            raise ProgramCompileError("Program Asset variants must reference locally declared features")
-        key = tuple(features[item.id] for item in row.elts if isinstance(item, ast.Name))
-        if list(key) != sorted(key) or len(set(key)) != len(key):
-            raise ProgramCompileError(f"Program Asset variant is not canonical: {list(key)}")
+        if not isinstance(row, ast.Dict):
+            raise ProgramCompileError("each Program Asset variant must be a specialization mapping")
+        assignments: list[SpecializationAssignment] = []
+        for parameter, value in zip(row.keys, row.values, strict=True):
+            if not isinstance(parameter, ast.Name) or parameter.id not in specializations:
+                raise ProgramCompileError("Program Asset variant keys must reference locally declared specializations")
+            try:
+                literal = ast.literal_eval(value)
+                assignments.append(specialization_assignment(specializations[parameter.id], literal))
+            except (ValueError, TypeError, SyntaxError) as error:
+                raise ProgramCompileError(str(error)) from None
+        key = tuple(sorted(assignments))
+        if len({assignment.name for assignment in key}) != len(key):
+            raise ProgramCompileError("Program Asset variant contains duplicate specialization names")
         if key in parsed:
-            raise ProgramCompileError(f"duplicate Program Asset variant: {list(key)}")
+            raise ProgramCompileError("duplicate Program Asset variant")
         parsed.append(key)
     if not parsed:
         raise ProgramCompileError("a Program Asset must declare at least one variant")
@@ -208,7 +242,7 @@ def lint_python_program_asset(source: str | Path, descriptor_name: str) -> Progr
     entries = tuple(_resolved_entry(source_path, entry) for entry in _static_entries(tree, program))
 
     variants = _linted_variants(tree, keywords)
-    requested = {name for variant in variants for name in variant}
+    requested = {assignment.name for variant in variants for assignment in variant if assignment.type == "bool"}
     undeclared = requested - set(load_project(source_path).features)
     if undeclared:
         raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(undeclared)))

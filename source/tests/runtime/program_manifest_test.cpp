@@ -116,19 +116,19 @@ TEST(ProgramGraphLinker, IdentityDoesNotDependOnConnectionInsertionOrder) {
               reordered.deployment.program.abi.boundarySlots.size());
 }
 
-TEST(ProgramGraphLinker, RejectsIncompleteNodeAndFeatureIdentity) {
+TEST(ProgramGraphLinker, RejectsIncompleteNodeIdentityAndAllowsNodeLocalSpecializations) {
     using namespace vernon::runtime;
     ProgramVariantDeployment first = graphLinkFixture(true);
     ProgramVariantDeployment second = graphLinkFixture(false);
-    first.key = {"native"};
-    second.key = {"portable"};
+    first.key = {{"mode", ProgramSpecializationKind::Bool, true}};
+    second.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{2}}};
     LinkedProgramDeployment linked;
     program::Diagnostic diagnostic;
     EXPECT_FALSE(linkProgramGraph({{0, "first", "", &first, {}}}, {}, {}, {}, linked, diagnostic));
     EXPECT_EQ(diagnostic.path, "/nodes/0");
-    EXPECT_FALSE(linkProgramGraph({{0, "first", "first-hash", &first, {}}, {1, "second", "second-hash", &second, {}}},
-                                  {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic));
-    EXPECT_EQ(diagnostic.path, "/nodes/1");
+    EXPECT_TRUE(linkProgramGraph({{0, "first", "first-hash", &first, {}}, {1, "second", "second-hash", &second, {}}},
+                                 {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic))
+        << diagnostic.message;
 }
 
 TEST(ProgramGraphLinker, RejectsExportOfAnInternalizedDestination) {
@@ -182,8 +182,8 @@ TEST(ProgramGraphLinker, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
     using namespace vernon::runtime;
     ProgramVariantDeployment producer = graphStorageLinkFixture();
     ProgramVariantDeployment consumer = graphStorageLinkFixture(false);
-    producer.key = {"device"};
-    consumer.key = {"device"};
+    producer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
+    consumer.key = {{"rank", ProgramSpecializationKind::U32, uint32_t{1}}};
     const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer, {}},
                                                     {1, "consumer", "consumer-hash", &consumer, {}}};
     LinkedProgramDeployment linked;
@@ -191,7 +191,7 @@ TEST(ProgramGraphLinker, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
     ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {{0, 0}}, {}, linked, diagnostic)) << diagnostic.message;
     ASSERT_EQ(linked.deployment.program.abi.boundarySlots.size(), 1u);
     EXPECT_EQ(linked.boundarySlots.at({0, 0}), 0u);
-    EXPECT_EQ(linked.deployment.key, std::vector<std::string>{"device"});
+    EXPECT_TRUE(linked.deployment.key.empty());
 
     LinkedProgramDeployment internalized;
     ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {}, {}, internalized, diagnostic)) << diagnostic.message;

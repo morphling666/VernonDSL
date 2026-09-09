@@ -9,6 +9,7 @@
 #include <string>
 
 extern "C" VernonStatus vernonRegisterModuleProgramFixture(void);
+extern "C" VernonStatus vernonRegisterTypedSpecializationFixture(void);
 
 namespace {
 
@@ -42,6 +43,37 @@ VernonProgramArgument tensorArgument(const VernonProgramParameterView &parameter
     return result;
 }
 
+VernonProgramArgument tensorArrayArgument(const VernonProgramParameterView &parameter, float *values,
+                                          const uint64_t *shape) {
+    VernonProgramArgument result{};
+    result.slot = parameter.slot;
+    result.kind = VERNON_PROGRAM_TENSOR;
+    result.tensor.struct_size = sizeof(VernonTensorView);
+    result.tensor.storage = VERNON_TENSOR_HOST;
+    result.tensor.host_data = values;
+    result.tensor.element_layout = parameter.element_layout;
+    result.tensor.access = parameter.access;
+    result.tensor.rank = 1;
+    result.tensor.shape = shape;
+    static const int64_t stride = sizeof(float);
+    result.tensor.byte_strides = &stride;
+    result.tensor.byte_size = *shape * sizeof(float);
+    return result;
+}
+
+VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter, uint32_t &value) {
+    VernonProgramArgument result{};
+    result.slot = parameter.slot;
+    result.kind = VERNON_PROGRAM_TENSOR;
+    result.tensor.struct_size = sizeof(VernonTensorView);
+    result.tensor.storage = VERNON_TENSOR_HOST;
+    result.tensor.host_data = &value;
+    result.tensor.element_layout = parameter.element_layout;
+    result.tensor.access = parameter.access;
+    result.tensor.byte_size = sizeof(value);
+    return result;
+}
+
 VernonProgramBindingToken bindingToken(const char *value) {
     return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
 }
@@ -60,7 +92,7 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     ASSERT_EQ(vernonRuntimeProgramExecutableGetParameterCount(pipeline), 2u);
     ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
@@ -182,14 +214,21 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
     const VernonStringView id = vernonRuntimeProgramBundleGetId(bundle);
     EXPECT_GT(id.size, 0u);
 
-    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, {nullptr, 1}), nullptr);
-    const char *missing[]{"NO_SUCH_FEATURE"};
-    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, {missing, 1}), nullptr);
+    const VernonProgramVariantSelector invalidSelector{};
+    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, &invalidSelector), nullptr);
+    const std::string missingName = "NO_SUCH_SPECIALIZATION";
+    VernonProgramSpecialization missing{};
+    missing.struct_size = sizeof(missing);
+    missing.name = {missingName.data(), missingName.size()};
+    missing.kind = VERNON_PROGRAM_SPECIALIZATION_BOOL;
+    missing.value.boolean_value = 1;
+    const VernonProgramVariantSelector missingSelector{sizeof(VernonProgramVariantSelector), &missing, 1, {}};
+    EXPECT_EQ(vernonRuntimeResolveProgram(bundle, &missingSelector), nullptr);
     EXPECT_NE(lastError(context).find("no matching variant"), std::string::npos);
 
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
-    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(second, nullptr) << lastError(context);
     EXPECT_NE(second, pipeline);
     vernonRuntimeProgramExecutableDestroy(second);
@@ -336,6 +375,64 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphProvidesNodeScopedFrameBindings) {
         EXPECT_FALSE(invocation.forward(false));
         EXPECT_FLOAT_EQ(firstOutputValue, 4.0f);
         EXPECT_FLOAT_EQ(secondOutputValue, 9.0f);
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes) {
+    ASSERT_EQ(vernonRegisterTypedSpecializationFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_TYPED_SPECIALIZATION_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        vernon::runtime::ProgramVariant one;
+        one.set("extent", uint32_t{1});
+        vernon::runtime::ProgramVariant four;
+        four.set("extent", uint32_t{4});
+        const auto oneExecutable = asset.resolve(one);
+        const auto fourExecutable = asset.resolve(four);
+        const VernonProgramParameterView oneOutput = parameter(oneExecutable.get(), "output");
+        const VernonProgramParameterView fourOutput = parameter(fourExecutable.get(), "output");
+        ASSERT_EQ(oneOutput.rank, 1u);
+        ASSERT_EQ(fourOutput.rank, 1u);
+        EXPECT_EQ(oneOutput.static_shape[0], 1);
+        EXPECT_EQ(fourOutput.static_shape[0], 4);
+
+        vernon::runtime::ProgramGraph graph(context);
+        const auto oneNode = graph.add(asset, one);
+        const auto fourNode = graph.add(asset, four);
+        const auto oneBoundary = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        const auto fourBoundary = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        const auto oneGridX = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_x");
+        const auto oneGridY = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_y");
+        const auto oneGridZ = oneNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_z");
+        const auto fourGridX = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_x");
+        const auto fourGridY = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_y");
+        const auto fourGridZ = fourNode.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "__grid_z");
+        auto graphExecutable = graph.compile();
+        vernon::runtime::ProgramInstance instance(graphExecutable);
+        float oneValues[1]{};
+        float fourValues[4]{};
+        const uint64_t oneShape[]{1};
+        const uint64_t fourShape[]{4};
+        uint32_t gridExtent = 1;
+        auto invocation = instance.begin();
+        invocation.node(oneNode).bind(oneBoundary, tensorArrayArgument(oneOutput, oneValues, oneShape));
+        invocation.node(fourNode).bind(fourBoundary, tensorArrayArgument(fourOutput, fourValues, fourShape));
+        invocation.node(oneNode)
+            .bind(oneGridX, scalarArgument(parameter(oneExecutable.get(), "__grid_x"), gridExtent))
+            .bind(oneGridY, scalarArgument(parameter(oneExecutable.get(), "__grid_y"), gridExtent))
+            .bind(oneGridZ, scalarArgument(parameter(oneExecutable.get(), "__grid_z"), gridExtent));
+        invocation.node(fourNode)
+            .bind(fourGridX, scalarArgument(parameter(fourExecutable.get(), "__grid_x"), gridExtent))
+            .bind(fourGridY, scalarArgument(parameter(fourExecutable.get(), "__grid_y"), gridExtent))
+            .bind(fourGridZ, scalarArgument(parameter(fourExecutable.get(), "__grid_z"), gridExtent));
+        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_FLOAT_EQ(oneValues[0], 1.0f);
+        EXPECT_FLOAT_EQ(fourValues[0], 4.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

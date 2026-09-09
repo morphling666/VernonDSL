@@ -32,6 +32,7 @@ from vernon_dsl.bundle import (
     with_content_hash,
 )
 from vernon_dsl.bundle.requirements import runtime_requirements
+from vernon_dsl.types import SpecializationAssignment
 
 
 def _scalar_layout(dtype: str) -> dict[str, object]:
@@ -904,7 +905,8 @@ class PipelineCompileTests(unittest.TestCase):
             ],
             "abi": {"boundary_slots": [], "derivative_projections": [], "tape_plans": []},
         }
-        plan = build_program_plan("program", stage.target, [(("FEATURE",), {"main": stage}, program)])
+        variant = (SpecializationAssignment("FEATURE", "bool", True),)
+        plan = build_program_plan("program", stage.target, [(variant, {"main": stage}, program)])
         manifest = build_program_manifest(
             plan,
             {

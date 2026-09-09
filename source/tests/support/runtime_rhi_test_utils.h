@@ -71,7 +71,7 @@ public:
         options.bundle_directory = directory.c_str();
         bundle_ = vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
         if (bundle_)
-            executable_ = vernonRuntimeResolveProgram(bundle_, {nullptr, 0});
+            executable_ = vernonRuntimeResolveProgram(bundle_, nullptr);
     }
 
     ~OwnedProgramExecutable() {

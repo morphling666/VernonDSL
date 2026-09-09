@@ -154,7 +154,6 @@ Value createDestinationPassingCompute(OpBuilder &builder, Location location, Str
     state.addTypes(resultType);
     state.addAttribute("callee", builder.getStringAttr(callee));
     state.addAttribute("grid", builder.getDenseI64ArrayAttr(linearizedLaunchGrid(resultType)));
-    state.addAttribute("features", builder.getArrayAttr({}));
     state.addAttribute("operand_names",
                        builder.getArrayAttr(llvm::map_to_vector(
                            operandNames, [&](StringRef name) -> Attribute { return builder.getStringAttr(name); })));
@@ -445,7 +444,6 @@ FailureOr<SmallVector<Value>> buildComputeVjp(ComputeOp operation, const Autodif
         }
         state.addAttribute("vernon_program.grid_control_arguments", builder.getDenseI64ArrayAttr(remapped));
     }
-    state.addAttribute("features", operation.getFeaturesAttr());
     state.addAttribute("operand_names", builder.getArrayAttr(operandNames));
     state.addAttribute(kOperandAccessesAttrName, builder.getArrayAttr(operandAccesses));
     state.addAttribute("vernon_program.operand_autodiff_roles", builder.getArrayAttr(operandRoles));

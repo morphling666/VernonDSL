@@ -168,11 +168,6 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonR
                                                                          VernonRhiCommandEncoder encoder,
                                                                          VernonRuntimeProviderObject *output);
 
-typedef struct VernonFeatureSetView {
-    const char *const *names;
-    size_t count;
-} VernonFeatureSetView;
-
 typedef enum VernonDataType {
     VERNON_DATA_BOOL = 0,
     VERNON_DATA_I32 = 1,
@@ -182,6 +177,42 @@ typedef enum VernonDataType {
     VERNON_DATA_F64 = 5,
     VERNON_DATA_U8 = 6
 } VernonDataType;
+
+typedef enum VernonProgramSpecializationKind {
+    VERNON_PROGRAM_SPECIALIZATION_BOOL = 0,
+    VERNON_PROGRAM_SPECIALIZATION_I32 = 1,
+    VERNON_PROGRAM_SPECIALIZATION_U32 = 2,
+    VERNON_PROGRAM_SPECIALIZATION_F32 = 3,
+    VERNON_PROGRAM_SPECIALIZATION_F64 = 4
+} VernonProgramSpecializationKind;
+
+typedef union VernonProgramSpecializationValue {
+    uint8_t boolean_value;
+    int32_t i32_value;
+    uint32_t u32_value;
+    float f32_value;
+    double f64_value;
+} VernonProgramSpecializationValue;
+
+typedef struct VernonProgramSpecialization {
+    uint32_t struct_size;
+    VernonStringView name;
+    VernonProgramSpecializationKind kind;
+    VernonProgramSpecializationValue value;
+    uint32_t reserved[4];
+} VernonProgramSpecialization;
+
+/*
+ * Selects one exact cooked Program variant. Names must be non-empty and
+ * unique; order is irrelevant. A null selector selects the empty key.
+ * Floating-point values must be finite.
+ */
+typedef struct VernonProgramVariantSelector {
+    uint32_t struct_size;
+    const VernonProgramSpecialization *specializations;
+    size_t specialization_count;
+    uint32_t reserved[4];
+} VernonProgramVariantSelector;
 
 typedef enum VernonValueAccess {
     VERNON_ACCESS_READ = 0,
@@ -409,6 +440,7 @@ VERNON_RUNTIME_CAPI VernonProgramGraph *vernonRuntimeProgramGraphCreate(VernonRu
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph,
                                                                      const VernonProgramBundle *bundle,
+                                                                     const VernonProgramVariantSelector *selector,
                                                                      VernonProgramNodeId *node);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *graph,
                                                                        VernonProgramNodeId node,
@@ -443,10 +475,9 @@ VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramGraphGetGraphicsNodeCount(const V
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphGetGraphicsNodeByIndex(const VernonProgramGraph *graph,
                                                                                  VernonProgramNodeId node, size_t index,
                                                                                  VernonProgramNodeGraphicsToken *token);
-VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph,
-                                                                              VernonFeatureSetView features);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph);
 VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
-                                                                         VernonFeatureSetView features);
+                                                                         const VernonProgramVariantSelector *selector);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);

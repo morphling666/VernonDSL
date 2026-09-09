@@ -16,7 +16,15 @@ from ..bundle import ProgramCompileError, canonical_json, make_target_options
 from ..compiler import Compiler, FrontendCompileRequest, FrontendCompileResult
 from ..frontend.model import ConcreteType
 from ..host_values import pack_host_value
-from ..types import TypeExpr, _Scalar
+from ..types import (
+    Specialization,
+    SpecializationAssignment,
+    TypeExpr,
+    _Scalar,
+    specialization_constants,
+    specialization_key,
+)
+from ..types import bool as dsl_bool
 from .resource_common import _session_state
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
@@ -99,7 +107,7 @@ class Kernel:
 
     def _specialization_key(
         self,
-        features: tuple[str, ...],
+        specializations: tuple[SpecializationAssignment, ...],
         target: str,
         target_options: tuple[tuple[str, Any], ...],
     ) -> tuple[Any, ...]:
@@ -118,7 +126,7 @@ class Kernel:
             self._workgroup_size,
             target,
             target_options,
-            features,
+            specializations,
             constants,
         )
 
@@ -330,7 +338,7 @@ class Kernel:
 
     def _lower(
         self,
-        features: tuple[str, ...] = (),
+        specializations: tuple[SpecializationAssignment, ...] = (),
         *,
         autodiff_planning_policy: str | None = None,
     ) -> _LoweredKernel:
@@ -351,13 +359,52 @@ class Kernel:
             for name, value in self._globals.items()
             if name in loaded_names and isinstance(value, (int, float, bool))
         )
+        declared_rows = tuple(
+            (name, value)
+            for name, value in self._globals.items()
+            if name in loaded_names and isinstance(value, Specialization)
+        )
+        declared_names = tuple(value.name for _, value in declared_rows)
+        if len(set(declared_names)) != len(declared_names):
+            raise ProgramCompileError("kernel declares duplicate specialization names")
+        declared_specializations = {value.name: (name, value) for name, value in declared_rows}
+        supplied_specializations = {assignment.name: assignment for assignment in specializations}
+        if len(supplied_specializations) != len(specializations):
+            raise ProgramCompileError("kernel specialization assignments contain duplicate names")
+        missing = sorted(
+            name
+            for name, (_, parameter) in declared_specializations.items()
+            if parameter.type is not dsl_bool and name not in supplied_specializations
+        )
+        unknown = sorted(set(supplied_specializations) - set(declared_specializations))
+        mismatched = sorted(
+            name
+            for name in set(supplied_specializations) & set(declared_specializations)
+            if supplied_specializations[name].type != declared_specializations[name][1].type.name
+        )
+        if missing or unknown or mismatched:
+            detail = []
+            if missing:
+                detail.append("missing " + ", ".join(missing))
+            if unknown:
+                detail.append("unknown " + ", ".join(unknown))
+            if mismatched:
+                detail.append("type mismatch for " + ", ".join(mismatched))
+            raise ProgramCompileError("kernel specialization assignment mismatch: " + "; ".join(detail))
+        specialization_bindings = tuple(
+            sorted(
+                (declared_specializations[name][0], name)
+                for name, assignment in supplied_specializations.items()
+                if assignment.type != "bool"
+            )
+        )
         request = FrontendCompileRequest(
             self._file,
             self._entry,
-            features,
-            (),
-            constants,
-            self._workgroup_size,
+            specializations=specializations,
+            specialization_bindings=specialization_bindings,
+            captured_constants=constants,
+            workgroup_size=self._workgroup_size,
             autodiff_planning_policy=autodiff_planning_policy,
         )
         frontend = Compiler().compile_request(request)
@@ -367,7 +414,27 @@ class Kernel:
         )
         return _LoweredKernel(frontend, specialized_function, function, builtins)
 
-    def compile_artifact(self, *arguments: Any, target: str) -> tuple[bytes, str]:
+    def _resolved_annotations(
+        self,
+        specializations: tuple[SpecializationAssignment, ...],
+    ) -> dict[str, Any]:
+        annotation_globals = dict(self._function.__globals__)
+        values = dict(specialization_constants(specializations))
+        annotation_globals.update(
+            {
+                local_name: values[value.name]
+                for local_name, value in self._function.__globals__.items()
+                if isinstance(value, Specialization) and value.name in values
+            }
+        )
+        return inspect.get_annotations(self._function, globals=annotation_globals, eval_str=True)
+
+    def compile_artifact(
+        self,
+        *arguments: Any,
+        target: str,
+        specializations: Mapping[Specialization, object] | None = None,
+    ) -> tuple[bytes, str]:
         state = _session_state()
         if state._native is None:
             raise RuntimeError("native artifact compilation requires vernon_dsl._native")
@@ -382,7 +449,7 @@ class Kernel:
         }
         if target not in targets:
             raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
-        lowered = self._lower()
+        lowered = self._lower(specialization_key(specializations))
         if arguments:
             self._bind_launch(lowered, arguments)
         options = make_target_options(
@@ -400,11 +467,12 @@ class Kernel:
 
     def specialize(
         self,
-        features: tuple[str, ...] = (),
+        specializations: Mapping[Specialization, object] | None = None,
         *,
         lowered: _LoweredKernel | None = None,
     ) -> _CompiledKernel:
-        lowered = lowered or self._lower(features)
+        key_assignments = specialization_key(specializations)
+        lowered = lowered or self._lower(key_assignments)
         frontend = lowered.frontend
         state, target, options = self._session_target()
         key = hashlib.sha256(
@@ -432,7 +500,7 @@ class Kernel:
         )
         if entry is None or entry.storage_activity is None:
             raise RuntimeError("compiled kernel has no typed storage activity")
-        annotations = inspect.get_annotations(self._function, eval_str=True)
+        annotations = self._resolved_annotations(key_assignments)
         parameter_names = tuple(
             name for name in inspect.signature(self._function).parameters if name not in lowered.builtins
         )
@@ -457,8 +525,7 @@ class Kernel:
                 self,
                 tuple(inputs[name] for name in parameter_names),
                 tuple(inputs[f"__grid_{axis}"] for axis in "xyz"),
-                features,
-                lowered=lowered,
+                key_assignments,
             ),
             None,
         )
@@ -483,9 +550,10 @@ class Kernel:
         self,
         arguments: tuple[Any, ...],
         grid: tuple[int, int, int] | None,
-        features: tuple[str, ...] = (),
+        specializations: Mapping[Specialization, object] | None = None,
     ) -> None:
-        lowered = self._lower(features)
+        key_assignments = specialization_key(specializations)
+        lowered = self._lower(key_assignments)
         user_parameters, normalized = self._normalize_arguments(lowered.source, lowered.builtins, arguments)
         self._validate_tensor_view_arguments(lowered.frontend, user_parameters, normalized)
         entry = next(function for function in lowered.frontend.typed_functions if function.source.name == self._entry)
@@ -511,7 +579,7 @@ class Kernel:
             )
         if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
             raise ValueError("grid must contain three positive integers")
-        compiled = self.specialize(features, lowered=lowered)
+        compiled = self.specialize(specializations, lowered=lowered)
         actual = dict(zip(user_parameters, normalized, strict=True))
         outputs = {name: actual[name] for name in compiled.invocation.outputs}
         actual.update({f"__grid_{axis}": value for axis, value in zip("xyz", grid, strict=True)})
@@ -521,9 +589,9 @@ class Kernel:
         self,
         *arguments: Any,
         grid: tuple[int, int, int] | None = None,
-        features: tuple[str, ...] = (),
+        specializations: Mapping[Specialization, object] | None = None,
     ) -> None:
-        self._invoke(arguments, grid, features)
+        self._invoke(arguments, grid, specializations)
 
 
 atexit.register(Kernel.clear_cache)

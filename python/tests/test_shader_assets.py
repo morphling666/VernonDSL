@@ -210,7 +210,12 @@ class ShaderAssetManifestTests(unittest.TestCase):
                     (),
                     {"Module.square": stage},
                     {
-                        "stages": {"Module.square": {"operation": "compute", "contract_hash": "0" * 64}},
+                        "stages": {
+                            "Module.square": {
+                                "operation": "compute",
+                                "contract_hash": "0" * 64,
+                            }
+                        },
                         "parameters": [],
                         "storages": [],
                         "values": [],
@@ -219,7 +224,10 @@ class ShaderAssetManifestTests(unittest.TestCase):
                                 "direction": "forward",
                                 "nodes": [
                                     {
-                                        "operation": {"tag": "compute", "workgroups": [4, 1, 1]},
+                                        "operation": {
+                                            "tag": "compute",
+                                            "workgroups": [4, 1, 1],
+                                        },
                                     }
                                 ],
                             }
@@ -361,14 +369,17 @@ def fragment_main(value: vd.f32) -> vd.f32:
 asset = vd.program_asset(
     id="pipelines/static",
     program=vd.pipeline(vertex_main, fragment_main),
-    variants=((), (FEATURE,)),
+    variants=({}, {FEATURE: True}),
 )
 """,
                 encoding="utf-8",
             )
             lint = lint_python_program_asset(source, "asset")
             self.assertEqual(lint.id, "pipelines/static")
-            self.assertEqual(lint.variants, ((), ("FEATURE",)))
+            self.assertEqual(
+                tuple(tuple((item.name, item.type, item.value) for item in key) for key in lint.variants),
+                ((), (("FEATURE", "bool", True),)),
+            )
             self.assertEqual(set(lint.entries), {"vertex_main", "fragment_main"})
 
     def test_python_program_asset_rejects_legacy_stage_fields(self) -> None:
@@ -385,7 +396,7 @@ def compute_main() -> None:
 asset = vd.program_asset(
     id="pipelines/legacy",
     compute=compute_main,
-    variants=((),),
+    variants=({},),
     targets={"cpu": {}},
 )
 """,
@@ -416,7 +427,7 @@ def fragment_main() -> None:
 asset = vd.program_asset(
     id="pipelines/reversed",
     program=vd.pipeline(fragment_main, vertex_main),
-    variants=((),),
+    variants=({},),
 )
 """,
                 encoding="utf-8",
@@ -430,8 +441,8 @@ asset = vd.program_asset(
             source.write_text(
                 """
 import vernon_dsl as vd
-ZED = vd.feature("ZED")
-ALPHA = vd.feature("ALPHA")
+ZED = vd.feature("DUPLICATE")
+ALPHA = vd.feature("DUPLICATE")
 
 @vd.kernel
 def compute_main() -> None:
@@ -440,19 +451,19 @@ def compute_main() -> None:
 asset = vd.program_asset(
     id="pipelines/bad",
     program=compute_main,
-    variants=((ZED, ALPHA),),
+    variants=({ZED: True, ALPHA: True},),
 )
 """,
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ProgramCompileError, "not canonical"):
+            with self.assertRaisesRegex(ProgramCompileError, "duplicate specialization names"):
                 lint_python_program_asset(source, "asset")
 
     def test_python_program_asset_enforces_variant_cap(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "asset.py"
             features = "\n".join(f'F{index} = vd.feature("F{index:02}")' for index in range(17))
-            variants = ", ".join(f"(F{index}, )" for index in range(17))
+            variants = ", ".join(f"{{F{index}: True}}" for index in range(17))
             source.write_text(
                 f"""
 import vernon_dsl as vd
@@ -478,9 +489,57 @@ asset = vd.program_asset(
         declaration = lint_python_program_asset(root / "examples" / "variant_mesh.py", "mesh_asset")
         self.assertEqual(declaration.id, "shaders/variant_mesh")
         self.assertEqual(
-            declaration.variants,
-            ((), ("INSTANCE",), ("SKIN",), ("INSTANCE", "SKIN")),
+            tuple(tuple((item.name, item.type, item.value) for item in key) for key in declaration.variants),
+            (
+                (),
+                (("INSTANCE", "bool", True),),
+                (("SKIN", "bool", True),),
+                (("INSTANCE", "bool", True), ("SKIN", "bool", True)),
+            ),
         )
+
+    def test_bool_specialization_is_a_feature_convenience_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bool_specialization.py"
+            source.write_text(
+                """
+import vernon_dsl as vd
+
+FLAG = vd.specialization("FLAG", vd.bool)
+
+@vd.kernel
+def choose(output: vd.TensorView[vd.f32, (1,), vd.write]) -> None:
+    if FLAG:
+        output[0] = 1.0
+    else:
+        output[0] = 0.0
+
+asset = vd.program_asset(
+    id="compute/bool-specialization",
+    program=choose,
+    variants=({FLAG: False}, {FLAG: True}),
+)
+""",
+                encoding="utf-8",
+            )
+            declaration = lint_python_program_asset(source, "asset")
+        self.assertEqual(
+            tuple(tuple((item.name, item.type, item.value) for item in key) for key in declaration.variants),
+            (
+                (("FLAG", "bool", False),),
+                (("FLAG", "bool", True),),
+            ),
+        )
+
+    def test_f32_specializations_use_canonical_f32_values(self) -> None:
+        from vernon_dsl.types import specialization_assignment
+
+        parameter = vd.specialization("scale", vd.f32)
+        assignment = specialization_assignment(parameter, 0.1)
+        self.assertEqual(assignment.value, float(np.float32(0.1)))
+        self.assertEqual(specialization_assignment(parameter, -0.0).value, 0.0)
+        with self.assertRaisesRegex(TypeError, "outside the finite f32 range"):
+            specialization_assignment(parameter, 1.0e100)
 
 
 class CanonicalProgramCaptureTests(unittest.TestCase):
@@ -555,7 +614,9 @@ module_vjp_asset = vd.program_asset(
         self.assertEqual(captures[2].variants[0].ir.vjp_wrt, ("source",))
         self.assertEqual(captures[4].variants[0].ir.vjp_wrt, ("source",))
 
-    def test_tuple_graphics_asset_is_rejected_without_a_legacy_capture_path(self) -> None:
+    def test_tuple_graphics_asset_is_rejected_without_a_legacy_capture_path(
+        self,
+    ) -> None:
         @vd.vertex
         def vertex_main() -> None:
             pass
@@ -727,7 +788,14 @@ class BarePipelineAssetCookTests(unittest.TestCase):
     'declared a host Program that is not a Vernon Module'. Dispatch now happens on the evaluated declaration.
     """
 
-    def _cook(self, directory: str, name: str, *, format: str = "rgba16_float", extra: str = "") -> dict[str, Any]:
+    def _cook(
+        self,
+        directory: str,
+        name: str,
+        *,
+        format: str = "rgba16_float",
+        extra: str = "",
+    ) -> dict[str, Any]:
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
         source = Path(directory) / f"{name}.py"
@@ -775,14 +843,22 @@ class BarePipelineAssetCookTests(unittest.TestCase):
             for storage in program["storages"]
             if "tag" in storage["descriptor"]
         }
-        self.assertNotIn("extent", storages["image"], "borrowed attachment extent comes from each bound image view")
-        self.assertEqual(storages["buffer"]["byte_length"], 0, "the vertex count is chosen per invocation")
+        self.assertNotIn(
+            "extent",
+            storages["image"],
+            "borrowed attachment extent comes from each bound image view",
+        )
+        self.assertEqual(
+            storages["buffer"]["byte_length"],
+            0,
+            "the vertex count is chosen per invocation",
+        )
         self.assertIn("vertex", storages["buffer"]["usage"])
 
-    def test_a_cooked_pipeline_may_not_carry_its_own_features(self) -> None:
+    def test_a_cooked_pipeline_may_not_carry_its_own_specializations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaisesRegex(ProgramCompileError, "must not carry its own features"):
-                self._cook(directory, "featured", extra="features=('SKIN',), ")
+            with self.assertRaisesRegex(ProgramCompileError, "must not carry its own specializations"):
+                self._cook(directory, "featured", extra='specializations={vd.feature("SKIN"): True}, ')
 
     def test_every_variant_of_a_canonical_asset_is_deployed(self) -> None:
         """Canonical deployment used to refuse more than one variant, and its caller split the plan to get around it."""
@@ -821,7 +897,7 @@ asset = vd.program_asset(
         fragment_main,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((), (TINTED,)),
+    variants=({}, {TINTED: True}),
 )
 """,
                 encoding="utf-8",
@@ -832,7 +908,49 @@ asset = vd.program_asset(
                 target="vulkan",
             )
             document = json.loads(manifest.read_text(encoding="utf-8"))
-        self.assertEqual([variant["key"] for variant in document["variants"]], [["TINTED"], []])
+            self.assertEqual(
+                [variant["key"] for variant in document["variants"]],
+                [[], [{"name": "TINTED", "value": {"tag": "bool", "value": True}}]],
+            )
+
+    def test_typed_specialization_cooks_distinct_program_variants(self) -> None:
+        if not _native_available():
+            self.skipTest("native Vernon extension is not built")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "typed_variant.py"
+            source.write_text(
+                """
+from __future__ import annotations
+
+import vernon_dsl as vd
+
+EXTENT = vd.specialization("extent", vd.u32)
+
+@vd.kernel
+def fill(output: vd.TensorView[vd.f32, (EXTENT,), vd.write]) -> None:
+    output[0] = vd.f32(EXTENT)
+
+asset = vd.program_asset(
+    id="compute/typed-variant",
+    program=fill,
+    variants=({EXTENT: 1}, {EXTENT: 4}),
+)
+""",
+                encoding="utf-8",
+            )
+            manifest = cook_program_asset(
+                program_asset=f"{source}:asset",
+                output=Path(directory) / "out",
+                target="cpu",
+            )
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                [variant["key"] for variant in document["variants"]],
+                [
+                    [{"name": "extent", "value": {"tag": "u32", "value": 1}}],
+                    [{"name": "extent", "value": {"tag": "u32", "value": 4}}],
+                ],
+            )
         deployed = [
             canonical_json(
                 {
@@ -842,7 +960,11 @@ asset = vd.program_asset(
             )
             for variant in document["variants"]
         ]
-        self.assertEqual(len(set(deployed)), 2, "each variant deploys the binaries compiled for its own feature key")
+        self.assertEqual(
+            len(set(deployed)),
+            2,
+            "each variant deploys the binaries compiled for its own specialization key",
+        )
 
     def test_a_graphics_vjp_asset_is_refused_as_an_unsupported_capability(self) -> None:
         """One diagnostic, not the contradictory demand for a rule set that no graphics VJP could ever use."""
@@ -1025,7 +1147,10 @@ asset = vd.program_asset(id="module/square", program=Square())
                 [value["origin"]["tag"] for value in program["values"]],
                 ["argument", "allocation", "node_result"],
             )
-            self.assertEqual([storage["ownership"] for storage in program["storages"]], ["borrowed", "owned"])
+            self.assertEqual(
+                [storage["ownership"] for storage in program["storages"]],
+                ["borrowed", "owned"],
+            )
 
             from vernon_dsl._program_assets.artifact_io import write_external_artifact
             from vernon_dsl._program_assets.capture import capture_program
@@ -1104,7 +1229,11 @@ asset = vd.program_asset(id="module/square", program=Square())
                         output_buffer = host.create_buffer(output_array.nbytes)
                         source_buffer.upload(source_array.tobytes())
                         output_buffer.upload(output_array.tobytes())
-                        for parameter, buffer in zip(loaded.parameters, (source_buffer, output_buffer), strict=True):
+                        for parameter, buffer in zip(
+                            loaded.parameters,
+                            (source_buffer, output_buffer),
+                            strict=True,
+                        ):
                             prepared = builder.prepare_rhi_tensor(
                                 parameter.slot,
                                 buffer,
@@ -1140,7 +1269,10 @@ asset = vd.program_asset(id="module/square", program=Square())
                         bad_artifacts = bad_deployment["variants"][0]["artifact_system"]
                         bad_reflection = bad_artifacts["artifacts"][artifact_id]["reflection"]
                         bad_reflection["endpoints"][1]["abi"]["bindings"][0]["carrier"]["slot"] = 0
-                        contract = {"operation": "compute", "reflection": bad_reflection}
+                        contract = {
+                            "operation": "compute",
+                            "reflection": bad_reflection,
+                        }
                         contract_hash = hashlib.sha256(
                             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
                         ).hexdigest()
@@ -1190,7 +1322,7 @@ asset = vd.program_asset(
         fragment_main,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )
 """,
                 encoding="utf-8",
@@ -1219,7 +1351,10 @@ asset = vd.program_asset(
             variant = bundle["variants"][0]
             self.assertNotIn("execution", variant)
             program = variant["program"]
-            self.assertEqual([graph["direction"] for graph in program["graphs"]], ["forward", "backward"])
+            self.assertEqual(
+                [graph["direction"] for graph in program["graphs"]],
+                ["forward", "backward"],
+            )
             self.assertEqual(set(program["stages"]), set(variant["artifact_system"]["artifacts"]))
 
     def test_gpu_captured_tape_vjp_cooks_canonical_programs(self) -> None:
@@ -1261,7 +1396,10 @@ asset = vd.program_asset(
                         [graph["direction"] for graph in program["graphs"]],
                         ["forward", "backward"],
                     )
-                    self.assertEqual(set(program["stages"]), set(variant["artifact_system"]["artifacts"]))
+                    self.assertEqual(
+                        set(program["stages"]),
+                        set(variant["artifact_system"]["artifacts"]),
+                    )
 
     def test_four_graphics_variants_deploy_canonical_programs(self) -> None:
         root = Path(__file__).parents[2]
@@ -1282,11 +1420,19 @@ asset = vd.program_asset(
             for variant in bundle["variants"]:
                 self.assertEqual(set(variant["program"]["stages"]), {"forward:0"})
                 artifact = variant["artifact_system"]["artifacts"]["forward:0"]
-                self.assertEqual([module["role"] for module in artifact["modules"]], ["vertex", "fragment"])
-            combined = next(variant for variant in bundle["variants"] if variant["key"] == ["INSTANCE", "SKIN"])
+                self.assertEqual(
+                    [module["role"] for module in artifact["modules"]],
+                    ["vertex", "fragment"],
+                )
+            combined = next(
+                variant
+                for variant in bundle["variants"]
+                if [assignment["name"] for assignment in variant["key"]] == ["INSTANCE", "SKIN"]
+            )
             endpoints = combined["artifact_system"]["artifacts"]["forward:0"]["implementation"]["endpoints"]
             self.assertEqual(
-                [endpoint["index"] for endpoint in endpoints if endpoint["module"] == "vertex"], [0, 1, 2, 3]
+                [endpoint["index"] for endpoint in endpoints if endpoint["module"] == "vertex"],
+                [0, 1, 2, 3],
             )
             self.assertTrue(
                 all(
@@ -1358,8 +1504,16 @@ asset = vd.program_asset(
 
         native = _native_module()
         assets = (
-            (root / "python" / "tests" / "cube_map_shader.py", "cube_map_asset", {"vertex", "fragment"}),
-            (root / "python" / "tests" / "program_asset_fixture.py", "scale_asset", {"compute"}),
+            (
+                root / "python" / "tests" / "cube_map_shader.py",
+                "cube_map_asset",
+                {"vertex", "fragment"},
+            ),
+            (
+                root / "python" / "tests" / "program_asset_fixture.py",
+                "scale_asset",
+                {"compute"},
+            ),
         )
         targets = {
             "metal": ("msl", {"platform": "macos"}),
@@ -1378,7 +1532,10 @@ asset = vd.program_asset(
                             target=make_target_options(target, target_options),
                         )
                         document = json.loads(manifest.read_text(encoding="utf-8"))
-                        self.assertEqual(document["target"], {"kind": target, "options": target_options})
+                        self.assertEqual(
+                            document["target"],
+                            {"kind": target, "options": target_options},
+                        )
                         modules = _deployed_modules(document)
                         self.assertEqual({module["role"] for module in modules}, stages)
                         if name == "cube_map_asset":

@@ -49,7 +49,7 @@ TEST(RuntimeStructuredScalarAutodiff, ProfilesMatchAnalyticVjp) {
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
 
@@ -293,7 +293,7 @@ TEST(RuntimeStructuredScalarAutodiff, PublicationFailureMatrixIsAtomicForForward
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     float x = 2.0f;
@@ -508,7 +508,7 @@ TEST(RuntimeStructuredScalarAutodiff, CanonicalTapeRetentionUsesRuntimeMemoryAcc
         auto retainedPolicy = std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(
             std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max());
         vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, retainedPolicy);
-        pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+        pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
         ASSERT_NE(pipeline, nullptr) << lastError(context);
         run(
             pipeline, grid,
@@ -557,7 +557,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeTraversalScalesLinearlyWithExec
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     auto measure = [&](int32_t count) {
@@ -650,7 +650,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     float x = 1.25f;
@@ -707,7 +707,7 @@ TEST(RuntimeStructuredScalarAutodiff, DynamicTapeBudgetFailureDoesNotPublishGrad
     auto boundedPolicy =
         std::make_shared<vernon::runtime::ad::HostTapeMemoryPolicy>(oneInvocationBytes, oneInvocationBytes);
     vernon::runtime::ad::setHostTapeMemoryPolicyForTesting(*context, boundedPolicy);
-    pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     count = 1500;
     output = -31.0f;
@@ -744,7 +744,7 @@ TEST(RuntimeStructuredScalarAutodiff, PreservesF64PrimalCotangentAndGradientDtyp
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
 
     const auto expectBoundaryF64 = [&](VernonProgramBoundaryRole role) {

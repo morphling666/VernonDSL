@@ -240,7 +240,7 @@ function(
 endfunction()
 
 function(
-    vernon_add_autodiff_python_fixture
+    vernon_add_python_program_fixture
     target
     module
     registration_function
@@ -628,6 +628,14 @@ if(TARGET VernonRuntime)
             module_program_cooked_manifest
             module_program_cooked_fixture_target)
         vernon_add_cpu_program_fixture(
+            typed-specialization
+            typed_specialization_fixture
+            typed_specialization_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/typed_specialization_program_asset.py:asset"
+            vernonRegisterTypedSpecializationFixture
+            typed_specialization_manifest
+            typed_specialization_fixture_target)
+        vernon_add_cpu_program_fixture(
             native-autodiff-f16
             autodiff_native_f16_fixture
             autodiff_native_f16_fixture.program.json
@@ -767,10 +775,16 @@ if(TARGET VernonRuntime)
         target_link_libraries(VernonRuntimeTests PRIVATE ${module_program_cooked_fixture_target})
         target_compile_definitions(VernonRuntimeTests
                                    PRIVATE VERNON_CPU_CANONICAL_PROGRAM_MANIFEST="${module_program_cooked_manifest}")
-        target_link_libraries(VernonModuleProgramRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
-                                                                      ${module_program_cooked_fixture_target})
-        target_compile_definitions(VernonModuleProgramRuntimeTests
-                                   PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cooked_manifest}")
+        target_link_libraries(
+            VernonModuleProgramRuntimeTests
+            PRIVATE GTest::gtest_main
+                    Vernon::Runtime
+                    ${module_program_cooked_fixture_target}
+                    ${typed_specialization_fixture_target})
+        target_compile_definitions(
+            VernonModuleProgramRuntimeTests
+            PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cooked_manifest}"
+                    VERNON_TYPED_SPECIALIZATION_MANIFEST="${typed_specialization_manifest}")
         set_target_properties(VernonModuleProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                          "${CMAKE_BINARY_DIR}/source")
         vernon_stage_target_files(VernonModuleProgramRuntimeTests VernonRuntime)
@@ -995,57 +1009,62 @@ if(TARGET VernonRuntime)
         vernon_stage_target_files(VernonRuntimeWorkgroupAutodiffTests VernonRuntime)
         vernon_discover_gtests(VernonRuntimeWorkgroupAutodiffTests)
 
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonCookedAutodiffPythonFixture
             vernon_cooked_autodiff_fixture
             vernonRegisterAutodiffFixture
             ${cooked_autodiff_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonNativeAutodiffF16PythonFixture
             vernon_native_autodiff_f16_fixture
             vernonRegisterNativeAutodiffF16Fixture
             ${native_autodiff_f16_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
+            VernonTypedSpecializationPythonFixture
+            vernon_typed_specialization_fixture
+            vernonRegisterTypedSpecializationFixture
+            ${typed_specialization_fixture_target})
+        vernon_add_python_program_fixture(
             VernonNativeAutodiffNumericCpuPythonFixture
             vernon_native_autodiff_numeric_cpu_fixture
             vernonRegisterNativeAutodiffNumericCpuFixture
             ${native_autodiff_numeric_cpu_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonStructuredStorageAggregateAutodiffPythonFixture
             vernon_structured_storage_aggregate_autodiff_fixture
             vernonRegisterStructuredStorageAggregateAutodiffFixture
             ${structured_storage_aggregate_autodiff_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2SignedStridePythonFixture
             vernon_dynamic_v2_signed_stride_fixture
             vernonRegisterDynamicV2SignedStrideFixture
             ${dynamic_v2_signed_stride_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2FieldPathPythonFixture
             vernon_dynamic_v2_field_path_fixture
             vernonRegisterDynamicV2FieldPathFixture
             ${dynamic_v2_field_path_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2StridedScatterPythonFixture
             vernon_dynamic_v2_strided_scatter_fixture
             vernonRegisterDynamicV2StridedScatterFixture
             ${dynamic_v2_strided_scatter_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2GatherPythonFixture
             vernon_dynamic_v2_gather_fixture
             vernonRegisterDynamicV2GatherFixture
             ${dynamic_v2_gather_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2MultiOutputPythonFixture
             vernon_dynamic_v2_multi_output_fixture
             vernonRegisterDynamicV2MultiOutputFixture
             ${dynamic_v2_multi_output_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2PartiallyDynamicPythonFixture
             vernon_dynamic_v2_partially_dynamic_fixture
             vernonRegisterDynamicV2PartiallyDynamicFixture
             ${dynamic_v2_partially_dynamic_fixture_target})
-        vernon_add_autodiff_python_fixture(
+        vernon_add_python_program_fixture(
             VernonDynamicV2MixedAliasPythonFixture
             vernon_dynamic_v2_mixed_alias_fixture
             vernonRegisterDynamicV2MixedAliasFixture
@@ -1061,6 +1080,12 @@ if(TARGET VernonRuntime)
             COMMAND
                 "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/autodiff_native_f16_runtime_test.py"
                 "${native_autodiff_f16_manifest}" "$<TARGET_FILE_DIR:VernonNativeAutodiffF16PythonFixture>"
+                "${VERNON_REPOSITORY_ROOT}/python")
+        add_test(
+            NAME VernonPythonTypedSpecializationTest
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_TEST_ROOT}/python/typed_specialization_runtime_test.py"
+                "${typed_specialization_manifest}" "$<TARGET_FILE_DIR:VernonTypedSpecializationPythonFixture>"
                 "${VERNON_REPOSITORY_ROOT}/python")
         add_test(
             NAME VernonPythonNativeAutodiffNumericCpuTest

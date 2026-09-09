@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+from typing import Any
 
 
 def main() -> int:
@@ -19,15 +20,21 @@ def main() -> int:
     output = arguments.manifest.parent
     variants = document.get("variants")
     blobs = document.get("blobs")
-    if document.get("type") != "program" or not isinstance(variants, list) or len(variants) != 1:
-        raise ValueError("cooked CPU Program fixture must contain exactly one variant")
-    artifact_system = variants[0].get("artifact_system")
-    records = artifact_system.get("artifacts") if isinstance(artifact_system, dict) else None
-    if not isinstance(blobs, dict) or not isinstance(records, dict):
+    if document.get("type") != "program" or not isinstance(variants, list) or not variants:
+        raise ValueError("cooked CPU Program fixture must contain at least one variant")
+    if not isinstance(blobs, dict):
         raise ValueError("cooked CPU Program fixture has no canonical artifact system")
+    records: list[dict[str, Any]] = []
+    for variant in variants:
+        artifact_system = variant.get("artifact_system")
+        variant_records = artifact_system.get("artifacts") if isinstance(artifact_system, dict) else None
+        if not isinstance(variant_records, dict):
+            raise ValueError("cooked CPU Program fixture has no canonical artifact system")
+        records.append(variant_records)
     digests = {
         module["blob"]
-        for record in records.values()
+        for variant_records in records
+        for record in variant_records.values()
         for module in record.get("modules", ())
         if module.get("format") == "relocatable_object"
     }

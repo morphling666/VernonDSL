@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..frontend.autodiff_profiles import DerivativeGroup
+from ..types import Specialization, SpecializationAssignment, specialization_key
 from .binding import _dispatch_borrow_scope, _PersistentBindingTable
 from .resource_common import _session_state
 from .sampler import SamplerState
@@ -70,7 +72,7 @@ class CookedProgram:
 
     _bundle: bytes
     _directory: str
-    _features: tuple[str, ...]
+    _specializations: tuple[SpecializationAssignment, ...]
     _native: Any = None
     _runtime_generation: int = -1
     _binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
@@ -84,7 +86,7 @@ class CookedProgram:
         self._native = state._native_runtime.load_program(
             self._bundle,
             self._directory,
-            list(self._features),
+            [assignment.manifest for assignment in self._specializations],
         )
         self._runtime_generation = state._runtime_generation
 
@@ -218,16 +220,15 @@ class CookedProgram:
 def load_program(
     manifest: str | Path,
     *,
-    features: tuple[str, ...] = (),
+    specializations: Mapping[Specialization, object] | None = None,
 ) -> CookedProgram:
     manifest_path = Path(manifest).resolve()
-    if any(not isinstance(feature, str) or not feature for feature in features):
-        raise ValueError("Program features must be non-empty strings")
+    assignments = specialization_key(specializations)
     bundle = manifest_path.read_bytes()
     executable = CookedProgram(
         bundle,
         str(manifest_path.parent),
-        tuple(sorted(set(features))),
+        assignments,
     )
     executable._load()
     return executable

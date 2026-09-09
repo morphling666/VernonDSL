@@ -77,19 +77,54 @@ struct Runtime {
     }
 
     std::unique_ptr<PythonProgramExecutable> loadProgramAsset(const nb::bytes &data, const std::string &directory,
-                                                              const std::vector<std::string> &features) {
+                                                              const nb::list &specializationRows) {
         VernonProgramBundleLoadOptions options{};
         options.struct_size = sizeof(options);
         options.bundle_directory = directory.c_str();
-        std::vector<const char *> names;
-        for (const std::string &feature : features)
-            names.push_back(feature.c_str());
+        std::vector<std::string> names;
+        std::vector<VernonProgramSpecialization> specializations;
+        names.reserve(specializationRows.size());
+        specializations.reserve(specializationRows.size());
+        for (nb::handle rowHandle : specializationRows) {
+            const nb::dict row = nb::cast<nb::dict>(rowHandle);
+            if (!row.contains("name") || !row.contains("value"))
+                throw std::invalid_argument("Program specialization row is incomplete");
+            const nb::dict value = nb::cast<nb::dict>(row["value"]);
+            if (!value.contains("tag") || !value.contains("value"))
+                throw std::invalid_argument("Program specialization value is incomplete");
+            names.push_back(nb::cast<std::string>(row["name"]));
+            const std::string tag = nb::cast<std::string>(value["tag"]);
+            VernonProgramSpecialization specialization{};
+            specialization.struct_size = sizeof(specialization);
+            specialization.name = {names.back().data(), names.back().size()};
+            if (tag == "bool") {
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_BOOL;
+                specialization.value.boolean_value = nb::cast<bool>(value["value"]) ? 1 : 0;
+            } else if (tag == "i32") {
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_I32;
+                specialization.value.i32_value = nb::cast<int32_t>(value["value"]);
+            } else if (tag == "u32") {
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_U32;
+                specialization.value.u32_value = nb::cast<uint32_t>(value["value"]);
+            } else if (tag == "f32") {
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_F32;
+                specialization.value.f32_value = nb::cast<float>(value["value"]);
+            } else if (tag == "f64") {
+                specialization.kind = VERNON_PROGRAM_SPECIALIZATION_F64;
+                specialization.value.f64_value = nb::cast<double>(value["value"]);
+            } else {
+                throw std::invalid_argument("Program specialization tag is invalid");
+            }
+            specializations.push_back(specialization);
+        }
+        const VernonProgramVariantSelector selector{
+            sizeof(VernonProgramVariantSelector), specializations.data(), specializations.size(), {}};
         VernonProgramBundle *bundle =
             vernonRuntimeLoadProgramBundleWithOptions(handle, data.c_str(), data.size(), &options);
         if (!bundle)
             throw std::runtime_error("cannot load Program bundle: " +
                                      nativeStringView(vernonRuntimeGetLastError(handle)));
-        VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, {names.data(), names.size()});
+        VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, &selector);
         if (!executable) {
             const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
             vernonRuntimeProgramBundleDestroy(bundle);
@@ -120,7 +155,7 @@ struct Runtime {
             if (!bundle)
                 throw std::runtime_error("cannot load in-memory Program bundle: " +
                                          nativeStringView(vernonRuntimeGetLastError(handle)));
-            VernonProgramExecutable *loaded = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+            VernonProgramExecutable *loaded = vernonRuntimeResolveProgram(bundle, nullptr);
             if (!loaded) {
                 error = nativeStringView(vernonRuntimeGetLastError(handle));
                 vernonRuntimeProgramBundleDestroy(bundle);

@@ -83,7 +83,7 @@ def main() -> None:
     render = vd.pipeline(
         vertex_main,
         fragment_main,
-        features=() if args.no_picking else {"PICKING"},
+        specializations={} if args.no_picking else {PICKING: True},
     )
 
     positions = vd.storage.from_numpy(

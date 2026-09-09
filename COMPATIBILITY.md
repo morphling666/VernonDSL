@@ -13,11 +13,18 @@ automatically.
 
 ## Release and ABI
 
-Published patch releases preserve their documented Python API and public C
-ABI. Wheels are supported only on their tagged Python, operating-system, and
-architecture combination. The release matrix targets CPython 3.11–3.14 on
-Windows x64, Linux x64, and macOS arm64. VernonDSL is wheel-only: no source
-distribution, Intel macOS wheel, PyPy wheel, or 32-bit wheel is published.
+Version 0.1.1 was a preliminary release and is not the compatibility baseline
+for the canonical Program architecture. Version 0.1.2 intentionally does not
+preserve the 0.1.1 direct pipeline/Stage C and C++ execution API or public
+ExecutionGraph authoring surface. Those interfaces are removed rather than
+retained through aliases, adapters, or a second execution path.
+
+Beginning with 0.1.2, published patch releases preserve their documented Python
+API and public C ABI. Wheels are supported only on their tagged Python,
+operating-system, and architecture combination. The release matrix targets
+CPython 3.11–3.14 on Windows x64, Linux x64, and macOS arm64. VernonDSL is
+wheel-only: no source distribution, Intel macOS wheel, PyPy wheel, or 32-bit
+wheel is published.
 
 The bundled Runtime source package has the same release version as its wheel.
 Applications embedding that source must rebuild when changing VernonDSL
@@ -43,6 +50,7 @@ options, backend capabilities, and ABI recorded by their manifest.
 
 ## Deprecation
 
+The deprecation policy applies to APIs first published in 0.1.2 or later.
 Public APIs receive a documented deprecation period of at least one minor
 release before removal. Compatibility may be broken without that period only
 to correct an exploitable security issue, memory-safety issue, or behavior that

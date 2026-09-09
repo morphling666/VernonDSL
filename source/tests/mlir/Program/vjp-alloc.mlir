@@ -15,7 +15,6 @@ module {
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
       callee = "square",
-      features = [],
       grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"],
       result_names = ["output"],

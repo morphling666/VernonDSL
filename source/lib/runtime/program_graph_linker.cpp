@@ -2,10 +2,12 @@
 #include "content_hash.h"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <set>
 #include <string_view>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace vernon::runtime {
@@ -164,8 +166,6 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
     std::map<std::string, uint32_t> graphUserSlotCounts;
     std::map<std::string, uint32_t> graphControlSlotCounts;
     const std::string target = nodes.front().deployment ? nodes.front().deployment->artifactSystem.target : "";
-    const std::vector<std::string> featureKey =
-        nodes.front().deployment ? nodes.front().deployment->key : std::vector<std::string>{};
     for (size_t index = 0; index < nodes.size(); ++index) {
         const ProgramGraphNodeSource &node = nodes[index];
         if (!node.deployment || node.id == UINT32_MAX || node.bundleId.empty() || node.contentHash.empty() ||
@@ -174,9 +174,6 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         if (node.deployment->artifactSystem.target != target)
             return reject(diagnostic, "/nodes/" + std::to_string(node.id),
                           "ProgramGraph nodes target different backends");
-        if (node.deployment->key != featureKey)
-            return reject(diagnostic, "/nodes/" + std::to_string(node.id),
-                          "ProgramGraph nodes selected different feature keys");
         offsets[index].value = valueCount;
         offsets[index].storage = storageCount;
         offsets[index].parameter = parameterCount;
@@ -579,7 +576,7 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         linked.boundarySlots[connection.source] = finalSlot->second;
     }
     program.abi.publication = program::derivePublicationPlan(program.abi.boundarySlots);
-    linked.deployment.key = featureKey;
+    linked.deployment.key.clear();
     artifacts.target = target;
     std::string identity;
     const auto appendIdentity = [&](std::string_view value) {
@@ -592,8 +589,26 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         appendIdentity(std::to_string(node.id));
         appendIdentity(node.bundleId);
         appendIdentity(node.contentHash);
-        for (const std::string &feature : node.deployment->key)
-            appendIdentity(feature);
+        for (const ProgramSpecialization &specialization : node.deployment->key) {
+            appendIdentity(specialization.name);
+            appendIdentity(std::to_string(static_cast<uint32_t>(specialization.kind)));
+            std::visit(
+                [&](const auto &value) {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, float>) {
+                        uint32_t bits = 0;
+                        std::memcpy(&bits, &value, sizeof(bits));
+                        appendIdentity(std::to_string(bits));
+                    } else if constexpr (std::is_same_v<T, double>) {
+                        uint64_t bits = 0;
+                        std::memcpy(&bits, &value, sizeof(bits));
+                        appendIdentity(std::to_string(bits));
+                    } else {
+                        appendIdentity(std::to_string(value));
+                    }
+                },
+                specialization.value);
+        }
     }
     std::vector<ProgramGraphConnection> canonicalConnections = connections;
     std::sort(canonicalConnections.begin(), canonicalConnections.end(), [](const auto &left, const auto &right) {

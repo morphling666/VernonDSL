@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import vernon_dsl as vd
 from shader_lib.mesh import expand_indexed_mesh
-from shader_lib.pbr import pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
+from shader_lib.pbr import ENVIRONMENT, ROCK_TEXTURE, SHADOW, pbr_fragment, pbr_vertex, shadow_fragment, shadow_vertex
 from shader_lib.showcase import sky_fragment, sky_vertex
 from shader_lib.terrain_erosion import apply_erosion_flow, build_terrain_mesh, compute_erosion_flow
 from showcase_common import (
@@ -301,12 +301,17 @@ def main() -> None:
         depth_stencil=vd.DepthStencilState(depth_test=True, depth_write=True),
     )
     render_sky = vd.pipeline(sky_vertex, sky_fragment, state=depth_state)
-    render = vd.pipeline(pbr_vertex, pbr_fragment, state=depth_state, features={"SHADOW", "ENVIRONMENT"})
+    render = vd.pipeline(
+        pbr_vertex,
+        pbr_fragment,
+        state=depth_state,
+        specializations={SHADOW: True, ENVIRONMENT: True},
+    )
     render_terrain = vd.pipeline(
         pbr_vertex,
         pbr_fragment,
         state=depth_state,
-        features={"SHADOW", "ROCK_TEXTURE"},
+        specializations={SHADOW: True, ROCK_TEXTURE: True},
     )
     render_shadow = vd.pipeline(shadow_vertex, shadow_fragment, state=depth_state)
 

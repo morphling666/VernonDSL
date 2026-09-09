@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -109,7 +110,7 @@ struct RuntimeProgramGraphNode {
     uint32_t id{};
     std::string bundleId;
     std::string contentHash;
-    std::vector<vernon::runtime::ProgramVariantDeployment> deployments;
+    vernon::runtime::ProgramVariantDeployment deployment;
     std::filesystem::path bundleRoot;
 };
 
@@ -473,19 +474,65 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
             return false;
         }
         vernon::runtime::ProgramVariantDeployment parsed;
-        for (const nlohmann::json &feature : variant["key"]) {
-            if (!feature.is_string()) {
-                fail(&context, "Program bundle feature names must be strings", VERNON_STATUS_PARSE_ERROR);
+        for (const nlohmann::json &assignment : variant["key"]) {
+            if (!assignment.is_object() || assignment.size() != 2 || !assignment.contains("name") ||
+                !assignment["name"].is_string() || assignment["name"].get_ref<const std::string &>().empty() ||
+                !assignment.contains("value") || !assignment["value"].is_object() || assignment["value"].size() != 2 ||
+                !assignment["value"].contains("tag") || !assignment["value"]["tag"].is_string() ||
+                !assignment["value"].contains("value")) {
+                fail(&context, "Program bundle specialization assignment is invalid", VERNON_STATUS_PARSE_ERROR);
                 return false;
             }
-            parsed.key.push_back(feature.get<std::string>());
+            vernon::runtime::ProgramSpecialization specialization;
+            specialization.name = assignment["name"].get<std::string>();
+            const std::string tag = assignment["value"]["tag"].get<std::string>();
+            const nlohmann::json &value = assignment["value"]["value"];
+            if (tag == "bool" && value.is_boolean()) {
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::Bool;
+                specialization.value = value.get<bool>();
+            } else if (tag == "i32" && value.is_number_integer()) {
+                const int64_t integer = value.get<int64_t>();
+                if (integer < std::numeric_limits<int32_t>::min() || integer > std::numeric_limits<int32_t>::max()) {
+                    fail(&context, "Program bundle i32 specialization is out of range", VERNON_STATUS_PARSE_ERROR);
+                    return false;
+                }
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::I32;
+                specialization.value = static_cast<int32_t>(integer);
+            } else if (tag == "u32" && value.is_number_unsigned()) {
+                const uint64_t integer = value.get<uint64_t>();
+                if (integer > std::numeric_limits<uint32_t>::max()) {
+                    fail(&context, "Program bundle u32 specialization is out of range", VERNON_STATUS_PARSE_ERROR);
+                    return false;
+                }
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::U32;
+                specialization.value = static_cast<uint32_t>(integer);
+            } else if (tag == "f32" && value.is_number_float()) {
+                const float scalar = value.get<float>();
+                if (!std::isfinite(scalar)) {
+                    fail(&context, "Program bundle f32 specialization must be finite", VERNON_STATUS_PARSE_ERROR);
+                    return false;
+                }
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::F32;
+                specialization.value = scalar == 0.0f ? 0.0f : scalar;
+            } else if (tag == "f64" && value.is_number_float()) {
+                const double scalar = value.get<double>();
+                if (!std::isfinite(scalar)) {
+                    fail(&context, "Program bundle f64 specialization must be finite", VERNON_STATUS_PARSE_ERROR);
+                    return false;
+                }
+                specialization.kind = vernon::runtime::ProgramSpecializationKind::F64;
+                specialization.value = scalar == 0.0 ? 0.0 : scalar;
+            } else {
+                fail(&context, "Program bundle specialization value does not match its tag", VERNON_STATUS_PARSE_ERROR);
+                return false;
+            }
+            parsed.key.push_back(std::move(specialization));
         }
-        std::vector<std::string> canonicalKey = parsed.key;
-        std::sort(canonicalKey.begin(), canonicalKey.end());
-        canonicalKey.erase(std::unique(canonicalKey.begin(), canonicalKey.end()), canonicalKey.end());
-        if (canonicalKey != parsed.key || std::any_of(parsed.key.begin(), parsed.key.end(),
-                                                      [](const std::string &feature) { return feature.empty(); })) {
-            fail(&context, "Program bundle feature key is not canonical", VERNON_STATUS_PARSE_ERROR);
+        if (!std::is_sorted(parsed.key.begin(), parsed.key.end()) ||
+            std::adjacent_find(parsed.key.begin(), parsed.key.end(), [](const auto &left, const auto &right) {
+                return left.name == right.name;
+            }) != parsed.key.end()) {
+            fail(&context, "Program bundle specialization key is not canonical", VERNON_STATUS_PARSE_ERROR);
             return false;
         }
         const std::string keyBytes = variant["key"].dump();
@@ -497,7 +544,7 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
         if (std::any_of(result.begin(), result.end(), [&](const vernon::runtime::ProgramVariantDeployment &existing) {
                 return existing.key == parsed.key;
             })) {
-            fail(&context, "Program bundle contains duplicate feature variants", VERNON_STATUS_PARSE_ERROR);
+            fail(&context, "Program bundle contains duplicate specialization variants", VERNON_STATUS_PARSE_ERROR);
             return false;
         }
         vernon::runtime::program::Diagnostic diagnostic;
@@ -522,18 +569,70 @@ bool parseProgramDeployments(VernonRuntimeContext &context, const nlohmann::json
 const vernon::runtime::ProgramVariantDeployment *
 selectProgramDeployment(VernonRuntimeContext &context,
                         const std::vector<vernon::runtime::ProgramVariantDeployment> &variants,
-                        VernonFeatureSetView features) {
-    std::vector<std::string> requested;
-    requested.reserve(features.count);
-    for (size_t index = 0; index < features.count; ++index) {
-        if (!features.names[index] || !*features.names[index]) {
-            fail(&context, "Program bundle feature names must not be empty");
+                        const VernonProgramVariantSelector *selector) {
+    std::vector<vernon::runtime::ProgramSpecialization> requested;
+    if (selector) {
+        if (selector->struct_size < sizeof(*selector) ||
+            (selector->specialization_count && !selector->specializations)) {
+            fail(&context, "Program variant selector is invalid");
             return nullptr;
         }
-        requested.emplace_back(features.names[index]);
+        requested.reserve(selector->specialization_count);
+        for (size_t index = 0; index < selector->specialization_count; ++index) {
+            const VernonProgramSpecialization &source = selector->specializations[index];
+            if (source.struct_size < sizeof(source) || !source.name.data || !source.name.size) {
+                fail(&context, "Program specialization is invalid");
+                return nullptr;
+            }
+            vernon::runtime::ProgramSpecialization destination;
+            destination.name.assign(source.name.data, source.name.size);
+            switch (source.kind) {
+            case VERNON_PROGRAM_SPECIALIZATION_BOOL:
+                if (source.value.boolean_value > 1) {
+                    fail(&context, "Program bool specialization must be zero or one");
+                    return nullptr;
+                }
+                destination.kind = vernon::runtime::ProgramSpecializationKind::Bool;
+                destination.value = source.value.boolean_value != 0;
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_I32:
+                destination.kind = vernon::runtime::ProgramSpecializationKind::I32;
+                destination.value = source.value.i32_value;
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_U32:
+                destination.kind = vernon::runtime::ProgramSpecializationKind::U32;
+                destination.value = source.value.u32_value;
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_F32:
+                if (!std::isfinite(source.value.f32_value)) {
+                    fail(&context, "Program f32 specialization must be finite");
+                    return nullptr;
+                }
+                destination.kind = vernon::runtime::ProgramSpecializationKind::F32;
+                destination.value = source.value.f32_value == 0.0f ? 0.0f : source.value.f32_value;
+                break;
+            case VERNON_PROGRAM_SPECIALIZATION_F64:
+                if (!std::isfinite(source.value.f64_value)) {
+                    fail(&context, "Program f64 specialization must be finite");
+                    return nullptr;
+                }
+                destination.kind = vernon::runtime::ProgramSpecializationKind::F64;
+                destination.value = source.value.f64_value == 0.0 ? 0.0 : source.value.f64_value;
+                break;
+            default:
+                fail(&context, "Program specialization kind is invalid");
+                return nullptr;
+            }
+            requested.push_back(std::move(destination));
+        }
     }
     std::sort(requested.begin(), requested.end());
-    requested.erase(std::unique(requested.begin(), requested.end()), requested.end());
+    if (std::adjacent_find(requested.begin(), requested.end(), [](const auto &left, const auto &right) {
+            return left.name == right.name;
+        }) != requested.end()) {
+        fail(&context, "Program variant selector contains duplicate specialization names");
+        return nullptr;
+    }
     const auto found =
         std::find_if(variants.begin(), variants.end(), [&](const vernon::runtime::ProgramVariantDeployment &variant) {
             return variant.key == requested;
@@ -827,9 +926,7 @@ const program::BoundarySlot *programGraphBoundary(const VernonProgramGraph &grap
         token->node >= graph.nodes.size() || token->kind > VERNON_PROGRAM_SAMPLER)
         return nullptr;
     const RuntimeProgramGraphNode &node = graph.nodes[token->node];
-    if (node.deployments.empty())
-        return nullptr;
-    const auto &boundaries = node.deployments.front().program.abi.boundarySlots;
+    const auto &boundaries = node.deployment.program.abi.boundarySlots;
     return token->local_slot < boundaries.size() && boundaries[token->local_slot].id == token->local_slot
                ? &boundaries[token->local_slot]
                : nullptr;
@@ -892,16 +989,21 @@ void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph) {
 }
 
 VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph, const VernonProgramBundle *bundle,
+                                                 const VernonProgramVariantSelector *selector,
                                                  VernonProgramNodeId *node) {
     RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
     if (!graph || !bundle || !node || bundle->context != graph->context || graph->nodes.size() >= UINT32_MAX)
         return fail(graph ? graph->context : nullptr, "invalid ProgramGraph node");
     try {
+        const ProgramVariantDeployment *deployment =
+            selectProgramDeployment(*graph->context, bundle->deployments, selector);
+        if (!deployment)
+            return VERNON_STATUS_PARSE_ERROR;
         RuntimeProgramGraphNode source;
         source.id = static_cast<uint32_t>(graph->nodes.size());
         source.bundleId = bundle->id;
         source.contentHash = bundle->contentHash;
-        source.deployments = bundle->deployments;
+        source.deployment = *deployment;
         source.bundleRoot = bundle->bundleRoot;
         graph->nodes.push_back(std::move(source));
         *node = graph->nodes.back().id;
@@ -917,26 +1019,15 @@ VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *gra
     RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
     const auto expectedRole = reflectedBoundaryRole(role);
     if (!graph || !expectedRole || !token || token->struct_size < sizeof(*token) || (name.size && !name.data) ||
-        node >= graph->nodes.size() || graph->nodes[node].deployments.empty())
+        node >= graph->nodes.size())
         return fail(graph ? graph->context : nullptr, "invalid ProgramGraph boundary lookup");
-    const program::Program &program = graph->nodes[node].deployments.front().program;
+    const program::Program &program = graph->nodes[node].deployment.program;
     const auto found = std::find_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
                                     [&](const program::BoundarySlot &slot) {
                                         return slot.role == *expectedRole && stringViewEquals(name, slot.path);
                                     });
     if (found == program.abi.boundarySlots.end())
         return fail(graph->context, "ProgramGraph node boundary was not found");
-    for (const ProgramVariantDeployment &deployment : graph->nodes[node].deployments) {
-        if (found->id >= deployment.program.abi.boundarySlots.size()) {
-            return fail(graph->context, "ProgramGraph variants have different boundary contracts",
-                        VERNON_STATUS_PARSE_ERROR);
-        }
-        const program::BoundarySlot &candidate = deployment.program.abi.boundarySlots[found->id];
-        if (!sameProgramGraphBoundaryContract(*found, candidate)) {
-            return fail(graph->context, "ProgramGraph variants have different boundary contracts",
-                        VERNON_STATUS_PARSE_ERROR);
-        }
-    }
     token->graph_id = graph->id;
     token->node = node;
     token->local_slot = found->id;
@@ -1070,7 +1161,7 @@ VernonStatus vernonRuntimeProgramGraphFindGraphicsNode(const VernonProgramGraph 
                                                        VernonStringView name, VernonProgramNodeGraphicsToken *token) {
     RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
     if (!graph || !token || token->struct_size < sizeof(*token) || !name.data || !name.size ||
-        node >= graph->nodes.size() || graph->nodes[node].deployments.empty())
+        node >= graph->nodes.size())
         return fail(graph ? graph->context : nullptr, "invalid ProgramGraph graphics node lookup");
     const auto findNode = [&](const ProgramVariantDeployment &deployment) -> const program::Node * {
         const program::Graph *forward = program::findGraph(deployment.program, "forward");
@@ -1082,15 +1173,9 @@ VernonStatus vernonRuntimeProgramGraphFindGraphicsNode(const VernonProgramGraph 
         });
         return found == forward->nodes.end() ? nullptr : &*found;
     };
-    const program::Node *selected = findNode(graph->nodes[node].deployments.front());
+    const program::Node *selected = findNode(graph->nodes[node].deployment);
     if (!selected)
         return fail(graph->context, "ProgramGraph graphics node was not found");
-    for (const ProgramVariantDeployment &deployment : graph->nodes[node].deployments) {
-        const program::Node *candidate = findNode(deployment);
-        if (!candidate || candidate->id != selected->id)
-            return fail(graph->context, "ProgramGraph variants have different graphics node contracts",
-                        VERNON_STATUS_PARSE_ERROR);
-    }
     token->graph_id = graph->id;
     token->node = node;
     token->local_node = selected->id;
@@ -1098,9 +1183,9 @@ VernonStatus vernonRuntimeProgramGraphFindGraphicsNode(const VernonProgramGraph 
 }
 
 size_t vernonRuntimeProgramGraphGetGraphicsNodeCount(const VernonProgramGraph *graph, VernonProgramNodeId node) {
-    if (!graph || node >= graph->nodes.size() || graph->nodes[node].deployments.empty())
+    if (!graph || node >= graph->nodes.size())
         return 0;
-    const program::Graph *forward = program::findGraph(graph->nodes[node].deployments.front().program, "forward");
+    const program::Graph *forward = program::findGraph(graph->nodes[node].deployment.program, "forward");
     return forward ? static_cast<size_t>(std::count_if(forward->nodes.begin(), forward->nodes.end(),
                                                        [](const program::Node &candidate) {
                                                            return program::executionKind(candidate) ==
@@ -1112,8 +1197,7 @@ size_t vernonRuntimeProgramGraphGetGraphicsNodeCount(const VernonProgramGraph *g
 VernonStatus vernonRuntimeProgramGraphGetGraphicsNodeByIndex(const VernonProgramGraph *graph, VernonProgramNodeId node,
                                                              size_t index, VernonProgramNodeGraphicsToken *token) {
     RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
-    if (!graph || !token || token->struct_size < sizeof(*token) || node >= graph->nodes.size() ||
-        graph->nodes[node].deployments.empty())
+    if (!graph || !token || token->struct_size < sizeof(*token) || node >= graph->nodes.size())
         return fail(graph ? graph->context : nullptr, "invalid ProgramGraph graphics node index");
     const auto findNode = [&](const ProgramVariantDeployment &deployment) -> const program::Node * {
         const program::Graph *forward = program::findGraph(deployment.program, "forward");
@@ -1125,26 +1209,20 @@ VernonStatus vernonRuntimeProgramGraphGetGraphicsNodeByIndex(const VernonProgram
                 return &candidate;
         return nullptr;
     };
-    const program::Node *selected = findNode(graph->nodes[node].deployments.front());
+    const program::Node *selected = findNode(graph->nodes[node].deployment);
     if (!selected)
         return fail(graph->context, "ProgramGraph graphics node index is out of range");
-    for (const ProgramVariantDeployment &deployment : graph->nodes[node].deployments) {
-        const program::Node *candidate = findNode(deployment);
-        if (!candidate || candidate->id != selected->id)
-            return fail(graph->context, "ProgramGraph variants have different graphics node contracts",
-                        VERNON_STATUS_PARSE_ERROR);
-    }
     token->graph_id = graph->id;
     token->node = node;
     token->local_node = selected->id;
     return VERNON_STATUS_OK;
 }
 
-VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph, VernonFeatureSetView features) {
+VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph) {
     if (!graph)
         return nullptr;
     RuntimeDiagnosticScope diagnostic(graph->context);
-    if ((features.count && !features.names) || graph->nodes.empty()) {
+    if (graph->nodes.empty()) {
         fail(graph->context, "invalid ProgramGraph resolve invocation");
         return nullptr;
     }
@@ -1152,11 +1230,7 @@ VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *gr
         std::vector<ProgramGraphNodeSource> sources;
         sources.reserve(graph->nodes.size());
         for (RuntimeProgramGraphNode &node : graph->nodes) {
-            const ProgramVariantDeployment *selected =
-                selectProgramDeployment(*graph->context, node.deployments, features);
-            if (!selected)
-                return nullptr;
-            sources.push_back({node.id, node.bundleId, node.contentHash, selected, node.bundleRoot});
+            sources.push_back({node.id, node.bundleId, node.contentHash, &node.deployment, node.bundleRoot});
         }
         std::vector<ProgramGraphConnection> connections;
         for (const RuntimeProgramGraphValue &value : graph->values)
@@ -1229,17 +1303,14 @@ VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *gr
     }
 }
 
-VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle, VernonFeatureSetView features) {
+VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
+                                                     const VernonProgramVariantSelector *selector) {
     if (!bundle)
         return nullptr;
     try {
         RuntimeDiagnosticScope diagnostic(bundle->context);
-        if (features.count && !features.names) {
-            invocationDiagnostic(*bundle->context) = "invalid pipeline feature set";
-            return nullptr;
-        }
         const vernon::runtime::ProgramVariantDeployment *selected =
-            selectProgramDeployment(*bundle->context, bundle->deployments, features);
+            selectProgramDeployment(*bundle->context, bundle->deployments, selector);
         VernonProgramExecutable *executable =
             selected ? resolveProgramDeployment(*bundle->context, *selected, bundle->bundleRoot) : nullptr;
         if (executable)

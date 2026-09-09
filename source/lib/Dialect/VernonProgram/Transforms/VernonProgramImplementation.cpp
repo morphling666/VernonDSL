@@ -108,7 +108,6 @@ LogicalResult replaceWithBuiltin(Operation *operation, StringRef implementation,
     state.addTypes(operation->getResultTypes());
     state.addAttribute("callee", builder.getStringAttr((Twine("vernon.builtin.") + implementation).str()));
     state.addAttribute("grid", builder.getDenseI64ArrayAttr(*grid));
-    state.addAttribute("features", builder.getArrayAttr({}));
     state.addAttribute(
         "operand_names",
         operandNames(builder, implementation, useSuppliedOperands ? operands.size() : operation->getNumOperands()));

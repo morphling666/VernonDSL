@@ -25,6 +25,7 @@ from ..storage import from_values as storage_from_values
 from ..storage import tangent_zeros as storage_tangent_zeros
 from ..storage import zeros as storage_zeros
 from ..storage import zeros_like as storage_zeros_like
+from ..types import specialization_key
 from .runtime_types import RuntimeParameterDescriptor
 
 _COMPARE = {
@@ -393,7 +394,7 @@ class _ForwardInterpreter:
                 self.capture.leave_module()
         if _is_kernel(callee):
             grid = keywords.pop("grid", None)
-            features = keywords.pop("features", ())
+            specializations = keywords.pop("specializations", None)
             if keywords:
                 raise TypeError(f"{callee.__name__} got unexpected Module.forward() keywords {sorted(keywords)}")
             grid_value = None
@@ -409,12 +410,12 @@ class _ForwardInterpreter:
                 ):
                     raise TypeError("grid must contain three positive compile-time integers or scalar Program values")
                 grid_value = grid
-            feature_value = _require_comptime(features, what="features")
+            specialization_value = _require_comptime(specializations, what="specializations")
             self.capture.capture_kernel(
                 callee,
                 tuple(args),
                 grid_value,
-                tuple(feature_value),
+                specialization_key(specialization_value),
             )
             return None
         if _is_pipeline(callee):
@@ -444,7 +445,14 @@ class _ForwardInterpreter:
 
                 if not isinstance(dynamic_state, DynamicState):
                     raise TypeError("dynamic_state must be a DynamicState or None")
-            self.capture.capture_graphics(callee, keywords, render_pass, draw, dynamic_state)
+            self.capture.capture_graphics(
+                callee,
+                keywords,
+                render_pass,
+                draw,
+                dynamic_state,
+                callee._variant,
+            )
             return None
         attachment_aspect = getattr(callee, "__vernon_attachment_output__", None)
         if attachment_aspect is not None:

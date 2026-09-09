@@ -154,7 +154,6 @@ module {
     %result = "vernon_program.compute"(%source) {
       callee = "Module.square",
       grid = array<i64: 1, 1, 1>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"]
     } : (f32) -> f32
@@ -179,7 +178,6 @@ module {
       callee = "Module.square",
       grid = array<i64: 1, 7, 1>,
       vernon_program.grid_control_arguments = array<i64: 1, -1, 2>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"]
     } : (f32) -> f32

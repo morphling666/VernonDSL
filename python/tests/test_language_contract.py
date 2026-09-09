@@ -39,6 +39,7 @@ from vernon_dsl.language.stage_registry import (
     validate_graphics_topology,
 )
 from vernon_dsl.shader_contracts import ATOMIC_OPERATION_NAMES, DEVICE_ONLY_OPERATION_NAMES
+from vernon_dsl.types import SpecializationAssignment
 
 
 class LanguageVersionTests(unittest.TestCase):
@@ -1514,7 +1515,9 @@ class NumericInferenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             disabled = Compiler().compile_request(FrontendCompileRequest(main, "main"))
-            enabled = Compiler().compile_request(FrontendCompileRequest(main, "main", ("DOUBLE",)))
+            enabled = Compiler().compile_request(
+                FrontendCompileRequest(main, "main", (SpecializationAssignment("DOUBLE", "bool", True),))
+            )
 
         disabled_keys = [
             argument_types for name, argument_types, _ in disabled.helper_specializations if name.endswith("identity")

@@ -72,7 +72,7 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *pipeline = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(pipeline, nullptr) << lastError(context);
     ASSERT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(pipeline), 1u);
     const auto &boundarySlots = pipeline->executionPlan->resolvedProgram->program.abi.boundarySlots;
@@ -237,7 +237,7 @@ LoadedProgram loadProgram(vernon::tests::OwnedRhiRuntime &owned, const std::file
     result.bundle =
         vernonRuntimeLoadProgramBundleWithOptions(owned.runtime(), manifest.data(), manifest.size(), &options);
     if (result.bundle)
-        result.executable = vernonRuntimeResolveProgram(result.bundle, {nullptr, 0});
+        result.executable = vernonRuntimeResolveProgram(result.bundle, nullptr);
     return result;
 }
 

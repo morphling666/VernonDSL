@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from .frontend.model import ConcreteType
 from .frontend.runtime_types import RuntimeParameterDescriptor
+from .types import SpecializationAssignment
 
 
 class OperationKind(Enum):
@@ -198,7 +199,7 @@ class KernelCallOp:
     inputs: Mapping[str, int]
     outputs: Mapping[str, int]
     grid: tuple[DispatchControl, DispatchControl, DispatchControl]
-    features: tuple[str, ...]
+    specializations: tuple[SpecializationAssignment, ...]
 
 
 @dataclass(frozen=True)
@@ -214,7 +215,7 @@ class GraphicsCallOp:
     outputs: Mapping[str, int]
     attachment_names: tuple[str, ...]
     color_count: int
-    features: tuple[str, ...]
+    specializations: tuple[SpecializationAssignment, ...]
 
 
 def _resource_owner(value: Any) -> Any | None:
@@ -302,7 +303,7 @@ class OperationGraph:
         binding_slots: Mapping[str, int],
         parameters: tuple[KernelParameter, ...],
         grid: tuple[int | GraphValueInput, int | GraphValueInput, int | GraphValueInput],
-        features: tuple[str, ...],
+        specializations: tuple[SpecializationAssignment, ...],
     ) -> KernelCallOp:
         operation_id = len(self._nodes)
         inputs: dict[str, int] = {}
@@ -326,7 +327,7 @@ class OperationGraph:
             MappingProxyType(inputs),
             MappingProxyType(outputs),
             tuple(DispatchControl.from_value(component) for component in grid),
-            features,
+            specializations,
         )
         self._nodes.append(operation)
         return operation
@@ -342,7 +343,7 @@ class OperationGraph:
         parameters: tuple[KernelParameter, ...],
         attachments: tuple[GraphControlResource, ...],
         color_count: int,
-        features: tuple[str, ...],
+        specializations: tuple[SpecializationAssignment, ...],
     ) -> GraphicsCallOp:
         operation_id = len(self._nodes)
         inputs: dict[str, int] = {attachment.name: self._current_version(attachment) for attachment in attachments}
@@ -369,7 +370,7 @@ class OperationGraph:
             MappingProxyType(outputs),
             tuple(attachment.name for attachment in attachments),
             color_count,
-            features,
+            specializations,
         )
         self._nodes.append(operation)
         return operation

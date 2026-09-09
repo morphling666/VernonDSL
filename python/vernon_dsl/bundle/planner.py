@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
 from ..language.stage_registry import validate_stage_target
+from ..types import SpecializationAssignment, specialization_key_data
 from .reflection import (
     compiled_stage_from_program,
     parse_reflection_json,
@@ -27,7 +28,7 @@ def build_program_plan(
     target: TargetOptions,
     variants: Sequence[
         tuple[
-            Sequence[str],
+            Sequence[SpecializationAssignment],
             Mapping[str, CompiledStage],
             Mapping[str, Any],
         ]
@@ -88,7 +89,7 @@ def build_program_plan(
                 {name: stage.id for name, stage in stages.items()},
             )
         )
-    variant_plans.sort(key=lambda variant: canonical_json(list(variant.key)))
+    variant_plans.sort(key=lambda variant: canonical_json(specialization_key_data(variant.key)))
     return BundlePlan(
         program_id,
         target,

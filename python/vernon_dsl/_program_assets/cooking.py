@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..bundle import OpenGLTargetOptions, ProgramCompileError, TargetOptions, make_target_options
-from ..module_graph import load_project
 from .artifact_io import write_bundle_artifacts
 from .capture import CapturedProgram, capture_program
 from .compile_orchestration import compile_captured_program
@@ -35,12 +34,6 @@ def cook_program_asset(
         target = OpenGLTargetOptions()
     elif isinstance(target, str):
         target = make_target_options(target)
-
-    declared_features = set(load_project(source).features)
-    for variant in captured.variant_keys:
-        unknown = set(variant) - declared_features
-        if unknown:
-            raise ProgramCompileError("variant requests undeclared feature(s): " + ", ".join(sorted(unknown)))
 
     _validate_captured_target(captured, target)
     plan = compile_captured_program(captured, target)

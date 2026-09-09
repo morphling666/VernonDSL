@@ -7,7 +7,6 @@ import dataclasses
 import inspect
 from collections.abc import Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, get_args
 
 from ._runtime.tensor import TensorStorage, TensorView
@@ -25,6 +24,7 @@ from .operation_graph import (
     ProgramControlRef,
     ProgramControlSource,
 )
+from .types import SpecializationAssignment
 
 
 def _symbolic_program_inputs(parameter_types: Mapping[str, Any]) -> dict[str, Any]:
@@ -92,14 +92,6 @@ def _one_node_program(
         output_names,
     )
     return template, invocation, parsed
-
-
-def _graphics_stage_frontend(pipeline: Any, stage: Any) -> Any:
-    from .compiler import Compiler, FrontendCompileRequest
-
-    function = stage.function
-    source = Path(inspect.getsourcefile(function) or "").resolve()
-    return Compiler().compile_request(FrontendCompileRequest(source, function.__name__, tuple(pipeline._features)))
 
 
 # Attachment logical types are built as "2d" below, so a declared attachment has two extent components.
@@ -276,8 +268,7 @@ class CapturedKernelCall:
     kernel: Any
     arguments: tuple[Any, ...]
     grid: tuple[Any, Any, Any]
-    features: tuple[str, ...]
-    lowered: Any = None
+    specializations: tuple[SpecializationAssignment, ...]
 
 
 @dataclass(frozen=True)
@@ -291,7 +282,7 @@ class CapturedGraphicsCall:
     render_pass_ref: ProgramControlRef
     draw_ref: ProgramControlRef
     dynamic_state_ref: ProgramControlRef
-    frontends: tuple[Any, ...] = ()
+    specializations: tuple[SpecializationAssignment, ...]
 
 
 class _ControlIdentityRegistry:
@@ -349,9 +340,7 @@ class ProgramCapture:
         kernel: Any,
         arguments: tuple[Any, ...],
         grid: tuple[Any, Any, Any] | None,
-        features: tuple[str, ...],
-        *,
-        lowered: Any = None,
+        specializations: tuple[SpecializationAssignment, ...],
     ) -> None:
         dispatch_grid = grid or (1, 1, 1)
         if len(dispatch_grid) != 3:
@@ -365,7 +354,15 @@ class ProgramCapture:
         ordinal = self._name_counts.get(base, 0)
         self._name_counts[base] = ordinal + 1
         name = base if ordinal == 0 else f"{base}.{ordinal}"
-        self.ops.append(CapturedKernelCall(name, kernel, arguments, dispatch_grid, tuple(features), lowered))
+        self.ops.append(
+            CapturedKernelCall(
+                name,
+                kernel,
+                arguments,
+                dispatch_grid,
+                tuple(specializations),
+            )
+        )
 
     def capture_graphics(
         self,
@@ -374,8 +371,7 @@ class ProgramCapture:
         render_pass: Any,
         draw: Any,
         dynamic_state: Any,
-        *,
-        frontends: tuple[Any, ...] = (),
+        specializations: tuple[SpecializationAssignment, ...],
     ) -> None:
         base = ".".join((*self._scopes, "graphics"))
         ordinal = self._name_counts.get(base, 0)
@@ -392,7 +388,7 @@ class ProgramCapture:
                 self.control_ref(render_pass, "render_pass"),
                 self.control_ref(draw, "draw"),
                 self.control_ref(dynamic_state, "dynamic_state"),
-                frontends,
+                tuple(specializations),
             )
         )
 
@@ -420,7 +416,7 @@ class KernelCallTemplate:
     parameter_names: tuple[str, ...]
     parameters: tuple[KernelParameter, ...]
     grid: tuple[Any, Any, Any]
-    features: tuple[str, ...]
+    specializations: tuple[SpecializationAssignment, ...]
 
 
 @dataclass(frozen=True)
@@ -429,7 +425,7 @@ class GraphicsCallTemplate:
     pipeline: Any
     parameter_names: tuple[str, ...]
     parameters: tuple[KernelParameter, ...]
-    features: tuple[str, ...]
+    specializations: tuple[SpecializationAssignment, ...]
     implementations: tuple[tuple[str, str, str], ...]
     structs: tuple[tuple[str, tuple[Any, ...]], ...]
 
@@ -448,13 +444,10 @@ class ProgramTemplate:
                 parameters: dict[str, KernelParameter] = {}
                 implementations: list[tuple[str, str, str]] = []
                 structs: dict[str, tuple[Any, ...]] = {}
+                frontends = captured.pipeline._frontends(captured.specializations)
                 for stage_index, stage in enumerate(captured.pipeline._stages):
                     function = stage.function
-                    frontend = (
-                        captured.frontends[stage_index]
-                        if captured.frontends
-                        else _graphics_stage_frontend(captured.pipeline, stage)
-                    )
+                    frontend = frontends[stage_index]
                     implementations.append((stage.kind, function.__name__, frontend.mlir))
                     for struct_name, struct_fields in frontend.structs:
                         previous_fields = structs.get(struct_name)
@@ -492,14 +485,14 @@ class ProgramTemplate:
                         captured.pipeline,
                         parameter_names,
                         tuple(parameters[name] for name in parameter_names),
-                        tuple(captured.pipeline._features),
+                        captured.specializations,
                         tuple(implementations),
                         tuple(sorted(structs.items())),
                     )
                 )
                 continue
             assert isinstance(captured, CapturedKernelCall)
-            lowered = captured.lowered or captured.kernel._lower(captured.features)
+            lowered = captured.kernel._lower(captured.specializations)
             frontend = lowered.frontend
             builtin_names = lowered.builtins
             parameter_names = tuple(
@@ -536,7 +529,7 @@ class ProgramTemplate:
                     parameter_names,
                     tuple(parameters),
                     captured.grid,
-                    captured.features,
+                    captured.specializations,
                 )
             )
         return cls(tuple(calls))
@@ -574,7 +567,11 @@ class ProgramTemplate:
             template = self.calls[call_index]
             call_index += 1
             if isinstance(captured, CapturedGraphicsCall):
-                if not isinstance(template, GraphicsCallTemplate) or template.pipeline is not captured.pipeline:
+                if (
+                    not isinstance(template, GraphicsCallTemplate)
+                    or template.pipeline is not captured.pipeline
+                    or template.specializations != captured.specializations
+                ):
                     raise RuntimeError("Module graphics sequence changed for an existing Program specialization")
                 first_slot = len(slots)
                 arguments = tuple(
@@ -614,7 +611,7 @@ class ProgramTemplate:
                     parameters=template.parameters,
                     attachments=attachments,
                     color_count=color_count,
-                    features=template.features,
+                    specializations=template.specializations,
                 )
                 operation_bindings[operation.id] = (
                     *arguments,
@@ -628,7 +625,7 @@ class ProgramTemplate:
             if (
                 template.kernel is not captured.kernel
                 or template.grid != captured.grid
-                or template.features != captured.features
+                or template.specializations != captured.specializations
             ):
                 raise RuntimeError("Module kernel sequence changed for an existing Program specialization")
             first_slot = len(slots)
@@ -642,7 +639,7 @@ class ProgramTemplate:
                 binding_slots=binding_slots,
                 parameters=template.parameters,
                 grid=template.grid,
-                features=template.features,
+                specializations=template.specializations,
             )
             operation_bindings[operation.id] = captured.arguments
         graph.set_outputs(
@@ -1003,14 +1000,17 @@ def _parse_module_program(
     )
 
 
-def _parse_pipeline_program(pipeline: Any, features: tuple[str, ...] = ()) -> Any:
+def _parse_pipeline_program(
+    pipeline: Any,
+    specializations: tuple[SpecializationAssignment, ...] = (),
+) -> Any:
     """Capture a bare vd.pipeline(...) as a one-node Program, the way a Module calling one is captured.
 
     The render pass, draw, and dynamic state stay symbolic controls with no prototype, so nothing about a particular
     invocation reaches the manifest. Attachment formats come from the pipeline's declared targets instead.
     """
 
-    frontends = pipeline._frontends(tuple(features))
+    frontends = pipeline._frontends(specializations)
     parameter_types = pipeline._parameter_types(None, frontends, None, None, None)
     arguments = tuple(name for name in parameter_types if not name.startswith("__"))
     _, _, parsed = _one_node_program(
@@ -1022,7 +1022,7 @@ def _parse_pipeline_program(pipeline: Any, features: tuple[str, ...] = ()) -> An
             inputs["__render_pass"],
             inputs["__draw"],
             inputs["__dynamic_state"],
-            frontends=frontends,
+            specializations,
         ),
         output_names=None,
     )
@@ -1031,19 +1031,19 @@ def _parse_pipeline_program(pipeline: Any, features: tuple[str, ...] = ()) -> An
 
 def _parse_kernel_program(
     kernel: Any,
-    features: tuple[str, ...] = (),
     *,
+    specializations: tuple[SpecializationAssignment, ...] = (),
     transform: Any | None = None,
 ) -> Any:
     """Capture a compute Kernel or Kernel VJP as the same one-node Program used by Modules."""
 
-    return _capture_kernel_program(kernel, features, transform=transform)[3]
+    return _capture_kernel_program(kernel, specializations=specializations, transform=transform)[3]
 
 
 def _capture_kernel_program(
     kernel: Any,
-    features: tuple[str, ...] = (),
     *,
+    specializations: tuple[SpecializationAssignment, ...] = (),
     transform: Any | None = None,
 ) -> tuple[ProgramCapture, ProgramTemplate, ProgramInvocation, Any, tuple[str, ...], Any]:
     """Capture a compute Kernel as an executable canonical one-node Program."""
@@ -1052,8 +1052,8 @@ def _capture_kernel_program(
     from .types import u32
 
     function = kernel._function
-    lowered = kernel._lower(features)
-    annotations = inspect.get_annotations(function, eval_str=True)
+    lowered = kernel._lower(specializations)
+    annotations = kernel._resolved_annotations(specializations)
     parameter_names = tuple(name for name in inspect.signature(function).parameters if name not in lowered.builtins)
     parameter_types: dict[str, Any] = {}
     for name in parameter_names:
@@ -1071,8 +1071,7 @@ def _capture_kernel_program(
             kernel,
             tuple(inputs[name] for name in parameter_names),
             tuple(inputs[f"__grid_{axis}"] for axis in "xyz"),
-            features,
-            lowered=lowered,
+            specializations,
         ),
         output_names=None,
     )
@@ -1175,7 +1174,6 @@ class _PrimalSpecialization:
     invocation: ProgramInvocation
     signature: inspect.Signature
     allocations: tuple[_AllocationSpec, ...]
-    calls: tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...]
     outputs: _TreeRecipe
     native_program: Any
 
@@ -1197,7 +1195,6 @@ def _capture_recipes(
     outputs: Any,
 ) -> tuple[
     tuple[_AllocationSpec, ...],
-    tuple[tuple[Any, tuple[_ValueRecipe, ...], tuple[int, int, int], tuple[str, ...]], ...],
     _TreeRecipe,
 ]:
     inputs = tuple(capture.inputs.items())
@@ -1260,20 +1257,11 @@ def _capture_recipes(
             return _TreeRecipe("list", tuple(tree(member) for member in value))
         raise TypeError("Module output contains a value that cannot be reconstructed from Program IR")
 
-    calls = tuple(
-        (
-            call.kernel,
-            tuple(recipe(value) for value in call.arguments),
-            call.grid,
-            call.features,
-        )
-        for call in capture.calls
-    )
     allocations = tuple(
         _AllocationSpec(alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values)
         for alloc in capture.allocs
     )
-    return allocations, calls, tree(outputs)
+    return allocations, tree(outputs)
 
 
 def _primal_specialization(
@@ -1282,7 +1270,7 @@ def _primal_specialization(
     outputs: Any,
     invocation: ProgramInvocation,
 ) -> _PrimalSpecialization:
-    allocations, calls, output_recipe = _capture_recipes(capture, outputs)
+    allocations, output_recipe = _capture_recipes(capture, outputs)
     from .program_frontend import parse_program
 
     parsed = parse_program(invocation)
@@ -1294,7 +1282,6 @@ def _primal_specialization(
         invocation,
         type(module)._module_definition.signature,
         allocations,
-        calls,
         output_recipe,
         compile_program(parsed, invocation.template),
     )
@@ -1416,7 +1403,7 @@ def execute_module_vjp(
         from ._runtime.program_autodiff import compile_program_autodiff
 
         compiled = compile_program_autodiff(parsed_program, template)
-        allocations, _, output_recipe = _capture_recipes(capture, outputs)
+        allocations, output_recipe = _capture_recipes(capture, outputs)
         specialization = _VjpSpecialization(
             compiled,
             invocation,

@@ -123,7 +123,7 @@ module {
         : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %square = "vernon_program.compute"(%source, %square_buffer) {
-      callee = "square", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "square", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>,
@@ -137,7 +137,7 @@ module {
         : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %cube = "vernon_program.compute"(%source, %cube_buffer) {
-      callee = "cube", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "cube", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>,
@@ -266,7 +266,7 @@ module {
         : (!vernon.tensor_view<f32, [1], "read_write", "device">) ->
           !vernon.tensor_view<f32, [1], "read_write", "device">
     %kept, %unused = "vernon_program.compute"(%source, %kept_dest, %unused_dest) {
-      callee = "pair", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "pair", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "kept", "unused"],
       result_names = ["kept", "unused"],
       vernon_program.operand_accesses = ["read", "write", "write"],
@@ -332,13 +332,13 @@ TEST_F(VernonStructuredVjpTest, AggregateDerivativeProjectsDifferentiableLeafAbi
 module {
   "vernon.struct"() {
     sym_name = "Particle",
-    fields = ["velocity:tensor<2xf32>", "mass:f32", "tag:i32"],
-    abi_leaf_dtypes = ["f32", "f32", "i32"]
+    fields = ["velocity:tensor<2xf16>", "mass:f32", "tag:i32"],
+    abi_leaf_dtypes = ["f16", "f32", "i32"]
   } : () -> ()
   func.func @primal(
       %particles: !vernon.tensor_view<!vernon.struct<"Particle">, [1], "read", "device">
           {vernon.source_name = "particles",
-           vernon.abi_leaf_dtypes = ["f32", "f32", "i32"]}) {
+           vernon.abi_leaf_dtypes = ["f16", "f32", "i32"]}) {
     func.return
   }
 }
@@ -349,7 +349,7 @@ module {
     FailureOr<Type> derivative = getAutodiffDerivativeType(primal.getArgument(0).getType(), *module, "write");
     ASSERT_TRUE(succeeded(derivative));
     FailureOr<SmallVector<StringRef>> dtypes =
-        getAutodiffDerivativeLogicalLeafDtypes(primal.getArgument(0).getType(), *module, {"f32", "f32", "i32"});
+        getAutodiffDerivativeLogicalLeafDtypes(primal.getArgument(0).getType(), *module, {"f16", "f32", "i32"});
     ASSERT_TRUE(succeeded(dtypes));
     EXPECT_EQ(*dtypes, SmallVector<StringRef>({"f32", "f32"}));
 
@@ -435,17 +435,17 @@ module {
       -> !vernon.tensor<!vernon.struct<"Pair">, [2]>
       attributes {vernon_program.graph = "primal"} {
     %left = "vernon_program.compute"(%input) {
-      callee = "left", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "left", grid = array<i64: 1, 1, 1>,
       operand_names = ["input"], result_names = ["output"]
     } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>) ->
         (!vernon.tensor<!vernon.struct<"Pair">, [2]>)
     %right = "vernon_program.compute"(%input) {
-      callee = "right", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "right", grid = array<i64: 1, 1, 1>,
       operand_names = ["input"], result_names = ["output"]
     } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>) ->
         (!vernon.tensor<!vernon.struct<"Pair">, [2]>)
     %output = "vernon_program.compute"(%left, %right) {
-      callee = "merge", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "merge", grid = array<i64: 1, 1, 1>,
       operand_names = ["left", "right"], result_names = ["output"]
     } : (!vernon.tensor<!vernon.struct<"Pair">, [2]>,
          !vernon.tensor<!vernon.struct<"Pair">, [2]>) ->

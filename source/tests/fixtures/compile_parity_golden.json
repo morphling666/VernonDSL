@@ -27,10 +27,16 @@
       }
     ],
     "variants": [
+      [],
       [
-        "OFFSET"
-      ],
-      []
+        {
+          "name": "OFFSET",
+          "value": {
+            "tag": "bool",
+            "value": true
+          }
+        }
+      ]
     ]
   }
 }

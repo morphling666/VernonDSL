@@ -14,6 +14,7 @@ import hashlib
 from typing import Any, Mapping
 
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
+from ..types import specialization_key_data
 from .requirements import runtime_requirements
 from .types import BundlePlan, ProgramCompileError, ProgramVariantPlan, canonical_json
 
@@ -125,7 +126,7 @@ def _deploy_program_variant(
     requirements.pop("compute_workgroup_size", None)
     return (
         {
-            "key": list(variant.key),
+            "key": specialization_key_data(variant.key),
             "program": copy.deepcopy(dict(variant.program)),
             "artifact_system": {
                 "runtime_requirements": requirements,

@@ -11,7 +11,6 @@ module {
       -> tensor<2x2xf32> attributes {vernon_program.graph = "primal"} {
     %normalized = "vernon_program.compute"(%left) {
       callee = "normalize",
-      features = [],
       grid = array<i64: 1, 1, 1>,
       operand_names = ["input"],
       result_names = ["result"]

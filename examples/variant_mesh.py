@@ -35,5 +35,5 @@ mesh_asset = vd.program_asset(
         mesh_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((), (INSTANCE,), (SKIN,), (INSTANCE, SKIN)),
+    variants=({}, {INSTANCE: True}, {SKIN: True}, {INSTANCE: True, SKIN: True}),
 )

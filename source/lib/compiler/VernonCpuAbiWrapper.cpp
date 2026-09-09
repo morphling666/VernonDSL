@@ -223,6 +223,7 @@ llvm::Error emitCpuAbiWrapper(llvm::Module &module, const CpuAbiWrapperMetadata 
     llvm::Function *function = module.getFunction(metadata.internalFunctionSymbol);
     if (!function)
         return invalidAbi("CPU ABI wrapper internal function '" + metadata.internalFunctionSymbol + "' does not exist");
+    function->setLinkage(llvm::GlobalValue::InternalLinkage);
     if (metadata.requiresPhases) {
         llvm::Expected<llvm::Function *> coroutine = createPhaseCoroutine(module, *function, metadata.resultCallLanes);
         if (!coroutine)

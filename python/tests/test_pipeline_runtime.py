@@ -12,6 +12,7 @@ import vernon_dsl as vd
 import vernon_dsl._runtime.pipeline as pipeline_module
 import vernon_dsl._runtime.session as runtime_module
 from advanced_pipeline_shader import (
+    PICKING,
     advanced_fragment,
     advanced_vertex,
 )
@@ -24,6 +25,7 @@ from aggregate_vertex_shader import (
     small_multidimensional_aggregate_attribute_vertex,
 )
 from pipeline_shader import (
+    OPTIONAL_IMAGE,
     colored_fragment,
     copy_static_tensor_value,
     cube_direction_fragment,
@@ -594,7 +596,11 @@ def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
     np.testing.assert_array_equal(target.to_numpy()[4, 4], np.array((0, 255, 0, 255), dtype=np.uint8))
 
     enabled_target = vd.Texture.zeros(shape=(8, 8))
-    vd.pipeline(triangle_vertex, optional_texture_fragment, features={"OPTIONAL_IMAGE"})(
+    vd.pipeline(
+        triangle_vertex,
+        optional_texture_fragment,
+        specializations={OPTIONAL_IMAGE: True},
+    )(
         position=positions,
         base_image=base_image,
         base_sampler=vd.sampler(),
@@ -945,7 +951,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             render_pass=render_pass,
             dynamic_state=dynamic_state,
         )
-        compiled = next(iter(render._specializations.values()))
+        compiled = next(iter(render._cache.values()))
         initial_telemetry = dict(compiled.specialization.binding_telemetry)
         target.upload(np.zeros((32, 32, 4), dtype=np.uint8))
         render(position=positions, render_pass=render_pass, dynamic_state=dynamic_state)
@@ -1055,7 +1061,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         return positions, offsets, indices
 
     def test_indexed_instanced_mrt_variant_and_residency(self) -> None:
-        render = vd.pipeline(advanced_vertex, advanced_fragment, features={"PICKING"})
+        render = vd.pipeline(advanced_vertex, advanced_fragment, specializations={PICKING: True})
         positions, offsets, indices = self._advanced_inputs()
         color = vd.Texture.zeros(shape=(64, 64))
         object_id = vd.Texture.zeros(shape=(64, 64))
@@ -1082,7 +1088,7 @@ class OpenGLPipelineTests(unittest.TestCase):
         positions, offsets, indices = self._advanced_inputs()
         color = vd.Texture.zeros(shape=(32, 32))
         object_id = vd.Texture.zeros(shape=(32, 32))
-        render = vd.pipeline(advanced_vertex, advanced_fragment, features=("PICKING", "PICKING"))
+        render = vd.pipeline(advanced_vertex, advanced_fragment, specializations={PICKING: True})
         with self.assertRaisesRegex(ValueError, "exactly match"):
             render(
                 position=positions,
@@ -1099,7 +1105,11 @@ class OpenGLPipelineTests(unittest.TestCase):
                 draw=vd.draw(index_buffer=vd.index_buffer(indices)),
                 render_pass=mrt_target(color, object_id),
             )
-        unknown = vd.pipeline(advanced_vertex, advanced_fragment, features={"UNKNOWN"})
+        unknown = vd.pipeline(
+            advanced_vertex,
+            advanced_fragment,
+            specializations={vd.feature("UNKNOWN"): True},
+        )
         with self.assertRaisesRegex(vd.CompileError, "undeclared feature"):
             unknown(
                 position=positions,
@@ -1265,7 +1275,7 @@ class VulkanPipelineTests(unittest.TestCase):
             side_effect=AssertionError("subprocess prohibited"),
         ):
             render(position=positions, render_pass=render_target(target))
-        compiled = next(iter(render._specializations.values()))
+        compiled = next(iter(render._cache.values()))
         self.assertGreater(len(compiled.specialization.executable.program_abi["boundary_slots"]), 0)
         self.assertEqual(len(compiled.invocation.graph.operations), 1)
 
@@ -1275,7 +1285,7 @@ class VulkanPipelineTests(unittest.TestCase):
         target = vd.Texture.zeros(shape=(16, 16))
         attachments = render_target(target)
         render(position=positions, render_pass=attachments)
-        compiled = next(iter(render._specializations.values()))
+        compiled = next(iter(render._cache.values()))
         native = compiled.specialization.executable
         self.assertEqual(
             [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in native.parameters],
@@ -1294,7 +1304,7 @@ class VulkanPipelineTests(unittest.TestCase):
         self.assertEqual(render.compile_count, 1)
 
     def test_indexed_instanced_mrt(self) -> None:
-        render = vd.pipeline(advanced_vertex, advanced_fragment, features={"PICKING"})
+        render = vd.pipeline(advanced_vertex, advanced_fragment, specializations={PICKING: True})
         positions, offsets, indices = OpenGLPipelineTests._advanced_inputs()
         color = vd.Texture.zeros(shape=(64, 64))
         object_id = vd.Texture.zeros(shape=(64, 64))

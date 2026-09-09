@@ -3,12 +3,17 @@
 
 #include "VernonRuntime.h"
 
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <variant>
+#include <vector>
 
 namespace vernon::runtime {
 
@@ -54,6 +59,79 @@ private:
 
 class ProgramExecutable;
 
+class ProgramVariant {
+public:
+    ProgramVariant &set(std::string name, bool value) {
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_BOOL, value);
+    }
+    ProgramVariant &set(std::string name, int32_t value) {
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_I32, value);
+    }
+    ProgramVariant &set(std::string name, uint32_t value) {
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_U32, value);
+    }
+    ProgramVariant &set(std::string name, float value) {
+        if (!std::isfinite(value))
+            throw std::invalid_argument("Program f32 specialization must be finite");
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_F32, value);
+    }
+    ProgramVariant &set(std::string name, double value) {
+        if (!std::isfinite(value))
+            throw std::invalid_argument("Program f64 specialization must be finite");
+        return set(std::move(name), VERNON_PROGRAM_SPECIALIZATION_F64, value);
+    }
+
+private:
+    using Value = std::variant<bool, int32_t, uint32_t, float, double>;
+    struct Entry {
+        std::string name;
+        VernonProgramSpecializationKind kind{};
+        Value value;
+    };
+
+    ProgramVariant &set(std::string name, VernonProgramSpecializationKind kind, Value value) {
+        if (name.empty())
+            throw std::invalid_argument("Program specialization name must not be empty");
+        for (const Entry &entry : entries_)
+            if (entry.name == name)
+                throw std::invalid_argument("Program specialization name is duplicated");
+        entries_.push_back({std::move(name), kind, std::move(value)});
+        return *this;
+    }
+
+    std::vector<VernonProgramSpecialization> native() const {
+        std::vector<VernonProgramSpecialization> result;
+        result.reserve(entries_.size());
+        for (const Entry &entry : entries_) {
+            VernonProgramSpecialization specialization{};
+            specialization.struct_size = sizeof(specialization);
+            specialization.name = {entry.name.data(), entry.name.size()};
+            specialization.kind = entry.kind;
+            std::visit(
+                [&](const auto &value) {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, bool>)
+                        specialization.value.boolean_value = value ? 1 : 0;
+                    else if constexpr (std::is_same_v<T, int32_t>)
+                        specialization.value.i32_value = value;
+                    else if constexpr (std::is_same_v<T, uint32_t>)
+                        specialization.value.u32_value = value;
+                    else if constexpr (std::is_same_v<T, float>)
+                        specialization.value.f32_value = value;
+                    else
+                        specialization.value.f64_value = value;
+                },
+                entry.value);
+            result.push_back(specialization);
+        }
+        return result;
+    }
+
+    std::vector<Entry> entries_;
+    friend class ProgramAsset;
+    friend class ProgramGraph;
+};
+
 class ProgramAsset {
 public:
     static ProgramAsset load(VernonRuntimeContext *context, const void *bundle, size_t bundleSize,
@@ -65,7 +143,8 @@ public:
     }
 
     VernonProgramBundle *get() const noexcept { return handle_.get(); }
-    ProgramExecutable resolve(VernonFeatureSetView features = {nullptr, 0}) const;
+    ProgramExecutable resolve() const;
+    ProgramExecutable resolve(const ProgramVariant &variant) const;
 
 private:
     explicit ProgramAsset(VernonProgramBundle *handle) : handle_(handle, vernonRuntimeProgramBundleDestroy) {}
@@ -144,8 +223,18 @@ private:
     friend class ProgramGraph;
 };
 
-inline ProgramExecutable ProgramAsset::resolve(VernonFeatureSetView features) const {
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(handle_.get(), features);
+inline ProgramExecutable ProgramAsset::resolve() const {
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(handle_.get(), nullptr);
+    if (!executable)
+        throw std::runtime_error("failed to resolve Program variant");
+    return ProgramExecutable(executable);
+}
+
+inline ProgramExecutable ProgramAsset::resolve(const ProgramVariant &variant) const {
+    const std::vector<VernonProgramSpecialization> specializations = variant.native();
+    const VernonProgramVariantSelector selector{
+        sizeof(VernonProgramVariantSelector), specializations.data(), specializations.size(), {}};
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(handle_.get(), &selector);
     if (!executable)
         throw std::runtime_error("failed to resolve Program variant");
     return ProgramExecutable(executable);
@@ -163,14 +252,25 @@ public:
     ProgramGraph(ProgramGraph &&) noexcept = default;
     ProgramGraph &operator=(ProgramGraph &&) noexcept = default;
 
-    ProgramNode add(const ProgramAsset &asset) {
+    ProgramNode add(const ProgramAsset &asset) { return add(asset, nullptr); }
+
+    ProgramNode add(const ProgramAsset &asset, const ProgramVariant &variant) {
+        const std::vector<VernonProgramSpecialization> specializations = variant.native();
+        const VernonProgramVariantSelector selector{
+            sizeof(VernonProgramVariantSelector), specializations.data(), specializations.size(), {}};
+        return add(asset, &selector);
+    }
+
+private:
+    ProgramNode add(const ProgramAsset &asset, const VernonProgramVariantSelector *selector) {
         VernonProgramNodeId id{};
         if (!state_ || !state_->handle ||
-            vernonRuntimeProgramGraphAddProgram(state_->handle, asset.get(), &id) != VERNON_STATUS_OK)
+            vernonRuntimeProgramGraphAddProgram(state_->handle, asset.get(), selector, &id) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to add ProgramGraph node");
         return ProgramNode(state_, id);
     }
 
+public:
     ProgramGraphValue createValue(ProgramNodeBinding source) {
         ProgramGraphValue value;
         if (!state_ || !state_->handle ||
@@ -227,9 +327,8 @@ public:
         return *this;
     }
 
-    ProgramExecutable compile(VernonFeatureSetView features = {nullptr, 0}) {
-        VernonProgramExecutable *executable =
-            vernonRuntimeResolveProgramGraph(state_ ? state_->handle : nullptr, features);
+    ProgramExecutable compile() {
+        VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(state_ ? state_->handle : nullptr);
         if (!executable)
             throw std::runtime_error("failed to compile ProgramGraph");
         return ProgramExecutable(executable);

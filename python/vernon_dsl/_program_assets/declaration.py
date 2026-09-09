@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Iterable
 
 from .._runtime.kernel import Kernel
 from .._runtime.pipeline import Pipeline
 from ..ad import ProgramExpression
 from ..module import Module
 from ..program import ModuleVjpExpression
-from ..types import Feature
+from ..types import Specialization, SpecializationAssignment, specialization_assignment
 
 VARIANT_CAP = 16
 ProgramAssetProgram = Kernel | Pipeline | Module | ProgramExpression | ModuleVjpExpression
@@ -18,39 +18,42 @@ ProgramAssetProgram = Kernel | Pipeline | Module | ProgramExpression | ModuleVjp
 class ProgramAssetDeclaration:
     id: str
     program: ProgramAssetProgram
-    variants: tuple[tuple[Feature, ...], ...]
+    variants: tuple[tuple[SpecializationAssignment, ...], ...]
 
     @property
-    def variant_keys(self) -> tuple[tuple[str, ...], ...]:
-        return tuple(tuple(feature.name for feature in variant) for variant in self.variants)
+    def variant_keys(self) -> tuple[tuple[SpecializationAssignment, ...], ...]:
+        return self.variants
 
 
 def _validated_variants(
-    variants: Iterable[Iterable[Feature]],
-) -> tuple[tuple[Feature, ...], ...]:
-    result = tuple(tuple(key) for key in variants)
-    if not result:
+    variants: Iterable[Mapping[Specialization, object]],
+) -> tuple[tuple[SpecializationAssignment, ...], ...]:
+    rows = tuple(variants)
+    result: list[tuple[SpecializationAssignment, ...]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise TypeError("each Program Asset variant must be a mapping from specializations to values")
+        if any(not isinstance(parameter, Specialization) for parameter in row):
+            raise TypeError("Program Asset variant keys must be vd.specialization(...) or vd.feature(...) values")
+        assignments = tuple(sorted((specialization_assignment(parameter, value) for parameter, value in row.items())))
+        if len({assignment.name for assignment in assignments}) != len(assignments):
+            raise ValueError("Program Asset variant contains duplicate specialization names")
+        result.append(assignments)
+    canonical = tuple(result)
+    if not canonical:
         raise ValueError("a Program Asset must declare at least one variant")
-    if len(result) > VARIANT_CAP:
-        raise ValueError(f"a Program Asset declares {len(result)} variants, exceeding variant cap {VARIANT_CAP}")
-    seen: list[tuple[str, ...]] = []
-    for variant in result:
-        if any(not isinstance(feature, Feature) for feature in variant):
-            raise TypeError("Program Asset variants must contain vd.feature(...) values")
-        key = tuple(feature.name for feature in variant)
-        if list(key) != sorted(key) or len(set(key)) != len(key):
-            raise ValueError(f"Program Asset variant is not canonical: {list(key)}")
-        if key in seen:
-            raise ValueError(f"duplicate Program Asset variant: {list(key)}")
-        seen.append(key)
-    return result
+    if len(canonical) > VARIANT_CAP:
+        raise ValueError(f"a Program Asset declares {len(canonical)} variants, exceeding variant cap {VARIANT_CAP}")
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("Program Asset variants contain duplicate canonical keys")
+    return canonical
 
 
 def program_asset(
     *,
     id: str,
     program: ProgramAssetProgram,
-    variants: Iterable[Iterable[Feature]] = ((),),
+    variants: Iterable[Mapping[Specialization, object]] = ({},),
 ) -> ProgramAssetDeclaration:
     """Declare one cookable Program."""
 

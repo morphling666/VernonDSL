@@ -27,6 +27,7 @@ from ..program_frontend import (
     ProgramImplementation,
     ProviderChain,
 )
+from ..types import SpecializationAssignment
 from .capture import CapturedProgram
 from .deployment_validation import validate_canonical_deployment
 
@@ -104,7 +105,7 @@ def _compile_stage(
     module_id: str,
     entry: str,
     stage: str,
-    variant: tuple[str, ...],
+    variant: tuple[SpecializationAssignment, ...],
     target: TargetOptions,
     compiler: Any,
     native_target: Any,
@@ -171,13 +172,18 @@ def _compile_program_variant(
     parsed: ParsedProgram,
     *,
     program_id: str,
-    variant: tuple[str, ...],
+    variant: tuple[SpecializationAssignment, ...],
     target: TargetOptions,
     compiler: Any,
     native: Any,
     native_target: Any,
     retained_programs: list[tuple[CompiledStage, Any]] | None = None,
-) -> tuple[TargetOptions, tuple[str, ...], Mapping[str, CompiledStage], Mapping[str, Any]]:
+) -> tuple[
+    TargetOptions,
+    tuple[SpecializationAssignment, ...],
+    Mapping[str, CompiledStage],
+    Mapping[str, Any],
+]:
     planned = compiler.plan_program_result(parsed.mlir)
     if not bool(planned.ok):
         raise ProgramCompileError(str(planned.diagnostics) or "Program planning failed")

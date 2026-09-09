@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,16 +14,17 @@ from ._program_assets.cooking import cook_program_asset
 from ._program_assets.declaration import ProgramAssetDeclaration, program_asset
 from ._program_assets.parsing import ProgramAssetLint, lint_python_program_asset
 from .bundle import ProgramCompileError
+from .types import Specialization
 
 
 def load_program(
     manifest: str | Path,
     *,
-    features: tuple[str, ...] = (),
+    specializations: Mapping[Specialization, object] | None = None,
 ) -> CookedProgram:
     from ._runtime.cooked_program import load_program as load
 
-    return load(manifest, features=features)
+    return load(manifest, specializations=specializations)
 
 
 __all__ = [

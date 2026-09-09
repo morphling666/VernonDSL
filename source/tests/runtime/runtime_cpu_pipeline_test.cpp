@@ -74,7 +74,7 @@ CanonicalCpuProgram loadCanonicalCpuProgram() {
         vernonRuntimeLoadProgramBundleWithOptions(result.context, manifest.data(), manifest.size(), nullptr);
     EXPECT_NE(result.bundle, nullptr) << lastError(result.context);
     if (result.bundle)
-        result.pipeline = vernonRuntimeResolveProgram(result.bundle, {nullptr, 0});
+        result.pipeline = vernonRuntimeResolveProgram(result.bundle, nullptr);
     EXPECT_NE(result.pipeline, nullptr) << lastError(result.context);
     return result;
 }
@@ -103,8 +103,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
     ASSERT_NE(bundle, nullptr) << lastError(context);
     EXPECT_EQ(context->livePipelines, 0u);
-    VernonProgramExecutable *first = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
-    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    VernonProgramExecutable *first = vernonRuntimeResolveProgram(bundle, nullptr);
+    VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(first, nullptr) << lastError(context);
     ASSERT_NE(second, nullptr) << lastError(context);
     EXPECT_NE(first, second);

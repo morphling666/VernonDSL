@@ -192,8 +192,8 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
     VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime);
     ASSERT_NE(graph, nullptr);
     VernonProgramNodeId nodes[2]{};
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &nodes[0]), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &nodes[1]), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &nodes[0]), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &nodes[1]), VERNON_STATUS_OK);
 
     VernonProgramNodeBindingToken outputs[2]{{sizeof(VernonProgramNodeBindingToken)},
                                              {sizeof(VernonProgramNodeBindingToken)}};
@@ -210,9 +210,9 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
                       VERNON_STATUS_OK);
         }
     }
-    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph);
     ASSERT_NE(executable, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
-    VernonProgramExecutable *sameExecutable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    VernonProgramExecutable *sameExecutable = vernonRuntimeResolveProgramGraph(graph);
     ASSERT_NE(sameExecutable, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
     const VernonStringView identity = vernonRuntimeProgramExecutableGetId(executable);
     const VernonStringView sameIdentity = vernonRuntimeProgramExecutableGetId(sameExecutable);

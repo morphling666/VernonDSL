@@ -8,6 +8,7 @@ from typing import Any, ClassVar, Mapping, TypeAlias
 
 from .._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from ..diagnostics import ProgramCompileError
+from ..types import SpecializationAssignment, specialization_key_data
 
 
 def canonical_json(value: Any) -> str:
@@ -234,13 +235,15 @@ class CompiledStage:
 
 @dataclass(frozen=True)
 class ProgramVariantPlan:
-    key: tuple[str, ...]
+    key: tuple[SpecializationAssignment, ...]
     program: Mapping[str, Any]
     stage_implementations: Mapping[str, str]
 
     def __post_init__(self) -> None:
-        if any(not feature for feature in self.key) or tuple(sorted(set(self.key))) != self.key:
-            raise ProgramCompileError("Program variant key must contain unique non-empty features in sorted order")
+        if tuple(sorted(set(self.key))) != self.key or len({assignment.name for assignment in self.key}) != len(
+            self.key
+        ):
+            raise ProgramCompileError("Program variant key must contain unique typed assignments in name order")
         required = {"stages", "parameters", "storages", "values", "graphs", "abi"}
         optional = {"residual_contract"}
         if set(self.program) - optional != required or set(self.program) - required - optional:
@@ -278,7 +281,7 @@ class BundlePlan:
         keys = tuple(variant.key for variant in self.variants)
         if len(set(keys)) != len(keys):
             raise ProgramCompileError("Program variants contain duplicate canonical keys")
-        if keys != tuple(sorted(keys, key=lambda key: canonical_json(list(key)))):
+        if keys != tuple(sorted(keys, key=lambda key: canonical_json(specialization_key_data(key)))):
             raise ProgramCompileError("Program variants are not ordered by canonical key bytes")
         stages = {stage.id: stage for stage in self.compiled_stages}
         if len(stages) != len(self.compiled_stages):

@@ -12,7 +12,9 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 namespace vernon::runtime::ad {
@@ -108,10 +110,31 @@ template <typename Handle> void destroyRuntimeBackendState(Handle &handle) {
 }
 
 namespace vernon::runtime {
+enum class ProgramSpecializationKind {
+    Bool,
+    I32,
+    U32,
+    F32,
+    F64,
+};
+
+struct ProgramSpecialization {
+    std::string name;
+    ProgramSpecializationKind kind{ProgramSpecializationKind::Bool};
+    std::variant<bool, int32_t, uint32_t, float, double> value{false};
+
+    bool operator==(const ProgramSpecialization &other) const {
+        return name == other.name && kind == other.kind && value == other.value;
+    }
+    bool operator<(const ProgramSpecialization &other) const {
+        return name != other.name ? name < other.name : std::tie(kind, value) < std::tie(other.kind, other.value);
+    }
+};
+
 // One fully validated deployment variant. Loading parses the immutable
 // descriptor; resolving copies the Program into a fresh physical executable.
 struct ProgramVariantDeployment {
-    std::vector<std::string> key;
+    std::vector<ProgramSpecialization> key;
     program::Program program;
     program::ArtifactSystem artifactSystem;
 };

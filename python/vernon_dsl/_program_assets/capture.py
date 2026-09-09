@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from ..diagnostics import ProgramCompileError
 from ..program_frontend import ParsedProgram
+from ..types import SpecializationAssignment, specialization_constants
 from .declaration import ProgramAssetDeclaration
 
 if TYPE_CHECKING:
@@ -23,7 +24,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class CapturedProgramVariant:
-    key: tuple[str, ...]
+    key: tuple[SpecializationAssignment, ...]
     ir: ParsedProgram
 
 
@@ -40,7 +41,7 @@ class CapturedProgram:
             raise ValueError("CapturedProgram variant keys must be unique")
 
     @property
-    def variant_keys(self) -> tuple[tuple[str, ...], ...]:
+    def variant_keys(self) -> tuple[tuple[SpecializationAssignment, ...], ...]:
         return tuple(variant.key for variant in self.variants)
 
 
@@ -62,26 +63,38 @@ def _validate_module_vjp_resources(module: object) -> None:
                 )
 
 
-def _capture_kernel(kernel: Kernel, keys: tuple[tuple[str, ...], ...]) -> tuple[CapturedProgramVariant, ...]:
+def _capture_kernel(
+    kernel: Kernel, keys: tuple[tuple[SpecializationAssignment, ...], ...]
+) -> tuple[CapturedProgramVariant, ...]:
     from ..program import _parse_kernel_program
 
-    return tuple(CapturedProgramVariant(key, _parse_kernel_program(kernel, key)) for key in keys)
+    return tuple(
+        CapturedProgramVariant(
+            key,
+            _parse_kernel_program(kernel, specializations=key),
+        )
+        for key in keys
+    )
 
 
-def _capture_pipeline(pipeline: Pipeline, keys: tuple[tuple[str, ...], ...]) -> tuple[CapturedProgramVariant, ...]:
+def _capture_pipeline(
+    pipeline: Pipeline, keys: tuple[tuple[SpecializationAssignment, ...], ...]
+) -> tuple[CapturedProgramVariant, ...]:
     from ..program import _parse_pipeline_program
 
-    if pipeline._features:
+    if pipeline._variant:
         raise ProgramCompileError(
-            "a Program Asset drives features from its variants, so a cooked vd.pipeline(...) must not carry its "
-            "own features="
+            "a Program Asset drives specializations from its variants, so a cooked vd.pipeline(...) must not carry "
+            "its own specializations="
         )
+    if any(specialization_constants(key) for key in keys):
+        raise ProgramCompileError("graphics Program specialization values are not implemented")
     return tuple(CapturedProgramVariant(key, _parse_pipeline_program(pipeline, key)) for key in keys)
 
 
 def _capture_kernel_vjp(
     expression: ProgramExpression,
-    keys: tuple[tuple[str, ...], ...],
+    keys: tuple[tuple[SpecializationAssignment, ...], ...],
 ) -> tuple[CapturedProgramVariant, ...]:
     from ..ad import _capability_diagnostic
     from ..program import _parse_kernel_program
@@ -90,24 +103,38 @@ def _capture_kernel_vjp(
     if getattr(kernel, "__vernon_dsl__", (None,))[0] != "compute":
         raise ProgramCompileError(_capability_diagnostic("graphics_vjp"))
     return tuple(
-        CapturedProgramVariant(key, _parse_kernel_program(kernel, key, transform=expression.transform)) for key in keys
+        CapturedProgramVariant(
+            key,
+            _parse_kernel_program(
+                kernel,
+                specializations=key,
+                transform=expression.transform,
+            ),
+        )
+        for key in keys
     )
 
 
-def _capture_module(module: Module, keys: tuple[tuple[str, ...], ...]) -> tuple[CapturedProgramVariant, ...]:
+def _capture_module(
+    module: Module, keys: tuple[tuple[SpecializationAssignment, ...], ...]
+) -> tuple[CapturedProgramVariant, ...]:
     from ..program import _parse_module_program
 
+    if any(keys):
+        raise ProgramCompileError("Module Program variants are not supported")
     parsed = _parse_module_program(module)
     return tuple(CapturedProgramVariant(key, parsed) for key in keys)
 
 
 def _capture_module_vjp(
     expression: ModuleVjpExpression,
-    keys: tuple[tuple[str, ...], ...],
+    keys: tuple[tuple[SpecializationAssignment, ...], ...],
 ) -> tuple[CapturedProgramVariant, ...]:
     from ..program import _parse_module_program
 
     _validate_module_vjp_resources(expression.module)
+    if any(keys):
+        raise ProgramCompileError("Module VJP variants are not supported")
     try:
         parsed = _parse_module_program(
             expression.module,

@@ -8,7 +8,6 @@ module {
   } {
     %result = "vernon_program.compute"(%input) {
       callee = "normalize",
-      features = [],
       grid = array<i64: 1, 1, 1>,
       operand_names = ["input"],
       result_names = ["result"]
@@ -24,7 +23,6 @@ module {
     %updated = "vernon_program.graphics"(%target, %vertices) {
       callee = "draw_mesh",
       topology = "triangle_list",
-      features = [],
       operand_names = ["vertices"],
       result_names = ["target"]
     } : (tensor<4xi32>, tensor<3x4xf32>) -> tensor<4xi32>

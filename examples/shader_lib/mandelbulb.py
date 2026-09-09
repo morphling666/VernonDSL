@@ -209,5 +209,5 @@ mandelbulb_asset = vd.program_asset(
         mandelbulb_fragment,
         targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
     ),
-    variants=((),),
+    variants=({},),
 )

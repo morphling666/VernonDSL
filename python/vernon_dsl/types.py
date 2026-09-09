@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import builtins
+import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, Self, TypeAlias
 
 import numpy as np
 
@@ -253,15 +255,98 @@ Sampler = TypeExpr("Sampler")
 
 
 @dataclass(frozen=True)
-class Feature:
+class Specialization:
     name: str
+    type: _Scalar
 
-    def __bool__(self) -> bool:
-        raise TypeError("Vernon features are compile-time-only values")
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("specialization name must be a non-empty string")
+        if self.type not in {bool, i32, u32, f32, f64}:
+            raise TypeError("specialization type must be bool, i32, u32, f32, or f64")
+
+    def __bool__(self) -> builtins.bool:
+        raise TypeError("Vernon specializations are compile-time-only values")
+
+
+Feature = Specialization
+SpecializationScalar: TypeAlias = builtins.bool | int | float
+
+
+@dataclass(frozen=True, order=True)
+class SpecializationAssignment:
+    name: str
+    type: str
+    value: SpecializationScalar
+
+    @property
+    def manifest(self) -> dict[str, object]:
+        return {"name": self.name, "value": {"tag": self.type, "value": self.value}}
+
+
+def specialization_key_data(key: tuple[SpecializationAssignment, ...]) -> list[dict[str, object]]:
+    return [assignment.manifest for assignment in key]
+
+
+def enabled_features(key: tuple[SpecializationAssignment, ...]) -> tuple[str, ...]:
+    return tuple(assignment.name for assignment in key if assignment.type == "bool" and assignment.value is True)
+
+
+def specialization_constants(
+    key: tuple[SpecializationAssignment, ...],
+) -> tuple[tuple[str, int | float | builtins.bool], ...]:
+    return tuple((assignment.name, assignment.value) for assignment in key if assignment.type != "bool")
+
+
+def specialization(name: str, type: _Scalar) -> Specialization:
+    return Specialization(name, type)
 
 
 def feature(name: str) -> Feature:
-    return Feature(name)
+    return Specialization(name, bool)
+
+
+def specialization_assignment(parameter: Specialization, value: object) -> SpecializationAssignment:
+    if parameter.type is bool:
+        if type(value) is not builtins.bool:
+            raise TypeError(f"specialization {parameter.name!r} requires a bool value")
+        return SpecializationAssignment(parameter.name, "bool", value)
+    if parameter.type is i32:
+        if type(value) is not int or not -(1 << 31) <= value < (1 << 31):
+            raise TypeError(f"specialization {parameter.name!r} requires an i32 value")
+        return SpecializationAssignment(parameter.name, "i32", value)
+    if parameter.type is u32:
+        if type(value) is not int or not 0 <= value < (1 << 32):
+            raise TypeError(f"specialization {parameter.name!r} requires a u32 value")
+        return SpecializationAssignment(parameter.name, "u32", value)
+    if parameter.type is f32:
+        if type(value) not in {int, float} or not math.isfinite(float(value)):
+            raise TypeError(f"specialization {parameter.name!r} requires a finite f32 value")
+        with np.errstate(over="ignore"):
+            canonical = float(np.float32(value))
+        if not math.isfinite(canonical):
+            raise TypeError(f"specialization {parameter.name!r} is outside the finite f32 range")
+        if canonical == 0.0:
+            canonical = 0.0
+        return SpecializationAssignment(parameter.name, "f32", canonical)
+    if parameter.type is f64:
+        if type(value) not in {int, float} or not math.isfinite(float(value)):
+            raise TypeError(f"specialization {parameter.name!r} requires a finite f64 value")
+        canonical = float(value)
+        return SpecializationAssignment(parameter.name, "f64", 0.0 if canonical == 0.0 else canonical)
+    raise TypeError(f"specialization {parameter.name!r} has an unsupported type")
+
+
+def specialization_key(
+    supplied: Mapping[Specialization, object] | None,
+) -> tuple[SpecializationAssignment, ...]:
+    values = {} if supplied is None else supplied
+    if not isinstance(values, Mapping) or any(not isinstance(parameter, Specialization) for parameter in values):
+        raise TypeError("specializations must map vd.specialization(...) values to scalar values")
+    assignments = tuple(sorted(specialization_assignment(parameter, value) for parameter, value in values.items()))
+    if len({assignment.name for assignment in assignments}) != len(assignments):
+        raise ValueError("specializations contain duplicate names")
+    return assignments
 
 
 @dataclass(frozen=True)

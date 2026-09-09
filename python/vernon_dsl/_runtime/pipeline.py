@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import inspect
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast, get_args, get_origin
@@ -27,6 +27,12 @@ from ..render import (
     lines,
     points,
     triangles,
+)
+from ..types import (
+    Specialization,
+    SpecializationAssignment,
+    specialization_key,
+    specialization_key_data,
 )
 from .resource_common import _session_state
 from .tensor import TensorStorage, TensorView
@@ -62,17 +68,16 @@ class Pipeline:
         *stages: Any,
         state: GraphicsPipelineState | None = None,
         targets: GraphicsTargetFormats | None = None,
-        features: Iterable[str] = (),
+        specializations: Mapping[Specialization, object] | None = None,
     ):
         kinds = cast(
             tuple[str, ...],
             tuple(getattr(stage, "__vernon_dsl__", (None,))[0] for stage in stages),
         )
         validate_graphics_topology(kinds)
-        feature_values = tuple(features)
-        if any(not isinstance(value, str) or not value for value in feature_values):
-            raise TypeError("pipeline features must be non-empty strings")
-        self._features = tuple(sorted(set(feature_values)))
+        self._variant = specialization_key(specializations)
+        if any(assignment.type != "bool" for assignment in self._variant):
+            raise TypeError("graphics pipeline specializations must be Boolean")
         self._graphics_state = graphics_state() if state is None else state
         if not isinstance(self._graphics_state, GraphicsPipelineState):
             raise TypeError("state must be a GraphicsPipelineState")
@@ -83,12 +88,15 @@ class Pipeline:
         self._stages = stages
         self._vertex = stages[0]
         self._fragment = stages[-1]
-        self._specializations: dict[str, _CompiledPipeline] = {}
+        self._cache: dict[str, _CompiledPipeline] = {}
         self.compile_count = 0
 
-    def _frontends(self, features: tuple[str, ...] | None = None) -> tuple[Any, ...]:
+    def _frontends(
+        self,
+        specializations: tuple[SpecializationAssignment, ...] | None = None,
+    ) -> tuple[Any, ...]:
         compiler = Compiler()
-        selected = self._features if features is None else features
+        selected = self._variant if specializations is None else specializations
         result = []
         for stage in self._stages:
             function = stage.function
@@ -216,7 +224,7 @@ class Pipeline:
                     ),
                     "depth": None if depth is None else depth.format.name,
                     "state": repr(self._graphics_state),
-                    "features": self._features,
+                    "specializations": specialization_key_data(self._variant),
                     "backend": options.spec,
                     "arguments": tuple(
                         (
@@ -247,7 +255,7 @@ class Pipeline:
         frontends = self._frontends()
         parameter_types = self._parameter_types(arguments, frontends, render_pass, draw, dynamic_state)
         identity = self._identity(render_pass, parameter_types)
-        cached = self._specializations.get(identity)
+        cached = self._cache.get(identity)
         if cached is not None:
             return cached
         from ..program import _one_node_program
@@ -261,7 +269,7 @@ class Pipeline:
                 inputs["__render_pass"],
                 inputs["__draw"],
                 inputs["__dynamic_state"],
-                frontends=frontends,
+                self._variant,
             ),
         )
         from .program_autodiff import compile_program
@@ -271,7 +279,7 @@ class Pipeline:
         except ProgramCompileError as error:
             raise RuntimeError(str(error)) from None
         compiled = _CompiledPipeline(identity, invocation, specialization)
-        self._specializations[identity] = compiled
+        self._cache[identity] = compiled
         self.compile_count += 1
         return compiled
 
@@ -312,9 +320,9 @@ def pipeline(
     *stages: Any,
     state: GraphicsPipelineState | None = None,
     targets: GraphicsTargetFormats | None = None,
-    features: Iterable[str] = (),
+    specializations: Mapping[Specialization, object] | None = None,
 ) -> Pipeline:
-    return Pipeline(*stages, state=state, targets=targets, features=features)
+    return Pipeline(*stages, state=state, targets=targets, specializations=specializations)
 
 
 __all__ = ["Pipeline", "PrimitiveTopology", "lines", "pipeline", "points", "triangles"]

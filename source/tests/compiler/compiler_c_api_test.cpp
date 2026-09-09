@@ -139,7 +139,6 @@ module {
     %result = "vernon_program.compute"(%source) {
       callee = "Square.square",
       grid = array<i64: 4, 1, 1>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"]
     } : (tensor<4xf32>) -> tensor<4xf32>
@@ -171,7 +170,7 @@ module {
       -> (tensor<4xf32> {                         })
       attributes {vernon_program.graph = "forward"} {
     %result = "vernon_program.compute"(%source) {
-      callee = "Square.square", grid = array<i64: 4, 1, 1>, features = [],
+      callee = "Square.square", grid = array<i64: 4, 1, 1>,
       operand_names = ["source"], result_names = ["output"]
     } : (tensor<4xf32>) -> tensor<4xf32>
     func.return %result : tensor<4xf32>
@@ -186,7 +185,7 @@ module {
       -> (tensor<4xf32> {                         })
       attributes {vernon_program.graph = "backward"} {
     %gradient = "vernon_program.compute"(%source, %output, %output_cotangent) {
-      callee = "Square.backward", grid = array<i64: 4, 1, 1>, features = [],
+      callee = "Square.backward", grid = array<i64: 4, 1, 1>,
       operand_names = ["source", "output", "output_cotangent"], result_names = ["source_gradient"]
     } : (tensor<4xf32>, tensor<4xf32>, tensor<4xf32>) -> tensor<4xf32>
     func.return %gradient : tensor<4xf32>
@@ -224,7 +223,6 @@ module {
     %result = "vernon_program.compute"(%source) {
       callee = "Module.square",
       grid = array<i64: 1, 1, 1>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"]
     } : (f32) -> f32
@@ -369,12 +367,12 @@ module {
         vernon_program.result_names = ["output.result"]
       } {
     %middle = "vernon_program.compute"(%source) {
-      callee = "Module.copy", grid = array<i64: 4, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 4, 1, 1>,
       operand_names = ["source"], result_names = ["output"]
     } : (!vernon.tensor_view<f32, [4], "read", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     %output = "vernon_program.compute"(%middle) {
-      callee = "Module.copy", grid = array<i64: 4, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 4, 1, 1>,
       operand_names = ["source"], result_names = ["output"]
     } : (!vernon.tensor_view<f32, [4], "read_write", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
@@ -472,7 +470,6 @@ module {
     %updated = "vernon_program.graphics"(%target) {
       callee = "draw",
       topology = "triangle_list",
-      features = [],
       operand_names = [],
       result_names = ["target"],
       vernon_program.control_slots = array<i64: 1, 2, 3>,
@@ -689,7 +686,6 @@ module {
       callee = "increment",
       grid = array<i64: 1, 1, 1>,
       vernon_program.grid_control_arguments = array<i64: 1, 2, 3>,
-      features = [],
       operand_names = ["values"],
       result_names = ["values"],
       vernon_program.operand_accesses = ["read_write"],
@@ -795,7 +791,6 @@ module {
     %result = "vernon_program.compute"(%budget) {
       callee = "Identity.copy",
       grid = array<i64: 1, 1, 1>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"],
       vernon_program.result_abi_leaf_dtypes = [["u32"]]
@@ -845,7 +840,6 @@ module {
     %result = "vernon_program.compute"(%payload) {
       callee = "Identity.copy",
       grid = array<i64: 1, 1, 1>,
-      features = [],
       operand_names = ["source"],
       result_names = ["output"],
       vernon_program.result_abi_leaf_dtypes = [["u32", "f32"]]
@@ -944,7 +938,7 @@ module {
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
-      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>
@@ -1070,7 +1064,7 @@ module {
         : (!vernon.tensor_view<f32, [4], "read", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
-      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>
@@ -1114,7 +1108,7 @@ module {
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %result = "vernon_program.compute"(%source, %buffer) {
-      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>
@@ -1141,7 +1135,7 @@ module {
         : (!vernon.tensor_view<f32, [-1, -1], "read", "device">)
         -> !vernon.tensor_view<f32, [-1, -1], "read_write", "device">
     %gradient = "vernon_program.compute"(%cotangent, %buffer) {
-      callee = "Module.copy", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.copy", grid = array<i64: 1, 1, 1>,
       operand_names = ["source", "output"], result_names = ["output"],
       vernon_program.operand_accesses = ["read", "write"],
       vernon_program.result_resource_sources = array<i64: 1>
@@ -1273,12 +1267,12 @@ module attributes {vernon_program.vjp_wrt = ["source"]} {
         vernon_program.graph = "primal"
       } {
     %left = "vernon_program.compute"(%source) {
-      callee = "Module.left", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.left", grid = array<i64: 1, 1, 1>,
       operand_names = ["source"], result_names = ["output"]
     } : (!vernon.tensor_view<f32, [4], "read", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
     %right = "vernon_program.compute"(%source) {
-      callee = "Module.right", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.right", grid = array<i64: 1, 1, 1>,
       operand_names = ["source"], result_names = ["output"]
     } : (!vernon.tensor_view<f32, [4], "read", "device">)
         -> !vernon.tensor_view<f32, [4], "read_write", "device">
@@ -1385,7 +1379,7 @@ module {
         vernon_program.result_names = ["output.result"]
       } {
     %result = "vernon_program.compute"(%values) {
-      callee = "Module.increment", grid = array<i64: 1, 1, 1>, features = [],
+      callee = "Module.increment", grid = array<i64: 1, 1, 1>,
       operand_names = ["values"], result_names = ["values"],
       vernon_program.operand_accesses = ["read_write"],
       vernon_program.result_resource_sources = array<i64: 0>
