@@ -35,6 +35,8 @@ from pipeline_shader import (
     f16_attribute_vertex,
     f32_attribute_vertex,
     f64_attribute_vertex,
+    heightmap_fragment,
+    heightmap_vertex,
     i32_attribute_vertex,
     instanced_tensor_transform_vertex,
     mat2_vertex,
@@ -578,6 +580,24 @@ def assert_three_dimensional_texture_samples(test: unittest.TestCase) -> None:
         np.testing.assert_allclose(target.to_numpy()[4, 4], color, atol=1)
 
 
+def assert_vertex_heightmap_sampling(test: unittest.TestCase) -> None:
+    positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+    coordinates = vd.storage.from_numpy(np.array(((0.0, 0.0), (1.0, 0.0), (0.5, 1.0)), dtype=np.float32))
+    texel = np.array((128, 64, 32, 255), dtype=np.uint8)
+    heightmap = vd.Texture.from_numpy(np.broadcast_to(texel, (2, 2, 4)).copy())
+    target = vd.Texture.zeros(shape=(16, 16))
+
+    vd.pipeline(heightmap_vertex, heightmap_fragment)(
+        position=positions,
+        uv=coordinates,
+        heightmap=heightmap,
+        heightmap_sampler=vd.sampler(address="clamp_to_edge"),
+        render_pass=render_target(target),
+    )
+
+    np.testing.assert_allclose(target.to_numpy()[8, 8], texel, atol=1)
+
+
 def assert_inactive_texture_binding_renders(test: unittest.TestCase) -> None:
     positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
     base_image = vd.Texture.from_numpy(np.full((2, 2, 4), (0, 255, 0, 255), dtype=np.uint8))
@@ -993,6 +1013,9 @@ class OpenGLPipelineTests(unittest.TestCase):
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
 
+    def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
+        assert_vertex_heightmap_sampling(self)
+
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
 
@@ -1175,6 +1198,9 @@ class OpenGLESPipelineTests(unittest.TestCase):
     def test_non_square_and_divisor_two_attributes_render(self) -> None:
         assert_non_square_and_divisor_two_attributes_render(self)
 
+    def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
+        assert_vertex_heightmap_sampling(self)
+
 
 class VulkanPipelineTests(unittest.TestCase):
     def test_aggregate_attribute_renders(self) -> None:
@@ -1229,6 +1255,9 @@ class VulkanPipelineTests(unittest.TestCase):
 
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
+
+    def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
+        assert_vertex_heightmap_sampling(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)
@@ -1362,6 +1391,9 @@ class DirectXPipelineTests(unittest.TestCase):
 
     def test_three_dimensional_texture_samples(self) -> None:
         assert_three_dimensional_texture_samples(self)
+
+    def test_vertex_shader_samples_heightmap_with_explicit_lod(self) -> None:
+        assert_vertex_heightmap_sampling(self)
 
     def test_inactive_texture_binding_renders(self) -> None:
         assert_inactive_texture_binding_renders(self)

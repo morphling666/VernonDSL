@@ -169,6 +169,17 @@ def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
         with self.assertRaisesRegex(CompileError, "without lod"):
             compile_source(vertex_implicit_lod, "vertex_implicit_lod.py")
 
+        vertex_explicit_lod = """
+from vernon_dsl import *
+@vertex
+def main(image: Texture["2d", f32], sampler: Sampler,
+         uv: Vector[f32, 2]) -> Vector[f32, 4]:
+    height = texture_sample(image, sampler, uv, 0.0)
+    return Vector([uv, height.x, 1.0])
+"""
+        output = compile_source(vertex_explicit_lod, "vertex_explicit_lod.py")
+        self.assertIn('name = "texture_sample"', output)
+
         invalid_sample_lod = """
 from vernon_dsl import *
 @fragment

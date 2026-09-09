@@ -62,6 +62,30 @@ def triangle_vertex(
     return vd.Vector([position, 0.0, 1.0])
 
 
+@vd.struct
+class HeightmapVertexOutput:
+    position: Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]
+    color: vd.Vector[vd.f32, 4]
+
+
+@vd.vertex
+def heightmap_vertex(
+    position: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    uv: Annotated[vd.Vector[vd.f32, 2], vd.attribute()],
+    heightmap: Annotated[vd.Texture["2d", vd.f32], vd.resource(set=0, binding=0)],  # noqa: F722, F821
+    heightmap_sampler: Annotated[vd.Sampler, vd.resource(set=0, binding=1)],
+) -> HeightmapVertexOutput:
+    sample = vd.texture_sample(heightmap, heightmap_sampler, uv, 0.0)
+    return HeightmapVertexOutput(vd.Vector([position, sample.x * 0.5, 1.0]), sample)
+
+
+@vd.fragment
+def heightmap_fragment(
+    color: Annotated[vd.Vector[vd.f32, 4], vd.varying()],
+) -> vd.Vector[vd.f32, 4]:
+    return color
+
+
 @vd.vertex
 def rank_three_tensor_attribute_vertex(
     value: Annotated[vd.Tensor[vd.f32, (2, 2, 3)], vd.attribute()],
