@@ -219,6 +219,121 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), seedBuffer), VERNON_RHI_STATUS_OK);
 }
 
+void runProgramGraphNodePullback(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
+    vernon::tests::OwnedRhiRuntime owned(backend);
+    VernonRuntimeContext *context = owned.runtime();
+    if (!context)
+        GTEST_SKIP() << "GPU backend is unavailable";
+
+    std::ifstream input(manifestPath, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    const std::string bundleDirectory = manifestPath.parent_path().string();
+    VernonProgramBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = bundleDirectory.c_str();
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, nullptr);
+    ASSERT_NE(standalone, nullptr) << lastError(context);
+
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(context);
+    ASSERT_NE(graph, nullptr);
+    VernonProgramNodeId node = UINT32_MAX;
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &node), VERNON_STATUS_OK);
+    VernonProgramNodeBindingToken sourceToken{sizeof(VernonProgramNodeBindingToken)};
+    VernonProgramNodeBindingToken outputToken{sizeof(VernonProgramNodeBindingToken)};
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                    {"source", std::strlen("source")}, &sourceToken),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                    {"output", std::strlen("output")}, &outputToken),
+              VERNON_STATUS_OK);
+    VernonProgramExecutable *composite = vernonRuntimeResolveProgramGraph(graph);
+    ASSERT_NE(composite, nullptr) << lastError(context);
+    EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(composite), 0u);
+
+    VernonRhiBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = sizeof(float);
+    descriptor.alignment = alignof(float);
+    descriptor.usage =
+        VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_STORAGE;
+    descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer sourceBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer outputBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer seedBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    VernonRhiBuffer gradientBuffer{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &sourceBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &outputBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &seedBuffer), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(owned.device(), &descriptor, &gradientBuffer), VERNON_RHI_STATUS_OK);
+    const float source = 3.0f;
+    const float seed = 1.0f;
+    const float zero = 0.0f;
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), sourceBuffer, 0, &source, sizeof(source)),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), outputBuffer, 0, &zero, sizeof(zero)), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), seedBuffer, 0, &seed, sizeof(seed)), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), gradientBuffer, 0, &zero, sizeof(zero)),
+              VERNON_RHI_STATUS_OK);
+
+    VernonProgramArgument sourceArgument = tensorArgument(context, sourceBuffer, parameter(standalone, "source"));
+    VernonProgramArgument outputArgument = tensorArgument(context, outputBuffer, parameter(standalone, "output"));
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(composite);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &sourceToken, &sourceArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    VernonPullback *compositePullback = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &compositePullback), VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_EQ(compositePullback, nullptr);
+    VernonPullback *nodePullback = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, node, &nodePullback), VERNON_STATUS_OK)
+        << lastError(context);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    ASSERT_NE(nodePullback, nullptr);
+
+    VernonProgramParameterView cotangent{};
+    VernonProgramParameterView gradient{};
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0, &cotangent),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0, &gradient),
+        VERNON_STATUS_OK);
+    VernonProgramArgument derivatives[]{
+        tensorArgument(context, seedBuffer, cotangent),
+        tensorArgument(context, gradientBuffer, gradient),
+    };
+    ASSERT_EQ(vernonProgramPullbackApply(nodePullback, derivatives, std::size(derivatives)), VERNON_STATUS_OK)
+        << lastError(context);
+    float output = 0.0f;
+    float gradientValue = 0.0f;
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), outputBuffer, 0, &output, sizeof(output)),
+              VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDownloadBuffer(owned.device(), gradientBuffer, 0, &gradientValue, sizeof(gradientValue)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_FLOAT_EQ(output, 9.0f);
+    EXPECT_FLOAT_EQ(gradientValue, 6.0f);
+
+    vernonProgramPullbackDestroy(nodePullback);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(composite);
+    vernonRuntimeProgramGraphDestroy(graph);
+    vernonRuntimeProgramExecutableDestroy(standalone);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), gradientBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), seedBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), outputBuffer), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), sourceBuffer), VERNON_RHI_STATUS_OK);
+}
+
 struct LoadedProgram {
     VernonProgramBundle *bundle{};
     VernonProgramExecutable *executable{};
@@ -526,6 +641,9 @@ void runDynamicShapeGridReuse(VernonRuntimeBackend backend, const std::filesyste
 TEST(RuntimeModuleProgramGpuCApi, VulkanComputeModuleForward9AndVjpGradient6) {
     runModuleProgram(VERNON_RUNTIME_VULKAN, VERNON_MODULE_PROGRAM_VULKAN_MANIFEST);
 }
+TEST(RuntimeModuleProgramGpuCApi, VulkanProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(VERNON_RUNTIME_VULKAN, VERNON_MODULE_PROGRAM_VULKAN_MANIFEST);
+}
 TEST(RuntimeModuleProgramGpuCApi, VulkanReusesOneStageAcrossDifferentNodeProjections) {
     runReusedStageModule(VERNON_RUNTIME_VULKAN, VERNON_REUSED_STAGE_VULKAN_MANIFEST);
 }
@@ -540,6 +658,9 @@ TEST(RuntimeModuleProgramGpuCApi, VulkanReusesLoadedProgramAcrossDynamicShapesAn
 #if defined(VERNON_MODULE_PROGRAM_CUDA_MANIFEST)
 TEST(RuntimeModuleProgramGpuCApi, CudaComputeModuleForward9AndVjpGradient6) {
     runModuleProgram(VERNON_RUNTIME_CUDA, VERNON_MODULE_PROGRAM_CUDA_MANIFEST);
+}
+TEST(RuntimeModuleProgramGpuCApi, CudaProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(VERNON_RUNTIME_CUDA, VERNON_MODULE_PROGRAM_CUDA_MANIFEST);
 }
 TEST(RuntimeModuleProgramGpuCApi, CudaReusesOneStageAcrossDifferentNodeProjections) {
     runReusedStageModule(VERNON_RUNTIME_CUDA, VERNON_REUSED_STAGE_CUDA_MANIFEST);
@@ -556,6 +677,9 @@ TEST(RuntimeModuleProgramGpuCApi, CudaReusesLoadedProgramAcrossDynamicShapesAndG
 TEST(RuntimeModuleProgramGpuCApi, DirectX12ComputeModuleForward9AndVjpGradient6) {
     runModuleProgram(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST);
 }
+TEST(RuntimeModuleProgramGpuCApi, DirectX12ProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST);
+}
 TEST(RuntimeModuleProgramGpuCApi, DirectX12ReusesOneStageAcrossDifferentNodeProjections) {
     runReusedStageModule(VERNON_RUNTIME_DIRECTX12, VERNON_REUSED_STAGE_DIRECTX_MANIFEST);
 }
@@ -571,6 +695,9 @@ TEST(RuntimeModuleProgramGpuCApi, DirectX12ReusesLoadedProgramAcrossDynamicShape
 TEST(RuntimeModuleProgramGpuCApi, MetalComputeModuleForward9AndVjpGradient6) {
     runModuleProgram(VERNON_RUNTIME_METAL, VERNON_MODULE_PROGRAM_METAL_MANIFEST);
 }
+TEST(RuntimeModuleProgramGpuCApi, MetalProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(VERNON_RUNTIME_METAL, VERNON_MODULE_PROGRAM_METAL_MANIFEST);
+}
 TEST(RuntimeModuleProgramGpuCApi, MetalReusesOneStageAcrossDifferentNodeProjections) {
     runReusedStageModule(VERNON_RUNTIME_METAL, VERNON_REUSED_STAGE_METAL_MANIFEST);
 }
@@ -584,6 +711,9 @@ TEST(RuntimeModuleProgramGpuCApi, MetalReusesLoadedProgramAcrossDynamicShapesAnd
 
 TEST(RuntimeModuleProgramGpuCApi, OpenGLComputeModuleForward9AndVjpGradient6) {
     runModuleProgram(VERNON_RUNTIME_OPENGL, VERNON_MODULE_PROGRAM_OPENGL_MANIFEST);
+}
+TEST(RuntimeModuleProgramGpuCApi, OpenGLProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(VERNON_RUNTIME_OPENGL, VERNON_MODULE_PROGRAM_OPENGL_MANIFEST);
 }
 TEST(RuntimeModuleProgramGpuCApi, OpenGLReusesOneStageAcrossDifferentNodeProjections) {
     runReusedStageModule(VERNON_RUNTIME_OPENGL, VERNON_REUSED_STAGE_OPENGL_MANIFEST);

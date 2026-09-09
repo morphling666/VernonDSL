@@ -53,6 +53,11 @@ struct LinkedProgramDeployment {
     ProgramVariantDeployment deployment;
     std::map<ProgramGraphBoundaryKey, uint32_t> boundarySlots;
     std::map<ProgramGraphGraphicsKey, uint32_t> graphicsNodes;
+    struct NodeMapping {
+        std::vector<uint32_t> values;
+        std::vector<uint32_t> storages;
+    };
+    std::map<uint32_t, NodeMapping> nodeMappings;
 };
 
 bool sameProgramGraphBoundaryContract(const program::BoundarySlot &left, const program::BoundarySlot &right);

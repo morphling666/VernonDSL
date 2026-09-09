@@ -156,6 +156,14 @@ struct CanonicalProgramAutodiffState {
     std::string checkpointPolicy;
 };
 
+struct VernonProgramExecutable;
+
+struct ProgramGraphNodeAutodiffState {
+    std::shared_ptr<VernonProgramExecutable> executable;
+    std::vector<uint32_t> globalValues;
+    std::vector<uint32_t> globalStorages;
+};
+
 struct VernonProgramExecutable {
     VernonProgramExecutable(VernonRuntimeContext &runtime,
                             std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan);
@@ -172,6 +180,7 @@ struct VernonProgramExecutable {
     std::map<uint64_t, std::vector<uint32_t>> programGraphBoundarySlots;
     std::map<uint32_t, std::vector<uint32_t>> programGraphStorageSlots;
     std::map<uint64_t, VernonProgramGraphicsControlsView> programGraphGraphicsControls;
+    std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> programGraphNodeAutodiff;
     CanonicalProgramAutodiffState programAutodiff;
 };
 

@@ -168,6 +168,7 @@ struct ProgramNodeGraphics {
 };
 
 class ProgramGraph;
+class ProgramInvocation;
 namespace detail {
 struct ProgramGraphState {
     explicit ProgramGraphState(VernonRuntimeContext *context) : handle(vernonRuntimeProgramGraphCreate(context)) {}
@@ -192,6 +193,7 @@ private:
     std::shared_ptr<detail::ProgramGraphState> owner_;
     VernonProgramNodeId id_{};
     friend class ProgramGraph;
+    friend class ProgramInvocation;
 };
 
 using ProgramNodeHandle = ProgramNode;
@@ -214,10 +216,12 @@ public:
     }
 
 private:
-    explicit ProgramExecutable(VernonProgramExecutable *handle)
-        : handle_(handle, vernonRuntimeProgramExecutableDestroy) {}
+    explicit ProgramExecutable(VernonProgramExecutable *handle,
+                               std::shared_ptr<detail::ProgramGraphState> graphOwner = {})
+        : handle_(handle, vernonRuntimeProgramExecutableDestroy), graphOwner_(std::move(graphOwner)) {}
 
     std::shared_ptr<VernonProgramExecutable> handle_;
+    std::shared_ptr<detail::ProgramGraphState> graphOwner_;
     friend class ProgramAsset;
     friend class ProgramInstance;
     friend class ProgramGraph;
@@ -331,7 +335,7 @@ public:
         VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(state_ ? state_->handle : nullptr);
         if (!executable)
             throw std::runtime_error("failed to compile ProgramGraph");
-        return ProgramExecutable(executable);
+        return ProgramExecutable(executable, state_);
     }
 
 private:
@@ -399,14 +403,18 @@ public:
     };
 
     ProgramInvocation() = default;
-    explicit ProgramInvocation(VernonProgramInvocation *handle) : handle_(handle) {}
+    explicit ProgramInvocation(VernonProgramInvocation *handle,
+                               std::shared_ptr<detail::ProgramGraphState> graphOwner = {})
+        : handle_(handle), graphOwner_(std::move(graphOwner)) {}
     ProgramInvocation(const ProgramInvocation &) = delete;
     ProgramInvocation &operator=(const ProgramInvocation &) = delete;
-    ProgramInvocation(ProgramInvocation &&other) noexcept : handle_(std::exchange(other.handle_, nullptr)) {}
+    ProgramInvocation(ProgramInvocation &&other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)), graphOwner_(std::move(other.graphOwner_)) {}
     ProgramInvocation &operator=(ProgramInvocation &&other) noexcept {
         if (this != &other) {
             vernonRuntimeProgramInvocationDestroy(handle_);
             handle_ = std::exchange(other.handle_, nullptr);
+            graphOwner_ = std::move(other.graphOwner_);
         }
         return *this;
     }
@@ -487,6 +495,17 @@ public:
         return Pullback(pullback);
     }
 
+    Pullback pullback(const ProgramNodeHandle &node) {
+        if (!handle_)
+            throw std::logic_error("Program invocation is empty");
+        if (!graphOwner_ || graphOwner_ != node.owner_)
+            throw std::invalid_argument("ProgramGraph node belongs to another graph");
+        VernonPullback *pullback = nullptr;
+        if (vernonRuntimeProgramInvocationGetNodePullback(handle_, node.id(), &pullback) != VERNON_STATUS_OK)
+            throw std::runtime_error("ProgramGraph node pullback is unavailable");
+        return Pullback(pullback);
+    }
+
     void rollback() {
         if (handle_)
             vernonRuntimeProgramInvocationRollback(handle_);
@@ -496,23 +515,27 @@ public:
 
 private:
     VernonProgramInvocation *handle_{};
+    std::shared_ptr<detail::ProgramGraphState> graphOwner_;
 };
 
 class ProgramInstance {
 public:
     explicit ProgramInstance(ProgramExecutable &executable)
-        : executable_(executable.handle_), handle_(vernonRuntimeProgramInstanceCreate(executable_.get())) {
+        : executable_(executable.handle_), graphOwner_(executable.graphOwner_),
+          handle_(vernonRuntimeProgramInstanceCreate(executable_.get())) {
         if (!handle_)
             throw std::runtime_error("failed to create Program instance");
     }
     ProgramInstance(const ProgramInstance &) = delete;
     ProgramInstance &operator=(const ProgramInstance &) = delete;
     ProgramInstance(ProgramInstance &&other) noexcept
-        : executable_(std::move(other.executable_)), handle_(std::exchange(other.handle_, nullptr)) {}
+        : executable_(std::move(other.executable_)), graphOwner_(std::move(other.graphOwner_)),
+          handle_(std::exchange(other.handle_, nullptr)) {}
     ProgramInstance &operator=(ProgramInstance &&other) noexcept {
         if (this != &other) {
             vernonRuntimeProgramInstanceDestroy(handle_);
             executable_ = std::move(other.executable_);
+            graphOwner_ = std::move(other.graphOwner_);
             handle_ = std::exchange(other.handle_, nullptr);
         }
         return *this;
@@ -523,7 +546,7 @@ public:
         VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(handle_);
         if (!invocation)
             throw std::runtime_error("failed to begin Program invocation");
-        return ProgramInvocation(invocation);
+        return ProgramInvocation(invocation, graphOwner_);
     }
 
     VernonProgramBindingTelemetry telemetry() const {
@@ -538,6 +561,7 @@ public:
 
 private:
     std::shared_ptr<VernonProgramExecutable> executable_;
+    std::shared_ptr<detail::ProgramGraphState> graphOwner_;
     VernonProgramInstance *handle_{};
 };
 

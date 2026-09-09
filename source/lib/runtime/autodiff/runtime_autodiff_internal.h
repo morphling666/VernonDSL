@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -75,6 +76,8 @@ struct ForwardExecutionTarget {
     const VernonProgramArgument *arguments{};
     size_t argumentCount{};
     const ProgramInvocationContext *programContext{};
+    std::map<VernonProgramNodeId, std::unique_ptr<class PullbackExecution>> *nodePullbacks{};
+    bool retainPullback{};
 };
 
 class PullbackExecution {

@@ -336,6 +336,28 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
     const auto globalNode = [&](size_t nodeIndex, std::string_view graph, uint32_t node) {
         return offsets[nodeIndex].graphNodes.at(std::string(graph)) + node;
     };
+    for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
+        LinkedProgramDeployment::NodeMapping mapping;
+        mapping.values.reserve(nodes[nodeIndex].deployment->program.values.size());
+        for (const program::Value &value : nodes[nodeIndex].deployment->program.values)
+            mapping.values.push_back(globalValue(nodeIndex, value.id));
+        mapping.storages.reserve(nodes[nodeIndex].deployment->program.storages.size());
+        for (const program::Storage &storage : nodes[nodeIndex].deployment->program.storages)
+            mapping.storages.push_back(globalStorage(nodeIndex, storage.id));
+        linked.nodeMappings.emplace(nodes[nodeIndex].id, std::move(mapping));
+    }
+    for (const ProgramGraphConnection &connection : connections) {
+        if (!connection.storageConnection)
+            continue;
+        const size_t sourceIndex = nodeIndices.at(connection.source.node);
+        const size_t destinationIndex = nodeIndices.at(connection.destination.node);
+        const program::BoundarySlot &source = *boundary(nodes[sourceIndex], connection.source.slot);
+        const program::BoundarySlot &destination = *boundary(nodes[destinationIndex], connection.destination.slot);
+        const uint32_t destinationInitial =
+            nodes[destinationIndex].deployment->program.storages[destination.aliasOwner.id].initialValue;
+        linked.nodeMappings.at(connection.destination.node).values[destinationInitial] =
+            globalValue(sourceIndex, source.value);
+    }
 
     program::Program &program = linked.deployment.program;
     program::ArtifactSystem &artifacts = linked.deployment.artifactSystem;
@@ -413,19 +435,33 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         const ProgramGraphNodeSource &source = nodes[nodeIndex];
         const program::Program &child = source.deployment->program;
         const std::string prefix = "node/" + std::to_string(source.id) + "/";
+        const program::Graph *childForward = program::findGraph(child, "forward");
+        if (!childForward)
+            return reject(diagnostic, "/nodes/" + std::to_string(source.id), "ProgramGraph child has no forward graph");
+        std::set<std::string> forwardStages;
+        for (const program::Node &node : childForward->nodes)
+            forwardStages.insert(node.stage);
         for (const auto &[stageId, contract] : child.stages)
-            program.stages.emplace(prefix + stageId, contract);
+            if (forwardStages.count(stageId))
+                program.stages.emplace(prefix + stageId, contract);
+        std::set<std::string> forwardBlobs;
+        for (const auto &[stageId, stage] : source.deployment->artifactSystem.stages) {
+            if (!forwardStages.count(stageId))
+                continue;
+            program::StageArtifact linkedStage = stage;
+            for (program::CodeModule &module : linkedStage.modules) {
+                forwardBlobs.insert(module.blob);
+                module.blob = prefix + module.blob;
+            }
+            artifacts.stages.emplace(prefix + stageId, std::move(linkedStage));
+        }
         for (const auto &[blobId, blob] : source.deployment->artifactSystem.blobs) {
+            if (!forwardBlobs.count(blobId))
+                continue;
             const std::string linkedId = prefix + blobId;
             program::Blob linkedBlob = blob;
             linkedBlob.bundleRoot = source.bundleRoot;
             artifacts.blobs.emplace(linkedId, std::move(linkedBlob));
-        }
-        for (const auto &[stageId, stage] : source.deployment->artifactSystem.stages) {
-            program::StageArtifact linkedStage = stage;
-            for (program::CodeModule &module : linkedStage.modules)
-                module.blob = prefix + module.blob;
-            artifacts.stages.emplace(prefix + stageId, std::move(linkedStage));
         }
         for (const program::Parameter &childParameter : child.parameters) {
             program::Parameter parameter = childParameter;
@@ -434,8 +470,16 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
             parameter.value = globalValue(nodeIndex, parameter.value);
             program.parameters.push_back(std::move(parameter));
         }
+        for (const program::TapePlan &childPlan : child.abi.tapePlans) {
+            program::TapePlan plan = childPlan;
+            plan.value = globalValue(nodeIndex, plan.value);
+            plan.backwardConsumer = false;
+            program.abi.tapePlans.push_back(std::move(plan));
+        }
 
         for (const program::Graph &childGraph : child.graphs) {
+            if (childGraph.direction != "forward")
+                continue;
             auto graph =
                 std::find_if(program.graphs.begin(), program.graphs.end(), [&](const program::Graph &candidate) {
                     return candidate.direction == childGraph.direction;
@@ -535,6 +579,8 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
     for (size_t nodeIndex = 0; nodeIndex < nodes.size(); ++nodeIndex) {
         const ProgramGraphNodeSource &source = nodes[nodeIndex];
         for (const program::BoundarySlot &childSlot : source.deployment->program.abi.boundarySlots) {
+            if (childSlot.role == program::BoundaryRole::Cotangent || childSlot.role == program::BoundaryRole::Gradient)
+                continue;
             const ProgramGraphBoundaryKey key{source.id, childSlot.id};
             const bool connectedInput = destinations.count(key);
             const bool connectedOutput =
@@ -584,7 +630,7 @@ bool linkProgramGraph(const std::vector<ProgramGraphNodeSource> &nodes,
         identity += ':';
         identity.append(value.data(), value.size());
     };
-    appendIdentity("vernon.program_graph.v1");
+    appendIdentity("vernon.program_graph.v2");
     for (const ProgramGraphNodeSource &node : nodes) {
         appendIdentity(std::to_string(node.id));
         appendIdentity(node.bundleId);

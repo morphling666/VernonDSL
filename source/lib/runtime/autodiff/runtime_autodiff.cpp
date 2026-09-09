@@ -186,9 +186,10 @@ bool validateDerivativeGroupsAgainstSignature(VernonRuntimeContext &context,
 
 namespace vernon::runtime::program_execution {
 
-VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
-                                      size_t argumentCount, VernonPullback *&pullback,
-                                      const ProgramInvocationContext *programContext) {
+VernonStatus forwardProgramInvocation(
+    VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments, size_t argumentCount,
+    VernonPullback *&pullback, const ProgramInvocationContext *programContext,
+    std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks, bool retainPullback) {
     pullback = nullptr;
     const auto *autodiff = canonicalProgramAutodiff(&pipeline);
     auto *executable = autodiff ? autodiff->canonicalExecution.get() : nullptr;
@@ -197,7 +198,7 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline, const V
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     std::unique_ptr<ad::PullbackExecution> execution;
-    const ad::ForwardExecutionTarget target{arguments, argumentCount, programContext};
+    const ad::ForwardExecutionTarget target{arguments, argumentCount, programContext, nodePullbacks, retainPullback};
     const VernonStatus status = executable->forward(target, execution);
     if (status != VERNON_STATUS_OK)
         return status;
@@ -212,6 +213,16 @@ VernonStatus forwardProgramInvocation(VernonProgramExecutable &pipeline, const V
 
 void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const program::InvocationSnapshot> snapshot) {
     pullback.programSnapshot = std::move(snapshot);
+}
+
+VernonPullback *makeRetainedProgramPullback(VernonProgramExecutable &pipeline,
+                                            std::unique_ptr<ad::PullbackExecution> execution,
+                                            std::shared_ptr<const program::InvocationSnapshot> snapshot) {
+    auto result = std::make_unique<VernonPullback>();
+    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
+    result->execution = std::move(execution);
+    result->programSnapshot = std::move(snapshot);
+    return result.release();
 }
 
 } // namespace vernon::runtime::program_execution

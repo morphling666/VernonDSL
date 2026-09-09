@@ -2,6 +2,7 @@
 #include "execution_graph/command_graph.h"
 #include "execution_graph/execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
+#include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/autodiff/tape_allocator_abi.h"
 #include "runtime/backend_cpu.h"
 #include "runtime/compute_launch_planner.h"
@@ -103,7 +104,9 @@ struct VernonProgramInvocation {
     std::unique_ptr<vernon::runtime::program::BindingTransaction> controlTransaction;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> controlSnapshot;
+    std::map<VernonProgramNodeId, std::unique_ptr<vernon::runtime::ad::PullbackExecution>> nodePullbacks;
     bool finished{};
+    bool succeeded{};
 };
 
 struct RuntimeProgramGraphNode {
@@ -1253,11 +1256,35 @@ VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *gr
             return nullptr;
         }
         std::string error;
-        VernonProgramExecutable *executable = program::loadBackendProgramPipeline(
-            *graph->context, linked.deployment.program, linked.deployment.artifactSystem, {}, error);
+        std::unique_ptr<VernonProgramExecutable, decltype(&vernonRuntimeProgramExecutableDestroy)> executable(
+            program::loadBackendProgramPipeline(*graph->context, linked.deployment.program,
+                                                linked.deployment.artifactSystem, {}, error),
+            vernonRuntimeProgramExecutableDestroy);
         if (!executable) {
             fail(graph->context, error.empty() ? "cannot resolve ProgramGraph" : error, VERNON_STATUS_PARSE_ERROR);
             return nullptr;
+        }
+        for (const RuntimeProgramGraphNode &node : graph->nodes) {
+            if (!program::findGraph(node.deployment.program, "backward"))
+                continue;
+            VernonProgramExecutable *child = program::loadBackendProgramPipeline(
+                *graph->context, node.deployment.program, node.deployment.artifactSystem, node.bundleRoot, error);
+            if (!child) {
+                fail(graph->context, error.empty() ? "cannot resolve differentiated ProgramGraph child" : error,
+                     VERNON_STATUS_PARSE_ERROR);
+                return nullptr;
+            }
+            const auto mapping = linked.nodeMappings.find(node.id);
+            if (mapping == linked.nodeMappings.end()) {
+                vernonRuntimeProgramExecutableDestroy(child);
+                fail(graph->context, "ProgramGraph child remapping is unavailable", VERNON_STATUS_INTERNAL_ERROR);
+                return nullptr;
+            }
+            ProgramGraphNodeAutodiffState state;
+            state.executable = std::shared_ptr<VernonProgramExecutable>(child, vernonRuntimeProgramExecutableDestroy);
+            state.globalValues = mapping->second.values;
+            state.globalStorages = mapping->second.storages;
+            executable->programGraphNodeAutodiff.emplace(node.id, std::move(state));
         }
         executable->id = linked.id;
         executable->programGraphId = graph->id;
@@ -1296,7 +1323,7 @@ VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *gr
                                                   graphics.renderPassControl, graphics.drawCommandControl,
                                                   graphics.dynamicStateControl});
         }
-        return executable;
+        return executable.release();
     } catch (const std::exception &error) {
         fail(graph->context, error.what(), VERNON_STATUS_INTERNAL_ERROR);
         return nullptr;
@@ -2519,7 +2546,9 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         const ProgramInvocationContext programContext{*invocation->controlSnapshot};
         VernonPullback *pullback = nullptr;
         const VernonStatus status = vernon::runtime::program_execution::forwardProgramInvocation(
-            *pipeline, arguments.data(), arguments.size(), pullback, &programContext);
+            *pipeline, arguments.data(), arguments.size(), pullback, &programContext,
+            pipeline->programGraphId && outputPullback ? &invocation->nodePullbacks : nullptr,
+            outputPullback != nullptr);
         if (status != VERNON_STATUS_OK) {
             invocation->transaction->rollback();
             invocation->controlTransaction->rollback();
@@ -2529,6 +2558,7 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         invocation->snapshot = invocation->transaction->commit();
         invocation->controlSnapshot = invocation->controlTransaction->commit();
         invocation->finished = true;
+        invocation->succeeded = true;
         if (pullback)
             vernon::runtime::program_execution::attachProgramSnapshot(*pullback, invocation->snapshot);
         if (outputPullback)
@@ -2543,6 +2573,32 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
             invocation->finished = true;
         }
         return fail(pipeline ? pipeline->context : nullptr, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
+VernonStatus vernonRuntimeProgramInvocationGetNodePullback(VernonProgramInvocation *invocation,
+                                                           VernonProgramNodeId node, VernonPullback **outputPullback) {
+    VernonProgramExecutable *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (outputPullback)
+        *outputPullback = nullptr;
+    if (!invocation || !invocation->finished || !invocation->succeeded || !pipeline || !pipeline->programGraphId ||
+        !outputPullback)
+        return fail(pipeline ? pipeline->context : nullptr, "invalid ProgramGraph node pullback retrieval");
+    const auto declared = pipeline->programGraphNodeAutodiff.find(node);
+    if (declared == pipeline->programGraphNodeAutodiff.end())
+        return fail(pipeline->context, "ProgramGraph node is not differentiable");
+    const auto retained = invocation->nodePullbacks.find(node);
+    if (retained == invocation->nodePullbacks.end() || !retained->second)
+        return fail(pipeline->context, "ProgramGraph node pullback is unavailable");
+    try {
+        VernonPullback *pullback = vernon::runtime::program_execution::makeRetainedProgramPullback(
+            *pipeline, std::move(retained->second), invocation->snapshot);
+        invocation->nodePullbacks.erase(retained);
+        *outputPullback = pullback;
+        return VERNON_STATUS_OK;
+    } catch (const std::exception &exception) {
+        return fail(pipeline->context, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
     }
 }
 

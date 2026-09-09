@@ -5,13 +5,33 @@
 namespace vernon::runtime::ad {
 namespace {
 
+program_execution::CanonicalValueSnapshot ownHostBytes(program_execution::CanonicalValueSnapshot snapshot) {
+    auto &logical = snapshot.logical;
+    if (!snapshot.deviceOwner && logical.ownedHostBytes.empty() && logical.argument.kind == VERNON_PROGRAM_TENSOR &&
+        logical.argument.tensor.storage == VERNON_TENSOR_HOST && logical.argument.tensor.host_data &&
+        logical.argument.tensor.byte_size) {
+        const auto *data = static_cast<const uint8_t *>(logical.argument.tensor.host_data);
+        logical.ownedHostBytes.assign(data, data + logical.argument.tensor.byte_size);
+        logical.argument.tensor.host_data = logical.ownedHostBytes.data();
+        snapshot.residentArgument = logical.argument;
+    }
+    return snapshot;
+}
+
 std::vector<program_execution::CanonicalValueSnapshot>
 captureValues(const ProgramResidualPlan &plan, const program_execution::ProgramInvocationState &invocation) {
     std::vector<program_execution::CanonicalValueSnapshot> result;
     result.reserve(plan.retainedValues.size());
     for (uint32_t value : plan.retainedValues)
-        result.push_back(invocation.snapshotValue(value));
+        result.push_back(ownHostBytes(invocation.snapshotValue(value)));
     return result;
+}
+
+std::vector<program_execution::CanonicalValueSnapshot>
+ownHostBytes(std::vector<program_execution::CanonicalValueSnapshot> values) {
+    for (auto &value : values)
+        value = ownHostBytes(std::move(value));
+    return values;
 }
 
 std::vector<std::vector<uint8_t>> captureBytes(size_t valueCount,
@@ -33,8 +53,7 @@ makeCaptureShapes(size_t valueCount, const std::vector<program_execution::Canoni
 }
 
 std::map<uint32_t, program_execution::ProgramStorageBacking>
-captureStorages(const program_execution::ProgramInvocationState &invocation) {
-    auto result = invocation.storageBackings();
+sanitizeStorages(std::map<uint32_t, program_execution::ProgramStorageBacking> result) {
     for (auto &[storage, backing] : result) {
         (void)storage;
         backing.external.reset();
@@ -43,14 +62,21 @@ captureStorages(const program_execution::ProgramInvocationState &invocation) {
     return result;
 }
 
-std::vector<char> captureTapeValues(const program_execution::ProgramInvocationState &invocation) {
-    if (!invocation.plan().resolvedProgram)
-        return {};
-    const program::Program &program = invocation.plan().resolvedProgram->program;
+std::map<uint32_t, program_execution::ProgramStorageBacking>
+captureStorages(const program_execution::ProgramInvocationState &invocation) {
+    return sanitizeStorages(invocation.storageBackings());
+}
+
+std::vector<char> captureTapeValues(const program::Program &program) {
     std::vector<char> result(program.values.size());
     for (const program::Value &value : program.values)
         result[value.id] = program::isTapeValueType(value.type);
     return result;
+}
+
+std::vector<char> captureTapeValues(const program_execution::ProgramInvocationState &invocation) {
+    return invocation.plan().resolvedProgram ? captureTapeValues(invocation.plan().resolvedProgram->program)
+                                             : std::vector<char>{};
 }
 
 } // namespace
@@ -62,6 +88,15 @@ RetainedPullbackState::RetainedPullbackState(ProgramResidualPlan plan,
       storages_(captureStorages(invocation)), residualCaptures_(captureBytes(invocation.values().size(), values_)),
       captureShapes_(makeCaptureShapes(invocation.values().size(), values_)),
       tapeValues_(captureTapeValues(invocation)), tape_(tapeScratch.releaseSnapshot()) {}
+
+RetainedPullbackState::RetainedPullbackState(ProgramResidualPlan plan, const program::Program &program,
+                                             std::vector<program_execution::CanonicalValueSnapshot> values,
+                                             std::map<uint32_t, program_execution::ProgramStorageBacking> storages,
+                                             ProgramTapeScratch tapeScratch)
+    : residualPlan_(std::move(plan)), values_(ownHostBytes(std::move(values))),
+      storages_(sanitizeStorages(std::move(storages))), residualCaptures_(captureBytes(program.values.size(), values_)),
+      captureShapes_(makeCaptureShapes(program.values.size(), values_)), tapeValues_(captureTapeValues(program)),
+      tape_(tapeScratch.releaseSnapshot()) {}
 
 bool RetainedPullbackState::importInto(program_execution::ProgramInvocationState &invocation,
                                        ProgramTapeScratch &tapeScratch, bool importTape, std::string &error) const {

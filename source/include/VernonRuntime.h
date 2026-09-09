@@ -570,6 +570,16 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDynamicState(
     const VernonDynamicState *dynamic_state);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
                                                                        VernonPullback **output_pullback);
+/*
+ * A non-null output_pullback requests retention. For a ProgramGraph it remains
+ * null because the graph has no composite VJP; retrieve each differentiated
+ * child's pullback exactly once, after successful forward and before
+ * destroying the invocation. The returned pullback owns its retained state
+ * and may outlive the invocation.
+ */
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationGetNodePullback(VernonProgramInvocation *invocation,
+                                                                               VernonProgramNodeId node,
+                                                                               VernonPullback **output_pullback);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInvocationDestroy(VernonProgramInvocation *invocation);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInstanceGetTelemetry(const VernonProgramInstance *instance,

@@ -1,7 +1,5 @@
 #include "program_tape_scratch.h"
 
-#include "runtime/tensor_bridge.h"
-
 #include <algorithm>
 
 namespace vernon::runtime::ad {
@@ -37,16 +35,25 @@ ProgramTapeSnapshot ProgramTapeScratch::releaseSnapshot() {
         for (size_t index = 0; index < carriers_[value].size(); ++index) {
             Carrier &source = carriers_[value][index];
             auto &destination = snapshot.carriers[value][index];
-            destination.owner = std::move(source.buffer);
+            destination.owner = source.buffer ? std::move(source.buffer) : std::move(source.retainedBuffer);
             destination.argument = source.argument;
             destination.shape = std::move(source.shape);
             destination.strides = std::move(source.strides);
+            if (destination.argument.kind == VERNON_PROGRAM_TENSOR) {
+                destination.argument.tensor.shape = destination.shape.empty() ? nullptr : destination.shape.data();
+                destination.argument.tensor.byte_strides =
+                    destination.strides.empty() ? nullptr : destination.strides.data();
+            }
         }
     return snapshot;
 }
 
 void ProgramTapeScratch::importSnapshot(const ProgramTapeSnapshot &snapshot) {
-    hostBatches_.assign(carriers_.size(), nullptr);
+    hostBatches_.clear();
+    hostBatches_.reserve(snapshot.hostBatches.size());
+    for (const auto &batch : snapshot.hostBatches)
+        hostBatches_.push_back(std::const_pointer_cast<HostStaticTapeBatch>(batch));
+    hostBatches_.resize(carriers_.size());
     const size_t valueCount = std::min(carriers_.size(), snapshot.carriers.size());
     for (size_t value = 0; value < valueCount; ++value)
         for (size_t index = 0; index < carriers_[value].size(); ++index) {
@@ -58,6 +65,11 @@ void ProgramTapeScratch::importSnapshot(const ProgramTapeSnapshot &snapshot) {
             destination.shape = source.shape;
             destination.strides = source.strides;
             destination.readOnly = static_cast<bool>(source.owner);
+            if (destination.argument.kind == VERNON_PROGRAM_TENSOR) {
+                destination.argument.tensor.shape = destination.shape.empty() ? nullptr : destination.shape.data();
+                destination.argument.tensor.byte_strides =
+                    destination.strides.empty() ? nullptr : destination.strides.data();
+            }
         }
 }
 

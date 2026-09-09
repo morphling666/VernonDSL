@@ -200,6 +200,120 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
+TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompositeAutodiff) {
+    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr) << lastError(context);
+    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, nullptr);
+    ASSERT_NE(standalone, nullptr) << lastError(context);
+
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(context);
+    ASSERT_NE(graph, nullptr);
+    VernonProgramNodeId firstNode = UINT32_MAX;
+    VernonProgramNodeId secondNode = UINT32_MAX;
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &firstNode), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, nullptr, &secondNode), VERNON_STATUS_OK);
+    VernonProgramNodeBindingToken firstSource{};
+    VernonProgramNodeBindingToken firstOutput{};
+    VernonProgramNodeBindingToken secondSource{};
+    VernonProgramNodeBindingToken secondOutput{};
+    firstSource.struct_size = sizeof(firstSource);
+    firstOutput.struct_size = sizeof(firstOutput);
+    secondSource.struct_size = sizeof(secondSource);
+    secondOutput.struct_size = sizeof(secondOutput);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, firstNode, VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                    {"source", std::strlen("source")}, &firstSource),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, firstNode, VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                    {"output", std::strlen("output")}, &firstOutput),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, secondNode, VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                    {"source", std::strlen("source")}, &secondSource),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, secondNode, VERNON_PROGRAM_BOUNDARY_OUTPUT,
+                                                    {"output", std::strlen("output")}, &secondOutput),
+              VERNON_STATUS_OK);
+    VernonProgramGraphValue intermediate{sizeof(VernonProgramGraphValue)};
+    ASSERT_EQ(vernonRuntimeProgramGraphCreateValue(graph, &firstOutput, &intermediate), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphConnectValue(graph, &intermediate, &secondSource), VERNON_STATUS_OK);
+    VernonProgramExecutable *composite = vernonRuntimeResolveProgramGraph(graph);
+    ASSERT_NE(composite, nullptr) << lastError(context);
+    EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(composite), 0u);
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_COTANGENT), 0u);
+    EXPECT_EQ(vernonRuntimeProgramExecutableGetBoundaryCount(composite, VERNON_PROGRAM_BOUNDARY_GRADIENT), 0u);
+
+    float source = 3.0f;
+    float output = 0.0f;
+    VernonProgramArgument sourceArgument = tensorArgument(parameter(standalone, "source"), source);
+    VernonProgramArgument outputArgument = tensorArgument(parameter(standalone, "output"), output);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(composite);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &firstSource, &sourceArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &secondOutput, &outputArgument, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    VernonPullback *compositePullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &compositePullback), VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_EQ(compositePullback, nullptr);
+    EXPECT_FLOAT_EQ(output, 81.0f);
+
+    VernonPullback *firstPullback = nullptr;
+    VernonPullback *secondPullback = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, firstNode, &firstPullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation, secondNode, &secondPullback), VERNON_STATUS_OK)
+        << lastError(context);
+    ASSERT_NE(firstPullback, nullptr);
+    ASSERT_NE(secondPullback, nullptr);
+    vernonRuntimeProgramInvocationDestroy(invocation);
+
+    VernonProgramParameterView cotangent{};
+    VernonProgramParameterView gradient{};
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_COTANGENT, 0, &cotangent),
+        VERNON_STATUS_OK);
+    ASSERT_EQ(
+        vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone, VERNON_PROGRAM_BOUNDARY_GRADIENT, 0, &gradient),
+        VERNON_STATUS_OK);
+    float seed = 1.0f;
+    float intermediateCotangent = 0.0f;
+    VernonProgramArgument secondDerivatives[]{
+        tensorArgument(cotangent, seed),
+        tensorArgument(gradient, intermediateCotangent),
+    };
+    ASSERT_EQ(vernonProgramPullbackApply(secondPullback, secondDerivatives, std::size(secondDerivatives)),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_FLOAT_EQ(intermediateCotangent, 18.0f);
+    float result = 0.0f;
+    VernonProgramArgument firstDerivatives[]{
+        tensorArgument(cotangent, intermediateCotangent),
+        tensorArgument(gradient, result),
+    };
+    ASSERT_EQ(vernonProgramPullbackApply(firstPullback, firstDerivatives, std::size(firstDerivatives)),
+              VERNON_STATUS_OK)
+        << lastError(context);
+    EXPECT_FLOAT_EQ(result, 108.0f);
+
+    vernonProgramPullbackDestroy(secondPullback);
+    vernonProgramPullbackDestroy(firstPullback);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(composite);
+    vernonRuntimeProgramGraphDestroy(graph);
+    vernonRuntimeProgramExecutableDestroy(standalone);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
 TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
     ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
@@ -352,6 +466,14 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphProvidesNodeScopedFrameBindings) {
         auto standalone = asset.resolve();
         const VernonProgramParameterView sourceParameter = parameter(standalone.get(), "source");
         const VernonProgramParameterView outputParameter = parameter(standalone.get(), "output");
+        VernonProgramParameterView cotangent{};
+        VernonProgramParameterView gradient{};
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone.get(), VERNON_PROGRAM_BOUNDARY_COTANGENT,
+                                                                   0, &cotangent),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(standalone.get(), VERNON_PROGRAM_BOUNDARY_GRADIENT,
+                                                                   0, &gradient),
+                  VERNON_STATUS_OK);
         vernon::runtime::ProgramGraph graph(context);
         const auto first = graph.add(asset);
         const auto second = graph.add(asset);
@@ -372,9 +494,31 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphProvidesNodeScopedFrameBindings) {
         invocation.node(second)
             .bind(secondSource, tensorArgument(sourceParameter, secondSourceValue))
             .bind(secondOutput, tensorArgument(outputParameter, secondOutputValue));
-        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_FALSE(invocation.forward());
         EXPECT_FLOAT_EQ(firstOutputValue, 4.0f);
         EXPECT_FLOAT_EQ(secondOutputValue, 9.0f);
+        vernon::runtime::ProgramGraph otherGraph(context);
+        const auto foreignNode = otherGraph.add(asset);
+        EXPECT_THROW(invocation.pullback(foreignNode), std::invalid_argument);
+        auto firstPullback = invocation.pullback(first);
+        auto secondPullback = invocation.pullback(second);
+        float seed = 1.0f;
+        float firstGradient = 0.0f;
+        float secondGradient = 0.0f;
+        VernonProgramArgument firstDerivatives[]{
+            tensorArgument(cotangent, seed),
+            tensorArgument(gradient, firstGradient),
+        };
+        VernonProgramArgument secondDerivatives[]{
+            tensorArgument(cotangent, seed),
+            tensorArgument(gradient, secondGradient),
+        };
+        firstPullback.apply(firstDerivatives, std::size(firstDerivatives));
+        EXPECT_FLOAT_EQ(firstGradient, 4.0f);
+        EXPECT_FLOAT_EQ(secondGradient, 0.0f);
+        secondPullback.apply(secondDerivatives, std::size(secondDerivatives));
+        EXPECT_FLOAT_EQ(firstGradient, 4.0f);
+        EXPECT_FLOAT_EQ(secondGradient, 6.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
@@ -433,6 +577,11 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
         EXPECT_FALSE(invocation.forward(false));
         EXPECT_FLOAT_EQ(oneValues[0], 1.0f);
         EXPECT_FLOAT_EQ(fourValues[0], 4.0f);
+        VernonPullback *pullback = nullptr;
+        EXPECT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation.get(), oneNode.id(), &pullback),
+                  VERNON_STATUS_INVALID_ARGUMENT);
+        EXPECT_EQ(pullback, nullptr);
+        EXPECT_EQ(lastError(context), "ProgramGraph node is not differentiable");
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
@@ -466,6 +615,11 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
         invocation.node(consumer).bind(consumerOutput, tensorArgument(outputParameter, output));
         EXPECT_FALSE(invocation.forward(false));
         EXPECT_FLOAT_EQ(output, 16.0f);
+        VernonPullback *pullback = nullptr;
+        EXPECT_EQ(vernonRuntimeProgramInvocationGetNodePullback(invocation.get(), producer.id(), &pullback),
+                  VERNON_STATUS_INVALID_ARGUMENT);
+        EXPECT_EQ(pullback, nullptr);
+        EXPECT_EQ(lastError(context), "ProgramGraph node pullback is unavailable");
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
