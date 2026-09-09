@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "execution_control_plane.h"
 #include "execution_graph/execution_command_model.h"
+#include "runtime/resolved_stage_types.h"
 
 #include <cstddef>
 #include <cstdint>

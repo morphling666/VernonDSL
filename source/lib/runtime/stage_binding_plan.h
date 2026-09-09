@@ -120,7 +120,6 @@ struct ParameterUse {
 };
 
 enum class StageParameterSource {
-    Projected,
     Direct,
     ImplicitSampler,
     Resolution,
@@ -145,7 +144,7 @@ struct Parameter {
     uint32_t slot{};
     std::string name;
     std::string kind;
-    StageParameterSource source{StageParameterSource::Projected};
+    StageParameterSource source;
     // Representation of the invocation-owned Tensor descriptor.
     TensorRepresentation tensorArgument{TensorRepresentation::ElementStream};
     std::optional<ValueLayout> valueLayout;

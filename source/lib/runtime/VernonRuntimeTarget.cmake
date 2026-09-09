@@ -171,7 +171,7 @@ function(vernon_add_runtime)
     endif()
 
     add_library(
-        VernonExecutionGraph STATIC
+        VernonCommandGraph OBJECT
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_model.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp
@@ -179,15 +179,12 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_checkpoint_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_submission.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp)
-    add_library(Vernon::ExecutionGraph ALIAS VernonExecutionGraph)
-    set_target_properties(VernonExecutionGraph PROPERTIES EXPORT_NAME ExecutionGraph POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(
-        VernonExecutionGraph
-        PUBLIC $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}> $<INSTALL_INTERFACE:include>
-        PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
-    target_link_libraries(VernonExecutionGraph PUBLIC Vernon::RHI)
+    set_target_properties(VernonCommandGraph PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(VernonCommandGraph PRIVATE $<BUILD_INTERFACE:${_VERNON_RUNTIME_INCLUDE_DIR}>
+                                                          $<BUILD_INTERFACE:${_VERNON_RUNTIME_IMPL_DIR}/..>)
+    target_link_libraries(VernonCommandGraph PRIVATE Vernon::RHI)
     if(MSVC)
-        target_compile_options(VernonExecutionGraph PRIVATE /EHsc)
+        target_compile_options(VernonCommandGraph PRIVATE /EHsc)
     endif()
 
     add_library(VernonRuntimeCore STATIC ${_VERNON_RUNTIME_IMPL_DIR}/graphics_variant_key.cpp
@@ -211,11 +208,12 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/dirty_index_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_planner.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_materializer.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/target_implementation_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/prepared_graphics_draw.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/stage_artifact.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/stage_binding_plan.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/program_graph_linker.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_backend.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_execution_manifest.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/program_instance.cpp
@@ -304,14 +302,14 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_backend_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cpu.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_cuda.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_direct.cpp
+        ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_resolved_compute.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_directx12.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_dispatch.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_metal.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_opengl.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/runtime_pipeline_vulkan.cpp)
     add_library(Vernon::Runtime ALIAS VernonRuntime)
-    target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeInternals>)
+    target_sources(VernonRuntime PRIVATE $<TARGET_OBJECTS:VernonRuntimeInternals> $<TARGET_OBJECTS:VernonCommandGraph>)
     set_target_properties(VernonRuntime PROPERTIES EXPORT_NAME Runtime)
     target_compile_definitions(VernonRuntime PRIVATE VERNON_RUNTIME_BUILD)
     if(VERNON_RUNTIME_PROFILE STREQUAL "web")
@@ -354,7 +352,6 @@ function(vernon_add_runtime)
                 VernonRuntimeRHIAdapter
                 VernonPlatform
                 VernonRHI
-                VernonExecutionGraph
                 $<BUILD_INTERFACE:nlohmann_json::nlohmann_json>)
     if(NOT
        VERNON_RUNTIME_PROFILE
@@ -384,7 +381,7 @@ function(vernon_add_runtime)
         set(_vernon_runtime_bin_destination bin)
         set(_vernon_runtime_lib_destination lib)
     endif()
-    set(_vernon_runtime_install_targets VernonRuntime VernonRHI VernonExecutionGraph)
+    set(_vernon_runtime_install_targets VernonRuntime VernonRHI)
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "STATIC")
         list(
             APPEND

@@ -1,7 +1,7 @@
 #ifndef VERNON_EXECUTION_GRAPH_CHECKPOINT_PLANNER_INTERNAL_H
 #define VERNON_EXECUTION_GRAPH_CHECKPOINT_PLANNER_INTERNAL_H
 
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 namespace vernon::execution::detail {
 

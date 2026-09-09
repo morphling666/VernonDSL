@@ -1,5 +1,5 @@
-#ifndef VERNON_EXECUTION_GRAPH_H
-#define VERNON_EXECUTION_GRAPH_H
+#ifndef VERNON_RUNTIME_COMMAND_GRAPH_H
+#define VERNON_RUNTIME_COMMAND_GRAPH_H
 
 #include "VernonRHI.h"
 
@@ -16,14 +16,14 @@
 
 namespace vernon::execution {
 
-class ExecutionGraph;
-class CompiledExecutionGraph;
+class CommandGraph;
+class CompiledCommandGraph;
 class ExecutionSubmission;
 class ExecutionResources;
 class GraphPullback;
 class GraphBackwardSubmission;
 namespace detail {
-struct ExecutionGraphTestAccess;
+struct CommandGraphTestAccess;
 struct RhiCommandExecutionPlan;
 class RhiCommandPlanSink;
 } // namespace detail
@@ -259,7 +259,7 @@ public:
     size_t size() const { return values_.size(); }
 
 private:
-    friend class CompiledExecutionGraph;
+    friend class CompiledCommandGraph;
     friend class GraphPullback;
     friend class ExecutionBindingsBuilder;
     friend class ExecutionResources;
@@ -276,7 +276,7 @@ public:
     std::shared_ptr<const ExecutionBindings> snapshot() const;
 
 private:
-    friend class CompiledExecutionGraph;
+    friend class CompiledCommandGraph;
     ExecutionBindingsBuilder(uint64_t graphIdentity, size_t parameterCount);
 
     uint64_t graphIdentity_{};
@@ -295,7 +295,7 @@ public:
     const std::shared_ptr<const ExecutionBindingValue> &binding(ExecutionParameter parameter) const;
 
 private:
-    friend class CompiledExecutionGraph;
+    friend class CompiledCommandGraph;
     const std::vector<GraphResource> &resources_;
     const std::vector<VernonRhiBuffer> &buffers_;
     std::shared_ptr<const ExecutionBindings> bindings_;
@@ -331,7 +331,7 @@ protected:
                    uint32_t stageMask = 0);
 
 private:
-    friend class ExecutionGraph;
+    friend class CommandGraph;
     void resetDeclaration();
     void finishDeclaration();
 
@@ -339,7 +339,7 @@ private:
     uint32_t flags_{};
     uint32_t configuredFlags_{};
     bool declaring_{};
-    ExecutionGraph *owner_{};
+    CommandGraph *owner_{};
     bool frozen_{};
     std::vector<ExecutionPass *> dependencies_;
     std::vector<ResourceUse> uses_;
@@ -359,7 +359,7 @@ protected:
     void renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
 
 private:
-    friend class ExecutionGraph;
+    friend class CommandGraph;
     std::vector<ColorAttachmentUse> colors_;
     std::unique_ptr<DepthStencilAttachmentUse> depth_;
     uint32_t renderArea_[4]{};
@@ -494,13 +494,13 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-class ExecutionGraph {
+class CommandGraph {
 public:
-    ExecutionGraph();
-    explicit ExecutionGraph(VernonRhiDevice device);
-    ~ExecutionGraph();
-    ExecutionGraph(const ExecutionGraph &) = delete;
-    ExecutionGraph &operator=(const ExecutionGraph &) = delete;
+    CommandGraph();
+    explicit CommandGraph(VernonRhiDevice device);
+    ~CommandGraph();
+    CommandGraph(const CommandGraph &) = delete;
+    CommandGraph &operator=(const CommandGraph &) = delete;
 
     template <typename Pass, typename... Arguments> Pass &emplacePass(Arguments &&...arguments) {
         if (compiled_)
@@ -525,12 +525,12 @@ public:
                               std::vector<NamedDerivativeEndpoint> objectives);
     void setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes);
     void planAutodiffCheckpoints(uint64_t memoryBudget);
-    std::shared_ptr<CompiledExecutionGraph> compile(std::string &error);
+    std::shared_ptr<CompiledCommandGraph> compile(std::string &error);
     bool validate(std::string &error);
 
 private:
     friend class ExecutionPass;
-    friend struct detail::ExecutionGraphTestAccess;
+    friend struct detail::CommandGraphTestAccess;
 
     bool buildPlan(std::string &error);
     bool validateDeclarations(std::string &error) const;
@@ -582,17 +582,17 @@ public:
     const VernonRhiCommandEncoderStats &commandStats() const;
 
 private:
-    friend class CompiledExecutionGraph;
+    friend class CompiledCommandGraph;
     class Impl;
     explicit ExecutionSubmission(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
 
-class CompiledExecutionGraph {
+class CompiledCommandGraph {
 public:
-    ~CompiledExecutionGraph();
-    CompiledExecutionGraph(const CompiledExecutionGraph &) = delete;
-    CompiledExecutionGraph &operator=(const CompiledExecutionGraph &) = delete;
+    ~CompiledCommandGraph();
+    CompiledCommandGraph(const CompiledCommandGraph &) = delete;
+    CompiledCommandGraph &operator=(const CompiledCommandGraph &) = delete;
 
     ExecutionBindingsBuilder createBindings(const std::vector<ExecutionBinding> &initial) const;
     ExecutionSubmission submit(std::shared_ptr<const ExecutionBindings> bindings = {}) const;
@@ -602,11 +602,11 @@ public:
     const AutodiffDagCheckpointPlan *autodiffCheckpointPlan() const;
 
 private:
-    friend class ExecutionGraph;
+    friend class CommandGraph;
     friend class ExecutionSubmission;
     friend class GraphPullback;
     struct State;
-    explicit CompiledExecutionGraph(std::shared_ptr<State> state);
+    explicit CompiledCommandGraph(std::shared_ptr<State> state);
     std::shared_ptr<State> state_;
 };
 
@@ -668,7 +668,7 @@ public:
     std::vector<GraphAutodiffPassTelemetry> passTelemetry() const;
 
 private:
-    friend class CompiledExecutionGraph;
+    friend class CompiledCommandGraph;
     class Impl;
     explicit GraphPullback(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;

@@ -6,10 +6,21 @@
 #include "graphics_invocation_planner.h"
 #include "runtime_state.h"
 
+#include <optional>
 #include <string_view>
 #include <vector>
 
 namespace vernon::runtime {
+
+inline std::optional<VernonRuntimeProviderBindingKind> providerBindingKindForTransport(std::string_view transport) {
+    if (transport == "storage_buffer")
+        return VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    if (transport == "uniform_buffer")
+        return VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER;
+    if (transport == "push_constant")
+        return VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+    return std::nullopt;
+}
 
 struct OpenGLNativeUniformShape {
     uint32_t scalarCount{};

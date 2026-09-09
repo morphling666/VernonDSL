@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
+#include "resolved_stage_types.h"
 #include "stage_binding_plan.h"
 
 #include <array>

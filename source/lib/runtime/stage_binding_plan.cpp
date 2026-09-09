@@ -419,8 +419,7 @@ bool validateStageBindingPlan(const StageBindingPlan &plan, std::string &error) 
         return false;
     }
     for (const Parameter &parameter : plan.parameters) {
-        const bool externalTransport =
-            parameter.source == StageParameterSource::Projected || parameter.source == StageParameterSource::Direct;
+        const bool externalTransport = parameter.source == StageParameterSource::Direct;
         if (parameter.name.empty() || parameter.uses.empty() || !externalTransport) {
             error = "external Stage parameter invariant failed";
             return false;

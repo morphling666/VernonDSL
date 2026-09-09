@@ -23,7 +23,7 @@ extern "C" {
 
 typedef struct VernonRuntimeContext VernonRuntimeContext;
 typedef struct VernonProgramBundle VernonProgramBundle;
-typedef struct VernonStageExecutable VernonStageExecutable;
+typedef struct VernonProgramGraph VernonProgramGraph;
 typedef struct VernonProgramExecutable VernonProgramExecutable;
 typedef struct VernonPullback VernonPullback;
 typedef struct VernonSubmission VernonSubmission;
@@ -79,14 +79,6 @@ VERNON_RUNTIME_CAPI VernonRuntimeContext *vernonRuntimeCreateForRhiDevice(Vernon
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeDestroy(VernonRuntimeContext *context);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeGetLastError(const VernonRuntimeContext *context);
 
-VERNON_RUNTIME_CAPI VernonStageExecutable *vernonRuntimeLoadArtifact(VernonRuntimeContext *context,
-                                                                     const void *artifact, size_t artifact_size,
-                                                                     const char *reflection, size_t reflection_size,
-                                                                     const char *entry, size_t entry_size);
-VERNON_RUNTIME_CAPI VernonStageExecutable *vernonRuntimeLoadCpuEntry(VernonRuntimeContext *context,
-                                                                     VernonCpuEntryPoint entry_point,
-                                                                     const char *reflection, size_t reflection_size,
-                                                                     const char *entry, size_t entry_size);
 /*
  * Registers an AOT entry that was statically linked into the application.
  * Re-registering the same symbol and pointer is idempotent.
@@ -275,19 +267,6 @@ typedef struct VernonProgramArgument {
     };
 } VernonProgramArgument;
 
-typedef struct VernonStageInvocationDescriptor {
-    uint32_t struct_size;
-    uint32_t abi_version;
-    const VernonProgramArgument *arguments;
-    size_t argument_count;
-    VernonLaunchSize compute_grid;
-    VernonRuntimeProviderObject command_encoder;
-    const VernonGraphicsState *graphics_state;
-    const VernonRenderPass *render_pass;
-    const VernonDrawCommand *draw_command;
-    const VernonDynamicState *dynamic_state;
-} VernonStageInvocationDescriptor;
-
 typedef struct VernonProgramBindingToken {
     uint32_t struct_size;
     const void *data;
@@ -351,6 +330,37 @@ typedef enum VernonProgramBoundaryRole {
     VERNON_PROGRAM_BOUNDARY_GRADIENT = 3
 } VernonProgramBoundaryRole;
 
+typedef uint32_t VernonProgramNodeId;
+
+typedef struct VernonProgramNodeBindingToken {
+    uint32_t struct_size;
+    uint64_t graph_id;
+    VernonProgramNodeId node;
+    uint32_t local_slot;
+    VernonProgramArgumentKind kind;
+} VernonProgramNodeBindingToken;
+
+typedef struct VernonProgramGraphValue {
+    uint32_t struct_size;
+    uint64_t graph_id;
+    uint32_t id;
+    VernonProgramArgumentKind kind;
+} VernonProgramGraphValue;
+
+typedef struct VernonProgramGraphStorage {
+    uint32_t struct_size;
+    uint64_t graph_id;
+    uint32_t id;
+    VernonProgramArgumentKind kind;
+} VernonProgramGraphStorage;
+
+typedef struct VernonProgramNodeGraphicsToken {
+    uint32_t struct_size;
+    uint64_t graph_id;
+    VernonProgramNodeId node;
+    uint32_t local_node;
+} VernonProgramNodeGraphicsToken;
+
 typedef enum VernonAdDerivativeRole {
     VERNON_AD_DERIVATIVE_GRADIENT = 0,
     VERNON_AD_DERIVATIVE_COTANGENT = 1
@@ -395,9 +405,50 @@ vernonRuntimeLoadProgramBundleWithOptions(VernonRuntimeContext *context, const v
                                           const VernonProgramBundleLoadOptions *options);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramBundleGetId(const VernonProgramBundle *bundle);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramBundleDestroy(VernonProgramBundle *bundle);
+VERNON_RUNTIME_CAPI VernonProgramGraph *vernonRuntimeProgramGraphCreate(VernonRuntimeContext *context);
+VERNON_RUNTIME_CAPI void vernonRuntimeProgramGraphDestroy(VernonProgramGraph *graph);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphAddProgram(VernonProgramGraph *graph,
+                                                                     const VernonProgramBundle *bundle,
+                                                                     VernonProgramNodeId *node);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *graph,
+                                                                       VernonProgramNodeId node,
+                                                                       VernonProgramBoundaryRole role,
+                                                                       VernonStringView name,
+                                                                       VernonProgramNodeBindingToken *token);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphCreateValue(VernonProgramGraph *graph,
+                                                                      const VernonProgramNodeBindingToken *source,
+                                                                      VernonProgramGraphValue *value);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphConnectValue(
+    VernonProgramGraph *graph, const VernonProgramGraphValue *value, const VernonProgramNodeBindingToken *destination);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphCreateStorage(
+    VernonProgramGraph *graph, const VernonProgramNodeBindingToken *first_version, VernonProgramGraphStorage *storage);
+VERNON_RUNTIME_CAPI VernonStatus
+vernonRuntimeProgramGraphAppendStorage(VernonProgramGraph *graph, const VernonProgramGraphStorage *storage,
+                                       const VernonProgramNodeBindingToken *next_version);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphExportBoundary(VernonProgramGraph *graph,
+                                                                         const VernonProgramNodeBindingToken *boundary,
+                                                                         VernonStringView graph_name);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphExportValue(VernonProgramGraph *graph,
+                                                                      const VernonProgramGraphValue *value,
+                                                                      VernonStringView graph_name);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphExportStorage(VernonProgramGraph *graph,
+                                                                        const VernonProgramGraphStorage *storage,
+                                                                        VernonStringView graph_name);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphFindGraphicsNode(const VernonProgramGraph *graph,
+                                                                           VernonProgramNodeId node,
+                                                                           VernonStringView name,
+                                                                           VernonProgramNodeGraphicsToken *token);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramGraphGetGraphicsNodeCount(const VernonProgramGraph *graph,
+                                                                         VernonProgramNodeId node);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramGraphGetGraphicsNodeByIndex(const VernonProgramGraph *graph,
+                                                                                 VernonProgramNodeId node, size_t index,
+                                                                                 VernonProgramNodeGraphicsToken *token);
+VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph,
+                                                                              VernonFeatureSetView features);
 VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle,
                                                                          VernonFeatureSetView features);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramParameterView *parameter);
@@ -452,36 +503,6 @@ typedef struct VernonProgramGraphicsControlsView {
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetGraphicsNodeCount(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramGraphicsControlsView *output);
-VERNON_RUNTIME_CAPI void vernonRuntimeStageExecutableDestroy(VernonStageExecutable *stage);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeStageExecutableGetParameterCount(const VernonStageExecutable *stage);
-VERNON_RUNTIME_CAPI uint32_t vernonRuntimeStageExecutableIsCompute(const VernonStageExecutable *stage);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableGetParameterByIndex(const VernonStageExecutable *stage,
-                                                                                 size_t index,
-                                                                                 VernonProgramParameterView *parameter);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableFindParameter(const VernonStageExecutable *stage,
-                                                                           VernonStringView name,
-                                                                           VernonProgramParameterView *parameter);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableGetParameterValueLeaf(const VernonStageExecutable *stage,
-                                                                                   VernonStringView parameter_name,
-                                                                                   size_t leaf_index,
-                                                                                   VernonProgramValueLeafView *leaf);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableGetImageConstraintByParameterIndex(
-    const VernonStageExecutable *stage, size_t parameter_index, VernonProgramImageConstraintView *constraint);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableFindImageConstraint(
-    const VernonStageExecutable *stage, VernonStringView parameter_name, VernonProgramImageConstraintView *constraint);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeStageExecutableGetOutputCount(const VernonStageExecutable *stage);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableGetOutputByIndex(const VernonStageExecutable *stage,
-                                                                              size_t index,
-                                                                              VernonProgramOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageExecutableFindOutput(const VernonStageExecutable *stage,
-                                                                        VernonStringView name,
-                                                                        VernonProgramOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageSubmit(VernonStageExecutable *stage,
-                                                          const VernonStageInvocationDescriptor *invocation,
-                                                          VernonSubmission **output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeStageEncode(VernonRuntimeProviderObject encoder,
-                                                          VernonStageExecutable *stage,
-                                                          const VernonStageInvocationDescriptor *invocation);
 VERNON_RUNTIME_CAPI VernonProgramInstance *vernonRuntimeProgramInstanceCreate(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramInstanceDestroy(VernonProgramInstance *instance);
 VERNON_RUNTIME_CAPI VernonProgramInvocation *
@@ -491,6 +512,20 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBind(VernonProgra
                                                                     const VernonProgramArgument *argument,
                                                                     const VernonProgramResourceLease *lease,
                                                                     uint64_t upload_bytes, uint64_t upload_ranges);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindNode(VernonProgramInvocation *invocation,
+                                                                        const VernonProgramNodeBindingToken *token,
+                                                                        const VernonProgramArgument *argument,
+                                                                        const VernonProgramResourceLease *lease,
+                                                                        uint64_t upload_bytes, uint64_t upload_ranges);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindGraphStorage(
+    VernonProgramInvocation *invocation, const VernonProgramGraphStorage *storage,
+    const VernonProgramArgument *argument, const VernonProgramResourceLease *lease, uint64_t upload_bytes,
+    uint64_t upload_ranges);
+VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindNodeGraphics(
+    VernonProgramInvocation *invocation, const VernonProgramNodeGraphicsToken *node,
+    const VernonRenderPass *render_pass, const VernonProgramResourceLease *render_pass_leases,
+    size_t render_pass_lease_count, const VernonDrawCommand *draw, const VernonProgramResourceLease *draw_lease,
+    const VernonDynamicState *dynamic_state);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindRenderPass(
     VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
     const VernonRenderPass *render_pass, const VernonProgramResourceLease *leases, size_t lease_count);

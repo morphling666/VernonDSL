@@ -8,8 +8,12 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <gtest/gtest.h>
+#include <iterator>
 #include <string>
+#include <string_view>
 
 namespace {
 
@@ -167,6 +171,99 @@ TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkg
         verifySynchronizationResult(result);
     }
 
+    EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
+}
+
+TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
+    ASSERT_EQ(vernonRegisterSynchronizationProgramFixture(), VERNON_STATUS_OK);
+    VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(runtime, nullptr);
+    const std::filesystem::path manifestPath = VERNON_SYNCHRONIZATION_CPU_MANIFEST;
+    std::ifstream input(manifestPath, std::ios::binary);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    ASSERT_FALSE(manifest.empty());
+    const std::string directory = manifestPath.parent_path().string();
+    VernonProgramBundleLoadOptions options{};
+    options.struct_size = sizeof(options);
+    options.bundle_directory = directory.c_str();
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(runtime, manifest.data(), manifest.size(), &options);
+    ASSERT_NE(bundle, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime);
+    ASSERT_NE(graph, nullptr);
+    VernonProgramNodeId nodes[2]{};
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &nodes[0]), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &nodes[1]), VERNON_STATUS_OK);
+
+    VernonProgramNodeBindingToken outputs[2]{{sizeof(VernonProgramNodeBindingToken)},
+                                             {sizeof(VernonProgramNodeBindingToken)}};
+    std::array<std::array<VernonProgramNodeBindingToken, 3>, 2> grids{};
+    for (size_t node = 0; node < 2; ++node) {
+        ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                        {"output", 6}, &outputs[node]),
+                  VERNON_STATUS_OK);
+        for (size_t axis = 0; axis < 3; ++axis) {
+            grids[node][axis].struct_size = sizeof(VernonProgramNodeBindingToken);
+            const std::string name = "__grid_" + std::string(1, "xyz"[axis]);
+            ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_INPUT,
+                                                            {name.data(), name.size()}, &grids[node][axis]),
+                      VERNON_STATUS_OK);
+        }
+    }
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    ASSERT_NE(executable, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
+    VernonProgramExecutable *sameExecutable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    ASSERT_NE(sameExecutable, nullptr) << stringValue(vernonRuntimeGetLastError(runtime));
+    const VernonStringView identity = vernonRuntimeProgramExecutableGetId(executable);
+    const VernonStringView sameIdentity = vernonRuntimeProgramExecutableGetId(sameExecutable);
+    EXPECT_EQ(std::string_view(identity.data, identity.size), std::string_view(sameIdentity.data, sameIdentity.size));
+    vernonRuntimeProgramExecutableDestroy(sameExecutable);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+
+    std::array<std::array<int32_t, 10>, 2> results{};
+    constexpr uint64_t shape[]{10};
+    constexpr int64_t strides[]{sizeof(int32_t)};
+    const uint32_t gridValues[3]{2, 1, 1};
+    for (size_t node = 0; node < 2; ++node) {
+        VernonProgramArgument output{};
+        output.kind = VERNON_PROGRAM_TENSOR;
+        output.tensor.struct_size = sizeof(VernonTensorView);
+        output.tensor.storage = VERNON_TENSOR_HOST;
+        output.tensor.host_data = results[node].data();
+        output.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_I32);
+        output.tensor.access = VERNON_ACCESS_WRITE;
+        output.tensor.rank = 1;
+        output.tensor.shape = shape;
+        output.tensor.byte_strides = strides;
+        output.tensor.byte_size = sizeof(results[node]);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &outputs[node], &output, nullptr, 0, 0),
+                  VERNON_STATUS_OK);
+        for (size_t axis = 0; axis < 3; ++axis) {
+            VernonProgramArgument grid{};
+            grid.kind = VERNON_PROGRAM_TENSOR;
+            grid.tensor.struct_size = sizeof(VernonTensorView);
+            grid.tensor.storage = VERNON_TENSOR_HOST;
+            grid.tensor.host_data = &gridValues[axis];
+            grid.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_U32);
+            grid.tensor.access = VERNON_ACCESS_READ;
+            grid.tensor.byte_size = sizeof(uint32_t);
+            ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &grids[node][axis], &grid, nullptr, 0, 0),
+                      VERNON_STATUS_OK);
+        }
+    }
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+        << stringValue(vernonRuntimeGetLastError(runtime));
+    verifySynchronizationResult(results[0]);
+    verifySynchronizationResult(results[1]);
+
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    vernonRuntimeProgramGraphDestroy(graph);
+    vernonRuntimeProgramBundleDestroy(bundle);
     EXPECT_EQ(vernonRuntimeDestroy(runtime), VERNON_STATUS_OK);
 }
 #endif

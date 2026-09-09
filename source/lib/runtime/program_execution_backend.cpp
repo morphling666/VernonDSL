@@ -70,7 +70,8 @@ bool loadCodeModuleBytes(const ArtifactSystem &artifacts, const std::string &art
                       "CodeModule references an unknown Blob");
 
     std::error_code error;
-    const std::filesystem::path root = std::filesystem::canonical(bundleRoot, error);
+    const std::filesystem::path root =
+        std::filesystem::canonical(blob->second.bundleRoot.empty() ? bundleRoot : blob->second.bundleRoot, error);
     const std::filesystem::path relative = std::filesystem::u8path(blob->second.uri);
     if (error || !std::filesystem::is_directory(root, error) || relative.empty() || relative.is_absolute() ||
         relative.has_root_path() || relative.lexically_normal() != relative ||

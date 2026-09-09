@@ -1,8 +1,8 @@
 #ifndef VERNON_EXECUTION_GRAPH_INTERNAL_H
 #define VERNON_EXECUTION_GRAPH_INTERNAL_H
 
-#include "VernonExecutionGraph.h"
 #include "execution_command_model.h"
+#include "execution_graph/command_graph.h"
 #include "rhi/logical_resource_record.h"
 
 #include <memory>
@@ -11,7 +11,7 @@
 
 namespace vernon::execution {
 
-struct CompiledExecutionGraph::State {
+struct CompiledCommandGraph::State {
     detail::ExecutionProvider provider{detail::ExecutionProvider::Cpu};
     VernonRhiDevice device{};
     uint64_t graphIdentity{};
@@ -38,12 +38,12 @@ struct CompiledExecutionGraph::State {
 
 class ExecutionSubmission::Impl {
 public:
-    Impl(std::shared_ptr<CompiledExecutionGraph::State> retainedPlan,
+    Impl(std::shared_ptr<CompiledCommandGraph::State> retainedPlan,
          std::shared_ptr<const ExecutionBindings> retainedBindings)
         : plan(std::move(retainedPlan)), bindings(std::move(retainedBindings)) {}
     ~Impl();
 
-    std::shared_ptr<CompiledExecutionGraph::State> plan;
+    std::shared_ptr<CompiledCommandGraph::State> plan;
     std::shared_ptr<const ExecutionBindings> bindings;
     mutable std::mutex stateMutex;
     State state{State::Pending};

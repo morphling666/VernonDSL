@@ -1,4 +1,4 @@
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 #include "execution_graph/execution_graph_checkpoint_planner_internal.h"
 #include "execution_graph/execution_graph_internal.h"
 
@@ -10,8 +10,8 @@
 
 namespace vernon::execution::detail {
 
-struct ExecutionGraphTestAccess {
-    static GraphBuffer importBuffer(ExecutionGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
+struct CommandGraphTestAccess {
+    static GraphBuffer importBuffer(CommandGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
         const uint64_t key = (static_cast<uint64_t>(buffer.generation) << 32) | (uint64_t{buffer.index} + 1);
         if (const auto found = graph.importedBuffers_.find(key); found != graph.importedBuffers_.end()) {
             graph.resourceRecords_[found->second].exported |= exported;
@@ -36,7 +36,7 @@ struct ExecutionGraphTestAccess {
         return result;
     }
 
-    static GraphImage importImage(ExecutionGraph &graph, VernonRhiImage image, VernonRhiImageView view,
+    static GraphImage importImage(CommandGraph &graph, VernonRhiImage image, VernonRhiImageView view,
                                   VernonRhiFormat format, uint32_t width, uint32_t height, uint32_t layers = 1,
                                   uint32_t samples = 1, bool exported = false,
                                   const VernonRhiImageSubresourceRange *subresources = nullptr) {
@@ -86,16 +86,16 @@ namespace {
 
 using namespace vernon::execution;
 
-GraphBuffer importBufferForTesting(ExecutionGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
-    return detail::ExecutionGraphTestAccess::importBuffer(graph, buffer, exported);
+GraphBuffer importBufferForTesting(CommandGraph &graph, VernonRhiBuffer buffer, bool exported = false) {
+    return detail::CommandGraphTestAccess::importBuffer(graph, buffer, exported);
 }
 
-GraphImage importImageForTesting(ExecutionGraph &graph, VernonRhiImage image, VernonRhiImageView view,
+GraphImage importImageForTesting(CommandGraph &graph, VernonRhiImage image, VernonRhiImageView view,
                                  VernonRhiFormat format, uint32_t width, uint32_t height, uint32_t layers = 1,
                                  uint32_t samples = 1, bool exported = false,
                                  const VernonRhiImageSubresourceRange *subresources = nullptr) {
-    return detail::ExecutionGraphTestAccess::importImage(graph, image, view, format, width, height, layers, samples,
-                                                         exported, subresources);
+    return detail::CommandGraphTestAccess::importImage(graph, image, view, format, width, height, layers, samples,
+                                                       exported, subresources);
 }
 
 class TestComputePass final : public ComputePass {
@@ -237,7 +237,7 @@ private:
     uint32_t hostCopyFromCount_{};
 };
 
-GraphBuffer importCheckpointBuffer(ExecutionGraph &graph, uint64_t identity, bool exported = false) {
+GraphBuffer importCheckpointBuffer(CommandGraph &graph, uint64_t identity, bool exported = false) {
     return graph.importHostBuffer(identity, exported,
                                   std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float)));
 }
@@ -720,8 +720,8 @@ private:
 
 GraphResource none() { return {UINT32_MAX, ResourceKind::Buffer}; }
 
-TEST(ExecutionGraph, InfersHazardsAndHonorsExplicitDependencies) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, InfersHazardsAndHonorsExplicitDependencies) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer source = importBufferForTesting(graph, {0, 1});
     const GraphBuffer intermediate = importBufferForTesting(graph, {1, 1});
     const GraphBuffer output = importBufferForTesting(graph, {2, 1}, true);
@@ -737,9 +737,9 @@ TEST(ExecutionGraph, InfersHazardsAndHonorsExplicitDependencies) {
     EXPECT_FALSE(plan->scopes()[0].rendering);
 }
 
-TEST(ExecutionGraph, CpuProviderExecutesCompiledRawWarAndWawSchedules) {
+TEST(CommandGraph, CpuProviderExecutesCompiledRawWarAndWawSchedules) {
     const auto executeHazard = [](AccessMode firstAccess, AccessMode secondAccess) {
-        ExecutionGraph graph;
+        CommandGraph graph;
         const GraphBuffer shared = graph.importHostBuffer(1, true);
         std::vector<std::string> events;
         graph.emplacePass<CpuComputePass>("first", shared, firstAccess, events);
@@ -759,8 +759,8 @@ TEST(ExecutionGraph, CpuProviderExecutesCompiledRawWarAndWawSchedules) {
     executeHazard(AccessMode::Write, AccessMode::Write);
 }
 
-TEST(ExecutionGraph, CpuProviderPropagatesFailureAndStopsSchedule) {
-    ExecutionGraph graph;
+TEST(CommandGraph, CpuProviderPropagatesFailureAndStopsSchedule) {
+    CommandGraph graph;
     const GraphBuffer shared = graph.importHostBuffer(1, true);
     std::vector<std::string> events;
     graph.emplacePass<CpuComputePass>("first", shared, AccessMode::Write, events);
@@ -776,11 +776,11 @@ TEST(ExecutionGraph, CpuProviderPropagatesFailureAndStopsSchedule) {
     EXPECT_EQ(events, (std::vector<std::string>{"first", "failure"}));
 }
 
-TEST(ExecutionGraph, CompiledPlanOwnsPassesAndSupportsRepeatedSubmissions) {
+TEST(CommandGraph, CompiledPlanOwnsPassesAndSupportsRepeatedSubmissions) {
     std::vector<std::string> events;
-    std::shared_ptr<CompiledExecutionGraph> plan;
+    std::shared_ptr<CompiledCommandGraph> plan;
     {
-        ExecutionGraph graph;
+        CommandGraph graph;
         const GraphBuffer shared = graph.importHostBuffer(1, true);
         graph.emplacePass<CpuComputePass>("run", shared, AccessMode::Write, events);
         std::string error;
@@ -796,8 +796,8 @@ TEST(ExecutionGraph, CompiledPlanOwnsPassesAndSupportsRepeatedSubmissions) {
     EXPECT_EQ(events, (std::vector<std::string>{"run", "run"}));
 }
 
-TEST(ExecutionGraph, FreezesRetainedPassReferencesAfterCompilation) {
-    ExecutionGraph graph;
+TEST(CommandGraph, FreezesRetainedPassReferencesAfterCompilation) {
+    CommandGraph graph;
     const GraphBuffer output = graph.importHostBuffer(1, true);
     auto &pass = graph.emplacePass<TestComputePass>("run", none(), output);
     std::string error;
@@ -808,9 +808,9 @@ TEST(ExecutionGraph, FreezesRetainedPassReferencesAfterCompilation) {
     EXPECT_THROW(pass.addReadForTesting(output), std::logic_error);
 }
 
-TEST(ExecutionGraph, SubmissionRetainsCompiledPlan) {
+TEST(CommandGraph, SubmissionRetainsCompiledPlan) {
     std::vector<std::string> events;
-    ExecutionGraph graph;
+    CommandGraph graph;
     const GraphBuffer shared = graph.importHostBuffer(1, true);
     graph.emplacePass<CpuComputePass>("run", shared, AccessMode::Write, events);
     std::string error;
@@ -824,8 +824,8 @@ TEST(ExecutionGraph, SubmissionRetainsCompiledPlan) {
     EXPECT_EQ(events, (std::vector<std::string>{"run"}));
 }
 
-TEST(ExecutionGraph, FusesCompatibleRenderPassesAndSplitsCompute) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, FusesCompatibleRenderPassesAndSplitsCompute) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphImage color =
         importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 64, 64, 1, 1, true);
     const GraphBuffer buffer = importBufferForTesting(graph, {0, 1}, true);
@@ -842,8 +842,8 @@ TEST(ExecutionGraph, FusesCompatibleRenderPassesAndSplitsCompute) {
     EXPECT_FALSE(plan->scopes()[1].rendering);
 }
 
-TEST(ExecutionGraph, RejectsDependencyCycles) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, RejectsDependencyCycles) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     auto &first = graph.emplacePass<TestComputePass>("first", none(), none());
     auto &second = graph.emplacePass<TestComputePass>("second", none(), none());
     first.setFlags(PassSideEffect);
@@ -856,8 +856,8 @@ TEST(ExecutionGraph, RejectsDependencyCycles) {
     EXPECT_NE(error.find("cycle"), std::string::npos);
 }
 
-TEST(ExecutionGraph, CullsTransientPassesWithoutLiveConsumers) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, CullsTransientPassesWithoutLiveConsumers) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer transient = importBufferForTesting(graph, {0, 1});
     graph.emplacePass<TestComputePass>("dead", none(), transient);
 
@@ -868,8 +868,8 @@ TEST(ExecutionGraph, CullsTransientPassesWithoutLiveConsumers) {
     EXPECT_TRUE(plan->scopes().empty());
 }
 
-TEST(ExecutionGraph, RebuildClearsDeclarationDerivedFlags) {
-    ExecutionGraph graph;
+TEST(CommandGraph, RebuildClearsDeclarationDerivedFlags) {
+    CommandGraph graph;
     bool sideEffect = true;
     graph.emplacePass<ConditionalFlagPass>("conditional", sideEffect);
     std::string error;
@@ -880,8 +880,8 @@ TEST(ExecutionGraph, RebuildClearsDeclarationDerivedFlags) {
     EXPECT_TRUE(compiled->schedule().empty());
 }
 
-TEST(ExecutionGraph, KeepsUnexportedAutodiffObjectiveProducerLive) {
-    ExecutionGraph graph;
+TEST(CommandGraph, KeepsUnexportedAutodiffObjectiveProducerLive) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer objective = importCheckpointBuffer(graph, 2);
     graph.emplacePass<ScalarDifferentiablePass>("objective", input, objective, 2.0);
@@ -894,8 +894,8 @@ TEST(ExecutionGraph, KeepsUnexportedAutodiffObjectiveProducerLive) {
     EXPECT_EQ(compiled->schedule(), (std::vector<uint32_t>{0}));
 }
 
-TEST(ExecutionGraph, DeduplicatesImportsAndPromotesExportedResources) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, DeduplicatesImportsAndPromotesExportedResources) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer first = importBufferForTesting(graph, {4, 9});
     const GraphBuffer second = importBufferForTesting(graph, {4, 9}, true);
     EXPECT_EQ(first.id, second.id);
@@ -913,9 +913,9 @@ TEST(ExecutionGraph, DeduplicatesImportsAndPromotesExportedResources) {
     EXPECT_EQ(plan->schedule(), (std::vector<uint32_t>{0}));
 }
 
-TEST(ExecutionGraph, AliasedImportsPreserveRawWarAndWawHazards) {
+TEST(CommandGraph, AliasedImportsPreserveRawWarAndWawHazards) {
     const auto expectBothPassesLive = [](AccessMode firstAccess, AccessMode secondAccess) {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphBuffer firstAlias = importBufferForTesting(graph, {4, 9}, secondAccess != AccessMode::Read);
         const GraphBuffer secondAlias = importBufferForTesting(graph, {4, 9});
         const GraphBuffer output = importBufferForTesting(graph, {5, 1}, secondAccess == AccessMode::Read);
@@ -937,9 +937,9 @@ TEST(ExecutionGraph, AliasedImportsPreserveRawWarAndWawHazards) {
     expectBothPassesLive(AccessMode::Write, AccessMode::Write);
 }
 
-TEST(ExecutionGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
-    ExecutionGraph first({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
-    ExecutionGraph second({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
+    CommandGraph first({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+    CommandGraph second({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer foreign = importBufferForTesting(first, {0, 1});
     const GraphBuffer output = importBufferForTesting(second, {1, 1}, true);
     second.emplacePass<TestComputePass>("foreign", foreign, output);
@@ -953,8 +953,8 @@ TEST(ExecutionGraph, RejectsResourceFromAnotherGraphWithMatchingNumericId) {
     EXPECT_NE(error.find("foreign"), std::string::npos);
 }
 
-TEST(ExecutionGraph, DerivesBarrierStageAccessAndStateFromUses) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, DerivesBarrierStageAccessAndStateFromUses) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphBuffer intermediate = importBufferForTesting(graph, {0, 1});
     const GraphImage color =
         importImageForTesting(graph, {1, 1}, {1, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
@@ -975,8 +975,8 @@ TEST(ExecutionGraph, DerivesBarrierStageAccessAndStateFromUses) {
     EXPECT_EQ(barrier.new_state, VERNON_RHI_STATE_SHADER_READ);
 }
 
-TEST(ExecutionGraph, TracksImageHazardsByParentAndSubresourceRange) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, TracksImageHazardsByParentAndSubresourceRange) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const VernonRhiImageSubresourceRange mip0{0, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_COLOR};
     const VernonRhiImageSubresourceRange mip1{1, 1, 0, 1, VERNON_RHI_IMAGE_ASPECT_COLOR};
     const GraphImage first =
@@ -1006,9 +1006,9 @@ TEST(ExecutionGraph, TracksImageHazardsByParentAndSubresourceRange) {
     EXPECT_EQ(barrier.destination_access, VERNON_RHI_ACCESS_SHADER_READ);
 }
 
-TEST(ExecutionGraph, PreservesComputeImageViewMetadataAndRejectsSlicedImages) {
+TEST(CommandGraph, PreservesComputeImageViewMetadataAndRejectsSlicedImages) {
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const VernonRhiImageSubresourceRange range{2, 1, 3, 2, VERNON_RHI_IMAGE_ASPECT_COLOR};
         const GraphImage image =
             importImageForTesting(graph, {4, 2}, {7, 3}, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 2, 1, true, &range);
@@ -1022,7 +1022,7 @@ TEST(ExecutionGraph, PreservesComputeImageViewMetadataAndRejectsSlicedImages) {
         EXPECT_EQ(pass.uses().front().image->subresources.base_array_layer, 3u);
     }
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage image =
             importImageForTesting(graph, {4, 2}, {7, 3}, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 1, 1, true);
         graph.emplacePass<TestComputePass>("sliced-image", none(), image);
@@ -1031,9 +1031,9 @@ TEST(ExecutionGraph, PreservesComputeImageViewMetadataAndRejectsSlicedImages) {
     }
 }
 
-TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
+TEST(CommandGraph, RejectsInvalidAttachmentFormatAndExtent) {
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage depth =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestRenderPass>("depth-as-color", depth);
@@ -1042,7 +1042,7 @@ TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
         EXPECT_NE(error.find("depth-as-color"), std::string::npos);
     }
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage first =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
         const GraphImage second =
@@ -1054,9 +1054,9 @@ TEST(ExecutionGraph, RejectsInvalidAttachmentFormatAndExtent) {
     }
 }
 
-TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
+TEST(CommandGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage depth =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("read-only-clear", depth, VERNON_RHI_LOAD_CLEAR, true);
@@ -1065,7 +1065,7 @@ TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
         EXPECT_NE(error.find("read-only-clear"), std::string::npos);
     }
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage depth =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("write", depth, VERNON_RHI_LOAD_PRESERVE, false);
@@ -1078,9 +1078,9 @@ TEST(ExecutionGraph, RejectsClearOnReadOnlyDepthAndSplitsReadOnlyChanges) {
     }
 }
 
-TEST(ExecutionGraph, TracksWritableStencilAndRejectsReadOnlyStencilMutation) {
+TEST(CommandGraph, TracksWritableStencilAndRejectsReadOnlyStencilMutation) {
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage depthStencil =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("stencil-write", depthStencil, VERNON_RHI_LOAD_PRESERVE, true,
@@ -1092,7 +1092,7 @@ TEST(ExecutionGraph, TracksWritableStencilAndRejectsReadOnlyStencilMutation) {
         ASSERT_EQ(plan->schedule(), (std::vector<uint32_t>{0}));
     }
     {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage depthStencil =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
         graph.emplacePass<TestDepthPass>("read-only-stencil-clear", depthStencil, VERNON_RHI_LOAD_PRESERVE, false,
@@ -1104,8 +1104,8 @@ TEST(ExecutionGraph, TracksWritableStencilAndRejectsReadOnlyStencilMutation) {
     }
 }
 
-TEST(ExecutionGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphImage color =
         importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
     graph.emplacePass<TestRenderPass>("discard-output", color, VERNON_RHI_LOAD_CLEAR, VERNON_RHI_STORE_DISCARD);
@@ -1119,9 +1119,9 @@ TEST(ExecutionGraph, SplitsScopesWhenIntermediateDiscardCannotBeRepresented) {
     EXPECT_TRUE(plan->scopes()[1].rendering);
 }
 
-TEST(ExecutionGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad) {
+TEST(CommandGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad) {
     const auto compileScopes = [](VernonRhiLoadOperation secondLoad) {
-        ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+        CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
         const GraphImage color =
             importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
         graph.emplacePass<TestRenderPass>("first", color);
@@ -1135,8 +1135,8 @@ TEST(ExecutionGraph, FusesAnIntermediateClearButSplitsAnIntermediateDiscardLoad)
     EXPECT_EQ(compileScopes(VERNON_RHI_LOAD_DISCARD), 2u);
 }
 
-TEST(ExecutionGraph, SplitsRenderScopesAcrossDiscardedStencilBoundary) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, SplitsRenderScopesAcrossDiscardedStencilBoundary) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphImage depthStencil =
         importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT, 16, 16, 1, 1, true);
     graph.emplacePass<TestDepthPass>("discard-stencil", depthStencil, VERNON_RHI_LOAD_PRESERVE, false,
@@ -1149,8 +1149,8 @@ TEST(ExecutionGraph, SplitsRenderScopesAcrossDiscardedStencilBoundary) {
     EXPECT_EQ(plan->scopes().size(), 2u);
 }
 
-TEST(ExecutionGraph, SplitsRenderScopesForNonAttachmentHazards) {
-    ExecutionGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
+TEST(CommandGraph, SplitsRenderScopesForNonAttachmentHazards) {
+    CommandGraph graph({static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     const GraphImage color =
         importImageForTesting(graph, {0, 1}, {0, 1}, VERNON_RHI_FORMAT_RGBA8_UNORM, 16, 16, 1, 1, true);
     const GraphBuffer buffer = importBufferForTesting(graph, {1, 1});
@@ -1167,8 +1167,8 @@ TEST(ExecutionGraph, SplitsRenderScopesForNonAttachmentHazards) {
               VERNON_RHI_ACCESS_COLOR_READ | VERNON_RHI_ACCESS_COLOR_WRITE);
 }
 
-TEST(ExecutionGraph, ValidatesParameterSchemasAndInitialBindings) {
-    ExecutionGraph graph;
+TEST(CommandGraph, ValidatesParameterSchemasAndInitialBindings) {
+    CommandGraph graph;
     const ExecutionParameter parameter = graph.parameter("value");
     EXPECT_THROW(graph.parameter("value"), std::invalid_argument);
     std::vector<std::shared_ptr<const IntegerBindingValue>> observed;
@@ -1181,13 +1181,13 @@ TEST(ExecutionGraph, ValidatesParameterSchemasAndInitialBindings) {
     const auto value = std::make_shared<IntegerBindingValue>(1);
     EXPECT_THROW(plan->createBindings({{parameter, value}, {parameter, value}}), std::invalid_argument);
 
-    ExecutionGraph foreignGraph;
+    CommandGraph foreignGraph;
     const ExecutionParameter foreign = foreignGraph.parameter("foreign");
     EXPECT_THROW(plan->createBindings({{foreign, value}}), std::invalid_argument);
 }
 
-TEST(ExecutionGraph, SnapshotsSparseParameterUpdatesAndRetainsSubmissionValues) {
-    ExecutionGraph graph;
+TEST(CommandGraph, SnapshotsSparseParameterUpdatesAndRetainsSubmissionValues) {
+    CommandGraph graph;
     const ExecutionParameter dynamic = graph.parameter("dynamic");
     const ExecutionParameter constant = graph.parameter("constant");
     std::vector<std::shared_ptr<const IntegerBindingValue>> observed;
@@ -1221,8 +1221,8 @@ TEST(ExecutionGraph, SnapshotsSparseParameterUpdatesAndRetainsSubmissionValues) 
     EXPECT_EQ(second.wait(), VERNON_RHI_STATUS_OK);
 }
 
-TEST(ExecutionGraphAutodiff, ComposesNativePullbacksAndSupportsReuseAfterPlanRelease) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, ComposesNativePullbacksAndSupportsReuseAfterPlanRelease) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
     const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
@@ -1278,8 +1278,8 @@ TEST(ExecutionGraphAutodiff, ComposesNativePullbacksAndSupportsReuseAfterPlanRel
     EXPECT_DOUBLE_EQ(implicitGradient->value, 10.0);
 }
 
-TEST(ExecutionGraphAutodiff, SerializesConcurrentApplicationsWithoutSharingGradients) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, SerializesConcurrentApplicationsWithoutSharingGradients) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
     const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
@@ -1310,8 +1310,8 @@ TEST(ExecutionGraphAutodiff, SerializesConcurrentApplicationsWithoutSharingGradi
         EXPECT_DOUBLE_EQ(applications[index].get(), static_cast<double>((index + 1) * 10));
 }
 
-TEST(ExecutionGraphAutodiff, RejectsFanInThatWasNotLoweredFromProgramGraph) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RejectsFanInThatWasNotLoweredFromProgramGraph) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer leftObjective = importCheckpointBuffer(graph, 2, true);
     const GraphBuffer rightObjective = importCheckpointBuffer(graph, 3, true);
@@ -1333,9 +1333,9 @@ TEST(ExecutionGraphAutodiff, RejectsFanInThatWasNotLoweredFromProgramGraph) {
     EXPECT_TRUE(submission->gradients().empty());
 }
 
-TEST(ExecutionGraphAutodiff, DeduplicatesAliasedContributionsAndPublishesGradientsTransactionally) {
+TEST(CommandGraphAutodiff, DeduplicatesAliasedContributionsAndPublishesGradientsTransactionally) {
     const auto compileAliasedGraph = [](bool includeDisconnected, std::string &error) {
-        ExecutionGraph graph;
+        CommandGraph graph;
         const GraphBuffer input = importCheckpointBuffer(graph, 1);
         const GraphBuffer objective = importCheckpointBuffer(graph, 2, true);
         graph.emplacePass<AliasedGradientPass>(input, objective);
@@ -1371,8 +1371,8 @@ TEST(ExecutionGraphAutodiff, DeduplicatesAliasedContributionsAndPublishesGradien
     EXPECT_TRUE(failed->gradients().empty());
 }
 
-TEST(ExecutionGraphAutodiff, ReturnsMultipleDeclaredInputGradients) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, ReturnsMultipleDeclaredInputGradients) {
+    CommandGraph graph;
     const GraphBuffer leftInput = importCheckpointBuffer(graph, 1);
     const GraphBuffer rightInput = importCheckpointBuffer(graph, 2);
     const GraphBuffer leftObjective = importCheckpointBuffer(graph, 3, true);
@@ -1401,8 +1401,8 @@ TEST(ExecutionGraphAutodiff, ReturnsMultipleDeclaredInputGradients) {
     EXPECT_DOUBLE_EQ(right->value, 21.0);
 }
 
-TEST(ExecutionGraphAutodiff, PublishesNoPartialGradientsForDisconnectedInput) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, PublishesNoPartialGradientsForDisconnectedInput) {
+    CommandGraph graph;
     const GraphBuffer connected = importCheckpointBuffer(graph, 1);
     const GraphBuffer disconnected = graph.importHostBuffer(2);
     const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
@@ -1421,8 +1421,8 @@ TEST(ExecutionGraphAutodiff, PublishesNoPartialGradientsForDisconnectedInput) {
     EXPECT_NE(error.find("disconnected"), std::string::npos);
 }
 
-TEST(ExecutionGraphAutodiff, CompilationRejectsDuplicateLogicalEndpoints) {
-    ExecutionGraph duplicateInputs;
+TEST(CommandGraphAutodiff, CompilationRejectsDuplicateLogicalEndpoints) {
+    CommandGraph duplicateInputs;
     const GraphBuffer input = duplicateInputs.importHostBuffer(1);
     const GraphBuffer objective = duplicateInputs.importHostBuffer(2, true);
     duplicateInputs.emplacePass<ScalarDifferentiablePass>("step", input, objective, 2.0);
@@ -1433,7 +1433,7 @@ TEST(ExecutionGraphAutodiff, CompilationRejectsDuplicateLogicalEndpoints) {
     EXPECT_FALSE(duplicateInputs.compile(error));
     EXPECT_NE(error.find("invalid differentiable input endpoint"), std::string::npos);
 
-    ExecutionGraph duplicateObjectives;
+    CommandGraph duplicateObjectives;
     const GraphBuffer secondInput = duplicateObjectives.importHostBuffer(3);
     const GraphBuffer secondObjective = duplicateObjectives.importHostBuffer(4, true);
     duplicateObjectives.emplacePass<ScalarDifferentiablePass>("step", secondInput, secondObjective, 2.0);
@@ -1445,8 +1445,8 @@ TEST(ExecutionGraphAutodiff, CompilationRejectsDuplicateLogicalEndpoints) {
     EXPECT_NE(error.find("invalid objective endpoint"), std::string::npos);
 }
 
-TEST(ExecutionGraphAutodiff, CompilationRejectsNonDifferentiableWriteOnActiveReversePath) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, CompilationRejectsNonDifferentiableWriteOnActiveReversePath) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer objective = importCheckpointBuffer(graph, 2, true);
     std::vector<std::string> events;
@@ -1460,8 +1460,8 @@ TEST(ExecutionGraphAutodiff, CompilationRejectsNonDifferentiableWriteOnActiveRev
     EXPECT_NE(error.find("non-differentiable pass"), std::string::npos);
 }
 
-TEST(ExecutionGraphAutodiff, RollsBackPartialForwardPullbacksOnFailure) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RollsBackPartialForwardPullbacksOnFailure) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer intermediate = importCheckpointBuffer(graph, 2);
     const GraphBuffer objective = importCheckpointBuffer(graph, 3, true);
@@ -1477,9 +1477,9 @@ TEST(ExecutionGraphAutodiff, RollsBackPartialForwardPullbacksOnFailure) {
     EXPECT_EQ(error, "test forward failure");
 }
 
-TEST(ExecutionGraphAutodiff, RestoresWritableResourcesAfterForwardFailureOrException) {
+TEST(CommandGraphAutodiff, RestoresWritableResourcesAfterForwardFailureOrException) {
     const auto run = [](bool throwForward) {
-        ExecutionGraph graph;
+        CommandGraph graph;
         auto inputState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
         auto intermediateState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
         auto objectiveState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
@@ -1511,8 +1511,8 @@ TEST(ExecutionGraphAutodiff, RestoresWritableResourcesAfterForwardFailureOrExcep
     run(true);
 }
 
-TEST(ExecutionGraphAutodiff, ReportsRollbackFailureWhenCheckpointResourceProvidesNoError) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, ReportsRollbackFailureWhenCheckpointResourceProvidesNoError) {
+    CommandGraph graph;
     auto inputState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
     auto intermediateState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
     auto objectiveState = std::make_shared<ByteCheckpointResource>(sizeof(float), alignof(float));
@@ -1535,8 +1535,8 @@ TEST(ExecutionGraphAutodiff, ReportsRollbackFailureWhenCheckpointResourceProvide
     EXPECT_EQ(error, "test forward failure; rollback failed: graph VJP forward rollback failed");
 }
 
-TEST(ExecutionGraphAutodiff, PublishesNoGradientsWhenBackwardFails) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, PublishesNoGradientsWhenBackwardFails) {
+    CommandGraph graph;
     const GraphBuffer input = importCheckpointBuffer(graph, 1);
     const GraphBuffer objective = importCheckpointBuffer(graph, 2, true);
     graph.emplacePass<ScalarDifferentiablePass>("failure", input, objective, 2.0, false, true);
@@ -1555,8 +1555,8 @@ TEST(ExecutionGraphAutodiff, PublishesNoGradientsWhenBackwardFails) {
     EXPECT_EQ(submission->state(), GraphBackwardSubmission::State::Failed);
 }
 
-TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails) {
+    CommandGraph graph;
     std::vector<GraphBuffer> resources;
     std::vector<std::shared_ptr<ByteCheckpointResource>> resourceStates;
     for (uint64_t identity = 1; identity <= 5; ++identity) {
@@ -1593,8 +1593,8 @@ TEST(ExecutionGraphAutodiff, RestoresStateAndPublishesNoGradientsWhenReplayFails
     EXPECT_EQ(error, "graph pullback is no longer reusable after failed checkpoint replay");
 }
 
-TEST(ExecutionGraphAutodiff, PlansExplicitReverseCommandDagMetadata) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, PlansExplicitReverseCommandDagMetadata) {
+    CommandGraph graph;
     graph.setExplicitReverseCommandDag({
         {0, {}, 64, 0, 5},
         {1, {0}, 0, 32, 3},
@@ -1608,12 +1608,12 @@ TEST(ExecutionGraphAutodiff, PlansExplicitReverseCommandDagMetadata) {
     EXPECT_EQ(plan->backwardValueBytes, 96u);
     EXPECT_EQ(plan->replayCost, 8u);
 
-    ExecutionGraph invalid;
+    CommandGraph invalid;
     EXPECT_THROW(invalid.setExplicitReverseCommandDag({{0, {0}, 0, 0, 0}}), std::invalid_argument);
 }
 
-TEST(ExecutionGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFailure) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFailure) {
+    CommandGraph graph;
     std::vector<GraphBuffer> resources;
     for (uint64_t identity = 1; identity <= 5; ++identity)
         resources.push_back(graph.importHostBuffer(
@@ -1644,8 +1644,8 @@ TEST(ExecutionGraphAutodiff, ReconstructsRetainedTapesAfterRecoverableBackwardFa
     EXPECT_DOUBLE_EQ(gradient->value, 16.0);
 }
 
-TEST(ExecutionGraphAutodiff, RejectsRuntimeTapeAllocationAbovePlannedBudget) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RejectsRuntimeTapeAllocationAbovePlannedBudget) {
+    CommandGraph graph;
     const GraphBuffer input = graph.importHostBuffer(1, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     const GraphBuffer output = graph.importHostBuffer(2, true, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     graph.emplacePass<ScalarDifferentiablePass>("underestimated", input, output, 2.0, false, false, nullptr, UINT32_MAX,
@@ -1660,8 +1660,8 @@ TEST(ExecutionGraphAutodiff, RejectsRuntimeTapeAllocationAbovePlannedBudget) {
     EXPECT_EQ(error, "graph autodiff runtime allocation exceeds the compiled checkpoint memory budget");
 }
 
-TEST(ExecutionGraphAutodiff, RejectsCheckpointReplayForNonReplayablePass) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RejectsCheckpointReplayForNonReplayablePass) {
+    CommandGraph graph;
     const GraphBuffer input = graph.importHostBuffer(1, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
     const GraphBuffer intermediate =
         graph.importHostBuffer(2, false, std::make_shared<ByteCheckpointResource>(sizeof(float)));
@@ -1679,8 +1679,8 @@ TEST(ExecutionGraphAutodiff, RejectsCheckpointReplayForNonReplayablePass) {
     EXPECT_EQ(error, "autodiff DAG checkpoint schedule requires replaying a non-replayable node");
 }
 
-TEST(ExecutionGraphAutodiff, ReplaysFromOriginalInputAndRestoresCallerState) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, ReplaysFromOriginalInputAndRestoresCallerState) {
+    CommandGraph graph;
     std::vector<GraphBuffer> resources;
     std::vector<std::shared_ptr<ByteCheckpointResource>> states;
     for (uint64_t identity = 1; identity <= 4; ++identity) {
@@ -1717,8 +1717,8 @@ TEST(ExecutionGraphAutodiff, ReplaysFromOriginalInputAndRestoresCallerState) {
     EXPECT_FLOAT_EQ(states.back()->floatValue(), 999.0f);
 }
 
-TEST(ExecutionGraphAutodiff, RestoresInitialInputsFirstReadAfterCheckpointCut) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, RestoresInitialInputsFirstReadAfterCheckpointCut) {
+    CommandGraph graph;
     std::vector<std::shared_ptr<ByteCheckpointResource>> states;
     std::vector<GraphBuffer> resources;
     for (uint64_t identity = 1; identity <= 5; ++identity) {
@@ -1756,8 +1756,8 @@ TEST(ExecutionGraphAutodiff, RestoresInitialInputsFirstReadAfterCheckpointCut) {
     }
 }
 
-TEST(ExecutionGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplications) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplications) {
+    CommandGraph graph;
     std::vector<GraphBuffer> resources;
     std::vector<std::shared_ptr<ByteCheckpointResource>> checkpointResources;
     for (uint64_t identity = 1; identity <= 5; ++identity) {
@@ -1803,7 +1803,7 @@ TEST(ExecutionGraphAutodiff, UsesAlignedCheckpointStorageAcrossReusableApplicati
     EXPECT_GT(pullback->recomputationFactor(), 1.0);
 }
 
-TEST(ExecutionGraphAutodiff, MetalSnapshotsAndCheckpointsRemainDeviceLocal) {
+TEST(CommandGraphAutodiff, MetalSnapshotsAndCheckpointsRemainDeviceLocal) {
     VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
     deviceDescriptor.struct_size = sizeof(deviceDescriptor);
     deviceDescriptor.backend = VERNON_RHI_BACKEND_METAL;
@@ -1815,7 +1815,7 @@ TEST(ExecutionGraphAutodiff, MetalSnapshotsAndCheckpointsRemainDeviceLocal) {
     std::vector<std::shared_ptr<ByteCheckpointResource>> states;
     std::string error;
     {
-        ExecutionGraph graph(device);
+        CommandGraph graph(device);
         std::vector<GraphBuffer> resources;
         VernonRhiBufferDescriptor bufferDescriptor{};
         bufferDescriptor.struct_size = sizeof(bufferDescriptor);
@@ -1856,9 +1856,9 @@ TEST(ExecutionGraphAutodiff, MetalSnapshotsAndCheckpointsRemainDeviceLocal) {
     vernonRhiDestroyDevice(device);
 }
 
-TEST(ExecutionGraphAutodiff, PlansDeclaredDirtyRangesAndKeepsUnknownFootprintsConservative) {
+TEST(CommandGraphAutodiff, PlansDeclaredDirtyRangesAndKeepsUnknownFootprintsConservative) {
     auto compilePlan = [](bool declareRanges) {
-        ExecutionGraph graph;
+        CommandGraph graph;
         std::vector<GraphBuffer> resources;
         for (uint64_t identity = 1; identity <= 5; ++identity)
             resources.push_back(
@@ -1894,11 +1894,11 @@ TEST(ExecutionGraphAutodiff, PlansDeclaredDirtyRangesAndKeepsUnknownFootprintsCo
     EXPECT_EQ(conservative->autodiffCheckpointPlan()->transactionBytes, 4u * 16u);
 }
 
-TEST(ExecutionGraphAutodiff, DuplicateFootprintsUnionAndConservativeDeclarationWins) {
+TEST(CommandGraphAutodiff, DuplicateFootprintsUnionAndConservativeDeclarationWins) {
     auto restorationBytes = [](std::vector<std::vector<GraphByteRange>> declarations) {
         const bool conservative =
             std::any_of(declarations.begin(), declarations.end(), [](const auto &ranges) { return ranges.empty(); });
-        ExecutionGraph graph;
+        CommandGraph graph;
         std::vector<GraphBuffer> resources;
         for (uint64_t identity = 1; identity <= 5; ++identity)
             resources.push_back(
@@ -1922,8 +1922,8 @@ TEST(ExecutionGraphAutodiff, DuplicateFootprintsUnionAndConservativeDeclarationW
     EXPECT_EQ(restorationBytes({{{0, sizeof(float)}}, {}}), 5u * 16u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, StoresImmutablePlanInCompiledGraph) {
-    ExecutionGraph graph;
+TEST(CommandGraphAutodiffCheckpointTest, StoresImmutablePlanInCompiledGraph) {
+    CommandGraph graph;
     std::vector<GraphBuffer> resources;
     for (uint64_t identity = 1; identity <= 5; ++identity)
         resources.push_back(graph.importHostBuffer(
@@ -1981,7 +1981,7 @@ std::vector<detail::AutodiffDagNode> valueDag(std::initializer_list<TestDagNode>
     return result;
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
+TEST(CommandGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
     std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 4, 10, 1, true, 4},
         {{0}, 3, 10, 2, true},
@@ -2022,7 +2022,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, PlansDagCutsFromLiveResources) {
                                             16 * plan.replayCost);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, RejectsReplayThatViolatesDeterministicReductionConstraints) {
+TEST(CommandGraphAutodiffCheckpointTest, RejectsReplayThatViolatesDeterministicReductionConstraints) {
     std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 4, 10, 1, true, 4},
         {{0}, 3, 10, 2, true},
@@ -2036,7 +2036,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, RejectsReplayThatViolatesDeterministi
     EXPECT_EQ(error, "autodiff DAG checkpoint schedule violates deterministic reduction constraints");
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, SupportsInternalMemoryAndRuntimePolicies) {
+TEST(CommandGraphAutodiffCheckpointTest, SupportsInternalMemoryAndRuntimePolicies) {
     const std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 1, 10, 1, true},
         {{0}, 1, 10, 1, true},
@@ -2066,7 +2066,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, SupportsInternalMemoryAndRuntimePolic
     EXPECT_LE(score(balancedPlan), score(memoryPlan));
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredecessors) {
+TEST(CommandGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredecessors) {
     std::vector<detail::AutodiffDagNode> nodes =
         valueDag({{{}, 10, 100, 1, true}, {{0}, 10, 100, 1, true}, {{1}, 0, 100, 1, true}});
     nodes[0].outputs[0].consumers.clear();
@@ -2080,7 +2080,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, DoesNotCheckpointSchedulingOnlyPredec
     EXPECT_TRUE(plan.checkpointResources.empty());
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, CheckpointsOnlyLiveOutputs) {
+TEST(CommandGraphAutodiffCheckpointTest, CheckpointsOnlyLiveOutputs) {
     std::vector<detail::AutodiffDagNode> nodes =
         valueDag({{{}, 1, 100, 1, true}, {{0}, 0, 100, 1, true}, {{1}, 0, 100, 1, true}});
     nodes[0].outputs.push_back({{99, 1}, 1000, 8, true, {}});
@@ -2092,7 +2092,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, CheckpointsOnlyLiveOutputs) {
     EXPECT_EQ(plan.persistentCheckpointBytes, 1u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, NoCutPlanAllocatesOnlyTransactionSnapshot) {
+TEST(CommandGraphAutodiffCheckpointTest, NoCutPlanAllocatesOnlyTransactionSnapshot) {
     const std::vector<detail::AutodiffDagNode> nodes = valueDag({{{}, 4, 16, 1, true}, {{0}, 4, 16, 1, true}});
     auto noCheckpointNodes = nodes;
     for (auto &node : noCheckpointNodes)
@@ -2110,7 +2110,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, NoCutPlanAllocatesOnlyTransactionSnap
     EXPECT_EQ(plan.peakBytes, 160u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, TracksSharedCheckpointCutLifetimes) {
+TEST(CommandGraphAutodiffCheckpointTest, TracksSharedCheckpointCutLifetimes) {
     const std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 2, 10, 1, true},
         {{}, 1, 10, 1, true},
@@ -2137,7 +2137,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, TracksSharedCheckpointCutLifetimes) {
     EXPECT_LE(plan.peakBytes, 24u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, SplitsTiedDagPeakSegmentsTogether) {
+TEST(CommandGraphAutodiffCheckpointTest, SplitsTiedDagPeakSegmentsTogether) {
     const std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 2, 10, 1, true},
         {{0}, 2, 10, 1, true},
@@ -2153,7 +2153,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, SplitsTiedDagPeakSegmentsTogether) {
     EXPECT_EQ(plan.peakBytes, 16u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, AcceptsTemporaryPeakIncreaseNeededForFeasibleCuts) {
+TEST(CommandGraphAutodiffCheckpointTest, AcceptsTemporaryPeakIncreaseNeededForFeasibleCuts) {
     std::vector<detail::AutodiffDagNode> nodes(3);
     for (auto &node : nodes) {
         node.residualBytes = 10;
@@ -2172,7 +2172,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, AcceptsTemporaryPeakIncreaseNeededFor
     EXPECT_EQ(plan.persistentCheckpointBytes, 15u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, ReplacesEarlierCutsToFindFeasibleFrontier) {
+TEST(CommandGraphAutodiffCheckpointTest, ReplacesEarlierCutsToFindFeasibleFrontier) {
     const std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 7, 15, 1, true},
         {{0}, 19, 18, 1, true},
@@ -2188,7 +2188,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, ReplacesEarlierCutsToFindFeasibleFron
     EXPECT_EQ(plan.peakBytes, 48u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, ChargesPhysicalRetainedAllocationInsteadOfLogicalPayload) {
+TEST(CommandGraphAutodiffCheckpointTest, ChargesPhysicalRetainedAllocationInsteadOfLogicalPayload) {
     std::vector<detail::AutodiffDagNode> nodes = valueDag({
         {{}, 0, 1, 1, true},
         {{0}, 0, 1, 1, true},
@@ -2207,7 +2207,7 @@ TEST(ExecutionGraphAutodiffCheckpointTest, ChargesPhysicalRetainedAllocationInst
     EXPECT_EQ(plan.retainedAllocationBytes, 48u);
 }
 
-TEST(ExecutionGraphAutodiffCheckpointTest, RejectsInvalidOrUnbudgetableDags) {
+TEST(CommandGraphAutodiffCheckpointTest, RejectsInvalidOrUnbudgetableDags) {
     AutodiffDagCheckpointPlan plan;
     std::string error;
     EXPECT_FALSE(detail::planDagAutodiffCheckpoints(valueDag({{{1}, 1, 1, 1, true}}), 1, plan, error));

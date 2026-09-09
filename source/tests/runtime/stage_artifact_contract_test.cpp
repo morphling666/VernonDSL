@@ -194,10 +194,6 @@ TEST(StageArtifactContract, ValidatesExternalAndRuntimeParameterOwnership) {
     std::string error;
     EXPECT_TRUE(validateStageBindingPlan(plan, error)) << error;
 
-    plan.parameters.front().source = StageParameterSource::Projected;
-    error.clear();
-    EXPECT_TRUE(validateStageBindingPlan(plan, error)) << error;
-
     plan.parameters.front().source = StageParameterSource::Resolution;
     error.clear();
     EXPECT_FALSE(validateStageBindingPlan(plan, error));

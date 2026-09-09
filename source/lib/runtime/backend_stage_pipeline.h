@@ -3,6 +3,7 @@
 
 #include "VernonRuntime.h"
 #include "pipeline_metadata.h"
+#include "resolved_stage_types.h"
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 

@@ -159,8 +159,9 @@ struct ResolvedAttachmentTransition {
     AttachmentTransition transition{AttachmentTransition::Preserve};
 };
 
-struct ResolvedGraphicsScopePlan {
+struct ResolvedGraphicsScopeCandidate {
     NodeKey node;
+    uint32_t region{};
     std::vector<ResolvedAttachmentTransition> attachments;
 };
 
@@ -211,7 +212,7 @@ struct ResolvedExecutionPlan {
     std::map<GraphValueKey, ResidencyRequirement> residency;
     ResolvedTransferPlan transfers;
     ResolvedHazardPlan hazards;
-    std::vector<ResolvedGraphicsScopePlan> graphicsScopes;
+    std::vector<ResolvedGraphicsScopeCandidate> graphicsScopeCandidates;
     ResolvedAutodiffPlan autodiff;
     ResolvedPublicationPlan publications;
 

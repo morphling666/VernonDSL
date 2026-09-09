@@ -16,7 +16,8 @@ public:
 
     bool prepareGraph(program::GraphDirection graph, std::string &error);
     VernonStatus appendBeforeConsumer(program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
-                                      vernon::execution::detail::RhiCommandExecutionPlan &commands, std::string &error);
+                                      vernon::execution::detail::RhiCommandExecutionPlan &commands,
+                                      bool &commandsAppended, std::string &error);
     bool restoreForRetry(program::GraphDirection graph, std::string &error);
     bool readbackBoundaryValues(const std::vector<char> &values, std::string &error) const;
 

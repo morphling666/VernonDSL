@@ -1,7 +1,7 @@
 #ifndef VERNON_EXECUTION_COMMAND_MODEL_H
 #define VERNON_EXECUTION_COMMAND_MODEL_H
 
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 #include <cstdint>
 #include <string>

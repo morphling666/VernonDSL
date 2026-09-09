@@ -1,4 +1,4 @@
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 #include "rhi/logical_resource_record.h"
 #include "rhi/rhi_internal.h"
@@ -13,7 +13,7 @@ bool writes(AccessMode access) { return access != AccessMode::Read; }
 
 } // namespace
 
-bool ExecutionGraph::validateDeclarations(std::string &error) const {
+bool CommandGraph::validateDeclarations(std::string &error) const {
     for (size_t index = 0; index < resourceRecords_.size(); ++index)
         if (!resourceRecords_[index].resourceKey) {
             error = "execution graph resource " + std::to_string(index) + " is stale";

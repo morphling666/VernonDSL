@@ -1238,6 +1238,7 @@ static bool buildGraphicsStageBindingPlan(const TargetBindingPlan &plan, StageBi
             vernon::runtime::Parameter parameter;
             parameter.slot = static_cast<uint32_t>(stagePlan.parameters.size());
             parameter.name = binding.name;
+            parameter.source = StageParameterSource::Direct;
             parameter.access = binding.access;
             parameter.kind = binding.kind;
             parameter.tensorArgument = tensorArgumentRepresentation(binding);

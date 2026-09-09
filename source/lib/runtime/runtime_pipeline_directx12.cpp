@@ -235,9 +235,13 @@ bool resolveDirectX12Pipeline(BackendStageBuildInputs &inputs, const StageBindin
                     supported = false;
                     break;
                 }
-                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                const std::optional<VernonRuntimeProviderBindingKind> providerKind =
+                    providerBindingKindForTransport(use.transport);
+                if (!providerKind) {
+                    supported = false;
+                    break;
+                }
+                candidate.layout.kind = *providerKind;
                 const uint64_t physicalSize = use.interfacePlan->root->size;
                 if (!physicalSize || physicalSize > UINT32_MAX ||
                     (candidate.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER && use.binding == UINT32_MAX)) {

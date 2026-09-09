@@ -1,4 +1,4 @@
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 #include "autodiff/autodiff_memory_accounting.h"
 #include "execution_graph_internal.h"
@@ -524,7 +524,7 @@ struct CheckpointEntry {
 
 class GraphPullback::Impl {
 public:
-    Impl(std::shared_ptr<CompiledExecutionGraph::State> retainedPlan,
+    Impl(std::shared_ptr<CompiledCommandGraph::State> retainedPlan,
          std::shared_ptr<const ExecutionBindings> retainedBindings, ExecutionSubmission forwardSubmission)
         : plan(std::move(retainedPlan)), bindings(std::move(retainedBindings)), forward(std::move(forwardSubmission)) {}
 
@@ -1349,7 +1349,7 @@ public:
         return false;
     }
 
-    std::shared_ptr<CompiledExecutionGraph::State> plan;
+    std::shared_ptr<CompiledCommandGraph::State> plan;
     std::shared_ptr<const ExecutionBindings> bindings;
     ExecutionSubmission forward;
     std::unordered_map<uint32_t, std::unique_ptr<PassPullback>> tapes;
@@ -1375,8 +1375,8 @@ public:
     mutable std::mutex mutex;
 };
 
-std::shared_ptr<GraphPullback> CompiledExecutionGraph::vjp(std::shared_ptr<const ExecutionBindings> bindings,
-                                                           std::string &error) const {
+std::shared_ptr<GraphPullback> CompiledCommandGraph::vjp(std::shared_ptr<const ExecutionBindings> bindings,
+                                                         std::string &error) const {
     error.clear();
     if (state_->differentiableInputs.empty() || state_->objectives.empty()) {
         error = state_->differentiableInputs.empty() ? "compiled graph has no differentiable inputs"

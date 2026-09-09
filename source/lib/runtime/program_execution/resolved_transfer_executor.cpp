@@ -107,7 +107,8 @@ bool ResolvedTransferExecutor::prepareGraph(program::GraphDirection graph, std::
 
 VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
     program::NodeKey consumer, const std::vector<DeviceBufferCopy> &physicalCopies,
-    vernon::execution::detail::RhiCommandExecutionPlan &commands, std::string &error) {
+    vernon::execution::detail::RhiCommandExecutionPlan &commands, bool &commandsAppended, std::string &error) {
+    commandsAppended = false;
     if (!prepared_ || consumer.graph != preparedGraph_)
         return VERNON_STATUS_INVALID_ARGUMENT;
     const bool plannedConsumer = std::any_of(state_.plan_->transfers.edges.begin(), state_.plan_->transfers.edges.end(),
@@ -136,9 +137,11 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
         buildBufferTransferCommandPlan(context_, appendInitial ? initialCopies_ : physicalCopies, uploads, transfers);
     if (status != VERNON_STATUS_OK)
         return status;
-    if (!transfers.commands.nodes.empty() &&
-        !vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(transfers), true, error))
-        return VERNON_STATUS_INVALID_ARGUMENT;
+    if (!transfers.commands.nodes.empty()) {
+        if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(transfers), true, error))
+            return VERNON_STATUS_INVALID_ARGUMENT;
+        commandsAppended = true;
+    }
     if (appendInitial)
         initialCopiesPending_ = false;
     if (appendInitial && !physicalCopies.empty()) {
@@ -146,9 +149,11 @@ VernonStatus ResolvedTransferExecutor::appendBeforeConsumer(
         const VernonStatus physicalStatus = buildBufferTransferCommandPlan(context_, physicalCopies, {}, physical);
         if (physicalStatus != VERNON_STATUS_OK)
             return physicalStatus;
-        if (!physical.commands.nodes.empty() &&
-            !vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(physical), true, error))
-            return VERNON_STATUS_INVALID_ARGUMENT;
+        if (!physical.commands.nodes.empty()) {
+            if (!vernon::execution::detail::appendRhiCommandExecutionPlan(commands, std::move(physical), true, error))
+                return VERNON_STATUS_INVALID_ARGUMENT;
+            commandsAppended = true;
+        }
     }
     return VERNON_STATUS_OK;
 }

@@ -244,8 +244,8 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     EXPECT_EQ(memoryHazard->storage, 0u);
     EXPECT_EQ(memoryHazard->barrier, BarrierRequirement::Memory);
 
-    ASSERT_EQ(fixture.plan.graphicsScopes.size(), 1u);
-    EXPECT_EQ(fixture.plan.graphicsScopes[0].attachments[0].transition, AttachmentTransition::ReadWrite);
+    ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 1u);
+    EXPECT_EQ(fixture.plan.graphicsScopeCandidates[0].attachments[0].transition, AttachmentTransition::ReadWrite);
     ASSERT_EQ(fixture.plan.autodiff.tapes.size(), 1u);
     EXPECT_EQ(fixture.plan.autodiff.residualValues, std::vector<uint32_t>({1}));
     ASSERT_EQ(fixture.plan.autodiff.replayNodes.size(), 1u);
@@ -253,6 +253,53 @@ TEST(ResolvedExecutionPlan, DerivesTypedResidencyTransferHazardGraphicsAndAutodi
     ASSERT_EQ(fixture.plan.publications.transactions.size(), 2u);
     EXPECT_EQ(fixture.plan.publications.transactions[0].mode, PublicationCommitMode::CommitAfterSuccess);
     EXPECT_EQ(fixture.plan.publications.transactions[1].mode, PublicationCommitMode::InPlace);
+}
+
+TEST(ResolvedExecutionPlan, GroupsAdjacentVersionContinuousGraphicsNodesIntoOneScope) {
+    PlanFixture fixture;
+    Program &program = fixture.resolved->program;
+    Graph &forward = program.graphs.front();
+    Node &first = forward.nodes.back();
+    program.values.push_back(value(3, OriginKind::NodeResult, 1, first.id));
+    first.operands = {2};
+    first.results = {3};
+    first.accesses[0].before = 2;
+    first.accesses[0].after = 3;
+
+    Node second = first;
+    second.id = 5;
+    second.name = "draw.second_program";
+    second.operands = {3};
+    second.results = {4};
+    second.accesses[0].before = 3;
+    second.accesses[0].after = 4;
+    program.values.push_back(value(4, OriginKind::NodeResult, 1, second.id));
+    forward.nodes.push_back(second);
+    fixture.resolved->graphs[0].predecessors.resize(forward.nodes.size());
+    ResolvedGraphicsControls controls;
+    controls.colorAttachments.push_back({0, 1, 0, 1});
+    fixture.plan.nodes.emplace(NodeKey{GraphDirection::Forward, second.id},
+                               ResolvedNodePlan{{GraphDirection::Forward, second.id}, fixture.graphics, {}, controls});
+
+    Diagnostic diagnostic;
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
+    EXPECT_EQ(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
+
+    forward.nodes[forward.nodes.size() - 2].accesses.push_back(
+        {AccessKind::Write, 0, 1, 0, 1, std::nullopt, "read_write"});
+    forward.nodes.back().accesses.push_back({AccessKind::Read, 0, 1, 1, 1, std::nullopt, "read"});
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
+    EXPECT_NE(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
+    forward.nodes[forward.nodes.size() - 2].accesses.pop_back();
+    forward.nodes.back().accesses.pop_back();
+
+    std::get<GraphicsOperation>(forward.nodes.back().operation).colorAttachments[0].formats = {
+        VERNON_TEXTURE_RGBA8_SRGB};
+    ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(fixture.plan.graphicsScopeCandidates.size(), 2u);
+    EXPECT_NE(fixture.plan.graphicsScopeCandidates[0].region, fixture.plan.graphicsScopeCandidates[1].region);
 }
 
 TEST(ResolvedExecutionPlan, OrdersDeviceResultTransferBeforeUniformConsumer) {

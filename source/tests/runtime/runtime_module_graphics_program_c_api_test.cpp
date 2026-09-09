@@ -1,4 +1,6 @@
 #include "VernonRuntime.h"
+#include "runtime/resolved_execution_plan.h"
+#include "runtime/runtime_state.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
@@ -361,4 +363,137 @@ TEST(RuntimeModuleGraphicsProgramCApi, OpenGLExternalVerticesGraphicsModuleRende
 
 TEST(RuntimeModuleGraphicsProgramCApi, OpenGLComputeGeneratedVerticesReachGraphicsModule) {
     invokeAndExpectTriangle(VERNON_RUNTIME_OPENGL, VERNON_MODULE_MIXED_OPENGL_MANIFEST, false);
+}
+
+void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
+    RhiRuntime runtime = vernon::tests::createRhiRuntime(backend);
+    if (!runtime.runtime) {
+        vernon::tests::destroyRhiRuntime(runtime);
+        GTEST_SKIP() << "requested graphics runtime is unavailable";
+    }
+    VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
+    ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
+    VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime.runtime);
+    ASSERT_NE(graph, nullptr);
+    VernonProgramNodeId scene{};
+    VernonProgramNodeId overlay{};
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &scene), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAddProgram(graph, bundle, &overlay), VERNON_STATUS_OK);
+    VernonProgramNodeBindingToken sceneOutput{sizeof(VernonProgramNodeBindingToken)};
+    VernonProgramNodeBindingToken overlayOutput{sizeof(VernonProgramNodeBindingToken)};
+    VernonProgramNodeBindingToken sceneVertices{sizeof(VernonProgramNodeBindingToken)};
+    VernonProgramNodeBindingToken overlayVertices{sizeof(VernonProgramNodeBindingToken)};
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, scene, VERNON_PROGRAM_BOUNDARY_OUTPUT, {"output", 6},
+                                                    &sceneOutput),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, overlay, VERNON_PROGRAM_BOUNDARY_OUTPUT, {"output", 6},
+                                                    &overlayOutput),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, scene, VERNON_PROGRAM_BOUNDARY_INPUT, {"vertices", 8},
+                                                    &sceneVertices),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, overlay, VERNON_PROGRAM_BOUNDARY_INPUT, {"vertices", 8},
+                                                    &overlayVertices),
+              VERNON_STATUS_OK);
+    VernonProgramGraphStorage framebuffer{sizeof(VernonProgramGraphStorage)};
+    ASSERT_EQ(vernonRuntimeProgramGraphCreateStorage(graph, &sceneOutput, &framebuffer), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphAppendStorage(graph, &framebuffer, &overlayOutput), VERNON_STATUS_OK);
+    EXPECT_EQ(vernonRuntimeProgramGraphGetGraphicsNodeCount(graph, scene), 1u);
+    EXPECT_EQ(vernonRuntimeProgramGraphGetGraphicsNodeCount(graph, overlay), 1u);
+    VernonProgramNodeGraphicsToken sceneGraphics{sizeof(VernonProgramNodeGraphicsToken)};
+    VernonProgramNodeGraphicsToken overlayGraphics{sizeof(VernonProgramNodeGraphicsToken)};
+    ASSERT_EQ(vernonRuntimeProgramGraphGetGraphicsNodeByIndex(graph, scene, 0, &sceneGraphics), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphGetGraphicsNodeByIndex(graph, overlay, 0, &overlayGraphics), VERNON_STATUS_OK);
+    EXPECT_EQ(sceneGraphics.node, scene);
+    EXPECT_EQ(overlayGraphics.node, overlay);
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph, {nullptr, 0});
+    ASSERT_NE(executable, nullptr) << lastError(runtime.runtime);
+    ASSERT_EQ(executable->executionPlan->graphicsScopeCandidates.size(), 2u);
+    EXPECT_EQ(executable->executionPlan->graphicsScopeCandidates[0].region,
+              executable->executionPlan->graphicsScopeCandidates[1].region);
+    vernonRuntimeProgramGraphDestroy(graph);
+    graph = nullptr;
+
+    VernonProgramExecutable *standalone = vernonRuntimeResolveProgram(bundle, {nullptr, 0});
+    ASSERT_NE(standalone, nullptr);
+    VernonProgramParameterView verticesParameter{};
+    ASSERT_EQ(vernonRuntimeProgramExecutableFindParameter(standalone, {"vertices", 8}, &verticesParameter),
+              VERNON_STATUS_OK);
+    vernonRuntimeProgramExecutableDestroy(standalone);
+    constexpr std::array<float, 6> positions{-0.8f, -0.8f, 0.8f, -0.8f, 0.0f, 0.8f};
+    vernon::tests::RhiBuffer vertices = vernon::tests::createBuffer(runtime, sizeof(positions), alignof(float),
+                                                                    VERNON_RHI_BUFFER_VERTEX, positions.data());
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
+    ASSERT_NE(instance, nullptr);
+    RhiImage target = vernon::tests::createImage(runtime, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM, 8, 8, 1,
+                                                 VERNON_RHI_IMAGE_COLOR_ATTACHMENT);
+    RhiImageView targetView =
+        vernon::tests::createImageView(runtime, target, VERNON_RHI_IMAGE_2D, VERNON_RHI_FORMAT_RGBA8_UNORM);
+    VernonProgramArgument output{};
+    output.kind = VERNON_PROGRAM_IMAGE;
+    output.image = {targetView.reference};
+    const VernonProgramArgument vertexArgument = tensorArgument(verticesParameter, vertices.reference);
+    for (size_t invocationIndex = 0; invocationIndex < 2; ++invocationIndex) {
+        VernonColorAttachment sceneAttachment{};
+        sceneAttachment.location = 0;
+        sceneAttachment.view = targetView.reference;
+        sceneAttachment.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+        sceneAttachment.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
+        VernonColorAttachment overlayAttachment = sceneAttachment;
+        overlayAttachment.load_operation =
+            invocationIndex == 0 ? VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE : VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+        vernon::tests::CanonicalGraphicsControls sceneControls(&sceneAttachment, 1, 0);
+        vernon::tests::CanonicalGraphicsControls overlayControls(&overlayAttachment, 1, 0);
+        for (vernon::tests::CanonicalGraphicsControls *controls : {&sceneControls, &overlayControls}) {
+            controls->renderPass.render_area[2] = 8;
+            controls->renderPass.render_area[3] = 8;
+            controls->dynamic.viewport[2] = 8;
+            controls->dynamic.viewport[3] = 8;
+            controls->dynamic.scissor[2] = 8;
+            controls->dynamic.scissor[3] = 8;
+        }
+        VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+        ASSERT_NE(invocation, nullptr);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindGraphStorage(invocation, &framebuffer, &output, nullptr, 0, 0),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &sceneVertices, &vertexArgument, nullptr, 0, 0),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &overlayVertices, &vertexArgument, nullptr, 0, 0),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindNodeGraphics(invocation, &sceneGraphics, &sceneControls.renderPass,
+                                                                 nullptr, 0, &sceneControls.draw, nullptr,
+                                                                 &sceneControls.dynamic),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramInvocationBindNodeGraphics(
+                      invocation, &overlayGraphics, &overlayControls.renderPass, nullptr, 0, &overlayControls.draw,
+                      nullptr, &overlayControls.dynamic),
+                  VERNON_STATUS_OK);
+        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+            << lastError(runtime.runtime);
+        vernonRuntimeProgramInvocationDestroy(invocation);
+    }
+    VernonProgramInvocation *foreignInvocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(foreignInvocation, nullptr);
+    VernonProgramGraphStorage foreign = framebuffer;
+    ++foreign.graph_id;
+    EXPECT_NE(vernonRuntimeProgramInvocationBindGraphStorage(foreignInvocation, &foreign, &output, nullptr, 0, 0),
+              VERNON_STATUS_OK);
+    vernonRuntimeProgramInvocationRollback(foreignInvocation);
+    vernonRuntimeProgramInvocationDestroy(foreignInvocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
+    destroyTarget(runtime, targetView, target);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    vernonRuntimeProgramBundleDestroy(bundle);
+    vernon::tests::destroyRhiRuntime(runtime);
+}
+
+#if defined(VERNON_MODULE_GRAPHICS_METAL_MANIFEST)
+TEST(RuntimeModuleGraphicsProgramCApi, MetalProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
+    expectProgramGraphFusion(VERNON_RUNTIME_METAL, VERNON_MODULE_GRAPHICS_METAL_MANIFEST);
+}
+#endif
+
+TEST(RuntimeModuleGraphicsProgramCApi, OpenGLProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
+    expectProgramGraphFusion(VERNON_RUNTIME_OPENGL, VERNON_MODULE_GRAPHICS_OPENGL_MANIFEST);
 }

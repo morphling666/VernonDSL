@@ -125,7 +125,7 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
     plan.residency.clear();
     plan.transfers = {};
     plan.hazards = {};
-    plan.graphicsScopes.clear();
+    plan.graphicsScopeCandidates.clear();
     uint32_t transferOrder = 0;
     for (size_t graphIndex = 0; graphIndex < program.graphs.size(); ++graphIndex) {
         const Graph &graph = program.graphs[graphIndex];
@@ -262,17 +262,21 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
             }
         }
 
+        const Node *previousGraphics = nullptr;
+        uint32_t nextRegion = plan.graphicsScopeCandidates.empty() ? 0 : plan.graphicsScopeCandidates.back().region + 1;
         for (const Node &node : graph.nodes) {
-            if (executionKind(node) != ExecutionKind::Graphics)
+            if (executionKind(node) != ExecutionKind::Graphics) {
+                previousGraphics = nullptr;
                 continue;
+            }
             const NodeKey key{*direction, node.id};
             const ResolvedGraphicsControls *controls =
                 std::get_if<ResolvedGraphicsControls>(&plan.nodes.at(key).controls);
             if (!controls)
                 return reject(diagnostic, "/graphs/" + std::to_string(graphIndex),
                               "graphics Node has no resolved graphics controls");
-            ResolvedGraphicsScopePlan scope;
-            scope.node = key;
+            ResolvedGraphicsScopeCandidate candidate;
+            candidate.node = key;
             const auto append = [&](const ResolvedGraphicsAttachment &attachment) {
                 const ResourceAccess &access = node.accesses[attachment.access];
                 const bool initializes = access.before < program.values.size() &&
@@ -283,13 +287,61 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
                                                         : access.access == "read_write"
                                                             ? AttachmentTransition::ReadWrite
                                                             : AttachmentTransition::Preserve;
-                scope.attachments.push_back({attachment.storage, attachment.location, attachment.aspects, transition});
+                candidate.attachments.push_back(
+                    {attachment.storage, attachment.location, attachment.aspects, transition});
             };
             for (const ResolvedGraphicsAttachment &attachment : controls->colorAttachments)
                 append(attachment);
             if (controls->depthStencilAttachment)
                 append(*controls->depthStencilAttachment);
-            plan.graphicsScopes.push_back(std::move(scope));
+            bool continuesScope = previousGraphics != nullptr;
+            if (continuesScope) {
+                const NodeKey currentKey{*direction, node.id};
+                const bool requiresMemoryBarrier = std::any_of(
+                    plan.hazards.edges.begin(), plan.hazards.edges.end(), [&](const ResolvedDependencyEdge &edge) {
+                        return edge.successor == currentKey && edge.barrier == BarrierRequirement::Memory;
+                    });
+                continuesScope = !requiresMemoryBarrier;
+                const auto *previousControls =
+                    std::get_if<ResolvedGraphicsControls>(&plan.nodes.at({*direction, previousGraphics->id}).controls);
+                continuesScope &= previousControls &&
+                                  previousControls->colorAttachments.size() == controls->colorAttachments.size() &&
+                                  previousControls->depthStencilAttachment.has_value() ==
+                                      controls->depthStencilAttachment.has_value();
+                const GraphicsOperation &previousOperation = graphicsOperation(*previousGraphics);
+                const GraphicsOperation &currentOperation = graphicsOperation(node);
+                continuesScope &= previousOperation.colorAttachments.size() == currentOperation.colorAttachments.size();
+                if (continuesScope)
+                    for (size_t index = 0; index < currentOperation.colorAttachments.size(); ++index) {
+                        const GraphicsAttachmentSignature &left = previousOperation.colorAttachments[index];
+                        const GraphicsAttachmentSignature &right = currentOperation.colorAttachments[index];
+                        continuesScope &= left.location == right.location && left.formats == right.formats &&
+                                          left.sampleCounts == right.sampleCounts && left.aspects == right.aspects;
+                    }
+                if (continuesScope && currentOperation.depthStencilAttachment) {
+                    const GraphicsAttachmentSignature &left = *previousOperation.depthStencilAttachment;
+                    const GraphicsAttachmentSignature &right = *currentOperation.depthStencilAttachment;
+                    continuesScope &= left.location == right.location && left.formats == right.formats &&
+                                      left.sampleCounts == right.sampleCounts && left.aspects == right.aspects;
+                }
+                const auto continuous = [&](const ResolvedGraphicsAttachment &previous,
+                                            const ResolvedGraphicsAttachment &current) {
+                    const ResourceAccess &before = previousGraphics->accesses[previous.access];
+                    const ResourceAccess &after = node.accesses[current.access];
+                    return previous.storage == current.storage && previous.location == current.location &&
+                           previous.aspects == current.aspects && before.after == after.before;
+                };
+                if (continuesScope)
+                    for (size_t index = 0; index < controls->colorAttachments.size(); ++index)
+                        continuesScope &=
+                            continuous(previousControls->colorAttachments[index], controls->colorAttachments[index]);
+                if (continuesScope && controls->depthStencilAttachment)
+                    continuesScope &=
+                        continuous(*previousControls->depthStencilAttachment, *controls->depthStencilAttachment);
+            }
+            candidate.region = continuesScope ? plan.graphicsScopeCandidates.back().region : nextRegion++;
+            plan.graphicsScopeCandidates.push_back(std::move(candidate));
+            previousGraphics = &node;
         }
     }
 
@@ -383,9 +435,10 @@ bool validateResolvedExecutionPlan(const ResolvedExecutionPlan &plan, Diagnostic
                 if (!producerGraph)
                     return reject(diagnostic, "/graphs", "physical read has an invalid producer graph");
                 if (*producerGraph != key.graph) {
+                    const GraphDirection consumerDirection = key.graph;
                     const auto consumerGraph =
                         std::find_if(program.graphs.begin(), program.graphs.end(), [&](const Graph &graph) {
-                            return graphDirection(graph.direction) == std::optional<GraphDirection>(key.graph);
+                            return graphDirection(graph.direction) == std::optional<GraphDirection>(consumerDirection);
                         });
                     const bool captured = consumerGraph != program.graphs.end() &&
                                           std::find(consumerGraph->captures.begin(), consumerGraph->captures.end(),

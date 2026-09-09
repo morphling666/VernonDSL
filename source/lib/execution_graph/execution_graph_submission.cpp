@@ -1,4 +1,4 @@
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 #include "execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
@@ -9,7 +9,7 @@
 
 namespace vernon::execution {
 
-CompiledExecutionGraph::State::~State() {
+CompiledCommandGraph::State::~State() {
     for (const detail::ExecutionResourceRecord &record : resourceRecords) {
         if (provider == detail::ExecutionProvider::Rhi && record.graphOwned)
             vernonRhiDeviceDestroyBuffer(device, record.buffer);
@@ -30,7 +30,7 @@ ExecutionSubmission::Impl::~Impl() {
         (void)vernonRhiDeviceDestroyCompletion(plan->device, completion);
 }
 
-std::shared_ptr<CompiledExecutionGraph> ExecutionGraph::compile(std::string &error) {
+std::shared_ptr<CompiledCommandGraph> CommandGraph::compile(std::string &error) {
     if (!buildPlan(error))
         return {};
     detail::CommandDag commandDag;
@@ -41,9 +41,9 @@ std::shared_ptr<CompiledExecutionGraph> ExecutionGraph::compile(std::string &err
         return {};
     for (uint32_t index = 0; index < scopes_.size(); ++index)
         scopes_[index].barriers = std::move(commandBarriers[index]);
-    std::shared_ptr<CompiledExecutionGraph::State> state;
+    std::shared_ptr<CompiledCommandGraph::State> state;
     try {
-        state = std::make_shared<CompiledExecutionGraph::State>();
+        state = std::make_shared<CompiledCommandGraph::State>();
     } catch (const std::bad_alloc &) {
         error = "cannot allocate compiled execution graph";
         return {};
@@ -77,7 +77,7 @@ std::shared_ptr<CompiledExecutionGraph> ExecutionGraph::compile(std::string &err
     importedImages_.clear();
     parameterIds_.clear();
     compiled_ = true;
-    return std::shared_ptr<CompiledExecutionGraph>(new CompiledExecutionGraph(std::move(state)));
+    return std::shared_ptr<CompiledCommandGraph>(new CompiledCommandGraph(std::move(state)));
 }
 
 ExecutionSubmission::ExecutionSubmission() = default;
@@ -165,16 +165,16 @@ const VernonRhiCommandEncoderStats &ExecutionSubmission::commandStats() const {
     return impl_ ? impl_->stats : empty;
 }
 
-CompiledExecutionGraph::CompiledExecutionGraph(std::shared_ptr<State> state) : state_(std::move(state)) {}
-CompiledExecutionGraph::~CompiledExecutionGraph() = default;
+CompiledCommandGraph::CompiledCommandGraph(std::shared_ptr<State> state) : state_(std::move(state)) {}
+CompiledCommandGraph::~CompiledCommandGraph() = default;
 
-const std::vector<uint32_t> &CompiledExecutionGraph::schedule() const { return state_->schedule; }
-const std::vector<CompiledScope> &CompiledExecutionGraph::scopes() const { return state_->scopes; }
-const AutodiffDagCheckpointPlan *CompiledExecutionGraph::autodiffCheckpointPlan() const {
+const std::vector<uint32_t> &CompiledCommandGraph::schedule() const { return state_->schedule; }
+const std::vector<CompiledScope> &CompiledCommandGraph::scopes() const { return state_->scopes; }
+const AutodiffDagCheckpointPlan *CompiledCommandGraph::autodiffCheckpointPlan() const {
     return state_->hasAutodiffCheckpointPlan ? &state_->autodiffCheckpointPlan : nullptr;
 }
 
-ExecutionBindingsBuilder CompiledExecutionGraph::createBindings(const std::vector<ExecutionBinding> &initial) const {
+ExecutionBindingsBuilder CompiledCommandGraph::createBindings(const std::vector<ExecutionBinding> &initial) const {
     ExecutionBindingsBuilder builder(state_->graphIdentity, state_->parameterNames.size());
     std::vector<bool> seen(state_->parameterNames.size());
     for (const ExecutionBinding &binding : initial) {
@@ -639,7 +639,7 @@ VernonRhiStatus detail::submitRhiComputeCommandRange(
     return status;
 }
 
-ExecutionSubmission CompiledExecutionGraph::submit(std::shared_ptr<const ExecutionBindings> bindings) const {
+ExecutionSubmission CompiledCommandGraph::submit(std::shared_ptr<const ExecutionBindings> bindings) const {
     if (!bindings) {
         if (!state_->parameterNames.empty())
             throw std::invalid_argument("compiled execution graph requires parameter bindings");
@@ -687,7 +687,7 @@ ExecutionSubmission CompiledExecutionGraph::submit(std::shared_ptr<const Executi
             buffers[index] = state_->resourceRecords[index].buffer;
     ExecutionResources resources(state_->resources, buffers, submission->bindings);
     struct NodeContext {
-        const CompiledExecutionGraph::State &state;
+        const CompiledCommandGraph::State &state;
         const detail::CommandNode &node;
         const ExecutionResources &resources;
     };

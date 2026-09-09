@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_RESOLVED_STAGE_INVOCATION_H
 
 #include "VernonRuntime.h"
+#include "resolved_stage_types.h"
 
 namespace vernon::runtime {
 

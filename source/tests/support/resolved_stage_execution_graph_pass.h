@@ -1,8 +1,8 @@
 #ifndef VERNON_TESTS_RESOLVED_STAGE_EXECUTION_GRAPH_PASS_H
 #define VERNON_TESTS_RESOLVED_STAGE_EXECUTION_GRAPH_PASS_H
 
-#include "VernonExecutionGraph.h"
 #include "VernonRuntime.h"
+#include "execution_graph/command_graph.h"
 #include "runtime/resolved_stage_invocation.h"
 
 #include <string>

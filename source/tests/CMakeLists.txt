@@ -315,7 +315,6 @@ if(TARGET VernonRuntime)
         runtime/runtime_external_gl_test.cpp
         runtime/shape_layout_test.cpp
         runtime/stage_artifact_contract_test.cpp
-        runtime/structured_value_binding_test.cpp
         runtime/tensor_bridge_test.cpp
         runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
@@ -325,7 +324,7 @@ if(TARGET VernonRuntime)
         VernonRuntimeTests
         PRIVATE GTest::gtest_main
                 Vernon::Runtime
-                Vernon::ExecutionGraph
+                VernonCommandGraph
                 Vernon::RuntimeRHIAdapter
                 nlohmann_json::nlohmann_json)
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
@@ -350,7 +349,7 @@ if(TARGET VernonRuntime)
             VernonCompilerRuntimeIntegrationTests
             PRIVATE GTest::gtest_main
                     Vernon::Runtime
-                    Vernon::ExecutionGraph
+                    VernonCommandGraph
                     Vernon::RuntimeRHIAdapter
                     VernonDSLCompiler)
         vernon_stage_target_files(
@@ -888,9 +887,14 @@ if(TARGET VernonRuntime)
         if(module_graphics_fixture_targets)
             add_executable(VernonModuleGraphicsProgramRuntimeTests
                            runtime/runtime_module_graphics_program_c_api_test.cpp)
-            target_link_libraries(VernonModuleGraphicsProgramRuntimeTests PRIVATE GTest::gtest_main Vernon::Runtime
-                                                                                  Vernon::RHI)
-            target_include_directories(VernonModuleGraphicsProgramRuntimeTests PRIVATE "${VERNON_TEST_ROOT}/support")
+            target_link_libraries(
+                VernonModuleGraphicsProgramRuntimeTests
+                PRIVATE GTest::gtest_main
+                        Vernon::Runtime
+                        Vernon::RHI
+                        nlohmann_json::nlohmann_json)
+            target_include_directories(VernonModuleGraphicsProgramRuntimeTests
+                                       PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support")
             add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
             if(VERNON_ENABLE_VULKAN_RUNTIME)
                 target_compile_definitions(

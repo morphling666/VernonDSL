@@ -65,9 +65,10 @@ public:
         bundleOptions.struct_size = sizeof(bundleOptions);
         bundleOptions.bundle_directory = vernon_external_engine::graphics_bundle::kCookedDirectory;
         try {
-            program_.emplace(vernon::runtime::ProgramExecutable::load(
+            const auto asset = vernon::runtime::ProgramAsset::load(
                 runtime_, vernon_external_engine::graphics_bundle::kManifest,
-                vernon_external_engine::graphics_bundle::kManifestSize, {nullptr, 0}, &bundleOptions));
+                vernon_external_engine::graphics_bundle::kManifestSize, &bundleOptions);
+            program_.emplace(asset.resolve());
             instance_ = std::make_unique<vernon::runtime::ProgramInstance>(*program_);
         } catch (const std::exception &exception) {
             const std::string diagnostic = vernon_external_engine::programRuntimeError(runtime_);

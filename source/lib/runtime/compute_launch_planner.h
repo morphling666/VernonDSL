@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_COMPUTE_LAUNCH_PLANNER_H
 
 #include "VernonRuntime.h"
+#include "resolved_stage_types.h"
 #include "stage_binding_plan.h"
 #include "tensor_bridge.h"
 

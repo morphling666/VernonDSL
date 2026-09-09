@@ -274,9 +274,14 @@ bool resolveOpenGLPipeline(BackendStageBuildInputs &inputs, const StageBindingPl
                         useRhiGraphics = false;
                         break;
                     }
-                    candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                            : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                                : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                    const std::optional<VernonRuntimeProviderBindingKind> providerKind =
+                        providerBindingKindForTransport(use.transport);
+                    if (!providerKind) {
+                        representationError = "OpenGL uniform transport is unsupported";
+                        useRhiGraphics = false;
+                        break;
+                    }
+                    candidate.layout.kind = *providerKind;
                     if (!physicalSize || physicalSize > UINT32_MAX || (buffered && use.binding == UINT32_MAX)) {
                         representationError = "OpenGL uniform reflection is incomplete";
                         useRhiGraphics = false;

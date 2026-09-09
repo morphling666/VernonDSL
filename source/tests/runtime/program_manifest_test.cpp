@@ -4,6 +4,7 @@
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution_manifest.h"
+#include "runtime/program_graph_linker.h"
 #include "runtime/runtime_pipeline_backend.h"
 #include "runtime/target_binding_plan.h"
 #include "runtime_rhi_test_utils.h"
@@ -14,6 +15,189 @@
 #include <array>
 
 namespace {
+
+vernon::runtime::ProgramVariantDeployment graphLinkFixture(bool output) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    ProgramVariantDeployment deployment;
+    deployment.artifactSystem.target = "cpu";
+    Value value;
+    value.id = 0;
+    value.name = "value";
+    value.type = "f32";
+    value.canonicalType.semantic = *vernon::program::parseSemanticType("f32");
+    value.canonicalType.dtype = "f32";
+    value.origin.kind = OriginKind::Argument;
+    deployment.program.values.push_back(value);
+    Graph graph;
+    graph.name = "forward";
+    graph.direction = "forward";
+    if (output)
+        graph.outputs.push_back({0, "transfer"});
+    else
+        graph.inputs.push_back({GraphInputKind::UserInput, 0, 0});
+    deployment.program.graphs.push_back(std::move(graph));
+    BoundarySlot slot;
+    slot.id = 0;
+    slot.path = "value";
+    slot.value = 0;
+    slot.role = output ? BoundaryRole::Output : BoundaryRole::Input;
+    slot.direction = output ? BoundaryDirection::Output : BoundaryDirection::Input;
+    slot.category = BoundaryCategory::Value;
+    slot.access = output ? BoundaryAccess::Write : BoundaryAccess::Read;
+    slot.logicalType = "f32";
+    slot.aliasOwner = {ProgramOwnerKind::Value, 0};
+    slot.publication = output ? BoundaryPublication::CommitAfterSuccess : BoundaryPublication::None;
+    deployment.program.abi.boundarySlots.push_back(slot);
+    deployment.program.abi.publication = derivePublicationPlan(deployment.program.abi.boundarySlots);
+    return deployment;
+}
+
+vernon::runtime::ProgramVariantDeployment graphStorageLinkFixture(bool output = true) {
+    using namespace vernon::runtime::program;
+    vernon::runtime::ProgramVariantDeployment deployment = graphLinkFixture(output);
+    Storage storage;
+    storage.id = 0;
+    storage.name = "storage";
+    storage.descriptorKind = StorageDescriptorKind::Buffer;
+    deployment.program.storages.push_back(storage);
+    Value &value = deployment.program.values.front();
+    value.storage = 0;
+    BoundarySlot &boundary = deployment.program.abi.boundarySlots.front();
+    boundary.category = BoundaryCategory::StorageView;
+    boundary.aliasOwner = {ProgramOwnerKind::Storage, 0};
+    BoundaryStorage boundaryStorage;
+    boundaryStorage.id = 0;
+    boundaryStorage.descriptorKind = StorageDescriptorKind::Buffer;
+    boundary.storage = boundaryStorage;
+    return deployment;
+}
+
+TEST(ProgramGraphLinker, KeepsNodeNamespacesAndInternalizesConnectedBoundaries) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment producer = graphLinkFixture(true);
+    ProgramVariantDeployment consumer = graphLinkFixture(false);
+    const std::vector<ProgramGraphNodeSource> nodes{{3, "producer", "producer-hash", &producer, {}},
+                                                    {7, "consumer", "consumer-hash", &consumer, {}}};
+    LinkedProgramDeployment linked;
+    program::Diagnostic diagnostic;
+    ASSERT_TRUE(linkProgramGraph(nodes, {{{3, 0}, {7, 0}}}, {}, {{{3, 0}, "result"}}, linked, diagnostic))
+        << diagnostic.message;
+    ASSERT_EQ(linked.deployment.program.values.size(), 1u);
+    ASSERT_EQ(linked.deployment.program.abi.boundarySlots.size(), 1u);
+    EXPECT_EQ(linked.deployment.program.abi.boundarySlots[0].path, "result");
+    EXPECT_EQ(linked.boundarySlots.at({3, 0}), 0u);
+    EXPECT_FALSE(linked.boundarySlots.count({7, 0}));
+    EXPECT_EQ(linked.id.rfind("program-graph:", 0), 0u);
+    ASSERT_EQ(linked.deployment.program.graphs.size(), 1u);
+    EXPECT_TRUE(linked.deployment.program.graphs[0].inputs.empty());
+}
+
+TEST(ProgramGraphLinker, IdentityDoesNotDependOnConnectionInsertionOrder) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment producer = graphLinkFixture(true);
+    ProgramVariantDeployment firstConsumer = graphLinkFixture(false);
+    ProgramVariantDeployment secondConsumer = graphLinkFixture(false);
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer, {}},
+                                                    {1, "first", "first-hash", &firstConsumer, {}},
+                                                    {2, "second", "second-hash", &secondConsumer, {}}};
+    const ProgramGraphConnection first{{0, 0}, {1, 0}};
+    const ProgramGraphConnection second{{0, 0}, {2, 0}};
+    LinkedProgramDeployment linked;
+    LinkedProgramDeployment reordered;
+    program::Diagnostic diagnostic;
+    ASSERT_TRUE(linkProgramGraph(nodes, {first, second}, {}, {{{0, 0}, "result"}}, linked, diagnostic))
+        << diagnostic.message;
+    ASSERT_TRUE(linkProgramGraph(nodes, {second, first}, {}, {{{0, 0}, "result"}}, reordered, diagnostic))
+        << diagnostic.message;
+    EXPECT_EQ(linked.id, reordered.id);
+    EXPECT_EQ(linked.deployment.program.values.size(), reordered.deployment.program.values.size());
+    EXPECT_EQ(linked.deployment.program.abi.boundarySlots.size(),
+              reordered.deployment.program.abi.boundarySlots.size());
+}
+
+TEST(ProgramGraphLinker, RejectsIncompleteNodeAndFeatureIdentity) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment first = graphLinkFixture(true);
+    ProgramVariantDeployment second = graphLinkFixture(false);
+    first.key = {"native"};
+    second.key = {"portable"};
+    LinkedProgramDeployment linked;
+    program::Diagnostic diagnostic;
+    EXPECT_FALSE(linkProgramGraph({{0, "first", "", &first, {}}}, {}, {}, {}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/nodes/0");
+    EXPECT_FALSE(linkProgramGraph({{0, "first", "first-hash", &first, {}}, {1, "second", "second-hash", &second, {}}},
+                                  {{{0, 0}, {1, 0}}}, {}, {}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/nodes/1");
+}
+
+TEST(ProgramGraphLinker, RejectsExportOfAnInternalizedDestination) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment producer = graphLinkFixture(true);
+    ProgramVariantDeployment consumer = graphLinkFixture(false);
+    LinkedProgramDeployment linked;
+    program::Diagnostic diagnostic;
+    EXPECT_FALSE(linkProgramGraph(
+        {{0, "producer", "producer-hash", &producer, {}}, {1, "consumer", "consumer-hash", &consumer, {}}},
+        {{{0, 0}, {1, 0}}}, {}, {{{1, 0}, "internal"}}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/exports/0");
+}
+
+TEST(ProgramGraphLinker, VariantBoundaryContractIncludesDirectionAccessLayoutAndPublication) {
+    using namespace vernon::runtime;
+    using namespace vernon::runtime::program;
+    ProgramVariantDeployment deployment = graphLinkFixture(true);
+    const BoundarySlot &boundary = deployment.program.abi.boundarySlots.front();
+    BoundarySlot candidate = boundary;
+    EXPECT_TRUE(sameProgramGraphBoundaryContract(boundary, candidate));
+    candidate.access = BoundaryAccess::Read;
+    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
+    candidate = boundary;
+    candidate.publication = BoundaryPublication::InPlace;
+    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
+    candidate = boundary;
+    candidate.layout = vernon::runtime::program::ValueLayout{};
+    EXPECT_FALSE(sameProgramGraphBoundaryContract(boundary, candidate));
+}
+
+TEST(ProgramGraphLinker, RejectsBranchedAndReversedStorageVersionChains) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment first = graphStorageLinkFixture();
+    ProgramVariantDeployment second = graphStorageLinkFixture();
+    ProgramVariantDeployment third = graphStorageLinkFixture();
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "first", "first-hash", &first, {}},
+                                                    {1, "second", "second-hash", &second, {}},
+                                                    {2, "third", "third-hash", &third, {}}};
+    LinkedProgramDeployment linked;
+    program::Diagnostic diagnostic;
+    EXPECT_FALSE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}, true}, {{0, 0}, {2, 0}, true}}, {}, {}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/connections/1");
+    EXPECT_FALSE(linkProgramGraph(nodes, {{{1, 0}, {0, 0}, true}}, {}, {}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/connections/0");
+    EXPECT_FALSE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}, true}}, {{0, 0}}, {}, linked, diagnostic));
+    EXPECT_EQ(diagnostic.path, "/retained_boundaries/0");
+}
+
+TEST(ProgramGraphLinker, RetainsBindableStorageThatAlsoFeedsAValueConnection) {
+    using namespace vernon::runtime;
+    ProgramVariantDeployment producer = graphStorageLinkFixture();
+    ProgramVariantDeployment consumer = graphStorageLinkFixture(false);
+    producer.key = {"device"};
+    consumer.key = {"device"};
+    const std::vector<ProgramGraphNodeSource> nodes{{0, "producer", "producer-hash", &producer, {}},
+                                                    {1, "consumer", "consumer-hash", &consumer, {}}};
+    LinkedProgramDeployment linked;
+    program::Diagnostic diagnostic;
+    ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {{0, 0}}, {}, linked, diagnostic)) << diagnostic.message;
+    ASSERT_EQ(linked.deployment.program.abi.boundarySlots.size(), 1u);
+    EXPECT_EQ(linked.boundarySlots.at({0, 0}), 0u);
+    EXPECT_EQ(linked.deployment.key, std::vector<std::string>{"device"});
+
+    LinkedProgramDeployment internalized;
+    ASSERT_TRUE(linkProgramGraph(nodes, {{{0, 0}, {1, 0}}}, {}, {}, internalized, diagnostic)) << diagnostic.message;
+    EXPECT_NE(linked.id, internalized.id);
+    EXPECT_TRUE(internalized.deployment.program.abi.boundarySlots.empty());
+}
 
 TEST(ProgramSemanticType, StrictCanonicalRoundTripAndClassification) {
     using namespace vernon::program;

@@ -28,6 +28,8 @@ struct ResolvedExecutionPlan;
 struct VernonRuntimeContext {
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
     size_t liveBundles{};
+    size_t liveProgramGraphs{};
+    uint64_t nextProgramGraphId{1};
     size_t livePipelines{};
     size_t liveContextLeases{};
     void *backendState{};
@@ -119,6 +121,7 @@ struct ProgramVariantDeployment {
 struct VernonProgramBundle {
     VernonRuntimeContext *context{};
     std::string id;
+    std::string contentHash;
     std::vector<vernon::runtime::ProgramVariantDeployment> deployments;
     std::filesystem::path bundleRoot;
 };
@@ -140,7 +143,12 @@ struct VernonProgramExecutable {
     ~VernonProgramExecutable() = default;
 
     VernonRuntimeContext *context;
+    std::string id;
+    uint64_t programGraphId{};
     const std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> executionPlan;
+    std::map<uint64_t, std::vector<uint32_t>> programGraphBoundarySlots;
+    std::map<uint32_t, std::vector<uint32_t>> programGraphStorageSlots;
+    std::map<uint64_t, VernonProgramGraphicsControlsView> programGraphGraphicsControls;
     CanonicalProgramAutodiffState programAutodiff;
 };
 

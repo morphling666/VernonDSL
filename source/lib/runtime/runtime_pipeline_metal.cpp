@@ -218,9 +218,11 @@ bool resolveMetalPipeline(BackendStageBuildInputs &inputs, const StageBindingPla
                 if (!dtype || !use.interfacePlan->root->size || use.interfacePlan->root->size > UINT32_MAX ||
                     !use.interfacePlan->root->alignment || use.interfacePlan->root->alignment > UINT32_MAX)
                     return false;
-                candidate.layout.kind = use.transport == "storage_buffer"   ? VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER
-                                        : use.transport == "uniform_buffer" ? VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER
-                                                                            : VERNON_RUNTIME_PROVIDER_INLINE_VALUE;
+                const std::optional<VernonRuntimeProviderBindingKind> providerKind =
+                    providerBindingKindForTransport(use.transport);
+                if (!providerKind)
+                    return false;
+                candidate.layout.kind = *providerKind;
                 candidate.layout.element_size = static_cast<uint32_t>(use.interfacePlan->root->size);
                 candidate.layout.interface_kind = VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM;
                 candidate.layout.element_alignment = static_cast<uint32_t>(use.interfacePlan->root->alignment);

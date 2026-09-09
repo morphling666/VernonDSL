@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
@@ -127,6 +128,9 @@ struct Blob {
     uint64_t byteLength{};
     std::string sha256;
     std::string uri;
+    // Loader-owned location context. It is never parsed from or serialized into
+    // the Program contract and does not participate in artifact identity.
+    std::filesystem::path bundleRoot;
 };
 
 struct ArtifactSystem {

@@ -28,21 +28,11 @@ void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeC
 bool validateRuntimeRequirements(VernonRuntimeContext &context, const RuntimeRequirements &requirements);
 
 VernonStatus registerBackendStaticCpuEntry(VernonStringView symbol, VernonCpuEntryPoint entryPoint);
-VernonStageExecutable *loadBackendCpuEntryPipeline(VernonRuntimeContext &context, VernonCpuEntryPoint entryPoint,
-                                                   const char *reflection, size_t reflectionSize, const char *entry,
-                                                   size_t entrySize);
-VernonStageExecutable *loadBackendArtifactPipeline(VernonRuntimeContext &context, const void *artifact,
-                                                   size_t artifactSize, const char *reflection, size_t reflectionSize,
-                                                   const char *entry, size_t entrySize);
 VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &context, StageBindingPlan stagePlan,
                                                        ReflectedEntry reflection, const void *artifact,
                                                        size_t artifactSize, const std::string &entry,
                                                        VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots);
-bool buildDirectComputeStage(VernonRuntimeContext &context, const void *artifact, size_t artifactSize,
-                             const char *reflection, size_t reflectionSize, const char *entry, size_t entrySize,
-                             LoadedStageArtifact &stage, StageBindingPlan &stagePlan, ReflectedEntry &reflectedEntry);
-
 bool resolveBackendPipeline(BackendStageBuildInputs &inputs, const StageBindingPlan &plan,
                             VernonStageExecutable &pipeline);
 void destroyBackendPipeline(VernonStageExecutable &pipeline);

@@ -1,4 +1,4 @@
-#include "VernonExecutionGraph.h"
+#include "execution_graph/command_graph.h"
 
 #include "execution_graph_checkpoint_planner_internal.h"
 #include "rhi/rhi_internal.h"
@@ -328,12 +328,12 @@ void RenderPass::renderArea(uint32_t x, uint32_t y, uint32_t width, uint32_t hei
     renderArea_[3] = height;
 }
 
-ExecutionGraph::ExecutionGraph() : graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
-ExecutionGraph::ExecutionGraph(VernonRhiDevice device)
+CommandGraph::CommandGraph() : graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
+CommandGraph::CommandGraph(VernonRhiDevice device)
     : provider_(detail::ExecutionProvider::Rhi), device_(device),
       graphIdentity_(nextGraphIdentity.fetch_add(1, std::memory_order_relaxed)) {}
 
-void ExecutionGraph::planAutodiffCheckpoints(uint64_t memoryBudget) {
+void CommandGraph::planAutodiffCheckpoints(uint64_t memoryBudget) {
     if (compiled_)
         throw std::logic_error("cannot mutate a compiled execution graph builder");
     autodiffMemoryBudget_ = memoryBudget;
@@ -341,7 +341,7 @@ void ExecutionGraph::planAutodiffCheckpoints(uint64_t memoryBudget) {
     dirty_ = true;
 }
 
-void ExecutionGraph::setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes) {
+void CommandGraph::setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes) {
     if (compiled_)
         throw std::logic_error("cannot mutate a compiled execution graph builder");
     for (uint32_t index = 0; index < nodes.size(); ++index) {
@@ -356,10 +356,10 @@ void ExecutionGraph::setExplicitReverseCommandDag(std::vector<ExplicitReverseCom
     dirty_ = true;
 }
 
-bool ExecutionGraph::validate(std::string &error) { return buildPlan(error); }
+bool CommandGraph::validate(std::string &error) { return buildPlan(error); }
 
-void ExecutionGraph::setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
-                                          std::vector<NamedDerivativeEndpoint> objectives) {
+void CommandGraph::setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
+                                        std::vector<NamedDerivativeEndpoint> objectives) {
     if (compiled_)
         throw std::logic_error("cannot mutate a compiled execution graph builder");
     differentiableInputs_ = std::move(differentiableInputs);
@@ -367,7 +367,7 @@ void ExecutionGraph::setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> d
     dirty_ = true;
 }
 
-ExecutionGraph::~ExecutionGraph() {
+CommandGraph::~CommandGraph() {
     for (const detail::ExecutionResourceRecord &record : resourceRecords_) {
         if (provider_ == detail::ExecutionProvider::Rhi && record.graphOwned)
             vernonRhiDeviceDestroyBuffer(device_, record.buffer);
@@ -383,7 +383,7 @@ ExecutionGraph::~ExecutionGraph() {
     }
 }
 
-ExecutionParameter ExecutionGraph::parameter(std::string name) {
+ExecutionParameter CommandGraph::parameter(std::string name) {
     if (compiled_)
         throw std::logic_error("cannot mutate a compiled execution graph builder");
     if (name.empty())
@@ -397,8 +397,8 @@ ExecutionParameter ExecutionGraph::parameter(std::string name) {
     return {id, graphIdentity_};
 }
 
-GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported,
-                                             std::shared_ptr<GraphCheckpointResource> checkpoint) {
+GraphBuffer CommandGraph::importHostBuffer(uint64_t identity, bool exported,
+                                           std::shared_ptr<GraphCheckpointResource> checkpoint) {
     if (compiled_ || !identity || provider_ != detail::ExecutionProvider::Cpu)
         return {};
     if (const auto found = importedHostBuffers_.find(identity); found != importedHostBuffers_.end()) {
@@ -428,8 +428,8 @@ GraphBuffer ExecutionGraph::importHostBuffer(uint64_t identity, bool exported,
     return result;
 }
 
-VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
-                                             bool exported) {
+VernonRhiStatus CommandGraph::createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
+                                           bool exported) {
     output = {};
     if (compiled_ || provider_ != detail::ExecutionProvider::Rhi)
         return VERNON_RHI_STATUS_UNSUPPORTED;
@@ -447,8 +447,8 @@ VernonRhiStatus ExecutionGraph::createBuffer(const VernonRhiBufferDescriptor &de
     return VERNON_RHI_STATUS_OK;
 }
 
-GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported,
-                                         std::shared_ptr<GraphCheckpointResource> checkpoint) {
+GraphBuffer CommandGraph::importBuffer(VernonRhiBuffer buffer, bool exported,
+                                       std::shared_ptr<GraphCheckpointResource> checkpoint) {
     if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t key = handleKey(buffer.index, buffer.generation);
@@ -496,7 +496,7 @@ GraphBuffer ExecutionGraph::importBuffer(VernonRhiBuffer buffer, bool exported,
     return result;
 }
 
-GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
+GraphImage CommandGraph::importImage(VernonRhiImage image, VernonRhiImageView view, bool exported) {
     if (compiled_ || provider_ != detail::ExecutionProvider::Rhi || !vernon::rhi::deviceExists(device_))
         return {};
     const uint64_t imageKey = vernon::rhi::imageResource(device_, image);
@@ -571,7 +571,7 @@ GraphImage ExecutionGraph::importImage(VernonRhiImage image, VernonRhiImageView 
     return result;
 }
 
-bool ExecutionGraph::buildPlan(std::string &error) {
+bool CommandGraph::buildPlan(std::string &error) {
     error.clear();
     if (compiled_) {
         error = "execution graph builder was already compiled";

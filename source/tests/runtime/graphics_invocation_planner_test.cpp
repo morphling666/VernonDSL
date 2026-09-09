@@ -1,5 +1,5 @@
 #include "runtime/graphics_invocation_planner.h"
-#include "runtime/graphics_scope_planner.h"
+#include "runtime/graphics_scope_materializer.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/program_graphics_executor.h"
 
@@ -399,7 +399,7 @@ TEST(GraphicsInvocationPlanner, StageBindingPlanKeyUsesOnlyCanonicalStaticFields
     EXPECT_FALSE(graphicsVariantKeysEqual(first, same));
 }
 
-TEST(GraphicsScopePlanner, MergesOnlyPreservedCompatibleAttachments) {
+TEST(GraphicsScopeMaterializer, SelectsFusedOrSplitResolvedCandidatePath) {
     VernonColorAttachment previous{};
     previous.location = 0;
     previous.view = {7, {11}, 0, 0};
@@ -414,18 +414,25 @@ TEST(GraphicsScopePlanner, MergesOnlyPreservedCompatibleAttachments) {
     PlannedGraphicsInvocation second = first;
     second.attachments = {&following};
 
-    GraphicsScopePlanner planner;
-    EXPECT_FALSE(planner.canAppend(first));
-    planner.append(first);
-    EXPECT_TRUE(planner.canAppend(second));
-    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
-    EXPECT_FALSE(planner.canAppend(second));
-    following.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
-    following.view.identity = 8;
-    EXPECT_FALSE(planner.canAppend(second));
+    GraphicsScopeMaterializer materializer;
+    EXPECT_EQ(materializer.materialize(0, first), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, second), GraphicsScopeMaterialization::Fuse);
+    EXPECT_EQ(materializer.materialize(0, second, true), GraphicsScopeMaterialization::Begin);
+    VernonColorAttachment clearing = following;
+    PlannedGraphicsInvocation clearingInvocation = second;
+    clearingInvocation.attachments = {&clearing};
+    clearing.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_CLEAR;
+    EXPECT_EQ(materializer.materialize(0, clearingInvocation), GraphicsScopeMaterialization::Split);
+    VernonColorAttachment differentView = clearing;
+    differentView.load_operation = VERNON_RUNTIME_PROVIDER_LOAD_PRESERVE;
+    differentView.view.identity = 8;
+    PlannedGraphicsInvocation differentViewInvocation = second;
+    differentViewInvocation.attachments = {&differentView};
+    EXPECT_EQ(materializer.materialize(0, differentViewInvocation), GraphicsScopeMaterialization::Split);
+    EXPECT_EQ(materializer.materialize(1, differentViewInvocation), GraphicsScopeMaterialization::Begin);
 }
 
-TEST(GraphicsScopePlanner, SamplingPreviousDepthAttachmentEndsScope) {
+TEST(GraphicsScopeMaterializer, SamplingPreviousDepthAttachmentSelectsSplitPath) {
     VernonDepthAttachment previous{};
     previous.view = {17, {29}, 0, 0};
     previous.store_operation = VERNON_RUNTIME_PROVIDER_STORE_PRESERVE;
@@ -443,9 +450,9 @@ TEST(GraphicsScopePlanner, SamplingPreviousDepthAttachmentEndsScope) {
     pbr.depthAttachment = &following;
     pbr.sampledResources[{0, 0}].imageView = previous.view;
 
-    GraphicsScopePlanner planner;
-    planner.append(shadow);
-    EXPECT_FALSE(planner.canAppend(pbr));
+    GraphicsScopeMaterializer materializer;
+    EXPECT_EQ(materializer.materialize(0, shadow), GraphicsScopeMaterialization::Begin);
+    EXPECT_EQ(materializer.materialize(0, pbr), GraphicsScopeMaterialization::Split);
 }
 
 TEST(GraphicsInvocationPlanner, UsesTypedInvocationControls) {

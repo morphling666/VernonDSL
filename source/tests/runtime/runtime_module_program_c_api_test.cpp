@@ -277,7 +277,8 @@ TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(context, nullptr);
     {
-        auto executable = vernon::runtime::ProgramExecutable::load(context, manifest.data(), manifest.size());
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto executable = asset.resolve();
         const VernonProgramParameterView sourceParameter = parameter(executable.get(), "source");
         const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
         vernon::runtime::ProgramInstance instance(executable);
@@ -296,6 +297,78 @@ TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
         const VernonProgramBindingTelemetry telemetry = instance.telemetry();
         EXPECT_EQ(telemetry.prepare_count, 2u);
         EXPECT_EQ(telemetry.upload_bytes, sizeof(source));
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCppApi, ProgramGraphProvidesNodeScopedFrameBindings) {
+    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto standalone = asset.resolve();
+        const VernonProgramParameterView sourceParameter = parameter(standalone.get(), "source");
+        const VernonProgramParameterView outputParameter = parameter(standalone.get(), "output");
+        vernon::runtime::ProgramGraph graph(context);
+        const auto first = graph.add(asset);
+        const auto second = graph.add(asset);
+        const auto firstSource = first.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const auto firstOutput = first.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        const auto secondSource = second.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const auto secondOutput = second.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        auto executable = graph.compile();
+        vernon::runtime::ProgramInstance instance(executable);
+        float firstSourceValue = 2.0f;
+        float firstOutputValue = 0.0f;
+        float secondSourceValue = 3.0f;
+        float secondOutputValue = 0.0f;
+        auto invocation = instance.begin();
+        invocation.node(first)
+            .bind(firstSource, tensorArgument(sourceParameter, firstSourceValue))
+            .bind(firstOutput, tensorArgument(outputParameter, firstOutputValue));
+        invocation.node(second)
+            .bind(secondSource, tensorArgument(sourceParameter, secondSourceValue))
+            .bind(secondOutput, tensorArgument(outputParameter, secondOutputValue));
+        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_FLOAT_EQ(firstOutputValue, 4.0f);
+        EXPECT_FLOAT_EQ(secondOutputValue, 9.0f);
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
+    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
+    ASSERT_TRUE(input);
+    const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto standalone = asset.resolve();
+        const VernonProgramParameterView sourceParameter = parameter(standalone.get(), "source");
+        const VernonProgramParameterView outputParameter = parameter(standalone.get(), "output");
+        vernon::runtime::ProgramGraph graph(context);
+        const auto producer = graph.add(asset);
+        const auto consumer = graph.add(asset);
+        const auto producerSource = producer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const auto producerOutput = producer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        const auto consumerSource = consumer.boundary(VERNON_PROGRAM_BOUNDARY_INPUT, "source");
+        const auto consumerOutput = consumer.boundary(VERNON_PROGRAM_BOUNDARY_OUTPUT, "output");
+        graph.connect(graph.createValue(producerOutput), consumerSource);
+        auto executable = graph.compile();
+        vernon::runtime::ProgramInstance instance(executable);
+        float source = 2.0f;
+        float output = 0.0f;
+        auto invocation = instance.begin();
+        invocation.node(producer).bind(producerSource, tensorArgument(sourceParameter, source));
+        invocation.node(consumer).bind(consumerOutput, tensorArgument(outputParameter, output));
+        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_FLOAT_EQ(output, 16.0f);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

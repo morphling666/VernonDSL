@@ -1,5 +1,5 @@
-#include "VernonExecutionGraph.h"
 #include "VernonRuntimeRHIAdapter.h"
+#include "execution_graph/command_graph.h"
 
 #include <gtest/gtest.h>
 
@@ -68,7 +68,7 @@ TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
     vernonRhiDestroyDevice(device);
 }
 
-TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuffers) {
+TEST_P(RhiResourceLifetime, CommandGraphDestroysOwnedBuffersButNotImportedBuffers) {
     const BackendCase test = GetParam();
     VernonRhiOwnedDeviceDescriptor deviceDescriptor{};
     deviceDescriptor.struct_size = sizeof(deviceDescriptor);
@@ -86,7 +86,7 @@ TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuff
     VernonRhiBuffer imported{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &imported), VERNON_RHI_STATUS_OK);
     {
-        vernon::execution::ExecutionGraph graph(device);
+        vernon::execution::CommandGraph graph(device);
         const vernon::execution::GraphBuffer first = graph.importBuffer(imported);
         const vernon::execution::GraphBuffer second = graph.importBuffer(imported);
         EXPECT_EQ(first.id, second.id);
@@ -96,7 +96,7 @@ TEST_P(RhiResourceLifetime, ExecutionGraphDestroysOwnedBuffersButNotImportedBuff
 
     VernonRhiBuffer owned{};
     {
-        vernon::execution::ExecutionGraph graph(device);
+        vernon::execution::CommandGraph graph(device);
         vernon::execution::GraphBuffer graphBuffer;
         ASSERT_EQ(graph.createBuffer(bufferDescriptor, graphBuffer), VERNON_RHI_STATUS_OK);
         owned = graphBuffer.handle;
@@ -324,7 +324,7 @@ TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
     vernonRhiDestroyDevice(device);
 }
 
-TEST_P(RhiResourceLifetime, ExecutionGraphRetainsImportedImageViewAndParent) {
+TEST_P(RhiResourceLifetime, CommandGraphRetainsImportedImageViewAndParent) {
     const BackendCase test = GetParam();
     if (!test.supportsImages)
         GTEST_SKIP() << test.name << " does not expose images";
@@ -362,7 +362,7 @@ TEST_P(RhiResourceLifetime, ExecutionGraphRetainsImportedImageViewAndParent) {
 
     VernonRhiImage replacement{};
     {
-        vernon::execution::ExecutionGraph graph(device);
+        vernon::execution::CommandGraph graph(device);
         const vernon::execution::GraphImage imported = graph.importImage(image, view);
         ASSERT_NE(imported.id, UINT32_MAX);
         ASSERT_EQ(vernonRhiDeviceDestroyImageView(device, view), VERNON_RHI_STATUS_OK);
