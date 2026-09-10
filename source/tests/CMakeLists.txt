@@ -25,12 +25,24 @@ file(
     VERNON_TEST_BUNDLE_PYTHON_SOURCES
     CONFIGURE_DEPENDS
     "${VERNON_REPOSITORY_ROOT}/python/vernon_dsl/*.py")
+set_property(
+    DIRECTORY
+    APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS "${VERNON_REPOSITORY_ROOT}/python/tests/language_contract_cases.py"
+             "${VERNON_REPOSITORY_ROOT}/python/tests/generate_language_contract_acceptance_cmake.py")
 
 function(vernon_discover_gtests target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /EHsc)
     endif()
     gtest_discover_tests(${target} DISCOVERY_MODE POST_BUILD WORKING_DIRECTORY "${VERNON_TEST_BINARY_ROOT}")
+endfunction()
+
+function(vernon_enable_glfw_context_owner_for_test target)
+    if(TARGET VernonGlfwContextOwner)
+        target_link_libraries(${target} PRIVATE Vernon::GlfwContextOwner)
+        target_compile_definitions(${target} PRIVATE VERNON_GLFW_CONTEXT_OWNER_AVAILABLE=1)
+    endif()
 endfunction()
 
 function(
@@ -213,8 +225,9 @@ if(TARGET VernonRuntime)
         runtime/tensor_bridge_test.cpp
         runtime/vertex_attribute_capabilities_test.cpp)
     set_target_properties(VernonRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/source")
-    target_include_directories(VernonRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                          "${VERNON_TEST_ROOT}/support")
+    target_include_directories(
+        VernonRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                                   "${VERNON_TEST_BINARY_ROOT}/generated")
     target_link_libraries(
         VernonRuntimeTests
         PRIVATE GTest::gtest_main
@@ -256,43 +269,62 @@ if(TARGET VernonRuntime)
     endif()
     if(TARGET vernon-dsl-native AND Python_FOUND)
         set(gpu_autodiff_fixture_targets)
-        set(module_program_gpu_fixture_targets)
+        set(module_program_fixture_targets)
         set(module_graphics_fixture_targets)
         set(synchronization_fixture_targets)
+        set(language_contract_fixture_targets)
+        set(module_program_cpu_fixture_targets)
+        set(synchronization_cpu_fixture_targets)
+        set(language_contract_cpu_fixture_targets)
+        set(VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS)
         set(enabled_fixture_targets)
+        list(APPEND enabled_fixture_targets "cpu|VERNON_RUNTIME_CPU|compute,autodiff,synchronization")
         if(VERNON_ENABLE_CUDA_RUNTIME)
-            list(APPEND enabled_fixture_targets "cuda|VERNON_RUNTIME_CUDA|compute,autodiff,synchronization")
+            list(APPEND enabled_fixture_targets "cuda|VERNON_RUNTIME_CUDA|compute,autodiff,gpu,synchronization,texture")
         endif()
         if(VERNON_ENABLE_VULKAN_RUNTIME)
             list(APPEND enabled_fixture_targets
-                 "vulkan|VERNON_RUNTIME_VULKAN|compute,autodiff,graphics,synchronization")
+                 "vulkan|VERNON_RUNTIME_VULKAN|compute,autodiff,gpu,graphics,synchronization,texture")
         endif()
         if(VERNON_ENABLE_DIRECTX12_RUNTIME)
             list(APPEND enabled_fixture_targets
-                 "directx|VERNON_RUNTIME_DIRECTX12|compute,autodiff,graphics,synchronization")
+                 "directx|VERNON_RUNTIME_DIRECTX12|compute,autodiff,gpu,graphics,synchronization,texture")
         endif()
         if(VERNON_ENABLE_METAL_RUNTIME)
-            list(APPEND enabled_fixture_targets "metal|VERNON_RUNTIME_METAL|compute,autodiff,graphics,synchronization")
+            list(APPEND enabled_fixture_targets
+                 "metal|VERNON_RUNTIME_METAL|compute,autodiff,gpu,graphics,synchronization,texture")
         endif()
         list(
             APPEND
             enabled_fixture_targets
-            "opengl|VERNON_RUNTIME_OPENGL|compute,autodiff,graphics,synchronization"
-            "opengles|VERNON_RUNTIME_OPENGL_ES|compute,autodiff,graphics,synchronization")
+            "opengl|VERNON_RUNTIME_OPENGL|compute,autodiff,gpu,graphics,synchronization,texture"
+            "opengles|VERNON_RUNTIME_OPENGL_ES|compute,autodiff,gpu,graphics,synchronization,texture")
 
         set(cross_backend_fixture_specs
-            "synchronization|synchronization|${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset|synchronization"
-            "module_program_gpu|module_program|${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset|compute"
-            "module_program_gpu|reused_stage|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset|compute"
-            "module_program_gpu|tensor_view_chain|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset|compute"
-            "module_program_gpu|dynamic_shape_grid|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset|compute"
-            "gpu_autodiff|gpu_autodiff|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset|autodiff"
-            "gpu_autodiff|gpu_autodiff_non_power_of_two|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset|autodiff"
-            "gpu_autodiff|gpu_autodiff_static|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset|autodiff"
-            "gpu_autodiff|gpu_autodiff_dynamic|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset|autodiff"
-            "module_graphics|module_graphics|${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:graphics_asset|graphics"
-            "module_graphics|module_mixed|${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:mixed_asset|graphics"
-        )
+            "gpu_autodiff|gpu_autodiff|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset|gpu"
+            "gpu_autodiff|gpu_autodiff_non_power_of_two|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset|gpu"
+            "gpu_autodiff|gpu_autodiff_static|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset|gpu")
+        set(language_contract_fixture_specs_file
+            "${VERNON_TEST_BINARY_ROOT}/generated/language_contract_fixture_specs.cmake")
+        execute_process(
+            COMMAND
+                "${CMAKE_COMMAND}" -E env
+                "PYTHONPATH=${VERNON_REPOSITORY_ROOT}/python:${VERNON_REPOSITORY_ROOT}/python/tests"
+                "${Python_EXECUTABLE}"
+                "${VERNON_REPOSITORY_ROOT}/python/tests/generate_language_contract_acceptance_cmake.py" --repository
+                "${VERNON_REPOSITORY_ROOT}" --output "${language_contract_fixture_specs_file}" --cpp-output
+                "${VERNON_TEST_BINARY_ROOT}/generated/language_contract_acceptance_descriptors.inc"
+            RESULT_VARIABLE language_contract_fixture_specs_status
+            ERROR_VARIABLE language_contract_fixture_specs_error)
+        if(NOT
+           language_contract_fixture_specs_status
+           EQUAL
+           0)
+            message(FATAL_ERROR "failed to generate language contract fixture matrix: "
+                                "${language_contract_fixture_specs_error}")
+        endif()
+        include("${language_contract_fixture_specs_file}")
+        list(APPEND cross_backend_fixture_specs ${VERNON_LANGUAGE_CONTRACT_FIXTURE_SPECS})
         set(VERNON_TEST_FIXTURE_MANIFEST_ROWS)
         set(VERNON_TEST_FIXTURE_PAIRS)
         foreach(enabled_fixture_target IN LISTS enabled_fixture_targets)
@@ -360,11 +392,22 @@ if(TARGET VernonRuntime)
                     GET
                     fixture_fields
                     3
-                    fixture_requirement)
-                if(NOT
-                   fixture_requirement
-                   IN_LIST
-                   fixture_capability_list)
+                    fixture_requirements)
+                string(
+                    REPLACE ","
+                            ";"
+                            fixture_requirement_list
+                            "${fixture_requirements}")
+                set(fixture_supported TRUE)
+                foreach(fixture_requirement IN LISTS fixture_requirement_list)
+                    if(NOT
+                       fixture_requirement
+                       IN_LIST
+                       fixture_capability_list)
+                        set(fixture_supported FALSE)
+                    endif()
+                endforeach()
+                if(NOT fixture_supported)
                     continue()
                 endif()
                 set(fixture_pair "${fixture_id}@${fixture_architecture}")
@@ -378,12 +421,38 @@ if(TARGET VernonRuntime)
                             fixture_name
                             "${fixture_id}")
                 set(fixture_manifest_variable "${fixture_id}_${fixture_architecture}_manifest")
-                vernon_add_program_asset_test_bundle(
-                    "${fixture_name}-${fixture_architecture}"
-                    "${fixture_architecture}"
-                    "${fixture_asset}"
-                    "${fixture_id}_${fixture_architecture}_fixture"
-                    "${fixture_manifest_variable}")
+                if(fixture_runtime STREQUAL "VERNON_RUNTIME_CPU")
+                    string(MAKE_C_IDENTIFIER "${fixture_id}_${fixture_architecture}" fixture_registration_suffix)
+                    set(fixture_registration "vernonRegisterFixture_${fixture_registration_suffix}")
+                    set(fixture_target_variable "${fixture_id}_${fixture_architecture}_fixture_target")
+                    vernon_add_cpu_program_fixture(
+                        "${fixture_name}-${fixture_architecture}"
+                        "${fixture_id}_${fixture_architecture}_fixture"
+                        "${fixture_id}_${fixture_architecture}_fixture.program.json"
+                        "${fixture_asset}"
+                        "${fixture_registration}"
+                        "${fixture_manifest_variable}"
+                        "${fixture_target_variable}")
+                    list(APPEND ${fixture_group}_cpu_fixture_targets "${${fixture_target_variable}}")
+                    string(TOUPPER "${fixture_group}" fixture_group_macro)
+                    string(MAKE_C_IDENTIFIER "${fixture_group_macro}" fixture_group_macro)
+                    string(
+                        APPEND
+                        VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS
+                        "#if defined(VERNON_${fixture_group_macro}_CPU_FIXTURES_AVAILABLE)\nextern \"C\" VernonStatus ${fixture_registration}(void);\n#endif\n"
+                    )
+                    set(fixture_registration_expression "&${fixture_registration}")
+                else()
+                    vernon_add_program_asset_test_bundle(
+                        "${fixture_name}-${fixture_architecture}"
+                        "${fixture_architecture}"
+                        "${fixture_asset}"
+                        "${fixture_id}_${fixture_architecture}_fixture"
+                        "${fixture_manifest_variable}")
+                    list(APPEND ${fixture_group}_fixture_targets
+                         "vernon-${fixture_name}-${fixture_architecture}-test-bundle")
+                    set(fixture_registration_expression "nullptr")
+                endif()
                 string(FIND "${${fixture_manifest_variable}}" ")vernon\"" fixture_raw_string_terminator)
                 if(NOT
                    fixture_raw_string_terminator
@@ -392,32 +461,28 @@ if(TARGET VernonRuntime)
                     message(
                         FATAL_ERROR "fixture manifest path contains reserved raw-string terminator: ${fixture_pair}")
                 endif()
-                list(APPEND ${fixture_group}_fixture_targets
-                     "vernon-${fixture_name}-${fixture_architecture}-test-bundle")
-                string(
-                    APPEND
-                    VERNON_TEST_FIXTURE_MANIFEST_ROWS
-                    "        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\"},\n"
-                )
+                if(fixture_runtime STREQUAL "VERNON_RUNTIME_CPU")
+                    string(TOUPPER "${fixture_group}" fixture_group_macro)
+                    string(MAKE_C_IDENTIFIER "${fixture_group_macro}" fixture_group_macro)
+                    string(
+                        APPEND
+                        VERNON_TEST_FIXTURE_MANIFEST_ROWS
+                        "#if defined(VERNON_${fixture_group_macro}_CPU_FIXTURES_AVAILABLE)\n        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\", ${fixture_registration_expression}},\n#endif\n"
+                    )
+                else()
+                    string(
+                        APPEND
+                        VERNON_TEST_FIXTURE_MANIFEST_ROWS
+                        "        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\", ${fixture_registration_expression}},\n"
+                    )
+                endif()
             endforeach()
         endforeach()
-        vernon_add_cpu_program_fixture(
-            synchronization-cpu
-            synchronization_cpu_fixture
-            synchronization_cpu_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset"
-            vernonRegisterSynchronizationProgramFixture
-            synchronization_cpu_manifest
-            synchronization_cpu_fixture_target)
-        string(
-            APPEND
-            VERNON_TEST_FIXTURE_MANIFEST_ROWS
-            "        {\"synchronization\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${synchronization_cpu_manifest})vernon\"},\n"
-        )
-        target_compile_definitions(VernonCompilerRuntimeIntegrationTests
-                                   PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1)
+        target_compile_definitions(
+            VernonCompilerRuntimeIntegrationTests PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1
+                                                          VERNON_SYNCHRONIZATION_CPU_FIXTURES_AVAILABLE=1)
         target_include_directories(VernonCompilerRuntimeIntegrationTests PRIVATE "${VERNON_TEST_BINARY_ROOT}/generated")
-        target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE ${synchronization_cpu_fixture_target})
+        target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE ${synchronization_cpu_fixture_targets})
         add_dependencies(VernonCompilerRuntimeIntegrationTests ${synchronization_fixture_targets})
 
         vernon_add_cpu_program_fixture(
@@ -428,47 +493,11 @@ if(TARGET VernonRuntime)
             vernonRegisterAutodiffFixture
             cooked_autodiff_manifest
             cooked_autodiff_fixture_target)
-        vernon_add_cpu_program_fixture(
-            module-program-cooked
-            module_program_cooked_fixture
-            module_program_cooked_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-            vernonRegisterModuleProgramFixture
-            module_program_cooked_manifest
-            module_program_cooked_fixture_target)
-        vernon_add_cpu_program_fixture(
-            module-reused-stage-cpu
-            reused_stage_cpu_fixture
-            reused_stage_cpu_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset"
-            vernonRegisterReusedStageCpuFixture
-            reused_stage_cpu_manifest
-            reused_stage_cpu_fixture_target)
-        vernon_add_cpu_program_fixture(
-            module-tensor-view-chain-cpu
-            tensor_view_chain_cpu_fixture
-            tensor_view_chain_cpu_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset"
-            vernonRegisterTensorViewChainCpuFixture
-            tensor_view_chain_cpu_manifest
-            tensor_view_chain_cpu_fixture_target)
-        vernon_add_cpu_program_fixture(
-            module-dynamic-shape-grid-cpu
-            dynamic_shape_grid_cpu_fixture
-            dynamic_shape_grid_cpu_fixture.program.json
-            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset"
-            vernonRegisterDynamicShapeGridCpuFixture
-            dynamic_shape_grid_cpu_manifest
-            dynamic_shape_grid_cpu_fixture_target)
-        string(
-            APPEND
-            VERNON_TEST_FIXTURE_MANIFEST_ROWS
-            "        {\"module_program\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${module_program_cooked_manifest})vernon\"},\n"
-            "        {\"reused_stage\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${reused_stage_cpu_manifest})vernon\"},\n"
-            "        {\"tensor_view_chain\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${tensor_view_chain_cpu_manifest})vernon\"},\n"
-            "        {\"dynamic_shape_grid\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${dynamic_shape_grid_cpu_manifest})vernon\"},\n"
-        )
         file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")
+        file(
+            GENERATE
+            OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_registration_declarations.inc"
+            CONTENT "${VERNON_TEST_FIXTURE_REGISTRATION_DECLARATIONS}")
         file(
             GENERATE
             OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_manifest_rows.inc"
@@ -618,23 +647,22 @@ if(TARGET VernonRuntime)
             dynamic_v2_mixed_alias_manifest
             dynamic_v2_mixed_alias_fixture_target)
         add_executable(VernonModuleProgramRuntimeTests runtime/runtime_module_program_c_api_test.cpp)
-        target_link_libraries(VernonRuntimeTests PRIVATE ${module_program_cooked_fixture_target})
-        target_compile_definitions(VernonRuntimeTests
-                                   PRIVATE VERNON_CPU_CANONICAL_PROGRAM_MANIFEST="${module_program_cooked_manifest}")
+        target_link_libraries(VernonRuntimeTests PRIVATE ${module_program_cpu_fixture_targets})
+        target_compile_definitions(
+            VernonRuntimeTests PRIVATE VERNON_CPU_CANONICAL_PROGRAM_MANIFEST="${module_program_cpu_manifest}"
+                                       VERNON_MODULE_PROGRAM_CPU_FIXTURES_AVAILABLE=1)
         target_link_libraries(
             VernonModuleProgramRuntimeTests
             PRIVATE GTest::gtest_main
                     Vernon::Runtime
-                    ${module_program_cooked_fixture_target}
-                    ${reused_stage_cpu_fixture_target}
-                    ${tensor_view_chain_cpu_fixture_target}
-                    ${dynamic_shape_grid_cpu_fixture_target}
+                    ${module_program_cpu_fixture_targets}
                     ${typed_specialization_fixture_target})
         target_include_directories(VernonModuleProgramRuntimeTests PRIVATE "${VERNON_TEST_ROOT}/support"
                                                                            "${VERNON_TEST_BINARY_ROOT}/generated")
         target_compile_definitions(
             VernonModuleProgramRuntimeTests
-            PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cooked_manifest}"
+            PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cpu_manifest}"
+                    VERNON_MODULE_PROGRAM_CPU_FIXTURES_AVAILABLE=1
                     VERNON_TYPED_SPECIALIZATION_MANIFEST="${typed_specialization_manifest}")
         set_target_properties(VernonModuleProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                          "${CMAKE_BINARY_DIR}/source")
@@ -647,13 +675,14 @@ if(TARGET VernonRuntime)
                 VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
                                                "${VERNON_TEST_BINARY_ROOT}/generated")
             target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
+            vernon_enable_glfw_context_owner_for_test(VernonGpuAutodiffTests)
             add_dependencies(VernonGpuAutodiffTests ${gpu_autodiff_fixture_targets})
             set_target_properties(VernonGpuAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                     "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonGpuAutodiffTests VernonRuntime VernonRHI)
             vernon_discover_gtests(VernonGpuAutodiffTests)
         endif()
-        if(module_program_gpu_fixture_targets)
+        if(module_program_fixture_targets)
             add_executable(VernonModuleProgramGpuRuntimeTests runtime/runtime_module_program_gpu_c_api_test.cpp)
             target_link_libraries(
                 VernonModuleProgramGpuRuntimeTests
@@ -661,11 +690,12 @@ if(TARGET VernonRuntime)
                         Vernon::Runtime
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
+            vernon_enable_glfw_context_owner_for_test(VernonModuleProgramGpuRuntimeTests)
             target_include_directories(
                 VernonModuleProgramGpuRuntimeTests
                 PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
                         "${VERNON_TEST_BINARY_ROOT}/generated")
-            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
+            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_fixture_targets})
             set_target_properties(VernonModuleProgramGpuRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                 "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonModuleProgramGpuRuntimeTests VernonRuntime VernonRHI)
@@ -680,6 +710,7 @@ if(TARGET VernonRuntime)
                         Vernon::Runtime
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
+            vernon_enable_glfw_context_owner_for_test(VernonModuleGraphicsProgramRuntimeTests)
             target_include_directories(
                 VernonModuleGraphicsProgramRuntimeTests
                 PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
@@ -689,6 +720,28 @@ if(TARGET VernonRuntime)
                                                                                      "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRuntime VernonRHI)
             vernon_discover_gtests(VernonModuleGraphicsProgramRuntimeTests)
+        endif()
+        if(language_contract_fixture_targets OR language_contract_cpu_fixture_targets)
+            add_executable(VernonLanguageContractAcceptanceTests runtime/runtime_language_contract_acceptance_test.cpp)
+            target_link_libraries(
+                VernonLanguageContractAcceptanceTests
+                PRIVATE GTest::gtest_main
+                        Vernon::Runtime
+                        Vernon::RHI
+                        nlohmann_json::nlohmann_json
+                        ${language_contract_cpu_fixture_targets})
+            vernon_enable_glfw_context_owner_for_test(VernonLanguageContractAcceptanceTests)
+            target_include_directories(
+                VernonLanguageContractAcceptanceTests
+                PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                        "${VERNON_TEST_BINARY_ROOT}/generated")
+            target_compile_definitions(VernonLanguageContractAcceptanceTests
+                                       PRIVATE VERNON_LANGUAGE_CONTRACT_CPU_FIXTURES_AVAILABLE=1)
+            add_dependencies(VernonLanguageContractAcceptanceTests ${language_contract_fixture_targets})
+            set_target_properties(VernonLanguageContractAcceptanceTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                                   "${CMAKE_BINARY_DIR}/source")
+            vernon_stage_target_files(VernonLanguageContractAcceptanceTests VernonRuntime VernonRHI)
+            vernon_discover_gtests(VernonLanguageContractAcceptanceTests)
         endif()
 
         add_executable(VernonStructuredScalarAutodiffTests runtime/runtime_structured_scalar_autodiff_test.cpp)
@@ -1014,18 +1067,26 @@ if(TARGET VernonRuntime)
             "${VERNON_REPOSITORY_ROOT}/python/tests/cube_map_shader.py:cube_map_asset"
             vulkan_cube_map_bundle
             vulkan_cube_map_test_manifest)
+        vernon_add_program_asset_test_bundle(
+            vulkan-multiset-texture
+            vulkan
+            "${VERNON_TEST_ROOT}/fixtures/language_contract_texture_asset.py:multiset_asset"
+            vulkan_multiset_texture_bundle
+            vulkan_multiset_texture_test_manifest)
         target_sources(VernonRuntimeTests PRIVATE runtime/runtime_vulkan_pipeline_test.cpp
                                                   runtime/runtime_vulkan_cube_map_test.cpp)
         target_compile_definitions(
             VernonRuntimeTests
             PRIVATE VERNON_VULKAN_PROGRAM_BUNDLE="${vulkan_program_test_manifest}"
                     VERNON_VULKAN_CUBE_MAP_BUNDLE="${vulkan_cube_map_test_manifest}"
-                    VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE="${vulkan_compute_program_test_manifest}")
+                    VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE="${vulkan_compute_program_test_manifest}"
+                    VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE="${vulkan_multiset_texture_test_manifest}")
         add_dependencies(
             VernonRuntimeTests
             vernon-vulkan-pipeline-test-bundle
             vernon-vulkan-cube-map-test-bundle
-            vernon-vulkan-compute-pipeline-test-bundle)
+            vernon-vulkan-compute-pipeline-test-bundle
+            vernon-vulkan-multiset-texture-test-bundle)
     endif()
 
     if(TARGET vernon-dsl-native AND Python_FOUND)

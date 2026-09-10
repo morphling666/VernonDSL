@@ -3,11 +3,44 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from language_contract_cases import LanguageContractCase
+from language_contract_cases import (
+    AcceptanceSuite,
+    LanguageContractAcceptance,
+    LanguageContractCase,
+    RuntimeOracleKind,
+)
 from language_contract_traceability import ContractTestBinding
 
 _HEADING = re.compile(r"^### `(?P<id>LANG-[A-Z0-9-]+)`", re.MULTILINE)
 _LAYERS = re.compile(r"^- Layers: (?P<layers>.+)$", re.MULTILINE)
+
+_RUNTIME_ORACLES_BY_SUITE = {
+    AcceptanceSuite.LANGUAGE_CONTRACT: frozenset(
+        {
+            RuntimeOracleKind.FLOAT_BUFFER,
+            RuntimeOracleKind.SAMPLED_PIXEL,
+            RuntimeOracleKind.SPECIALIZATION_PIXELS,
+            RuntimeOracleKind.STORAGE_TEXEL,
+            RuntimeOracleKind.STRUCTURED_VIEW,
+            RuntimeOracleKind.GRAPHICS_TRIANGLE,
+            RuntimeOracleKind.FAN_OUT_VJP,
+            RuntimeOracleKind.SIGNED_STRIDE_VJP,
+        }
+    ),
+    AcceptanceSuite.SYNCHRONIZATION: frozenset({RuntimeOracleKind.SYNCHRONIZATION}),
+    AcceptanceSuite.MODULE_PROGRAM: frozenset(
+        {
+            RuntimeOracleKind.MODULE_VJP,
+            RuntimeOracleKind.REUSED_STAGE,
+            RuntimeOracleKind.TENSOR_VIEW_CHAIN,
+            RuntimeOracleKind.DYNAMIC_SHAPE_GRID,
+        }
+    ),
+    AcceptanceSuite.GPU_AUTODIFF: frozenset({RuntimeOracleKind.DYNAMIC_VJP}),
+    AcceptanceSuite.MODULE_GRAPHICS: frozenset(
+        {RuntimeOracleKind.GRAPHICS_TRIANGLE, RuntimeOracleKind.MIXED_COMPUTE_GRAPHICS}
+    ),
+}
 
 _GROUPED_LAYERS = {
     "LANG-BUILTIN-POSITION": frozenset({"F", "I", "C", "A", "R"}),
@@ -160,3 +193,46 @@ def audit_coverage(
             for (contract_id, region), missing in sorted(gaps.items())
         )
         raise AssertionError(f"language contract coverage gaps: {details}")
+
+
+def acceptance_coverage_gaps(
+    requirements: Mapping[str, frozenset[str]],
+    cases: tuple[LanguageContractCase, ...],
+    acceptances: tuple[LanguageContractAcceptance, ...],
+) -> dict[str, frozenset[str]]:
+    known_contracts = {case.contract_id for case in cases}
+    covered_layers: dict[str, frozenset[str]] = {}
+    seen_acceptance_ids: set[str] = set()
+    for acceptance in acceptances:
+        if acceptance.id in seen_acceptance_ids:
+            raise AssertionError(f"duplicate language contract acceptance ID: {acceptance.id}")
+        seen_acceptance_ids.add(acceptance.id)
+        if not acceptance.asset_reference:
+            raise AssertionError(f"{acceptance.id} has no authored Program asset")
+        source, separator, symbol = acceptance.asset_reference.partition(":")
+        if separator != ":" or not source or not symbol.isidentifier():
+            raise AssertionError(f"{acceptance.id} has an invalid Program asset reference")
+        if not acceptance.contract_ids:
+            raise AssertionError(f"{acceptance.id} covers no contracts")
+        if not any(vars(acceptance.requirements).values()):
+            raise AssertionError(f"{acceptance.id} has no backend requirements")
+        if acceptance.oracle.kind not in _RUNTIME_ORACLES_BY_SUITE[acceptance.suite]:
+            raise AssertionError(
+                f"{acceptance.id} oracle {acceptance.oracle.kind.value!r} is not executed by "
+                f"suite {acceptance.suite.value!r}"
+            )
+        if not acceptance.oracle.expected:
+            raise AssertionError(f"{acceptance.id} runtime oracle has no expected observations")
+        unknown_contracts = acceptance.contract_ids - known_contracts
+        if unknown_contracts:
+            raise AssertionError(f"{acceptance.id} references unknown contracts: {sorted(unknown_contracts)}")
+        for contract_id in acceptance.contract_ids:
+            covered_layers[contract_id] = covered_layers.get(contract_id, frozenset()) | frozenset({"C", "A", "R"})
+
+    gaps: dict[str, frozenset[str]] = {}
+    for contract_id, required in requirements.items():
+        required_acceptance_layers = required & {"C", "A", "R"}
+        missing = required_acceptance_layers - covered_layers.get(contract_id, frozenset())
+        if missing:
+            gaps[contract_id] = missing
+    return gaps

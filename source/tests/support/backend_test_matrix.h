@@ -36,10 +36,12 @@ struct BackendTestRequirements {
     bool compute{};
     bool graphics{};
     bool storageBuffers{};
+    bool storageTexture{};
     bool deviceAtomics{};
     bool f32AtomicAdd{};
     bool f64AtomicAdd{};
     bool textureSamplerOperations{};
+    bool programVjp{};
     uint16_t minimumApiMajor{};
     uint16_t minimumApiMinor{};
     std::string_view nativeInteropBackend;
@@ -98,6 +100,12 @@ inline BackendProbeResult probeCompilerBackend(const VernonCompilerContext *comp
         if (requirements.graphics && !get(Id::GraphicsTextureSampling).supported)
             return unsupported(backend.name, "graphics_texture_sampling");
     }
+    if (requirements.storageTexture &&
+        !vernon::program_capabilities::get(vernon::program_capabilities::Id::ComputeTextureBinding).supported)
+        return unsupported(backend.name, "storage_texture");
+    if (requirements.programVjp &&
+        !vernon::program_capabilities::get(vernon::program_capabilities::Id::ComputeVjp).supported)
+        return unsupported(backend.name, "program_vjp");
     if (!requirements.nativeInteropBackend.empty() && requirements.nativeInteropBackend != backend.name)
         return unsupported(backend.name, std::string(requirements.nativeInteropBackend) + "_native_interop");
     return {};

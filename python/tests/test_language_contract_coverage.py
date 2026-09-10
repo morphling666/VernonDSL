@@ -2,11 +2,25 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
-from language_contract_cases import CONTRACT_CASE_GROUPS, LANGUAGE_CONTRACT_CASES, case_by_id
-from language_contract_inventory import audit_coverage, coverage_gaps, inventory_layer_requirements
+from backend_test_matrix import CapabilityUnavailable, ProbeKind, ProbeResult
+from language_contract_cases import (
+    CONTRACT_CASE_GROUPS,
+    LANGUAGE_CONTRACT_REGISTRY,
+    AcceptanceSuite,
+    RuntimeOracle,
+    RuntimeOracleKind,
+    case_by_id,
+)
+from language_contract_inventory import (
+    acceptance_coverage_gaps,
+    audit_coverage,
+    coverage_gaps,
+    inventory_layer_requirements,
+)
 from language_contract_pytest import reject_skipped_contract_test
 from language_contract_traceability import (
     ContractTestBinding,
@@ -34,27 +48,80 @@ class LanguageContractCoverageTests(unittest.TestCase):
         self.assertTrue(all(layers for layers in self.requirements.values()))
 
     def test_every_inventory_contract_has_a_canonical_case(self) -> None:
-        registered = {case.contract_id for case in LANGUAGE_CONTRACT_CASES}
+        registered = {case.contract_id for case in LANGUAGE_CONTRACT_REGISTRY.cases}
         self.assertEqual(registered, self.requirements.keys())
         contracts_with_supported_regions = {
             case.contract_id
-            for case in LANGUAGE_CONTRACT_CASES
+            for case in LANGUAGE_CONTRACT_REGISTRY.cases
             if case.valid_regions and case.expected_diagnostic is None
         }
         self.assertEqual(contracts_with_supported_regions, self.requirements.keys())
 
     def test_registered_cases_reference_inventory_contracts(self) -> None:
-        for case in LANGUAGE_CONTRACT_CASES:
+        for case in LANGUAGE_CONTRACT_REGISTRY.cases:
             with self.subTest(reference=case.id):
                 self.assertIn(case.contract_id, self.requirements)
 
     def test_declared_tests_cover_required_frontend_and_ir_regions(self) -> None:
         audit_coverage(
             self.requirements,
-            LANGUAGE_CONTRACT_CASES,
+            LANGUAGE_CONTRACT_REGISTRY.cases,
             self.bindings,
             layers=frozenset({"F", "I"}),
         )
+
+    def test_acceptance_scenarios_cover_required_compile_artifact_and_runtime_layers(self) -> None:
+        self.assertEqual(
+            acceptance_coverage_gaps(
+                self.requirements,
+                LANGUAGE_CONTRACT_REGISTRY.cases,
+                LANGUAGE_CONTRACT_REGISTRY.acceptances,
+            ),
+            {},
+        )
+
+    def test_acceptance_assets_are_authored_repository_sources(self) -> None:
+        for acceptance in LANGUAGE_CONTRACT_REGISTRY.acceptances:
+            with self.subTest(acceptance=acceptance.id):
+                source_path, separator, symbol = acceptance.asset_reference.partition(":")
+                self.assertEqual(separator, ":")
+                self.assertTrue(symbol.isidentifier())
+                self.assertTrue((self.repository / source_path).is_file())
+
+    def test_removing_acceptance_reopens_required_layers(self) -> None:
+        without_fan_out = tuple(
+            acceptance for acceptance in LANGUAGE_CONTRACT_REGISTRY.acceptances if acceptance.id != "fan_out_vjp"
+        )
+        gaps = acceptance_coverage_gaps(
+            self.requirements,
+            LANGUAGE_CONTRACT_REGISTRY.cases,
+            without_fan_out,
+        )
+        self.assertEqual(gaps["LANG-PAIR-012"], frozenset({"C", "A", "R"}))
+
+    def test_acceptance_oracle_must_be_executed_by_its_suite(self) -> None:
+        acceptance = LANGUAGE_CONTRACT_REGISTRY.acceptances[0]
+        invalid = replace(
+            acceptance,
+            suite=AcceptanceSuite.SYNCHRONIZATION,
+            oracle=RuntimeOracle(RuntimeOracleKind.FLOAT_BUFFER, (1.0,)),
+        )
+        with self.assertRaisesRegex(AssertionError, "is not executed by suite"):
+            acceptance_coverage_gaps(
+                self.requirements,
+                LANGUAGE_CONTRACT_REGISTRY.cases,
+                (invalid,),
+            )
+
+    def test_acceptance_runtime_oracle_requires_observations(self) -> None:
+        acceptance = LANGUAGE_CONTRACT_REGISTRY.acceptances[0]
+        invalid = replace(acceptance, oracle=replace(acceptance.oracle, expected=()))
+        with self.assertRaisesRegex(AssertionError, "has no expected observations"):
+            acceptance_coverage_gaps(
+                self.requirements,
+                LANGUAGE_CONTRACT_REGISTRY.cases,
+                (invalid,),
+            )
 
     def test_fake_binding_that_does_not_consume_its_case_is_rejected(self) -> None:
         source = """
@@ -116,7 +183,7 @@ class FakeTests:
                 collect_test_bindings((path,), case_groups=self.case_groups)
 
     def test_additional_observed_layers_do_not_create_a_failure(self) -> None:
-        case = next(case for case in LANGUAGE_CONTRACT_CASES if case.id == "LANG-SCALAR-001/f32")
+        case = next(case for case in LANGUAGE_CONTRACT_REGISTRY.cases if case.id == "LANG-SCALAR-001/f32")
         binding = ContractTestBinding((case.id,), frozenset({"F", "I"}), "synthetic")
         self.assertEqual(
             coverage_gaps(
@@ -134,7 +201,7 @@ class FakeTests:
         with self.assertRaisesRegex(AssertionError, "LANG-NEW-001"):
             coverage_gaps(
                 requirements,
-                LANGUAGE_CONTRACT_CASES,
+                LANGUAGE_CONTRACT_REGISTRY.cases,
                 self.bindings,
                 layers=frozenset({"F", "I"}),
             )
@@ -201,9 +268,14 @@ class FakeTests:
         reject_skipped_contract_test(ordinary_report, lambda: None)
         self.assertEqual(ordinary_report.outcome, "skipped")
 
+        capability_report = SimpleNamespace(outcome="skipped", longrepr="reason", skipped=True)
+        capability = CapabilityUnavailable(ProbeResult(ProbeKind.CAPABILITY_UNSUPPORTED, "missing required feature"))
+        reject_skipped_contract_test(capability_report, bound, capability)
+        self.assertEqual(capability_report.outcome, "skipped")
+
     def test_unexecuted_negative_case_fails_the_audit(self) -> None:
-        positive = next(case for case in LANGUAGE_CONTRACT_CASES if case.id == "LANG-SCALAR-001/f32")
-        negative = next(case for case in LANGUAGE_CONTRACT_CASES if case.id == "LANG-SCALAR-001/unknown-type")
+        positive = next(case for case in LANGUAGE_CONTRACT_REGISTRY.cases if case.id == "LANG-SCALAR-001/f32")
+        negative = next(case for case in LANGUAGE_CONTRACT_REGISTRY.cases if case.id == "LANG-SCALAR-001/unknown-type")
         binding = ContractTestBinding((positive.id,), frozenset({"F", "I"}), "synthetic")
         with self.assertRaisesRegex(AssertionError, "diagnostic cases were not executed"):
             audit_coverage(
@@ -218,7 +290,7 @@ class FakeTests:
         without_case = tuple(binding for binding in self.bindings if case_id not in binding.case_ids)
         gaps = coverage_gaps(
             self.requirements,
-            LANGUAGE_CONTRACT_CASES,
+            LANGUAGE_CONTRACT_REGISTRY.cases,
             without_case,
             layers=frozenset({"F", "I"}),
         )

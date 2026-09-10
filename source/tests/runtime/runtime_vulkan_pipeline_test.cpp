@@ -1,6 +1,7 @@
 #include "VernonRuntime.h"
 #include "runtime/runtime_test_hooks.h"
 #include "runtime_rhi_test_utils.h"
+#include "sampled_texture_runtime_oracle.h"
 #include "vernon_test_support.h"
 
 #include <array>
@@ -18,6 +19,9 @@
 #endif
 #ifndef VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE
 #error VERNON_VULKAN_COMPUTE_PROGRAM_BUNDLE must name the cooked compute Program bundle
+#endif
+#ifndef VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE
+#error VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE must name the cooked multi-set texture Program bundle
 #endif
 namespace {
 
@@ -48,6 +52,18 @@ vernon::tests::RhiImage createTexture2D(vernon::tests::RhiRuntime &context, uint
 }
 
 } // namespace
+
+TEST(RuntimeVulkanPipeline, ResolvesDistinctDescriptorSetsWithRepeatedBindingNumbers) {
+    if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)
+        GTEST_SKIP() << "Vulkan runtime backend is unavailable";
+
+    vernon::tests::OwnedRhiRuntime owned(VERNON_RUNTIME_VULKAN);
+    ASSERT_NE(owned.runtime(), nullptr);
+    vernon::tests::OwnedProgramExecutable executable(owned.runtime(), VERNON_VULKAN_MULTISET_TEXTURE_BUNDLE);
+    ASSERT_TRUE(executable) << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+    constexpr double expected[]{255, 0, 0, 255};
+    vernon::tests::runSampledTextureRuntimeOracle(owned, executable.get(), expected, std::size(expected));
+}
 
 TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     if (!vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN).available)

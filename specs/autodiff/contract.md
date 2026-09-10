@@ -225,6 +225,11 @@ d_roughness = gradients["material.roughness"]
 d_vertices = gradients["vertices.position"]
 ```
 
+`grid` is required exactly when the resolved Program exposes the three
+`__grid_{x,y,z}` invocation Values. A Module whose authored graph owns every
+kernel launch grid omits those boundary Values, so callers omit `grid`; passing
+one is rejected rather than silently overriding the authored launches.
+
 The binding names and paths accepted by `wrt` are canonical reflected source
 paths. They are fixed at cook time and cannot be changed by a Runtime call.
 Program signature groups transport structured output cotangents and

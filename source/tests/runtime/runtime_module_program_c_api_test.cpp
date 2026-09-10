@@ -13,10 +13,6 @@
 #include <string_view>
 #include <vector>
 
-extern "C" VernonStatus vernonRegisterModuleProgramFixture(void);
-extern "C" VernonStatus vernonRegisterReusedStageCpuFixture(void);
-extern "C" VernonStatus vernonRegisterTensorViewChainCpuFixture(void);
-extern "C" VernonStatus vernonRegisterDynamicShapeGridCpuFixture(void);
 extern "C" VernonStatus vernonRegisterTypedSpecializationFixture(void);
 
 namespace {
@@ -99,20 +95,27 @@ VernonProgramBindingToken bindingToken(const char *value) {
     return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
 }
 
-std::string fixtureManifest(std::string_view fixtureId) {
+const vernon::tests::ProgramFixtureManifest &cpuFixture(std::string_view fixtureId) {
     const auto *fixture = vernon::tests::findProgramFixtureManifest(fixtureId, VERNON_RUNTIME_CPU);
     if (!fixture)
         throw std::logic_error("missing CPU fixture '" + std::string(fixtureId) + "'");
-    std::ifstream input(std::string(fixture->manifestPath), std::ios::binary);
+    return *fixture;
+}
+
+std::string fixtureManifest(std::string_view fixtureId) {
+    const auto &fixture = cpuFixture(fixtureId);
+    if (fixture.prepare() != VERNON_STATUS_OK)
+        throw std::runtime_error("cannot register CPU fixture '" + std::string(fixtureId) + "'");
+    std::ifstream input(std::string(fixture.manifestPath), std::ios::binary);
     if (!input)
-        throw std::runtime_error("cannot read CPU fixture manifest '" + std::string(fixture->manifestPath) + "'");
+        throw std::runtime_error("cannot read CPU fixture manifest '" + std::string(fixture.manifestPath) + "'");
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 } // namespace
 
 TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublicLifecycle) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = VERNON_MODULE_PROGRAM_MANIFEST;
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -232,7 +235,7 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
 }
 
 TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompositeAutodiff) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -346,7 +349,7 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
 }
 
 TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -453,7 +456,7 @@ INSTANTIATE_TEST_SUITE_P(RetiredAndUnknownTypes, RuntimeProgramEnvelopeRejection
                                          "programs", "PROGRAM", " program", "program ", "null", "true", "unknown"));
 
 TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -486,7 +489,7 @@ TEST(RuntimeModuleProgramCppApi, RetainsExecutableForPersistentInstance) {
 }
 
 TEST(RuntimeModuleProgramCppApi, ProgramGraphProvidesNodeScopedFrameBindings) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -618,7 +621,7 @@ TEST(RuntimeModuleProgramCppApi, TypedVariantsSelectIndependentProgramGraphNodes
 }
 
 TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    ASSERT_EQ(cpuFixture("module_program").prepare(), VERNON_STATUS_OK);
     std::ifstream input(VERNON_MODULE_PROGRAM_MANIFEST, std::ios::binary);
     ASSERT_TRUE(input);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
@@ -656,7 +659,6 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
 }
 
 TEST(RuntimeModuleProgramCpuMatrix, ReusesOneStageAcrossDifferentNodeProjections) {
-    ASSERT_EQ(vernonRegisterReusedStageCpuFixture(), VERNON_STATUS_OK);
     const std::string manifest = fixtureManifest("reused_stage");
     ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -690,7 +692,6 @@ TEST(RuntimeModuleProgramCpuMatrix, ReusesOneStageAcrossDifferentNodeProjections
 }
 
 TEST(RuntimeModuleProgramCpuMatrix, ChainsDistinctComputeKernelsThroughTensorViews) {
-    ASSERT_EQ(vernonRegisterTensorViewChainCpuFixture(), VERNON_STATUS_OK);
     const std::string manifest = fixtureManifest("tensor_view_chain");
     ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
@@ -714,7 +715,6 @@ TEST(RuntimeModuleProgramCpuMatrix, ChainsDistinctComputeKernelsThroughTensorVie
 }
 
 TEST(RuntimeModuleProgramCpuMatrix, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    ASSERT_EQ(vernonRegisterDynamicShapeGridCpuFixture(), VERNON_STATUS_OK);
     const std::string manifest = fixtureManifest("dynamic_shape_grid");
     ASSERT_FALSE(manifest.empty());
     VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);

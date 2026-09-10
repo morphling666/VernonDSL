@@ -164,16 +164,26 @@ class CookedProgram:
     def vjp(
         self,
         bindings: dict[str, Any],
-        grid: tuple[int, int, int],
+        grid: tuple[int, int, int] | None = None,
     ) -> tuple[Any, _CookedProgramPullback]:
         self._load()
-        if len(grid) != 3 or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid):
-            raise ValueError("grid must contain three positive integers")
         parameters = tuple(self._native.parameters)
-        grid_values = dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True))
-        grid_parameters = {parameter.name for parameter in parameters if parameter.name in grid_values}
-        if grid_parameters != set(grid_values):
-            raise RuntimeError("cooked Program is missing compute workgroup boundary Values")
+        grid_names = ("__grid_x", "__grid_y", "__grid_z")
+        grid_parameters = {parameter.name for parameter in parameters if parameter.name in grid_names}
+        if grid_parameters == set(grid_names):
+            if (
+                not isinstance(grid, tuple)
+                or len(grid) != 3
+                or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in grid)
+            ):
+                raise ValueError("grid must contain three positive integers")
+            grid_values = dict(zip(grid_names, grid, strict=True))
+        elif grid_parameters:
+            raise RuntimeError("cooked Program has an incomplete compute workgroup boundary")
+        else:
+            if grid is not None:
+                raise ValueError("this cooked Program owns its launch grids and does not accept a grid")
+            grid_values = {}
         if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
             raise ValueError("autodiff bindings do not match Program parameters")
         state = _session_state()
@@ -206,9 +216,12 @@ class CookedProgram:
         )
         if not groups or {group.role for group in groups} != {"gradient", "cotangent"}:
             raise RuntimeError("cooked Program has no validated derivative groups")
-        workgroup = tuple(getattr(self._native, "workgroup_size", (1, 1, 1)))
-        extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
-        carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
+        if grid is None:
+            carrier_shape = ()
+        else:
+            workgroup = tuple(getattr(self._native, "workgroup_size", (1, 1, 1)))
+            extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
+            carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
         return output, _CookedProgramPullback(
             native_pullback,
             tuple(group for group in groups if group.role == "gradient"),

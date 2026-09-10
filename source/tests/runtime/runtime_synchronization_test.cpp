@@ -20,10 +20,6 @@ namespace {
 
 class RhiRuntimeSynchronization : public testing::TestWithParam<vernon::tests::BackendTestRow> {};
 
-#if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
-extern "C" VernonStatus vernonRegisterSynchronizationProgramFixture(void);
-#endif
-
 std::string stringValue(VernonStringView value) {
     return value.data ? std::string(value.data, value.size) : std::string{};
 }
@@ -98,12 +94,12 @@ void verifySynchronizationResult(const std::array<int32_t, 10> &result) {
 
 #if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
 TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkgroups) {
-    ASSERT_EQ(vernonRegisterSynchronizationProgramFixture(), VERNON_STATUS_OK);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
     {
         const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
         ASSERT_NE(fixture, nullptr);
+        ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
         vernon::tests::OwnedProgramExecutable program(runtime, std::string(fixture->manifestPath));
         ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(runtime));
 
@@ -136,11 +132,11 @@ TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkg
 }
 
 TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
-    ASSERT_EQ(vernonRegisterSynchronizationProgramFixture(), VERNON_STATUS_OK);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
     const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
     ASSERT_NE(fixture, nullptr);
+    ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
     const std::filesystem::path manifestPath = std::string(fixture->manifestPath);
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};

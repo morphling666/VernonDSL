@@ -1,3 +1,4 @@
+#include "program_fixture_manifest_table.h"
 #include "runtime/runtime_state.h"
 
 #include <cstring>
@@ -12,7 +13,6 @@
 #define VERNON_CPU_CANONICAL_PROGRAM_MANIFEST ""
 #endif
 
-extern "C" VernonStatus vernonRegisterModuleProgramFixture(void);
 #endif
 
 namespace {
@@ -64,7 +64,9 @@ struct CanonicalCpuProgram {
 };
 
 CanonicalCpuProgram loadCanonicalCpuProgram() {
-    EXPECT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    const auto *fixture = vernon::tests::findProgramFixtureManifest("module_program", VERNON_RUNTIME_CPU);
+    EXPECT_NE(fixture, nullptr);
+    EXPECT_EQ(fixture ? fixture->prepare() : VERNON_STATUS_INVALID_ARGUMENT, VERNON_STATUS_OK);
     const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
     EXPECT_FALSE(manifest.empty());
     CanonicalCpuProgram result;
@@ -90,7 +92,9 @@ void destroy(CanonicalCpuProgram &program) {
 
 #if !defined(VERNON_RUNTIME_PROFILE_WEB)
 TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
-    ASSERT_EQ(vernonRegisterModuleProgramFixture(), VERNON_STATUS_OK);
+    const auto *fixture = vernon::tests::findProgramFixtureManifest("module_program", VERNON_RUNTIME_CPU);
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
     const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
     ASSERT_FALSE(manifest.empty());
     VernonRuntimeBackend target = VERNON_RUNTIME_CUDA;

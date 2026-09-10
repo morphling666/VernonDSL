@@ -77,10 +77,10 @@ function(vernon_add_python_bindings package_directory source_directory)
         RUNTIME DESTINATION vernon_dsl COMPONENT VernonWheel
         LIBRARY DESTINATION vernon_dsl COMPONENT VernonWheel)
 
-    if(VERNON_ENABLE_GLFW_CONTEXT_OWNER AND TARGET glfw)
+    if(TARGET VernonGlfwContextOwner)
         nanobind_add_module(vernon-dsl-gl-context "${source_directory}/python/gl_context_module.cpp")
         _vernon_set_python_module_output(vernon-dsl-gl-context "${package_directory}")
-        target_link_libraries(vernon-dsl-gl-context PRIVATE glfw)
+        target_link_libraries(vernon-dsl-gl-context PRIVATE Vernon::GlfwContextOwner)
         if(MSVC)
             target_compile_options(vernon-dsl-gl-context PRIVATE /EHsc)
         endif()

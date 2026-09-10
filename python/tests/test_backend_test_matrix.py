@@ -68,6 +68,25 @@ class BackendTestMatrixTests(unittest.TestCase):
         ):
             probe_runtime(BACKEND_TEST_MATRIX[1], BackendRequirements(compute=True))
 
+    def test_runtime_probe_checks_effective_compute_api_version(self) -> None:
+        runtime = SimpleNamespace(
+            capabilities={
+                "available": True,
+                "compute": True,
+                "graphics": True,
+                "storage_buffers": True,
+                "api_version": (4, 2),
+            }
+        )
+        with (
+            mock.patch("backend_test_matrix._native", SimpleNamespace()),
+            mock.patch("backend_test_matrix.vd.init"),
+            mock.patch("backend_test_matrix.runtime_session._native_runtime", runtime),
+        ):
+            result = probe_runtime(BACKEND_TEST_MATRIX[5], BackendRequirements(compute=True))
+        self.assertIs(result.kind, ProbeKind.CAPABILITY_UNSUPPORTED)
+        self.assertIn("api_version>=(4, 3)", result.reason)
+
     def test_cpu_compute_and_storage_probe_end_to_end(self) -> None:
         if backend_test_matrix._native is None:
             self.skipTest("native Vernon extension is not built")

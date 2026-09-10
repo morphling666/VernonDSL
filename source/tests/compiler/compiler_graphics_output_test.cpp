@@ -1,6 +1,6 @@
 #include "VernonCompiler.h"
 #include "VernonVersions.h"
-#include "compiler_target_test_utils.h"
+#include "backend_test_matrix.h"
 
 #include <algorithm>
 #include <array>
@@ -252,10 +252,19 @@ void expectPackedPushConstants(std::string_view artifact) {
 TEST(CompilerGraphicsOutput, PreservesInterfacesTexturesAndSwizzles) {
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_OPENGL_ES,
-                                VERNON_TARGET_METAL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    requirements.textureSamplerOperations = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target == VERNON_TARGET_CPU || target == VERNON_TARGET_CUDA)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result = vernonCompilerCompileMlir(compiler, module.data(), module.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -518,7 +527,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target : {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL}) {
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    requirements.textureSamplerOperations = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL)
+            continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, samplingModule.data(), samplingModule.size(), target);
         ASSERT_TRUE(result);
@@ -598,10 +619,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target :
-         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_METAL}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX &&
+            target != VERNON_TARGET_METAL)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, storageModule.data(), storageModule.size(), target);
         ASSERT_TRUE(result);
@@ -710,9 +740,18 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
     EXPECT_NE(reflected.find("\"shape\":[3,4]"), std::string_view::npos);
 
     vernonCompileResultDestroy(result);
-    for (VernonTarget target : {VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         result = vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);
         if (vernonCompileResultGetStatus(result) != VERNON_STATUS_OK) {
@@ -834,10 +873,19 @@ module attributes {)mlir" VERNON_MLIR_VERSION_ATTRIBUTES R"mlir(} {
 
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_TRUE(compiler);
-    for (VernonTarget target :
-         {VERNON_TARGET_VULKAN, VERNON_TARGET_OPENGL, VERNON_TARGET_DIRECTX, VERNON_TARGET_CUDA}) {
-        if (vernon::tests::unavailableDirectXTarget(compiler, target))
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.compute = true;
+    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix) {
+        const VernonTarget target = backend.compiler;
+        if (target != VERNON_TARGET_VULKAN && target != VERNON_TARGET_OPENGL && target != VERNON_TARGET_DIRECTX &&
+            target != VERNON_TARGET_CUDA)
             continue;
+        const vernon::tests::BackendProbeResult probe =
+            vernon::tests::probeCompilerBackend(compiler, backend, requirements);
+        if (!probe.available()) {
+            EXPECT_TRUE(probe.skippable()) << probe.reason;
+            continue;
+        }
         VernonCompileResult *result =
             vernonCompilerCompileMlir(compiler, tensorModule.data(), tensorModule.size(), target);
         ASSERT_TRUE(result);

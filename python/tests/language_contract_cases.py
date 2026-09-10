@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Final
 
 from vernon_dsl.shader_contracts import (
@@ -10,7 +11,6 @@ from vernon_dsl.shader_contracts import (
     GENERATED_INTERFACE_CONTRACTS,
 )
 
-RUNTIME_NOT_APPLICABLE: Final = "runtime_not_applicable"
 DEVICE_REGIONS: Final = frozenset({"compute", "vertex", "fragment", "func"})
 ENTRY_REGIONS: Final = frozenset({"compute", "vertex", "fragment"})
 KNOWN_REGIONS: Final = DEVICE_REGIONS | {"host"}
@@ -38,6 +38,62 @@ class MlirOracle:
 
 
 @dataclass(frozen=True)
+class AcceptanceRequirements:
+    compute: bool = False
+    graphics: bool = False
+    storage_buffers: bool = False
+    storage_texture: bool = False
+    device_atomics: bool = False
+    f32_atomic_add: bool = False
+    texture_sampler_operations: bool = False
+    program_vjp: bool = False
+
+
+class RuntimeOracleKind(Enum):
+    FLOAT_BUFFER = "float_buffer"
+    SAMPLED_PIXEL = "sampled_pixel"
+    SPECIALIZATION_PIXELS = "specialization_pixels"
+    STORAGE_TEXEL = "storage_texel"
+    STRUCTURED_VIEW = "structured_view"
+    SYNCHRONIZATION = "synchronization"
+    MODULE_VJP = "module_vjp"
+    REUSED_STAGE = "reused_stage"
+    TENSOR_VIEW_CHAIN = "tensor_view_chain"
+    DYNAMIC_SHAPE_GRID = "dynamic_shape_grid"
+    DYNAMIC_VJP = "dynamic_vjp"
+    FAN_OUT_VJP = "fan_out_vjp"
+    GRAPHICS_TRIANGLE = "graphics_triangle"
+    MIXED_COMPUTE_GRAPHICS = "mixed_compute_graphics"
+    SIGNED_STRIDE_VJP = "signed_stride_vjp"
+
+
+class AcceptanceSuite(Enum):
+    LANGUAGE_CONTRACT = "language_contract"
+    SYNCHRONIZATION = "synchronization"
+    MODULE_PROGRAM = "module_program"
+    GPU_AUTODIFF = "gpu_autodiff"
+    MODULE_GRAPHICS = "module_graphics"
+
+
+@dataclass(frozen=True)
+class RuntimeOracle:
+    kind: RuntimeOracleKind
+    expected: tuple[int | float, ...]
+    parameter: str = "output"
+    grid: tuple[int, int, int] = (1, 1, 1)
+
+
+@dataclass(frozen=True)
+class LanguageContractAcceptance:
+    id: str
+    contract_ids: frozenset[str]
+    asset_reference: str
+    requirements: AcceptanceRequirements
+    oracle: RuntimeOracle
+    suite: AcceptanceSuite = AcceptanceSuite.LANGUAGE_CONTRACT
+
+
+@dataclass(frozen=True)
 class LanguageContractCase:
     contract_id: str
     name: str
@@ -47,7 +103,6 @@ class LanguageContractCase:
     invalid_regions: frozenset[str]
     capabilities: frozenset[str]
     expected_diagnostic: str | None
-    runtime_oracle: str
     expected: object | None = None
 
     @property
@@ -73,7 +128,6 @@ def _valid_type(
         frozenset(),
         capabilities,
         None,
-        RUNTIME_NOT_APPLICABLE,
         expected_mlir,
     )
 
@@ -93,7 +147,6 @@ def _invalid_type(
         DEVICE_REGIONS,
         frozenset(),
         diagnostic,
-        RUNTIME_NOT_APPLICABLE,
     )
 
 
@@ -107,7 +160,6 @@ def _invalid_source(
     valid_regions: frozenset[str] = frozenset(),
     invalid_regions: frozenset[str] = DEVICE_REGIONS,
     capabilities: frozenset[str] = frozenset(),
-    runtime_oracle: str = RUNTIME_NOT_APPLICABLE,
 ) -> LanguageContractCase:
     return LanguageContractCase(
         contract_id,
@@ -118,7 +170,6 @@ def _invalid_source(
         invalid_regions,
         capabilities,
         diagnostic,
-        runtime_oracle,
     )
 
 
@@ -130,7 +181,6 @@ def _valid_source(
     *,
     valid_regions: frozenset[str],
     capabilities: frozenset[str],
-    runtime_oracle: str,
     expected: object | None = None,
 ) -> LanguageContractCase:
     return LanguageContractCase(
@@ -142,7 +192,6 @@ def _valid_source(
         DEVICE_REGIONS - valid_regions,
         capabilities,
         None,
-        runtime_oracle,
         expected,
     )
 
@@ -304,7 +353,6 @@ METADATA_VALID_CASES: Final = tuple(
         frozenset(),
         frozenset({"graphics"}),
         None,
-        RUNTIME_NOT_APPLICABLE,
         expected,
     )
     for name, source, expected in (
@@ -411,7 +459,6 @@ def main(value: Annotated[u32, builtin("mystery")]) -> Vector[f32, 4]:
         DEVICE_REGIONS,
         frozenset({"graphics"}),
         "unknown builtin 'mystery'",
-        RUNTIME_NOT_APPLICABLE,
     ),
     LanguageContractCase(
         "LANG-BUILTIN-VERTEX-INDEX",
@@ -427,7 +474,6 @@ def main(value: Annotated[u32, builtin("vertex_index")]) -> Vector[f32, 4]:
         frozenset({"compute", "fragment", "func"}),
         frozenset({"graphics"}),
         "requires a vertex input",
-        RUNTIME_NOT_APPLICABLE,
     ),
     LanguageContractCase(
         "LANG-BUILTIN-VERTEX-INDEX",
@@ -443,7 +489,6 @@ def main() -> Annotated[u32, builtin("vertex_index")]:
         frozenset({"compute", "fragment", "func"}),
         frozenset({"graphics"}),
         "requires a vertex input",
-        RUNTIME_NOT_APPLICABLE,
     ),
     LanguageContractCase(
         "LANG-BUILTIN-GLOBAL-ID",
@@ -459,7 +504,6 @@ def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
         frozenset({"vertex", "fragment", "func"}),
         frozenset({"compute"}),
         "requires type tensor<3xi32>",
-        RUNTIME_NOT_APPLICABLE,
     ),
     LanguageContractCase(
         "LANG-BUILTIN-POSITION",
@@ -475,7 +519,6 @@ def main() -> Vector[f32, 3]:
         frozenset({"compute", "fragment", "func"}),
         frozenset({"graphics"}),
         "builtin 'position' requires type tensor<4xf32>",
-        RUNTIME_NOT_APPLICABLE,
     ),
 )
 
@@ -616,7 +659,6 @@ def sample(
 """,
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="filtered_texel",
         expected=f'!vernon.texture<"{dimension}", f32, "unknown", "sampled">',
     )
     for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3))
@@ -638,7 +680,6 @@ def store(
 """,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_texture"}),
-        runtime_oracle="stored_texel",
         expected='!vernon.texture<"3d", f32, "rgba32_float", "write">',
     ),
     _valid_source(
@@ -655,7 +696,6 @@ def main(image: Texture["2d", f32], sampler: Sampler,
 """,
         valid_regions=frozenset({"vertex"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="selected_filtered_mip",
     ),
     _valid_source(
         "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
@@ -669,7 +709,6 @@ def main(image: Texture["2d", f32], sampler: Sampler) -> None:
 """,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "texture_sampler"}),
-        runtime_oracle="selected_filtered_mip",
     ),
     _valid_source(
         "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
@@ -684,7 +723,6 @@ def main(image: Texture["2d", f32], sampler: Sampler,
 """,
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="selected_filtered_mip",
     ),
 )
 
@@ -798,7 +836,6 @@ SYNCHRONIZATION_VALID_CASES: Final = (
         "    atomic_add(device, 0, 1.0)\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "workgroup_memory", "f32_atomic_add", "device_storage_atomics"}),
-        runtime_oracle="both_scopes_contended_sum",
         expected=(
             'atomic_kind = "add"',
             'scope = "workgroup"',
@@ -828,7 +865,6 @@ SYNCHRONIZATION_VALID_CASES: Final = (
         "    storage_barrier()\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "workgroup_memory"}),
-        runtime_oracle="legal_workgroup_atomic_serialization",
         expected=(
             'atomic_kind = "add"',
             'atomic_kind = "min"',
@@ -851,7 +887,6 @@ SYNCHRONIZATION_VALID_CASES: Final = (
         "    output[()] = value[()]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "workgroup_memory"}),
-        runtime_oracle="independent_workgroup_value",
     ),
     _valid_source(
         "LANG-ATOMIC-001",
@@ -871,7 +906,6 @@ SYNCHRONIZATION_VALID_CASES: Final = (
         "    unsigned_maximum = atomic_max(unsigned, 1, 3)\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "device_storage_atomics"}),
-        runtime_oracle="legal_atomic_serialization",
     ),
 )
 
@@ -891,7 +925,6 @@ TENSOR_VIEW_VALID_CASES: Final = (
         "    scalar[()] = scalar[()] + 1.0\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="bound_rank_shape_and_access",
     ),
     _valid_source(
         "LANG-VIEW-006",
@@ -903,7 +936,6 @@ TENSOR_VIEW_VALID_CASES: Final = (
         "    return value[0, 0]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="projected_load_value",
     ),
     _valid_source(
         "LANG-TENSOR-005",
@@ -920,7 +952,6 @@ TENSOR_VIEW_VALID_CASES: Final = (
         "    output[output.shape[0], tile.shape[1]] = f32(vec.shape[0]) + f32(mat.shape[1])\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="dynamic_and_static_extents",
     ),
     _valid_source(
         "LANG-VIEW-004",
@@ -932,7 +963,6 @@ TENSOR_VIEW_VALID_CASES: Final = (
         "    output[0] = value[1, 2]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="one_artifact_multiple_layouts",
     ),
 )
 
@@ -995,7 +1025,6 @@ DISPATCH_CONTRACT_CASES: Final = (
         "    output[0] = value\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute"}),
-        runtime_oracle="exact_publication_for_legal_grid",
         expected=(3, 2, 1),
     ),
     _invalid_source(
@@ -1010,7 +1039,6 @@ DISPATCH_CONTRACT_CASES: Final = (
         valid_regions=frozenset({"compute"}),
         invalid_regions=frozenset(),
         capabilities=frozenset({"compute"}),
-        runtime_oracle="pre_submission_dispatch_rejection",
     ),
 )
 
@@ -1053,7 +1081,6 @@ asset = vd.program_asset(id="module/copy", program=Copy())
 """,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute"}),
-        runtime_oracle="module_matches_direct_semantics",
     ),
     _valid_source(
         "LANG-AD-001",
@@ -1062,7 +1089,6 @@ asset = vd.program_asset(id="module/copy", program=Copy())
         _PROGRAM_VJP_ASSET_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "program_vjp"}),
-        runtime_oracle="primal_and_finite_difference_gradient",
     ),
     _invalid_source(
         "LANG-AD-004",
@@ -1474,7 +1500,6 @@ RAW_BUILTIN_VALID_CASES: Final = tuple(
         _RAW_BUILTIN_SOURCE,
         valid_regions=frozenset(stage for stage, _ in BUILTIN_CONTRACTS[builtin_name].uses),
         capabilities=frozenset({"compute", "graphics"}),
-        runtime_oracle="backend_interface_value",
         expected=f'vernon.builtin = "{builtin_name}"',
     )
     for contract_id, builtin_name in BUILTIN_NAMES_BY_CONTRACT
@@ -1503,7 +1528,6 @@ GENERATED_BUILTIN_VALID_CASES: Final = tuple(
         _GENERATED_BUILTIN_SOURCE,
         valid_regions=frozenset({GENERATED_INTERFACE_CONTRACTS[operation.removesuffix("()")].stage}),
         capabilities=frozenset({"graphics"}),
-        runtime_oracle="backend_interface_value",
         expected=expected,
     )
     for contract_id, operation, expected in (
@@ -1538,7 +1562,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = value[0]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="stored_value",
         expected='"vernon.store"',
     ),
     _valid_source(
@@ -1551,7 +1574,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return value\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="equal_indexing",
         expected="tensor<8x3xf32>",
     ),
     _valid_source(
@@ -1561,7 +1583,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "from vernon_dsl import *\n@struct\nclass Vertex:\n    position: Tensor[f32, (3,)]\n    weight: f64\n",
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset(),
-        runtime_oracle="portable_leaf_round_trip",
         expected='abi_leaf_dtypes = ["f32", "f64"]',
     ),
     _valid_source(
@@ -1576,7 +1597,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = local[0]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "workgroup_memory"}),
-        runtime_oracle="stored_value",
         expected='"workgroup"',
     ),
     _valid_source(
@@ -1594,7 +1614,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    values[0] = value\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="aggregate_round_trip",
         expected='!vernon.struct<"Vertex">',
     ),
     _valid_source(
@@ -1607,7 +1626,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = source[0]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="effect_order",
         expected="vernon.storage_effects",
     ),
     _valid_source(
@@ -1620,7 +1638,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    previous = atomic_add(values, 0, 1.0)\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "f32_atomic_add"}),
-        runtime_oracle="atomic_contention_sum",
         expected='atomic_kind = "add"',
     ),
     _valid_source(
@@ -1635,7 +1652,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "@fragment\ndef fragment_main(value: f32) -> f32:\n    return value\n",
         valid_regions=frozenset({"compute", "vertex", "fragment"}),
         capabilities=frozenset({"compute", "graphics"}),
-        runtime_oracle="entry_invocation",
         expected="vernon.entry",
     ),
     _valid_source(
@@ -1651,7 +1667,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = square(2.0)\n",
         valid_regions=frozenset({"host", "compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="host_device_equal",
         expected="vernon.shared",
     ),
     _valid_source(
@@ -1665,7 +1680,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return left if enabled else right\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="selected_value",
         expected="scf.if",
     ),
     _valid_source(
@@ -1681,7 +1695,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return result\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="python_range_equal",
         expected="cf.assert",
     ),
     _valid_source(
@@ -1701,7 +1714,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return result\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="structured_exit_result",
         expected="vernon.loop_control_index",
     ),
     _valid_source(
@@ -1714,7 +1726,6 @@ CORE_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return acos(clamp(x, -1.0, 1.0)) + atan2(y, x) + floor(y) + value.norm()\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics"}),
-        runtime_oracle="host_math_reference",
         expected="math.atan2",
     ),
 )
@@ -1738,7 +1749,6 @@ HOST_CONTRACT_CASES: Final = (
         "TensorStorage.view(shape=(4,), access=read_write)",
         valid_regions=frozenset({"host"}),
         capabilities=frozenset({"storage_buffers"}),
-        runtime_oracle="binding_validation",
         expected="strict_binding",
     ),
     _valid_source(
@@ -1748,7 +1758,6 @@ HOST_CONTRACT_CASES: Final = (
         "TensorStorage.view()[slice_a], TensorStorage.view()[slice_b]",
         valid_regions=frozenset({"host"}),
         capabilities=frozenset({"storage_buffers"}),
-        runtime_oracle="alias_and_lifetime_validation",
         expected="overlap",
     ),
 )
@@ -1833,7 +1842,6 @@ SPECIALIZED_FRONTEND_IR_CASES: Final = (
         "    return value\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics"}),
-        runtime_oracle="variant_identity",
         expected="vernon.features",
     ),
     _valid_source(
@@ -1843,7 +1851,6 @@ SPECIALIZED_FRONTEND_IR_CASES: Final = (
         _VJP_STORAGE_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="storage_gradient",
         expected="owned_gradient_storage",
     ),
     _valid_source(
@@ -1853,7 +1860,6 @@ SPECIALIZED_FRONTEND_IR_CASES: Final = (
         _VJP_CONTROL_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="control_flow_gradient",
         expected="replayed_control_flow",
     ),
     _valid_source(
@@ -1863,7 +1869,6 @@ SPECIALIZED_FRONTEND_IR_CASES: Final = (
         _PROGRAM_VJP_ASSET_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="supported_transform_boundary",
         expected="first_order_vjp",
     ),
 )
@@ -1882,7 +1887,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    return value\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="struct_boundary_preserved",
         expected=(
             '!vernon.tensor<!vernon.struct<"Box">, [2]>',
             'fields = ["value:tensor<3xf32>"]',
@@ -1902,7 +1906,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    values[0] = values[1]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="descriptor_layout_reuse",
         expected='!vernon.tensor_view<!vernon.struct<"Pair">, [-1], "read_write", "device">',
     ),
     _valid_source(
@@ -1918,7 +1921,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    copy(output, source)\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="propagated_entry_effects",
         expected=(
             "vernon.storage_effects",
             "func.call @copy",
@@ -1943,7 +1945,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    output[0] = values[1, 2].right\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "workgroup_memory"}),
-        runtime_oracle="barrier_publication",
         expected=MlirOracle(
             required=(
                 '!vernon.tensor_view<!vernon.struct<"Pair">, [2, 3], "read_write", "workgroup">',
@@ -1967,7 +1968,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    return texture_sample(image, sampler, uv, 0.0)\n",
         valid_regions=frozenset({"vertex", "fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="selected_filtered_texel",
         expected=MlirOracle(
             required=(
                 "!vernon.sampler",
@@ -1997,7 +1997,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    return result\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="aggregate_control_result",
         expected=(
             '!vernon.struct<"State">',
             "scf.for",
@@ -2019,7 +2018,6 @@ PAIRWISE_IR_SOURCE_CASES: Final = (
         "    values[0] = values[1]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="carrier_round_trip",
         expected='abi_leaf_dtypes = ["f32", "i32"]',
     ),
 )
@@ -2039,7 +2037,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         "    values[0] = values[1]\n",
         valid_regions=frozenset({"host", "compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="field_projection_alias_validation",
         expected='!vernon.struct<"Vertex">',
     ),
     _valid_source(
@@ -2059,7 +2056,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         "    return selected\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics"}),
-        runtime_oracle="specialization_identity",
         expected="func.func private @identity__",
     ),
     _valid_source(
@@ -2069,7 +2065,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         _VJP_CONTROL_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="control_flow_gradient",
         expected="replayed_control_flow",
     ),
     _valid_source(
@@ -2079,7 +2074,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         _VJP_STORAGE_SOURCE,
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="signed_stride_gradient",
         expected="runtime_layout_absent_from_vjp_ir",
     ),
     _valid_source(
@@ -2089,7 +2083,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         _MODULE_FAN_OUT_SOURCE,
         valid_regions=frozenset({"host", "compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "program_vjp"}),
-        runtime_oracle="fan_in_accumulation",
         expected="captured_fan_out_vjp",
     ),
     _valid_source(
@@ -2102,7 +2095,6 @@ PAIRWISE_SPECIALIZED_CASES: Final = (
         "    output[0, 0] = 1.0\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="injectivity_before_dispatch",
         expected=("vernon.storage_effects", "indices = array<i64: 0, 0>"),
     ),
 )
@@ -2115,7 +2107,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "from vernon_dsl import *\n@func\ndef main(value: f64, count: i32) -> f64:\n    return value + count + 0.5\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="host_numeric_reference",
         expected="arith.sitofp",
     ),
     _valid_source(
@@ -2131,7 +2122,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return value\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="host_numeric_reference",
         expected="arith.divf",
     ),
     _valid_source(
@@ -2147,7 +2137,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return tensor + matmul(matrix, vector)\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="constructor_values",
         expected='name = "construct"',
     ),
     _valid_source(
@@ -2162,7 +2151,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return first + f32(second) + pair[0]\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="tuple_values",
         expected='"vernon.tuple_create"',
     ),
     _valid_source(
@@ -2179,7 +2167,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return result\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="structured_control_result",
         expected="scf.for",
     ),
     _valid_source(
@@ -2192,7 +2179,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return matmul(matrix, vector)\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset(),
-        runtime_oracle="host_matmul_reference",
         expected='name = "matmul"',
     ),
     _valid_source(
@@ -2205,7 +2191,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return texture_sample(image, uv, 1.0)\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="selected_filtered_mip",
         expected='name = "texture_sample"',
     ),
     _valid_source(
@@ -2220,7 +2205,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return base + mip\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="mip_extent",
         expected='name = "texture_size"',
     ),
     _valid_source(
@@ -2234,7 +2218,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = Vector([local[0]])[0]\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers", "workgroup_memory"}),
-        runtime_oracle="canonical_replacement_behavior",
         expected='"vernon.workgroup_alloc"',
     ),
     _valid_source(
@@ -2244,7 +2227,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "from vernon_dsl import *\n@kernel\ndef main() -> None:\n    workgroup_barrier()\n    storage_barrier()\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "workgroup_memory"}),
-        runtime_oracle="barrier_publication",
         expected='"vernon.barrier"',
     ),
     _valid_source(
@@ -2257,7 +2239,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    output[0] = value\n",
         valid_regions=frozenset({"compute"}),
         capabilities=frozenset({"compute", "storage_buffers"}),
-        runtime_oracle="entry_abi_binding",
         expected="func.func @main",
     ),
     _valid_source(
@@ -2273,7 +2254,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return identity(value)\n",
         valid_regions=frozenset({"func", "fragment"}),
         capabilities=frozenset({"graphics"}),
-        runtime_oracle="specialized_result",
         expected="func.func private @identity__",
     ),
     _valid_source(
@@ -2286,7 +2266,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return texture_sample(image, uv)\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="filtered_texel",
         expected='name = "texture_sample"',
     ),
     _valid_source(
@@ -2299,7 +2278,6 @@ ADDITIONAL_FRONTEND_IR_SOURCE_CASES: Final = (
         "    return texture_sample(image, sampler, uv)\n",
         valid_regions=frozenset({"fragment"}),
         capabilities=frozenset({"graphics", "texture_sampler"}),
-        runtime_oracle="filtered_texel",
         expected='name = "texture_sample"',
     ),
 )
@@ -2312,7 +2290,6 @@ HOST_API_CONTRACT_CASES: Final = (
         "import vernon_dsl as vd\nvalue = vd.TensorStorage.zeros(dtype=vd.f32, shape=(2,))\n",
         valid_regions=frozenset({"host"}),
         capabilities=frozenset({"storage_buffers"}),
-        runtime_oracle="owner_round_trip",
         expected="TensorStorage",
     ),
     _valid_source(
@@ -2334,7 +2311,6 @@ HOST_API_CONTRACT_CASES: Final = (
         ")\n",
         valid_regions=frozenset({"host"}),
         capabilities=frozenset({"storage_buffers"}),
-        runtime_oracle="typed_view_round_trip",
         expected="RawBuffer",
     ),
 )
@@ -2428,7 +2404,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_VALUE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers"}),
-        runtime_oracle="canonical_scalar_ir",
         expected="f32",
     ),
     _valid_source(
@@ -2438,7 +2413,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_VALUE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers"}),
-        runtime_oracle="canonical_tensor_ir",
         expected="tensor<2xf32>",
     ),
     _valid_source(
@@ -2448,7 +2422,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_VALUE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers"}),
-        runtime_oracle="canonical_alias_ir",
         expected=("tensor<4xf32>", "tensor<2x2xf32>"),
     ),
     _valid_source(
@@ -2458,7 +2431,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_VALUE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers"}),
-        runtime_oracle="canonical_struct_ir",
         expected='!vernon.struct<"Payload">',
     ),
     _valid_source(
@@ -2468,7 +2440,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_RESOURCE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers", "texture_sampler"}),
-        runtime_oracle="canonical_resource_ir",
         expected=("!vernon.texture", "!vernon.sampler"),
     ),
     _valid_source(
@@ -2478,7 +2449,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_RESOURCE_SOURCE,
         valid_regions=DEVICE_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers", "texture_sampler"}),
-        runtime_oracle="canonical_texture_ir",
         expected='!vernon.texture<"2d", f32, "unknown", "sampled">',
     ),
     _valid_source(
@@ -2488,7 +2458,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         _CROSS_REGION_INTERFACE_SOURCE,
         valid_regions=ENTRY_REGIONS,
         capabilities=frozenset({"compute", "graphics", "storage_buffers"}),
-        runtime_oracle="canonical_interface_ir",
         expected=("vernon.builtin", "vernon.interface"),
     ),
     _valid_source(
@@ -2501,7 +2470,6 @@ CROSS_REGION_FRONTEND_IR_CASES: Final = (
         "    return values[0]\n",
         valid_regions=frozenset({"func"}),
         capabilities=frozenset({"storage_buffers"}),
-        runtime_oracle="canonical_view_ir",
         expected='!vernon.tensor_view<f32, [-1], "read", "device">',
     ),
 )
@@ -2510,7 +2478,298 @@ FRONTEND_IR_SOURCE_CASES: Final = (
     CORE_FRONTEND_IR_SOURCE_CASES + ADDITIONAL_FRONTEND_IR_SOURCE_CASES + CROSS_REGION_FRONTEND_IR_CASES
 )
 
-LANGUAGE_CONTRACT_CASES: Final = (
+LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
+    LanguageContractAcceptance(
+        id="language_contract_compute",
+        contract_ids=frozenset(
+            {
+                "LANG-SCALAR-001",
+                "LANG-SCALAR-002",
+                "LANG-SCALAR-003",
+                "LANG-TENSOR-001",
+                "LANG-TENSOR-002",
+                "LANG-TENSOR-003",
+                "LANG-TUPLE-001",
+                "LANG-STRUCT-001",
+                "LANG-ABI-001",
+                "LANG-VIEW-001",
+                "LANG-VIEW-002",
+                "LANG-ENTRY-001",
+                "LANG-HELPER-001",
+                "LANG-CONTROL-001",
+                "LANG-CONTROL-002",
+                "LANG-CONTROL-003",
+                "LANG-CONTROL-004",
+                "LANG-MATH-001",
+                "LANG-MATMUL-001",
+                "LANG-BUILTIN-GLOBAL-ID",
+                "LANG-PAIR-001",
+                "LANG-PAIR-009",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_compute_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(
+            RuntimeOracleKind.FLOAT_BUFFER,
+            (3.0, 3.0, 5.0, 11.0, 2.0, 4.0, 2.0, 3.0, 4.0, 11.0, 6.0, 5.0, 3.0, 0.0, 6.0, 3.0, 4.0, 6.0),
+        ),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_graphics_raw",
+        contract_ids=frozenset(
+            {
+                "LANG-ENTRY-001",
+                "LANG-INTERFACE-001",
+                "LANG-BUILTIN-POSITION",
+                "LANG-BUILTIN-VERTEX-INDEX",
+                "LANG-BUILTIN-INSTANCE-INDEX",
+                "LANG-BUILTIN-FRAG-COORD",
+                "LANG-BUILTIN-FRONT-FACING",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:raw_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.GRAPHICS_TRIANGLE, (255, 64, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_graphics_generated",
+        contract_ids=frozenset(
+            {
+                "LANG-GENERATED-RESOLUTION",
+                "LANG-GENERATED-FRAGMENT-COORD",
+                "LANG-GENERATED-FRONT-FACING",
+                "LANG-GENERATED-VERTEX-ID",
+                "LANG-GENERATED-INSTANCE-ID",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:generated_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.GRAPHICS_TRIANGLE, (255, 64, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="sampled_texture",
+        contract_ids=frozenset(
+            {
+                "LANG-RESOURCE-001",
+                "LANG-RESOURCE-002",
+                "LANG-INTERFACE-001",
+                "LANG-TEXTURE-SAMPLE-EXPLICIT",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:explicit_asset",
+        requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SAMPLED_PIXEL, (255, 0, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_texture_pair",
+        contract_ids=frozenset(
+            {
+                "LANG-RESOURCE-001",
+                "LANG-RESOURCE-002",
+                "LANG-TEXTURE-SAMPLE-LOD",
+                "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
+                "LANG-TEXTURE-SIZE",
+                "LANG-PAIR-008",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:pair_asset",
+        requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SAMPLED_PIXEL, (255, 0, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_texture_implicit",
+        contract_ids=frozenset(
+            {
+                "LANG-RESOURCE-002",
+                "LANG-TEXTURE-SAMPLE-IMPLICIT",
+                "LANG-TEXTURE-SAMPLE-EXPLICIT-LOD",
+                "LANG-PAIR-008",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:implicit_asset",
+        requirements=AcceptanceRequirements(graphics=True, texture_sampler_operations=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SAMPLED_PIXEL, (255, 0, 0, 255)),
+    ),
+    LanguageContractAcceptance(
+        id="language_contract_specialization",
+        contract_ids=frozenset({"LANG-SPECIALIZE-001", "LANG-PAIR-004"}),
+        asset_reference="source/tests/fixtures/language_contract_graphics_asset.py:specialization_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SPECIALIZATION_PIXELS, (64, 128)),
+    ),
+    LanguageContractAcceptance(
+        id="storage_texture",
+        contract_ids=frozenset({"LANG-RESOURCE-002", "LANG-TEXTURE-STORAGE"}),
+        asset_reference="source/tests/fixtures/language_contract_texture_asset.py:storage_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_texture=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.STORAGE_TEXEL, (1.0, 1.0, 1.0, 1.0)),
+    ),
+    LanguageContractAcceptance(
+        id="synchronization",
+        contract_ids=frozenset(
+            {
+                "LANG-WORKGROUP-001",
+                "LANG-ATOMIC-001",
+                "LANG-BARRIER-001",
+                "LANG-BUILTIN-LOCAL-ID",
+                "LANG-BUILTIN-WORKGROUP-ID",
+            }
+        ),
+        asset_reference="source/tests/fixtures/synchronization_program_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(
+            RuntimeOracleKind.SYNCHRONIZATION,
+            (0, 1, 2, 3, 100, 101, 102, 103, 4, 104),
+        ),
+        suite=AcceptanceSuite.SYNCHRONIZATION,
+    ),
+    LanguageContractAcceptance(
+        id="aggregate_publication",
+        contract_ids=frozenset(
+            {
+                "LANG-WORKGROUP-001",
+                "LANG-ATOMIC-001",
+                "LANG-BARRIER-001",
+                "LANG-VIEW-007",
+                "LANG-PAIR-006",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_synchronization_asset.py:aggregate_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, f32_atomic_add=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.FLOAT_BUFFER, (2.5,)),
+    ),
+    LanguageContractAcceptance(
+        id="floating_contention",
+        contract_ids=frozenset(
+            {
+                "LANG-WORKGROUP-001",
+                "LANG-ATOMIC-001",
+                "LANG-ATOMIC-002",
+                "LANG-BARRIER-001",
+                "LANG-PAIR-007",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_synchronization_asset.py:floating_asset",
+        requirements=AcceptanceRequirements(
+            compute=True,
+            storage_buffers=True,
+            device_atomics=True,
+            f32_atomic_add=True,
+        ),
+        oracle=RuntimeOracle(RuntimeOracleKind.FLOAT_BUFFER, (16.0, 16.0), parameter="device", grid=(4, 1, 1)),
+    ),
+    LanguageContractAcceptance(
+        id="structured_view",
+        contract_ids=frozenset(
+            {
+                "LANG-ABI-001",
+                "LANG-VIEW-006",
+                "LANG-VIEW-007",
+                "LANG-INTEROP-001",
+                "LANG-PAIR-002",
+                "LANG-PAIR-003",
+                "LANG-PAIR-005",
+                "LANG-PAIR-013",
+                "LANG-VIEW-003",
+                "LANG-VIEW-005",
+            }
+        ),
+        asset_reference="source/tests/fixtures/language_contract_view_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.STRUCTURED_VIEW, (3.0, 5.0, 7.0, 10.0)),
+    ),
+    LanguageContractAcceptance(
+        id="module_program",
+        contract_ids=frozenset(
+            {
+                "LANG-SCALAR-001",
+                "LANG-TENSOR-001",
+                "LANG-STORAGE-001",
+                "LANG-VIEW-001",
+                "LANG-PROGRAM-001",
+                "LANG-AD-001",
+                "LANG-AD-002",
+                "LANG-AD-004",
+            }
+        ),
+        asset_reference="source/tests/fixtures/module_program_cooked_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.MODULE_VJP, (9.0, 6.0, 12.0)),
+        suite=AcceptanceSuite.MODULE_PROGRAM,
+    ),
+    LanguageContractAcceptance(
+        id="gpu_autodiff_dynamic",
+        contract_ids=frozenset({"LANG-AD-003", "LANG-CONTROL-004", "LANG-PAIR-010"}),
+        asset_reference="source/tests/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.DYNAMIC_VJP, (11.0, 104.0)),
+        suite=AcceptanceSuite.GPU_AUTODIFF,
+    ),
+    LanguageContractAcceptance(
+        id="signed_stride_vjp",
+        contract_ids=frozenset({"LANG-AD-002", "LANG-VIEW-004", "LANG-PAIR-011"}),
+        asset_reference="source/tests/fixtures/language_contract_vjp_asset.py:signed_stride_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.SIGNED_STRIDE_VJP, (13.0, 0.0, 4.0, 0.0, 6.0)),
+    ),
+    LanguageContractAcceptance(
+        id="fan_out_vjp",
+        contract_ids=frozenset({"LANG-PROGRAM-001", "LANG-AD-001", "LANG-PAIR-012"}),
+        asset_reference="source/tests/fixtures/language_contract_vjp_asset.py:fan_out_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.FAN_OUT_VJP, (4.0, 8.0, 28.0)),
+    ),
+    LanguageContractAcceptance(
+        id="reused_stage",
+        contract_ids=frozenset({"LANG-PROGRAM-001"}),
+        asset_reference="source/tests/fixtures/module_architecture_program_asset.py:reused_stage_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.REUSED_STAGE, (3.0, 4.0, 5.0, 6.0)),
+        suite=AcceptanceSuite.MODULE_PROGRAM,
+    ),
+    LanguageContractAcceptance(
+        id="tensor_view_chain",
+        contract_ids=frozenset({"LANG-VIEW-001", "LANG-VIEW-002", "LANG-PROGRAM-001"}),
+        asset_reference="source/tests/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.TENSOR_VIEW_CHAIN, (8.0,)),
+        suite=AcceptanceSuite.MODULE_PROGRAM,
+    ),
+    LanguageContractAcceptance(
+        id="dynamic_shape_grid",
+        contract_ids=frozenset(
+            {
+                "LANG-TENSOR-005",
+                "LANG-VIEW-004",
+                "LANG-DISPATCH-001",
+                "LANG-BUILTIN-GLOBAL-ID",
+                "LANG-PAIR-014",
+            }
+        ),
+        asset_reference="source/tests/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.DYNAMIC_SHAPE_GRID, (2.0, 6.0)),
+        suite=AcceptanceSuite.MODULE_PROGRAM,
+    ),
+    LanguageContractAcceptance(
+        id="module_graphics",
+        contract_ids=frozenset({"LANG-ENTRY-001", "LANG-INTERFACE-001", "LANG-BUILTIN-POSITION"}),
+        asset_reference="source/tests/fixtures/module_graphics_program_asset.py:graphics_asset",
+        requirements=AcceptanceRequirements(graphics=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.GRAPHICS_TRIANGLE, (255, 64, 0, 255)),
+        suite=AcceptanceSuite.MODULE_GRAPHICS,
+    ),
+    LanguageContractAcceptance(
+        id="module_mixed",
+        contract_ids=frozenset({"LANG-ENTRY-001", "LANG-BUILTIN-GLOBAL-ID"}),
+        asset_reference="source/tests/fixtures/module_graphics_program_asset.py:mixed_asset",
+        requirements=AcceptanceRequirements(compute=True, graphics=True, storage_buffers=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.MIXED_COMPUTE_GRAPHICS, (255, 64, 0, 255)),
+        suite=AcceptanceSuite.MODULE_GRAPHICS,
+    ),
+)
+
+_LANGUAGE_CONTRACT_CASES: Final = (
     TYPE_PARSER_VALID_CASES
     + TYPE_PARSER_INVALID_CASES
     + METADATA_VALID_CASES
@@ -2545,6 +2804,18 @@ LANGUAGE_CONTRACT_CASES: Final = (
     + HOST_API_CONTRACT_CASES
 )
 
+
+@dataclass(frozen=True)
+class LanguageContractRegistry:
+    cases: tuple[LanguageContractCase, ...]
+    acceptances: tuple[LanguageContractAcceptance, ...]
+
+
+LANGUAGE_CONTRACT_REGISTRY: Final = LanguageContractRegistry(
+    cases=_LANGUAGE_CONTRACT_CASES,
+    acceptances=LANGUAGE_CONTRACT_ACCEPTANCES,
+)
+
 CONTRACT_CASE_GROUPS: Final = {
     "TYPE_PARSER_VALID_CASES": TYPE_PARSER_VALID_CASES,
     "TYPE_PARSER_INVALID_CASES": TYPE_PARSER_INVALID_CASES,
@@ -2570,18 +2841,18 @@ CONTRACT_CASE_GROUPS: Final = {
 
 
 def cases_for_contract(contract_id: str) -> tuple[LanguageContractCase, ...]:
-    return tuple(case for case in LANGUAGE_CONTRACT_CASES if case.contract_id == contract_id)
+    return tuple(case for case in LANGUAGE_CONTRACT_REGISTRY.cases if case.contract_id == contract_id)
 
 
 def case_by_id(case_id: str) -> LanguageContractCase:
-    matches = tuple(case for case in LANGUAGE_CONTRACT_CASES if case.id == case_id)
+    matches = tuple(case for case in LANGUAGE_CONTRACT_REGISTRY.cases if case.id == case_id)
     if len(matches) != 1:
         raise KeyError(case_id)
     return matches[0]
 
 
 def audit_case_registry(inventory_contract_ids: frozenset[str] | None = None) -> None:
-    ids = [case.id for case in LANGUAGE_CONTRACT_CASES]
+    ids = [case.id for case in LANGUAGE_CONTRACT_REGISTRY.cases]
     duplicates = sorted(case_id for case_id in set(ids) if ids.count(case_id) > 1)
     if duplicates:
         raise AssertionError(f"duplicate language contract case IDs: {duplicates}")
@@ -2589,10 +2860,10 @@ def audit_case_registry(inventory_contract_ids: frozenset[str] | None = None) ->
     if builtin_names != BUILTIN_CONTRACTS.keys():
         raise AssertionError("language builtin cases do not match the canonical shader builtin registry")
     if inventory_contract_ids is not None:
-        unknown_contract_ids = {case.contract_id for case in LANGUAGE_CONTRACT_CASES} - inventory_contract_ids
+        unknown_contract_ids = {case.contract_id for case in LANGUAGE_CONTRACT_REGISTRY.cases} - inventory_contract_ids
         if unknown_contract_ids:
             raise AssertionError(f"cases reference unknown contract IDs: {sorted(unknown_contract_ids)}")
-    for case in LANGUAGE_CONTRACT_CASES:
+    for case in LANGUAGE_CONTRACT_REGISTRY.cases:
         if not case.source_construct:
             raise AssertionError(f"{case.id} has no source construct")
         if not case.valid_regions and not case.invalid_regions:
@@ -2607,5 +2878,3 @@ def audit_case_registry(inventory_contract_ids: frozenset[str] | None = None) ->
             raise AssertionError(f"{case.id} has no expected diagnostic")
         if case.expected_diagnostic is not None:
             re.compile(case.expected_diagnostic)
-        if not case.runtime_oracle:
-            raise AssertionError(f"{case.id} has no runtime oracle disposition")

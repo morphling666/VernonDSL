@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
+from unittest import SkipTest
 
 import vernon_dsl as vd
 import vernon_dsl._runtime.session as runtime_session
@@ -40,10 +41,12 @@ class BackendRequirements:
     compute: bool = False
     graphics: bool = False
     storage_buffers: bool = False
+    storage_texture: bool = False
     device_atomics: bool = False
     f32_atomic_add: bool = False
     f64_atomic_add: bool = False
     texture_sampler_operations: bool = False
+    program_vjp: bool = False
     minimum_api_version: tuple[int, int] | None = None
     native_interop_backend: str | None = None
 
@@ -64,6 +67,26 @@ class ProbeResult:
     @property
     def available(self) -> bool:
         return self.kind is ProbeKind.AVAILABLE
+
+
+class CapabilityUnavailable(SkipTest):
+    def __init__(self, result: ProbeResult) -> None:
+        if result.kind not in {
+            ProbeKind.PLATFORM_NOT_BUILT,
+            ProbeKind.DEVICE_OR_CONTEXT_UNAVAILABLE,
+            ProbeKind.CAPABILITY_UNSUPPORTED,
+        }:
+            raise ValueError(f"{result.kind.value} is not a skippable capability result")
+        super().__init__(f"{result.kind.value}: {result.reason}")
+        self.result = result
+
+
+def require_available(result: ProbeResult) -> None:
+    if result.available:
+        return
+    if result.kind is ProbeKind.PROBE_FAILURE:
+        raise RuntimeError(result.reason)
+    raise CapabilityUnavailable(result)
 
 
 @dataclass(frozen=True)
@@ -109,6 +132,12 @@ def probe_compiler(row: BackendRow, requirements: BackendRequirements) -> ProbeR
         program_capability = dict(_native._program_capability(capability))
         if not program_capability["supported"]:
             return _unsupported(row, capability)
+    for required, capability in (
+        (requirements.storage_texture, "compute_texture_binding"),
+        (requirements.program_vjp, "compute_vjp"),
+    ):
+        if required and not dict(_native._program_capability(capability))["supported"]:
+            return _unsupported(row, capability)
     if requirements.native_interop_backend is not None and requirements.native_interop_backend != row.name:
         return _unsupported(row, f"{requirements.native_interop_backend}_native_interop")
     return ProbeResult(ProbeKind.AVAILABLE)
@@ -153,11 +182,8 @@ def probe_runtime(row: BackendRow, requirements: BackendRequirements) -> ProbeRe
     ):
         if required and not capabilities[key]:
             return _unsupported(row, key)
-    if (
-        requirements.minimum_api_version is not None
-        and tuple(capabilities["api_version"]) < requirements.minimum_api_version
-    ):
-        return _unsupported(row, f"api_version>={requirements.minimum_api_version}")
+    if api_version is not None and tuple(capabilities["api_version"]) < api_version:
+        return _unsupported(row, f"api_version>={api_version}")
     return ProbeResult(ProbeKind.AVAILABLE)
 
 

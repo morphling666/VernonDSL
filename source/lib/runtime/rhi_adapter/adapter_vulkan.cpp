@@ -119,9 +119,11 @@ struct PreparedLayout {
     std::vector<Entry> entries;
     std::vector<VernonRuntimeProviderVertexAttribute> vertexAttributes;
     std::vector<PushRange> pushRanges;
-    VkDescriptorSetLayout descriptorSetLayout{};
+    std::vector<VkDescriptorSetLayout> descriptorSetLayouts;
+    std::vector<uint8_t> descriptorSetsUsed;
     uint32_t pushConstantSize{};
-    bool hasDescriptors{};
+
+    ~PreparedLayout();
 };
 struct PreparedPipeline {
     struct RenderingCacheEntry {
@@ -173,7 +175,7 @@ struct PreparedBindingSet {
     struct Snapshot {
         SnapshotKey key;
         rhi::vulkan::DeviceState *device{};
-        VkDescriptorSet descriptorSet{};
+        std::vector<VkDescriptorSet> descriptorSets;
         std::vector<Slot> slots;
         rhi::vulkan::Buffer inlineBuffer;
         std::vector<VkDeviceSize> inlineOffsets;
@@ -185,7 +187,7 @@ struct PreparedBindingSet {
     PreparedLayout *layout{};
     std::vector<Slot> slots;
     std::unordered_map<uint32_t, size_t> slotIndices;
-    std::unordered_map<uint32_t, size_t> samplerByBinding;
+    std::unordered_map<uint64_t, size_t> samplerByBinding;
     std::vector<size_t> valueIndices;
     std::vector<uint8_t> seenSlots;
     std::vector<uint8_t> pushConstantStorage;
@@ -195,6 +197,8 @@ struct PreparedBindingSet {
 
     ~PreparedBindingSet();
 };
+
+uint64_t descriptorBindingKey(uint32_t set, uint32_t binding) { return (static_cast<uint64_t>(set) << 32) | binding; }
 
 void releaseCommandBindings(void *context, uint64_t);
 void releaseCommandBindingSnapshot(void *context, uint64_t object);
@@ -380,7 +384,7 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
     if (!layout)
         return fail(adapter, "Vulkan layout preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
     layout->device = &vulkanDevice(adapter);
-    std::vector<VkDescriptorSetLayoutBinding> nativeBindings;
+    std::vector<std::vector<VkDescriptorSetLayoutBinding>> nativeBindings;
     try {
         layout->entries.reserve(descriptor->binding_count);
         for (size_t index = 0; index < descriptor->binding_count; ++index) {
@@ -397,15 +401,25 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
             PreparedLayout::Entry entry;
             entry.layout = source;
             if (source.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE) {
-                if (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE)
-                    nativeBindings.push_back(
+                if (source.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
+                    if (source.set == UINT32_MAX)
+                        return fail(adapter, "Vulkan descriptor set index is invalid");
+                    if (nativeBindings.size() <= source.set)
+                        nativeBindings.resize(static_cast<size_t>(source.set) + 1);
+                    nativeBindings[source.set].push_back(
                         {source.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+                }
             } else if (source.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
-                const auto existing =
-                    std::find_if(nativeBindings.begin(), nativeBindings.end(),
-                                 [&](const auto &binding) { return binding.binding == source.binding; });
-                if (existing == nativeBindings.end())
-                    nativeBindings.push_back(
+                if (source.set == UINT32_MAX)
+                    return fail(adapter, "Vulkan descriptor set index is invalid");
+                if (nativeBindings.size() <= source.set)
+                    nativeBindings.resize(static_cast<size_t>(source.set) + 1);
+                auto &setBindings = nativeBindings[source.set];
+                const auto existing = std::find_if(setBindings.begin(), setBindings.end(), [&](const auto &binding) {
+                    return binding.binding == source.binding;
+                });
+                if (existing == setBindings.end())
+                    setBindings.push_back(
                         {source.binding, descriptorType(source.kind), 1, stages(source.stage_mask), nullptr});
                 else if ((existing->descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
                           source.kind == VERNON_RUNTIME_PROVIDER_SAMPLER) ||
@@ -475,14 +489,19 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
     }
     if (layout->pushConstantSize > layout->device->maxPushConstantsSize)
         return fail(adapter, "Vulkan push constants exceed the device limit", VERNON_STATUS_UNSUPPORTED_TARGET);
-    const VkDescriptorSetLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr, 0,
-                                                     static_cast<uint32_t>(nativeBindings.size()),
-                                                     nativeBindings.data()};
-    layout->hasDescriptors = !nativeBindings.empty();
-    const VkResult result = rhi::vulkan::driver().createDescriptorSetLayout(layout->device->device, &createInfo,
-                                                                            nullptr, &layout->descriptorSetLayout);
-    if (result != VK_SUCCESS)
-        return failure(adapter, result, "vkCreateDescriptorSetLayout");
+    layout->descriptorSetLayouts.resize(nativeBindings.size());
+    layout->descriptorSetsUsed.resize(nativeBindings.size());
+    for (size_t set = 0; set < nativeBindings.size(); ++set) {
+        const auto &setBindings = nativeBindings[set];
+        const VkDescriptorSetLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, nullptr,
+                                                         0, static_cast<uint32_t>(setBindings.size()),
+                                                         setBindings.data()};
+        const VkResult result = rhi::vulkan::driver().createDescriptorSetLayout(
+            layout->device->device, &createInfo, nullptr, &layout->descriptorSetLayouts[set]);
+        if (result != VK_SUCCESS)
+            return failure(adapter, result, "vkCreateDescriptorSetLayout");
+        layout->descriptorSetsUsed[set] = !setBindings.empty();
+    }
     *output = toHandle(layout.release());
     adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
     return VERNON_STATUS_OK;
@@ -493,8 +512,8 @@ VernonStatus createPipelineLayout(VernonRuntimeRhiAdapter &adapter, PreparedPipe
     const VkPipelineLayoutCreateInfo createInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
                                                 nullptr,
                                                 0,
-                                                1,
-                                                &pipeline.layout->descriptorSetLayout,
+                                                static_cast<uint32_t>(pipeline.layout->descriptorSetLayouts.size()),
+                                                pipeline.layout->descriptorSetLayouts.data(),
                                                 pipeline.layout->pushConstantSize ? 1u : 0u,
                                                 pipeline.layout->pushConstantSize ? &range : nullptr};
     return failure(adapter,
@@ -952,7 +971,9 @@ PreparedBindingSet::Snapshot::~Snapshot() {
         return;
     if (inlineBuffer.buffer)
         device->destroyBuffer(inlineBuffer);
-    if (descriptorSet) {
+    for (VkDescriptorSet descriptorSet : descriptorSets) {
+        if (!descriptorSet)
+            continue;
         std::string ignored;
         (void)device->freeDescriptorSet(descriptorSet, ignored);
     }
@@ -1045,10 +1066,12 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
                             snapshot->slots[index].inlineStorage.data(), snapshot->slots[index].inlineStorage.size());
         rhi::vulkan::driver().unmapMemory(bindings.device->device, snapshot->inlineBuffer.memory);
     }
-    if (bindings.layout->hasDescriptors &&
-        !bindings.device->allocateDescriptorSet(bindings.layout->descriptorSetLayout, snapshot->descriptorSet,
-                                                adapter.error))
-        return nullptr;
+    snapshot->descriptorSets.resize(bindings.layout->descriptorSetLayouts.size());
+    for (size_t set = 0; set < bindings.layout->descriptorSetLayouts.size(); ++set)
+        if (bindings.layout->descriptorSetsUsed[set] &&
+            !bindings.device->allocateDescriptorSet(bindings.layout->descriptorSetLayouts[set],
+                                                    snapshot->descriptorSets[set], adapter.error))
+            return nullptr;
 
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> buffers;
@@ -1063,7 +1086,7 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
             slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER)
             continue;
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = snapshot->descriptorSet;
+        write.dstSet = snapshot->descriptorSets[slot.entry.layout.set];
         write.dstBinding = slot.entry.layout.binding;
         write.descriptorCount = 1;
         write.descriptorType = descriptorType(slot.entry.layout.kind);
@@ -1095,7 +1118,8 @@ PreparedBindingSet::Snapshot *snapshotBindings(VernonRuntimeRhiAdapter &adapter,
             info.imageLayout = slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
                                    ? VK_IMAGE_LAYOUT_GENERAL
                                    : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            const auto samplerIndex = bindings.samplerByBinding.find(slot.entry.layout.binding);
+            const auto samplerIndex =
+                bindings.samplerByBinding.find(descriptorBindingKey(slot.entry.layout.set, slot.entry.layout.binding));
             if (samplerIndex != bindings.samplerByBinding.end()) {
                 const auto &sampler = snapshot->slots[samplerIndex->second];
                 write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1170,7 +1194,8 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
         if (!bindings->slotIndices.emplace(entry.layout.slot, index).second)
             return fail(adapter, "Vulkan binding layout contains duplicate slots");
         if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
-            !bindings->samplerByBinding.emplace(entry.layout.binding, index).second)
+            !bindings->samplerByBinding.emplace(descriptorBindingKey(entry.layout.set, entry.layout.binding), index)
+                 .second)
             return fail(adapter, "Vulkan binding layout contains duplicate sampler bindings");
         if (packedUniformBytes(entry.layout.kind, entry.layout.interface_kind))
             slot.inlineStorage.resize(entry.layout.element_size);
@@ -1226,13 +1251,14 @@ bool transitionImage(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObje
     return true;
 }
 
-void bindDescriptorSet(VkCommandBuffer command, PreparedPipeline &pipeline,
-                       const PreparedBindingSet::Snapshot *snapshot, VkPipelineBindPoint bindPoint) {
+void bindDescriptorSets(VkCommandBuffer command, PreparedPipeline &pipeline,
+                        const PreparedBindingSet::Snapshot *snapshot, VkPipelineBindPoint bindPoint) {
     if (!snapshot)
         return;
-    if (snapshot->descriptorSet)
-        rhi::vulkan::driver().cmdBindDescriptorSets(command, bindPoint, pipeline.pipelineLayout, 0, 1,
-                                                    &snapshot->descriptorSet, 0, nullptr);
+    for (uint32_t set = 0; set < snapshot->descriptorSets.size(); ++set)
+        if (snapshot->descriptorSets[set])
+            rhi::vulkan::driver().cmdBindDescriptorSets(command, bindPoint, pipeline.pipelineLayout, set, 1,
+                                                        &snapshot->descriptorSets[set], 0, nullptr);
 }
 
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncoder,
@@ -1266,7 +1292,7 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
                     VERNON_STATUS_INTERNAL_ERROR);
     auto &driver = rhi::vulkan::driver();
     driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
-    bindDescriptorSet(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_COMPUTE);
+    bindDescriptorSets(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_COMPUTE);
     driver.cmdDispatch(command, descriptor->group_count[0], descriptor->group_count[1], descriptor->group_count[2]);
     if (!recordProviderCommand(adapter, commandEncoder, false))
         return fail(adapter, "Vulkan dispatch command encoder state changed");
@@ -1593,7 +1619,7 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         driver.cmdBeginRenderPass(command, &begin, VK_SUBPASS_CONTENTS_INLINE);
     }
     driver.cmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
-    bindDescriptorSet(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_GRAPHICS);
+    bindDescriptorSets(command, *pipeline, bindingSnapshot, VK_PIPELINE_BIND_POINT_GRAPHICS);
     if (bindingSnapshot)
         for (const auto &slot : bindingSnapshot->slots) {
             if (slot.entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE) {
@@ -1652,8 +1678,14 @@ void destroyLayout(void *, VernonRuntimeProviderObject handle) {
     auto *layout = fromHandle<PreparedLayout>(handle);
     if (!layout)
         return;
-    rhi::vulkan::driver().destroyDescriptorSetLayout(layout->device->device, layout->descriptorSetLayout, nullptr);
     delete layout;
+}
+PreparedLayout::~PreparedLayout() {
+    if (!device)
+        return;
+    for (VkDescriptorSetLayout descriptorSetLayout : descriptorSetLayouts)
+        if (descriptorSetLayout)
+            rhi::vulkan::driver().destroyDescriptorSetLayout(device->device, descriptorSetLayout, nullptr);
 }
 PreparedPipeline::~PreparedPipeline() {
     if (adapter)

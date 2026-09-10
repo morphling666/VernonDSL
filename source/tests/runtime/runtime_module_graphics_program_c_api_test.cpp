@@ -433,10 +433,15 @@ const std::vector<vernon::tests::ProgramFixtureManifest> &moduleGraphicsBackendC
     return cases;
 }
 
+const std::vector<vernon::tests::ProgramFixtureManifest> &moduleMixedBackendCases() {
+    static const auto cases = vernon::tests::programFixtureCases("module_mixed");
+    return cases;
+}
+
 class RuntimeModuleGraphicsProgramMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
-        return vernon::tests::computeFixtureRequirements(GetParam().runtime, true);
+        return vernon::tests::graphicsImageCopyFixtureRequirements(GetParam().runtime);
     }
 };
 
@@ -448,16 +453,28 @@ TEST_P(RuntimeModuleGraphicsProgramMatrix, ExternalVerticesGraphicsModuleRenders
     invokeAndExpectTriangle(runtime(), GetParam().manifestPath, true);
 }
 
-TEST_P(RuntimeModuleGraphicsProgramMatrix, ComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(runtime(), fixture("module_mixed").manifestPath, false);
-}
-
 TEST_P(RuntimeModuleGraphicsProgramMatrix, ProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
     expectProgramGraphFusion(runtime(), GetParam().manifestPath);
 }
 
 INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleGraphicsProgramMatrix,
                          testing::ValuesIn(moduleGraphicsBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
+                             return std::string(info.param.target);
+                         });
+
+class RuntimeModuleMixedProgramMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::computeGraphicsFixtureRequirements(GetParam().runtime);
+    }
+};
+
+TEST_P(RuntimeModuleMixedProgramMatrix, ComputeGeneratedVerticesReachGraphicsModule) {
+    invokeAndExpectTriangle(runtime(), GetParam().manifestPath, false);
+}
+
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleMixedProgramMatrix, testing::ValuesIn(moduleMixedBackendCases()),
                          [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
                              return std::string(info.param.target);
                          });

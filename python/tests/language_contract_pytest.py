@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any, Protocol
 
+from backend_test_matrix import CapabilityUnavailable
 from language_contract_traceability import contract_test_bindings
 
 
@@ -14,9 +15,15 @@ class MutableTestReport(Protocol):
     def skipped(self) -> bool: ...
 
 
-def reject_skipped_contract_test(report: MutableTestReport, test_method: Callable[..., Any]) -> None:
+def reject_skipped_contract_test(
+    report: MutableTestReport,
+    test_method: Callable[..., Any],
+    exception: BaseException | None = None,
+) -> None:
     bindings = contract_test_bindings(test_method)
     if not report.skipped or not bindings:
+        return
+    if isinstance(exception, CapabilityUnavailable):
         return
     case_ids = sorted({case_id for binding in bindings for case_id in binding.case_ids})
     report.outcome = "failed"
