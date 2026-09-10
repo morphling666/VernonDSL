@@ -1,14 +1,22 @@
 #include "VernonRuntime.hpp"
+#include "program_fixture_manifest_table.h"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
 
 extern "C" VernonStatus vernonRegisterModuleProgramFixture(void);
+extern "C" VernonStatus vernonRegisterReusedStageCpuFixture(void);
+extern "C" VernonStatus vernonRegisterTensorViewChainCpuFixture(void);
+extern "C" VernonStatus vernonRegisterDynamicShapeGridCpuFixture(void);
 extern "C" VernonStatus vernonRegisterTypedSpecializationFixture(void);
 
 namespace {
@@ -74,8 +82,31 @@ VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter
     return result;
 }
 
+VernonProgramArgument scalarArgument(const VernonProgramParameterView &parameter, float &value) {
+    VernonProgramArgument result{};
+    result.slot = parameter.slot;
+    result.kind = VERNON_PROGRAM_TENSOR;
+    result.tensor.struct_size = sizeof(VernonTensorView);
+    result.tensor.storage = VERNON_TENSOR_HOST;
+    result.tensor.host_data = &value;
+    result.tensor.element_layout = parameter.element_layout;
+    result.tensor.access = parameter.access;
+    result.tensor.byte_size = sizeof(value);
+    return result;
+}
+
 VernonProgramBindingToken bindingToken(const char *value) {
     return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
+}
+
+std::string fixtureManifest(std::string_view fixtureId) {
+    const auto *fixture = vernon::tests::findProgramFixtureManifest(fixtureId, VERNON_RUNTIME_CPU);
+    if (!fixture)
+        throw std::logic_error("missing CPU fixture '" + std::string(fixtureId) + "'");
+    std::ifstream input(std::string(fixture->manifestPath), std::ios::binary);
+    if (!input)
+        throw std::runtime_error("cannot read CPU fixture manifest '" + std::string(fixture->manifestPath) + "'");
+    return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
 } // namespace
@@ -620,6 +651,125 @@ TEST(RuntimeModuleProgramCppApi, ProgramGraphValueConnectsProducerToConsumer) {
                   VERNON_STATUS_INVALID_ARGUMENT);
         EXPECT_EQ(pullback, nullptr);
         EXPECT_EQ(lastError(context), "ProgramGraph node pullback is unavailable");
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCpuMatrix, ReusesOneStageAcrossDifferentNodeProjections) {
+    ASSERT_EQ(vernonRegisterReusedStageCpuFixture(), VERNON_STATUS_OK);
+    const std::string manifest = fixtureManifest("reused_stage");
+    ASSERT_FALSE(manifest.empty());
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto executable = asset.resolve();
+        std::array<float, 4> source{1, 2, 3, 4};
+        std::array<float, 4> output{};
+        const uint64_t shape[]{source.size()};
+        uint32_t gridX = 4;
+        uint32_t gridY = 1;
+        uint32_t gridZ = 1;
+        std::array<VernonProgramArgument, 5> arguments{
+            tensorArrayArgument(parameter(executable.get(), "source"), source.data(), shape),
+            tensorArrayArgument(parameter(executable.get(), "output"), output.data(), shape),
+            scalarArgument(parameter(executable.get(), "grid_x"), gridX),
+            scalarArgument(parameter(executable.get(), "grid_y"), gridY),
+            scalarArgument(parameter(executable.get(), "grid_z"), gridZ),
+        };
+        vernon::runtime::ProgramInstance instance(executable);
+        auto invocation = instance.begin();
+        for (size_t index = 0; index < arguments.size(); ++index) {
+            const std::string text = "cpu-reused-stage-" + std::to_string(index);
+            invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]);
+        }
+        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_EQ(output, (std::array<float, 4>{3, 4, 5, 6}));
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCpuMatrix, ChainsDistinctComputeKernelsThroughTensorViews) {
+    ASSERT_EQ(vernonRegisterTensorViewChainCpuFixture(), VERNON_STATUS_OK);
+    const std::string manifest = fixtureManifest("tensor_view_chain");
+    ASSERT_FALSE(manifest.empty());
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto executable = asset.resolve();
+        float source = 3.0f;
+        float output = 0.0f;
+        vernon::runtime::ProgramInstance instance(executable);
+        auto invocation = instance.begin();
+        invocation
+            .bind(bindingToken("cpu-tensor-chain-source"),
+                  tensorArgument(parameter(executable.get(), "source"), source))
+            .bind(bindingToken("cpu-tensor-chain-output"),
+                  tensorArgument(parameter(executable.get(), "output"), output));
+        EXPECT_FALSE(invocation.forward(false));
+        EXPECT_FLOAT_EQ(output, 8.0f);
+    }
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeModuleProgramCpuMatrix, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
+    ASSERT_EQ(vernonRegisterDynamicShapeGridCpuFixture(), VERNON_STATUS_OK);
+    const std::string manifest = fixtureManifest("dynamic_shape_grid");
+    ASSERT_FALSE(manifest.empty());
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    {
+        const auto asset = vernon::runtime::ProgramAsset::load(context, manifest.data(), manifest.size());
+        auto executable = asset.resolve();
+        const VernonProgramParameterView sourceParameter = parameter(executable.get(), "source");
+        const VernonProgramParameterView outputParameter = parameter(executable.get(), "output");
+        VernonProgramParameterView publishedOutputParameter{};
+        ASSERT_EQ(vernonRuntimeProgramExecutableGetBoundaryByIndex(executable.get(), VERNON_PROGRAM_BOUNDARY_OUTPUT, 0,
+                                                                   &publishedOutputParameter),
+                  VERNON_STATUS_OK);
+        const VernonProgramParameterView factorParameter = parameter(executable.get(), "factor");
+        std::array<VernonProgramParameterView, 3> gridParameters{
+            parameter(executable.get(), "__grid_x"),
+            parameter(executable.get(), "__grid_y"),
+            parameter(executable.get(), "__grid_z"),
+        };
+        vernon::runtime::ProgramInstance instance(executable);
+        constexpr std::array<size_t, 2> counts{3, 5};
+        constexpr std::array<float, 2> factors{2, 3};
+        uint32_t one = 1;
+        for (size_t iteration = 0; iteration < counts.size(); ++iteration) {
+            const size_t count = counts[iteration];
+            std::vector<float> source(count);
+            for (size_t index = 0; index < count; ++index)
+                source[index] = static_cast<float>(index + 1);
+            std::vector<float> output(count);
+            const uint64_t shape[]{count};
+            uint32_t gridX = static_cast<uint32_t>(count);
+            float factor = factors[iteration];
+            std::array<VernonProgramArgument, 7> arguments{
+                tensorArrayArgument(sourceParameter, source.data(), shape),
+                tensorArrayArgument(outputParameter, output.data(), shape),
+                tensorArrayArgument(publishedOutputParameter, output.data(), shape),
+                scalarArgument(factorParameter, factor),
+                scalarArgument(gridParameters[0], gridX),
+                scalarArgument(gridParameters[1], one),
+                scalarArgument(gridParameters[2], one),
+            };
+            auto invocation = instance.begin();
+            for (size_t index = 0; index < arguments.size(); ++index) {
+                const std::string text = index >= 5
+                                             ? "cpu-dynamic-stable-" + std::to_string(index)
+                                             : "cpu-dynamic-" + std::to_string(iteration) + "-" + std::to_string(index);
+                invocation.bind({sizeof(VernonProgramBindingToken), text.data(), text.size()}, arguments[index]);
+            }
+            EXPECT_FALSE(invocation.forward(false));
+            for (size_t index = 0; index < count; ++index)
+                EXPECT_FLOAT_EQ(output[index], source[index] * factor);
+        }
+        const VernonProgramBindingTelemetry telemetry = instance.telemetry();
+        EXPECT_EQ(telemetry.prepare_count, 12u);
+        EXPECT_EQ(telemetry.reuse_count, 2u);
     }
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }

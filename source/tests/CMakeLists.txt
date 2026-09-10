@@ -67,111 +67,6 @@ function(
 endfunction()
 
 function(
-    vernon_add_gpu_tape_test_bundles
-    architecture
-    output_stem
-    static_manifest_variable
-    dynamic_manifest_variable
-    targets_variable)
-    vernon_add_program_asset_test_bundle(
-        "gpu-autodiff-${architecture}-static"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset"
-        "autodiff_gpu_${output_stem}_static_fixture"
-        _vernon_static_manifest)
-    vernon_add_program_asset_test_bundle(
-        "gpu-autodiff-${architecture}-dynamic"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset"
-        "autodiff_gpu_${output_stem}_dynamic_fixture"
-        _vernon_dynamic_manifest)
-    set(${static_manifest_variable}
-        "${_vernon_static_manifest}"
-        PARENT_SCOPE)
-    set(${dynamic_manifest_variable}
-        "${_vernon_dynamic_manifest}"
-        PARENT_SCOPE)
-    set(${targets_variable}
-        ${${targets_variable}} "vernon-gpu-autodiff-${architecture}-static-test-bundle"
-        "vernon-gpu-autodiff-${architecture}-dynamic-test-bundle"
-        PARENT_SCOPE)
-endfunction()
-
-function(
-    vernon_add_module_architecture_test_bundles
-    architecture
-    output_stem
-    reused_manifest_variable
-    tensor_view_manifest_variable
-    dynamic_manifest_variable
-    targets_variable)
-    vernon_add_program_asset_test_bundle(
-        "reused-stage-${architecture}"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset"
-        "reused_stage_${output_stem}_fixture"
-        _vernon_reused_manifest)
-    vernon_add_program_asset_test_bundle(
-        "tensor-view-chain-${architecture}"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset"
-        "tensor_view_chain_${output_stem}_fixture"
-        _vernon_tensor_view_manifest)
-    vernon_add_program_asset_test_bundle(
-        "dynamic-shape-grid-${architecture}"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset"
-        "dynamic_shape_grid_${output_stem}_fixture"
-        _vernon_dynamic_manifest)
-    set(${reused_manifest_variable}
-        "${_vernon_reused_manifest}"
-        PARENT_SCOPE)
-    set(${tensor_view_manifest_variable}
-        "${_vernon_tensor_view_manifest}"
-        PARENT_SCOPE)
-    set(${dynamic_manifest_variable}
-        "${_vernon_dynamic_manifest}"
-        PARENT_SCOPE)
-    set(${targets_variable}
-        ${${targets_variable}}
-        "vernon-reused-stage-${architecture}-test-bundle"
-        "vernon-tensor-view-chain-${architecture}-test-bundle"
-        "vernon-dynamic-shape-grid-${architecture}-test-bundle"
-        PARENT_SCOPE)
-endfunction()
-
-function(
-    vernon_add_module_graphics_test_bundles
-    architecture
-    output_stem
-    graphics_manifest_variable
-    mixed_manifest_variable
-    targets_variable)
-    vernon_add_program_asset_test_bundle(
-        "module-graphics-${architecture}"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:graphics_asset"
-        "module_graphics_${output_stem}_fixture"
-        _vernon_graphics_manifest)
-    vernon_add_program_asset_test_bundle(
-        "module-mixed-${architecture}"
-        "${architecture}"
-        "${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:mixed_asset"
-        "module_mixed_${output_stem}_fixture"
-        _vernon_mixed_manifest)
-    set(${graphics_manifest_variable}
-        "${_vernon_graphics_manifest}"
-        PARENT_SCOPE)
-    set(${mixed_manifest_variable}
-        "${_vernon_mixed_manifest}"
-        PARENT_SCOPE)
-    set(${targets_variable}
-        ${${targets_variable}} "vernon-module-graphics-${architecture}-test-bundle"
-        "vernon-module-mixed-${architecture}-test-bundle"
-        PARENT_SCOPE)
-endfunction()
-
-function(
     vernon_add_cpu_program_fixture
     name
     directory_stem
@@ -364,35 +259,147 @@ if(TARGET VernonRuntime)
         set(module_program_gpu_fixture_targets)
         set(module_graphics_fixture_targets)
         set(synchronization_fixture_targets)
-        set(synchronization_architectures opengl opengles)
-        if(VERNON_ENABLE_VULKAN_RUNTIME)
-            list(APPEND synchronization_architectures vulkan)
-        endif()
+        set(enabled_fixture_targets)
         if(VERNON_ENABLE_CUDA_RUNTIME)
-            list(APPEND synchronization_architectures cuda)
+            list(APPEND enabled_fixture_targets "cuda|VERNON_RUNTIME_CUDA|compute,autodiff,synchronization")
+        endif()
+        if(VERNON_ENABLE_VULKAN_RUNTIME)
+            list(APPEND enabled_fixture_targets
+                 "vulkan|VERNON_RUNTIME_VULKAN|compute,autodiff,graphics,synchronization")
         endif()
         if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-            list(APPEND synchronization_architectures directx)
+            list(APPEND enabled_fixture_targets
+                 "directx|VERNON_RUNTIME_DIRECTX12|compute,autodiff,graphics,synchronization")
         endif()
         if(VERNON_ENABLE_METAL_RUNTIME)
-            list(APPEND synchronization_architectures metal)
+            list(APPEND enabled_fixture_targets "metal|VERNON_RUNTIME_METAL|compute,autodiff,graphics,synchronization")
         endif()
-        foreach(synchronization_architecture IN LISTS synchronization_architectures)
-            set(synchronization_manifest_variable "synchronization_${synchronization_architecture}_manifest")
-            vernon_add_program_asset_test_bundle(
-                "synchronization-${synchronization_architecture}"
-                "${synchronization_architecture}"
-                "${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset"
-                "synchronization_${synchronization_architecture}_fixture"
-                "${synchronization_manifest_variable}")
-            string(TOUPPER "${synchronization_architecture}" synchronization_architecture_upper)
-            target_compile_definitions(
-                VernonCompilerRuntimeIntegrationTests
-                PRIVATE
-                    "VERNON_SYNCHRONIZATION_${synchronization_architecture_upper}_MANIFEST=\"${${synchronization_manifest_variable}}\""
-            )
-            list(APPEND synchronization_fixture_targets
-                 "vernon-synchronization-${synchronization_architecture}-test-bundle")
+        list(
+            APPEND
+            enabled_fixture_targets
+            "opengl|VERNON_RUNTIME_OPENGL|compute,autodiff,graphics,synchronization"
+            "opengles|VERNON_RUNTIME_OPENGL_ES|compute,autodiff,graphics,synchronization")
+
+        set(cross_backend_fixture_specs
+            "synchronization|synchronization|${VERNON_TEST_ROOT}/fixtures/synchronization_program_asset.py:asset|synchronization"
+            "module_program_gpu|module_program|${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset|compute"
+            "module_program_gpu|reused_stage|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset|compute"
+            "module_program_gpu|tensor_view_chain|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset|compute"
+            "module_program_gpu|dynamic_shape_grid|${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset|compute"
+            "gpu_autodiff|gpu_autodiff|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset|autodiff"
+            "gpu_autodiff|gpu_autodiff_non_power_of_two|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset|autodiff"
+            "gpu_autodiff|gpu_autodiff_static|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset|autodiff"
+            "gpu_autodiff|gpu_autodiff_dynamic|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:dynamic_asset|autodiff"
+            "module_graphics|module_graphics|${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:graphics_asset|graphics"
+            "module_graphics|module_mixed|${VERNON_TEST_ROOT}/fixtures/module_graphics_program_asset.py:mixed_asset|graphics"
+        )
+        set(VERNON_TEST_FIXTURE_MANIFEST_ROWS)
+        set(VERNON_TEST_FIXTURE_PAIRS)
+        foreach(enabled_fixture_target IN LISTS enabled_fixture_targets)
+            string(
+                REPLACE "|"
+                        ";"
+                        enabled_fixture_target_fields
+                        "${enabled_fixture_target}")
+            list(LENGTH enabled_fixture_target_fields enabled_fixture_target_field_count)
+            if(NOT
+               enabled_fixture_target_field_count
+               EQUAL
+               3)
+                message(FATAL_ERROR "invalid fixture target row: ${enabled_fixture_target}")
+            endif()
+            list(
+                GET
+                enabled_fixture_target_fields
+                0
+                fixture_architecture)
+            list(
+                GET
+                enabled_fixture_target_fields
+                1
+                fixture_runtime)
+            list(
+                GET
+                enabled_fixture_target_fields
+                2
+                fixture_capabilities)
+            string(
+                REPLACE ","
+                        ";"
+                        fixture_capability_list
+                        "${fixture_capabilities}")
+            foreach(cross_backend_fixture_spec IN LISTS cross_backend_fixture_specs)
+                string(
+                    REPLACE "|"
+                            ";"
+                            fixture_fields
+                            "${cross_backend_fixture_spec}")
+                list(LENGTH fixture_fields fixture_field_count)
+                if(NOT
+                   fixture_field_count
+                   EQUAL
+                   4)
+                    message(FATAL_ERROR "invalid cross-backend fixture row: ${cross_backend_fixture_spec}")
+                endif()
+                list(
+                    GET
+                    fixture_fields
+                    0
+                    fixture_group)
+                list(
+                    GET
+                    fixture_fields
+                    1
+                    fixture_id)
+                list(
+                    GET
+                    fixture_fields
+                    2
+                    fixture_asset)
+                list(
+                    GET
+                    fixture_fields
+                    3
+                    fixture_requirement)
+                if(NOT
+                   fixture_requirement
+                   IN_LIST
+                   fixture_capability_list)
+                    continue()
+                endif()
+                set(fixture_pair "${fixture_id}@${fixture_architecture}")
+                if(fixture_pair IN_LIST VERNON_TEST_FIXTURE_PAIRS)
+                    message(FATAL_ERROR "duplicate cross-backend fixture pair: ${fixture_pair}")
+                endif()
+                list(APPEND VERNON_TEST_FIXTURE_PAIRS "${fixture_pair}")
+                string(
+                    REPLACE "_"
+                            "-"
+                            fixture_name
+                            "${fixture_id}")
+                set(fixture_manifest_variable "${fixture_id}_${fixture_architecture}_manifest")
+                vernon_add_program_asset_test_bundle(
+                    "${fixture_name}-${fixture_architecture}"
+                    "${fixture_architecture}"
+                    "${fixture_asset}"
+                    "${fixture_id}_${fixture_architecture}_fixture"
+                    "${fixture_manifest_variable}")
+                string(FIND "${${fixture_manifest_variable}}" ")vernon\"" fixture_raw_string_terminator)
+                if(NOT
+                   fixture_raw_string_terminator
+                   EQUAL
+                   -1)
+                    message(
+                        FATAL_ERROR "fixture manifest path contains reserved raw-string terminator: ${fixture_pair}")
+                endif()
+                list(APPEND ${fixture_group}_fixture_targets
+                     "vernon-${fixture_name}-${fixture_architecture}-test-bundle")
+                string(
+                    APPEND
+                    VERNON_TEST_FIXTURE_MANIFEST_ROWS
+                    "        {\"${fixture_id}\", \"${fixture_architecture}\", ${fixture_runtime}, R\"vernon(${${fixture_manifest_variable}})vernon\"},\n"
+                )
+            endforeach()
         endforeach()
         vernon_add_cpu_program_fixture(
             synchronization-cpu
@@ -402,214 +409,16 @@ if(TARGET VernonRuntime)
             vernonRegisterSynchronizationProgramFixture
             synchronization_cpu_manifest
             synchronization_cpu_fixture_target)
-        target_compile_definitions(
-            VernonCompilerRuntimeIntegrationTests
-            PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1
-                    "VERNON_SYNCHRONIZATION_CPU_MANIFEST=\"${synchronization_cpu_manifest}\"")
+        string(
+            APPEND
+            VERNON_TEST_FIXTURE_MANIFEST_ROWS
+            "        {\"synchronization\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${synchronization_cpu_manifest})vernon\"},\n"
+        )
+        target_compile_definitions(VernonCompilerRuntimeIntegrationTests
+                                   PRIVATE VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE=1)
+        target_include_directories(VernonCompilerRuntimeIntegrationTests PRIVATE "${VERNON_TEST_BINARY_ROOT}/generated")
         target_link_libraries(VernonCompilerRuntimeIntegrationTests PRIVATE ${synchronization_cpu_fixture_target})
         add_dependencies(VernonCompilerRuntimeIntegrationTests ${synchronization_fixture_targets})
-        if(VERNON_ENABLE_VULKAN_RUNTIME)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-vulkan
-                vulkan
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
-                autodiff_gpu_vulkan_fixture
-                gpu_autodiff_vulkan_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-test-bundle)
-            vernon_add_program_asset_test_bundle(
-                module-program-vulkan
-                vulkan
-                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-                module_program_vulkan_fixture
-                module_program_vulkan_manifest)
-            list(APPEND module_program_gpu_fixture_targets vernon-module-program-vulkan-test-bundle)
-            vernon_add_module_architecture_test_bundles(
-                vulkan
-                vulkan
-                reused_stage_vulkan_manifest
-                tensor_view_chain_vulkan_manifest
-                dynamic_shape_grid_vulkan_manifest
-                module_program_gpu_fixture_targets)
-            vernon_add_module_graphics_test_bundles(
-                vulkan
-                vulkan
-                module_graphics_vulkan_manifest
-                module_mixed_vulkan_manifest
-                module_graphics_fixture_targets)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-vulkan-non-power-of-two
-                vulkan
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
-                autodiff_gpu_vulkan_non_power_of_two_fixture
-                gpu_autodiff_vulkan_non_power_of_two_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-vulkan-non-power-of-two-test-bundle)
-            vernon_add_gpu_tape_test_bundles(
-                vulkan
-                vulkan
-                gpu_autodiff_vulkan_static_manifest
-                gpu_autodiff_vulkan_dynamic_manifest
-                gpu_autodiff_fixture_targets)
-        endif()
-        if(VERNON_ENABLE_CUDA_RUNTIME)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-cuda
-                cuda
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
-                autodiff_gpu_cuda_fixture
-                gpu_autodiff_cuda_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-test-bundle)
-            vernon_add_program_asset_test_bundle(
-                module-program-cuda
-                cuda
-                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-                module_program_cuda_fixture
-                module_program_cuda_manifest)
-            list(APPEND module_program_gpu_fixture_targets vernon-module-program-cuda-test-bundle)
-            vernon_add_module_architecture_test_bundles(
-                cuda
-                cuda
-                reused_stage_cuda_manifest
-                tensor_view_chain_cuda_manifest
-                dynamic_shape_grid_cuda_manifest
-                module_program_gpu_fixture_targets)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-cuda-non-power-of-two
-                cuda
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
-                autodiff_gpu_cuda_non_power_of_two_fixture
-                gpu_autodiff_cuda_non_power_of_two_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-cuda-non-power-of-two-test-bundle)
-            vernon_add_gpu_tape_test_bundles(
-                cuda
-                cuda
-                gpu_autodiff_cuda_static_manifest
-                gpu_autodiff_cuda_dynamic_manifest
-                gpu_autodiff_fixture_targets)
-        endif()
-        if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-directx
-                directx
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
-                autodiff_gpu_directx_fixture
-                gpu_autodiff_directx_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-test-bundle)
-            vernon_add_program_asset_test_bundle(
-                module-program-directx
-                directx
-                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-                module_program_directx_fixture
-                module_program_directx_manifest)
-            list(APPEND module_program_gpu_fixture_targets vernon-module-program-directx-test-bundle)
-            vernon_add_module_architecture_test_bundles(
-                directx
-                directx
-                reused_stage_directx_manifest
-                tensor_view_chain_directx_manifest
-                dynamic_shape_grid_directx_manifest
-                module_program_gpu_fixture_targets)
-            vernon_add_module_graphics_test_bundles(
-                directx
-                directx
-                module_graphics_directx_manifest
-                module_mixed_directx_manifest
-                module_graphics_fixture_targets)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-directx-non-power-of-two
-                directx
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
-                autodiff_gpu_directx_non_power_of_two_fixture
-                gpu_autodiff_directx_non_power_of_two_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-directx-non-power-of-two-test-bundle)
-            vernon_add_gpu_tape_test_bundles(
-                directx
-                directx
-                gpu_autodiff_directx_static_manifest
-                gpu_autodiff_directx_dynamic_manifest
-                gpu_autodiff_fixture_targets)
-        endif()
-        if(VERNON_ENABLE_METAL_RUNTIME)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-metal
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
-                autodiff_gpu_metal_fixture
-                gpu_autodiff_metal_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-test-bundle)
-            vernon_add_program_asset_test_bundle(
-                module-program-metal
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-                module_program_metal_fixture
-                module_program_metal_manifest)
-            list(APPEND module_program_gpu_fixture_targets vernon-module-program-metal-test-bundle)
-            vernon_add_module_architecture_test_bundles(
-                metal
-                metal
-                reused_stage_metal_manifest
-                tensor_view_chain_metal_manifest
-                dynamic_shape_grid_metal_manifest
-                module_program_gpu_fixture_targets)
-            vernon_add_module_graphics_test_bundles(
-                metal
-                metal
-                module_graphics_metal_manifest
-                module_mixed_metal_manifest
-                module_graphics_fixture_targets)
-            vernon_add_program_asset_test_bundle(
-                gpu-autodiff-metal-non-power-of-two
-                metal
-                "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
-                autodiff_gpu_metal_non_power_of_two_fixture
-                gpu_autodiff_metal_non_power_of_two_manifest)
-            list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-metal-non-power-of-two-test-bundle)
-            vernon_add_gpu_tape_test_bundles(
-                metal
-                metal
-                gpu_autodiff_metal_static_manifest
-                gpu_autodiff_metal_dynamic_manifest
-                gpu_autodiff_fixture_targets)
-        endif()
-        vernon_add_program_asset_test_bundle(
-            gpu-autodiff-opengl
-            opengl
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset"
-            autodiff_gpu_opengl_fixture
-            gpu_autodiff_opengl_manifest)
-        list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-test-bundle)
-        vernon_add_program_asset_test_bundle(
-            module-program-opengl
-            opengl
-            "${VERNON_TEST_ROOT}/fixtures/module_program_cooked_asset.py:asset"
-            module_program_opengl_fixture
-            module_program_opengl_manifest)
-        list(APPEND module_program_gpu_fixture_targets vernon-module-program-opengl-test-bundle)
-        vernon_add_module_architecture_test_bundles(
-            opengl
-            opengl
-            reused_stage_opengl_manifest
-            tensor_view_chain_opengl_manifest
-            dynamic_shape_grid_opengl_manifest
-            module_program_gpu_fixture_targets)
-        vernon_add_module_graphics_test_bundles(
-            opengl
-            opengl
-            module_graphics_opengl_manifest
-            module_mixed_opengl_manifest
-            module_graphics_fixture_targets)
-        vernon_add_program_asset_test_bundle(
-            gpu-autodiff-opengl-non-power-of-two
-            opengl
-            "${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset"
-            autodiff_gpu_opengl_non_power_of_two_fixture
-            gpu_autodiff_opengl_non_power_of_two_manifest)
-        list(APPEND gpu_autodiff_fixture_targets vernon-gpu-autodiff-opengl-non-power-of-two-test-bundle)
-        vernon_add_gpu_tape_test_bundles(
-            opengl
-            opengl
-            gpu_autodiff_opengl_static_manifest
-            gpu_autodiff_opengl_dynamic_manifest
-            gpu_autodiff_fixture_targets)
 
         vernon_add_cpu_program_fixture(
             cooked-autodiff
@@ -627,6 +436,43 @@ if(TARGET VernonRuntime)
             vernonRegisterModuleProgramFixture
             module_program_cooked_manifest
             module_program_cooked_fixture_target)
+        vernon_add_cpu_program_fixture(
+            module-reused-stage-cpu
+            reused_stage_cpu_fixture
+            reused_stage_cpu_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:reused_stage_asset"
+            vernonRegisterReusedStageCpuFixture
+            reused_stage_cpu_manifest
+            reused_stage_cpu_fixture_target)
+        vernon_add_cpu_program_fixture(
+            module-tensor-view-chain-cpu
+            tensor_view_chain_cpu_fixture
+            tensor_view_chain_cpu_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:tensor_view_chain_asset"
+            vernonRegisterTensorViewChainCpuFixture
+            tensor_view_chain_cpu_manifest
+            tensor_view_chain_cpu_fixture_target)
+        vernon_add_cpu_program_fixture(
+            module-dynamic-shape-grid-cpu
+            dynamic_shape_grid_cpu_fixture
+            dynamic_shape_grid_cpu_fixture.program.json
+            "${VERNON_TEST_ROOT}/fixtures/module_architecture_program_asset.py:dynamic_shape_grid_asset"
+            vernonRegisterDynamicShapeGridCpuFixture
+            dynamic_shape_grid_cpu_manifest
+            dynamic_shape_grid_cpu_fixture_target)
+        string(
+            APPEND
+            VERNON_TEST_FIXTURE_MANIFEST_ROWS
+            "        {\"module_program\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${module_program_cooked_manifest})vernon\"},\n"
+            "        {\"reused_stage\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${reused_stage_cpu_manifest})vernon\"},\n"
+            "        {\"tensor_view_chain\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${tensor_view_chain_cpu_manifest})vernon\"},\n"
+            "        {\"dynamic_shape_grid\", \"cpu\", VERNON_RUNTIME_CPU, R\"vernon(${dynamic_shape_grid_cpu_manifest})vernon\"},\n"
+        )
+        file(MAKE_DIRECTORY "${VERNON_TEST_BINARY_ROOT}/generated")
+        file(
+            GENERATE
+            OUTPUT "${VERNON_TEST_BINARY_ROOT}/generated/program_fixture_manifest_rows.inc"
+            CONTENT "${VERNON_TEST_FIXTURE_MANIFEST_ROWS}")
         vernon_add_cpu_program_fixture(
             typed-specialization
             typed_specialization_fixture
@@ -780,7 +626,12 @@ if(TARGET VernonRuntime)
             PRIVATE GTest::gtest_main
                     Vernon::Runtime
                     ${module_program_cooked_fixture_target}
+                    ${reused_stage_cpu_fixture_target}
+                    ${tensor_view_chain_cpu_fixture_target}
+                    ${dynamic_shape_grid_cpu_fixture_target}
                     ${typed_specialization_fixture_target})
+        target_include_directories(VernonModuleProgramRuntimeTests PRIVATE "${VERNON_TEST_ROOT}/support"
+                                                                           "${VERNON_TEST_BINARY_ROOT}/generated")
         target_compile_definitions(
             VernonModuleProgramRuntimeTests
             PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cooked_manifest}"
@@ -792,53 +643,11 @@ if(TARGET VernonRuntime)
 
         if(gpu_autodiff_fixture_targets)
             add_executable(VernonGpuAutodiffTests runtime/runtime_gpu_autodiff_test.cpp)
-            target_include_directories(VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                      "${VERNON_TEST_ROOT}/support")
+            target_include_directories(
+                VernonGpuAutodiffTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                                               "${VERNON_TEST_BINARY_ROOT}/generated")
             target_link_libraries(VernonGpuAutodiffTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
             add_dependencies(VernonGpuAutodiffTests ${gpu_autodiff_fixture_targets})
-            if(VERNON_ENABLE_VULKAN_RUNTIME)
-                target_compile_definitions(
-                    VernonGpuAutodiffTests
-                    PRIVATE
-                        VERNON_GPU_AUTODIFF_VULKAN_MANIFEST="${gpu_autodiff_vulkan_manifest}"
-                        VERNON_GPU_AUTODIFF_VULKAN_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_vulkan_non_power_of_two_manifest}"
-                        VERNON_GPU_AUTODIFF_VULKAN_STATIC_MANIFEST="${gpu_autodiff_vulkan_static_manifest}"
-                        VERNON_GPU_AUTODIFF_VULKAN_DYNAMIC_MANIFEST="${gpu_autodiff_vulkan_dynamic_manifest}")
-            endif()
-            if(VERNON_ENABLE_CUDA_RUNTIME)
-                target_compile_definitions(
-                    VernonGpuAutodiffTests
-                    PRIVATE
-                        VERNON_GPU_AUTODIFF_CUDA_MANIFEST="${gpu_autodiff_cuda_manifest}"
-                        VERNON_GPU_AUTODIFF_CUDA_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_cuda_non_power_of_two_manifest}"
-                        VERNON_GPU_AUTODIFF_CUDA_STATIC_MANIFEST="${gpu_autodiff_cuda_static_manifest}"
-                        VERNON_GPU_AUTODIFF_CUDA_DYNAMIC_MANIFEST="${gpu_autodiff_cuda_dynamic_manifest}")
-            endif()
-            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-                target_compile_definitions(
-                    VernonGpuAutodiffTests
-                    PRIVATE
-                        VERNON_GPU_AUTODIFF_DIRECTX_MANIFEST="${gpu_autodiff_directx_manifest}"
-                        VERNON_GPU_AUTODIFF_DIRECTX_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_directx_non_power_of_two_manifest}"
-                        VERNON_GPU_AUTODIFF_DIRECTX_STATIC_MANIFEST="${gpu_autodiff_directx_static_manifest}"
-                        VERNON_GPU_AUTODIFF_DIRECTX_DYNAMIC_MANIFEST="${gpu_autodiff_directx_dynamic_manifest}")
-            endif()
-            if(VERNON_ENABLE_METAL_RUNTIME)
-                target_compile_definitions(
-                    VernonGpuAutodiffTests
-                    PRIVATE
-                        VERNON_GPU_AUTODIFF_METAL_MANIFEST="${gpu_autodiff_metal_manifest}"
-                        VERNON_GPU_AUTODIFF_METAL_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_metal_non_power_of_two_manifest}"
-                        VERNON_GPU_AUTODIFF_METAL_STATIC_MANIFEST="${gpu_autodiff_metal_static_manifest}"
-                        VERNON_GPU_AUTODIFF_METAL_DYNAMIC_MANIFEST="${gpu_autodiff_metal_dynamic_manifest}")
-            endif()
-            target_compile_definitions(
-                VernonGpuAutodiffTests
-                PRIVATE
-                    VERNON_GPU_AUTODIFF_OPENGL_MANIFEST="${gpu_autodiff_opengl_manifest}"
-                    VERNON_GPU_AUTODIFF_OPENGL_NON_POWER_OF_TWO_MANIFEST="${gpu_autodiff_opengl_non_power_of_two_manifest}"
-                    VERNON_GPU_AUTODIFF_OPENGL_STATIC_MANIFEST="${gpu_autodiff_opengl_static_manifest}"
-                    VERNON_GPU_AUTODIFF_OPENGL_DYNAMIC_MANIFEST="${gpu_autodiff_opengl_dynamic_manifest}")
             set_target_properties(VernonGpuAutodiffTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                     "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonGpuAutodiffTests VernonRuntime VernonRHI)
@@ -852,47 +661,11 @@ if(TARGET VernonRuntime)
                         Vernon::Runtime
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
-            target_include_directories(VernonModuleProgramGpuRuntimeTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
-                                                                                  "${VERNON_TEST_ROOT}/support")
-            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
-            if(VERNON_ENABLE_VULKAN_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_VULKAN_MANIFEST="${module_program_vulkan_manifest}"
-                            VERNON_REUSED_STAGE_VULKAN_MANIFEST="${reused_stage_vulkan_manifest}"
-                            VERNON_TENSOR_VIEW_CHAIN_VULKAN_MANIFEST="${tensor_view_chain_vulkan_manifest}"
-                            VERNON_DYNAMIC_SHAPE_GRID_VULKAN_MANIFEST="${dynamic_shape_grid_vulkan_manifest}")
-            endif()
-            if(VERNON_ENABLE_CUDA_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_CUDA_MANIFEST="${module_program_cuda_manifest}"
-                            VERNON_REUSED_STAGE_CUDA_MANIFEST="${reused_stage_cuda_manifest}"
-                            VERNON_TENSOR_VIEW_CHAIN_CUDA_MANIFEST="${tensor_view_chain_cuda_manifest}"
-                            VERNON_DYNAMIC_SHAPE_GRID_CUDA_MANIFEST="${dynamic_shape_grid_cuda_manifest}")
-            endif()
-            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST="${module_program_directx_manifest}"
-                            VERNON_REUSED_STAGE_DIRECTX_MANIFEST="${reused_stage_directx_manifest}"
-                            VERNON_TENSOR_VIEW_CHAIN_DIRECTX_MANIFEST="${tensor_view_chain_directx_manifest}"
-                            VERNON_DYNAMIC_SHAPE_GRID_DIRECTX_MANIFEST="${dynamic_shape_grid_directx_manifest}")
-            endif()
-            if(VERNON_ENABLE_METAL_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleProgramGpuRuntimeTests
-                    PRIVATE VERNON_MODULE_PROGRAM_METAL_MANIFEST="${module_program_metal_manifest}"
-                            VERNON_REUSED_STAGE_METAL_MANIFEST="${reused_stage_metal_manifest}"
-                            VERNON_TENSOR_VIEW_CHAIN_METAL_MANIFEST="${tensor_view_chain_metal_manifest}"
-                            VERNON_DYNAMIC_SHAPE_GRID_METAL_MANIFEST="${dynamic_shape_grid_metal_manifest}")
-            endif()
-            target_compile_definitions(
+            target_include_directories(
                 VernonModuleProgramGpuRuntimeTests
-                PRIVATE VERNON_MODULE_PROGRAM_OPENGL_MANIFEST="${module_program_opengl_manifest}"
-                        VERNON_REUSED_STAGE_OPENGL_MANIFEST="${reused_stage_opengl_manifest}"
-                        VERNON_TENSOR_VIEW_CHAIN_OPENGL_MANIFEST="${tensor_view_chain_opengl_manifest}"
-                        VERNON_DYNAMIC_SHAPE_GRID_OPENGL_MANIFEST="${dynamic_shape_grid_opengl_manifest}")
+                PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                        "${VERNON_TEST_BINARY_ROOT}/generated")
+            add_dependencies(VernonModuleProgramGpuRuntimeTests ${module_program_gpu_fixture_targets})
             set_target_properties(VernonModuleProgramGpuRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                 "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonModuleProgramGpuRuntimeTests VernonRuntime VernonRHI)
@@ -907,31 +680,11 @@ if(TARGET VernonRuntime)
                         Vernon::Runtime
                         Vernon::RHI
                         nlohmann_json::nlohmann_json)
-            target_include_directories(VernonModuleGraphicsProgramRuntimeTests
-                                       PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support")
-            add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
-            if(VERNON_ENABLE_VULKAN_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleGraphicsProgramRuntimeTests
-                    PRIVATE VERNON_MODULE_GRAPHICS_VULKAN_MANIFEST="${module_graphics_vulkan_manifest}"
-                            VERNON_MODULE_MIXED_VULKAN_MANIFEST="${module_mixed_vulkan_manifest}")
-            endif()
-            if(VERNON_ENABLE_DIRECTX12_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleGraphicsProgramRuntimeTests
-                    PRIVATE VERNON_MODULE_GRAPHICS_DIRECTX_MANIFEST="${module_graphics_directx_manifest}"
-                            VERNON_MODULE_MIXED_DIRECTX_MANIFEST="${module_mixed_directx_manifest}")
-            endif()
-            if(VERNON_ENABLE_METAL_RUNTIME)
-                target_compile_definitions(
-                    VernonModuleGraphicsProgramRuntimeTests
-                    PRIVATE VERNON_MODULE_GRAPHICS_METAL_MANIFEST="${module_graphics_metal_manifest}"
-                            VERNON_MODULE_MIXED_METAL_MANIFEST="${module_mixed_metal_manifest}")
-            endif()
-            target_compile_definitions(
+            target_include_directories(
                 VernonModuleGraphicsProgramRuntimeTests
-                PRIVATE VERNON_MODULE_GRAPHICS_OPENGL_MANIFEST="${module_graphics_opengl_manifest}"
-                        VERNON_MODULE_MIXED_OPENGL_MANIFEST="${module_mixed_opengl_manifest}")
+                PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                        "${VERNON_TEST_BINARY_ROOT}/generated")
+            add_dependencies(VernonModuleGraphicsProgramRuntimeTests ${module_graphics_fixture_targets})
             set_target_properties(VernonModuleGraphicsProgramRuntimeTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
                                                                                      "${CMAKE_BINARY_DIR}/source")
             vernon_stage_target_files(VernonModuleGraphicsProgramRuntimeTests VernonRuntime VernonRHI)

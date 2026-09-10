@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "program_fixture_runtime_test.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
 #include "runtime_rhi_test_utils.h"
@@ -81,14 +82,7 @@ void destroyTarget(RhiRuntime &runtime, RhiImageView &view, RhiImage &image) {
         EXPECT_EQ(vernonRhiDeviceDestroyImage(runtime.device, image.handle), VERNON_RHI_STATUS_OK);
 }
 
-void invokeAndExpectTriangle(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath,
-                             bool externalVertices) {
-    RhiRuntime runtime = vernon::tests::createRhiRuntime(backend);
-    if (!runtime.runtime) {
-        vernon::tests::destroyRhiRuntime(runtime);
-        GTEST_SKIP() << "GPU backend is unavailable";
-    }
-
+void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &manifestPath, bool externalVertices) {
     VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
@@ -203,16 +197,9 @@ void invokeAndExpectTriangle(VernonRuntimeBackend backend, const std::filesystem
     destroyTarget(runtime, targetView, target);
     vernonRuntimeProgramExecutableDestroy(executable);
     vernonRuntimeProgramBundleDestroy(bundle);
-    vernon::tests::destroyRhiRuntime(runtime);
 }
 
-void reuseGraphicsProgramAcrossExtentsAndDynamicStates(VernonRuntimeBackend backend,
-                                                       const std::filesystem::path &manifestPath) {
-    RhiRuntime runtime = vernon::tests::createRhiRuntime(backend);
-    if (!runtime.runtime) {
-        vernon::tests::destroyRhiRuntime(runtime);
-        GTEST_SKIP() << "GPU backend is unavailable";
-    }
+void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
     VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
@@ -322,55 +309,9 @@ void reuseGraphicsProgramAcrossExtentsAndDynamicStates(VernonRuntimeBackend back
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, vertices.handle), VERNON_RHI_STATUS_OK);
     vernonRuntimeProgramExecutableDestroy(executable);
     vernonRuntimeProgramBundleDestroy(bundle);
-    vernon::tests::destroyRhiRuntime(runtime);
 }
 
-} // namespace
-
-#if defined(VERNON_MODULE_GRAPHICS_METAL_MANIFEST)
-TEST(RuntimeModuleGraphicsProgramCApi, MetalReusesLoadedGraphicsModuleAcrossExtentsAndDynamicStates) {
-    reuseGraphicsProgramAcrossExtentsAndDynamicStates(VERNON_RUNTIME_METAL, VERNON_MODULE_GRAPHICS_METAL_MANIFEST);
-}
-
-TEST(RuntimeModuleGraphicsProgramCApi, MetalComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_METAL, VERNON_MODULE_MIXED_METAL_MANIFEST, false);
-}
-#endif
-
-#if defined(VERNON_MODULE_GRAPHICS_VULKAN_MANIFEST)
-TEST(RuntimeModuleGraphicsProgramCApi, VulkanExternalVerticesGraphicsModuleRendersPixels) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_VULKAN, VERNON_MODULE_GRAPHICS_VULKAN_MANIFEST, true);
-}
-
-TEST(RuntimeModuleGraphicsProgramCApi, VulkanComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_VULKAN, VERNON_MODULE_MIXED_VULKAN_MANIFEST, false);
-}
-#endif
-
-#if defined(VERNON_MODULE_GRAPHICS_DIRECTX_MANIFEST)
-TEST(RuntimeModuleGraphicsProgramCApi, DirectX12ExternalVerticesGraphicsModuleRendersPixels) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_GRAPHICS_DIRECTX_MANIFEST, true);
-}
-
-TEST(RuntimeModuleGraphicsProgramCApi, DirectX12ComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_MIXED_DIRECTX_MANIFEST, false);
-}
-#endif
-
-TEST(RuntimeModuleGraphicsProgramCApi, OpenGLExternalVerticesGraphicsModuleRendersPixels) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_OPENGL, VERNON_MODULE_GRAPHICS_OPENGL_MANIFEST, true);
-}
-
-TEST(RuntimeModuleGraphicsProgramCApi, OpenGLComputeGeneratedVerticesReachGraphicsModule) {
-    invokeAndExpectTriangle(VERNON_RUNTIME_OPENGL, VERNON_MODULE_MIXED_OPENGL_MANIFEST, false);
-}
-
-void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    RhiRuntime runtime = vernon::tests::createRhiRuntime(backend);
-    if (!runtime.runtime) {
-        vernon::tests::destroyRhiRuntime(runtime);
-        GTEST_SKIP() << "requested graphics runtime is unavailable";
-    }
+void expectProgramGraphFusion(RhiRuntime &runtime, const std::filesystem::path &manifestPath) {
     VernonProgramBundle *bundle = loadBundle(runtime, manifestPath);
     ASSERT_NE(bundle, nullptr) << lastError(runtime.runtime);
     VernonProgramGraph *graph = vernonRuntimeProgramGraphCreate(runtime.runtime);
@@ -485,15 +426,40 @@ void expectProgramGraphFusion(VernonRuntimeBackend backend, const std::filesyste
     destroyTarget(runtime, targetView, target);
     vernonRuntimeProgramExecutableDestroy(executable);
     vernonRuntimeProgramBundleDestroy(bundle);
-    vernon::tests::destroyRhiRuntime(runtime);
 }
 
-#if defined(VERNON_MODULE_GRAPHICS_METAL_MANIFEST)
-TEST(RuntimeModuleGraphicsProgramCApi, MetalProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
-    expectProgramGraphFusion(VERNON_RUNTIME_METAL, VERNON_MODULE_GRAPHICS_METAL_MANIFEST);
+const std::vector<vernon::tests::ProgramFixtureManifest> &moduleGraphicsBackendCases() {
+    static const auto cases = vernon::tests::programFixtureCases("module_graphics");
+    return cases;
 }
-#endif
 
-TEST(RuntimeModuleGraphicsProgramCApi, OpenGLProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
-    expectProgramGraphFusion(VERNON_RUNTIME_OPENGL, VERNON_MODULE_GRAPHICS_OPENGL_MANIFEST);
+class RuntimeModuleGraphicsProgramMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::computeFixtureRequirements(GetParam().runtime, true);
+    }
+};
+
+TEST_P(RuntimeModuleGraphicsProgramMatrix, ReusesLoadedGraphicsModuleAcrossExtentsAndDynamicStates) {
+    reuseGraphicsProgramAcrossExtentsAndDynamicStates(runtime(), GetParam().manifestPath);
 }
+
+TEST_P(RuntimeModuleGraphicsProgramMatrix, ExternalVerticesGraphicsModuleRendersPixels) {
+    invokeAndExpectTriangle(runtime(), GetParam().manifestPath, true);
+}
+
+TEST_P(RuntimeModuleGraphicsProgramMatrix, ComputeGeneratedVerticesReachGraphicsModule) {
+    invokeAndExpectTriangle(runtime(), fixture("module_mixed").manifestPath, false);
+}
+
+TEST_P(RuntimeModuleGraphicsProgramMatrix, ProgramGraphFusesCookedGraphicsProgramsOnSharedFramebuffer) {
+    expectProgramGraphFusion(runtime(), GetParam().manifestPath);
+}
+
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleGraphicsProgramMatrix,
+                         testing::ValuesIn(moduleGraphicsBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
+                             return std::string(info.param.target);
+                         });
+
+} // namespace

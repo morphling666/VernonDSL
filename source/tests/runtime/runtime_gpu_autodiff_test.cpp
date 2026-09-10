@@ -1,4 +1,6 @@
 #include "VernonRuntime.h"
+#include "program_fixture_manifest_table.h"
+#include "program_fixture_runtime_test.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/autodiff/runtime_gpu_replay.h"
 #include "runtime/program_execution/failure_injection.h"
@@ -12,6 +14,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -229,11 +232,8 @@ VernonStatus canonicalProgramForward(VernonProgramExecutable *pipeline, VernonLa
                                                              pullback);
 }
 
-void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
+void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.get();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -337,13 +337,10 @@ void runNoTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &man
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
+void runNoTapeFailureInjection(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     using namespace vernon::runtime::ad::gpu;
     using namespace vernon::runtime::program_execution;
-    vernon::tests::OwnedRhiRuntime owned(backend);
     VernonRuntimeContext *context = owned.get();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -444,11 +441,9 @@ void runNoTapeFailureInjection(VernonRuntimeBackend backend, const std::filesyst
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath, bool dynamic) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
+void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
+                        bool dynamic) {
     VernonRuntimeContext *context = owned.get();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -563,11 +558,8 @@ void runCapturedTapeVjp(VernonRuntimeBackend backend, const std::filesystem::pat
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
+void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.get();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -674,108 +666,39 @@ void runNonPowerOfTwoReductionVjp(VernonRuntimeBackend backend, const std::files
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-#if defined(VERNON_GPU_AUTODIFF_VULKAN_MANIFEST)
-TEST(RuntimeGpuAutodiff, VulkanNoTapePullbackStaysOnDevice) {
-    runNoTapeVjp(VERNON_RUNTIME_VULKAN, VERNON_GPU_AUTODIFF_VULKAN_MANIFEST);
+const std::vector<vernon::tests::ProgramFixtureManifest> &gpuAutodiffBackendCases() {
+    static const auto cases = vernon::tests::programFixtureCases("gpu_autodiff");
+    return cases;
 }
-TEST(RuntimeGpuAutodiff, VulkanNoTapeFailuresAreTransactional) {
-    runNoTapeFailureInjection(VERNON_RUNTIME_VULKAN, VERNON_GPU_AUTODIFF_VULKAN_MANIFEST);
-}
-#if defined(VERNON_GPU_AUTODIFF_VULKAN_NON_POWER_OF_TWO_MANIFEST)
-TEST(RuntimeGpuAutodiff, VulkanNonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(VERNON_RUNTIME_VULKAN, VERNON_GPU_AUTODIFF_VULKAN_NON_POWER_OF_TWO_MANIFEST);
-}
-#endif
-#if defined(VERNON_GPU_AUTODIFF_VULKAN_STATIC_MANIFEST)
-TEST(RuntimeGpuAutodiff, VulkanStaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_VULKAN, VERNON_GPU_AUTODIFF_VULKAN_STATIC_MANIFEST, false);
-}
-TEST(RuntimeGpuAutodiff, VulkanDynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_VULKAN, VERNON_GPU_AUTODIFF_VULKAN_DYNAMIC_MANIFEST, true);
-}
-#endif
-#endif
 
-#if defined(VERNON_GPU_AUTODIFF_CUDA_MANIFEST)
-TEST(RuntimeGpuAutodiff, CudaNoTapePullbackStaysOnDevice) {
-    runNoTapeVjp(VERNON_RUNTIME_CUDA, VERNON_GPU_AUTODIFF_CUDA_MANIFEST);
-}
-#if defined(VERNON_GPU_AUTODIFF_CUDA_NON_POWER_OF_TWO_MANIFEST)
-TEST(RuntimeGpuAutodiff, CudaNonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(VERNON_RUNTIME_CUDA, VERNON_GPU_AUTODIFF_CUDA_NON_POWER_OF_TWO_MANIFEST);
-}
-#endif
-#if defined(VERNON_GPU_AUTODIFF_CUDA_STATIC_MANIFEST)
-TEST(RuntimeGpuAutodiff, CudaStaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_CUDA, VERNON_GPU_AUTODIFF_CUDA_STATIC_MANIFEST, false);
-}
-TEST(RuntimeGpuAutodiff, CudaDynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_CUDA, VERNON_GPU_AUTODIFF_CUDA_DYNAMIC_MANIFEST, true);
-}
-#endif
-#endif
+class RuntimeGpuAutodiffMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::computeFixtureRequirements(GetParam().runtime);
+    }
+};
 
-#if defined(VERNON_GPU_AUTODIFF_DIRECTX_MANIFEST)
-TEST(RuntimeGpuAutodiff, DirectXNoTapePullbackStaysOnDevice) {
-    runNoTapeVjp(VERNON_RUNTIME_DIRECTX12, VERNON_GPU_AUTODIFF_DIRECTX_MANIFEST);
-}
-#if defined(VERNON_GPU_AUTODIFF_DIRECTX_NON_POWER_OF_TWO_MANIFEST)
-TEST(RuntimeGpuAutodiff, DirectXNonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(VERNON_RUNTIME_DIRECTX12, VERNON_GPU_AUTODIFF_DIRECTX_NON_POWER_OF_TWO_MANIFEST);
-}
-#endif
-#if defined(VERNON_GPU_AUTODIFF_DIRECTX_STATIC_MANIFEST)
-TEST(RuntimeGpuAutodiff, DirectXStaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_DIRECTX12, VERNON_GPU_AUTODIFF_DIRECTX_STATIC_MANIFEST, false);
-}
-TEST(RuntimeGpuAutodiff, DirectXDynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_DIRECTX12, VERNON_GPU_AUTODIFF_DIRECTX_DYNAMIC_MANIFEST, true);
-}
-#endif
-#endif
+TEST_P(RuntimeGpuAutodiffMatrix, NoTapePullbackStaysOnDevice) { runNoTapeVjp(owned(), GetParam().manifestPath); }
 
-#if defined(VERNON_GPU_AUTODIFF_METAL_MANIFEST)
-TEST(RuntimeGpuAutodiff, MetalNoTapePullbackStaysOnDevice) {
-    runNoTapeVjp(VERNON_RUNTIME_METAL, VERNON_GPU_AUTODIFF_METAL_MANIFEST);
+TEST_P(RuntimeGpuAutodiffMatrix, NoTapeFailuresAreTransactional) {
+    runNoTapeFailureInjection(owned(), GetParam().manifestPath);
 }
-TEST(RuntimeGpuAutodiff, MetalNoTapeFailuresAreTransactional) {
-    runNoTapeFailureInjection(VERNON_RUNTIME_METAL, VERNON_GPU_AUTODIFF_METAL_MANIFEST);
-}
-#if defined(VERNON_GPU_AUTODIFF_METAL_NON_POWER_OF_TWO_MANIFEST)
-TEST(RuntimeGpuAutodiff, MetalNonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(VERNON_RUNTIME_METAL, VERNON_GPU_AUTODIFF_METAL_NON_POWER_OF_TWO_MANIFEST);
-}
-#endif
-#if defined(VERNON_GPU_AUTODIFF_METAL_STATIC_MANIFEST)
-TEST(RuntimeGpuAutodiff, MetalStaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_METAL, VERNON_GPU_AUTODIFF_METAL_STATIC_MANIFEST, false);
-}
-TEST(RuntimeGpuAutodiff, MetalDynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_METAL, VERNON_GPU_AUTODIFF_METAL_DYNAMIC_MANIFEST, true);
-}
-#endif
-#endif
 
-#if defined(VERNON_GPU_AUTODIFF_OPENGL_MANIFEST)
-TEST(RuntimeGpuAutodiff, OpenGLNoTapePullbackStaysOnDevice) {
-    runNoTapeVjp(VERNON_RUNTIME_OPENGL, VERNON_GPU_AUTODIFF_OPENGL_MANIFEST);
+TEST_P(RuntimeGpuAutodiffMatrix, NonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
+    runNonPowerOfTwoReductionVjp(owned(), fixture("gpu_autodiff_non_power_of_two").manifestPath);
 }
-TEST(RuntimeGpuAutodiff, OpenGLNoTapeFailuresAreTransactional) {
-    runNoTapeFailureInjection(VERNON_RUNTIME_OPENGL, VERNON_GPU_AUTODIFF_OPENGL_MANIFEST);
+
+TEST_P(RuntimeGpuAutodiffMatrix, StaticTapeUsesBoundedReplay) {
+    runCapturedTapeVjp(owned(), fixture("gpu_autodiff_static").manifestPath, false);
 }
-#if defined(VERNON_GPU_AUTODIFF_OPENGL_NON_POWER_OF_TWO_MANIFEST)
-TEST(RuntimeGpuAutodiff, OpenGLNonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(VERNON_RUNTIME_OPENGL, VERNON_GPU_AUTODIFF_OPENGL_NON_POWER_OF_TWO_MANIFEST);
+
+TEST_P(RuntimeGpuAutodiffMatrix, DynamicTapeUsesBoundedReplay) {
+    runCapturedTapeVjp(owned(), fixture("gpu_autodiff_dynamic").manifestPath, true);
 }
-#endif
-#if defined(VERNON_GPU_AUTODIFF_OPENGL_STATIC_MANIFEST)
-TEST(RuntimeGpuAutodiff, OpenGLStaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_OPENGL, VERNON_GPU_AUTODIFF_OPENGL_STATIC_MANIFEST, false);
-}
-TEST(RuntimeGpuAutodiff, OpenGLDynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(VERNON_RUNTIME_OPENGL, VERNON_GPU_AUTODIFF_OPENGL_DYNAMIC_MANIFEST, true);
-}
-#endif
-#endif
+
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeGpuAutodiffMatrix, testing::ValuesIn(gpuAutodiffBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
+                             return std::string(info.param.target);
+                         });
 
 } // namespace

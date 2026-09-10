@@ -2,6 +2,7 @@
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
 #include "backend_test_matrix.h"
+#include "program_fixture_manifest_table.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <algorithm>
@@ -21,48 +22,6 @@ class RhiRuntimeSynchronization : public testing::TestWithParam<vernon::tests::B
 
 #if defined(VERNON_SYNCHRONIZATION_FIXTURES_AVAILABLE)
 extern "C" VernonStatus vernonRegisterSynchronizationProgramFixture(void);
-
-#ifndef VERNON_SYNCHRONIZATION_CPU_MANIFEST
-#define VERNON_SYNCHRONIZATION_CPU_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_CUDA_MANIFEST
-#define VERNON_SYNCHRONIZATION_CUDA_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_VULKAN_MANIFEST
-#define VERNON_SYNCHRONIZATION_VULKAN_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST
-#define VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_METAL_MANIFEST
-#define VERNON_SYNCHRONIZATION_METAL_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_OPENGL_MANIFEST
-#define VERNON_SYNCHRONIZATION_OPENGL_MANIFEST ""
-#endif
-#ifndef VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST
-#define VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST ""
-#endif
-
-const char *synchronizationManifest(VernonTarget target) {
-    switch (target) {
-    case VERNON_TARGET_CPU:
-        return VERNON_SYNCHRONIZATION_CPU_MANIFEST;
-    case VERNON_TARGET_CUDA:
-        return VERNON_SYNCHRONIZATION_CUDA_MANIFEST;
-    case VERNON_TARGET_VULKAN:
-        return VERNON_SYNCHRONIZATION_VULKAN_MANIFEST;
-    case VERNON_TARGET_DIRECTX:
-        return VERNON_SYNCHRONIZATION_DIRECTX_MANIFEST;
-    case VERNON_TARGET_METAL:
-        return VERNON_SYNCHRONIZATION_METAL_MANIFEST;
-    case VERNON_TARGET_OPENGL:
-        return VERNON_SYNCHRONIZATION_OPENGL_MANIFEST;
-    case VERNON_TARGET_OPENGL_ES:
-        return VERNON_SYNCHRONIZATION_OPENGLES_MANIFEST;
-    }
-    return "";
-}
 #endif
 
 std::string stringValue(VernonStringView value) {
@@ -143,7 +102,9 @@ TEST(CompilerRuntimeSynchronization, CanonicalCpuProgramExecutesCooperativeWorkg
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
     {
-        vernon::tests::OwnedProgramExecutable program(runtime, VERNON_SYNCHRONIZATION_CPU_MANIFEST);
+        const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
+        ASSERT_NE(fixture, nullptr);
+        vernon::tests::OwnedProgramExecutable program(runtime, std::string(fixture->manifestPath));
         ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(runtime));
 
         std::array<int32_t, 10> result{};
@@ -178,7 +139,9 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
     ASSERT_EQ(vernonRegisterSynchronizationProgramFixture(), VERNON_STATUS_OK);
     VernonRuntimeContext *runtime = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
     ASSERT_NE(runtime, nullptr);
-    const std::filesystem::path manifestPath = VERNON_SYNCHRONIZATION_CPU_MANIFEST;
+    const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", VERNON_RUNTIME_CPU);
+    ASSERT_NE(fixture, nullptr);
+    const std::filesystem::path manifestPath = std::string(fixture->manifestPath);
     std::ifstream input(manifestPath, std::ios::binary);
     const std::string manifest{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
     ASSERT_FALSE(manifest.empty());
@@ -288,6 +251,13 @@ TEST_P(RhiRuntimeSynchronization, CanonicalProgramExecutesIndependentWorkgroupBa
     vernon::tests::BackendTestRequirements requirements;
     requirements.compute = true;
     requirements.storageBuffers = true;
+    if (backend.runtime == VERNON_RUNTIME_OPENGL) {
+        requirements.minimumApiMajor = 4;
+        requirements.minimumApiMinor = 3;
+    } else if (backend.runtime == VERNON_RUNTIME_OPENGL_ES) {
+        requirements.minimumApiMajor = 3;
+        requirements.minimumApiMinor = 1;
+    }
     VernonCompilerContext *compiler = vernonCompilerCreate();
     ASSERT_NE(compiler, nullptr);
     const vernon::tests::BackendProbeResult compilerProbe =
@@ -296,21 +266,20 @@ TEST_P(RhiRuntimeSynchronization, CanonicalProgramExecutesIndependentWorkgroupBa
         vernonCompilerDestroy(compiler);
         GTEST_SKIP() << compilerProbe.reason;
     }
+    vernonCompilerDestroy(compiler);
     vernon::tests::OwnedRhiRuntime owned(backend.runtime, nullptr, backend.runtime == VERNON_RUNTIME_DIRECTX12);
     vernon::tests::RhiRuntime &context = owned.context();
     const vernon::tests::BackendProbeResult runtimeProbe =
         vernon::tests::probeRuntimeBackend(backend, requirements, context.runtime);
     if (!runtimeProbe.available()) {
-        vernonCompilerDestroy(compiler);
         if (runtimeProbe.skippable())
             GTEST_SKIP() << runtimeProbe.reason;
         FAIL() << runtimeProbe.reason;
+        return;
     }
-    vernonCompilerDestroy(compiler);
-    const char *manifest = synchronizationManifest(backend.compiler);
-    ASSERT_NE(manifest, nullptr);
-    ASSERT_NE(*manifest, '\0');
-    vernon::tests::OwnedProgramExecutable program(context.runtime, manifest);
+    const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", backend.runtime);
+    ASSERT_NE(fixture, nullptr);
+    vernon::tests::OwnedProgramExecutable program(context.runtime, std::string(fixture->manifestPath));
     ASSERT_TRUE(program) << stringValue(vernonRuntimeGetLastError(context.runtime));
 
     std::array<int32_t, 10> result{};

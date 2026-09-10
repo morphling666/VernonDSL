@@ -1,12 +1,12 @@
 #include "../support/runtime_rhi_test_utils.h"
 #include "VernonRuntime.h"
+#include "program_fixture_runtime_test.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -56,11 +56,8 @@ VernonProgramBindingToken bindingToken(const char *value) {
     return {sizeof(VernonProgramBindingToken), value, std::strlen(value)};
 }
 
-void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
+void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.runtime();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -219,11 +216,8 @@ void runModuleProgram(VernonRuntimeBackend backend, const std::filesystem::path 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(owned.device(), seedBuffer), VERNON_RHI_STATUS_OK);
 }
 
-void runProgramGraphNodePullback(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
+void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     VernonRuntimeContext *context = owned.runtime();
-    if (!context)
-        GTEST_SKIP() << "GPU backend is unavailable";
 
     std::ifstream input(manifestPath, std::ios::binary);
     ASSERT_TRUE(input);
@@ -398,10 +392,7 @@ void destroyProgram(LoadedProgram &program) {
     program = {};
 }
 
-void runReusedStageModule(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
-    if (!owned.runtime())
-        GTEST_SKIP() << "GPU backend is unavailable";
+void runReusedStageModule(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     LoadedProgram program = loadProgram(owned, manifestPath);
     ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
     ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
@@ -471,10 +462,7 @@ void runReusedStageModule(VernonRuntimeBackend backend, const std::filesystem::p
     destroyProgram(program);
 }
 
-void runTensorViewChainModule(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
-    if (!owned.runtime())
-        GTEST_SKIP() << "GPU backend is unavailable";
+void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     LoadedProgram program = loadProgram(owned, manifestPath);
     ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
     ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
@@ -546,10 +534,7 @@ void runTensorViewChainModule(VernonRuntimeBackend backend, const std::filesyste
     destroyProgram(program);
 }
 
-void runDynamicShapeGridReuse(VernonRuntimeBackend backend, const std::filesystem::path &manifestPath) {
-    vernon::tests::OwnedRhiRuntime owned(backend);
-    if (!owned.runtime())
-        GTEST_SKIP() << "GPU backend is unavailable";
+void runDynamicShapeGridReuse(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
     LoadedProgram program = loadProgram(owned, manifestPath);
     ASSERT_NE(program.bundle, nullptr) << lastError(owned.runtime());
     ASSERT_NE(program.executable, nullptr) << lastError(owned.runtime());
@@ -635,92 +620,41 @@ void runDynamicShapeGridReuse(VernonRuntimeBackend backend, const std::filesyste
     destroyProgram(program);
 }
 
+const std::vector<vernon::tests::ProgramFixtureManifest> &moduleProgramBackendCases() {
+    static const auto cases = vernon::tests::programFixtureCases("module_program");
+    return cases;
+}
+
+class RuntimeModuleProgramGpuCApi : public vernon::tests::ProgramFixtureRuntimeTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::computeFixtureRequirements(GetParam().runtime);
+    }
+};
+
+TEST_P(RuntimeModuleProgramGpuCApi, ComputeModuleForward9AndVjpGradient6) {
+    runModuleProgram(owned(), GetParam().manifestPath);
+}
+
+TEST_P(RuntimeModuleProgramGpuCApi, ProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(owned(), GetParam().manifestPath);
+}
+
+TEST_P(RuntimeModuleProgramGpuCApi, ReusesOneStageAcrossDifferentNodeProjections) {
+    runReusedStageModule(owned(), fixture("reused_stage").manifestPath);
+}
+
+TEST_P(RuntimeModuleProgramGpuCApi, ChainsDistinctComputeKernelsThroughTensorViews) {
+    runTensorViewChainModule(owned(), fixture("tensor_view_chain").manifestPath);
+}
+
+TEST_P(RuntimeModuleProgramGpuCApi, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
+    runDynamicShapeGridReuse(owned(), fixture("dynamic_shape_grid").manifestPath);
+}
+
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleProgramGpuCApi, testing::ValuesIn(moduleProgramBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
+                             return std::string(info.param.target);
+                         });
+
 } // namespace
-
-#if defined(VERNON_MODULE_PROGRAM_VULKAN_MANIFEST)
-TEST(RuntimeModuleProgramGpuCApi, VulkanComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(VERNON_RUNTIME_VULKAN, VERNON_MODULE_PROGRAM_VULKAN_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, VulkanProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(VERNON_RUNTIME_VULKAN, VERNON_MODULE_PROGRAM_VULKAN_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, VulkanReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(VERNON_RUNTIME_VULKAN, VERNON_REUSED_STAGE_VULKAN_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, VulkanChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(VERNON_RUNTIME_VULKAN, VERNON_TENSOR_VIEW_CHAIN_VULKAN_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, VulkanReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    runDynamicShapeGridReuse(VERNON_RUNTIME_VULKAN, VERNON_DYNAMIC_SHAPE_GRID_VULKAN_MANIFEST);
-}
-#endif
-
-#if defined(VERNON_MODULE_PROGRAM_CUDA_MANIFEST)
-TEST(RuntimeModuleProgramGpuCApi, CudaComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(VERNON_RUNTIME_CUDA, VERNON_MODULE_PROGRAM_CUDA_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, CudaProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(VERNON_RUNTIME_CUDA, VERNON_MODULE_PROGRAM_CUDA_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, CudaReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(VERNON_RUNTIME_CUDA, VERNON_REUSED_STAGE_CUDA_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, CudaChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(VERNON_RUNTIME_CUDA, VERNON_TENSOR_VIEW_CHAIN_CUDA_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, CudaReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    runDynamicShapeGridReuse(VERNON_RUNTIME_CUDA, VERNON_DYNAMIC_SHAPE_GRID_CUDA_MANIFEST);
-}
-#endif
-
-#if defined(VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST)
-TEST(RuntimeModuleProgramGpuCApi, DirectX12ComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, DirectX12ProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(VERNON_RUNTIME_DIRECTX12, VERNON_MODULE_PROGRAM_DIRECTX_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, DirectX12ReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(VERNON_RUNTIME_DIRECTX12, VERNON_REUSED_STAGE_DIRECTX_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, DirectX12ChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(VERNON_RUNTIME_DIRECTX12, VERNON_TENSOR_VIEW_CHAIN_DIRECTX_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, DirectX12ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    runDynamicShapeGridReuse(VERNON_RUNTIME_DIRECTX12, VERNON_DYNAMIC_SHAPE_GRID_DIRECTX_MANIFEST);
-}
-#endif
-
-#if defined(VERNON_MODULE_PROGRAM_METAL_MANIFEST)
-TEST(RuntimeModuleProgramGpuCApi, MetalComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(VERNON_RUNTIME_METAL, VERNON_MODULE_PROGRAM_METAL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, MetalProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(VERNON_RUNTIME_METAL, VERNON_MODULE_PROGRAM_METAL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, MetalReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(VERNON_RUNTIME_METAL, VERNON_REUSED_STAGE_METAL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, MetalChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(VERNON_RUNTIME_METAL, VERNON_TENSOR_VIEW_CHAIN_METAL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, MetalReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    runDynamicShapeGridReuse(VERNON_RUNTIME_METAL, VERNON_DYNAMIC_SHAPE_GRID_METAL_MANIFEST);
-}
-#endif
-
-TEST(RuntimeModuleProgramGpuCApi, OpenGLComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(VERNON_RUNTIME_OPENGL, VERNON_MODULE_PROGRAM_OPENGL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, OpenGLProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(VERNON_RUNTIME_OPENGL, VERNON_MODULE_PROGRAM_OPENGL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, OpenGLReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(VERNON_RUNTIME_OPENGL, VERNON_REUSED_STAGE_OPENGL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, OpenGLChainsDistinctComputeKernelsThroughTensorViews) {
-    runTensorViewChainModule(VERNON_RUNTIME_OPENGL, VERNON_TENSOR_VIEW_CHAIN_OPENGL_MANIFEST);
-}
-TEST(RuntimeModuleProgramGpuCApi, OpenGLReusesLoadedProgramAcrossDynamicShapesAndGrids) {
-    runDynamicShapeGridReuse(VERNON_RUNTIME_OPENGL, VERNON_DYNAMIC_SHAPE_GRID_OPENGL_MANIFEST);
-}
