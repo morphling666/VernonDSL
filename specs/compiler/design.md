@@ -140,8 +140,10 @@ Neither bundle planning nor serialization imports the Python frontend or
 Runtime, allowing cooked-manifest identity to be tested independently of
 compiler and device availability.
 
-Runtime TensorStorage, TensorView, TensorLayout, and Texture implementations live in
-`_runtime.resources`. They resolve the owning session only when allocating or
+Runtime TensorStorage, TensorView, and TensorLayout implementations live in
+`_runtime.tensor`; Texture and Sampler implementations live in
+`_runtime.texture` and `_runtime.sampler`. There is no aggregate compatibility
+facade. These modules resolve the owning session only when allocating or
 registering a resource, so importing annotation/resource types does not create
 a session import cycle. Runtime generation, native context ownership, and child
 invalidation remain session state; resources never cache a copied global

@@ -34,10 +34,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--target",
-        choices=("cpu", "cuda", "opengl", "opengles", "vulkan", "metal", "directx", "dx"),
+        choices=("cpu", "cuda", "opengl", "opengles", "vulkan", "metal", "directx"),
         default="opengl",
         help=(
-            "compiler target (default: opengl); dx is an alias for directx. "
+            "compiler target (default: opengl). "
             "A recognized target may still report unsupported when its complete lowering is not built."
         ),
     )
@@ -113,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
                 {"shader_model": arguments.directx_shader_model} if arguments.directx_shader_model is not None else {}
             ),
         }
-        target = "directx" if arguments.target == "dx" else arguments.target
+        target = arguments.target
         selected_options = option_values.get(target, {})
         supplied_groups = {
             "cpu": any(

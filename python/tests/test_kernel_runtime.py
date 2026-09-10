@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import runpy
+import tempfile
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -15,6 +17,9 @@ from aggregate_vertex_shader import (
     copy_complex_aggregate_tensor_view,
     inspect_multidimensional_aggregate_tensor_value,
 )
+from language_contract_cases import case_by_id
+from language_contract_runner import contract_oracle
+from language_contract_traceability import covers_case
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.host_values import host_abi_layout
 
@@ -1342,15 +1347,38 @@ class KernelTests(unittest.TestCase):
         fill(second, 1.0, grid=(3, 2, 1))
         self.assertEqual(fill.compile_count, 1)
 
+    def test_device_and_workgroup_float_atomics_contend_in_one_dispatch(self) -> None:
+        case = case_by_id("LANG-PAIR-007/workgroup-atomic-contention")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / f"{case.name}.py"
+            path.write_text(case.source, encoding="utf-8")
+            kernel = runpy.run_path(path)["main"]
+            assert callable(kernel)
+            output = vd.storage.zeros(dtype=vd.f32, shape=(2,))
+            kernel(output, grid=(4, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), np.array([16.0, 16.0], dtype=np.float32))
+
+    @covers_case("LANG-DISPATCH-001/zero-grid-axis", layers="F")
     def test_grid_is_inferred_and_validated(self) -> None:
+        case = case_by_id("LANG-PAIR-014/injectivity-dynamic-launch")
+        dispatch_case = case_by_id("LANG-DISPATCH-001/dynamic-grid")
+        invalid_dispatch_case = case_by_id("LANG-DISPATCH-001/zero-grid-axis")
+        assert isinstance(dispatch_case.expected, tuple)
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-        fill(output, 1.0)
+        fill(output, 1.0, grid=dispatch_case.expected)
         np.testing.assert_array_equal(
             output.to_numpy(),
             np.array([[0, 1, 2], [1, 2, 3]], dtype=np.float32),
         )
-        with self.assertRaises(ValueError):
+        assert invalid_dispatch_case.expected_diagnostic is not None
+        with (
+            contract_oracle(invalid_dispatch_case),
+            self.assertRaisesRegex(ValueError, invalid_dispatch_case.expected_diagnostic),
+        ):
             fill(output, 1.0, grid=(3, 0, 1))
+        overlapping = output.view(shape=(2, 2), strides=(1, 1), access="write")
+        with self.subTest(case=case.id), self.assertRaisesRegex(ValueError, "overlap|injective"):
+            fill(overlapping, 1.0, grid=(2, 2, 1))
 
     def test_cpu_host_tensor_avoids_device_residency(self) -> None:
         output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))

@@ -118,6 +118,7 @@ void bindNativeCompiler(nb::module_ &module) {
                nb::arg("names"), nb::arg("values"));
     nb::class_<Compiler>(module, "Compiler")
         .def(nb::init<>())
+        .def("verify_program_result", &verifyProgramResult, nb::arg("mlir"))
         .def("analyze_program_result", &analyzeProgramResult, nb::arg("mlir"))
         .def("plan_program_result", &planProgramResult, nb::arg("program"))
         // shape_facts fill graphics image/attachment extents only. Compute TensorView dyn

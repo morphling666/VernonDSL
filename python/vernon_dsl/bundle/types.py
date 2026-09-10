@@ -160,7 +160,6 @@ TargetOptions: TypeAlias = (
 
 def make_target_options(target: str, options: Mapping[str, Any] | None = None) -> TargetOptions:
     values = dict(options or {})
-    target = "directx" if target == "dx" else target
     constructors = {
         "cpu": CpuTargetOptions,
         "opengl": OpenGLTargetOptions,

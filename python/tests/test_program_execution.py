@@ -9,6 +9,7 @@ from typing import Annotated
 
 import numpy as np
 import vernon_dsl as vd
+from language_contract_cases import case_by_id
 from vernon_dsl._program_assets.capture import capture_program
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.program_assets import cook_program_asset
@@ -330,13 +331,15 @@ class ProgramExecutionTests(unittest.TestCase):
             capture_program(declaration)
 
     def test_module_orders_dependent_kernels(self) -> None:
+        case = case_by_id("LANG-PROGRAM-001/module-composition")
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
         module = IncrementChain()
 
         first = module(source)
         second = module(vd.storage.from_numpy(np.arange(4, dtype=np.float32) + 10.0))
 
-        np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
+        with self.subTest(case=case.id):
+            np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 12.0)
         self.assertEqual(len(module._program_cache), 1)
 
@@ -432,6 +435,7 @@ class ProgramExecutionTests(unittest.TestCase):
         )
 
     def test_module_vjp_accumulates_branch_fan_in(self) -> None:
+        case = case_by_id("LANG-PAIR-012/module-fan-in-out-versions")
         source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
         outputs, pullback = vd.ad.vjp(
             FanOut(),
@@ -439,7 +443,8 @@ class ProgramExecutionTests(unittest.TestCase):
             outputs=("square", "cube"),
         )(source)
 
-        np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
+        with self.subTest(case=case.id):
+            np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
         gradient = pullback(
             {
@@ -448,6 +453,24 @@ class ProgramExecutionTests(unittest.TestCase):
             }
         )["source"]
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
+
+    def test_module_vjp_retains_signed_stride_view_layout(self) -> None:
+        case = case_by_id("LANG-PAIR-011/vjp-signed-stride-view")
+        owner = vd.storage.from_numpy(np.array([10.0, 2.0, 20.0, 3.0], dtype=np.float32))
+        source = owner.view(shape=(2,), strides=(-2,), offset=3, access="read")
+        output, pullback = vd.ad.vjp(
+            StridedSquareSum(),
+            wrt=("source",),
+            outputs=("output",),
+        )(source)
+
+        with self.subTest(case=case.id):
+            np.testing.assert_array_equal(output.to_numpy(), np.array([13.0], dtype=np.float32))
+        gradient = pullback({"output": np.ones((1,), dtype=np.float32)})["source"]
+        np.testing.assert_array_equal(
+            gradient.to_numpy(),
+            np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32),
+        )
 
     def test_module_vjp_returns_multiple_input_gradients(self) -> None:
         left = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
@@ -614,22 +637,6 @@ class ProgramGpuExecutionTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls) -> None:
         vd.init(arch=vd.cpu)
-
-    def test_gpu_module_vjp_retains_non_contiguous_view_layout(self) -> None:
-        owner = vd.storage.from_numpy(np.array([10.0, 2.0, 20.0, 3.0], dtype=np.float32))
-        source = owner.view(shape=(2,), strides=(-2,), offset=3, access="read")
-        output, pullback = vd.ad.vjp(
-            StridedSquareSum(),
-            wrt=("source",),
-            outputs=("output",),
-        )(source)
-
-        np.testing.assert_array_equal(output.to_numpy(), np.array([13.0], dtype=np.float32))
-        gradient = pullback({"output": np.ones((1,), dtype=np.float32)})["source"]
-        np.testing.assert_array_equal(
-            gradient.to_numpy(),
-            np.array([0.0, 4.0, 0.0, 6.0], dtype=np.float32),
-        )
 
     def test_gpu_module_binds_texture_as_forward_resource(self) -> None:
         image = vd.Texture.from_numpy(

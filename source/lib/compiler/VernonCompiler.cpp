@@ -7,6 +7,7 @@
 #include "compiler_program_implementation.h"
 #include "compiler_program_stage.h"
 #include "compiler_program_storage.h"
+#include "compiler_python_bridge.h"
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -90,6 +91,18 @@ VernonTargetCapabilities vernonCompilerGetTargetCapabilities(const VernonCompile
     if (!context || target < VERNON_TARGET_CPU || target > VERNON_TARGET_CUDA)
         return VernonTargetCapabilities{0, 0, 0, 0, 0};
     return vernon::compiler::targetCapabilities(target);
+}
+
+VernonCompileResult *vernonCompilerVerifyPythonMlir(VernonCompilerContext *context, const char *source,
+                                                    size_t sourceSize) {
+    auto result = std::make_unique<VernonCompileResult>();
+    if (!context || (!source && sourceSize != 0)) {
+        result->status = VERNON_STATUS_INVALID_ARGUMENT;
+        result->diagnostics = "context and source must be valid";
+        return result.release();
+    }
+    result->status = vernon::compiler::verifyMlir(*context->frontend, source, sourceSize, result->diagnostics);
+    return result.release();
 }
 
 VernonCompileResult *vernonCompilerValidateMlir(VernonCompilerContext *context, const char *source, size_t sourceSize) {

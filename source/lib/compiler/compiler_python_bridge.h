@@ -62,6 +62,9 @@ typedef struct VernonPythonProgramBuiltinView {
  * Private bridge for the in-tree Python extension. It is exported from the
  * compiler DLL but is not installed and is not part of the public C ABI.
  */
+VERNON_DSL_CAPI VernonCompileResult *vernonCompilerVerifyPythonMlir(VernonCompilerContext *context, const char *source,
+                                                                    size_t source_size);
+
 VERNON_DSL_CAPI VernonPythonValueAbiPlan *vernonCompilerPlanPythonValueAbi(VernonStringView module,
                                                                            const VernonStringView *logical_dtypes,
                                                                            size_t logical_dtype_count);

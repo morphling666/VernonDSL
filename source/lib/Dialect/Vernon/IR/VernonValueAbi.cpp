@@ -179,8 +179,6 @@ FailureOr<PlannedLayout> planProduct(Type type, ArrayRef<ResolvedStructField> fi
 
 FailureOr<PlannedLayout> planTensor(Type container, Type element, ArrayRef<int64_t> shape, ModuleOp module,
                                     SmallVectorImpl<StringRef> &activeStructs) {
-    if (shape.empty())
-        return failure();
     uint64_t count = 1;
     for (int64_t extent : shape) {
         if (extent <= 0)
@@ -826,7 +824,7 @@ FailureOr<WorkgroupPhysicalStoragePlan> getWorkgroupPhysicalStoragePlan(TensorVi
     constexpr uint64_t allocationAlignment = 16;
     if (view.getAddressSpace() != "workgroup")
         return failure();
-    if (view.getShape().empty() || llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
+    if (llvm::any_of(view.getShape(), [](int64_t extent) { return extent <= 0; }))
         return failure();
 
     FailureOr<ValueAbiLayout> layout = getValueStorageLayout(view.getElementType(), module);

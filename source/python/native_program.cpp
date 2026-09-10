@@ -261,6 +261,11 @@ std::unique_ptr<CompiledProgram> analyzeProgramResult(Compiler &compiler, const 
                                              VERNON_TARGET_CPU);
 }
 
+std::unique_ptr<CompiledProgram> verifyProgramResult(Compiler &compiler, const std::string &mlir) {
+    return std::make_unique<CompiledProgram>(vernonCompilerVerifyPythonMlir(compiler.context, mlir.data(), mlir.size()),
+                                             VERNON_TARGET_CPU);
+}
+
 std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,
                                                                        const nb::dict &targetOptions) {
     const CpuTargetOptionStrings cpu = parseCpuTargetOptions(targetOptions);

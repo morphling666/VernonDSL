@@ -4,6 +4,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from language_contract_cases import (
+    BUILTIN_INVALID_CASES,
+    GENERATED_BUILTIN_VALID_CASES,
+    RAW_BUILTIN_VALID_CASES,
+    case_by_id,
+)
+from language_contract_runner import assert_frontend_rejects, assert_verified_ir, contract_oracle
+from language_contract_traceability import covers_case, covers_case_group
 from vernon_dsl import CompileError, compile_file, compile_source
 from vernon_dsl.cli import main
 from vernon_dsl.types import SpecializationAssignment
@@ -52,67 +60,39 @@ def resources(
         self.assertIn(": f16", output)
         self.assertIn(": f64", output)
 
+    @covers_case("LANG-RESOURCE-002/sampled-2d", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-3d", layers="FI")
+    @covers_case("LANG-RESOURCE-002/sampled-cube", layers="FI")
     def test_texture_dimensions_and_coordinate_ranks(self) -> None:
-        for dimension, rank in (("2d", 2), ("3d", 3), ("cube", 3)):
-            source = f"""
-from vernon_dsl import *
-
-@fragment
-def sample(
-    image: Annotated[Texture["{dimension}", f32], resource(set=0, binding=0)],
-    sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: Vector[f32, {rank}],
-) -> Vector[f32, 4]:
-    return texture_sample(image, sampler, uv)
-"""
-            output = compile_source(source, f"texture_{dimension}.py")
-            self.assertIn(f'!vernon.texture<"{dimension}", f32, "unknown", "sampled">', output)
+        cases = (
+            case_by_id("LANG-RESOURCE-002/sampled-2d"),
+            case_by_id("LANG-RESOURCE-002/sampled-3d"),
+            case_by_id("LANG-RESOURCE-002/sampled-cube"),
+        )
+        for case in cases:
+            output = compile_source(case.source, f"{case.name}.py")
+            assert_verified_ir(self, output, case)
+            assert isinstance(case.expected, str)
+            self.assertIn(case.expected, output)
             self.assertIn('name = "texture_sample"', output)
 
+    @covers_case("LANG-RESOURCE-002/sampled-dimension", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank", layers="F")
     def test_texture_dimension_and_coordinate_rank_are_validated(self) -> None:
-        invalid_dimension = """
-from vernon_dsl import *
-@fragment
-def sample(image: Texture["1d", f32]) -> f32:
-    return 0.0
-"""
-        with self.assertRaisesRegex(CompileError, "texture dimension must be one of"):
-            compile_source(invalid_dimension, "bad_dimension.py")
+        assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/sampled-dimension"))
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/cube-coordinate-rank"))
 
-        invalid_coordinates = """
-from vernon_dsl import *
-@fragment
-def sample(image: Texture["cube", f32], sampler: Sampler,
-           uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, sampler, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "3-component"):
-            compile_source(invalid_coordinates, "bad_coordinates.py")
-
+    @covers_case("LANG-TEXTURE-STORAGE/three-dimensional-store", layers="FI")
+    @covers_case("LANG-RESOURCE-002/cube-storage", layers="F")
     def test_storage_texture_uses_unified_texture_annotation(self) -> None:
-        source = """
-from vernon_dsl import *
-
-@kernel
-def store(
-    image: Annotated[Texture["3d", rgba32_float, write], resource(set=0, binding=0)],
-    coordinate: Vector[i32, 3],
-    value: Vector[f32, 4],
-) -> None:
-    texture_store(image, coordinate, value)
-"""
-        output = compile_source(source, "storage_texture.py")
-        self.assertIn('!vernon.texture<"3d", f32, "rgba32_float", "write">', output)
+        case = case_by_id("LANG-TEXTURE-STORAGE/three-dimensional-store")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
+        assert isinstance(case.expected, str)
+        self.assertIn(case.expected, output)
         self.assertIn('name = "texture_store"', output)
 
-        invalid = """
-from vernon_dsl import *
-@kernel
-def bad(image: Texture["cube", rgba32_float, write]) -> None:
-    pass
-"""
-        with self.assertRaisesRegex(CompileError, "storage Texture dimension"):
-            compile_source(invalid, "bad_storage_texture.py")
+        assert_frontend_rejects(self, case_by_id("LANG-RESOURCE-002/cube-storage"))
 
     def test_sampling_overloads_and_texture_size(self) -> None:
         source = """
@@ -160,62 +140,36 @@ def main(image: Texture["2d", f32], sampler: Sampler,
         )
         self.assertNotIn('vernon.implicit = "sampler"', explicit_only)
 
+    @covers_case("LANG-TEXTURE-SAMPLE-IMPLICIT/vertex-without-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-LOD/integer-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SIZE/floating-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/compute-without-lod", layers="F")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/vertex", layers="FI")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/compute", layers="FI")
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/fragment", layers="FI")
     def test_sampling_stage_and_lod_types_are_validated(self) -> None:
-        vertex_implicit_lod = """
-from vernon_dsl import *
-@vertex
-def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "without lod"):
-            compile_source(vertex_implicit_lod, "vertex_implicit_lod.py")
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-IMPLICIT/vertex-without-lod"))
 
-        vertex_explicit_lod = """
-from vernon_dsl import *
-@vertex
-def main(image: Texture["2d", f32], sampler: Sampler,
-         uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    height = texture_sample(image, sampler, uv, 0.0)
-    return Vector([uv, height.x, 1.0])
-"""
-        output = compile_source(vertex_explicit_lod, "vertex_explicit_lod.py")
+        vertex_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/vertex")
+        output = compile_source(vertex_case.source, f"{vertex_case.name}.py")
+        assert_verified_ir(self, output, vertex_case)
         self.assertIn('name = "texture_sample"', output)
 
-        invalid_sample_lod = """
-from vernon_dsl import *
-@fragment
-def main(image: Texture["2d", f32], uv: Vector[f32, 2]) -> Vector[f32, 4]:
-    return texture_sample(image, uv, 1)
-"""
-        with self.assertRaisesRegex(CompileError, "floating-point scalar"):
-            compile_source(invalid_sample_lod, "invalid_sample_lod.py")
+        for case in (
+            case_by_id("LANG-TEXTURE-SAMPLE-LOD/integer-lod"),
+            case_by_id("LANG-TEXTURE-SIZE/floating-lod"),
+            case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/compute-without-lod"),
+        ):
+            assert_frontend_rejects(self, case)
 
-        invalid_size_lod = """
-from vernon_dsl import *
-@fragment
-def main(image: Texture["2d", f32]) -> Vector[u32, 2]:
-    return texture_size(image, 1.0)
-"""
-        with self.assertRaisesRegex(CompileError, "integer scalar"):
-            compile_source(invalid_size_lod, "invalid_size_lod.py")
+        compute_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/compute")
+        output = compile_source(compute_case.source, f"{compute_case.name}.py")
+        assert_verified_ir(self, output, compute_case)
+        self.assertIn('name = "texture_sample"', output)
 
-        compute_implicit_lod = """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(image: Texture["2d", f32], sampler: Sampler,
-         uv: Vector[f32, 2]) -> None:
-    color = texture_sample(image, sampler, uv)
-"""
-        with self.assertRaisesRegex(CompileError, "without lod.*fragment shaders"):
-            compile_source(compute_implicit_lod, "compute_implicit_lod.py")
-
-        compute_explicit_lod = """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(image: Texture["2d", f32], sampler: Sampler) -> None:
-    color = texture_sample(image, sampler, Vector([0.0, 0.0]), 0.0)
-"""
-        output = compile_source(compute_explicit_lod, "compute_explicit_lod.py")
+        fragment_case = case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT-LOD/fragment")
+        output = compile_source(fragment_case.source, f"{fragment_case.name}.py")
+        assert_verified_ir(self, output, fragment_case)
         self.assertIn('name = "texture_sample"', output)
 
     def test_implicit_sampler_binding_skips_declared_resources(self) -> None:
@@ -266,139 +220,32 @@ def invalid(color: Vector[f32, 3]) -> f32:
 
 
 class StageTests(unittest.TestCase):
+    @covers_case_group("RAW_BUILTIN_VALID_CASES", layers="FI")
     def test_raw_builtin_contracts(self) -> None:
-        source = """
-from vernon_dsl import *
+        output = compile_source(RAW_BUILTIN_VALID_CASES[0].source, "raw_builtins.py")
+        assert_verified_ir(self, output)
+        for case in RAW_BUILTIN_VALID_CASES:
+            with contract_oracle(case):
+                assert isinstance(case.expected, str)
+                self.assertIn(case.expected, output)
 
-@vertex
-def vertex_main(
-    vertex: Annotated[u32, builtin("vertex_index")],
-    instance: Annotated[u32, builtin("instance_index")],
-) -> Annotated[Vector[f32, 4], builtin("position")]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-
-@fragment
-def fragment_main(
-    coordinate: Annotated[Vector[f32, 4], builtin("frag_coord")],
-    facing: Annotated[bool, builtin("front_facing")],
-) -> Vector[f32, 4]:
-    return coordinate
-
-@kernel(workgroup_size=(1, 1, 1))
-def compute_main(
-    global_id: Annotated[Vector[u32, 3], builtin("global_invocation_id")],
-    local_id: Annotated[Vector[u32, 3], builtin("local_invocation_id")],
-    group_id: Annotated[Vector[u32, 3], builtin("workgroup_id")],
-) -> None:
-    pass
-"""
-        output = compile_source(source, "raw_builtins.py")
-        for builtin_name in (
-            "position",
-            "vertex_index",
-            "instance_index",
-            "frag_coord",
-            "front_facing",
-            "global_invocation_id",
-            "local_invocation_id",
-            "workgroup_id",
-        ):
-            self.assertIn(f'vernon.builtin = "{builtin_name}"', output)
-
+    @covers_case_group("BUILTIN_INVALID_CASES", layers="F")
     def test_raw_builtin_contract_diagnostics(self) -> None:
-        cases = (
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main(value: Annotated[u32, builtin("mystery")]) -> Vector[f32, 4]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-""",
-                "unknown builtin 'mystery'",
-            ),
-            (
-                """
-from vernon_dsl import *
-@fragment
-def main(value: Annotated[u32, builtin("vertex_index")]) -> Vector[f32, 4]:
-    return Vector([0.0, 0.0, 0.0, 1.0])
-""",
-                "requires a vertex input",
-            ),
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main() -> Annotated[u32, builtin("vertex_index")]:
-    return 0
-""",
-                "requires a vertex input",
-            ),
-            (
-                """
-from vernon_dsl import *
-@kernel(workgroup_size=(1, 1, 1))
-def main(gid: Annotated[u32, builtin("global_invocation_id")]) -> None:
-    pass
-""",
-                "requires type tensor<3xi32>",
-            ),
-            (
-                """
-from vernon_dsl import *
-@vertex
-def main() -> Vector[f32, 3]:
-    return Vector([0.0, 0.0, 0.0])
-""",
-                "builtin 'position' requires type tensor<4xf32>",
-            ),
-        )
-        for index, (source, diagnostic) in enumerate(cases):
-            with self.subTest(index=index), self.assertRaisesRegex(CompileError, diagnostic):
-                compile_source(source, f"bad_builtin_{index}.py")
+        for case in BUILTIN_INVALID_CASES:
+            assert_frontend_rejects(self, case)
 
+    @covers_case("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode", layers="F")
     def test_texture_cannot_mix_implicit_and_explicit_samplers(self) -> None:
-        source = """
-from vernon_dsl import *
-@fragment
-def main(
-    image: Annotated[Texture["2d", f32], resource(set=0, binding=0)],
-    sampler: Annotated[Sampler, resource(set=0, binding=1)],
-    uv: Vector[f32, 2],
-) -> Vector[f32, 4]:
-    implicit_value = texture_sample(image, uv)
-    explicit_value = texture_sample(image, sampler, uv)
-    return implicit_value + explicit_value
-"""
-        with self.assertRaisesRegex(CompileError, "both implicit and explicit sampler forms"):
-            compile_source(source, "mixed_sampler_forms.py")
+        assert_frontend_rejects(self, case_by_id("LANG-TEXTURE-SAMPLE-EXPLICIT/mixed-sampler-mode"))
 
+    @covers_case_group("GENERATED_BUILTIN_VALID_CASES", layers="FI")
     def test_parameterless_graphics_builtins(self) -> None:
-        source = """
-from vernon_dsl import *
-
-@vertex
-def vertex_main(position: Vector[f32, 4]) -> Vector[f32, 4]:
-    vertex = vertex_id()
-    instance = instance_id()
-    return position
-
-@fragment
-def fragment_main() -> Vector[f32, 4]:
-    size = resolution()
-    coordinate = fragment_coord()
-    facing = front_facing()
-    return coordinate
-"""
-        output = compile_source(source, "graphics_builtins.py")
-        for marker in (
-            'vernon.implicit = "resolution"',
-            'vernon.builtin = "frag_coord"',
-            'vernon.builtin = "front_facing"',
-            'vernon.builtin = "vertex_index"',
-            'vernon.builtin = "instance_index"',
-        ):
-            self.assertIn(marker, output)
+        output = compile_source(GENERATED_BUILTIN_VALID_CASES[0].source, "graphics_builtins.py")
+        assert_verified_ir(self, output)
+        for case in GENERATED_BUILTIN_VALID_CASES:
+            with contract_oracle(case):
+                assert isinstance(case.expected, str)
+                self.assertIn(case.expected, output)
 
     def test_parameterless_graphics_builtins_enforce_stage(self) -> None:
         invalid = """

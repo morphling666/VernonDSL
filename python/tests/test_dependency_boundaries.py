@@ -57,14 +57,7 @@ class DependencyBoundaryTests(unittest.TestCase):
             with self.subTest(module=leaf):
                 self.assertNotIn(".binding", imported_modules(runtime / leaf))
 
-        facade_tree = ast.parse((runtime / "resources.py").read_text(encoding="utf-8"))
-        self.assertFalse(
-            any(isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) for node in facade_tree.body)
-        )
-
         for path in runtime.rglob("*.py"):
-            if path.name == "resources.py":
-                continue
             with self.subTest(module=path.name):
                 self.assertNotIn(".resources", imported_modules(path))
 

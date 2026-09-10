@@ -147,6 +147,8 @@ mlir::MLIRContext &compilerMlirContext(CompilerFrontend &frontend);
 mlir::LogicalResult preparePortableTargetModule(mlir::ModuleOp module, TargetPreparationProvenance &provenance);
 mlir::FailureOr<TargetPreparationResult> prepareTargetModule(PreparedModule &prepared, const TargetPreparer &preparer);
 
+VernonStatus verifyMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, std::string &diagnostics);
+
 VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
                          std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics);
 

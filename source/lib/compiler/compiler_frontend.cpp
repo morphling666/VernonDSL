@@ -363,17 +363,32 @@ static VernonStatus prepareVerifiedModule(CompilerFrontend &frontend, mlir::Owni
     return VERNON_STATUS_OK;
 }
 
-VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
-                         std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
-    mlir::ScopedDiagnosticHandler handler(
-        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+static VernonStatus parseAndVerifyMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize,
+                                       mlir::OwningOpRef<mlir::ModuleOp> &module) {
     llvm::StringRef text(source ? source : "", sourceSize);
     mlir::ParserConfig parserConfig(&frontend.context, /*verifyAfterParse=*/false);
-    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
+    module = mlir::parseSourceString<mlir::ModuleOp>(text, parserConfig);
     if (!module)
         return VERNON_STATUS_PARSE_ERROR;
     if (mlir::failed(mlir::verify(*module)))
         return VERNON_STATUS_VERIFICATION_ERROR;
+    return VERNON_STATUS_OK;
+}
+
+VernonStatus verifyMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, std::string &diagnostics) {
+    mlir::ScopedDiagnosticHandler handler(
+        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    return parseAndVerifyMlir(frontend, source, sourceSize, module);
+}
+
+VernonStatus prepareMlir(CompilerFrontend &frontend, const char *source, size_t sourceSize, PreparedModulePtr &prepared,
+                         std::vector<Artifact> &artifacts, std::string &reflection, std::string &diagnostics) {
+    mlir::ScopedDiagnosticHandler handler(
+        &frontend.context, [&](mlir::Diagnostic &diagnostic) { appendDiagnostic(diagnostics, diagnostic); });
+    mlir::OwningOpRef<mlir::ModuleOp> module;
+    if (VernonStatus status = parseAndVerifyMlir(frontend, source, sourceSize, module); status != VERNON_STATUS_OK)
+        return status;
     return prepareVerifiedModule(frontend, std::move(module), prepared, artifacts, reflection, diagnostics);
 }
 

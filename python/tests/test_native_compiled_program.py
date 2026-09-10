@@ -188,6 +188,20 @@ module {
 
 
 class CompiledProgramTests(unittest.TestCase):
+    def test_private_mlir_verifier_does_not_run_program_preparation(self) -> None:
+        module = compile_source(
+            "from vernon_dsl import *\n@kernel\ndef main(value: f32) -> None:\n    pass\n",
+            "unprepared_value_input.py",
+        )
+        compiler = native.Compiler()
+        verified = compiler.verify_program_result(module)
+        self.assertTrue(verified.ok, verified.diagnostics)
+        self.assertEqual(verified.reflection, "")
+
+        malformed = compiler.verify_program_result("not mlir")
+        self.assertEqual(malformed.status, native.Status.PARSE_ERROR)
+        self.assertTrue(malformed.diagnostics)
+
     def test_program_planner_returns_kernel_compile_requests(self) -> None:
         plan = native.Compiler().plan_program_result(PROGRAM_MODULE)
         self.assertTrue(plan.ok, plan.diagnostics)

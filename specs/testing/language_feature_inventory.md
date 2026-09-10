@@ -678,9 +678,10 @@ For every generated-interface ID:
   `workgroup_array`, old workgroup IR, compatibility normalization, or legacy
   addressability metadata.
 - Capabilities: compile `none`; runtime `N/A`.
-- Layers: `F`, `I`, source guards.
+- Layers: `F`, `I`.
 - Diagnostic/oracle: unknown/removed-name reason identifies the canonical
-  replacement; no legacy symbol or schema appears in generated output.
+  replacement; source guards ensure no legacy symbol or schema appears in
+  generated output.
 
 The following are explicit non-features and therefore negative boundaries of
 the records above: dynamic-shape Tensor Values, private-storage constructors,

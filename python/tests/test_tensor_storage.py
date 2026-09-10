@@ -12,6 +12,9 @@ from unittest import mock
 import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._native as native
+from language_contract_cases import case_by_id
+from language_contract_runner import assert_frontend_rejects, assert_verified_ir, contract_oracle
+from language_contract_traceability import covers_case
 from vernon_dsl import CompileError, Compiler, compile_source
 from vernon_dsl._runtime.binding import (
     _dispatch_borrow_scope,
@@ -349,16 +352,24 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         view[()] = 7.0
         self.assertEqual(storage.to_numpy()[()], 7.0)
 
+    @covers_case("LANG-VIEW-003/strict-direct-binding", layers="F")
+    @covers_case("LANG-VIEW-005/alias-lifetime-proof", layers="F")
     def test_view_validation_rejects_out_of_bounds_and_defers_injectivity(self) -> None:
+        binding_case = case_by_id("LANG-VIEW-003/strict-direct-binding")
+        alias_case = case_by_id("LANG-VIEW-005/alias-lifetime-proof")
         storage = vd.TensorStorage.zeros(dtype=vd.i32, shape=(8,))
 
-        with self.assertRaisesRegex(ValueError, "outside its owner"):
+        with (
+            contract_oracle(binding_case),
+            self.subTest(case=binding_case.id),
+            self.assertRaisesRegex(ValueError, "outside its owner"),
+        ):
             storage.view(shape=(4,), strides=(1,), offset=6)
-        writable_alias = storage.view(shape=(2, 2), strides=(1, 1), access="write")
-        self.assertEqual(writable_alias.layout.element_strides, (1, 1))
-
-        overlapping_reader = storage.view(shape=(2, 2), strides=(1, 1), access="read")
-        np.testing.assert_array_equal(overlapping_reader.to_numpy(), np.zeros((2, 2), dtype=np.int32))
+        with contract_oracle(alias_case), self.subTest(case=alias_case.id):
+            writable_alias = storage.view(shape=(2, 2), strides=(1, 1), access="write")
+            self.assertEqual(writable_alias.layout.element_strides, (1, 1))
+            overlapping_reader = storage.view(shape=(2, 2), strides=(1, 1), access="read")
+            np.testing.assert_array_equal(overlapping_reader.to_numpy(), np.zeros((2, 2), dtype=np.int32))
 
     def test_access_modes_and_owner_lifetime_are_enforced(self) -> None:
         storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(4,))
@@ -376,11 +387,16 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         write_view.copy_from_numpy(np.arange(4, dtype=np.float32))
         np.testing.assert_array_equal(read_view.to_numpy(), np.arange(4, dtype=np.float32))
 
+    @covers_case("LANG-STORAGE-001/owning-storage", layers="F")
     def test_storage_namespace_is_distinct_from_tensor_values(self) -> None:
-        storage = vd.storage.zeros(dtype=vd.f32, shape=(2,))
+        case = case_by_id("LANG-STORAGE-001/owning-storage")
+        namespace: dict[str, object] = {}
+        exec(compile(case.source, f"{case.name}.py", "exec"), namespace)
+        storage = namespace["value"]
         value = vd.Tensor([1.0, 2.0])
 
-        self.assertIsInstance(storage, vd.TensorStorage)
+        with contract_oracle(case), self.subTest(case=case.id):
+            self.assertIsInstance(storage, vd.TensorStorage)
         self.assertFalse(hasattr(vd.Tensor, "zeros"))
         self.assertFalse(value.flags.writeable)
 
@@ -482,20 +498,22 @@ class TensorStorageRuntimeTests(unittest.TestCase):
                 with _dispatch_borrow_scope([("same_mip", mip0, "read")]):
                     pass
 
+    @covers_case("LANG-INTEROP-001/raw-buffer-boundary", layers="F")
     def test_raw_buffer_requires_explicit_byte_layout_units(self) -> None:
-        values = np.arange(12, dtype=np.float32).reshape(3, 4)
-        backing = bytearray(values.tobytes())
-        raw = vd.interop.RawBuffer.from_buffer(backing, alignment=4)
-        view = raw.typed_view(
-            dtype=vd.f32,
-            shape=(3, 2),
-            byte_strides=(16, 4),
-            byte_offset=4,
-            access="read_write",
-            layout_units="bytes",
-        )
+        case = case_by_id("LANG-INTEROP-001/raw-buffer-boundary")
+        namespace: dict[str, object] = {}
+        exec(compile(case.source, f"{case.name}.py", "exec"), namespace)
+        values = namespace["values"]
+        backing = namespace["backing"]
+        raw = namespace["raw"]
+        view = namespace["value"]
+        assert isinstance(values, np.ndarray)
+        assert isinstance(backing, bytearray)
+        assert isinstance(raw, vd.interop.RawBuffer)
+        assert isinstance(view, vd.TensorView)
 
-        self.assertEqual(raw.byte_size, values.nbytes)
+        with contract_oracle(case), self.subTest(case=case.id):
+            self.assertEqual(raw.byte_size, values.nbytes)
         np.testing.assert_array_equal(view.to_numpy(), values[:, 1:3])
         view.copy_from_numpy(np.full((3, 2), 7, dtype=np.float32))
         np.testing.assert_array_equal(np.frombuffer(backing, dtype=np.float32).reshape(3, 4)[:, 1:3], 7)
@@ -547,10 +565,17 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         self.assertEqual(view.dtype, packed.dtype)
         np.testing.assert_array_equal(view.to_numpy(), packed.to_numpy())
 
+    @covers_case("LANG-PAIR-003/field-projection-alias-proof", layers="FI")
     def test_struct_storage_uses_canonical_aos_layout_and_field_views(self) -> None:
+        case = case_by_id("LANG-PAIR-003/field-projection-alias-proof")
+        assert isinstance(case.expected, str)
+        mlir = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, mlir, case)
+        self.assertIn(case.expected, mlir)
         storage = vd.TensorStorage.zeros(dtype=StorageVertex, shape=(4,))
 
-        self.assertEqual(storage.dtype.itemsize, 32)
+        with self.subTest(case=case.id):
+            self.assertEqual(storage.dtype.itemsize, 32)
         self.assertEqual(storage.dtype.fields["position"][1], 0)
         self.assertEqual(storage.dtype.fields["weight"][1], 16)
         self.assertEqual(storage.dtype.fields["uv"][1], 24)
@@ -673,21 +698,14 @@ class TensorViewFrontendTests(unittest.TestCase):
         self.assertNotIn("storage", parameters[0])
         self.assertEqual(parameters[1]["access"], "read")
 
+    @covers_case("LANG-VIEW-001/shape-and-access-matrix", layers="FI")
+    @covers_case("LANG-VIEW-001/non-tuple-shape", layers="F")
     def test_tensor_view_accepts_rank_zero_static_dynamic_and_mixed_shapes(
         self,
     ) -> None:
-        output = compile_source(
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def shapes(\n"
-            "    scalar: TensorView[f32, (), read_write],\n"
-            "    static: TensorView[f32, (4, 8), read],\n"
-            "    dynamic: TensorView[f32, (dyn,), read],\n"
-            "    mixed: TensorView[f32, (dyn, 4), read],\n"
-            ") -> None:\n"
-            "    scalar[()] = scalar[()] + 1.0\n",
-            "tensor_view_shapes.py",
-        )
+        case = case_by_id("LANG-VIEW-001/shape-and-access-matrix")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
 
         self.assertIn(
             '!vernon.tensor_view<f32, [], "read_write", "device">',
@@ -698,48 +716,24 @@ class TensorViewFrontendTests(unittest.TestCase):
             output,
         )
         self.assertFalse(callable(vd.dyn))
-        with self.assertRaisesRegex(CompileError, "shape must be a tuple"):
-            compile_source(
-                "from vernon_dsl import *\n@kernel\ndef removed(value: TensorView[f32, 1, read]) -> None:\n    pass\n",
-                "removed_tensor_view_rank.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-VIEW-001/non-tuple-shape"))
 
+    @covers_case("LANG-STORAGE-001/device-annotation", layers="F")
+    @covers_case("LANG-VIEW-006/write-only-load", layers="F")
+    @covers_case("LANG-VIEW-006/rank-two-load", layers="FI")
     def test_storage_diagnostics_are_explicit(self) -> None:
-        with self.assertRaisesRegex(CompileError, "host-runtime owner"):
-            compile_source(
-                "from vernon_dsl import *\n@kernel\ndef bad(value: TensorStorage[f32]) -> None:\n    pass\n",
-                "storage_parameter.py",
-            )
-        with self.assertRaisesRegex(CompileError, "write-only TensorView"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad(value: TensorView[f32, (dyn,), write]) -> f32:\n"
-                "    return value[0]\n",
-                "write_only_load.py",
-            )
-        output = compile_source(
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def read(value: TensorView[f32, (dyn, dyn), read]) -> f32:\n"
-            "    return value[0, 0]\n",
-            "rank_two_view.py",
-        )
+        assert_frontend_rejects(self, case_by_id("LANG-STORAGE-001/device-annotation"))
+        assert_frontend_rejects(self, case_by_id("LANG-VIEW-006/write-only-load"))
+        case = case_by_id("LANG-VIEW-006/rank-two-load")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
         self.assertIn('"vernon.load"', output)
 
+    @covers_case("LANG-TENSOR-005/tensor-and-view-shape", layers="FI")
     def test_shape_lowers_to_get_shape_for_tensor_and_tensor_view(self) -> None:
-        output = compile_source(
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def extents(\n"
-            "    output: TensorView[f32, (dyn, dyn), write],\n"
-            "    tile: Tensor[f32, (2, 5)],\n"
-            "    vec: Vector[f32, 3],\n"
-            "    mat: Matrix[f32, 2, 4],\n"
-            ") -> None:\n"
-            "    output[output.shape[0], tile.shape[1]] = f32(vec.shape[0]) + f32(mat.shape[1])\n",
-            "tensor_and_view_shape.py",
-        )
+        case = case_by_id("LANG-TENSOR-005/tensor-and-view-shape")
+        output = compile_source(case.source, f"{case.name}.py")
+        assert_verified_ir(self, output, case)
         self.assertEqual(output.count('"vernon.get_shape"'), 4)
         self.assertIn(
             '!vernon.tensor_view<f32, [-1, -1], "write", "device">) -> tensor<2xi32>',
@@ -750,28 +744,19 @@ class TensorViewFrontendTests(unittest.TestCase):
         self.assertIn("tensor<2x4xf32>) -> tensor<2xi32>", output)
         self.assertNotIn("cannot load through a write-only TensorView", output)
 
+    @covers_case("LANG-TENSOR-005/rank-zero-shape", layers="F")
     def test_rank_zero_view_shape_is_rejected(self) -> None:
-        with self.assertRaisesRegex(CompileError, "shape requires rank >= 1"):
-            compile_source(
-                "from vernon_dsl import *\n"
-                "@kernel\n"
-                "def bad(value: TensorView[f32, (), read_write]) -> None:\n"
-                "    extent = value.shape\n",
-                "rank_zero_shape.py",
-            )
+        assert_frontend_rejects(self, case_by_id("LANG-TENSOR-005/rank-zero-shape"))
 
+    @covers_case("LANG-VIEW-004/layout-not-specialization", layers="FI")
     def test_tensor_view_layout_is_not_frontend_specialization_data(self) -> None:
-        source = (
-            "from vernon_dsl import *\n"
-            "@kernel\n"
-            "def read(output: TensorView[f32, (1,), write], value: TensorView[f32, (2, dyn), read]) -> None:\n"
-            "    output[0] = value[1, 2]\n"
-        )
+        case = case_by_id("LANG-VIEW-004/layout-not-specialization")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rank_two_view.py"
-            path.write_text(source, encoding="utf-8")
+            path.write_text(case.source, encoding="utf-8")
             result = Compiler().compile_request(FrontendCompileRequest(path, "read"))
 
+        assert_verified_ir(self, result.mlir, case)
         self.assertIn('"vernon.load"', result.mlir)
         self.assertNotIn("vernon.tensor_shape", result.mlir)
         self.assertNotIn("vernon.tensor_strides", result.mlir)

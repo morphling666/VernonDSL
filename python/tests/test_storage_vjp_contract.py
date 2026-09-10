@@ -8,6 +8,9 @@ from pathlib import Path
 import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._runtime.autodiff as runtime_autodiff
+from language_contract_cases import case_by_id
+from language_contract_runner import assert_verified_ir
+from language_contract_traceability import covers_case
 from vernon_dsl.compiler import Compiler, FrontendCompileRequest
 from vernon_dsl.diagnostics import CompileError
 from vernon_dsl.frontend.autodiff_profiles import derivative_groups_from_paths
@@ -100,6 +103,55 @@ def objective(
         self.assertNotIn("-> tensor<-1", backward)
         compiled = _native.Compiler().compile_program_result(backward, _native.Target.CPU)
         self.assertTrue(compiled.ok, compiled.diagnostics)
+
+    @covers_case("LANG-AD-002/storage-leaves", layers="FI")
+    @covers_case("LANG-AD-003/accepted-control-flow", layers="FI")
+    @covers_case("LANG-PAIR-010/vjp-structured-control", layers="FI")
+    @covers_case("LANG-PAIR-011/vjp-signed-stride-view", layers="FI")
+    def test_canonical_vjp_frontend_and_structured_ir_cases(self) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        storage_case = case_by_id("LANG-AD-002/storage-leaves")
+        control_case = case_by_id("LANG-AD-003/accepted-control-flow")
+        pair_case = case_by_id("LANG-PAIR-010/vjp-structured-control")
+        signed_stride_case = case_by_id("LANG-PAIR-011/vjp-signed-stride-view")
+        self.assertEqual(control_case.source, pair_case.source)
+
+        transform = vd.ad.ProgramTransformSpec(
+            "vjp",
+            ("value",),
+            output_cotangents=("loss",),
+        )
+        for equivalent_cases in (
+            (storage_case, signed_stride_case),
+            (control_case, pair_case),
+        ):
+            result = self.compile_source(equivalent_cases[0].source, transform=transform)
+            structured = build_structured_vjp(_native, result, transform)
+            for case in equivalent_cases:
+                assert_verified_ir(self, result.mlir, case)
+            for profile in structured.profiles.values():
+                assert_verified_ir(self, profile)
+
+            forward = structured.profiles["forward_with_tape"]
+            backward = structured.profiles["backward"]
+            self.assertIn('"vernon.load"', forward)
+            self.assertIn('"vernon.scatter_add"', backward)
+
+            if signed_stride_case in equivalent_cases:
+                self.assertIn('!vernon.tensor_view<f32, [-1], "read", "device">', result.mlir)
+                self.assertNotIn("tensor_strides", result.mlir)
+                self.assertNotIn("tensor_offset", result.mlir)
+
+            if pair_case in equivalent_cases:
+                self.assertEqual(result.mlir.count("scf.while"), 1)
+                self.assertGreaterEqual(result.mlir.count("scf.if"), 2)
+                self.assertEqual(forward.count("scf.while"), 1)
+                self.assertIn('"vernon.ad.checked_increment"', forward)
+                self.assertGreaterEqual(forward.count('"vernon.ad.begin_region"'), 3)
+                self.assertEqual(backward.count("scf.for"), 1)
+                self.assertIn('"vernon.ad.read_executed_count"', backward)
+                self.assertIn('"vernon.ad.read_nested_region"', backward)
 
     def test_frontend_nested_canonical_ranges_reach_native_vjp_profiles(self) -> None:
         from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]

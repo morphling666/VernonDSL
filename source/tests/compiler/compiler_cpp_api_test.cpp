@@ -3,6 +3,7 @@
 #include "compiler_reflection.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Vernon/IR/Vernon.h"
+#include "mlir/Dialect/Vernon/IR/VernonValueAbi.h"
 #include "mlir/Parser/Parser.h"
 #include "vernon-c/Compiler.h"
 
@@ -68,6 +69,36 @@ void expectDiagnostic(VernonCompilerContext *context, std::string_view module, s
 }
 
 } // namespace
+
+TEST(CompilerValueAbi, RankZeroTensorAndWorkgroupViewEachPlanOneScalarCell) {
+    std::unique_ptr<vernon::compiler::CompilerFrontend, decltype(&vernon::compiler::destroyCompilerFrontend)> frontend(
+        vernon::compiler::createCompilerFrontend(), vernon::compiler::destroyCompilerFrontend);
+    ASSERT_NE(frontend, nullptr);
+    mlir::MLIRContext &context = vernon::compiler::compilerMlirContext(*frontend);
+    context.getOrLoadDialect<mlir::vernon::VernonDialect>();
+    mlir::OwningOpRef<mlir::ModuleOp> module = mlir::parseSourceString<mlir::ModuleOp>("module {}", &context);
+    ASSERT_TRUE(module);
+
+    mlir::Type scalar = mlir::Float32Type::get(&context);
+    mlir::RankedTensorType tensor = mlir::RankedTensorType::get({}, scalar);
+    mlir::FailureOr<mlir::vernon::ValueAbiLayout> tensorLayout = mlir::vernon::getValueStorageLayout(tensor, *module);
+    ASSERT_TRUE(mlir::succeeded(tensorLayout));
+    EXPECT_EQ(tensorLayout->size, 4u);
+    ASSERT_EQ(tensorLayout->leaves.size(), 1u);
+    EXPECT_TRUE(tensorLayout->leaves[0].shape.empty());
+    EXPECT_EQ(tensorLayout->leaves[0].scalarCount, 1u);
+
+    mlir::vernon::TensorViewType view =
+        mlir::vernon::TensorViewType::get(&context, scalar, {}, "read_write", "workgroup");
+    mlir::FailureOr<mlir::vernon::WorkgroupPhysicalStoragePlan> workgroup =
+        mlir::vernon::getWorkgroupPhysicalStoragePlan(view, *module);
+    ASSERT_TRUE(mlir::succeeded(workgroup));
+    EXPECT_EQ(workgroup->recordCount, 1u);
+    EXPECT_EQ(workgroup->totalPhysicalBytes, 16u);
+    ASSERT_EQ(workgroup->leaves.size(), 1u);
+    EXPECT_EQ(workgroup->leaves[0].scalarCount, 1u);
+    EXPECT_EQ(workgroup->leaves[0].byteSize, 4u);
+}
 
 TEST(CompilerPreparation, MockGpuPreparerMaterializesResourceSignatureFromLogicalProfile) {
     std::unique_ptr<vernon::compiler::CompilerFrontend, decltype(&vernon::compiler::destroyCompilerFrontend)> frontend(

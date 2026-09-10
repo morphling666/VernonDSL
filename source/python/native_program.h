@@ -203,6 +203,7 @@ finalizeProgramResult(Compiler &compiler, const std::string &plan,
                       const std::vector<std::tuple<std::string, std::string, std::string, std::string>> &kernels,
                       const std::vector<std::tuple<std::string, std::string, std::vector<uint64_t>>> &shapeFacts);
 std::unique_ptr<CompiledProgram> analyzeProgramResult(Compiler &compiler, const std::string &mlir);
+std::unique_ptr<CompiledProgram> verifyProgramResult(Compiler &compiler, const std::string &mlir);
 
 std::vector<std::unique_ptr<CompiledProgram>> compileCpuProgramResults(const std::vector<std::string> &modules,
                                                                        const nb::dict &targetOptions);

@@ -378,6 +378,8 @@ class PipelineCompileTests(unittest.TestCase):
             make_target_options("metal", {"shader_model": 60})
         with self.assertRaisesRegex(ProgramCompileError, "shader model must be 6.0 or newer"):
             make_target_options("directx", {"shader_model": 55})
+        with self.assertRaisesRegex(ProgramCompileError, "unknown compiler target 'dx'"):
+            make_target_options("dx")
         with self.assertRaisesRegex(ProgramCompileError, "macos.*ios"):
             MetalTargetOptions(platform="tvos")
 
