@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Iterable
 
 from ..ad import ProgramTransformSpec
 from ..diagnostics import CompileError, SourceLocation
@@ -124,23 +123,32 @@ class Compiler:
         self,
         input_path: str | Path,
         *,
-        features: Iterable[str] = (),
+        specializations: tuple[SpecializationAssignment, ...] = (),
+        specialization_bindings: tuple[tuple[str, str], ...] = (),
         entry: str | None = None,
         program_transform: ProgramTransformSpec | None = None,
     ) -> str:
         """Compile one entry with caching, or an uncached whole module when entry is omitted."""
         path = Path(input_path)
-        enabled_features = tuple(sorted(set(features)))
+        canonical = tuple(sorted(specializations))
+        if len({assignment.name for assignment in canonical}) != len(canonical):
+            raise ValueError("frontend specializations contain duplicate names")
+        selected_features = enabled_features(canonical)
         if entry is None:
             if program_transform is not None:
                 raise ValueError("program transforms require one specialized entry")
-            project = load_project(path, enabled_features, entry)
-            return self.compile(project.source, str(path), project.dependencies, project.features, enabled_features)
+            if any(assignment.type != "bool" for assignment in canonical):
+                raise ValueError("non-Boolean specializations require an entry")
+            if specialization_bindings:
+                raise ValueError("specialization bindings require one specialized entry")
+            project = load_project(path, selected_features, entry)
+            return self.compile(project.source, str(path), project.dependencies, project.features, selected_features)
         return self.compile_request(
             FrontendCompileRequest(
                 path,
                 entry,
-                tuple(SpecializationAssignment(name, "bool", True) for name in enabled_features),
+                canonical,
+                specialization_bindings=specialization_bindings,
                 program_transform=program_transform,
             )
         ).mlir
@@ -477,8 +485,15 @@ def compile_source(source: str, filename: str = "<string>") -> str:
 def compile_file(
     input_path: str | Path,
     *,
-    features: Iterable[str] = (),
+    specializations: tuple[SpecializationAssignment, ...] = (),
+    specialization_bindings: tuple[tuple[str, str], ...] = (),
     entry: str | None = None,
     program_transform: ProgramTransformSpec | None = None,
 ) -> str:
-    return Compiler().compile_file(input_path, features=features, entry=entry, program_transform=program_transform)
+    return Compiler().compile_file(
+        input_path,
+        specializations=specializations,
+        specialization_bindings=specialization_bindings,
+        entry=entry,
+        program_transform=program_transform,
+    )

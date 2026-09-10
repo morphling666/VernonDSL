@@ -229,18 +229,7 @@ struct ProgramParameterMetadata {
     std::vector<uint64_t> shape;
 };
 
-struct ProgramOutputMetadata {
-    std::string name;
-    VernonProgramArgumentKind kind{};
-    VernonDataType dtype{};
-    VernonValueAccess access{};
-    std::vector<uint64_t> shape;
-    uint32_t location{};
-};
-
 ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &view);
-
-ProgramOutputMetadata outputMetadata(const VernonProgramOutputView &view);
 
 struct PreparedProgramArgument {
     PreparedProgramArgument() = default;

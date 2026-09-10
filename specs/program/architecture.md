@@ -41,8 +41,10 @@ Program transform. Graphics entry tuples are not Program assets by themselves.
 - **Program invocation** owns one concrete set of bindings and controls.
 - **Pullback** owns immutable retained forward state for reusable backward
   applications.
-- **ExecutionGraph/Command DAG** is private runtime scheduling machinery, not a
-  public authoring or deployment model.
+- **ProgramGraph** is an optional public pre-resolution composition builder.
+  Its nodes are loaded Programs and it finalizes into one ordinary Program.
+- **Command DAG** is private runtime scheduling machinery, not a public
+  authoring or deployment model.
 
 `Pipeline` is reserved for the `vd.pipeline(...)` graphics authoring object or
 a native backend pipeline. It is not a deployment version axis or an
@@ -94,9 +96,9 @@ must not replace explicit IDs and validated projections.
 A compute Stage has three distinct phases:
 
 ```text
-source + annotations + features -> lower -> portable IR
-portable IR + target            -> compile -> Stage artifact
-artifact + runtime bindings     -> invoke -> dispatch
+source + annotations + typed specialization key -> lower -> portable IR
+portable IR + target                         -> compile -> Stage artifact
+artifact + runtime bindings                  -> invoke -> dispatch
 ```
 
 - Lowering and Stage compilation do not receive invocation tensors, launch
@@ -123,13 +125,20 @@ Kernel IR remains a separate implementation level:
   kernel ABI, and kernel-local tape generation.
 
 Program-level Python control flow is host-static. It may depend on initialized
-Module state, constants, and Features. It may not depend on invocation Values
-or device data. Dynamic per-element control flow belongs inside a kernel or
-shader.
+Module state, constants, and typed specializations. It may not depend on
+invocation Values or device data. Dynamic per-element control flow belongs
+inside a kernel or shader.
 
 Initialized Module instances are compiler inputs, not serialized objects.
 Artifacts contain no Module instance, `__dict__`, pickle payload, Python
 callback, or constructor configuration tree.
+
+Interactive Module capture and Program reuse key on the annotation-static
+forward signature and host-static Module configuration, not concrete dynamic
+TensorView extents or launch values. A transient allocation declared relative
+to a dynamic input or prior allocation derives its concrete shape from that
+source for each invocation. The descriptor and artifact-identity boundary is
+defined by [`language/tensor_view.md`](../language/tensor_view.md).
 
 ## 6. Stage and Node binding
 
@@ -186,7 +195,68 @@ The Runtime records and submits backend commands internally. External encoders
 are an optional private embedding concern and do not define another Program
 API.
 
-## 8. Publication
+## 8. ProgramGraph composition
+
+`ProgramGraph` composes independently cooked Programs before physical resolve.
+It does not accept resolved executables, Stages, backend resources, command
+encoders, or callback passes, and it does not create another executable type.
+Finalization namespaces and links the child Programs into one canonical
+Program; the result follows the ordinary resolve, instance, invocation, and
+publication lifecycle.
+
+Each graph node has an opaque identity and a local boundary/control namespace.
+Equal child boundary names never collide. Names enter the composite public ABI
+only when the graph explicitly exports a boundary; frame updates use stable
+node-local binding tokens resolved during composition.
+
+Adding a node selects one exact child variant through canonical typed
+specialization assignments. Selection is node-local: two nodes may instantiate
+the same bundle at different pre-cooked specialization constants. Boolean capabilities and
+non-Boolean specialization values share the typed variant-key representation;
+rank and other constants must not be encoded as feature-name strings.
+Selection never generates a missing signature or artifact and never invokes a
+compiler.
+
+Graph construction creates explicit graph Value handles from child outputs,
+connects those Values to child inputs, and creates explicit graph Storage
+handles whose appended child boundaries form ordered version chains. A graph
+Storage is invocation-bound once; node-local tokens in that chain resolve to
+the same composite boundary. Concrete tensors, image views, shapes, strides,
+offsets, controls, resources, and launch grids remain instance- or
+invocation-time bindings. In particular, two independently supplied native
+image handles do not establish a compositional alias. Graphics Programs that
+share a framebuffer connect compatible attachment boundaries into one ordered
+symbolic graph Image Storage-version chain; this is storage composition, not a
+producer-to-consumer Value edge.
+
+A child Program owns its semantic subgraph but never owns an independently
+submitted physical command graph. Global resolve derives one hazard, transfer,
+residency, publication, and static render-scope candidate regions for the
+composite Program. Invocation materializes fused or split native scopes only
+from the paths admitted by those candidates.
+
+ProgramGraph composition links only primal forward topology. A differentiated
+child additionally contributes node-local VJP metadata and a resolved backward
+plan, but no backward graph, derivative boundary, or accumulation operation is
+added to the composite Program. When node pullbacks are requested, one
+composite forward retains independent state for each differentiated node. The
+caller retrieves and applies those pullbacks by node identity using the child
+Program's boundary namespace. Graph connections have no implicit derivative
+meaning.
+
+Consequently, ProgramGraph has no whole-graph gradient. Cross-node reverse
+topology and cotangent fan-in belong in a Module transformed and cooked as one
+VJP Program; deployment-time scheduling never synthesizes them.
+
+Standalone Program execution is the same model with an implicit one-node root
+composition.
+
+External engine objects may contain graph node handles and handle arbitrary
+events. The engine updates node-local bindings explicitly; Vernon does not own
+or call external polymorphic objects. Only the enclosing Program invocation
+submits work.
+
+## 9. Publication
 
 Program outputs declare one publication mode:
 
@@ -200,7 +270,7 @@ Publication is planned during physical resolution. A failed
 buffer publication use device transfers when residency permits; synchronous
 host round-trips are not a publication strategy.
 
-## 9. Differentiated Programs
+## 10. Differentiated Programs
 
 An explicit VJP transform produces one Program with:
 
@@ -229,7 +299,7 @@ when the requested derivative path traverses a graphics Node.
 The normative differentiation contract is
 [`../autodiff/contract.md`](../autodiff/contract.md).
 
-## 10. Graphics normalization
+## 11. Graphics normalization
 
 Compute and graphics use the same Program Value and Storage model.
 Source-level render conveniences normalize before deployment into graphics
@@ -250,9 +320,9 @@ Command DAG optimization and must preserve attachment semantics.
 
 Details are in [`graphics_execution.md`](graphics_execution.md).
 
-## 11. Variant and artifact rules
+## 12. Variant and artifact rules
 
-One Program bundle may contain multiple canonical feature variants. Each
+One Program bundle may contain multiple canonical typed specialization variants. Each
 variant:
 
 - identifies one exact target ArtifactSystem;
@@ -264,9 +334,10 @@ Stage artifact identity covers target, requirements, authenticated modules,
 entry points, reflection, and the current compiler/Program contract pair.
 Artifacts from unsupported Program versions are rejected, not normalized.
 
-## 12. Invariants
+## 13. Invariants
 
 - Every executable is a Program.
+- ProgramGraph composition finalizes into a Program before physical resolve.
 - Program, logical resolve, physical resolve, and Program invocation form the
   only deployment path.
 - Node count and Stage kind never select another architecture.
@@ -276,6 +347,8 @@ Artifacts from unsupported Program versions are rejected, not normalized.
 - Compute and graphics share Program Value binding and resource transitions.
 - Unsupported mappings and derivative paths fail closed.
 - Primal invocation has no AD work unless the caller explicitly requests VJP.
+- ProgramGraph never exposes a composite pullback; differentiated children
+  expose only node-local pullbacks retained by that graph invocation.
 - Pullbacks are reusable and do not share mutable invocation scratch.
 - Publication, transfers, residency, and hazards are resolved plans rather
   than execution-time guesses.

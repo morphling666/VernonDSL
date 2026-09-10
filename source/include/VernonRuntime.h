@@ -344,16 +344,6 @@ typedef struct VernonProgramImageConstraintView {
     uint32_t reserved[4];
 } VernonProgramImageConstraintView;
 
-typedef struct VernonProgramOutputView {
-    VernonStringView name;
-    VernonProgramArgumentKind kind;
-    VernonDataType dtype;
-    VernonValueAccess access;
-    uint32_t rank;
-    const uint64_t *static_shape;
-    uint32_t location;
-} VernonProgramOutputView;
-
 typedef enum VernonProgramBoundaryRole {
     VERNON_PROGRAM_BOUNDARY_INPUT = 0,
     VERNON_PROGRAM_BOUNDARY_OUTPUT = 1,
@@ -512,13 +502,6 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetImageConstrain
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(
     const VernonProgramExecutable *pipeline, VernonStringView parameter_name,
     VernonProgramImageConstraintView *constraint);
-VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetOutputCount(const VernonProgramExecutable *pipeline);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetOutputByIndex(const VernonProgramExecutable *pipeline,
-                                                                                size_t index,
-                                                                                VernonProgramOutputView *output);
-VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableFindOutput(const VernonProgramExecutable *pipeline,
-                                                                          VernonStringView name,
-                                                                          VernonProgramOutputView *output);
 /* The control slots a graphics node reads its per-invocation controls from.
  *
  * A Program assigns each control its own slot when it is compiled, so a caller cannot assume any particular number

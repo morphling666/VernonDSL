@@ -1319,6 +1319,24 @@ if(TARGET VernonRuntime)
             opengl_indexed_vertex_bundle
             opengl_indexed_vertex_manifest)
         vernon_add_program_asset_test_bundle(
+            opengl-i32-vertex
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:i32_vertex_asset"
+            opengl_i32_vertex_bundle
+            opengl_i32_vertex_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-u32-vertex
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:u32_vertex_asset"
+            opengl_u32_vertex_bundle
+            opengl_u32_vertex_manifest)
+        vernon_add_program_asset_test_bundle(
+            opengl-f32-vertex
+            opengl
+            "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:f32_vertex_asset"
+            opengl_f32_vertex_bundle
+            opengl_f32_vertex_manifest)
+        vernon_add_program_asset_test_bundle(
             opengl-storage-image
             opengl
             "${VERNON_REPOSITORY_ROOT}/python/tests/program_asset_fixture.py:storage_image_asset"
@@ -1333,6 +1351,9 @@ if(TARGET VernonRuntime)
                     VERNON_OPENGL_UNSIGNED_UNIFORM_BUNDLE="${opengl_unsigned_uniform_manifest}"
                     VERNON_OPENGL_EXPLICIT_SAMPLER_BUNDLE="${opengl_explicit_sampler_manifest}"
                     VERNON_OPENGL_INDEXED_VERTEX_BUNDLE="${opengl_indexed_vertex_manifest}"
+                    VERNON_OPENGL_I32_VERTEX_BUNDLE="${opengl_i32_vertex_manifest}"
+                    VERNON_OPENGL_U32_VERTEX_BUNDLE="${opengl_u32_vertex_manifest}"
+                    VERNON_OPENGL_F32_VERTEX_BUNDLE="${opengl_f32_vertex_manifest}"
                     VERNON_OPENGL_STORAGE_IMAGE_BUNDLE="${opengl_storage_image_manifest}")
         add_dependencies(
             VernonRuntimeTests
@@ -1343,6 +1364,9 @@ if(TARGET VernonRuntime)
             vernon-opengl-unsigned-uniform-test-bundle
             vernon-opengl-explicit-sampler-test-bundle
             vernon-opengl-indexed-vertex-test-bundle
+            vernon-opengl-i32-vertex-test-bundle
+            vernon-opengl-u32-vertex-test-bundle
+            vernon-opengl-f32-vertex-test-bundle
             vernon-opengl-storage-image-test-bundle)
     endif()
 

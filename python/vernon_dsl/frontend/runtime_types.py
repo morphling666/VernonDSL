@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..host_values import pack_host_value
-from ..types import TypeExpr, _Scalar, dyn
+from ..types import TypeExpr, _DynamicExtent, _Scalar, dyn
 from .model import ConcreteType, SemanticCategory, semantic_category
 
 
 @dataclass(frozen=True)
 class _StorageParameter:
     dtype: Any
-    shape: tuple[int, ...]
+    shape: tuple[int | str, ...]
     access: str
     as_view: bool
 
@@ -46,13 +46,13 @@ class RuntimeParameterDescriptor:
     def storage(
         cls,
         dtype: Any,
-        shape: tuple[int, ...],
+        shape: tuple[int | _DynamicExtent, ...],
         access: str = "read_write",
         as_view: bool = False,
     ) -> RuntimeParameterDescriptor:
         return cls(
             SemanticCategory.STORAGE,
-            _StorageParameter(dtype, tuple(shape), access, as_view),
+            _StorageParameter(dtype, tuple("?" if extent is dyn else extent for extent in shape), access, as_view),
         )
 
     @classmethod

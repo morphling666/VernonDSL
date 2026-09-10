@@ -923,12 +923,14 @@ def _parameter_types_from_values(
             owner = value.owner
             if not isinstance(owner, TensorStorage):
                 raise TypeError("Module.forward() TensorView parameters must borrow TensorStorage")
+            if as_view:
+                return runtime_parameter_descriptor(annotation)
             dtype = value.element_type if value.element_type is not None else tensor_dtype(owner)
             return RuntimeParameterDescriptor.storage(dtype, tuple(value.shape), str(value.access), True)
         if isinstance(value, TensorStorage):
+            if as_view:
+                return runtime_parameter_descriptor(annotation)
             access = "read_write"
-            if as_view and len(annotation.arguments) == 3:
-                access = str(getattr(annotation.arguments[2], "name", annotation.arguments[2]))
             return RuntimeParameterDescriptor.storage(tensor_dtype(value), tuple(value.shape), access, as_view)
         if annotation is None:
             raise TypeError(
@@ -1091,16 +1093,33 @@ def _capture_kernel_program(
 @dataclass(frozen=True)
 class _AllocationSpec:
     dtype: Any
-    shape: tuple[int, ...]
+    shape: tuple[int | str, ...]
     initializer: str
     values: Any = None
+    like_source: str | None = None
+    like_key: str | int | None = None
 
-    def create(self) -> TensorStorage:
+    def create(self, inputs: Mapping[str, Any], allocations: tuple[TensorStorage, ...]) -> TensorStorage:
         if self.initializer == "from_values":
             return TensorStorage.from_values(self.values, dtype=self.dtype)
+        shape = self.shape
+        if self.like_source is not None:
+            if self.like_source == "input":
+                if not isinstance(self.like_key, str):
+                    raise RuntimeError("input-relative allocation has no input name")
+                owner = inputs[self.like_key]
+            else:
+                if not isinstance(self.like_key, int):
+                    raise RuntimeError("allocation-relative allocation has no source index")
+                owner = allocations[self.like_key]
+            if not isinstance(owner, (TensorStorage, TensorView)):
+                raise TypeError("Module relative allocation source must be TensorStorage or TensorView")
+            shape = tuple(owner.shape)
+        if any(not isinstance(extent, int) for extent in shape):
+            raise RuntimeError("dynamic Module allocation requires an input-relative shape")
         if self.initializer in {"zeros", "zeros_like"}:
-            return TensorStorage.zeros(dtype=self.dtype, shape=self.shape)
-        return TensorStorage.empty(dtype=self.dtype, shape=self.shape)
+            return TensorStorage.zeros(dtype=self.dtype, shape=shape)
+        return TensorStorage.empty(dtype=self.dtype, shape=shape)
 
 
 @dataclass(frozen=True)
@@ -1179,7 +1198,10 @@ class _PrimalSpecialization:
 
     def invoke(self, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
         inputs = self.signature.bind(*arguments, **keywords).arguments
-        allocations = tuple(spec.create() for spec in self.allocations)
+        allocation_list: list[TensorStorage] = []
+        for spec in self.allocations:
+            allocation_list.append(spec.create(inputs, tuple(allocation_list)))
+        allocations = tuple(allocation_list)
         outputs = self.outputs.resolve(inputs, allocations)
         return self.native_program.invoke(
             dataclasses.replace(
@@ -1257,10 +1279,30 @@ def _capture_recipes(
             return _TreeRecipe("list", tuple(tree(member) for member in value))
         raise TypeError("Module output contains a value that cannot be reconstructed from Program IR")
 
-    allocations = tuple(
-        _AllocationSpec(alloc.result.dtype, tuple(alloc.result.shape), alloc.kind, alloc.values)
-        for alloc in capture.allocs
-    )
+    allocation_specs = []
+    for alloc in capture.allocs:
+        like_source = None
+        like_key = None
+        if alloc.like is not None:
+            like_key = input_name(alloc.like)
+            if like_key is not None:
+                like_source = "input"
+            else:
+                like_key = allocation_index(alloc.like)
+                if like_key is None:
+                    raise TypeError("Module relative allocation references an unregistered Program buffer")
+                like_source = "allocation"
+        allocation_specs.append(
+            _AllocationSpec(
+                alloc.result.dtype,
+                tuple(alloc.result.shape),
+                alloc.kind,
+                alloc.values,
+                like_source,
+                like_key,
+            )
+        )
+    allocations = tuple(allocation_specs)
     return allocations, tree(outputs)
 
 
@@ -1314,7 +1356,10 @@ class _VjpSpecialization:
         bound = self.signature.bind(*arguments, **keywords)
         bound.apply_defaults()
         inputs = dict(bound.arguments)
-        allocations = tuple(spec.create() for spec in self.allocations)
+        allocation_list: list[TensorStorage] = []
+        for spec in self.allocations:
+            allocation_list.append(spec.create(inputs, tuple(allocation_list)))
+        allocations = tuple(allocation_list)
         invocation = dataclasses.replace(
             self.invocation,
             inputs=inputs,

@@ -175,7 +175,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_model.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_command_plan.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_autodiff.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_checkpoint_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_submission.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/../execution_graph/execution_graph_validation.cpp)

@@ -23,7 +23,7 @@ class GraphBuffer:
     """SSA symbol for a Program Storage full view. Not a runtime allocation."""
 
     dtype: Any
-    shape: tuple[int, ...]
+    shape: tuple[int | str, ...]
     access: str
     as_view: bool = False
     logical: ConcreteType | None = None
@@ -156,7 +156,7 @@ class GraphControlResource:
 
 @dataclass(frozen=True)
 class ResourceType:
-    shape: tuple[int, ...]
+    shape: tuple[int | str, ...]
     dtype: str
     logical: ConcreteType | None = None
 

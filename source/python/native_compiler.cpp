@@ -237,13 +237,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("access",
                      [](const ProgramParameterMetadata &value) { return static_cast<uint32_t>(value.access); })
         .def_ro("shape", &ProgramParameterMetadata::shape);
-    nb::class_<ProgramOutputMetadata>(module, "ProgramOutput")
-        .def_ro("name", &ProgramOutputMetadata::name)
-        .def_prop_ro("kind", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.kind); })
-        .def_prop_ro("dtype", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.dtype); })
-        .def_prop_ro("access", [](const ProgramOutputMetadata &value) { return static_cast<uint32_t>(value.access); })
-        .def_ro("shape", &ProgramOutputMetadata::shape)
-        .def_ro("location", &ProgramOutputMetadata::location);
     nb::class_<vernon::runtime::DirtyRangeSet>(module, "_DirtyRangeSet")
         .def(nb::init<size_t, bool>(), nb::arg("byte_size"), nb::arg("dirty") = false)
         .def_prop_ro("ranges", &vernon::runtime::DirtyRangeSet::ranges)

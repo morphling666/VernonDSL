@@ -112,12 +112,8 @@ struct RhiSampler {
 };
 
 /*
- * The canonical counterpart of GraphicsInvocationControls.
- *
- * A canonical Program reads its render pass, draw, and dynamic state as Program controls off an invocation, so a
- * cooked `vd.pipeline(...)` asset is driven through this rather than through the submit descriptor. There is no
- * graphics state to bind: topology, rasterization, and blending are pipeline state the asset declares at cook time,
- * which is why `vd.pipeline` takes `state=` and `targets=`.
+ * A canonical Program reads its render pass, draw, and dynamic state as Program controls off an invocation.
+ * Graphics state is declared by the cooked `vd.pipeline(...)` asset through `state=` and `targets=`.
  */
 struct CanonicalGraphicsControls {
     VernonRenderPass renderPass{};

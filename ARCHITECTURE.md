@@ -46,7 +46,8 @@ Frontend 负责：
 - 加载受限 source module graph；
 - 解析 Kernel、graphics entries、helpers 和 Struct；
 - 执行类型推导、effect analysis 和 capability-independent validation；
-- 绑定 captured constants 和 Features；
+- 绑定 captured constants 和 typed specializations，并由 Boolean assignment
+  派生 feature pruning；
 - 捕获 initialized Module 的 host-static 控制流；
 - 生成 Vernon IR 和 MLIR Program IR。
 
@@ -63,6 +64,11 @@ Frontend 负责：
 Module constructor 和 host-static `forward` 控制流可以使用普通 Python 值。
 invocation Value 或 device data 不能控制 Module-level Python 分支；动态数据
 控制流必须位于 Kernel/Shader 内。
+
+Initialized Module 按 annotation-static forward signature 和 host-static
+configuration 缓存 Program。具体动态 TensorView shape、stride、offset 和
+launch value 只在 invocation 绑定；input-relative transient allocation 在每次
+调用中从其输入或前序 allocation 派生具体 shape。
 
 详见：
 
@@ -100,7 +106,8 @@ Runtime 不按名称、dtype 或 endpoint 顺序猜测映射。
 3. Implementation selection 将 Program Node 映射到 portable Stage。
 4. Target compiler 为 Stage 生成 object、PTX、SPIR-V、GLSL/GLES、MSL 或
    DXIL。
-5. Cooker 输出一个 Program、feature variants 和 target ArtifactSystem。
+5. Cooker 输出一个 Program、typed specialization variants 和 target
+   ArtifactSystem。
 
 Compute Stage 不根据动态 TensorView shape 或 grid 重新编译。动态 shape、
 stride、offset、byte extent 和 grid axes 都在 invocation 时绑定。
@@ -130,8 +137,8 @@ asset = vd.program_asset(
 ```
 
 每个 cooked bundle 对应一个 target ArtifactSystem，并可包含多个明确列出的
-feature variants。Manifest 是 immutable deployment description，不包含
-invocation-time 资源、shape 或 command encoder。
+typed specialization variants。Manifest 是 immutable deployment
+description，不包含 invocation-time 资源、shape 或 command encoder。
 
 ## 6. Runtime lifecycle
 
@@ -139,7 +146,7 @@ Canonical C/C++ 调用路径为：
 
 ```text
 load Program bundle
-  -> resolve feature variant
+  -> resolve typed specialization variant
   -> create Program executable
   -> create Program instance
   -> begin invocation

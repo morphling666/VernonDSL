@@ -415,13 +415,18 @@ topology validation through a versioned compiler contract.
 
 Generated builtin functions are the preferred authoring API.
 `builtin("...")` remains a low-level entry-interface annotation and uses the
-same closed stage/direction/type registry. `vd.feature` is the single
-compile-time specialization mechanism for program code. `ProgramAsset`
-explicitly enumerates accepted canonical feature combinations through
-`variants=`; there is no independent public shader-variant selector. Feature
-values and `When` branches are compile-time specialization inputs, not runtime
-Python conditions. Interface locations are assigned deterministically before
-feature pruning so disabled fields retain stable reservations.
+same closed stage/direction/type registry. `vd.specialization(name, scalar_type)`
+declares a typed compile-time value; `vd.feature(name)` is its Boolean
+convenience form. `ProgramAsset` explicitly enumerates canonical assignment
+mappings through `variants=`. Compute Kernel and Kernel-VJP assets accept all
+scalar specialization kinds; graphics Pipeline assets accept Boolean
+specializations. Module and Module-VJP assets require the empty variant key
+because their child specialization choices are authored explicitly in the
+Module graph. There is no independent public
+shader-variant selector. Specialization values and `When` branches are
+compile-time inputs, not runtime Python conditions. Interface locations are
+assigned deterministically before Boolean pruning so disabled fields retain
+stable reservations.
 
 Imported DSL declarations are loaded through the source module graph without
 executing Python. Captured constants must belong to the deterministic
@@ -431,7 +436,8 @@ methods normalize to ordinary typed helper calls before reachability analysis.
 Project processing order is:
 
 1. load and validate source imports;
-2. bind captured constants and specialize features;
+2. bind captured constants and the canonical typed specialization key,
+   deriving Boolean feature pruning from that key;
 3. normalize Struct methods and generated builtins;
 4. prune to selected entries and validate the call graph;
 5. infer, specialize, and validate typed semantic nodes and effects;
@@ -440,10 +446,12 @@ Project processing order is:
 
 Semantic cache identity includes `COMPILER_CONTRACT_VERSION`,
 `PROGRAM_VERSION`, all source dependency
-digests, entry, enabled features, concrete shapes and interfaces, captured
-constants, workgroup size, helper specializations, and derivative-transform
-identity. Diagnostics include source path, one-based line and column, and a
-stable reason string.
+digests, entry, the typed specialization key, annotation-static shape
+constraints and interfaces, captured constants, workgroup size, helper
+specializations, and derivative-transform identity. Concrete dynamic
+TensorView descriptors remain invocation data as defined in
+[`tensor_view.md`](tensor_view.md). Diagnostics include source path, one-based
+line and column, and a stable reason string.
 
 ## 7. Stable syntax target and deferred ergonomics
 

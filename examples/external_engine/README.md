@@ -70,6 +70,8 @@ Cooking always runs with the desktop Python toolchain. Only the Runtime and
 external engine are cross-compiled. Emscripten builds copy `browser.html` to
 `index.html` next to the generated JavaScript and WebAssembly files.
 
-The `External Engine Pages` workflow cooks both bundles, builds the browser
-application, and deploys these three static files to GitHub Pages after pushes
-to `master`. The repository's Pages source must be set to **GitHub Actions**.
+The `External Engine Pages` workflow cooks both bundles and builds the browser
+application on pull requests, pushes to `master`, and manual runs. Every run
+executes the headless Node checksum and an explicitly installed headless Chrome
+startup smoke. Non-PR runs also deploy the three static files to GitHub Pages.
+The repository's Pages source must be set to **GitHub Actions**.

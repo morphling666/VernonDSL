@@ -70,7 +70,10 @@ deployment requirements are explicit. It does not require a second dispatcher im
 The regular compiler tests emit and inspect a real WebAssembly object. Web-profile Runtime tests
 load and resolve multiple statically registered Programs without a bundle directory, and exercise
 the calling-thread scheduler. The external-engine example loads both bundles in one executable:
-the animated `examples/fractal.py` kernel runs through a CPU Execution Graph in the left panel while
-an RHI Execution Graph renders Mandelbulb through desktop OpenGL or Emscripten WebGL2 in the right
-panel. The web build embeds integrity-checked GLSL ES stages and the statically linked CPU object,
-and retains a CPU-only headless Node checksum smoke.
+the animated `examples/fractal.py` kernel runs through a persistent CPU Program instance in the
+left panel while a persistent graphics Program instance renders Mandelbulb through desktop OpenGL
+or Emscripten WebGL2 in the right panel. The web build embeds integrity-checked GLSL ES stages and
+the statically linked CPU object. On pull requests, the `External Engine Pages` workflow cooks both
+bundles, builds the Emscripten application, runs the headless Node checksum smoke, and verifies
+browser startup with an explicitly installed headless Chrome. Pages staging and deployment run
+only for non-PR workflow events.

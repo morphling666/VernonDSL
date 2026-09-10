@@ -43,6 +43,20 @@ def indexed_vertex(
 
 
 @vd.vertex
+def i32_vertex(
+    position: Annotated[vd.Vector[vd.i32, 3], vd.attribute(divisor=1)],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vd.f32(position.x), vd.f32(position.y), vd.f32(position.z), 1.0])
+
+
+@vd.vertex
+def u32_vertex(
+    position: Annotated[vd.Vector[vd.u32, 3], vd.attribute(divisor=1)],
+) -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
+    return vd.Vector([vd.f32(position.x), vd.f32(position.y), vd.f32(position.z), 1.0])
+
+
+@vd.vertex
 def resource_only_vertex() -> Annotated[vd.Vector[vd.f32, 4], vd.builtin("position")]:
     return vd.Vector([0.0, 0.0, 0.0, 1.0])
 
@@ -130,6 +144,24 @@ indexed_asset = vd.program_asset(
     ),
     variants=({},),
 )
+
+
+def vertex_format_asset(name: str, vertex: object):
+    return vd.program_asset(
+        id=f"pipelines/{name}_vertex",
+        program=vd.pipeline(
+            vertex,
+            solid_fragment,
+            targets=vd.target_formats(colors={0: vd.rgba8_unorm}),
+        ),
+        variants=({},),
+    )
+
+
+i32_vertex_asset = vertex_format_asset("i32", i32_vertex)
+u32_vertex_asset = vertex_format_asset("u32", u32_vertex)
+f32_vertex_asset = vertex_format_asset("f32", indexed_vertex)
+
 
 explicit_sampler_asset = vd.program_asset(
     id="pipelines/explicit_sampler",

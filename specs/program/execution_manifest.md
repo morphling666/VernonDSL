@@ -257,10 +257,23 @@ The object above shows container structure only, not a valid bundle: the
 digest is placeholder text and the nested objects are incomplete. Required
 root members are exactly those shown.
 `content_hash` is lowercase SHA-256 over canonical JSON bytes of the complete
-bundle excluding `content_hash`. A variant contains exactly sorted unique
-non-empty feature strings in `key`, one Program in `program`, and one
-`artifact_system`; variant keys are unique and variants are ordered by
-canonical key bytes. The variant artifact system contains exactly its
+bundle excluding `content_hash`. A variant contains one canonical typed
+specialization key, one Program in `program`, and one `artifact_system`;
+variant keys are unique and variants are ordered by canonical key bytes.
+Each key entry is exactly:
+
+```json
+{"name":"extent","value":{"tag":"u32","value":4}}
+```
+
+Entries are ordered by unique non-empty `name`. `tag` is one of `bool`, `i32`,
+`u32`, `f32`, or `f64`; `value` must have that exact finite scalar domain.
+An `f32` value is rounded to binary32 before key construction. Floating-point
+negative zero is canonicalized to positive zero.
+Boolean feature selection is represented by a typed `bool` assignment rather
+than a parallel feature-key schema. An empty key is `[]`.
+
+The variant artifact system contains exactly its
 aggregate `runtime_requirements` and `artifacts`. Its StageArtifact keys are
 the logical Stage IDs in that variant's Program, so no Stage binding map
 exists. Non-stage value artifacts use the reserved `value/` key namespace.
@@ -268,7 +281,7 @@ One cooked bundle has one target. A different backend is a different bundle,
 not a fat-bundle branch or runtime fallback.
 
 The cooker emits code and StageArtifacts for every explicitly requested
-variant. Runtime selects exactly one variant from its canonical feature key
+variant. Runtime selects exactly one variant from its canonical specialization key
 before artifact resolution and validates only that variant's aggregate Runtime
 requirements. It then resolves, authenticates, loads, or JITs only
 StageArtifacts, CodeModules, and external Blob ranges reachable from that
@@ -1626,6 +1639,54 @@ Node 0 produces Value 3 and node 1 consumes Value 3 in both `operands` and its
 read access, so Resolve derives edge `0 -> 1`; no dependency member is
 serialized.
 
+### 15.1 Runtime composition of cooked Programs
+
+`ProgramGraph` is an in-memory pre-resolution linker. It is not serialized as
+another manifest type. Each child is one loaded, validated Program variant and
+its ArtifactSystem. All children must belong to the same Runtime context,
+target, and selected specialization key.
+
+Linking produces one ordinary `Program` and `ArtifactSystem`:
+
+- child Stage, Parameter, Storage, Value, Node, graph-control, Blob, and
+  artifact identities are namespaced and deterministically remapped;
+- child boundary names remain local to an opaque Program-node identity;
+- graph Value handles retain one child output and connect it to one or more
+  compatible child inputs; linking replaces those boundaries with one
+  composite Value;
+- graph Storage handles retain an explicit ordered list of compatible child
+  output boundaries; linking forms one physical Storage alias domain while
+  preserving every logical Value version and never invents a dataflow edge;
+- the final boundary of every graph Storage remains externally bindable even
+  when its Value also feeds a graph Value connection;
+- unconnected child boundaries remain externally bindable through node-local
+  tokens; explicit exports additionally assign graph-level names;
+- intermediate child publications are removed, while exported publication is
+  derived and validated for the composite boundary;
+- only child forward graphs and their required tape carriers enter the linked
+  Program; backward graphs, residual contracts, derivative projections, and
+  derivative boundaries remain node-local;
+- artifact bytes and Stage contracts are reused without source or Stage
+  recompilation.
+
+Names are diagnostic and reflection data, not connection identity. Public
+construction APIs resolve a child name to a stable node-local token before
+finalization; duplicate names in different children are valid.
+
+The linker must reject incompatible logical types, Storage descriptors,
+ownership/lifetime, mutability, access, publication, target, specialization key,
+artifact identity, or graph directions. It must also reject unresolved
+connected destinations exported as external boundaries, intermediate Storage
+versions exported as final outputs, and non-linear Storage-version chains. It
+never guesses a connection from equal names or equal runtime resource handles.
+
+The linked forward Program enters the ordinary Resolve algorithm below.
+Differentiated children also resolve immutable node-local backward plans from
+their already loaded artifacts. This does not submit a child executable or
+create a nested publication transaction during graph forward. One globally
+resolved forward schedule remains the only primal execution path; node-local
+plans are used only by explicitly retrieved pullbacks.
+
 ## 16. Resolve
 
 Resolve is pure with respect to caller resources and backend execution:
@@ -1984,12 +2045,20 @@ approved Compiler Contract and/or Program Version cut.
 
 Canonical type strings contain no whitespace. Scalars are `bool`, `i8`, `u8`,
 `i16`, `u16`, `i32`, `u32`, `i64`, `u64`, `f16`, `f32`, and `f64`.
+These are language ABI identities, not MLIR storage spellings: in particular,
+signless MLIR integers do not determine Program signedness. The compiler MUST
+carry and validate the language ABI identity through lowering before emitting a
+canonical type.
+At the executable Program boundary, MLIR type structure and the ordered
+language-ABI scalar leaves are consumed together to build one canonical type
+tree. Every declared leaf MUST exist, match the corresponding MLIR scalar
+storage kind and width, and be consumed exactly once. A signless MLIR integer
+without a declared language-ABI leaf is signed; an unsigned Program integer
+therefore requires an explicit unsigned leaf identity. Both Value `type` and
+ValueLayout `logical_type` are serialized from that same canonical tree.
 Recursive forms are:
 
 ```text
-vector<NxT>
-matrix<RxCxT>
-array<NxT>
 tuple<T0,T1,...>
 struct<field0:T0,field1:T1,...>
 tensor<D0xD1x...xT>
@@ -2000,8 +2069,11 @@ sampler
 opaque<CONTRACT>
 ```
 
-`N`, `R`, `C`, and static `D` are positive canonical decimal integers; a
-dynamic `D` is `?` and must correspond positionally to Value `shape`.
+`tensor<T>` and `tensor_view<T>` are the rank-zero forms. For positive rank,
+static `D` is a positive canonical decimal integer; a dynamic `D` is `?` and
+must correspond positionally to Value `shape`. Vector, Matrix, and removed
+Array source annotations never introduce alternate Program type spellings;
+ranked Values serialize as `tensor`.
 Aggregate field order is semantic, field names are unique NFC identifiers,
 and nesting is recursive. Tensor/type dimensions MUST equal Value shape
 dimensions after symbol substitution. Resource formats are

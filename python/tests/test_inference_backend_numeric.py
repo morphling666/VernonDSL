@@ -6,6 +6,8 @@ from typing import Annotated
 import numpy as np
 import vernon_dsl as vd
 
+from python.tests.compiler_test_support import compile_kernel_artifact
+
 
 @vd.func
 def identity(value):
@@ -99,10 +101,8 @@ class InferenceBackendNumericTests(unittest.TestCase):
                 )
 
     def test_specialization_and_artifact_generation_are_deterministic(self) -> None:
-        values = vd.storage.from_numpy(np.arange(8, dtype=np.float32))
-        output = vd.storage.zeros(dtype=vd.f32, shape=(8,))
-        first_source, first_reflection = inferred_numeric.compile_artifact(output, values, target="cpu")
-        second_source, second_reflection = inferred_numeric.compile_artifact(output, values, target="cpu")
+        first_source, first_reflection = compile_kernel_artifact(inferred_numeric, "cpu")
+        second_source, second_reflection = compile_kernel_artifact(inferred_numeric, "cpu")
         self.assertEqual(first_source, second_source)
         self.assertEqual(first_reflection, second_reflection)
         self.assertTrue(first_source)

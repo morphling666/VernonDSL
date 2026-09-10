@@ -772,19 +772,6 @@ struct PythonProgramExecutable {
         return result;
     }
 
-    std::vector<ProgramOutputMetadata> outputs() const {
-        std::vector<ProgramOutputMetadata> result;
-        const size_t count = vernonRuntimeProgramExecutableGetOutputCount(executable);
-        result.reserve(count);
-        for (size_t index = 0; index < count; ++index) {
-            VernonProgramOutputView view{};
-            if (vernonRuntimeProgramExecutableGetOutputByIndex(executable, index, &view) != VERNON_STATUS_OK)
-                throw std::runtime_error("cannot read loaded executable output");
-            result.push_back(outputMetadata(view));
-        }
-        return result;
-    }
-
     Runtime *owner{};
     VernonRuntimeContext *runtime{};
     VernonProgramBundle *bundle{};

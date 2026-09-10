@@ -58,16 +58,6 @@ std::shared_ptr<CompiledCommandGraph> CommandGraph::compile(std::string &error) 
     state->schedule = std::move(schedule_);
     state->scopes = std::move(scopes_);
     state->commandDag = std::move(commandDag);
-    state->autodiffCheckpointPlan = std::move(autodiffCheckpointPlan_);
-    state->autodiffInitialResources = std::move(autodiffInitialResources_);
-    state->autodiffInitialRanges = std::move(autodiffInitialRanges_);
-    state->autodiffTransactionResources = std::move(autodiffTransactionResources_);
-    state->autodiffTransactionRanges = std::move(autodiffTransactionRanges_);
-    state->autodiffRestorationResources = std::move(autodiffRestorationResources_);
-    state->autodiffRestorationRanges = std::move(autodiffRestorationRanges_);
-    state->hasAutodiffCheckpointPlan = hasAutodiffSchedule_;
-    state->differentiableInputs = std::move(differentiableInputs_);
-    state->objectives = std::move(objectives_);
     for (const auto &pass : state->passes) {
         pass->owner_ = nullptr;
         pass->frozen_ = true;
@@ -170,9 +160,6 @@ CompiledCommandGraph::~CompiledCommandGraph() = default;
 
 const std::vector<uint32_t> &CompiledCommandGraph::schedule() const { return state_->schedule; }
 const std::vector<CompiledScope> &CompiledCommandGraph::scopes() const { return state_->scopes; }
-const AutodiffDagCheckpointPlan *CompiledCommandGraph::autodiffCheckpointPlan() const {
-    return state_->hasAutodiffCheckpointPlan ? &state_->autodiffCheckpointPlan : nullptr;
-}
 
 ExecutionBindingsBuilder CompiledCommandGraph::createBindings(const std::vector<ExecutionBinding> &initial) const {
     ExecutionBindingsBuilder builder(state_->graphIdentity, state_->parameterNames.size());

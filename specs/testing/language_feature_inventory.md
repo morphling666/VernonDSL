@@ -226,6 +226,9 @@ compile failure with the stated stable reason, never a runtime skip.
 - Layers: `I`, `C`, `A`, `R`.
 - Diagnostic/oracle: one artifact identity serves contiguous, non-contiguous,
   offset, and negative-stride bindings with correct projected results.
+  Initialized Modules with `vd.dyn` parameters reuse one annotation-static
+  cached Program across concrete shapes; input-relative transient allocations
+  follow each invocation's bound shape.
 
 ### `LANG-VIEW-005` — bounds, injectivity, alias, and lifetime
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from vernon_dsl import CompileError, compile_file, compile_source
 from vernon_dsl.cli import main
+from vernon_dsl.types import SpecializationAssignment
 
 
 class TypeSystemTests(unittest.TestCase):
@@ -676,6 +677,44 @@ def main(value: f32) -> f32:
             self.assertEqual(main([str(input_path), "-o", str(output_path)]), 0)
             self.assertIn("func.func @main", output_path.read_text(encoding="utf-8"))
 
+    def test_cli_accepts_typed_specialization_assignments(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            input_path = Path(directory) / "input.py"
+            output_path = Path(directory) / "output.mlir"
+            input_path.write_text(
+                "from vernon_dsl import *\n"
+                'FLAG = feature("FLAG")\n'
+                'RANK = specialization("rank", u32)\n'
+                "@fragment\n"
+                "def main(x: f32) -> f32:\n"
+                "    if FLAG:\n"
+                "        return x + f32(RANK)\n"
+                "    return x\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                main(
+                    [
+                        str(input_path),
+                        "-o",
+                        str(output_path),
+                        "--entry",
+                        "main",
+                        "--specialization",
+                        "FLAG:bool=true",
+                        "--specialization",
+                        "rank:u32=4",
+                        "--specialization-binding",
+                        "RANK=rank",
+                    ]
+                ),
+                0,
+            )
+            output = output_path.read_text(encoding="utf-8")
+            self.assertIn('vernon.variant_key = ["FLAG"]', output)
+            self.assertIn("arith.constant 4 : i32", output)
+            self.assertIn("arith.addf", output)
+
 
 class ModuleGraphTests(unittest.TestCase):
     def test_dsl_entry_can_share_a_module_with_host_program_code(self) -> None:
@@ -859,9 +898,15 @@ def main(
             )
 
             static = compile_file(path)
-            instanced = compile_file(path, features={"INSTANCE"})
-            skinned = compile_file(path, features={"SKIN"})
-            combined = compile_file(path, features={"SKIN", "INSTANCE"})
+            instanced = compile_file(path, specializations=(SpecializationAssignment("INSTANCE", "bool", True),))
+            skinned = compile_file(path, specializations=(SpecializationAssignment("SKIN", "bool", True),))
+            combined = compile_file(
+                path,
+                specializations=(
+                    SpecializationAssignment("SKIN", "bool", True),
+                    SpecializationAssignment("INSTANCE", "bool", True),
+                ),
+            )
 
             for output in (static, instanced, skinned, combined):
                 self.assertNotIn("scf.if", output)
@@ -905,7 +950,7 @@ def main(
             with self.assertRaisesRegex(CompileError, "disabled value"):
                 compile_file(path)
             with self.assertRaisesRegex(CompileError, "undeclared feature"):
-                compile_file(path, features={"SKIN"})
+                compile_file(path, specializations=(SpecializationAssignment("SKIN", "bool", True),))
 
     def test_selected_entry_prunes_unrelated_stages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

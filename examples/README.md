@@ -3,9 +3,10 @@
 ## External engine integration
 
 [`external_engine/`](external_engine/) is a minimal C++ host that links a
-cooked CPU pipeline and the Vernon Runtime. Its source is shared by native
-desktop and Emscripten builds and has no Python or nanobind dependency at
-runtime.
+CPU compute Program bundle, a graphics Program bundle, and the Vernon Runtime.
+Both panels use the canonical Program lifecycle. The source is shared by
+native desktop and Emscripten builds and has no Python or nanobind dependency
+at runtime.
 
 ## Visual showcases
 

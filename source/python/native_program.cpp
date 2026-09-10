@@ -308,18 +308,6 @@ ProgramParameterMetadata parameterMetadata(const VernonProgramParameterView &vie
     return result;
 }
 
-ProgramOutputMetadata outputMetadata(const VernonProgramOutputView &view) {
-    ProgramOutputMetadata result;
-    result.name = nativeStringView(view.name);
-    result.kind = view.kind;
-    result.dtype = view.dtype;
-    result.access = view.access;
-    result.location = view.location;
-    if (view.rank)
-        result.shape.assign(view.static_shape, view.static_shape + view.rank);
-    return result;
-}
-
 const char *numpyDtypeName(VernonDataType dtype) {
     if (dtype == VERNON_DATA_BOOL)
         return "bool_";

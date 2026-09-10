@@ -157,6 +157,17 @@ class IncrementChain(vd.Module):
         return output
 
 
+class DynamicIncrement(vd.Module):
+    def forward(
+        self,
+        source: vd.TensorView[vd.f32, (vd.dyn,), vd.read],
+        count: vd.u32,
+    ) -> vd.TensorStorage:
+        output = vd.empty_like(source)
+        program_increment(output, source, grid=(count, 1, 1))
+        return output
+
+
 class ParameterizedIncrement(vd.Module):
     def forward(self, source: vd.TensorStorage, amount: vd.f32) -> vd.TensorStorage:
         output = vd.empty_like(source)
@@ -327,6 +338,22 @@ class ProgramExecutionTests(unittest.TestCase):
 
         np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 12.0)
+        self.assertEqual(len(module._program_cache), 1)
+
+    def test_module_dynamic_tensor_view_shape_reuses_annotation_static_program(self) -> None:
+        module = DynamicIncrement()
+
+        first = module(
+            vd.storage.from_numpy(np.arange(4, dtype=np.float32)).view(access="read"),
+            np.uint32(4),
+        )
+        second = module(
+            vd.storage.from_numpy(np.arange(7, dtype=np.float32)).view(access="read"),
+            np.uint32(7),
+        )
+
+        np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 1.0)
+        np.testing.assert_array_equal(second.to_numpy(), np.arange(7, dtype=np.float32) + 1.0)
         self.assertEqual(len(module._program_cache), 1)
 
     def test_module_scalar_argument_is_bound_per_invocation(self) -> None:

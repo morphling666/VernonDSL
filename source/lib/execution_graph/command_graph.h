@@ -5,7 +5,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -20,12 +19,9 @@ class CommandGraph;
 class CompiledCommandGraph;
 class ExecutionSubmission;
 class ExecutionResources;
-class GraphPullback;
-class GraphBackwardSubmission;
 namespace detail {
 struct CommandGraphTestAccess;
 struct RhiCommandExecutionPlan;
-class RhiCommandPlanSink;
 } // namespace detail
 
 enum class ResourceKind : uint8_t { Buffer, Image };
@@ -57,7 +53,6 @@ enum PassFlagBits : uint32_t {
     PassNeverCull = 1u << 0,
     PassNoMerge = 1u << 1,
     PassSideEffect = 1u << 2,
-    PassDerivative = 1u << 3,
 };
 
 enum class ImageUseRole : uint8_t { None, Sampled, Storage, ColorAttachment, DepthAttachment, Transfer };
@@ -129,128 +124,9 @@ struct ExecutionBinding {
     std::shared_ptr<const ExecutionBindingValue> value;
 };
 
-enum class DerivativeEndpointKind : uint8_t { Resource, Parameter };
-
-struct DerivativeEndpointKey {
-    DerivativeEndpointKind kind{DerivativeEndpointKind::Resource};
-    uint32_t id{UINT32_MAX};
-
-    bool operator==(const DerivativeEndpointKey &other) const { return kind == other.kind && id == other.id; }
-};
-
-struct NamedDerivativeEndpoint {
-    std::string name;
-    DerivativeEndpointKey endpoint;
-};
-
-struct PassDerivativeMapping {
-    std::string path;
-    DerivativeEndpointKey endpoint;
-};
-
-struct PassPrimalResourceMapping {
-    std::string path;
-    uint32_t resource{};
-};
-
 struct GraphByteRange {
     uint64_t offset{};
     uint64_t byteSize{};
-};
-
-struct PassWriteFootprint {
-    uint32_t resource{};
-    std::vector<GraphByteRange> ranges;
-};
-
-class GraphAutodiffValue {
-public:
-    virtual ~GraphAutodiffValue() = default;
-    virtual uintptr_t logicalIdentity() const = 0;
-    virtual uint64_t allocationBytes() const = 0;
-    virtual bool materialize(detail::RhiCommandPlanSink *sink, std::string &error) = 0;
-};
-
-using NamedGraphAutodiffValues = std::vector<std::pair<std::string, std::shared_ptr<GraphAutodiffValue>>>;
-
-struct PassPullbackApplyOptions {
-    uint64_t maximumTemporaryBytes{std::numeric_limits<uint64_t>::max()};
-    uint64_t maximumReusableConstructionBytes{};
-};
-
-class PassPullback {
-public:
-    virtual ~PassPullback() = default;
-    virtual bool apply(const NamedGraphAutodiffValues &cotangents, NamedGraphAutodiffValues &gradients,
-                       const PassPullbackApplyOptions &options, detail::RhiCommandPlanSink *sink,
-                       std::string &error) = 0;
-    virtual uint64_t estimatedTapeBytes() const = 0;
-    virtual uint64_t logicalResidualBytes() const = 0;
-    virtual uint64_t residentTapeBytes() const = 0;
-    virtual uint64_t allocatedTapeBytes() const = 0;
-    virtual uint64_t retainedAllocationBytes() const { return allocatedTapeBytes(); }
-    virtual uint64_t peakTemporaryTapeBytes() const { return 0; }
-    virtual uint64_t submissionCount() const { return 0; }
-    virtual uint64_t waitCount() const { return 0; }
-    virtual uint64_t readbackCount() const { return 0; }
-    virtual uint64_t atomicPublicationCount() const { return 0; }
-    virtual uint64_t temporaryAllocationTrafficBytes() const { return 0; }
-    virtual uint64_t deviceWaitNanoseconds() const { return 0; }
-    virtual uint64_t activeOperationCount() const = 0;
-    virtual uint64_t recomputationCost() const = 0;
-    virtual uint64_t tapeContextLimitBytes() const = 0;
-    virtual std::string residualSourceKind() const { return "capture"; }
-    virtual std::string controlHistoryKind() const { return "unknown"; }
-};
-
-class DifferentiablePass {
-public:
-    virtual ~DifferentiablePass() = default;
-    virtual const std::vector<PassDerivativeMapping> &gradientMappings() const = 0;
-    virtual const std::vector<PassDerivativeMapping> &cotangentMappings() const = 0;
-    virtual const std::vector<PassPrimalResourceMapping> &requiredPrimalResources() const {
-        static const std::vector<PassPrimalResourceMapping> empty;
-        return empty;
-    }
-    virtual const std::vector<PassWriteFootprint> &writeFootprints() const {
-        static const std::vector<PassWriteFootprint> empty;
-        return empty;
-    }
-    virtual const std::vector<PassWriteFootprint> &readFootprints() const {
-        static const std::vector<PassWriteFootprint> empty;
-        return empty;
-    }
-    virtual bool forward(ComputeEncoder *encoder, const ExecutionResources &resources,
-                         detail::RhiCommandExecutionPlan *plan, std::unique_ptr<PassPullback> &pullback,
-                         std::string &error) = 0;
-    virtual bool zeroCotangent(const std::string &path, const ExecutionResources &resources,
-                               std::shared_ptr<GraphAutodiffValue> &value, std::string &error) = 0;
-    virtual bool implicitCotangent(const std::string &path, const ExecutionResources &resources,
-                                   std::shared_ptr<GraphAutodiffValue> &value, std::string &error) = 0;
-    virtual uint64_t estimatedResidualBytes() const { return 0; }
-    virtual uint64_t estimatedRetainedAllocationBytes() const = 0;
-    virtual uint64_t estimatedForwardPeakBytes() const { return estimatedRetainedAllocationBytes(); }
-    virtual uint64_t replayCost() const { return 0; }
-    virtual uint64_t resourceReloadCost() const { return 0; }
-    virtual uint64_t recomputationCost() const { return 0; }
-    virtual bool deterministicReductionLegal() const { return true; }
-    virtual bool hasCheckpointPlanningMetadata() const { return false; }
-    virtual bool supportsReplay() const { return false; }
-};
-
-class GraphCheckpointResource {
-public:
-    virtual ~GraphCheckpointResource() = default;
-    virtual uint64_t byteSize() const = 0;
-    virtual uint64_t alignment() const { return 1; }
-    virtual bool copyTo(void *destination, uint64_t byteSize, std::string &error) const = 0;
-    virtual bool copyFrom(const void *source, uint64_t byteSize, std::string &error) = 0;
-    virtual bool copyRangeTo(uint64_t offset, void *destination, uint64_t byteSize, std::string &error) const;
-    virtual bool copyRangeFrom(uint64_t offset, const void *source, uint64_t byteSize, std::string &error);
-    virtual bool copyRangesTo(const std::vector<GraphByteRange> &ranges, void *packedDestination,
-                              std::string &error) const;
-    virtual bool copyRangesFrom(const std::vector<GraphByteRange> &ranges, const void *packedSource,
-                                std::string &error);
 };
 
 class ExecutionBindings {
@@ -260,7 +136,6 @@ public:
 
 private:
     friend class CompiledCommandGraph;
-    friend class GraphPullback;
     friend class ExecutionBindingsBuilder;
     friend class ExecutionResources;
     ExecutionBindings(uint64_t graphIdentity, std::vector<std::shared_ptr<const ExecutionBindingValue>> values)
@@ -369,7 +244,6 @@ class ComputePass : public ExecutionPass {
 public:
     using ExecutionPass::ExecutionPass;
     virtual VernonRhiStatus execute(ComputeEncoder &encoder, const ExecutionResources &resources) = 0;
-    virtual DifferentiablePass *differentiable() { return nullptr; }
 };
 
 struct CompiledScope {
@@ -377,92 +251,6 @@ struct CompiledScope {
     std::vector<uint32_t> passIndices;
     std::vector<VernonRhiBarrier> barriers;
     std::vector<uint32_t> predecessors;
-};
-
-struct AutodiffReplaySegment {
-    uint32_t beginStep{};
-    uint32_t endStep{};
-    uint32_t checkpointIndex{std::numeric_limits<uint32_t>::max()};
-    uint64_t logicalResidualBytes{};
-    uint64_t retainedAllocationBytes{};
-    uint64_t peakBytes{};
-    uint64_t replayCost{};
-    std::vector<uint32_t> releaseCheckpointResources;
-};
-
-struct AutodiffResourceVersion {
-    uint32_t resource{};
-    uint32_t epoch{};
-};
-
-enum class AutodiffVersionSource : uint8_t {
-    RetainedOwner,
-    InitialState,
-    Checkpoint,
-    Replay,
-};
-
-struct AutodiffRequiredResourceVersion {
-    uint32_t consumer{};
-    AutodiffResourceVersion version;
-    uint32_t producer{std::numeric_limits<uint32_t>::max()};
-    AutodiffVersionSource source{AutodiffVersionSource::RetainedOwner};
-    std::string path;
-};
-
-struct AutodiffPassVersionState {
-    std::vector<AutodiffResourceVersion> inputs;
-    std::vector<AutodiffResourceVersion> outputs;
-};
-
-struct AutodiffCheckpointResource {
-    uint32_t producer{};
-    AutodiffResourceVersion version;
-    uint64_t offset{};
-    uint64_t byteSize{};
-    uint64_t alignment{1};
-    uint32_t firstCut{std::numeric_limits<uint32_t>::max()};
-    uint32_t lastCut{};
-};
-
-struct AutodiffLivenessCut {
-    uint32_t scheduleOffset{};
-    std::vector<uint32_t> checkpointResources;
-};
-
-struct AutodiffDagCheckpointPlan {
-    std::vector<AutodiffCheckpointResource> checkpointResources;
-    std::vector<AutodiffLivenessCut> cuts;
-    std::vector<AutodiffReplaySegment> replaySegments;
-    std::vector<AutodiffPassVersionState> passVersions;
-    std::vector<AutodiffRequiredResourceVersion> requiredVersions;
-    uint64_t persistentCheckpointBytes{};
-    uint64_t initialStateBytes{};
-    uint64_t restorationBytes{};
-    uint64_t transactionBytes{};
-    uint64_t logicalResidualBytes{};
-    uint64_t retainedAllocationBytes{};
-    uint64_t maximumForwardPeakBytes{};
-    uint64_t backwardValueBytes{};
-    uint64_t memoryBudget{};
-    uint64_t peakBytes{};
-    uint64_t replayCost{};
-    uint64_t captureStoreBytes{};
-    uint64_t backwardLoadBytes{};
-    uint64_t checkpointCopyBytes{};
-    uint64_t resourceReloadCost{};
-    uint64_t recomputationCost{};
-    uint64_t weightedRuntimeCost{};
-    bool deterministicReductionLegal{true};
-    std::string selectedPolicy{"balanced"};
-};
-
-struct ExplicitReverseCommandNode {
-    uint32_t id{};
-    std::vector<uint32_t> dependencies;
-    uint64_t residualBytes{};
-    uint64_t temporaryBytes{};
-    uint64_t replayCost{};
 };
 
 namespace detail {
@@ -476,7 +264,6 @@ struct ExecutionResourceRecord {
     std::vector<uint64_t> imageViewKeys;
     VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    std::shared_ptr<GraphCheckpointResource> checkpoint;
 };
 } // namespace detail
 
@@ -515,16 +302,10 @@ public:
 
     VernonRhiStatus createBuffer(const VernonRhiBufferDescriptor &descriptor, GraphBuffer &output,
                                  bool exported = false);
-    GraphBuffer importHostBuffer(uint64_t identity, bool exported = false,
-                                 std::shared_ptr<GraphCheckpointResource> checkpoint = {});
-    GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false,
-                             std::shared_ptr<GraphCheckpointResource> checkpoint = {});
+    GraphBuffer importHostBuffer(uint64_t identity, bool exported = false);
+    GraphBuffer importBuffer(VernonRhiBuffer buffer, bool exported = false);
     GraphImage importImage(VernonRhiImage image, VernonRhiImageView view, bool exported = false);
     ExecutionParameter parameter(std::string name);
-    void setAutodiffEndpoints(std::vector<NamedDerivativeEndpoint> differentiableInputs,
-                              std::vector<NamedDerivativeEndpoint> objectives);
-    void setExplicitReverseCommandDag(std::vector<ExplicitReverseCommandNode> nodes);
-    void planAutodiffCheckpoints(uint64_t memoryBudget);
     std::shared_ptr<CompiledCommandGraph> compile(std::string &error);
     bool validate(std::string &error);
 
@@ -548,18 +329,6 @@ private:
     std::unordered_map<std::string, uint32_t> parameterIds_;
     std::vector<uint32_t> schedule_;
     std::vector<CompiledScope> scopes_;
-    std::vector<uint32_t> autodiffInitialResources_;
-    std::vector<std::vector<GraphByteRange>> autodiffInitialRanges_;
-    std::vector<uint32_t> autodiffTransactionResources_;
-    std::vector<std::vector<GraphByteRange>> autodiffTransactionRanges_;
-    std::vector<uint32_t> autodiffRestorationResources_;
-    std::vector<std::vector<GraphByteRange>> autodiffRestorationRanges_;
-    AutodiffDagCheckpointPlan autodiffCheckpointPlan_;
-    uint64_t autodiffMemoryBudget_{};
-    bool hasAutodiffSchedule_{};
-    std::vector<NamedDerivativeEndpoint> differentiableInputs_;
-    std::vector<NamedDerivativeEndpoint> objectives_;
-    std::vector<ExplicitReverseCommandNode> explicitReverseNodes_;
     bool dirty_{true};
     bool compiled_{};
 };
@@ -596,82 +365,15 @@ public:
 
     ExecutionBindingsBuilder createBindings(const std::vector<ExecutionBinding> &initial) const;
     ExecutionSubmission submit(std::shared_ptr<const ExecutionBindings> bindings = {}) const;
-    std::shared_ptr<GraphPullback> vjp(std::shared_ptr<const ExecutionBindings> bindings, std::string &error) const;
     const std::vector<uint32_t> &schedule() const;
     const std::vector<CompiledScope> &scopes() const;
-    const AutodiffDagCheckpointPlan *autodiffCheckpointPlan() const;
 
 private:
     friend class CommandGraph;
     friend class ExecutionSubmission;
-    friend class GraphPullback;
     struct State;
     explicit CompiledCommandGraph(std::shared_ptr<State> state);
     std::shared_ptr<State> state_;
-};
-
-class GraphBackwardSubmission {
-public:
-    enum class State : uint8_t { Pending, Succeeded, Failed };
-
-    State state() const;
-    bool wait(std::string &error);
-    const NamedGraphAutodiffValues &gradients() const;
-
-private:
-    friend class GraphPullback;
-    State state_{State::Pending};
-    std::string error_;
-    NamedGraphAutodiffValues gradients_;
-};
-
-struct GraphAutodiffPassTelemetry {
-    uint32_t scheduleOffset{};
-    std::string passName;
-    std::string residualSourceKind{"capture"};
-    std::string controlHistoryKind{"unknown"};
-    uint64_t estimatedTapeBytes{};
-    uint64_t logicalResidualBytes{};
-    uint64_t residentTapeBytes{};
-    uint64_t allocatedTapeBytes{};
-    uint64_t retainedAllocationBytes{};
-    uint64_t peakTemporaryTapeBytes{};
-    uint64_t checkpointBytes{};
-    uint64_t activeOperationCount{};
-    uint64_t recomputationCost{};
-    std::optional<uint64_t> controlHistoryBytes;
-};
-
-class GraphPullback {
-public:
-    ~GraphPullback();
-    GraphPullback(const GraphPullback &) = delete;
-    GraphPullback &operator=(const GraphPullback &) = delete;
-    ExecutionSubmission &forwardSubmission();
-    const ExecutionSubmission &forwardSubmission() const;
-    std::shared_ptr<GraphBackwardSubmission> submit(const NamedGraphAutodiffValues &cotangents, bool implicit);
-    uint64_t estimatedTapeBytes() const;
-    uint64_t logicalResidualBytes() const;
-    uint64_t residentTapeBytes() const;
-    uint64_t allocatedTapeBytes() const;
-    uint64_t retainedAllocationBytes() const;
-    uint64_t checkpointBytes() const;
-    uint64_t peakRuntimeManagedBytes() const;
-    uint64_t submissionCount() const;
-    uint64_t waitCount() const;
-    uint64_t readbackCount() const;
-    uint64_t atomicPublicationCount() const;
-    uint64_t temporaryAllocationTrafficBytes() const;
-    uint64_t deviceWaitNanoseconds() const;
-    uint64_t tapeContextLimitBytes() const;
-    double recomputationFactor() const;
-    std::vector<GraphAutodiffPassTelemetry> passTelemetry() const;
-
-private:
-    friend class CompiledCommandGraph;
-    class Impl;
-    explicit GraphPullback(std::unique_ptr<Impl> impl);
-    std::unique_ptr<Impl> impl_;
 };
 
 } // namespace vernon::execution

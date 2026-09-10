@@ -159,6 +159,29 @@ buffers and images flow through ordinary Program Values and Storage versions.
 The resolved transfer and hazard plan orders producer writes, graphics reads,
 attachment transitions, and publications.
 
+`ProgramGraph` may link separately cooked graphics Programs into that same
+static Program DAG before physical resolve. Child-local boundary names are not
+flattened. A graph connection maps each attachment transition to one symbolic
+Image Storage version chain, and only an explicitly exported graph boundary
+becomes public. The graph invocation binds the concrete framebuffer view to
+the imported Image Storage once.
+
+Global resolve groups adjacent graphics Nodes into static fusion-candidate
+regions only when symbolic attachment identity and subresources, format,
+sample count, version continuity, intervening hazards, and backend capabilities
+permit fusion. Each candidate boundary retains both resolved fused and split
+execution paths.
+
+Invocation materialization selects between those pre-resolved paths using the
+bound image identity, render area, attachment geometry, and
+load/store/clear/resolve controls. Compatible controls materialize one native
+scope; incompatible controls materialize the split path without changing
+logical ordering, barriers, or publication. Any transfer or barrier command
+inserted between candidate Nodes selects the split path so that the command
+remains between their native scopes. This is constrained execution-plan
+materialization, not graph replanning. Different native pipelines may still
+require pipeline binds inside a merged scope.
+
 Graphics remains outside active VJP. A VJP request fails closed when its
 selected derivative path traverses a graphics Node. Graphics Nodes unrelated
 to requested derivatives may remain in primal execution without introducing

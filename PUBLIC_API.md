@@ -27,6 +27,12 @@ providers. They are not application-facing stable API and may change when the
 compiler contract or Program version changes. Compiler C headers installed only by the
 development component are likewise outside the wheel's stable API.
 
+`compile_file(entry=...)` and `vernon-compile-python` accept only the canonical
+typed specialization key. Boolean pruning is derived from that key;
+non-Boolean assignments also carry explicit source-name bindings. The exact
+compile-surface contract is defined by
+[`specs/compiler/design.md`](specs/compiler/design.md).
+
 The native `vernon-compile` executable and compiler shared library are bundled
 to implement the installed Python tools. They are not separately supported
 command-line or native-link interfaces. Python modules, native symbols,
@@ -73,6 +79,13 @@ once. Global resolve emits static graphics fusion-candidate regions;
 invocation materializes only their resolved fused or split paths. Only
 graph-level invocation forward submits work. ProgramGraph does not accept
 resolved executables, raw Stages, native resources, encoders, or callbacks.
+
+ProgramGraph connections are primal scheduling relationships, not derivative
+relationships. A differentiated child may retain its own pullback during graph
+forward; `vernonRuntimeProgramInvocationGetNodePullback` transfers that
+node-scoped handle before invocation destruction. The graph executable itself
+has no autodiff signature or composite pullback, and Runtime performs no
+reverse traversal or cotangent accumulation across connections.
 
 Borrowed Vulkan and DirectX 12 command targets are queued by their external
 owner. Their completions remain pending until that owner has observed its GPU

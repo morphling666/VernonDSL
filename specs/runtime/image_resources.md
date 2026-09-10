@@ -105,10 +105,10 @@ A storage binding:
 
 Storage texture operations therefore do not replace sampled texture
 operations. A storage binding cannot call `sample`. The same compatible image
-may be rebound as sampled in a later pass after the execution graph inserts the
-required synchronization. Simultaneously sampling and writing an overlapping
-subresource in one dispatch is rejected unless a future contract defines a
-portable, explicitly synchronized feedback model.
+may be rebound as sampled in a later pass after the private Command DAG inserts
+the required synchronization. Simultaneously sampling and writing an
+overlapping subresource in one dispatch is rejected unless a future contract
+defines a portable, explicitly synchronized feedback model.
 
 The source language may retain one `Texture[...]` annotation family. Its
 arguments describe the shader binding role rather than creating separate

@@ -86,6 +86,17 @@ Multi-node Program VJP must cover:
 Graphics derivative paths and unsupported opaque Resources must fail before
 execution.
 
+ProgramGraph node-local VJP tests must cover:
+
+- a graph executable exposes no composite derivative ABI or pullback;
+- one linked forward retains independently retrievable pullbacks for each
+  differentiated child only when retention is requested;
+- applying a consumer pullback and explicitly passing its gradient as the
+  producer cotangent matches the numeric chain rule;
+- retrieval from a primal child and duplicate retrieval fail deterministically;
+- graph connections never trigger reverse traversal or automatic accumulation;
+- transferred pullbacks outlive the graph invocation and remain reusable.
+
 ## 5. Binding and lifetime
 
 Persistent Program instances must verify:

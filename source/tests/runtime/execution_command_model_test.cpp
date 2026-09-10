@@ -25,13 +25,6 @@ CommandNode nodeWithAccess(CommandResourceAccess access, std::vector<uint32_t> p
     return result;
 }
 
-class CommandModelComputePass final : public ComputePass {
-public:
-    using ComputePass::ComputePass;
-    void declare() override {}
-    VernonRhiStatus execute(ComputeEncoder &, const ExecutionResources &) override { return VERNON_RHI_STATUS_OK; }
-};
-
 TEST(ExecutionCommandModel, RejectsEmptyAndOverflowingBufferRanges) {
     std::string error;
     CommandResourceAccess empty = bufferAccess(1, 0, 0, AccessMode::Read);
@@ -115,20 +108,6 @@ TEST(ExecutionCommandModel, AllowsRuntimeNodesWithoutCompiledScopes) {
     error.clear();
     EXPECT_FALSE(validateCommandDag(compute, error));
     EXPECT_NE(error.find("compiled scope"), std::string::npos);
-}
-
-TEST(ExecutionCommandModel, LowersDerivativePassToDerivativeNode) {
-    std::vector<std::unique_ptr<ExecutionPass>> passes;
-    auto pass = std::make_unique<CommandModelComputePass>("derivative");
-    pass->setFlags(PassDerivative | PassNoMerge);
-    passes.push_back(std::move(pass));
-    CompiledScope scope;
-    scope.passIndices = {0};
-    CommandDag dag;
-    std::string error;
-    ASSERT_TRUE(buildCommandDag({}, passes, {scope}, dag, error)) << error;
-    ASSERT_EQ(dag.nodes.size(), 1u);
-    EXPECT_EQ(dag.nodes.front().kind, CommandNodeKind::Derivative);
 }
 
 VernonRhiStatus encodeCommand(void *, VernonRhiCommandEncoder) { return VERNON_RHI_STATUS_OK; }

@@ -52,6 +52,7 @@ from vernon_dsl.bundle import OpenGLTargetOptions, VulkanTargetOptions, canonica
 from vernon_dsl.compiler import compile_file  # noqa: E402
 from vernon_dsl.program_asset_cli import main as program_asset_main  # noqa: E402
 from vernon_dsl.program_assets import cook_program_asset  # noqa: E402
+from vernon_dsl.types import SpecializationAssignment  # noqa: E402
 
 FIXTURE = PYTHON_TEST_ROOT / "program_asset_fixture.py"
 GOLDEN = json.loads(
@@ -201,7 +202,11 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 continue
             for entry in ("triangle_vertex", "solid_fragment"):
                 with self.subTest(target=target_name, entry=entry):
-                    mlir = compile_file(FIXTURE, features=("OFFSET",), entry=entry)
+                    mlir = compile_file(
+                        FIXTURE,
+                        specializations=(SpecializationAssignment("OFFSET", "bool", True),),
+                        entry=entry,
+                    )
                     direct_reflection, direct_artifacts = self.direct.compile(
                         mlir, c_target, glsl_version, hlsl_shader_model
                     )

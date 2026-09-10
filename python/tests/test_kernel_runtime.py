@@ -18,6 +18,8 @@ from aggregate_vertex_shader import (
 from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.host_values import host_abi_layout
 
+from python.tests.compiler_test_support import compile_kernel_artifact
+
 
 def _load_fractal() -> ModuleType:
     path = Path(__file__).resolve().parents[2] / "examples" / "fractal.py"
@@ -1047,7 +1049,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
 
         for target in ("cuda", "vulkan"):
             with self.subTest(target=target):
-                artifact, reflection = copy_tensor_view.compile_artifact(output, source, target=target)
+                artifact, reflection = compile_kernel_artifact(copy_tensor_view, target)
                 self.assertTrue(artifact)
                 self.assertIn('"tensor_views"', reflection)
 
@@ -1225,7 +1227,6 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
     def test_cross_compiled_source_generation(self) -> None:
-        output = vd.storage.zeros(dtype=vd.f32, shape=(16,))
         cases = {
             "metal": "kernel void vector_while",
             "opengl": "#version 430",
@@ -1233,7 +1234,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         }
         for target, marker in cases.items():
             with self.subTest(target=target):
-                source, reflection = vector_while.compile_artifact(output, 0.35, target=target)
+                source, reflection = compile_kernel_artifact(vector_while, target)
                 self.assertIn(marker, source.decode())
                 self.assertIn(f'"target":"{target}"', reflection)
 
@@ -1320,10 +1321,9 @@ class KernelTests(unittest.TestCase):
             np.array([[0, 1, 2], [1, 2, 3]], dtype=np.float32),
         )
 
-    def test_compile_artifact_uses_in_process_owning_compiler(self) -> None:
-        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+    def test_compiler_test_utility_uses_in_process_owning_compiler(self) -> None:
         with mock.patch("subprocess.run", side_effect=AssertionError("subprocess prohibited")):
-            artifact, reflection = fill.compile_artifact(output, 1.0, target="vulkan")
+            artifact, reflection = compile_kernel_artifact(fill, "vulkan")
         self.assertTrue(artifact)
         self.assertIn('"target":"vulkan"', reflection)
 

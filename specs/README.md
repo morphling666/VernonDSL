@@ -15,9 +15,11 @@ completed migrations and superseded plans. Measurement output belongs in
 - `PROGRAM_VERSION` versions Program manifests, deployment artifacts, Runtime
   and provider ABI, and RHI compatibility.
 
-Current values are read from `versions.toml` and are frozen for the active
-release line. Backend implementation, bug fixes, tests, and completion of
-documented behavior do not require a version change.
+Current values are read from `versions.toml`. Before a release is published,
+the selected contract may replace an incomplete intermediate implementation
+without retaining compatibility code. After publication, backend
+implementation, bug fixes, tests, and completion of documented behavior do not
+require a version change.
 
 A future version changes only through an explicit release/contract decision.
 If implementation work conflicts with the frozen contract, report that

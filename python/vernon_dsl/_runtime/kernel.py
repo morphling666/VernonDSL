@@ -429,42 +429,6 @@ class Kernel:
         )
         return inspect.get_annotations(self._function, globals=annotation_globals, eval_str=True)
 
-    def compile_artifact(
-        self,
-        *arguments: Any,
-        target: str,
-        specializations: Mapping[Specialization, object] | None = None,
-    ) -> tuple[bytes, str]:
-        state = _session_state()
-        if state._native is None:
-            raise RuntimeError("native artifact compilation requires vernon_dsl._native")
-        targets = {
-            "cpu": state._native.Target.CPU,
-            "cuda": state._native.Target.CUDA,
-            "vulkan": state._native.Target.VULKAN,
-            "directx": state._native.Target.DIRECTX,
-            "metal": state._native.Target.METAL,
-            "opengl": state._native.Target.OPENGL,
-            "opengles": state._native.Target.OPENGL_ES,
-        }
-        if target not in targets:
-            raise ValueError("target must be cpu, cuda, vulkan, directx, metal, opengl, or opengles")
-        lowered = self._lower(specialization_key(specializations))
-        if arguments:
-            self._bind_launch(lowered, arguments)
-        options = make_target_options(
-            target,
-            {"version": 430} if target == "opengl" else {"version": 310} if target == "opengles" else {},
-        )
-        program = state._native.Compiler().compile_program_result(
-            lowered.frontend.mlir, targets[target], **options.native_options
-        )
-        if not program.ok:
-            raise RuntimeError(program.diagnostics)
-        if len(program.artifacts) != 1:
-            raise RuntimeError("kernel compilation must produce exactly one artifact")
-        return bytes(program.artifacts[0][1]), str(program.reflection)
-
     def specialize(
         self,
         specializations: Mapping[Specialization, object] | None = None,

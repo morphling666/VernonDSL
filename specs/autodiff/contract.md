@@ -188,7 +188,7 @@ loss_asset = vd.program_asset(
         wrt=("parameters",),
         outputs=("loss",),
     ),
-    variants=((),),
+    variants=({},),
 )
 ```
 
@@ -214,9 +214,9 @@ There is no `ad_program_asset()` and no `autodiff=True` Boolean.
 After Runtime resolves the cooked Program:
 
 ```python
-program = vd.resolve_program(
+program = vd.load_program(
     "build/render/render.program.json",
-    features=(),
+    specializations={},
 )
 image, pullback = program.vjp(bindings, grid=(grid_x, grid_y, grid_z))
 gradients = pullback(d_image)
@@ -381,7 +381,7 @@ pullbacks on CUDA, Vulkan, DirectX 12, Metal, and OpenGL. Captured implementatio
 complete-workgroup bounded replay with original virtual IDs, device-local Tape,
 fixed lane-status readback, transactional gradient publication, and no
 GPU-to-host Tape payload readback. RHI graph resources provide checkpoint
-snapshots for graph replay. Cotangents and gradients use the same canonical
+snapshots for Program forward-graph replay segments. Cotangents and gradients use the same canonical
 `VernonProgramArgument` boundary binding as primal Values and may remain
 device-resident; there is no device-specific pullback ABI. Derivative execution
 and temporary Tape/gradient storage remain backend-local. Graphics autodiff
@@ -403,20 +403,23 @@ compatibility branch.
 
 ## 9. Program composition
 
-Program forward, backward, and residual graphs are the only top-level AD
-topology. The C++ Command DAG executes resolved dependencies, checkpoint
-segments, replay, and deterministic fan-in. Python exposes Module VJP rather
-than pass objects or a second reverse graph.
+`ProgramGraph` is a primal compute/resource scheduling graph, not a
+differentiable Program. Value connections and Storage-version chains carry no
+derivative semantics. Linking never constructs a composite backward graph,
+cotangent fan-in, or graph pullback.
 
-The canonical backward operation is `GraphPullback.submit()`, which returns a
-submission carrying named gradients. Native CPU execution may complete inline;
-calling the pullback directly is the synchronous shorthand. Pullbacks are
-reusable and outlive the builder and caller's compiled-plan handle.
+A differentiated cooked Program remains differentiable when used as one graph
+node. One graph forward retains that node's own immutable residual and tape
+state. After forward, the caller may retrieve a reusable pullback for that node
+and apply it with the child Program's original Cotangent and Gradient boundary
+slots. Pullbacks for different nodes are independent.
 
-The orchestration core and type-erased cotangent accumulation are native C++.
-Python adapts values at the binding boundary but does not traverse the schedule
-or snapshot graph resources. Statically linked wasm32 structured VJP entries
-remain required before CPU/WebAssembly graph VJP is complete.
+For `A -> B`, the caller applies `B`'s pullback, explicitly binds the resulting
+cotangent as input to `A`'s pullback, and decides whether or how to accumulate
+multiple contributions. The Runtime does not traverse ProgramGraph edges in
+reverse. A whole-graph derivative must instead be authored as one Module and
+cooked as one VJP Program, where the compiler owns reverse topology and
+cotangent accumulation.
 
 ## 10. C and C++ deployment API
 
@@ -440,6 +443,16 @@ VernonProgramInvocation *invocation =
 vernonRuntimeProgramInvocationForward(invocation, &pullback);
 vernonProgramPullbackApply(pullback, derivative_arguments, derivative_argument_count);
 vernonProgramPullbackDestroy(pullback);
+```
+
+For a ProgramGraph, passing a non-null pullback output requests node-local
+retention but returns no composite pullback. The caller retrieves each retained
+child pullback explicitly before destroying the invocation:
+
+```c
+VernonPullback *composite = NULL;
+vernonRuntimeProgramInvocationForward(invocation, &composite); /* remains NULL */
+vernonRuntimeProgramInvocationGetNodePullback(invocation, node, &pullback);
 ```
 
 The C structures use `struct_size` and reserved fields. C++ provides RAII over

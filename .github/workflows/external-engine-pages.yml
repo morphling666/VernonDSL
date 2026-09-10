@@ -2,6 +2,7 @@ name: External Engine Pages
 
 on:
   workflow_dispatch:
+  pull_request:
   push:
     branches:
       - master
@@ -12,7 +13,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: external-engine-pages
+  group: external-engine-pages-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -132,6 +133,10 @@ jobs:
       - name: Run headless Node smoke
         run: node pages-build/vernon-external-engine.js
 
+      - name: Set up Chrome
+        id: chrome
+        uses: browser-actions/setup-chrome@v2
+
       - name: Run browser startup smoke
         run: |
           python3 -m http.server 8000 --directory pages-build > "$RUNNER_TEMP/pages-server.log" 2>&1 &
@@ -146,7 +151,8 @@ jobs:
             sleep 0.25
           done
           [[ "$ready" == true ]]
-          dom="$(google-chrome \
+          chrome="${{ steps.chrome.outputs.chrome-path }}"
+          dom="$("$chrome" \
             --headless=new \
             --no-sandbox \
             --use-angle=swiftshader \
@@ -157,6 +163,7 @@ jobs:
           [[ "$dom" == *"Vernon split-screen CPU and GPU animation started"* ]]
 
       - name: Stage Pages site
+        if: github.event_name != 'pull_request'
         run: |
           cmake -E make_directory pages-site
           cmake -E copy pages-build/index.html pages-site/index.html
@@ -165,9 +172,11 @@ jobs:
           touch pages-site/.nojekyll
 
       - name: Configure Pages
+        if: github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: pages-site
@@ -175,6 +184,7 @@ jobs:
   deploy:
     name: Deploy demo
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:

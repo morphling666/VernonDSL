@@ -30,43 +30,43 @@ Do not restore a Python `specialize(shapes=...)` path for compute. Graphics
 `shape_facts` remain the way to materialize image/attachment extents at
 pipeline finalize.
 
-## Tensor-first type system
+## Logical types and ABI materialization
 
-The Python language has one compound numeric type,
-`Tensor[element_type, shape]`. Vector and matrix names are aliases that add
-constructors and operations such as swizzle, dot, cross, transpose, and matrix
-multiplication; they are not separate types.
+Public entry signatures use first-class `!vernon.*` logical types. They are the
+only compiler-IR authority for language scalar identity, ranked constructor,
+logical shape, aggregate structure, Storage access, and Resource kind. A
+TensorView of a named structure is written once:
 
-The MLIR representation is selected by use rather than source spelling:
+```mlir
+%values: !vernon.tensor_view<2x@Nested, read, device>
+```
 
-- Small fixed-size value tensors lower to `vector` and target-native
-  vector/matrix types.
-- General value computation uses `tensor` and `linalg`.
-- Addressable resources use `memref` or target buffer types.
+The `@Nested` declaration owns its field types. Reflection expands the
+declaration only when serializing the self-contained canonical Program type.
+Parallel semantic strings and leaf-dtype attributes are forbidden.
 
-## MLIR storage vs language ABI dtype
+Vector and Matrix are Tensor aliases, not distinct logical types. Their
+annotations normalize to `!vernon.tensor`; rank-specific operations validate
+the required rank and shape. Program reflection emits `tensor<...>` as the one
+canonical ranked Value spelling. Physical lowering may use vectors, tensors,
+linalg, memrefs, or target-native carriers independently of that logical type.
 
-MLIR integer types are storage class. They do not encode language signedness.
+Language ABI scalars are `bool`, `i32`, `u32`, `f16`, `f32`, and `f64`.
+Logical integer types distinguish signedness. One explicit ABI
+materialization boundary maps both `i32` and `u32` to signless MLIR `i32`;
+unsigned operation choice remains explicit (`divui`, `uitofp`, and related
+operations).
 
-- Allowed storage scalars: `i1`, signless `i32`, `f16`, `f32`, `f64`.
-- Language `u32` lowers to signless `i32`. Vernon does not emit MLIR `ui32`.
-- Unsigned meaning lives in ops (`divui`, `uitofp`) and ABI metadata, not the type.
+ABI materialization recursively validates the logical type and produces the
+physical Vernon/MLIR type and layout plan. It is the only layer where logical
+and physical types coexist. After conversion:
 
-Language ABI dtypes are `bool`, `i32`, `u32`, `f16`, `f32`, and `f64`.
-
-- `vernon.abi_leaf_dtypes` is the source of truth on every public kernel or
-  Program argument and result. Struct declarations use `abi_leaf_dtypes`.
-  TensorView cells use `vernon.element_abi_leaf_dtypes`.
-- `vernon.dtype` is sugar for a single leaf. If present it must equal that
-  leaf. It is not a second independent channel.
-- `layout_hash` is `physical_canonical|dtypes=...`. Physical canonical uses
-  signless storage names (`scalar(i32,4,4)`). Language signedness enters only
-  through `|dtypes=`.
-- `getValueAbiLayout` fails if a 32-bit integer leaf has no explicit language
-  dtype. Do not recover `i32`/`u32` from `IntegerType::isUnsigned()`.
-- Host tensors, Program JSON `dtype`, compiled parameter `dtype`, and planner
-  `element_layout` all use language names. Shape specialization is a separate
-  axis.
+- backend IR contains no language-semantic metadata;
+- layout leaves and language dtypes are derived from the retained logical type;
+- `layout_hash` combines physical canonical layout with those derived dtypes;
+- reflection uses the retained logical entry model, never reverse-infers
+  language semantics from physical types;
+- shape specialization remains a separate invocation-time axis.
 
 ## Backend split
 
@@ -197,8 +197,13 @@ does not embed CPython.
 ### Frontend cache
 
 Completed frontend requests are cached by the immutable
-`FrontendCompileRequest`, including source path, entry, features, captured
-constants, Tensor shapes, TensorView constraints/layouts, and workgroup size. Each hit
+`FrontendCompileRequest`, including source path, entry, the canonical typed
+specialization key and its source-name bindings, ordinary captured constants,
+annotation-static Tensor shapes and TensorView constraints, and workgroup size.
+Concrete dynamic TensorView shape, stride, offset, and extent are invocation
+data and never enter frontend cache identity. Boolean feature pruning is
+derived from the typed key inside compiler orchestration; it is not a second
+request representation. Each hit
 rehashes every previously discovered source dependency before returning the
 immutable semantic result. This keeps the hit path independent of Python AST
 objects while invalidating changes to any transitive module; failed requests
@@ -214,7 +219,7 @@ specialization and semantic analysis. Dependency digests guard reuse, so
 different graphics stages share discovery without sharing mutable specialized
 AST or typed records.
 
-Runtime shape and captured-constant substitution lives in
+Annotation-static shape-constraint and captured-constant substitution lives in
 `frontend.specialization`. It consumes only the immutable compile request and
 project source, before inference, and does not select operations or result
 types. Typed analysis remains the sole source of those semantic decisions.
@@ -265,6 +270,16 @@ native compiler implementation behind the stable C API. Interactive
 and the target `vernon-cook-program` tool must pass the same specialized MLIR
 and target options to that C API; none may carry an independent lowering or
 reflection path.
+
+`compile_file(entry=...)` accepts one canonical
+`tuple[SpecializationAssignment, ...]` plus the source-name bindings required
+by non-Boolean assignments. `vernon-compile-python` exposes the same inputs as
+repeatable `--specialization NAME:TYPE=VALUE` and
+`--specialization-binding LOCAL=NAME` options, where `TYPE` is `bool`, `i32`,
+`u32`, `f32`, or `f64`. Whole-module `compile_file(entry=None)` accepts only
+Boolean assignments because non-Boolean substitution requires one selected
+entry. There is no parallel `features=` or `--feature` compile surface.
+
 `vernon-compile` is a compatibility and file-packaging shell over the C API,
 not an internal compiler service. Python runtime and cooker code must never
 invoke it as a subprocess. It may write raw compiler artifacts and reflection;
@@ -284,9 +299,10 @@ target options, reflected dependencies and interface, and exact artifact
 digest. ProgramAsset serialization is deliberately excluded: changing
 asset packaging without changing the specialized program must not create a
 different stage. Frontend specialization caches include source dependency
-hashes, enabled features, captured constants, runtime tensor shapes, and
-workgroup size. Cache hits must preserve byte-identical artifacts and canonical
-reflection; content changes must invalidate the corresponding key.
+hashes, the canonical typed specialization key, captured constants,
+annotation-static shape constraints, and workgroup size. Cache hits must
+preserve byte-identical artifacts and canonical reflection; content changes
+must invalidate the corresponding key.
 
 ## Program Asset declarations
 
@@ -312,13 +328,13 @@ SKIN = vd.feature("SKIN")
 compute_asset = vd.program_asset(
     id="pipeline/simulate",
     program=simulate_kernel,
-    variants=((), (FAST_PATH,)),
+    variants=({}, {FAST_PATH: True}),
 )
 
 graphics_asset = vd.program_asset(
     id="pipeline/mesh",
     program=vd.pipeline(mesh_vertex, mesh_fragment),
-    variants=((), (SKIN,)),
+    variants=({}, {SKIN: True}),
 )
 ```
 
@@ -340,15 +356,14 @@ contract for the active release line. A future incompatible topology change requ
 separately approved contract cut; implementation work must not bump the
 contract automatically.
 
-`variants=` explicitly enumerates every accepted canonical feature
+`variants=` explicitly enumerates every accepted canonical specialization
 combination, preventing implicit powerset growth. It contains at least one
-feature tuple; each tuple is sorted by feature name, contains no duplicate, and
-the list contains no duplicate key. `()` is the empty feature key, not an
-implicit fallback. Stage compilation remains cached per entry and feature key,
-so unchanged artifacts are content-addressed and shared across variants. The
-manifest-level `features` list is exactly the union of names present in those
-keys. Features declared by source modules but omitted from every ProgramAsset
-variant are not part of its contract.
+mapping from `vd.specialization(...)` or `vd.feature(...)` declarations to
+typed scalar values. Each resulting key is sorted by specialization name,
+contains no duplicate name, and the list contains no duplicate key. `{}` is
+the empty specialization key, not an implicit fallback. Stage compilation
+remains cached per entry and specialization key, so unchanged artifacts are
+content-addressed and shared across variants.
 
 Target architecture and target options are cooker inputs, not ProgramAsset
 source fields. A compute ProgramAsset accepts a compute target; a graphics
@@ -774,8 +789,9 @@ artifacts contain ordered vertex and fragment modules. Each module records its
 exact deployment format, authenticated Blob range, and entry point; filename
 or extension inference is forbidden. Supported deployment formats are CPU
 relocatable object, PTX, SPIR-V, GLSL/GLES, MSL, and DXIL.
-One cooked bundle contains one target ArtifactSystem and all feature variants
-for that target. Multi-target deployment emits separate bundles.
+One cooked bundle contains one target ArtifactSystem and all typed
+specialization variants for that target. Multi-target deployment emits
+separate bundles.
 Artifact reflection emits the closed endpoint resource-layout and portable
 ABI slots from the Program manifest Appendix B. Backend lowering maps these
 slots deterministically to native locations; descriptor sets, root

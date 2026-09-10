@@ -125,15 +125,8 @@ bool buildCommandDag(const std::vector<ExecutionResourceRecord> &resources,
             error = "compiled scope refers to an invalid pass";
             return false;
         }
-        const bool derivative = !scope.rendering && (passes[scope.passIndices.front()]->flags() & PassDerivative);
-        if (derivative && scope.passIndices.size() != 1) {
-            error = "derivative command scope must contain exactly one pass";
-            return false;
-        }
         CommandNode node;
-        node.kind = scope.rendering ? CommandNodeKind::Render
-                    : derivative    ? CommandNodeKind::Derivative
-                                    : CommandNodeKind::Compute;
+        node.kind = scope.rendering ? CommandNodeKind::Render : CommandNodeKind::Compute;
         node.queue = scope.rendering ? CommandQueueClass::Graphics : CommandQueueClass::Compute;
         node.scopeIndices.push_back(scopeIndex);
         node.predecessors = scope.predecessors;

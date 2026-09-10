@@ -903,22 +903,6 @@ VernonStatus fillBoundaryImageConstraintView(const program::BoundarySlot &source
     return VERNON_STATUS_OK;
 }
 
-bool fillOutputView(const Output &source, VernonProgramOutputView &destination) {
-    const auto kind = pipelineArgumentKind(source.kind);
-    const auto dtype = pipelineDataType(source.dtype);
-    const auto access = pipelineValueAccess(source.access);
-    if (!kind || !dtype || !access)
-        return false;
-    destination = {{source.name.data(), source.name.size()},
-                   *kind,
-                   *dtype,
-                   *access,
-                   static_cast<uint32_t>(source.shape.size()),
-                   source.shape.empty() ? nullptr : source.shape.data(),
-                   source.location};
-    return true;
-}
-
 bool stringViewEquals(VernonStringView view, const std::string &value) {
     return view.size == value.size() && (!view.size || std::memcmp(view.data, value.data(), view.size) == 0);
 }
@@ -1488,11 +1472,6 @@ VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(const VernonProgr
     return slot ? fillBoundaryImageConstraintView(*slot, *constraint) : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
-size_t vernonRuntimeProgramExecutableGetOutputCount(const VernonProgramExecutable *pipeline) {
-    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    return 0;
-}
-
 namespace {
 
 /* Collects the forward graph's graphics nodes in graph order, which is the order the controls query indexes by. */
@@ -1533,20 +1512,6 @@ VernonStatus vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(const Vern
     *output = {sizeof(VernonProgramGraphicsControlsView), node.id, graphics.renderPassControl,
                graphics.drawCommandControl, graphics.dynamicStateControl};
     return VERNON_STATUS_OK;
-}
-
-VernonStatus vernonRuntimeProgramExecutableGetOutputByIndex(const VernonProgramExecutable *pipeline, size_t index,
-                                                            VernonProgramOutputView *output) {
-    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    (void)index;
-    return (!pipeline || !output) ? VERNON_STATUS_INVALID_ARGUMENT : VERNON_STATUS_INVALID_ARGUMENT;
-}
-
-VernonStatus vernonRuntimeProgramExecutableFindOutput(const VernonProgramExecutable *pipeline, VernonStringView name,
-                                                      VernonProgramOutputView *output) {
-    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-    (void)name;
-    return (!pipeline || !output) ? VERNON_STATUS_INVALID_ARGUMENT : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
 void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline) {

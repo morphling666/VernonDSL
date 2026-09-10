@@ -35,7 +35,7 @@ The only deployment lifecycle is:
 ```text
 manifest bytes
   -> VernonProgramBundle
-  -> resolve feature variant
+  -> resolve typed specialization variant
   -> VernonProgramExecutable
   -> VernonProgramInstance
   -> VernonProgramInvocation
@@ -71,7 +71,7 @@ sentinel values.
 The resolver validates, before loading target code:
 
 - Program and compiler contract versions;
-- feature-key selection;
+- typed specialization key selection;
 - target identity and runtime requirements;
 - artifact size, digest, format, and entry point;
 - reflection and Program endpoint compatibility;
@@ -150,8 +150,22 @@ pullback. Each apply creates a fresh `ProgramInvocationState`, binds canonical
 cotangent and gradient slots, executes the backward plan, and transactionally
 publishes fresh gradients.
 
+Residual and checkpoint selection is Program-owned planning over the resolved
+forward graph. The shared internal DAG planner supplies a
+`ProgramResidualPlan`; it is not a differentiable CommandGraph execution API.
+
 Pullback application uses only `VernonProgramArgument` boundary bindings.
 Derivative leaf/group reflection is metadata, not another execution ABI.
+
+A ProgramGraph executable has no composite pullback or derivative ABI. If
+forward is called with a non-null pullback output, Runtime retains independent
+state for each differentiated child and leaves that output null. Before
+destroying the invocation, the caller transfers a node's retained handle with
+`vernonRuntimeProgramInvocationGetNodePullback`. Applying that handle executes
+only the child Program's resolved backward plan in its original boundary-slot
+namespace. Runtime does not reverse ProgramGraph connections or accumulate
+cotangents between nodes. Passing a null pullback output performs primal-only
+graph execution and retains no node pullbacks.
 
 ## 8. Private Command DAG
 
@@ -161,7 +175,8 @@ The private Command DAG owns:
 - upload, device-copy, Stage execution, and readback ordering;
 - native barriers and resource transitions;
 - render-scope formation and fusion;
-- replay and checkpoint scheduling;
+- execution of resolved replay and checkpoint commands from the Program
+  residual plan;
 - submission, completion, and transient resource lifetime.
 
 It is not serialized as Program topology and is not a public Python authoring
