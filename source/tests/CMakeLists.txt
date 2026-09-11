@@ -18,6 +18,9 @@ endif()
 if(Python_EXECUTABLE)
     add_test(NAME VernonGeneratedVersionsCheck COMMAND "${Python_EXECUTABLE}"
                                                        "${VERNON_REPOSITORY_ROOT}/tools/generate_versions.py" --check)
+    add_test(NAME VernonRuntimeSourcePolicyCheck
+             COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_source_policy.py"
+                     --repository "${VERNON_REPOSITORY_ROOT}")
 endif()
 
 file(
@@ -182,6 +185,34 @@ if(TARGET VernonRuntime)
     target_link_libraries(VernonRuntimeCoreProviderTests PRIVATE GTest::gtest_main Vernon::RuntimeCore)
     add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
     vernon_discover_gtests(VernonRuntimeCoreProviderTests)
+
+    add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp runtime/lifecycle_benchmark_test.cpp)
+    target_link_libraries(VernonRuntimeSupportTests PRIVATE GTest::gtest_main Vernon::Runtime)
+    vernon_discover_gtests(VernonRuntimeSupportTests)
+    add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
+    target_compile_definitions(VernonLifecycleControlTests PRIVATE VERNON_LIFECYCLE_TEST_HOOKS=1)
+    target_link_libraries(VernonLifecycleControlTests PRIVATE GTest::gtest_main Vernon::Runtime)
+    vernon_discover_gtests(VernonLifecycleControlTests)
+    add_library(VernonRuntimeSupportNoExceptionsCheck OBJECT runtime/runtime_support_no_exceptions_compile.cpp)
+    target_link_libraries(VernonRuntimeSupportNoExceptionsCheck PRIVATE Vernon::Runtime)
+    if(MSVC)
+        target_compile_options(VernonRuntimeSupportNoExceptionsCheck PRIVATE /EHs-c-)
+    else()
+        target_compile_options(VernonRuntimeSupportNoExceptionsCheck PRIVATE -fno-exceptions)
+    endif()
+    add_dependencies(VernonRuntimeSupportTests VernonRuntimeSupportNoExceptionsCheck)
+    add_dependencies(VernonLifecycleControlTests VernonRuntimeSupportNoExceptionsCheck)
+    if(Python_EXECUTABLE
+       AND APPLE
+       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"
+       AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_test(
+            NAME VernonLifecyclePhase2PerformanceGate
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_lifecycle_benchmark.py" --benchmark
+                "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline
+                "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-11-macos-arm64-lifecycle-phase2-debug.json")
+    endif()
 
     if(VERNON_ENABLE_CUDA_RUNTIME)
         add_executable(VernonRuntimeRHIAdapterTests rhi/cuda_adapter_test.cpp)

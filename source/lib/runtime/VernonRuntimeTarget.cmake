@@ -398,6 +398,9 @@ function(vernon_add_runtime)
     install(
         FILES ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonVersions.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonCommon.h
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonResult.hpp
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonError.hpp
+              ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonLifecycle.hpp
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonProgramSemanticTypes.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonGraphicsState.h
               ${_VERNON_RUNTIME_INCLUDE_DIR}/VernonOpenGLContext.h
