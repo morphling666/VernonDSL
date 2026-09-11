@@ -27,29 +27,14 @@ static_assert(std::is_trivially_copyable_v<LifecycleSnapshot>);
 
 namespace detail {
 
-#if defined(VERNON_LIFECYCLE_TEST_HOOKS)
-enum class LifecycleTestEvent : std::uint8_t {
-    BeforeAcquireCompareExchange,
-    AfterAcquireLinearized,
-    BeforeClosingCompareExchange,
-    AfterClosingLinearized,
+struct NoLifecycleHooks {
+    static constexpr void beforeAcquire(const char *) noexcept {}
+    static constexpr void afterAcquire(const char *) noexcept {}
+    static constexpr void beforeClosing(const char *) noexcept {}
+    static constexpr void afterClosing(const char *) noexcept {}
 };
 
-using LifecycleTestHook = void (*)(LifecycleTestEvent, const char *) noexcept;
-
-inline std::atomic<LifecycleTestHook> lifecycleTestHook{};
-
-inline void setLifecycleTestHook(LifecycleTestHook hook) noexcept {
-    lifecycleTestHook.store(hook, std::memory_order_release);
-}
-
-inline void invokeLifecycleTestHook(LifecycleTestEvent event, const char *operation) noexcept {
-    if (LifecycleTestHook hook = lifecycleTestHook.load(std::memory_order_acquire))
-        hook(event, operation);
-}
-#endif
-
-class AtomicLifecycleCounter {
+template <typename HookPolicy = NoLifecycleHooks> class AtomicLifecycleCounter {
 public:
     static constexpr std::uint64_t maximumLeaseCount = (std::uint64_t{1} << 62) - 1;
 
@@ -73,13 +58,9 @@ public:
                 return Result<void, LifecycleError>{
                     err(LifecycleError{saturationCode, {operation, currentCount, encodeDetail(currentState)}})};
             const std::uint64_t desired = encode(LifecycleState::Open, currentCount + 1);
-#if defined(VERNON_LIFECYCLE_TEST_HOOKS)
-            invokeLifecycleTestHook(LifecycleTestEvent::BeforeAcquireCompareExchange, operation);
-#endif
+            HookPolicy::beforeAcquire(operation);
             if (word_.compare_exchange_weak(current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-#if defined(VERNON_LIFECYCLE_TEST_HOOKS)
-                invokeLifecycleTestHook(LifecycleTestEvent::AfterAcquireLinearized, operation);
-#endif
+                HookPolicy::afterAcquire(operation);
                 return Result<void, LifecycleError>{ok()};
             }
         }
@@ -106,13 +87,9 @@ public:
                 return Result<LifecycleSnapshot, LifecycleError>{
                     err(stateError(currentState, operation, decodeCount(current)))};
             const std::uint64_t desired = encode(LifecycleState::Closing, decodeCount(current));
-#if defined(VERNON_LIFECYCLE_TEST_HOOKS)
-            invokeLifecycleTestHook(LifecycleTestEvent::BeforeClosingCompareExchange, operation);
-#endif
+            HookPolicy::beforeClosing(operation);
             if (word_.compare_exchange_weak(current, desired, std::memory_order_acq_rel, std::memory_order_acquire)) {
-#if defined(VERNON_LIFECYCLE_TEST_HOOKS)
-                invokeLifecycleTestHook(LifecycleTestEvent::AfterClosingLinearized, operation);
-#endif
+                HookPolicy::afterClosing(operation);
                 return Result<LifecycleSnapshot, LifecycleError>{
                     ok(LifecycleSnapshot{LifecycleState::Closing, decodeCount(current)})};
             }
@@ -223,7 +200,7 @@ private:
 
 class OwnerControlBlock {
 public:
-    static constexpr std::uint64_t maximumChildCount = detail::AtomicLifecycleCounter::maximumLeaseCount;
+    static constexpr std::uint64_t maximumChildCount = detail::AtomicLifecycleCounter<>::maximumLeaseCount;
     static constexpr std::uint64_t maximumReferenceCount = std::numeric_limits<std::uint64_t>::max();
 
     OwnerControlBlock(const OwnerControlBlock &) = delete;
@@ -243,7 +220,7 @@ private:
     [[nodiscard]] Result<ChildReservation, LifecycleError> reserveChild(OwnerRef owner) noexcept;
     [[nodiscard]] Result<CloseAttempt, LifecycleError> beginClose(OwnerRef owner) noexcept;
 
-    detail::AtomicLifecycleCounter children_;
+    detail::AtomicLifecycleCounter<> children_;
     std::atomic<std::uint64_t> references_{1};
     const std::uint64_t maximumReferences_;
 
@@ -370,7 +347,7 @@ inline std::uint64_t OwnerRef::childCount() const noexcept { return control().ch
 
 inline Result<OwnerRef, LifecycleError> OwnerControlBlock::create(std::uint64_t maximumChildren,
                                                                   std::uint64_t maximumReferences) noexcept {
-    if (maximumChildren > detail::AtomicLifecycleCounter::maximumLeaseCount || maximumReferences == 0)
+    if (maximumChildren > detail::AtomicLifecycleCounter<>::maximumLeaseCount || maximumReferences == 0)
         return Result<OwnerRef, LifecycleError>{
             err(LifecycleError{LifecycleErrorCode::InvalidConfiguration,
                                {"create_owner_control", maximumChildren, maximumReferences == 0 ? 1u : 2u}})};
@@ -539,7 +516,7 @@ private:
 
 class OperationControlBlock {
 public:
-    static constexpr std::uint64_t maximumPinCount = detail::AtomicLifecycleCounter::maximumLeaseCount;
+    static constexpr std::uint64_t maximumPinCount = detail::AtomicLifecycleCounter<>::maximumLeaseCount;
     static constexpr std::uint64_t maximumReferenceCount = std::numeric_limits<std::uint64_t>::max();
 
     OperationControlBlock(const OperationControlBlock &) = delete;
@@ -562,7 +539,7 @@ private:
     [[nodiscard]] Result<OperationPin, LifecycleError> tryPin(OperationRef control) noexcept;
     [[nodiscard]] Result<DestructionAttempt, LifecycleError> beginDestroy(OperationRef control) noexcept;
 
-    detail::AtomicLifecycleCounter pins_;
+    detail::AtomicLifecycleCounter<> pins_;
     std::atomic<std::uint64_t> references_{1};
     const std::uint64_t maximumReferences_;
 

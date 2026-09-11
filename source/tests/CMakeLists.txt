@@ -190,7 +190,6 @@ if(TARGET VernonRuntime)
     target_link_libraries(VernonRuntimeSupportTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonRuntimeSupportTests)
     add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
-    target_compile_definitions(VernonLifecycleControlTests PRIVATE VERNON_LIFECYCLE_TEST_HOOKS=1)
     target_link_libraries(VernonLifecycleControlTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonLifecycleControlTests)
     add_library(VernonRuntimeSupportNoExceptionsCheck OBJECT runtime/runtime_support_no_exceptions_compile.cpp)
@@ -202,16 +201,33 @@ if(TARGET VernonRuntime)
     endif()
     add_dependencies(VernonRuntimeSupportTests VernonRuntimeSupportNoExceptionsCheck)
     add_dependencies(VernonLifecycleControlTests VernonRuntimeSupportNoExceptionsCheck)
-    if(Python_EXECUTABLE
-       AND APPLE
-       AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$"
-       AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    if(Python_EXECUTABLE)
+        if(APPLE)
+            set(_vernon_lifecycle_baseline_platform "macos")
+        elseif(WIN32)
+            set(_vernon_lifecycle_baseline_platform "windows")
+        else()
+            string(TOLOWER "${CMAKE_SYSTEM_NAME}" _vernon_lifecycle_baseline_platform)
+        endif()
+        string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _vernon_lifecycle_baseline_architecture)
+        if(CMAKE_CONFIGURATION_TYPES)
+            set(_vernon_lifecycle_baseline_configuration "$<LOWER_CASE:$<CONFIG>>")
+        else()
+            string(TOLOWER "${CMAKE_BUILD_TYPE}" _vernon_lifecycle_baseline_configuration)
+        endif()
+        set(_vernon_lifecycle_baseline
+            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-11-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-lifecycle-phase2-${_vernon_lifecycle_baseline_configuration}.json"
+        )
         add_test(
             NAME VernonLifecyclePhase2PerformanceGate
-            COMMAND
-                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_lifecycle_benchmark.py" --benchmark
-                "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline
-                "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-11-macos-arm64-lifecycle-phase2-debug.json")
+            COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_lifecycle_benchmark.py" --benchmark
+                    "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline "${_vernon_lifecycle_baseline}")
+        set_tests_properties(
+            VernonLifecyclePhase2PerformanceGate
+            PROPERTIES RUN_SERIAL
+                       TRUE
+                       SKIP_RETURN_CODE
+                       77)
     endif()
 
     if(VERNON_ENABLE_CUDA_RUNTIME)

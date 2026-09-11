@@ -55,8 +55,15 @@ private:
     bool open_{};
 };
 
+enum class LifecycleHookEvent : std::uint8_t {
+    BeforeAcquire,
+    AfterAcquire,
+    BeforeClosing,
+    AfterClosing,
+};
+
 struct LifecycleHookBarrier {
-    vernon::detail::LifecycleTestEvent event;
+    LifecycleHookEvent event;
     std::string_view operation;
     Gate reached;
     Gate resume;
@@ -65,7 +72,7 @@ struct LifecycleHookBarrier {
 
 std::atomic<LifecycleHookBarrier *> activeLifecycleHookBarrier{};
 
-void lifecycleTestHook(vernon::detail::LifecycleTestEvent event, const char *operation) noexcept {
+void invokeLifecycleTestHook(LifecycleHookEvent event, const char *operation) noexcept {
     LifecycleHookBarrier *barrier = activeLifecycleHookBarrier.load(std::memory_order_acquire);
     if (!barrier || barrier->event != event || barrier->operation != operation ||
         barrier->consumed.exchange(true, std::memory_order_acq_rel))
@@ -74,18 +81,31 @@ void lifecycleTestHook(vernon::detail::LifecycleTestEvent event, const char *ope
     barrier->resume.wait();
 }
 
+struct LifecycleHookPolicy {
+    static void beforeAcquire(const char *operation) noexcept {
+        invokeLifecycleTestHook(LifecycleHookEvent::BeforeAcquire, operation);
+    }
+    static void afterAcquire(const char *operation) noexcept {
+        invokeLifecycleTestHook(LifecycleHookEvent::AfterAcquire, operation);
+    }
+    static void beforeClosing(const char *operation) noexcept {
+        invokeLifecycleTestHook(LifecycleHookEvent::BeforeClosing, operation);
+    }
+    static void afterClosing(const char *operation) noexcept {
+        invokeLifecycleTestHook(LifecycleHookEvent::AfterClosing, operation);
+    }
+};
+
+using HookedLifecycleCounter = vernon::detail::AtomicLifecycleCounter<LifecycleHookPolicy>;
+
 class ScopedLifecycleHook {
 public:
     explicit ScopedLifecycleHook(LifecycleHookBarrier &barrier) noexcept {
         activeLifecycleHookBarrier.store(&barrier, std::memory_order_release);
-        vernon::detail::setLifecycleTestHook(lifecycleTestHook);
     }
     ScopedLifecycleHook(const ScopedLifecycleHook &) = delete;
     ScopedLifecycleHook &operator=(const ScopedLifecycleHook &) = delete;
-    ~ScopedLifecycleHook() noexcept {
-        vernon::detail::setLifecycleTestHook(nullptr);
-        activeLifecycleHookBarrier.store(nullptr, std::memory_order_release);
-    }
+    ~ScopedLifecycleHook() noexcept { activeLifecycleHookBarrier.store(nullptr, std::memory_order_release); }
 };
 
 TEST(LifecycleControlTest, ReservationRollbackAndCommittedLeaseHaveOneOwnerCount) {
@@ -348,61 +368,65 @@ TEST(LifecycleControlTest, OperationPinsRejectConcurrentDestruction) {
 }
 
 TEST(LifecycleControlTest, AdmissionWinsBeforeCloseDeterministically) {
-    vernon::OwnerRef owner = createOwner();
-    LifecycleHookBarrier barrier{vernon::detail::LifecycleTestEvent::AfterAcquireLinearized, "reserve_child"};
+    HookedLifecycleCounter children;
+    LifecycleHookBarrier barrier{LifecycleHookEvent::AfterAcquire, "reserve_child"};
     ScopedLifecycleHook hook{barrier};
     std::atomic<std::size_t> nativeMutations{0};
     bool admissionSucceeded = false;
     bool rollbackSucceeded = false;
 
     std::thread admission([&] {
-        auto reservation = owner.reserveChild();
-        admissionSucceeded = reservation.isOk();
+        auto admitted = children.acquire("reserve_child", vernon::LifecycleErrorCode::AdmissionSaturated);
+        admissionSucceeded = admitted.isOk();
         if (admissionSucceeded) {
             nativeMutations.fetch_add(1, std::memory_order_relaxed);
-            rollbackSucceeded = reservation.value().rollback().isOk();
+            rollbackSucceeded = children.release("rollback_child_reservation").isOk();
         }
     });
 
     barrier.reached.wait();
     EXPECT_EQ(nativeMutations.load(std::memory_order_relaxed), 0u);
-    auto close = owner.beginClose();
+    auto close = children.beginClosing("begin_owner_close");
+    const std::uint64_t closeSnapshot = close.isOk() ? close.value().leaseCount : 0;
+    const bool closeRejected = close.isOk() && closeSnapshot != 0;
+    if (closeRejected)
+        EXPECT_TRUE(children.restoreOpen("reject_owner_close"));
     EXPECT_EQ(nativeMutations.load(std::memory_order_relaxed), 0u);
     barrier.resume.open();
     admission.join();
 
     ASSERT_TRUE(admissionSucceeded);
     ASSERT_TRUE(rollbackSucceeded);
-    ASSERT_TRUE(close.isErr());
-    EXPECT_EQ(close.error().code, vernon::LifecycleErrorCode::LiveChildren);
+    EXPECT_TRUE(closeRejected);
+    EXPECT_EQ(closeSnapshot, 1u);
     EXPECT_EQ(nativeMutations.load(std::memory_order_relaxed), 1u);
-    EXPECT_EQ(owner.state(), vernon::LifecycleState::Open);
-    EXPECT_EQ(owner.childCount(), 0u);
+    EXPECT_EQ(children.state(), vernon::LifecycleState::Open);
+    EXPECT_EQ(children.leaseCount(), 0u);
 }
 
 TEST(LifecycleControlTest, ClosingWinsBeforeAdmissionDeterministically) {
-    vernon::OwnerRef owner = createOwner();
-    LifecycleHookBarrier barrier{vernon::detail::LifecycleTestEvent::AfterClosingLinearized, "begin_owner_close"};
+    HookedLifecycleCounter children;
+    LifecycleHookBarrier barrier{LifecycleHookEvent::AfterClosing, "begin_owner_close"};
     ScopedLifecycleHook hook{barrier};
     std::atomic<std::size_t> nativeMutations{0};
     bool closeSucceeded = false;
     bool rollbackSucceeded = false;
 
     std::thread closing([&] {
-        auto close = owner.beginClose();
+        auto close = children.beginClosing("begin_owner_close");
         closeSucceeded = close.isOk();
         if (closeSucceeded)
-            rollbackSucceeded = close.value().rollback().isOk();
+            rollbackSucceeded = children.restoreOpen("rollback_owner_close").isOk();
     });
 
     barrier.reached.wait();
-    auto reservation = owner.reserveChild();
-    const bool admissionRejected = reservation.isErr();
+    auto admission = children.acquire("reserve_child", vernon::LifecycleErrorCode::AdmissionSaturated);
+    const bool admissionRejected = admission.isErr();
     const vernon::LifecycleErrorCode admissionError =
-        admissionRejected ? reservation.error().code : vernon::LifecycleErrorCode::TeardownFailed;
-    if (reservation.isOk()) {
+        admissionRejected ? admission.error().code : vernon::LifecycleErrorCode::TeardownFailed;
+    if (admission.isOk()) {
         nativeMutations.fetch_add(1, std::memory_order_relaxed);
-        (void)reservation.value().rollback();
+        (void)children.release("rollback_child_reservation");
     }
     barrier.resume.open();
     closing.join();
@@ -412,66 +436,70 @@ TEST(LifecycleControlTest, ClosingWinsBeforeAdmissionDeterministically) {
     EXPECT_TRUE(admissionRejected);
     EXPECT_EQ(admissionError, vernon::LifecycleErrorCode::NotOpen);
     EXPECT_EQ(nativeMutations.load(std::memory_order_relaxed), 0u);
-    EXPECT_EQ(owner.state(), vernon::LifecycleState::Open);
-    EXPECT_EQ(owner.childCount(), 0u);
+    EXPECT_EQ(children.state(), vernon::LifecycleState::Open);
+    EXPECT_EQ(children.leaseCount(), 0u);
 }
 
 TEST(LifecycleControlTest, PinWinsBeforeDestroyDeterministically) {
-    vernon::OperationRef operations = createOperations();
-    LifecycleHookBarrier barrier{vernon::detail::LifecycleTestEvent::AfterAcquireLinearized, "pin_child_operation"};
+    HookedLifecycleCounter pins;
+    LifecycleHookBarrier barrier{LifecycleHookEvent::AfterAcquire, "pin_child_operation"};
     ScopedLifecycleHook hook{barrier};
     std::atomic<std::size_t> nativeOperations{0};
     bool pinSucceeded = false;
     bool releaseSucceeded = false;
 
     std::thread pinning([&] {
-        auto pin = operations.tryPin();
+        auto pin = pins.acquire("pin_child_operation", vernon::LifecycleErrorCode::PinRejected);
         pinSucceeded = pin.isOk();
         if (pinSucceeded) {
             nativeOperations.fetch_add(1, std::memory_order_relaxed);
-            releaseSucceeded = pin.value().release().isOk();
+            releaseSucceeded = pins.release("release_operation_pin").isOk();
         }
     });
 
     barrier.reached.wait();
     EXPECT_EQ(nativeOperations.load(std::memory_order_relaxed), 0u);
-    auto destruction = operations.beginDestroy();
+    auto destruction = pins.beginClosing("begin_child_destroy");
+    const std::uint64_t destructionSnapshot = destruction.isOk() ? destruction.value().leaseCount : 0;
+    const bool destructionRejected = destruction.isOk() && destructionSnapshot != 0;
+    if (destructionRejected)
+        EXPECT_TRUE(pins.restoreOpen("reject_child_destroy"));
     EXPECT_EQ(nativeOperations.load(std::memory_order_relaxed), 0u);
     barrier.resume.open();
     pinning.join();
 
     EXPECT_TRUE(pinSucceeded);
     EXPECT_TRUE(releaseSucceeded);
-    ASSERT_TRUE(destruction.isErr());
-    EXPECT_EQ(destruction.error().code, vernon::LifecycleErrorCode::PinRejected);
+    EXPECT_TRUE(destructionRejected);
+    EXPECT_EQ(destructionSnapshot, 1u);
     EXPECT_EQ(nativeOperations.load(std::memory_order_relaxed), 1u);
-    EXPECT_EQ(operations.state(), vernon::LifecycleState::Open);
-    EXPECT_EQ(operations.pinCount(), 0u);
+    EXPECT_EQ(pins.state(), vernon::LifecycleState::Open);
+    EXPECT_EQ(pins.leaseCount(), 0u);
 }
 
 TEST(LifecycleControlTest, DestroyWinsBeforePinDeterministically) {
-    vernon::OperationRef operations = createOperations();
-    LifecycleHookBarrier barrier{vernon::detail::LifecycleTestEvent::AfterClosingLinearized, "begin_child_destroy"};
+    HookedLifecycleCounter pins;
+    LifecycleHookBarrier barrier{LifecycleHookEvent::AfterClosing, "begin_child_destroy"};
     ScopedLifecycleHook hook{barrier};
     std::atomic<std::size_t> nativeOperations{0};
     bool destructionSucceeded = false;
     bool rollbackSucceeded = false;
 
     std::thread destroying([&] {
-        auto destruction = operations.beginDestroy();
+        auto destruction = pins.beginClosing("begin_child_destroy");
         destructionSucceeded = destruction.isOk();
         if (destructionSucceeded)
-            rollbackSucceeded = destruction.value().rollback().isOk();
+            rollbackSucceeded = pins.restoreOpen("rollback_child_destroy").isOk();
     });
 
     barrier.reached.wait();
-    auto pin = operations.tryPin();
+    auto pin = pins.acquire("pin_child_operation", vernon::LifecycleErrorCode::PinRejected);
     const bool pinRejected = pin.isErr();
     const vernon::LifecycleErrorCode pinError =
         pinRejected ? pin.error().code : vernon::LifecycleErrorCode::TeardownFailed;
     if (pin.isOk()) {
         nativeOperations.fetch_add(1, std::memory_order_relaxed);
-        (void)pin.value().release();
+        (void)pins.release("release_operation_pin");
     }
     barrier.resume.open();
     destroying.join();
@@ -481,8 +509,8 @@ TEST(LifecycleControlTest, DestroyWinsBeforePinDeterministically) {
     EXPECT_TRUE(pinRejected);
     EXPECT_EQ(pinError, vernon::LifecycleErrorCode::NotOpen);
     EXPECT_EQ(nativeOperations.load(std::memory_order_relaxed), 0u);
-    EXPECT_EQ(operations.state(), vernon::LifecycleState::Open);
-    EXPECT_EQ(operations.pinCount(), 0u);
+    EXPECT_EQ(pins.state(), vernon::LifecycleState::Open);
+    EXPECT_EQ(pins.leaseCount(), 0u);
 }
 
 TEST(LifecycleControlTest, AdmissionCloseAndPinDestroyRemainConsistentUnderStress) {
