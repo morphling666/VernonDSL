@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import wraps
 from typing import Any
 from unittest import SkipTest
 
@@ -23,21 +24,27 @@ class BackendRow:
     architecture: object
     compiler_target: str
     runtime_backend: str
+    rhi_backend: str | None
 
 
 BACKEND_TEST_MATRIX = (
-    BackendRow("CPU", vd.cpu, "CPU", "CPU"),
-    BackendRow("CUDA", vd.cuda, "CUDA", "CUDA"),
-    BackendRow("Vulkan", vd.vulkan, "VULKAN", "VULKAN"),
-    BackendRow("DirectX12", vd.directx, "DIRECTX", "DIRECTX12"),
-    BackendRow("Metal", vd.metal, "METAL", "METAL"),
-    BackendRow("OpenGL", vd.opengl, "OPENGL", "OPENGL"),
-    BackendRow("OpenGLES", vd.opengles, "OPENGL_ES", "OPENGL_ES"),
+    BackendRow("CPU", vd.cpu, "CPU", "CPU", None),
+    BackendRow("CUDA", vd.cuda, "CUDA", "CUDA", "CUDA"),
+    BackendRow("Vulkan", vd.vulkan, "VULKAN", "VULKAN", "VULKAN"),
+    BackendRow("DirectX12", vd.directx, "DIRECTX", "DIRECTX12", "DIRECTX12"),
+    BackendRow("Metal", vd.metal, "METAL", "METAL", "METAL"),
+    BackendRow("OpenGL", vd.opengl, "OPENGL", "OPENGL", "OPENGL"),
+    BackendRow("OpenGLES", vd.opengles, "OPENGL_ES", "OPENGL_ES", "OPENGL_ES"),
 )
 
 
 @dataclass(frozen=True)
 class BackendRequirements:
+    gpu: bool = False
+    rhi: bool = False
+    dynamic_range_step: bool = False
+    f16: bool = False
+    f64: bool = False
     compute: bool = False
     graphics: bool = False
     storage_buffers: bool = False
@@ -115,18 +122,22 @@ def probe_compiler(row: BackendRow, requirements: BackendRequirements) -> ProbeR
             ProbeKind.PLATFORM_NOT_BUILT,
             f"{row.name} compiler target is not built on this platform",
         )
+    if requirements.gpu and row.architecture == vd.cpu:
+        return _unsupported(row, "gpu")
+    if requirements.rhi and row.rhi_backend is None:
+        return _unsupported(row, "rhi")
     for required, key in (
+        (requirements.dynamic_range_step, "dynamic_range_step"),
+        (requirements.f16, "f16"),
+        (requirements.f64, "f64"),
         (requirements.compute, "compute"),
         (requirements.graphics, "graphics"),
         (requirements.device_atomics, "device_storage_atomics"),
         (requirements.f32_atomic_add, "f32_device_atomic_add"),
+        (requirements.f64_atomic_add, "f64_device_atomic_add"),
     ):
         if required and not capabilities[key]:
             return _unsupported(row, key)
-    # The public compiler capability record has no f64 field. Its current
-    # target profile exposes a legal f64 atomic implementation only for CPU.
-    if requirements.f64_atomic_add and row.compiler_target != "CPU":
-        return _unsupported(row, "f64_atomic_add")
     if requirements.texture_sampler_operations:
         capability = "graphics_texture_sampling" if requirements.graphics else "compute_sampler_binding"
         program_capability = dict(_native._program_capability(capability))
@@ -192,6 +203,13 @@ def probe_backend(row: BackendRow, requirements: BackendRequirements) -> ProbeRe
     return compiler if not compiler.available else probe_runtime(row, requirements)
 
 
+def backend_row(architecture: object) -> BackendRow:
+    for row in BACKEND_TEST_MATRIX:
+        if row.architecture == architecture:
+            return row
+    raise ValueError(f"architecture is not in the canonical backend matrix: {architecture!r}")
+
+
 def select_backends(requirements: BackendRequirements) -> BackendSelection:
     available: list[BackendRow] = []
     unavailable: list[tuple[BackendRow, ProbeResult]] = []
@@ -206,3 +224,38 @@ def select_backends(requirements: BackendRequirements) -> BackendSelection:
 
 def unavailable_summary(selection: BackendSelection) -> str:
     return "; ".join(f"{row.name} [{result.kind.value}]: {result.reason}" for row, result in selection.unavailable)
+
+
+_MATRIX_REQUIREMENTS_ATTRIBUTE = "__vernon_backend_matrix_requirements__"
+
+
+def backend_matrix_test(requirements: BackendRequirements):
+    def decorate(function):
+        setattr(function, _MATRIX_REQUIREMENTS_ATTRIBUTE, requirements)
+        return function
+
+    return decorate
+
+
+def expand_backend_matrix_tests(test_class):
+    for name, function in tuple(vars(test_class).items()):
+        requirements = getattr(function, _MATRIX_REQUIREMENTS_ATTRIBUTE, None)
+        if requirements is None:
+            continue
+        delattr(test_class, name)
+        for row in BACKEND_TEST_MATRIX:
+            test_name = f"{name}_{row.runtime_backend.lower()}"
+
+            @wraps(function)
+            def run(self, _function=function, _requirements=requirements, _row=row):
+                try:
+                    require_available(probe_backend(_row, _requirements))
+                    return _function(self, _row)
+                finally:
+                    if _row.architecture != vd.cpu:
+                        vd.init(arch=vd.cpu)
+
+            run.__name__ = test_name
+            run.__qualname__ = f"{test_class.__qualname__}.{test_name}"
+            setattr(test_class, test_name, run)
+    return test_class

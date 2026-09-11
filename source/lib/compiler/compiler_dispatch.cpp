@@ -40,16 +40,16 @@ VernonTargetCapabilities queryTargetCapabilities(VernonTarget target) {
 #endif
     switch (target) {
     case VERNON_TARGET_CPU:
-        return {1, 1, 1, 1, 1};
+        return {1, 1, 1, 1, 1, 1, 1, 1, 1};
     case VERNON_TARGET_VULKAN:
-        return {1, 1, 1, 1, 0};
+        return {1, 1, 1, 1, 0, 0, 0, 0, 0};
     case VERNON_TARGET_CUDA:
-        return {1, 0, 1, 1, 1};
+        return {1, 0, 1, 1, 1, 1, 0, 1, 0};
     case VERNON_TARGET_OPENGL:
     case VERNON_TARGET_OPENGL_ES:
     case VERNON_TARGET_METAL:
     case VERNON_TARGET_DIRECTX:
-        return {1, 1, 1, 1, 0};
+        return {1, 1, 1, 1, 0, 0, 0, 0, 0};
     }
     return {};
 }

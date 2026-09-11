@@ -50,16 +50,12 @@ def main() -> None:
     arguments.cpp_output.parent.mkdir(parents=True, exist_ok=True)
     expected_arrays = []
     descriptors = []
-    runtime_acceptances = tuple(
-        acceptance
-        for acceptance in LANGUAGE_CONTRACT_REGISTRY.acceptances
-        if acceptance.suite is AcceptanceSuite.LANGUAGE_CONTRACT
-    )
-    for index, acceptance in enumerate(runtime_acceptances):
+    for index, acceptance in enumerate(LANGUAGE_CONTRACT_REGISTRY.acceptances):
         values = ", ".join(repr(float(value)) for value in acceptance.oracle.expected)
         expected_arrays.append(f"constexpr double acceptanceExpected{index}[]{{{values or '0.0'}}};\n")
         descriptors.append(
             "    {"
+            f'"{acceptance.suite.value}", '
             f'"{acceptance.id}", '
             f"{str(acceptance.requirements.compute).lower()}, "
             f"{str(acceptance.requirements.graphics).lower()}, "
@@ -77,7 +73,7 @@ def main() -> None:
         )
     arguments.cpp_output.write_text(
         "".join(expected_arrays)
-        + "constexpr AcceptanceDescriptor acceptanceDescriptors[]{\n"
+        + "constexpr vernon::tests::AcceptanceDescriptor acceptanceDescriptors[]{\n"
         + "".join(descriptors)
         + "};\n",
         encoding="utf-8",

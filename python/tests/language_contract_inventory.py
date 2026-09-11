@@ -36,7 +36,14 @@ _RUNTIME_ORACLES_BY_SUITE = {
             RuntimeOracleKind.DYNAMIC_SHAPE_GRID,
         }
     ),
-    AcceptanceSuite.GPU_AUTODIFF: frozenset({RuntimeOracleKind.DYNAMIC_VJP}),
+    AcceptanceSuite.GPU_AUTODIFF: frozenset(
+        {
+            RuntimeOracleKind.NO_TAPE_VJP,
+            RuntimeOracleKind.REDUCTION_VJP,
+            RuntimeOracleKind.STATIC_VJP,
+            RuntimeOracleKind.DYNAMIC_VJP,
+        }
+    ),
     AcceptanceSuite.MODULE_GRAPHICS: frozenset(
         {RuntimeOracleKind.GRAPHICS_TRIANGLE, RuntimeOracleKind.MIXED_COMPUTE_GRAPHICS}
     ),

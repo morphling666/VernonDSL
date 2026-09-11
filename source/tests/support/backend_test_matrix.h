@@ -3,10 +3,12 @@
 
 #include "VernonCompiler.h"
 #include "VernonProgramCapabilities.h"
+#include "VernonRHI.h"
 #include "VernonRuntime.h"
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <ostream>
 #include <string>
 #include <string_view>
@@ -18,18 +20,19 @@ struct BackendTestRow {
     std::string_view name;
     VernonTarget compiler;
     VernonRuntimeBackend runtime;
+    std::optional<VernonRhiBackend> rhi;
 };
 
 inline void PrintTo(const BackendTestRow &backend, std::ostream *stream) { *stream << backend.name; }
 
 inline constexpr std::array<BackendTestRow, 7> backendTestMatrix{{
-    {"CPU", VERNON_TARGET_CPU, VERNON_RUNTIME_CPU},
-    {"CUDA", VERNON_TARGET_CUDA, VERNON_RUNTIME_CUDA},
-    {"Vulkan", VERNON_TARGET_VULKAN, VERNON_RUNTIME_VULKAN},
-    {"DirectX12", VERNON_TARGET_DIRECTX, VERNON_RUNTIME_DIRECTX12},
-    {"Metal", VERNON_TARGET_METAL, VERNON_RUNTIME_METAL},
-    {"OpenGL", VERNON_TARGET_OPENGL, VERNON_RUNTIME_OPENGL},
-    {"OpenGLES", VERNON_TARGET_OPENGL_ES, VERNON_RUNTIME_OPENGL_ES},
+    {"CPU", VERNON_TARGET_CPU, VERNON_RUNTIME_CPU, std::nullopt},
+    {"CUDA", VERNON_TARGET_CUDA, VERNON_RUNTIME_CUDA, VERNON_RHI_BACKEND_CUDA},
+    {"Vulkan", VERNON_TARGET_VULKAN, VERNON_RUNTIME_VULKAN, VERNON_RHI_BACKEND_VULKAN},
+    {"DirectX12", VERNON_TARGET_DIRECTX, VERNON_RUNTIME_DIRECTX12, VERNON_RHI_BACKEND_DIRECTX12},
+    {"Metal", VERNON_TARGET_METAL, VERNON_RUNTIME_METAL, VERNON_RHI_BACKEND_METAL},
+    {"OpenGL", VERNON_TARGET_OPENGL, VERNON_RUNTIME_OPENGL, VERNON_RHI_BACKEND_OPENGL},
+    {"OpenGLES", VERNON_TARGET_OPENGL_ES, VERNON_RUNTIME_OPENGL_ES, VERNON_RHI_BACKEND_OPENGL_ES},
 }};
 
 struct BackendTestRequirements {
@@ -89,9 +92,7 @@ inline BackendProbeResult probeCompilerBackend(const VernonCompilerContext *comp
         return unsupported(backend.name, "device_storage_atomics");
     if (requirements.f32AtomicAdd && !capabilities.supports_f32_device_atomic_add)
         return unsupported(backend.name, "f32_atomic_add");
-    // The current public compiler capability record has no f64 field. The
-    // target profile exposes a legal f64 atomic implementation only for CPU.
-    if (requirements.f64AtomicAdd && backend.compiler != VERNON_TARGET_CPU)
+    if (requirements.f64AtomicAdd && !capabilities.supports_f64_device_atomic_add)
         return unsupported(backend.name, "f64_atomic_add");
     if (requirements.textureSamplerOperations) {
         using namespace vernon::program_capabilities;

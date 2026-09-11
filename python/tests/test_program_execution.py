@@ -7,9 +7,9 @@ from typing import Annotated
 
 import numpy as np
 import vernon_dsl as vd
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 from language_contract_cases import case_by_id
 from vernon_dsl._program_assets.capture import capture_program
-from vernon_dsl._runtime.session import RuntimeUnavailableError
 
 from python.tests.storage_vjp_direct_fixture import (
     Particle,
@@ -617,25 +617,10 @@ class ProgramExecutionTests(unittest.TestCase):
             cube.view(dimension="2d")
 
 
+@expand_backend_matrix_tests
 class ProgramGpuExecutionTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        for architecture in (vd.metal, vd.vulkan, vd.opengl):
-            try:
-                if architecture == vd.opengl:
-                    vd.init(arch=architecture, api_version=(4, 3))
-                else:
-                    vd.init(arch=architecture)
-                return
-            except RuntimeUnavailableError:
-                pass
-        raise unittest.SkipTest("no GPU compute runtime is available")
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        vd.init(arch=vd.cpu)
-
-    def test_gpu_module_binds_texture_as_forward_resource(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    def test_gpu_module_binds_texture_as_forward_resource(self, backend: BackendRow) -> None:
         image = vd.Texture.from_numpy(
             np.zeros((2, 2, 2, 4), dtype=np.float32),
             dimension="3d",
@@ -651,7 +636,8 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         expected[...] = [1.0, 2.0, 3.0, 4.0]
         np.testing.assert_array_equal(image.to_numpy(), expected)
 
-    def test_gpu_module_reuses_unchanged_value_and_storage_bindings(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_gpu_module_reuses_unchanged_value_and_storage_bindings(self, backend: BackendRow) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
         output = vd.storage.from_numpy(np.full(4, -1.0, dtype=np.float32))
         module = PersistentlyBoundIncrement()
@@ -684,7 +670,8 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         )
         self.assertEqual(dirty_telemetry["upload_ranges"] - changed_telemetry["upload_ranges"], 1)
 
-    def test_gpu_module_vjp_accumulates_branch_fan_in(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_gpu_module_vjp_accumulates_branch_fan_in(self, backend: BackendRow) -> None:
         outputs, pullback = vd.ad.vjp(
             FanOut(),
             wrt=("source",),
@@ -701,7 +688,8 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         )["source"]
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
 
-    def test_gpu_module_vjp_preserves_structured_storage_gradients(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_gpu_module_vjp_preserves_structured_storage_gradients(self, backend: BackendRow) -> None:
         particles = vd.storage.zeros(dtype=GpuParticle, shape=(1,))
         values = particles.to_numpy()
         values["velocity"][0] = np.array([2.0, -3.0], dtype=np.float32)

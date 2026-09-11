@@ -24,6 +24,7 @@ from aggregate_vertex_shader import (
     oversized_aggregate_attribute_vertex,
     small_multidimensional_aggregate_attribute_vertex,
 )
+from backend_test_matrix import BackendRequirements, backend_row, probe_backend, require_available
 from pipeline_shader import (
     OPTIONAL_IMAGE,
     colored_fragment,
@@ -926,10 +927,12 @@ class OpenGLPipelineTests(unittest.TestCase):
             )
 
     def setUp(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(4, 3))
-        except RuntimeError:
-            self.skipTest("OpenGL runtime unavailable")
+        require_available(
+            probe_backend(
+                backend_row(vd.opengl),
+                BackendRequirements(graphics=True, minimum_api_version=(4, 3)),
+            )
+        )
 
     def test_triangle_renders_to_rgba8_texture(self) -> None:
         render = vd.pipeline(triangle_vertex, solid_fragment)
@@ -1061,10 +1064,12 @@ class OpenGLPipelineTests(unittest.TestCase):
         self.assertEqual(tuple(target.to_numpy()[32, 32]), (0, 0, 0, 0))
 
     def test_opengl_33_accepts_graphics_only(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeError:
-            self.skipTest("OpenGL 3.3 context unavailable")
+        require_available(
+            probe_backend(
+                backend_row(vd.opengl),
+                BackendRequirements(graphics=True, minimum_api_version=(3, 3)),
+            )
+        )
         render = vd.pipeline(triangle_vertex, solid_fragment)
         positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
         target = vd.Texture.zeros(shape=(16, 16))
@@ -1178,10 +1183,12 @@ class OpenGLPipelineTests(unittest.TestCase):
 
 class OpenGLESPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
-        try:
-            vd.init(arch=vd.opengles, api_version=(3, 1))
-        except RuntimeError:
-            self.skipTest("OpenGL ES runtime unavailable")
+        require_available(
+            probe_backend(
+                backend_row(vd.opengles),
+                BackendRequirements(graphics=True, minimum_api_version=(3, 1)),
+            )
+        )
 
     def test_rank_three_tensor_attribute_arithmetic_renders(self) -> None:
         assert_rank_three_tensor_attribute_renders(self)
@@ -1222,10 +1229,7 @@ class VulkanPipelineTests(unittest.TestCase):
         assert_rank_three_tensor_attribute_renders(self)
 
     def setUp(self) -> None:
-        try:
-            vd.init(arch=vd.vulkan)
-        except RuntimeError:
-            self.skipTest("Vulkan runtime unavailable")
+        require_available(probe_backend(backend_row(vd.vulkan), BackendRequirements(graphics=True)))
 
     @staticmethod
     def _triangle() -> vd.Tensor:
@@ -1375,10 +1379,7 @@ class DirectXPipelineTests(unittest.TestCase):
         assert_rank_three_tensor_attribute_renders(self)
 
     def setUp(self) -> None:
-        try:
-            vd.init(arch=vd.directx)
-        except RuntimeError:
-            self.skipTest("DirectX 12 runtime unavailable")
+        require_available(probe_backend(backend_row(vd.directx), BackendRequirements(graphics=True)))
 
     def test_matrix_uniform_transforms_vertices(self) -> None:
         assert_matrix_uniform_transforms_vertices(self)

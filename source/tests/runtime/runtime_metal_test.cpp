@@ -177,30 +177,6 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
               VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
-TEST(RuntimeMetal, RecordsIndependentCommandEncoders) {
-    VernonRhiDevice device = createMetalDevice();
-    ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);
-    EXPECT_NE(vernon::rhi::deviceCommandCapabilities(device) & vernon::rhi::BackendCommandIndependentRecording, 0u);
-
-    VernonRhiCommandEncoderDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
-    VernonRhiCommandEncoder first{}, second{};
-    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &first), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &second), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, second), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, first), VERNON_RHI_STATUS_OK);
-
-    VernonRhiCompletion firstCompletion{}, secondCompletion{};
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, second, &secondCompletion), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(device, first, &firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiCompletionWait(device, firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiCompletionWait(device, secondCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, secondCompletion), VERNON_RHI_STATUS_OK);
-    vernonRhiDestroyDevice(device);
-}
-
 TEST(RuntimeMetal, BoundsInFlightSubmissionsUntilCompletionObservation) {
     VernonRhiDevice device = createMetalDevice();
     ASSERT_NE(device.index, VERNON_RHI_INVALID_HANDLE_INDEX);

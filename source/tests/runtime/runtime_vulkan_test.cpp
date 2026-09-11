@@ -1,39 +1,8 @@
-#include "../../lib/rhi/rhi_internal.h"
 #include "VernonRuntime.h"
 #include "runtime_rhi_test_utils.h"
 
 #include <gtest/gtest.h>
 #include <vector>
-
-TEST(RuntimeVulkan, RecordsIndependentCommandEncoders) {
-    VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN);
-    if (!capabilities.available)
-        GTEST_SKIP() << "Vulkan runtime backend is unavailable";
-
-    auto context = vernon::tests::createRhiRuntime(VERNON_RUNTIME_VULKAN);
-    ASSERT_TRUE(context.runtime);
-    EXPECT_NE(vernon::rhi::deviceCommandCapabilities(context.device) & vernon::rhi::BackendCommandIndependentRecording,
-              0u);
-    VernonRhiCommandEncoderDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
-    VernonRhiCommandEncoder first{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-    VernonRhiCommandEncoder second{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(context.device, &descriptor, &first), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(context.device, &descriptor, &second), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, second), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiCommandEncoderFinish(context.device, first), VERNON_RHI_STATUS_OK);
-    VernonRhiCompletion firstCompletion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-    VernonRhiCompletion secondCompletion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
-    ASSERT_EQ(vernonRhiDeviceSubmit(context.device, second, &secondCompletion), VERNON_RHI_STATUS_OK);
-    ASSERT_EQ(vernonRhiDeviceSubmit(context.device, first, &firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiCompletionWait(context.device, firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiCompletionWait(context.device, secondCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(context.device, firstCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(context.device, secondCompletion), VERNON_RHI_STATUS_OK);
-    EXPECT_TRUE(vernonRuntimeDestroy(context.runtime) == VERNON_STATUS_OK);
-    vernonRhiDestroyDevice(context.device);
-}
 
 TEST(RuntimeVulkan, BoundsIndependentCommandRecordings) {
     VernonRuntimeCapabilities capabilities = vernonRuntimeGetCapabilities(VERNON_RUNTIME_VULKAN);

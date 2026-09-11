@@ -1,4 +1,5 @@
 #include "VernonRuntime.h"
+#include "acceptance_descriptor.h"
 #include "program_fixture_manifest_table.h"
 #include "program_fixture_runtime_test.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
@@ -23,6 +24,9 @@ namespace {
 using vernon::runtime::ad::gpu::BatchSummary;
 using vernon::runtime::ad::gpu::Segment;
 using vernon::runtime::program_execution::FailureBoundary;
+using vernon::tests::AcceptanceDescriptor;
+
+#include "language_contract_acceptance_descriptors.inc"
 
 TEST(RuntimeGpuAutodiff, FailureInjectionSelectsBoundaryAndOccurrence) {
     using namespace vernon::runtime::program_execution;
@@ -232,7 +236,8 @@ VernonStatus canonicalProgramForward(VernonProgramExecutable *pipeline, VernonLa
                                                              pullback);
 }
 
-void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
+void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
+                  const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
     std::ifstream input(manifestPath, std::ios::binary);
@@ -273,7 +278,9 @@ void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(canonicalProgramForward(pipeline, {1, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
     ASSERT_NE(pullback, nullptr);
-    EXPECT_EQ(loss, (std::array<float, 4>{4.0f, 9.0f, 25.0f, 49.0f}));
+    ASSERT_EQ(acceptance.expectedCount, 8u);
+    for (size_t index = 0; index < loss.size(); ++index)
+        EXPECT_FLOAT_EQ(loss[index], acceptance.expected[index]);
 
     values.fill(100.0f);
     std::array<float, 4> cotangent{1.0f, 1.0f, 1.0f, 1.0f};
@@ -313,12 +320,14 @@ void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients, &applyOptions),
               VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
+    for (size_t index = 0; index < gradient.size(); ++index)
+        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
 
     gradient.fill(0.0f);
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
+    for (size_t index = 0; index < gradient.size(); ++index)
+        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
     const vernon::runtime::AutodiffPullbackControlPlaneUsage control =
         vernon::runtime::autodiffPullbackControlPlaneUsage(pullback);
     EXPECT_EQ(control.submissions, 2u);
@@ -330,7 +339,8 @@ void runNoTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::
     gradient.fill(0.0f);
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_EQ(gradient, (std::array<float, 4>{4.0f, 6.0f, 10.0f, 14.0f}));
+    for (size_t index = 0; index < gradient.size(); ++index)
+        EXPECT_FLOAT_EQ(gradient[index], acceptance.expected[index + loss.size()]);
 
     vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
@@ -441,8 +451,8 @@ void runNoTapeFailureInjection(vernon::tests::OwnedRhiRuntime &owned, const std:
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
-                        bool dynamic) {
+void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath, bool dynamic,
+                        const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
     std::ifstream input(manifestPath, std::ios::binary);
@@ -486,8 +496,9 @@ void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesy
     VernonPullback *pullback = nullptr;
     ASSERT_EQ(canonicalProgramForward(pipeline, {2, 1, 1}, inputs, &pullback), VERNON_STATUS_OK) << lastError(context);
     ASSERT_NE(pullback, nullptr);
+    ASSERT_EQ(acceptance.expectedCount, dynamic ? 2u : 3u);
     for (size_t lane = 0; lane < laneCount; ++lane)
-        EXPECT_FLOAT_EQ(output[lane], dynamic ? 11.0f : 2.5f);
+        EXPECT_FLOAT_EQ(output[lane], acceptance.expected[0]);
 
     x = 100.0f;
     std::array<float, laneCount> seeds{};
@@ -521,9 +532,9 @@ void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesy
                                                       {}};
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
+    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
     if (!dynamic)
-        EXPECT_NEAR(gradientStorage[1], -26.0f, 1e-4f);
+        EXPECT_NEAR(gradientStorage[1], acceptance.expected[2], 1e-4f);
     std::array<float, laneCount> sharedSeeds{};
     sharedSeeds.fill(1.0f);
     vernon::tests::DerivativeLeafFixture sharedSeed{sizeof(vernon::tests::DerivativeLeafFixture),
@@ -539,9 +550,9 @@ void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesy
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &sharedCotangents, &gradients),
               VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
+    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
     if (!dynamic)
-        EXPECT_NEAR(gradientStorage[1], -26.0f, 1e-4f);
+        EXPECT_NEAR(gradientStorage[1], acceptance.expected[2], 1e-4f);
     const vernon::runtime::AutodiffPullbackMemoryUsage memory = vernon::runtime::autodiffPullbackMemoryUsage(pullback);
     EXPECT_GT(memory.logicalResidualBytes, 0u);
     EXPECT_GT(memory.residentBytes, 0u);
@@ -551,14 +562,15 @@ void runCapturedTapeVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesy
     gradientStorage.fill(0.0f);
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
         << lastError(context);
-    EXPECT_NEAR(gradientStorage[0], dynamic ? 104.0f : 24.0f, 1e-4f);
+    EXPECT_NEAR(gradientStorage[0], acceptance.expected[1], 1e-4f);
 
     vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
     vernonRuntimeProgramBundleDestroy(bundle);
 }
 
-void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath) {
+void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const std::filesystem::path &manifestPath,
+                                  const AcceptanceDescriptor &acceptance) {
     VernonRuntimeContext *context = owned.get();
 
     std::ifstream input(manifestPath, std::ios::binary);
@@ -656,10 +668,8 @@ void runNonPowerOfTwoReductionVjp(vernon::tests::OwnedRhiRuntime &owned, const s
         sizeof(vernon::tests::DerivativeLeafSetFixture), &gradientValue, 1, {}};
     ASSERT_EQ(vernon::tests::applyCanonicalPullback(pipeline, pullback, &cotangents, &gradients), VERNON_STATUS_OK)
         << lastError(context);
-    float expected = 0.0f;
-    for (float value : values)
-        expected += value + value * value;
-    EXPECT_NEAR(gradient, expected, 0.5f);
+    ASSERT_EQ(acceptance.expectedCount, 1u);
+    EXPECT_NEAR(gradient, acceptance.expected[0], 0.5f);
 
     vernonProgramPullbackDestroy(pullback);
     vernonRuntimeProgramExecutableDestroy(pipeline);
@@ -674,26 +684,32 @@ const std::vector<vernon::tests::ProgramFixtureManifest> &gpuAutodiffBackendCase
 class RuntimeGpuAutodiffMatrix : public vernon::tests::ProgramFixtureRuntimeTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
-        return vernon::tests::computeFixtureRequirements(GetParam().runtime);
+        return vernon::tests::programVjpFixtureRequirements(GetParam().runtime);
     }
 };
 
-TEST_P(RuntimeGpuAutodiffMatrix, NoTapePullbackStaysOnDevice) { runNoTapeVjp(owned(), GetParam().manifestPath); }
-
-TEST_P(RuntimeGpuAutodiffMatrix, NoTapeFailuresAreTransactional) {
-    runNoTapeFailureInjection(owned(), GetParam().manifestPath);
-}
-
-TEST_P(RuntimeGpuAutodiffMatrix, NonPowerOfTwoWorkgroupReductionIsNumericallyCorrect) {
-    runNonPowerOfTwoReductionVjp(owned(), fixture("gpu_autodiff_non_power_of_two").manifestPath);
-}
-
-TEST_P(RuntimeGpuAutodiffMatrix, StaticTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(owned(), fixture("gpu_autodiff_static").manifestPath, false);
-}
-
-TEST_P(RuntimeGpuAutodiffMatrix, DynamicTapeUsesBoundedReplay) {
-    runCapturedTapeVjp(owned(), fixture("gpu_autodiff_dynamic").manifestPath, true);
+TEST_P(RuntimeGpuAutodiffMatrix, ExecutesRegisteredAcceptanceOracles) {
+    size_t executed = 0;
+    for (const AcceptanceDescriptor &acceptance : acceptanceDescriptors) {
+        if (acceptance.suite != "gpu_autodiff")
+            continue;
+        ++executed;
+        SCOPED_TRACE(acceptance.fixtureId);
+        const std::filesystem::path &manifestPath = fixture(acceptance.fixtureId).manifestPath;
+        if (acceptance.oracle == "no_tape_vjp") {
+            runNoTapeVjp(owned(), manifestPath, acceptance);
+            runNoTapeFailureInjection(owned(), manifestPath);
+        } else if (acceptance.oracle == "reduction_vjp") {
+            runNonPowerOfTwoReductionVjp(owned(), manifestPath, acceptance);
+        } else if (acceptance.oracle == "static_vjp") {
+            runCapturedTapeVjp(owned(), manifestPath, false, acceptance);
+        } else if (acceptance.oracle == "dynamic_vjp") {
+            runCapturedTapeVjp(owned(), manifestPath, true, acceptance);
+        } else {
+            FAIL() << "GPU autodiff acceptance has no executor: " << acceptance.oracle;
+        }
+    }
+    EXPECT_GT(executed, 0u);
 }
 
 INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeGpuAutodiffMatrix, testing::ValuesIn(gpuAutodiffBackendCases()),

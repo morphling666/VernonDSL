@@ -17,10 +17,15 @@ from aggregate_vertex_shader import (
     copy_complex_aggregate_tensor_view,
     inspect_multidimensional_aggregate_tensor_value,
 )
+from backend_test_matrix import (
+    BackendRequirements,
+    BackendRow,
+    backend_matrix_test,
+    expand_backend_matrix_tests,
+)
 from language_contract_cases import case_by_id
 from language_contract_runner import contract_oracle
 from language_contract_traceability import covers_case
-from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl.host_values import host_abi_layout
 
 from python.tests.compiler_test_support import compile_kernel_artifact
@@ -86,6 +91,19 @@ def vector_while(
         if iterations >= 8:
             running = False
     output[x] = vd.f32(iterations)
+
+
+def vector_while_reference(phase: float, count: int) -> np.ndarray:
+    result = np.empty(count, dtype=np.float32)
+    c = np.array([-0.8, np.cos(np.float32(phase)) * 0.2], dtype=np.float32)
+    for x in range(count):
+        z = np.array([np.float32(x) * 0.01, 0.1], dtype=np.float32)
+        iterations = 0
+        while np.linalg.norm(z) < 20.0 and iterations < 8:
+            z = np.array([z[0] * z[0] - z[1] * z[1], z[1] * z[0] * 2.0], dtype=np.float32) + c
+            iterations += 1
+        result[x] = iterations
+    return result
 
 
 @vd.kernel(workgroup_size=(2, 2, 2))
@@ -536,6 +554,7 @@ def workgroup_atomic_lanes(
     output[group * 4 + lane] = previous
 
 
+@expand_backend_matrix_tests
 class KernelTensorRuntimeTests(unittest.TestCase):
     @staticmethod
     def _run_tensor_operators(arch: object) -> np.ndarray:
@@ -560,168 +579,107 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         vector_while(output, 0.35, grid=(2, 1, 1))
         return output.to_numpy()
 
-    @staticmethod
-    def _runtime_available(arch: object) -> bool:
-        try:
-            vd.init(arch=arch)  # type: ignore[arg-type]
-        except RuntimeUnavailableError:
-            vd.init(arch=vd.cpu)
-            return False
-        return True
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_rank_zero_tensor_view_backend_parity(self, backend: BackendRow) -> None:
+        value = vd.storage.from_numpy(np.array(3.0, dtype=np.float32))
+        rank_zero_round_trip(value)
+        self.assertEqual(value.to_numpy()[()], 6.0)
 
-    def _available_compute_backends(self, *, include_cpu: bool = True) -> list[object]:
-        backends: list[object] = [vd.cpu] if include_cpu else []
-        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
-            if self._runtime_available(architecture):
-                backends.append(architecture)
-        return backends
-
-    def test_rank_zero_tensor_view_backend_parity(self) -> None:
-        for backend in self._available_compute_backends():
-            with self.subTest(backend=backend):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                value = vd.storage.from_numpy(np.array(3.0, dtype=np.float32))
-                rank_zero_round_trip(value)
-                self.assertEqual(value.to_numpy()[()], 6.0)
-        vd.init(arch=vd.cpu)
-
-    def test_storage_texture_backend_parity(self) -> None:
-        backends = [
-            architecture
-            for architecture in (vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles)
-            if self._runtime_available(architecture)
-        ]
-        if not backends:
-            self.skipTest("no storage texture backend is available")
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    def test_storage_texture_backend_parity(self, backend: BackendRow) -> None:
         source = np.arange(2 * 4 * 4 * 4, dtype=np.float32).reshape(2, 4, 4, 4)
         device_result = source + np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                image = vd.Texture.from_numpy(
-                    source,
-                    dimension="3d",
-                    format=vd.rgba32_float,
-                    usage=("storage", "transfer_source", "transfer_destination"),
-                )
-                storage_texture_round_trip(image, grid=(2, 2, 1))
-                replacement = np.full((1, 1, 1, 4), 42.0, dtype=np.float32)
-                image.upload(replacement, origin=(0, 1, 1))
-                expected = device_result.copy()
-                expected[0:1, 1:2, 1:2] = replacement
-                np.testing.assert_array_equal(
-                    image.download(origin=(0, 1, 1), shape=(1, 2, 2)),
-                    expected[0:1, 1:3, 1:3],
-                )
-                np.testing.assert_array_equal(image.download(), expected)
+        image = vd.Texture.from_numpy(
+            source,
+            dimension="3d",
+            format=vd.rgba32_float,
+            usage=("storage", "transfer_source", "transfer_destination"),
+        )
+        storage_texture_round_trip(image, grid=(2, 2, 1))
+        replacement = np.full((1, 1, 1, 4), 42.0, dtype=np.float32)
+        image.upload(replacement, origin=(0, 1, 1))
+        expected = device_result.copy()
+        expected[0:1, 1:2, 1:2] = replacement
+        np.testing.assert_array_equal(
+            image.download(origin=(0, 1, 1), shape=(1, 2, 2)),
+            expected[0:1, 1:3, 1:3],
+        )
+        np.testing.assert_array_equal(image.download(), expected)
 
-    def test_three_dimensional_texture_mipmap_backend_parity(self) -> None:
-        backends = [architecture for architecture in (vd.vulkan, vd.metal) if self._runtime_available(architecture)]
-        if not backends:
-            self.skipTest("no 3D texture mipmap backend is available")
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_three_dimensional_texture_mipmap_backend_parity(self, backend: BackendRow) -> None:
         source = np.broadcast_to(
             np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
             (2, 4, 4, 4),
         ).copy()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                image = vd.Texture.from_numpy(
-                    source,
-                    dimension="3d",
-                    format=vd.rgba32_float,
-                    mip_levels=2,
-                    usage=("sampled", "transfer_source", "transfer_destination"),
-                )
-                image.generate_mipmaps()
-                np.testing.assert_array_equal(
-                    image.download(mip_level=1),
-                    np.broadcast_to(source[0, 0, 0], (1, 2, 2, 4)),
-                )
+        image = vd.Texture.from_numpy(
+            source,
+            dimension="3d",
+            format=vd.rgba32_float,
+            mip_levels=2,
+            usage=("sampled", "transfer_source", "transfer_destination"),
+        )
+        image.generate_mipmaps()
+        np.testing.assert_array_equal(
+            image.download(mip_level=1),
+            np.broadcast_to(source[0, 0, 0], (1, 2, 2, 4)),
+        )
 
-    def test_global_tensor_view_atomic_backend_parity(self) -> None:
-        backends: list[object] = [vd.cpu]
-        for architecture in (vd.cuda, vd.vulkan):
-            if self._runtime_available(architecture):
-                backends.append(architecture)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                values = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                global_atomic_increment(values, grid=(4, 1, 1))
-                self.assertEqual(values.to_numpy()[0], 256)
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True, device_atomics=True))
+    def test_global_tensor_view_atomic_backend_parity(self, backend: BackendRow) -> None:
+        values = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+        global_atomic_increment(values, grid=(4, 1, 1))
+        self.assertEqual(values.to_numpy()[0], 256)
 
-                inferred = vd.storage.zeros(dtype=vd.i32, shape=(8,))
-                atomic_fill(inferred)
-                np.testing.assert_array_equal(inferred.to_numpy(), np.ones(8, dtype=np.int32))
+        inferred = vd.storage.zeros(dtype=vd.i32, shape=(8,))
+        atomic_fill(inferred)
+        np.testing.assert_array_equal(inferred.to_numpy(), np.ones(8, dtype=np.int32))
 
-                operations = vd.storage.from_numpy(np.array([0, 10, 10, 1], dtype=np.int32))
-                global_atomic_operations(operations)
-                np.testing.assert_array_equal(operations.to_numpy(), np.array([5, 22, 7, 9], dtype=np.int32))
+        operations = vd.storage.from_numpy(np.array([0, 10, 10, 1], dtype=np.int32))
+        global_atomic_operations(operations)
+        np.testing.assert_array_equal(operations.to_numpy(), np.array([5, 22, 7, 9], dtype=np.int32))
 
-    def test_floating_atomic_nan_signed_zero_and_contention(self) -> None:
-        backends = [
-            architecture
-            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.metal, vd.opengl, vd.directx)
-            if self._runtime_available(architecture)
-        ]
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                nan_value = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
-                floating_atomic_add(
-                    nan_value,
-                    vd.storage.from_numpy(np.array([np.nan], dtype=np.float32)),
-                    grid=(1, 1, 1),
-                )
-                self.assertTrue(np.isnan(nan_value.to_numpy()[0]))
+    @backend_matrix_test(
+        BackendRequirements(compute=True, storage_buffers=True, device_atomics=True, f32_atomic_add=True)
+    )
+    def test_floating_atomic_nan_signed_zero_and_contention(self, backend: BackendRow) -> None:
+        nan_value = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
+        floating_atomic_add(
+            nan_value,
+            vd.storage.from_numpy(np.array([np.nan], dtype=np.float32)),
+            grid=(1, 1, 1),
+        )
+        self.assertTrue(np.isnan(nan_value.to_numpy()[0]))
 
-                negative_zero = vd.storage.from_numpy(np.array([-0.0], dtype=np.float32))
-                floating_atomic_add(
-                    negative_zero,
-                    vd.storage.from_numpy(np.array([-0.0], dtype=np.float32)),
-                    grid=(1, 1, 1),
-                )
-                self.assertTrue(np.signbit(negative_zero.to_numpy()[0]))
+        negative_zero = vd.storage.from_numpy(np.array([-0.0], dtype=np.float32))
+        floating_atomic_add(
+            negative_zero,
+            vd.storage.from_numpy(np.array([-0.0], dtype=np.float32)),
+            grid=(1, 1, 1),
+        )
+        self.assertTrue(np.signbit(negative_zero.to_numpy()[0]))
 
-                contended = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
-                floating_atomic_add(
-                    contended,
-                    vd.storage.from_numpy(np.ones(256, dtype=np.float32)),
-                    grid=(256, 1, 1),
-                )
-                self.assertEqual(contended.to_numpy()[0], 256.0)
+        contended = vd.storage.from_numpy(np.array([0.0], dtype=np.float32))
+        floating_atomic_add(
+            contended,
+            vd.storage.from_numpy(np.ones(256, dtype=np.float32)),
+            grid=(256, 1, 1),
+        )
+        self.assertEqual(contended.to_numpy()[0], 256.0)
 
-    def test_workgroup_atomic_lane_backend_parity(self) -> None:
-        backends = [
-            architecture
-            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.opengl, vd.directx)
-            if self._runtime_available(architecture)
-        ]
-        if not backends:
-            self.skipTest("no workgroup synchronization backend is available")
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_workgroup_atomic_lane_backend_parity(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.i32, shape=(10,))
+        workgroup_atomic_lanes(output, grid=(2, 1, 1))
+        result = output.to_numpy()
+        for group in range(2):
+            base = group * 100
+            previous = np.sort(result[group * 4 : group * 4 + 4])
+            np.testing.assert_array_equal(previous, np.arange(base, base + 4, dtype=np.int32))
+            self.assertEqual(result[8 + group], base + 4)
 
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                output = vd.storage.zeros(dtype=vd.i32, shape=(10,))
-                workgroup_atomic_lanes(output, grid=(2, 1, 1))
-                result = output.to_numpy()
-                for group in range(2):
-                    base = group * 100
-                    previous = np.sort(result[group * 4 : group * 4 + 4])
-                    np.testing.assert_array_equal(previous, np.arange(base, base + 4, dtype=np.int32))
-                    self.assertEqual(result[8 + group], base + 4)
-
-    def test_aggregate_workgroup_backend_parity(self) -> None:
-        backends = [
-            architecture
-            for architecture in (vd.cpu, vd.cuda, vd.vulkan, vd.opengl, vd.directx)
-            if self._runtime_available(architecture)
-        ]
-        if not backends:
-            self.skipTest("no aggregate workgroup backend is available")
-
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_aggregate_workgroup_backend_parity(self, backend: BackendRow) -> None:
         expected = np.empty(32, dtype=np.float32)
         for group in range(2):
             for lane in range(4):
@@ -730,26 +688,18 @@ class KernelTensorRuntimeTests(unittest.TestCase):
                 offset = (group * 4 + lane) * 4
                 expected[offset : offset + 4] = (value, value + 0.5, value + 10, value + 0.25)
 
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                output = vd.storage.zeros(dtype=vd.f32, shape=(32,))
-                aggregate_workgroup_values(output, grid=(2, 1, 1))
-                np.testing.assert_allclose(output.to_numpy(), expected, rtol=0.0, atol=0.0)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(32,))
+        aggregate_workgroup_values(output, grid=(2, 1, 1))
+        np.testing.assert_allclose(output.to_numpy(), expected, rtol=0.0, atol=0.0)
 
-    def test_rank_three_tensor_operators(self) -> None:
-        actual = self._run_tensor_operators(vd.cpu)
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_rank_three_tensor_operators(self, backend: BackendRow) -> None:
+        actual = self._run_tensor_operators(backend.architecture)
         shape = (2, 4, 4)
         left = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
         right = np.linspace(0.25, 2.5, np.prod(shape), dtype=np.float32).reshape(shape)
         expected = ((left + right) * 2.0 - right) / 2.0
         np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
-
-        backends = self._available_compute_backends(include_cpu=False)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                backend_actual = self._run_tensor_operators(backend)
-                np.testing.assert_allclose(backend_actual, expected, rtol=0.0, atol=1e-6)
 
     def test_autodiff_grid_counts_multiple_cooperative_workgroups(self) -> None:
         vd.init(arch=vd.cpu)
@@ -809,83 +759,68 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         gradient = pullback(cotangent)["scale"]
         np.testing.assert_allclose(gradient, expected, rtol=1.0e-6, atol=1.0e-6)
 
-    def test_lazy_short_circuit_boolean_backend_parity(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_lazy_short_circuit_boolean_backend_parity(self, backend: BackendRow) -> None:
         left_values = np.array((1, 0, -1, 2), dtype=np.int32)
         right_values = np.array((1, 1, 1, -2), dtype=np.int32)
         expected = np.array((1, 0, 0, 0), dtype=np.int32)
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
-                short_circuit_boolean(
-                    output,
-                    vd.storage.from_numpy(left_values),
-                    vd.storage.from_numpy(right_values),
-                    grid=(1, 1, 1),
-                )
-                np.testing.assert_array_equal(output.to_numpy(), expected)
+        output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
+        short_circuit_boolean(
+            output,
+            vd.storage.from_numpy(left_values),
+            vd.storage.from_numpy(right_values),
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), expected)
 
-    def test_conditional_expression_backend_parity(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_conditional_expression_backend_parity(self, backend: BackendRow) -> None:
         left_values = np.array((10, 20, 30, 40), dtype=np.int32)
         right_values = np.array((1, 2, 3, 4), dtype=np.int32)
         expected = np.array((10, 2, 30, 4), dtype=np.int32)
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
-                conditional_select(
-                    output,
-                    vd.storage.from_numpy(left_values),
-                    vd.storage.from_numpy(right_values),
-                    grid=(1, 1, 1),
-                )
+        output = vd.storage.zeros(dtype=vd.i32, shape=(4,))
+        conditional_select(
+            output,
+            vd.storage.from_numpy(left_values),
+            vd.storage.from_numpy(right_values),
+            grid=(1, 1, 1),
+        )
+        np.testing.assert_array_equal(output.to_numpy(), expected)
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_break_continue_backend_parity(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+        loop_control(output, 20)
+        np.testing.assert_array_equal(output.to_numpy(), np.array((16,), dtype=np.int32))
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_nested_loop_control_targets_nearest_loop(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+        nested_loop_control(output)
+        np.testing.assert_array_equal(output.to_numpy(), np.array((32,), dtype=np.int32))
+
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_early_return_aggregate_payload_backend_parity(self, backend: BackendRow) -> None:
+        for flag, expected in (
+            (True, np.array((7.0, 2.5, 3.0, 4.5, 5.0, 6.0), dtype=np.float32)),
+            (False, np.array((9.0, 4.5, 8.0, 9.5, 10.0, 11.0), dtype=np.float32)),
+        ):
+            with self.subTest(flag=flag):
+                output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
+                early_return_values(output, 1 if flag else 0, grid=(1, 1, 1))
                 np.testing.assert_array_equal(output.to_numpy(), expected)
 
-    def test_break_continue_backend_parity(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_loop_early_return_backend_parity(self, backend: BackendRow) -> None:
+        for limit, expected in ((2, -1), (8, 30)):
+            with self.subTest(limit=limit):
                 output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                loop_control(output, 20)
-                np.testing.assert_array_equal(output.to_numpy(), np.array((16,), dtype=np.int32))
+                source = vd.storage.from_numpy(np.array((limit,), dtype=np.int32))
+                loop_early_return(output, source)
+                np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
-    def test_nested_loop_control_targets_nearest_loop(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                nested_loop_control(output)
-                np.testing.assert_array_equal(output.to_numpy(), np.array((32,), dtype=np.int32))
-
-    def test_early_return_aggregate_payload_backend_parity(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            for flag, expected in (
-                (True, np.array((7.0, 2.5, 3.0, 4.5, 5.0, 6.0), dtype=np.float32)),
-                (False, np.array((9.0, 4.5, 8.0, 9.5, 10.0, 11.0), dtype=np.float32)),
-            ):
-                with self.subTest(backend=backend.name, flag=flag):
-                    vd.init(arch=backend)
-                    output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
-                    early_return_values(output, 1 if flag else 0, grid=(1, 1, 1))
-                    np.testing.assert_array_equal(output.to_numpy(), expected)
-
-    def test_loop_early_return_backend_parity(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            for limit, expected in ((2, -1), (8, 30)):
-                with self.subTest(backend=backend.name, limit=limit):
-                    vd.init(arch=backend)
-                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                    source = vd.storage.from_numpy(np.array((limit,), dtype=np.int32))
-                    loop_early_return(output, source)
-                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
-
-    def test_dynamic_signed_range_step_cpu_cuda_parity(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True, dynamic_range_step=True))
+    def test_dynamic_signed_range_step_backend_parity(self, backend: BackendRow) -> None:
         cases = (
             ((0, 10, 2), 20),
             ((10, 0, -3), 22),
@@ -894,17 +829,12 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             ((2_147_483_646, 2_147_483_647, 2), 2_147_483_646),
             ((-2_147_483_647, -2_147_483_648, -2), -2_147_483_647),
         )
-        backends = [vd.cpu]
-        if self._runtime_available(vd.cuda):
-            backends.append(vd.cuda)
-        for backend in backends:
-            for controls, expected in cases:
-                with self.subTest(backend=backend.name, controls=controls):
-                    vd.init(arch=backend)
-                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                    control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
-                    dynamic_range(output, control_values, grid=(1, 1, 1))
-                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
+        for controls, expected in cases:
+            with self.subTest(controls=controls):
+                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
+                dynamic_range(output, control_values, grid=(1, 1, 1))
+                np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
     def test_range_induction_is_i32_until_tensor_view_indexing(self) -> None:
         vd.init(arch=vd.cpu)
@@ -966,132 +896,102 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
 
-    def test_dynamic_range_bounds_all_backend_parity(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_dynamic_range_bounds_all_backend_parity(self, backend: BackendRow) -> None:
         cases = (((0, 10, 1), 20), ((10, 0, -1), 22), ((5, 5, 1), 0))
-        backends = self._available_compute_backends()
-        for backend in backends:
-            for controls, expected in cases:
-                with self.subTest(backend=backend.name, controls=controls):
-                    vd.init(arch=backend)
-                    output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
-                    control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
-                    signed_literal_step_range(output, control_values, grid=(1, 1, 1))
-                    np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
+        for controls, expected in cases:
+            with self.subTest(controls=controls):
+                output = vd.storage.zeros(dtype=vd.i32, shape=(1,))
+                control_values = vd.storage.from_numpy(np.array(controls, dtype=np.int32))
+                signed_literal_step_range(output, control_values, grid=(1, 1, 1))
+                np.testing.assert_array_equal(output.to_numpy(), np.array((expected,), dtype=np.int32))
 
-    def test_range_break_continue_and_early_return_backend_parity(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.i32, shape=(2,))
-                controls = vd.storage.from_numpy(np.array((10,), dtype=np.int32))
-                range_control_flow(output, controls, grid=(1, 1, 1))
-                np.testing.assert_array_equal(output.to_numpy(), np.array((13, 30), dtype=np.int32))
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_range_break_continue_and_early_return_backend_parity(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.i32, shape=(2,))
+        controls = vd.storage.from_numpy(np.array((10,), dtype=np.int32))
+        range_control_flow(output, controls, grid=(1, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), np.array((13, 30), dtype=np.int32))
 
-    def test_loop_carried_vector_norm(self) -> None:
-        expected = self._run_vector_while(vd.cpu)
-        backends = self._available_compute_backends(include_cpu=False)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                actual = self._run_vector_while(backend)
-                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_loop_carried_vector_norm(self, backend: BackendRow) -> None:
+        actual = self._run_vector_while(backend.architecture)
+        expected = vector_while_reference(0.35, 16)
+        np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-6)
 
-    def test_matrix_specialization(self) -> None:
-        backends = self._available_compute_backends(include_cpu=False)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.f32, shape=(2,))
-                matrix_vector(output, grid=(1, 1, 1))
-                np.testing.assert_allclose(
-                    output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6
-                )
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_matrix_specialization(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2,))
+        matrix_vector(output, grid=(1, 1, 1))
+        np.testing.assert_allclose(output.to_numpy(), np.array((17.0, 39.0), dtype=np.float32), rtol=0.0, atol=1e-6)
 
-    def test_literal_and_dynamic_floating_power(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_literal_and_dynamic_floating_power(self, backend: BackendRow) -> None:
         values = np.linspace(0.25, 2.0, 16, dtype=np.float32)
         exponent = 1.75
         expected = values ** np.float32(2.5) + values ** np.float32(exponent)
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.f32, shape=values.shape)
-                floating_power(
-                    output,
-                    vd.storage.from_numpy(values),
-                    exponent,
-                    grid=(2, 1, 1),
-                )
-                np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
+        output = vd.storage.zeros(dtype=vd.f32, shape=values.shape)
+        floating_power(
+            output,
+            vd.storage.from_numpy(values),
+            exponent,
+            grid=(2, 1, 1),
+        )
+        np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-6, atol=2e-6)
 
-    def test_strided_tensor_view_dispatch(self) -> None:
-        backends = self._available_compute_backends()
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_strided_tensor_view_dispatch(self, backend: BackendRow) -> None:
         expected = np.array([[2.0, 1.0, 0.0], [8.0, 7.0, 6.0]], dtype=np.float32)
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                source_bytes = bytearray(np.arange(12, dtype=np.float32).tobytes())
-                output_bytes = bytearray(12 * np.dtype(np.float32).itemsize)
-                source = vd.interop.RawBuffer.from_buffer(source_bytes, alignment=4).typed_view(
-                    dtype=vd.f32,
-                    shape=(2, 3),
-                    byte_strides=(24, -4),
-                    byte_offset=8,
-                    access="read",
-                    layout_units="bytes",
-                )
-                output = vd.interop.RawBuffer.from_buffer(output_bytes, alignment=4).typed_view(
-                    dtype=vd.f32,
-                    shape=(2, 3),
-                    byte_strides=(20, 4),
-                    byte_offset=4,
-                    access="read_write",
-                    layout_units="bytes",
-                )
+        source_bytes = bytearray(np.arange(12, dtype=np.float32).tobytes())
+        output_bytes = bytearray(12 * np.dtype(np.float32).itemsize)
+        source = vd.interop.RawBuffer.from_buffer(source_bytes, alignment=4).typed_view(
+            dtype=vd.f32,
+            shape=(2, 3),
+            byte_strides=(24, -4),
+            byte_offset=8,
+            access="read",
+            layout_units="bytes",
+        )
+        output = vd.interop.RawBuffer.from_buffer(output_bytes, alignment=4).typed_view(
+            dtype=vd.f32,
+            shape=(2, 3),
+            byte_strides=(20, 4),
+            byte_offset=4,
+            access="read_write",
+            layout_units="bytes",
+        )
+        copy_tensor_view(output, source)
+        np.testing.assert_array_equal(output.to_numpy(), expected)
 
-                copy_tensor_view(output, source)
-                np.testing.assert_array_equal(output.to_numpy(), expected)
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_dynamic_tensor_view_artifact_reuses_transposed_dispatch(self, backend: BackendRow) -> None:
+        copy_tensor_view.compile_count = 0
+        type(copy_tensor_view).clear_cache()
 
-        for target in ("cuda", "vulkan"):
-            with self.subTest(target=target):
-                artifact, reflection = compile_kernel_artifact(copy_tensor_view, target)
-                self.assertTrue(artifact)
-                self.assertIn('"tensor_views"', reflection)
+        first_source = vd.storage.from_numpy(np.arange(4, dtype=np.float32).reshape(2, 2))
+        first_output = vd.storage.zeros(dtype=vd.f32, shape=(2, 2))
+        copy_tensor_view(first_output, first_source)
+        np.testing.assert_array_equal(first_output.to_numpy(), first_source.to_numpy())
 
-    def test_dynamic_tensor_view_artifact_reuses_transposed_dispatch(self) -> None:
-        backends = self._available_compute_backends()
-        for backend in backends:
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                copy_tensor_view.compile_count = 0
-                type(copy_tensor_view).clear_cache()
+        owner = vd.storage.from_numpy(np.arange(6, dtype=np.float32).reshape(3, 2))
+        transposed_reversed = owner.view(shape=(2, 3), strides=(-1, 2), offset=1, access="read")
+        second_output = vd.storage.zeros(dtype=vd.f32, shape=(8,)).view(
+            shape=(2, 3), strides=(4, 1), offset=1, access="read_write"
+        )
+        copy_tensor_view(second_output, transposed_reversed)
+        np.testing.assert_array_equal(second_output.to_numpy(), owner.to_numpy().T[::-1])
+        self.assertEqual(copy_tensor_view.compile_count, 1)
+        self.assertEqual(len(type(copy_tensor_view)._cache), 1)
 
-                first_source = vd.storage.from_numpy(np.arange(4, dtype=np.float32).reshape(2, 2))
-                first_output = vd.storage.zeros(dtype=vd.f32, shape=(2, 2))
-                copy_tensor_view(first_output, first_source)
-                np.testing.assert_array_equal(first_output.to_numpy(), first_source.to_numpy())
-
-                owner = vd.storage.from_numpy(np.arange(6, dtype=np.float32).reshape(3, 2))
-                transposed_reversed = owner.view(shape=(2, 3), strides=(-1, 2), offset=1, access="read")
-                second_output = vd.storage.zeros(dtype=vd.f32, shape=(8,)).view(
-                    shape=(2, 3), strides=(4, 1), offset=1, access="read_write"
-                )
-                copy_tensor_view(second_output, transposed_reversed)
-                np.testing.assert_array_equal(second_output.to_numpy(), owner.to_numpy().T[::-1])
-                self.assertEqual(copy_tensor_view.compile_count, 1)
-                self.assertEqual(len(type(copy_tensor_view)._cache), 1)
-
-    def test_gpu_written_storage_survives_runtime_reinitialization(self) -> None:
-        for backend in self._available_compute_backends():
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
-                fill(output, 4.0)
-                vd.init(arch=vd.cpu)
-                np.testing.assert_array_equal(
-                    output.to_numpy(),
-                    np.array([[0.0, 1.0, 2.0], [4.0, 5.0, 6.0]], dtype=np.float32),
-                )
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_gpu_written_storage_survives_runtime_reinitialization(self, backend: BackendRow) -> None:
+        output = vd.storage.zeros(dtype=vd.f32, shape=(2, 3))
+        fill(output, 4.0)
+        vd.init(arch=vd.cpu)
+        np.testing.assert_array_equal(
+            output.to_numpy(),
+            np.array([[0.0, 1.0, 2.0], [4.0, 5.0, 6.0]], dtype=np.float32),
+        )
 
     def test_cached_tensor_view_dispatch_revalidates_abi(self) -> None:
         vd.init(arch=vd.cpu)
@@ -1116,7 +1016,8 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         self.assertEqual(copy_tensor_view.compile_count, 1)
         self.assertEqual(len(type(copy_tensor_view)._cache), 1)
 
-    def test_aggregate_tensor_view_dispatch(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_aggregate_tensor_view_dispatch(self, backend: BackendRow) -> None:
         values = tuple(
             ComplexAggregateVertex(
                 np.array((float(index), float(index) + 0.5), dtype=np.float32),
@@ -1129,79 +1030,75 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             )
             for index in range(4)
         )
-        for backend in self._available_compute_backends():
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                source = vd.storage.from_values(values, dtype=ComplexAggregateVertex).view(
-                    shape=(4,), strides=(-1,), offset=3, access="read"
-                )
-                output_storage = vd.storage.zeros(dtype=ComplexAggregateVertex, shape=(4,))
-                self.assertEqual(host_abi_layout(ComplexAggregateVertex).size, 44)
-                self.assertEqual(output_storage._native_host_array().nbytes, 4 * 44)
-                output = output_storage.view(access="write")
-                copy_complex_aggregate_tensor_view(output, source, grid=(1, 1, 1))
-                actual = output_storage.to_values()
-                for result, expected in zip(actual, reversed(values), strict=True):
-                    np.testing.assert_array_equal(result.position, expected.position)
-                    self.assertEqual(result.payload.object_id, expected.payload.object_id)
-                    np.testing.assert_array_equal(result.payload.uv, expected.payload.uv)
-                    np.testing.assert_array_equal(result.payload.weights, expected.payload.weights)
-                    np.testing.assert_array_equal(result.basis, expected.basis)
+        source = vd.storage.from_values(values, dtype=ComplexAggregateVertex).view(
+            shape=(4,), strides=(-1,), offset=3, access="read"
+        )
+        output_storage = vd.storage.zeros(dtype=ComplexAggregateVertex, shape=(4,))
+        self.assertEqual(host_abi_layout(ComplexAggregateVertex).size, 44)
+        self.assertEqual(output_storage._native_host_array().nbytes, 4 * 44)
+        output = output_storage.view(access="write")
+        copy_complex_aggregate_tensor_view(output, source, grid=(1, 1, 1))
+        actual = output_storage.to_values()
+        for result, expected in zip(actual, reversed(values), strict=True):
+            np.testing.assert_array_equal(result.position, expected.position)
+            self.assertEqual(result.payload.object_id, expected.payload.object_id)
+            np.testing.assert_array_equal(result.payload.uv, expected.payload.uv)
+            np.testing.assert_array_equal(result.payload.weights, expected.payload.weights)
+            np.testing.assert_array_equal(result.basis, expected.basis)
 
-                tuple_type = vd.Tuple[vd.i32, vd.f32]
-                tuple_values = ((vd.i32(2), vd.f32(3.5)), (vd.i32(5), vd.f32(7.5)))
-                tuple_source = vd.storage.from_values(tuple_values, dtype=tuple_type)
-                tuple_output = vd.storage.zeros(dtype=tuple_type, shape=(2,))
-                copy_tuple_tensor_view(
-                    tuple_output.view(access="write"),
-                    tuple_source.view(access="read"),
-                    grid=(1, 1, 1),
-                )
-                self.assertEqual(tuple_output.to_values(), tuple_values)
+        tuple_type = vd.Tuple[vd.i32, vd.f32]
+        tuple_values = ((vd.i32(2), vd.f32(3.5)), (vd.i32(5), vd.f32(7.5)))
+        tuple_source = vd.storage.from_values(tuple_values, dtype=tuple_type)
+        tuple_output = vd.storage.zeros(dtype=tuple_type, shape=(2,))
+        copy_tuple_tensor_view(
+            tuple_output.view(access="write"),
+            tuple_source.view(access="read"),
+            grid=(1, 1, 1),
+        )
+        self.assertEqual(tuple_output.to_values(), tuple_values)
 
-                tensor_type = vd.Tensor[vd.f32, (2,)]
-                tensor_values = (
-                    np.array([1.0, 2.0], dtype=np.float32),
-                    np.array([3.0, 4.0], dtype=np.float32),
-                )
-                tensor_source_bytes = bytearray(np.asarray(tensor_values, dtype=np.float32).tobytes())
-                tensor_output_bytes = bytearray(4 * np.dtype(np.float32).itemsize)
-                tensor_source = vd.interop.RawBuffer.from_buffer(tensor_source_bytes, alignment=4).typed_view(
-                    dtype=tensor_type,
-                    shape=(2,),
-                    byte_strides=(8,),
-                    access="read",
-                    layout_units="bytes",
-                )
-                tensor_output = vd.interop.RawBuffer.from_buffer(tensor_output_bytes, alignment=4).typed_view(
-                    dtype=tensor_type,
-                    shape=(2,),
-                    byte_strides=(8,),
-                    access="write",
-                    layout_units="bytes",
-                )
-                copy_value_tensor_view(tensor_output, tensor_source, grid=(1, 1, 1))
-                tensor_output.owner.synchronize()
-                np.testing.assert_array_equal(
-                    np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
-                    np.asarray(tensor_values),
-                )
+        tensor_type = vd.Tensor[vd.f32, (2,)]
+        tensor_values = (
+            np.array([1.0, 2.0], dtype=np.float32),
+            np.array([3.0, 4.0], dtype=np.float32),
+        )
+        tensor_source_bytes = bytearray(np.asarray(tensor_values, dtype=np.float32).tobytes())
+        tensor_output_bytes = bytearray(4 * np.dtype(np.float32).itemsize)
+        tensor_source = vd.interop.RawBuffer.from_buffer(tensor_source_bytes, alignment=4).typed_view(
+            dtype=tensor_type,
+            shape=(2,),
+            byte_strides=(8,),
+            access="read",
+            layout_units="bytes",
+        )
+        tensor_output = vd.interop.RawBuffer.from_buffer(tensor_output_bytes, alignment=4).typed_view(
+            dtype=tensor_type,
+            shape=(2,),
+            byte_strides=(8,),
+            access="write",
+            layout_units="bytes",
+        )
+        copy_value_tensor_view(tensor_output, tensor_source, grid=(1, 1, 1))
+        tensor_output.owner.synchronize()
+        np.testing.assert_array_equal(
+            np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
+            np.asarray(tensor_values),
+        )
 
-                vector_type = vd.Vector[vd.f32, 2]
-                vector_source = vd.storage.from_values(tensor_values, dtype=vector_type)
-                vector_output = vd.storage.zeros(dtype=vector_type, shape=(2,))
-                vector_source.view(access="read_write").copy_from_numpy(
-                    np.ascontiguousarray(tensor_values, dtype=np.float32)
-                )
-                copy_vector_tensor_view_through_helper(vector_output, vector_source, grid=(1, 1, 1))
-                np.testing.assert_array_equal(
-                    vector_output.to_numpy(),
-                    np.asarray(tensor_values),
-                )
-                for actual, expected in zip(vector_output.to_values(), tensor_values, strict=True):
-                    np.testing.assert_array_equal(actual, expected)
+        vector_type = vd.Vector[vd.f32, 2]
+        vector_source = vd.storage.from_values(tensor_values, dtype=vector_type)
+        vector_output = vd.storage.zeros(dtype=vector_type, shape=(2,))
+        vector_source.view(access="read_write").copy_from_numpy(np.ascontiguousarray(tensor_values, dtype=np.float32))
+        copy_vector_tensor_view_through_helper(vector_output, vector_source, grid=(1, 1, 1))
+        np.testing.assert_array_equal(
+            vector_output.to_numpy(),
+            np.asarray(tensor_values),
+        )
+        for actual, expected in zip(vector_output.to_values(), tensor_values, strict=True):
+            np.testing.assert_array_equal(actual, expected)
 
-    def test_multidimensional_aggregate_tensor_dispatch(self) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_multidimensional_aggregate_tensor_dispatch(self, backend: BackendRow) -> None:
         values = tuple(
             ComplexAggregateVertex(
                 np.array((float(index), float(index) + 0.5), dtype=np.float32),
@@ -1216,32 +1113,17 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         )
         expected = np.array((23.0, 23.5, 69.0, 23.75, 24.0, 28.0), dtype=np.float32)
 
-        for backend in self._available_compute_backends():
-            with self.subTest(backend=backend.name):
-                vd.init(arch=backend)
-                output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
-                tensor = vd.storage.from_values(
-                    tuple(
-                        tuple(tuple(values[plane * 12 + row * 4 + column] for column in range(4)) for row in range(3))
-                        for plane in range(2)
-                    ),
-                    dtype=ComplexAggregateVertex,
-                )
-                self.assertEqual(tensor._native_host_array().nbytes, 2 * 3 * 4 * 44)
-                inspect_multidimensional_aggregate_tensor_value(output, tensor, grid=(1, 1, 1))
-                np.testing.assert_array_equal(output.to_numpy(), expected)
-
-    def test_cross_compiled_source_generation(self) -> None:
-        cases = {
-            "metal": "kernel void vector_while",
-            "opengl": "#version 430",
-            "opengles": "#version 310 es",
-        }
-        for target, marker in cases.items():
-            with self.subTest(target=target):
-                source, reflection = compile_kernel_artifact(vector_while, target)
-                self.assertIn(marker, source.decode())
-                self.assertIn(f'"target":"{target}"', reflection)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(6,))
+        tensor = vd.storage.from_values(
+            tuple(
+                tuple(tuple(values[plane * 12 + row * 4 + column] for column in range(4)) for row in range(3))
+                for plane in range(2)
+            ),
+            dtype=ComplexAggregateVertex,
+        )
+        self.assertEqual(tensor._native_host_array().nbytes, 2 * 3 * 4 * 44)
+        inspect_multidimensional_aggregate_tensor_value(output, tensor, grid=(1, 1, 1))
+        np.testing.assert_array_equal(output.to_numpy(), expected)
 
 
 @vd.kernel(workgroup_size=(1, 1, 1))

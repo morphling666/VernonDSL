@@ -60,6 +60,9 @@ class RuntimeOracleKind(Enum):
     REUSED_STAGE = "reused_stage"
     TENSOR_VIEW_CHAIN = "tensor_view_chain"
     DYNAMIC_SHAPE_GRID = "dynamic_shape_grid"
+    NO_TAPE_VJP = "no_tape_vjp"
+    REDUCTION_VJP = "reduction_vjp"
+    STATIC_VJP = "static_vjp"
     DYNAMIC_VJP = "dynamic_vjp"
     FAN_OUT_VJP = "fan_out_vjp"
     GRAPHICS_TRIANGLE = "graphics_triangle"
@@ -2696,6 +2699,30 @@ LANGUAGE_CONTRACT_ACCEPTANCES: Final = (
         requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
         oracle=RuntimeOracle(RuntimeOracleKind.MODULE_VJP, (9.0, 6.0, 12.0)),
         suite=AcceptanceSuite.MODULE_PROGRAM,
+    ),
+    LanguageContractAcceptance(
+        id="gpu_autodiff",
+        contract_ids=frozenset({"LANG-AD-001", "LANG-AD-002"}),
+        asset_reference="source/tests/fixtures/autodiff_gpu_no_tape_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.NO_TAPE_VJP, (4.0, 9.0, 25.0, 49.0, 4.0, 6.0, 10.0, 14.0)),
+        suite=AcceptanceSuite.GPU_AUTODIFF,
+    ),
+    LanguageContractAcceptance(
+        id="gpu_autodiff_non_power_of_two",
+        contract_ids=frozenset({"LANG-AD-001", "LANG-AD-002"}),
+        asset_reference="source/tests/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.REDUCTION_VJP, (2396288.0,)),
+        suite=AcceptanceSuite.GPU_AUTODIFF,
+    ),
+    LanguageContractAcceptance(
+        id="gpu_autodiff_static",
+        contract_ids=frozenset({"LANG-AD-001", "LANG-AD-003"}),
+        asset_reference="source/tests/fixtures/autodiff_gpu_tape_asset.py:static_asset",
+        requirements=AcceptanceRequirements(compute=True, storage_buffers=True, program_vjp=True),
+        oracle=RuntimeOracle(RuntimeOracleKind.STATIC_VJP, (2.5, 24.0, -26.0)),
+        suite=AcceptanceSuite.GPU_AUTODIFF,
     ),
     LanguageContractAcceptance(
         id="gpu_autodiff_dynamic",

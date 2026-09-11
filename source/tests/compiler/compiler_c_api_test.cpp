@@ -2072,12 +2072,18 @@ TEST(CompilerCApi, ValidatesAndCompilesAllTargets) {
     VernonTargetCapabilities vulkan = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_VULKAN);
     ASSERT_TRUE(vulkan.available && vulkan.supports_graphics);
     ASSERT_TRUE(vulkan.supports_device_storage_atomics && !vulkan.supports_f32_device_atomic_add);
+    ASSERT_TRUE(!vulkan.supports_dynamic_range_step && !vulkan.supports_f16 && !vulkan.supports_f64 &&
+                !vulkan.supports_f64_device_atomic_add);
     VernonTargetCapabilities cuda = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CUDA);
     ASSERT_TRUE(cuda.available && cuda.supports_compute && !cuda.supports_graphics);
     ASSERT_TRUE(cuda.supports_device_storage_atomics && cuda.supports_f32_device_atomic_add);
+    ASSERT_TRUE(cuda.supports_dynamic_range_step && !cuda.supports_f16 && cuda.supports_f64 &&
+                !cuda.supports_f64_device_atomic_add);
     VernonTargetCapabilities cpu = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_CPU);
     ASSERT_TRUE(cpu.available && cpu.supports_graphics && cpu.supports_compute);
     ASSERT_TRUE(cpu.supports_device_storage_atomics && cpu.supports_f32_device_atomic_add);
+    ASSERT_TRUE(cpu.supports_dynamic_range_step && cpu.supports_f16 && cpu.supports_f64 &&
+                cpu.supports_f64_device_atomic_add);
     VernonTargetCapabilities opengl = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL);
     VernonTargetCapabilities opengles = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_OPENGL_ES);
     VernonTargetCapabilities metal = vernonCompilerGetTargetCapabilities(context, VERNON_TARGET_METAL);

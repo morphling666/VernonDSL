@@ -235,6 +235,7 @@ if(TARGET VernonRuntime)
                 VernonCommandGraph
                 Vernon::RuntimeRHIAdapter
                 nlohmann_json::nlohmann_json)
+    vernon_enable_glfw_context_owner_for_test(VernonRuntimeTests)
     if(VERNON_RUNTIME_LIBRARY_TYPE STREQUAL "SHARED")
         target_link_libraries(VernonRuntimeTests PRIVATE VernonRuntimeInternals Vernon::RuntimeCore)
     endif()
@@ -300,10 +301,6 @@ if(TARGET VernonRuntime)
             "opengl|VERNON_RUNTIME_OPENGL|compute,autodiff,gpu,graphics,synchronization,texture"
             "opengles|VERNON_RUNTIME_OPENGL_ES|compute,autodiff,gpu,graphics,synchronization,texture")
 
-        set(cross_backend_fixture_specs
-            "gpu_autodiff|gpu_autodiff|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_no_tape_asset.py:asset|gpu"
-            "gpu_autodiff|gpu_autodiff_non_power_of_two|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_non_power_of_two_asset.py:asset|gpu"
-            "gpu_autodiff|gpu_autodiff_static|${VERNON_TEST_ROOT}/fixtures/autodiff_gpu_tape_asset.py:static_asset|gpu")
         set(language_contract_fixture_specs_file
             "${VERNON_TEST_BINARY_ROOT}/generated/language_contract_fixture_specs.cmake")
         execute_process(
@@ -324,7 +321,7 @@ if(TARGET VernonRuntime)
                                 "${language_contract_fixture_specs_error}")
         endif()
         include("${language_contract_fixture_specs_file}")
-        list(APPEND cross_backend_fixture_specs ${VERNON_LANGUAGE_CONTRACT_FIXTURE_SPECS})
+        set(cross_backend_fixture_specs ${VERNON_LANGUAGE_CONTRACT_FIXTURE_SPECS})
         set(VERNON_TEST_FIXTURE_MANIFEST_ROWS)
         set(VERNON_TEST_FIXTURE_PAIRS)
         foreach(enabled_fixture_target IN LISTS enabled_fixture_targets)

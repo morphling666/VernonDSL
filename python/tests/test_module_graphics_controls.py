@@ -8,7 +8,7 @@ from typing import Annotated, Any, cast
 
 import numpy as np
 import vernon_dsl as vd
-from vernon_dsl._runtime.session import RuntimeUnavailableError
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 from vernon_dsl.frontend.module_ast import interpret_module_forward
 from vernon_dsl.frontend.runtime_types import RuntimeParameterDescriptor, runtime_parameter_descriptor
 from vernon_dsl.operation_graph import GraphicsCallOp, ProgramControlDescriptor
@@ -299,6 +299,7 @@ class _DepthTarget:
         return _DepthTexture()
 
 
+@expand_backend_matrix_tests
 class ModuleGraphicsControlTests(unittest.TestCase):
     @staticmethod
     def _cook(parsed: Any, pipeline_id: str) -> dict[str, Any]:
@@ -528,266 +529,183 @@ class ModuleGraphicsControlTests(unittest.TestCase):
         self.assertEqual(operation["draw"]["control"], 2)
         self.assertEqual(operation["dynamic_state"]["control"], 3)
 
-    def test_real_opengl_managed_module_uses_distinct_node_controls(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"OpenGL runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
+    @staticmethod
+    def _triangle_vertices() -> Any:
+        return vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
+            access="read"
+        )
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_module_uses_distinct_node_controls(self, backend: BackendRow) -> None:
+        vertices = self._triangle_vertices()
+        textures = (vd.Texture.zeros(shape=(16, 16)), vd.Texture.zeros(shape=(16, 16)))
+        module = ManagedGraphicsTwice()
+        controls = tuple(
+            control
+            for texture in textures
+            for control in (
+                vd.render_pass(
+                    vd.RenderTarget.from_attachments(colors={0: texture}),
+                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+                ),
+                vd.draw(vertex_count=3),
+                vd.dynamic_state(viewport=(0, 0, 16, 16)),
             )
-            first_texture = vd.Texture.zeros(shape=(16, 16))
-            second_texture = vd.Texture.zeros(shape=(16, 16))
-            first_target = vd.RenderTarget.from_attachments(colors={0: first_texture})
-            second_target = vd.RenderTarget.from_attachments(colors={0: second_texture})
-            module = ManagedGraphicsTwice()
+        )
+        module(vertices, *controls)
+        invocation_controls = next(iter(module._program_cache.values())).invocation.graphics_controls
+        self.assertEqual(len(invocation_controls), 2)
+        self.assertNotEqual(invocation_controls[0]["render_pass"][0], invocation_controls[1]["render_pass"][0])
+        for texture in textures:
+            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True, texture_sampler_operations=True))
+    def test_shadow_depth_is_sampled_by_pbr(self, backend: BackendRow) -> None:
+        depth = vd.Texture.device(shape=(16, 16), format=vd.d32_float, usage=("depth_stencil_attachment", "sampled"))
+        pbr_texture = vd.Texture.zeros(shape=(16, 16))
+        controls = (vd.draw(vertex_count=3), vd.dynamic_state(viewport=(0, 0, 16, 16)))
+        ShadowPbrProgram()(
+            self._triangle_vertices(),
+            vd.render_pass(vd.RenderTarget.from_attachments(colors={}, depth=depth), depth=vd.clear_depth(1.0)),
+            *controls,
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: pbr_texture}),
+                color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+            ),
+            *controls,
+            vd.sampler(),
+        )
+        self.assertGreater(pbr_texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, graphics=True, storage_buffers=True))
+    def test_compute_generated_vertices(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(shape=(16, 16))
+        ComputeGeneratedVertices()(
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: texture}),
+                color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+            ),
+            vd.draw(vertex_count=3),
+            vd.dynamic_state(viewport=(0, 0, 16, 16)),
+        )
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_module_uses_static_pipeline_state(self, backend: BackendRow) -> None:
+        vertices = self._triangle_vertices()
+        visible, culled = vd.Texture.zeros(shape=(16, 16)), vd.Texture.zeros(shape=(16, 16))
+        controls = (vd.draw(vertex_count=3), vd.dynamic_state(viewport=(0, 0, 16, 16)))
+        for module, texture in ((ManagedGraphics(), visible), (CulledManagedGraphics(), culled)):
             module(
                 vertices,
-                vd.render_pass(first_target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
-                vd.draw(vertex_count=3),
-                vd.dynamic_state(viewport=(0, 0, 16, 16)),
-                vd.render_pass(second_target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
-                vd.draw(vertex_count=3),
-                vd.dynamic_state(viewport=(0, 0, 16, 16)),
+                vd.render_pass(
+                    vd.RenderTarget.from_attachments(colors={0: texture}),
+                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+                ),
+                *controls,
             )
+        self.assertGreater(visible.to_numpy()[..., :3].sum(), 0)
+        self.assertEqual(culled.to_numpy()[..., :3].sum(), 0)
 
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_module_infers_optional_controls(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(shape=(16, 16))
+        DefaultedManagedGraphics()(
+            self._triangle_vertices(),
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: texture}),
+                color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+            ),
+        )
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_module_uses_static_blend_state(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(shape=(16, 16))
+        BlendedManagedGraphics()(
+            self._triangle_vertices(),
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: texture}),
+                color=vd.clear((0.0, 0.0, 1.0, 1.0)),
+            ),
+        )
+        center = texture.to_numpy()[8, 8]
+        self.assertGreater(int(center[0]), 100)
+        self.assertGreater(int(center[2]), 100)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_controls_are_explicit_per_invocation(self, backend: BackendRow) -> None:
+        vertices = self._triangle_vertices()
+        texture = vd.Texture.zeros(shape=(16, 16))
+        target = vd.RenderTarget.from_attachments(colors={0: texture})
+        module = ManagedGraphics()
+        render_pass = vd.render_pass(target, color=vd.clear((0.0, 0.0, 0.0, 1.0)))
+        draw = vd.draw(vertex_count=3)
+        dynamic_state = vd.dynamic_state(viewport=(0, 0, 16, 16))
+        module(vertices, render_pass, draw, dynamic_state)
+        texture.upload(np.zeros((16, 16, 4), dtype=np.uint8))
+        module(vertices=vertices, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+        invalid = vd.RenderTarget.from_attachments(
+            colors={0: vd.Texture.zeros(shape=(8, 8)), 1: vd.Texture.zeros(shape=(8, 8))}
+        )
+        with self.assertRaisesRegex((ValueError, RuntimeError), "color|exactly match"):
+            module(
+                vertices=vertices,
+                render_pass=vd.render_pass(
+                    invalid,
+                    colors={
+                        0: vd.clear((0.0, 0.0, 0.0, 1.0)),
+                        1: vd.clear((0.0, 0.0, 0.0, 1.0)),
+                    },
+                ),
+                draw=draw,
+                dynamic_state=dynamic_state,
+            )
+        texture.upload(np.zeros((16, 16, 4), dtype=np.uint8))
+        module(vertices=vertices, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_managed_module_executes_typed_controls(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(shape=(16, 16))
+        ManagedGraphics()(
+            self._triangle_vertices(),
+            vd.render_pass(
+                vd.RenderTarget.from_attachments(colors={0: texture}),
+                color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+            ),
+            vd.draw(vertex_count=3),
+            vd.dynamic_state(viewport=(0, 0, 16, 16)),
+        )
+        self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_program_reuses_across_attachment_extents_and_dynamic_states(self, backend: BackendRow) -> None:
+        module = ManagedGraphics()
+        executable_identity = None
+        manifest_snapshot = None
+        for size, stencil in ((8, 3), (16, 9)):
+            texture = vd.Texture.zeros(shape=(size, size))
+            module(
+                self._triangle_vertices(),
+                vd.render_pass(
+                    vd.RenderTarget.from_attachments(colors={0: texture}),
+                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+                ),
+                vd.draw(vertex_count=3),
+                vd.dynamic_state(viewport=(0, 0, size, size), stencil_reference=stencil),
+            )
+            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+            self.assertEqual(len(module._program_cache), 1)
             specialization = next(iter(module._program_cache.values()))
-            controls = specialization.invocation.graphics_controls
-            self.assertEqual(len(controls), 2)
-            self.assertNotEqual(controls[0]["render_pass"][0], controls[1]["render_pass"][0])
-            first_pixels = first_texture.to_numpy()
-            second_pixels = second_texture.to_numpy()
-            self.assertGreater(first_pixels[..., :3].sum(), 0)
-            self.assertGreater(second_pixels[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_metal_executes_shadow_depth_sampled_by_pbr(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"Metal runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            depth = vd.Texture.device(
-                shape=(16, 16),
-                format=vd.d32_float,
-                usage=("depth_stencil_attachment", "sampled"),
-            )
-            shadow_target = vd.RenderTarget.from_attachments(colors={}, depth=depth)
-            pbr_texture = vd.Texture.zeros(shape=(16, 16))
-            pbr_target = vd.RenderTarget.from_attachments(colors={0: pbr_texture})
-            controls = (vd.draw(vertex_count=3), vd.dynamic_state(viewport=(0, 0, 16, 16)))
-            ShadowPbrProgram()(
-                vertices,
-                vd.render_pass(shadow_target, depth=vd.clear_depth(1.0)),
-                *controls,
-                vd.render_pass(pbr_target, color=vd.clear((0.0, 0.0, 0.0, 1.0))),
-                *controls,
-                vd.sampler(),
-            )
-            self.assertGreater(pbr_texture.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_metal_executes_compute_generated_vertices(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"Metal runtime unavailable: {error}")
-        try:
-            controls = (vd.draw(vertex_count=3), vd.dynamic_state(viewport=(0, 0, 16, 16)))
-            generated_texture = vd.Texture.zeros(shape=(16, 16))
-            ComputeGeneratedVertices()(
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: generated_texture}),
-                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                ),
-                *controls,
-            )
-            self.assertGreater(generated_texture.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_opengl_managed_module_uses_static_pipeline_state(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"OpenGL runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            visible = vd.Texture.zeros(shape=(16, 16))
-            culled = vd.Texture.zeros(shape=(16, 16))
-            controls = (vd.draw(vertex_count=3), vd.dynamic_state(viewport=(0, 0, 16, 16)))
-            ManagedGraphics()(
-                vertices,
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: visible}),
-                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                ),
-                *controls,
-            )
-            CulledManagedGraphics()(
-                vertices,
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: culled}),
-                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                ),
-                *controls,
-            )
-            self.assertGreater(visible.to_numpy()[..., :3].sum(), 0)
-            self.assertEqual(culled.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_opengl_managed_module_infers_optional_controls(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"OpenGL runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            texture = vd.Texture.zeros(shape=(16, 16))
-            DefaultedManagedGraphics()(
-                vertices,
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: texture}),
-                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                ),
-            )
-            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_opengl_managed_module_uses_static_blend_state(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"OpenGL runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            texture = vd.Texture.zeros(shape=(16, 16))
-            BlendedManagedGraphics()(
-                vertices,
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: texture}),
-                    color=vd.clear((0.0, 0.0, 1.0, 1.0)),
-                ),
-            )
-            center = texture.to_numpy()[8, 8]
-            self.assertGreater(int(center[0]), 100)
-            self.assertGreater(int(center[2]), 100)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_opengl_managed_controls_are_explicit_per_invocation(self) -> None:
-        try:
-            vd.init(arch=vd.opengl, api_version=(3, 3))
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"OpenGL runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            texture = vd.Texture.zeros(shape=(16, 16))
-            target = vd.RenderTarget.from_attachments(colors={0: texture})
-            module = ManagedGraphics()
-            render_pass = vd.render_pass(target, color=vd.clear((0.0, 0.0, 0.0, 1.0)))
-            draw = vd.draw(vertex_count=3)
-            dynamic_state = vd.dynamic_state(viewport=(0, 0, 16, 16))
-            module(vertices, render_pass, draw, dynamic_state)
-            texture.upload(np.zeros((16, 16, 4), dtype=np.uint8))
-            module(vertices=vertices, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
-            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-
-            invalid = vd.RenderTarget.from_attachments(
-                colors={0: vd.Texture.zeros(shape=(8, 8)), 1: vd.Texture.zeros(shape=(8, 8))}
-            )
-            with self.assertRaisesRegex((ValueError, RuntimeError), "color|exactly match"):
-                module(
-                    vertices=vertices,
-                    render_pass=vd.render_pass(
-                        invalid,
-                        colors={
-                            0: vd.clear((0.0, 0.0, 0.0, 1.0)),
-                            1: vd.clear((0.0, 0.0, 0.0, 1.0)),
-                        },
-                    ),
-                    draw=draw,
-                    dynamic_state=dynamic_state,
-                )
-            texture.upload(np.zeros((16, 16, 4), dtype=np.uint8))
-            module(vertices=vertices, render_pass=render_pass, draw=draw, dynamic_state=dynamic_state)
-            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_metal_managed_module_executes_typed_controls(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"Metal runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            texture = vd.Texture.zeros(shape=(16, 16))
-            ManagedGraphics()(
-                vertices,
-                vd.render_pass(
-                    vd.RenderTarget.from_attachments(colors={0: texture}),
-                    color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                ),
-                vd.draw(vertex_count=3),
-                vd.dynamic_state(viewport=(0, 0, 16, 16)),
-            )
-            self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-        finally:
-            vd.init(arch=vd.cpu)
-
-    def test_real_metal_reuses_one_program_across_attachment_extents_and_dynamic_states(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"Metal runtime unavailable: {error}")
-        try:
-            vertices = vd.storage.from_numpy(np.array(((-0.8, -0.8), (0.8, -0.8), (0.0, 0.8)), dtype=np.float32)).view(
-                access="read"
-            )
-            module = ManagedGraphics()
-            executable_identity = None
-            manifest_snapshot = None
-            for size, stencil in ((8, 3), (16, 9)):
-                texture = vd.Texture.zeros(shape=(size, size))
-                module(
-                    vertices,
-                    vd.render_pass(
-                        vd.RenderTarget.from_attachments(colors={0: texture}),
-                        color=vd.clear((0.0, 0.0, 0.0, 1.0)),
-                    ),
-                    vd.draw(vertex_count=3),
-                    vd.dynamic_state(viewport=(0, 0, size, size), stencil_reference=stencil),
-                )
-                self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-                self.assertEqual(len(module._program_cache), 1)
-                specialization = next(iter(module._program_cache.values()))
-                if executable_identity is None:
-                    executable_identity = id(specialization.native_program)
-                    manifest_snapshot = repr(specialization.invocation.graph)
-                else:
-                    self.assertEqual(id(specialization.native_program), executable_identity)
-                    self.assertEqual(repr(specialization.invocation.graph), manifest_snapshot)
-        finally:
-            vd.init(arch=vd.cpu)
+            if executable_identity is None:
+                executable_identity = id(specialization.native_program)
+                manifest_snapshot = repr(specialization.invocation.graph)
+            else:
+                self.assertEqual(id(specialization.native_program), executable_identity)
+                self.assertEqual(repr(specialization.invocation.graph), manifest_snapshot)
 
 
 declared_pipeline = vd.pipeline(

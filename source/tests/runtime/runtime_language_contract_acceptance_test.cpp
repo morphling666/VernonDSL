@@ -1,3 +1,4 @@
+#include "../support/acceptance_descriptor.h"
 #include "../support/program_fixture_runtime_test.h"
 #include "../support/sampled_texture_runtime_oracle.h"
 
@@ -14,36 +15,23 @@
 
 namespace {
 
+using vernon::tests::AcceptanceDescriptor;
 using vernon::tests::ProgramFixtureManifest;
-
-struct AcceptanceDescriptor {
-    std::string_view fixtureId;
-    bool compute;
-    bool graphics;
-    bool storageBuffers;
-    bool storageTexture;
-    bool deviceAtomics;
-    bool f32AtomicAdd;
-    bool textureSamplerOperations;
-    bool programVjp;
-    std::string_view oracle;
-    std::string_view parameter;
-    VernonLaunchSize grid;
-    const double *expected;
-    size_t expectedCount;
-};
 
 #include "language_contract_acceptance_descriptors.inc"
 
 bool isAcceptanceFixture(std::string_view fixtureId) {
     return std::any_of(acceptanceDescriptors, std::end(acceptanceDescriptors),
-                       [&](const AcceptanceDescriptor &acceptance) { return acceptance.fixtureId == fixtureId; });
+                       [&](const AcceptanceDescriptor &acceptance) {
+                           return acceptance.suite == "language_contract" && acceptance.fixtureId == fixtureId;
+                       });
 }
 
 const AcceptanceDescriptor &acceptanceFor(std::string_view fixtureId) {
-    const auto *result =
-        std::find_if(acceptanceDescriptors, std::end(acceptanceDescriptors),
-                     [&](const AcceptanceDescriptor &acceptance) { return acceptance.fixtureId == fixtureId; });
+    const auto *result = std::find_if(
+        acceptanceDescriptors, std::end(acceptanceDescriptors), [&](const AcceptanceDescriptor &acceptance) {
+            return acceptance.suite == "language_contract" && acceptance.fixtureId == fixtureId;
+        });
     if (result == std::end(acceptanceDescriptors))
         throw std::logic_error("unknown acceptance fixture");
     return *result;

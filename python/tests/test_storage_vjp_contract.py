@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._runtime.autodiff as runtime_autodiff
+from backend_test_matrix import BACKEND_TEST_MATRIX, BackendRequirements, probe_compiler, require_available
 from language_contract_cases import case_by_id
 from language_contract_runner import assert_verified_ir
 from language_contract_traceability import covers_case
@@ -218,13 +219,15 @@ def objective(
         )
         structured = build_structured_vjp(_native, result, transform)
         self.assertEqual(structured.residual_storage_kind, "none")
-        for target in (
-            _native.Target.CUDA,
-            _native.Target.VULKAN,
-            _native.Target.METAL,
-            _native.Target.OPENGL,
-        ):
-            with self.subTest(target=target.name):
+        for backend in BACKEND_TEST_MATRIX:
+            target = getattr(_native.Target, backend.compiler_target)
+            with self.subTest(target=backend.name):
+                require_available(
+                    probe_compiler(
+                        backend,
+                        BackendRequirements(compute=True, program_vjp=True),
+                    )
+                )
                 compiled = _native.Compiler().compile_program_result(
                     structured.profiles["backward"],
                     target,

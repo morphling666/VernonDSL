@@ -20,6 +20,10 @@ nb::dict targetCapabilities(VernonTarget target) {
     result["compute"] = capabilities.supports_compute != 0;
     result["device_storage_atomics"] = capabilities.supports_device_storage_atomics != 0;
     result["f32_device_atomic_add"] = capabilities.supports_f32_device_atomic_add != 0;
+    result["dynamic_range_step"] = capabilities.supports_dynamic_range_step != 0;
+    result["f16"] = capabilities.supports_f16 != 0;
+    result["f64"] = capabilities.supports_f64 != 0;
+    result["f64_device_atomic_add"] = capabilities.supports_f64_device_atomic_add != 0;
     return result;
 }
 

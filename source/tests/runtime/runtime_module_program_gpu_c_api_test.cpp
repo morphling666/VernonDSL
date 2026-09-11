@@ -620,39 +620,58 @@ void runDynamicShapeGridReuse(vernon::tests::OwnedRhiRuntime &owned, const std::
     destroyProgram(program);
 }
 
-const std::vector<vernon::tests::ProgramFixtureManifest> &moduleProgramBackendCases() {
+const std::vector<vernon::tests::ProgramFixtureManifest> &moduleProgramVjpBackendCases() {
     static const auto cases = vernon::tests::programFixtureCases("module_program");
     return cases;
 }
 
-class RuntimeModuleProgramGpuCApi : public vernon::tests::ProgramFixtureRuntimeTest {
+const std::vector<vernon::tests::ProgramFixtureManifest> &moduleProgramComputeBackendCases() {
+    static const auto cases = vernon::tests::programFixtureCases("reused_stage");
+    return cases;
+}
+
+class RuntimeModuleProgramVjpGpuCApi : public vernon::tests::ProgramFixtureRuntimeTest {
+protected:
+    vernon::tests::BackendTestRequirements requirements() const override {
+        return vernon::tests::programVjpFixtureRequirements(GetParam().runtime);
+    }
+};
+
+TEST_P(RuntimeModuleProgramVjpGpuCApi, ComputeModuleForward9AndVjpGradient6) {
+    runModuleProgram(owned(), GetParam().manifestPath);
+}
+
+TEST_P(RuntimeModuleProgramVjpGpuCApi, ProgramGraphRetainsNodeLocalPullback) {
+    runProgramGraphNodePullback(owned(), GetParam().manifestPath);
+}
+
+class RuntimeModuleProgramComputeGpuCApi : public vernon::tests::ProgramFixtureRuntimeTest {
 protected:
     vernon::tests::BackendTestRequirements requirements() const override {
         return vernon::tests::computeFixtureRequirements(GetParam().runtime);
     }
 };
 
-TEST_P(RuntimeModuleProgramGpuCApi, ComputeModuleForward9AndVjpGradient6) {
-    runModuleProgram(owned(), GetParam().manifestPath);
+TEST_P(RuntimeModuleProgramComputeGpuCApi, ReusesOneStageAcrossDifferentNodeProjections) {
+    runReusedStageModule(owned(), GetParam().manifestPath);
 }
 
-TEST_P(RuntimeModuleProgramGpuCApi, ProgramGraphRetainsNodeLocalPullback) {
-    runProgramGraphNodePullback(owned(), GetParam().manifestPath);
-}
-
-TEST_P(RuntimeModuleProgramGpuCApi, ReusesOneStageAcrossDifferentNodeProjections) {
-    runReusedStageModule(owned(), fixture("reused_stage").manifestPath);
-}
-
-TEST_P(RuntimeModuleProgramGpuCApi, ChainsDistinctComputeKernelsThroughTensorViews) {
+TEST_P(RuntimeModuleProgramComputeGpuCApi, ChainsDistinctComputeKernelsThroughTensorViews) {
     runTensorViewChainModule(owned(), fixture("tensor_view_chain").manifestPath);
 }
 
-TEST_P(RuntimeModuleProgramGpuCApi, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
+TEST_P(RuntimeModuleProgramComputeGpuCApi, ReusesLoadedProgramAcrossDynamicShapesAndGrids) {
     runDynamicShapeGridReuse(owned(), fixture("dynamic_shape_grid").manifestPath);
 }
 
-INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleProgramGpuCApi, testing::ValuesIn(moduleProgramBackendCases()),
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleProgramVjpGpuCApi,
+                         testing::ValuesIn(moduleProgramVjpBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
+                             return std::string(info.param.target);
+                         });
+
+INSTANTIATE_TEST_SUITE_P(EnabledTargets, RuntimeModuleProgramComputeGpuCApi,
+                         testing::ValuesIn(moduleProgramComputeBackendCases()),
                          [](const testing::TestParamInfo<vernon::tests::ProgramFixtureManifest> &info) {
                              return std::string(info.param.target);
                          });

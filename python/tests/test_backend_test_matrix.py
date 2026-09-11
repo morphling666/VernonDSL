@@ -9,6 +9,8 @@ from backend_test_matrix import (
     BACKEND_TEST_MATRIX,
     BackendRequirements,
     ProbeKind,
+    backend_matrix_test,
+    expand_backend_matrix_tests,
     probe_backend,
     probe_compiler,
     probe_runtime,
@@ -45,6 +47,56 @@ class BackendTestMatrixTests(unittest.TestCase):
             result = probe_compiler(BACKEND_TEST_MATRIX[0], BackendRequirements(compute=True))
         self.assertIs(result.kind, ProbeKind.CAPABILITY_UNSUPPORTED)
         self.assertIn("compute", result.reason)
+
+    def test_dynamic_range_step_capability_is_explicit(self) -> None:
+        capabilities = {
+            "available": True,
+            "compute": True,
+            "graphics": True,
+            "device_storage_atomics": True,
+            "f32_device_atomic_add": True,
+            "dynamic_range_step": True,
+        }
+        fake = SimpleNamespace(
+            Target=SimpleNamespace(CPU=object(), VULKAN=object()),
+            target_capabilities=lambda target: capabilities,
+        )
+        with mock.patch("backend_test_matrix._native", fake):
+            cpu = probe_compiler(BACKEND_TEST_MATRIX[0], BackendRequirements(dynamic_range_step=True))
+            capabilities["dynamic_range_step"] = False
+            vulkan = probe_compiler(BACKEND_TEST_MATRIX[2], BackendRequirements(dynamic_range_step=True))
+        self.assertTrue(cpu.available)
+        self.assertIs(vulkan.kind, ProbeKind.CAPABILITY_UNSUPPORTED)
+        self.assertIn("dynamic_range_step", vulkan.reason)
+
+    def test_class_decorator_expands_each_matrix_test_per_backend(self) -> None:
+        @expand_backend_matrix_tests
+        class Example(unittest.TestCase):
+            @backend_matrix_test(BackendRequirements(compute=True))
+            def test_feature(self, backend) -> None:
+                pass
+
+        self.assertFalse(hasattr(Example, "test_feature"))
+        self.assertEqual(
+            {name for name in vars(Example) if name.startswith("test_feature_")},
+            {f"test_feature_{row.runtime_backend.lower()}" for row in BACKEND_TEST_MATRIX},
+        )
+
+    def test_matrix_test_restores_cpu_after_capability_skip(self) -> None:
+        @expand_backend_matrix_tests
+        class Example(unittest.TestCase):
+            @backend_matrix_test(BackendRequirements(compute=True))
+            def test_feature(self, backend) -> None:
+                self.fail("a skipped test must not execute")
+
+        unsupported = backend_test_matrix.ProbeResult(ProbeKind.CAPABILITY_UNSUPPORTED, "unsupported")
+        with (
+            mock.patch("backend_test_matrix.probe_backend", return_value=unsupported),
+            mock.patch("backend_test_matrix.vd.init") as initialize,
+            self.assertRaises(unittest.SkipTest),
+        ):
+            Example("test_feature_cuda").test_feature_cuda()
+        initialize.assert_called_once_with(arch=backend_test_matrix.vd.cpu)
 
     def test_runtime_probe_skips_only_declared_unavailability(self) -> None:
         fake = SimpleNamespace()

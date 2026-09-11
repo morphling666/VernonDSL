@@ -7,7 +7,7 @@ from unittest import mock
 
 import numpy as np
 import vernon_dsl as vd
-from vernon_dsl._runtime.session import RuntimeUnavailableError
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 from vernon_dsl.program_frontend import BuiltinDslProvider
 
 
@@ -150,6 +150,7 @@ def _builtin_program_value(value_id: int, dtype: str, shape: list[int]) -> dict[
     }
 
 
+@expand_backend_matrix_tests
 class ModuleTests(unittest.TestCase):
     def test_fusion_dsl_provider_lowers_builtin_add_request(self) -> None:
         values = {index: _builtin_program_value(index, "f32", [4]) for index in range(3)}
@@ -417,25 +418,19 @@ class ModuleTests(unittest.TestCase):
 
         np.testing.assert_array_equal(output.to_numpy(), np.array([9.0], dtype=np.float32))
 
-    def test_gpu_primal_cache_hit_executes_canonical_program(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError:
-            self.skipTest("Metal runtime is unavailable")
-        try:
-            module = FanIn()
-            module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
-            specialization = next(iter(module._program_cache.values()))
-            self.assertIsNotNone(specialization.native_program)
-            with mock.patch(
-                "vernon_dsl._runtime.kernel.Kernel.__call__",
-                side_effect=AssertionError("native cache hit called Python Kernel.__call__"),
-            ):
-                outputs = module(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)))
-            np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([9.0], dtype=np.float32))
-            np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([27.0], dtype=np.float32))
-        finally:
-            vd.init(arch=vd.cpu)
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_gpu_primal_cache_hit_executes_canonical_program(self, backend: BackendRow) -> None:
+        module = FanIn()
+        module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
+        specialization = next(iter(module._program_cache.values()))
+        self.assertIsNotNone(specialization.native_program)
+        with mock.patch(
+            "vernon_dsl._runtime.kernel.Kernel.__call__",
+            side_effect=AssertionError("native cache hit called Python Kernel.__call__"),
+        ):
+            outputs = module(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)))
+        np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([9.0], dtype=np.float32))
+        np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([27.0], dtype=np.float32))
 
     def test_program_asset_retains_initialized_module(self) -> None:
         module = AnnotatedSquare()

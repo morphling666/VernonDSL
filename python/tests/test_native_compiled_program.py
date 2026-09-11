@@ -5,6 +5,15 @@ import json
 import struct
 import unittest
 
+from backend_test_matrix import (
+    BACKEND_TEST_MATRIX,
+    BackendRequirements,
+    BackendRow,
+    backend_matrix_test,
+    expand_backend_matrix_tests,
+    probe_compiler,
+    require_available,
+)
 from vernon_dsl import _native as native
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
 from vernon_dsl.frontend.compiler import compile_source
@@ -187,6 +196,7 @@ module {
 """
 
 
+@expand_backend_matrix_tests
 class CompiledProgramTests(unittest.TestCase):
     def test_private_mlir_verifier_does_not_run_program_preparation(self) -> None:
         module = compile_source(
@@ -231,16 +241,9 @@ class CompiledProgramTests(unittest.TestCase):
 
     def test_target_available_reports_compiler_capabilities(self) -> None:
         self.assertTrue(native.target_available(native.Target.CPU))
-        for target in (
-            native.Target.CPU,
-            native.Target.CUDA,
-            native.Target.VULKAN,
-            native.Target.METAL,
-            native.Target.DIRECTX,
-            native.Target.OPENGL,
-            native.Target.OPENGL_ES,
-        ):
-            with self.subTest(target=target):
+        for backend in BACKEND_TEST_MATRIX:
+            target = getattr(native.Target, backend.compiler_target)
+            with self.subTest(target=backend.name):
                 self.assertIsInstance(native.target_available(target), bool)
 
     def test_context_owned_python_gpu_resource_api_is_removed(self) -> None:
@@ -249,11 +252,9 @@ class CompiledProgramTests(unittest.TestCase):
         self.assertFalse(hasattr(native, "Texture"))
         self.assertFalse(hasattr(native, "Sampler"))
 
-    def test_standalone_rhi_buffer_owns_generational_resource(self) -> None:
-        try:
-            host = native.RhiHost(native.RhiBackend.CUDA)
-        except RuntimeError:
-            self.skipTest("CUDA RHI device is unavailable")
+    @backend_matrix_test(BackendRequirements(rhi=True))
+    def test_standalone_rhi_buffer_owns_generational_resource(self, backend: BackendRow) -> None:
+        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
         source = struct.pack("4I", 1, 2, 3, 4)
         buffer = host.create_buffer(len(source))
         buffer.upload(source)
@@ -261,36 +262,28 @@ class CompiledProgramTests(unittest.TestCase):
         runtime = host.create_runtime()
         self.assertIsNotNone(runtime)
 
-    def test_standalone_rhi_image_upload_and_download(self) -> None:
-        for backend in (native.RhiBackend.VULKAN, native.RhiBackend.DIRECTX12):
-            with self.subTest(backend=backend):
-                try:
-                    host = native.RhiHost(backend)
-                except RuntimeError:
-                    continue
-                source = bytes(range(16))
-                image = host.create_image(2, 2)
-                image.upload(source)
-                self.assertEqual(image.download(), source)
+    @backend_matrix_test(BackendRequirements(rhi=True, graphics=True))
+    def test_standalone_rhi_image_upload_and_download(self, backend: BackendRow) -> None:
+        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
+        source = bytes(range(16))
+        image = host.create_image(2, 2)
+        image.upload(source)
+        self.assertEqual(image.download(), source)
 
-    def test_standalone_rhi_three_dimensional_image_round_trip(self) -> None:
-        for backend in (native.RhiBackend.VULKAN, native.RhiBackend.DIRECTX12):
-            with self.subTest(backend=backend):
-                try:
-                    host = native.RhiHost(backend)
-                except RuntimeError:
-                    continue
-                source = bytes(range(2 * 3 * 4 * 4))
-                image = host.create_image(
-                    4,
-                    3,
-                    native.TextureFormat.RGBA8_UNORM,
-                    native.TextureDimension.TEXTURE_3D,
-                    2,
-                )
-                self.assertEqual((image.width, image.height, image.depth), (4, 3, 2))
-                image.upload(source)
-                self.assertEqual(image.download(), source)
+    @backend_matrix_test(BackendRequirements(rhi=True, graphics=True))
+    def test_standalone_rhi_three_dimensional_image_round_trip(self, backend: BackendRow) -> None:
+        host = native.RhiHost(getattr(native.RhiBackend, backend.rhi_backend))
+        source = bytes(range(2 * 3 * 4 * 4))
+        image = host.create_image(
+            4,
+            3,
+            native.TextureFormat.RGBA8_UNORM,
+            native.TextureDimension.TEXTURE_3D,
+            2,
+        )
+        self.assertEqual((image.width, image.height, image.depth), (4, 3, 2))
+        image.upload(source)
+        self.assertEqual(image.download(), source)
 
     def test_graphics_dynamic_bounds_structured_loop_compiles(self) -> None:
         module = compile_source(
@@ -339,15 +332,11 @@ class CompiledProgramTests(unittest.TestCase):
             "    return floor(y) + acos(clamp(x, -1.0, 1.0)) + atan2(y, x)\n",
             "showcase_math_backends.py",
         )
-        for target, options in (
-            (native.Target.VULKAN, {}),
-            (native.Target.DIRECTX, {}),
-            (native.Target.OPENGL, {"version": 430}),
-        ):
-            with self.subTest(target=target):
-                if target == native.Target.DIRECTX and not native.target_available(target):
-                    continue
-                program = native.Compiler().compile_program_result(module, target, options)
+        for backend in BACKEND_TEST_MATRIX:
+            target = getattr(native.Target, backend.compiler_target)
+            with self.subTest(target=backend.name):
+                require_available(probe_compiler(backend, BackendRequirements(graphics=True)))
+                program = native.Compiler().compile_program_result(module, target)
                 self.assertTrue(program.ok, program.diagnostics)
 
     def test_spirv_dynamic_step_reports_contract_capability(self) -> None:
@@ -506,13 +495,10 @@ class CompiledProgramTests(unittest.TestCase):
             "aggregate_backends.py",
         )
         layouts: list[object] = []
-        for target in (
-            native.Target.CPU,
-            native.Target.CUDA,
-            native.Target.VULKAN,
-            native.Target.OPENGL,
-        ):
-            with self.subTest(target=target):
+        for backend in BACKEND_TEST_MATRIX:
+            target = getattr(native.Target, backend.compiler_target)
+            with self.subTest(target=backend.name):
+                require_available(probe_compiler(backend, BackendRequirements(compute=True)))
                 program = native.Compiler().compile_program_result(module, target)
                 self.assertTrue(program.ok, program.diagnostics)
                 layouts.append(json.loads(program.reflection)["struct_layouts"])

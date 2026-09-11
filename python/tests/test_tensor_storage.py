@@ -12,6 +12,7 @@ from unittest import mock
 import numpy as np
 import vernon_dsl as vd
 import vernon_dsl._native as native
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 from language_contract_cases import case_by_id
 from language_contract_runner import assert_frontend_rejects, assert_verified_ir, contract_oracle
 from language_contract_traceability import covers_case
@@ -21,7 +22,6 @@ from vernon_dsl._runtime.binding import (
     _DispatchBorrowLease,
     _PersistentBindingTable,
 )
-from vernon_dsl._runtime.session import RuntimeUnavailableError
 from vernon_dsl._runtime.tensor import _logical_collection_shape
 from vernon_dsl.compiler import FrontendCompileRequest
 from vernon_dsl.frontend.analysis import typed_model_data
@@ -41,6 +41,7 @@ class NestedRecord:
     pair: vd.Tuple[vd.f32, vd.i32]
 
 
+@expand_backend_matrix_tests
 class TensorStorageRuntimeTests(unittest.TestCase):
     def test_persistent_binding_table_commits_typed_updates(self) -> None:
         cache = _PersistentBindingTable()
@@ -312,21 +313,15 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         expected[::2] = 3.0
         np.testing.assert_array_equal(result, expected)
 
-    def test_metal_buffer_accepts_disjoint_partial_uploads(self) -> None:
-        try:
-            vd.init(arch=vd.metal)
-        except RuntimeUnavailableError as error:
-            self.skipTest(f"Metal runtime is unavailable: {error}")
-        try:
-            storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
-            native_buffer = storage._resident_buffer()
-            storage.update([1, 513], np.array([5.0, 7.0], dtype=np.float32))
-            storage._resident_buffer()
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_gpu_buffer_accepts_disjoint_partial_uploads(self, backend: BackendRow) -> None:
+        storage = vd.TensorStorage.zeros(dtype=vd.f32, shape=(1024,))
+        native_buffer = storage._resident_buffer()
+        storage.update([1, 513], np.array([5.0, 7.0], dtype=np.float32))
+        storage._resident_buffer()
 
-            resident = np.frombuffer(native_buffer.download(), dtype=np.float32)
-            np.testing.assert_array_equal(resident[[1, 513]], np.array([5.0, 7.0], dtype=np.float32))
-        finally:
-            vd.init(arch=vd.cpu)
+        resident = np.frombuffer(native_buffer.download(), dtype=np.float32)
+        np.testing.assert_array_equal(resident[[1, 513]], np.array([5.0, 7.0], dtype=np.float32))
 
     def test_strided_and_negative_views_project_without_copying(self) -> None:
         values = np.arange(12, dtype=np.float32).reshape(3, 4)
@@ -797,37 +792,17 @@ def fill_with_extents(
     )
 
 
+@expand_backend_matrix_tests
 class TensorViewShapeRuntimeTests(unittest.TestCase):
-    @staticmethod
-    def _runtime_available(architecture: object) -> bool:
-        try:
-            vd.init(arch=architecture)  # type: ignore[arg-type]
-        except RuntimeError:
-            vd.init(arch=vd.cpu)
-            return False
-        return True
-
-    def _available_compute_backends(self) -> list[object]:
-        backends: list[object] = [vd.cpu]
-        for architecture in (vd.cuda, vd.vulkan, vd.directx, vd.metal, vd.opengl, vd.opengles):
-            if self._runtime_available(architecture):
-                backends.append(architecture)
-        return backends
-
-    def test_tensor_and_tensor_view_shape_read_static_and_descriptor_extents(
-        self,
-    ) -> None:
+    @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
+    def test_tensor_and_tensor_view_shape_read_static_and_descriptor_extents(self, backend: BackendRow) -> None:
         expected = np.full((3, 4), 3534.0, dtype=np.float32)
         tile = np.zeros((2, 5), dtype=np.float32)
         vec = np.zeros(3, dtype=np.float32)
         mat = np.zeros((2, 4), dtype=np.float32)
-        for backend in self._available_compute_backends():
-            with self.subTest(backend=getattr(backend, "name", backend)):
-                vd.init(arch=backend)  # type: ignore[arg-type]
-                output = vd.storage.zeros(dtype=vd.f32, shape=(3, 4))
-                fill_with_extents(output, tile, vec, mat, grid=(4, 3, 1))
-                np.testing.assert_array_equal(output.to_numpy(), expected)
-        vd.init(arch=vd.cpu)
+        output = vd.storage.zeros(dtype=vd.f32, shape=(3, 4))
+        fill_with_extents(output, tile, vec, mat, grid=(4, 3, 1))
+        np.testing.assert_array_equal(output.to_numpy(), expected)
 
 
 if __name__ == "__main__":

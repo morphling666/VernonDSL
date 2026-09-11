@@ -541,7 +541,7 @@ VernonStatus preparePipelineImpl(void *data, const VernonRuntimeProviderPipeline
     VernonStatus status = createPipelineLayout(adapter, *pipeline);
     if (status != VERNON_STATUS_OK)
         return status;
-    if (pipeline->graphics && descriptor->color_format_count == 0) {
+    if (pipeline->graphics && descriptor->color_format_count == 0 && descriptor->depth_stencil_format == 0) {
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
         return VERNON_STATUS_OK;
@@ -1305,8 +1305,14 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
-    if (!validCommonDrawDescriptor(descriptor) || !pipeline || !pipeline->graphics || !pipeline->pipeline)
-        return fail(adapter, "Vulkan adapter received an invalid draw");
+    if (!validCommonDrawDescriptor(descriptor))
+        return fail(adapter, "Vulkan adapter received an invalid draw descriptor");
+    if (!pipeline)
+        return fail(adapter, "Vulkan adapter received an invalid prepared pipeline");
+    if (!pipeline->graphics)
+        return fail(adapter, "Vulkan adapter received a compute pipeline for a draw");
+    if (!pipeline->pipeline)
+        return fail(adapter, "Vulkan adapter received an uninitialized graphics pipeline");
     const VkCommandBuffer command = reinterpret_cast<VkCommandBuffer>(nativeCommandEncoder(adapter, commandEncoder));
     const int renderingClaim =
         claimCommandRendering(adapter, commandEncoder,

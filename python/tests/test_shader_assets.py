@@ -12,6 +12,14 @@ from typing import Any, cast
 
 import numpy as np
 import vernon_dsl as vd
+from backend_test_matrix import (
+    BACKEND_TEST_MATRIX,
+    BackendRequirements,
+    backend_row,
+    probe_backend,
+    probe_compiler,
+    require_available,
+)
 from vernon_dsl._program_assets.artifact_io import artifact_extension
 from vernon_dsl._program_assets.capture import CapturedProgram, capture_program
 from vernon_dsl._versions import COMPILER_CONTRACT_VERSION, PROGRAM_VERSION
@@ -1163,8 +1171,15 @@ asset = vd.program_asset(id="module/square", program=Square())
             native = _native_module()
             declaration = load_program_asset_declaration(source, "asset")
             captured = capture_program(declaration)
-            for target_name in ("cpu", "metal", "vulkan"):
-                with self.subTest(target=target_name):
+            for backend_row in BACKEND_TEST_MATRIX:
+                target_name = backend_row.architecture.name
+                with self.subTest(target=backend_row.name):
+                    require_available(
+                        probe_backend(
+                            backend_row,
+                            BackendRequirements(compute=True, storage_buffers=True),
+                        )
+                    )
                     target = make_target_options(target_name)
                     retained: list[tuple[CompiledStage, object]] = []
                     plan = compile_captured_program(
@@ -1187,7 +1202,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                     deployed = build_program_manifest(plan, descriptors)
                     artifact_system = deployed["variants"][0]["artifact_system"]
                     host = None
-                    if target_name == "cpu":
+                    if backend_row.rhi_backend is None:
                         runtime = native.Runtime(native.RuntimeBackend.CPU)
                         compiled_stages = [
                             (stage.metadata["symbol"], stage.entry, result) for stage, result in retained
@@ -1198,10 +1213,7 @@ asset = vd.program_asset(id="module/square", program=Square())
                         for descriptor in descriptors.values():
                             (runtime_root / descriptor["path"]).unlink()
                     else:
-                        runtime_backend = getattr(native.RuntimeBackend, target_name.upper())
-                        if not native.runtime_available(runtime_backend):
-                            continue
-                        backend = getattr(native.RhiBackend, target_name.upper())
+                        backend = getattr(native.RhiBackend, backend_row.rhi_backend)
                         host = native.RhiHost(backend)
                         runtime = host.create_runtime()
                         compiled_stages = []
@@ -1360,25 +1372,21 @@ asset = vd.program_asset(
     def test_gpu_captured_tape_vjp_cooks_canonical_programs(self) -> None:
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
-        from vernon_dsl._program_assets.compile_orchestration import _native_module
 
-        native = _native_module()
         source = Path(__file__).parents[2] / "source" / "tests" / "fixtures" / "autodiff_gpu_tape_asset.py"
-        targets = {
-            "cuda": native.Target.CUDA,
-            "vulkan": native.Target.VULKAN,
-            "directx": native.Target.DIRECTX,
-            "metal": native.Target.METAL,
-            "opengl": native.Target.OPENGL,
-        }
         for descriptor in ("static_asset", "dynamic_asset"):
-            for target, native_target in targets.items():
+            for backend in BACKEND_TEST_MATRIX:
+                target = backend.architecture.name
                 with (
                     self.subTest(descriptor=descriptor, target=target),
                     tempfile.TemporaryDirectory() as directory,
                 ):
-                    if not native.target_available(native_target):
-                        continue
+                    require_available(
+                        probe_compiler(
+                            backend,
+                            BackendRequirements(gpu=True, compute=True, program_vjp=True),
+                        )
+                    )
                     manifest = cook_program_asset(
                         program_asset=f"{source}:{descriptor}",
                         output=directory,
@@ -1445,14 +1453,23 @@ asset = vd.program_asset(
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
+        from vernon_dsl._program_assets.compile_orchestration import _native_module
+
+        native = _native_module()
         source = root / "python" / "tests" / "program_asset_fixture.py"
-        cases = {
-            "opengl": ("triangle_asset", "pipelines/triangle", {"vertex", "fragment"}),
-            "cuda": ("scale_asset", "pipelines/scale", {"compute"}),
-            "cpu": ("scale_asset", "pipelines/scale", {"compute"}),
-        }
         with tempfile.TemporaryDirectory() as directory:
-            for target, (name, asset_id, stages) in cases.items():
+            for backend in BACKEND_TEST_MATRIX:
+                target = backend.architecture.name
+                probe = probe_compiler(backend, BackendRequirements())
+                if not probe.available:
+                    with self.subTest(target=target):
+                        require_available(probe)
+                    continue
+                capabilities = native.target_capabilities(getattr(native.Target, backend.compiler_target))
+                if backend.rhi_backend is not None and capabilities["graphics"]:
+                    name, asset_id, stages = "triangle_asset", "pipelines/triangle", {"vertex", "fragment"}
+                else:
+                    name, asset_id, stages = "scale_asset", "pipelines/scale", {"compute"}
                 output = Path(directory) / target
                 manifest = cook_program_asset(
                     program_asset=f"{source}:{name}",
@@ -1462,12 +1479,10 @@ asset = vd.program_asset(
                 document = json.loads(manifest.read_text(encoding="utf-8"))
                 self.assertEqual(document["id"], asset_id)
                 self.assertEqual(document["target"]["kind"], target)
-                if target == "cpu":
-                    self.assertTrue(document["target"]["options"]["triple"])
-                else:
-                    self.assertEqual(document["target"]["options"], {})
+                reflected_options = document["target"]["options"]
+                self.assertEqual(dict(make_target_options(target, reflected_options).options), reflected_options)
                 self.assertEqual({module["role"] for module in _deployed_modules(document)}, stages)
-                if target in {"cuda", "cpu"}:
+                if backend.rhi_backend is None or not capabilities["graphics"]:
                     self.assertEqual(document["type"], "program")
                     program = document["variants"][0]["program"]
                     for index, slot in enumerate(program["abi"]["boundary_slots"]):
@@ -1479,11 +1494,11 @@ asset = vd.program_asset(
                         if boundary["role"] == "input"
                     }
                     self.assertEqual(boundaries["values"]["outer_shape"], [-1])
-                if target == "opengl":
+                if backend.rhi_backend is not None and capabilities["graphics"]:
                     self.assertEqual(document["type"], "program")
                     self.assertNotIn("stage_artifacts", document)
                     self.assertEqual(len(document["variants"]), 2)
-                    repeated = Path(directory) / "opengl_repeated"
+                    repeated = Path(directory) / f"{target}_repeated"
                     repeated_manifest = cook_program_asset(
                         program_asset=f"{source}:{name}",
                         output=repeated,
@@ -1500,9 +1515,7 @@ asset = vd.program_asset(
         root = Path(__file__).parents[2]
         if not _native_available():
             self.skipTest("native Vernon extension is not built")
-        from vernon_dsl._program_assets.compile_orchestration import _native_module
 
-        native = _native_module()
         assets = (
             (
                 root / "python" / "tests" / "cube_map_shader.py",
@@ -1523,8 +1536,12 @@ asset = vd.program_asset(
             for source, name, stages in assets:
                 for target, (artifact_format, target_options) in targets.items():
                     with self.subTest(asset=name, target=target):
-                        if target == "directx" and not native.target_available(native.Target.DIRECTX):
-                            continue
+                        architecture = vd.directx if target == "directx" else vd.metal
+                        requirements = BackendRequirements(
+                            compute="compute" in stages,
+                            graphics="vertex" in stages,
+                        )
+                        require_available(probe_compiler(backend_row(architecture), requirements))
                         output = Path(directory) / f"{name}_{target}"
                         manifest = cook_program_asset(
                             program_asset=f"{source}:{name}",

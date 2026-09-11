@@ -6,6 +6,7 @@ from typing import Any, cast
 
 import numpy as np
 import vernon_dsl as vd
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 
 from examples.autodiff_smoke_fluid_graph import (
     SmokeFluidModule,
@@ -110,6 +111,7 @@ def smoke_reference(
     )
 
 
+@expand_backend_matrix_tests
 class SmokeFluidGraphTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -203,27 +205,16 @@ class SmokeFluidGraphTests(unittest.TestCase):
         self.assertTrue(np.isfinite(gradients["state_density"].to_numpy()).all())
         self.assertTrue(np.isfinite(gradients["state_velocity"].to_numpy()).all())
 
-    def test_available_gpu_backends_match_cpu(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_gpu_backend_matches_cpu(self, backend: BackendRow) -> None:
         expected_density, expected_velocity, expected_loss, _, _ = self._run(vd.cpu, 17)
-        for architecture in (
-            vd.cuda,
-            vd.vulkan,
-            vd.directx,
-            vd.metal,
-            vd.opengl,
-            vd.opengles,
-        ):
-            try:
-                vd.init(arch=architecture)
-            except RuntimeError:
-                continue
-            actual_density, actual_velocity, actual_loss, _, _ = self._run(architecture, 17)
-            with self.subTest(backend=architecture.name):
-                np.testing.assert_allclose(actual_density, expected_density, rtol=3.0e-5, atol=3.0e-6)
-                np.testing.assert_allclose(actual_velocity, expected_velocity, rtol=3.0e-5, atol=3.0e-6)
-                np.testing.assert_allclose(actual_loss, expected_loss, rtol=3.0e-5, atol=3.0e-6)
+        actual_density, actual_velocity, actual_loss, _, _ = self._run(backend.architecture, 17)
+        np.testing.assert_allclose(actual_density, expected_density, rtol=3.0e-5, atol=3.0e-6)
+        np.testing.assert_allclose(actual_velocity, expected_velocity, rtol=3.0e-5, atol=3.0e-6)
+        np.testing.assert_allclose(actual_loss, expected_loss, rtol=3.0e-5, atol=3.0e-6)
 
-    def test_available_gpu_backends_validate_optimistic_static_tape_hints(self) -> None:
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_gpu_backend_validates_optimistic_static_tape_hints(self, backend: BackendRow) -> None:
         size = 4
         density, velocity, target = self._inputs(size)
 
@@ -250,22 +241,9 @@ class SmokeFluidGraphTests(unittest.TestCase):
             return result["state_velocity"].to_numpy()
 
         expected = gradient(vd.cpu)
-        for architecture in (
-            vd.cuda,
-            vd.vulkan,
-            vd.directx,
-            vd.metal,
-            vd.opengl,
-            vd.opengles,
-        ):
-            try:
-                vd.init(arch=architecture)
-            except RuntimeError:
-                continue
-            actual = gradient(architecture)
-            with self.subTest(backend=architecture.name):
-                self.assertTrue(np.isfinite(actual).all())
-                np.testing.assert_allclose(actual, expected, rtol=3.0e-4, atol=3.0e-6)
+        actual = gradient(backend.architecture)
+        self.assertTrue(np.isfinite(actual).all())
+        np.testing.assert_allclose(actual, expected, rtol=3.0e-4, atol=3.0e-6)
 
     def test_loss_is_single_invocation_serial_kernel(self) -> None:
         self.assertEqual(cast(Any, smoke_loss).__vernon_dsl__[1]["workgroup_size"], (1, 1, 1))

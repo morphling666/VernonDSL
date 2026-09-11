@@ -92,7 +92,13 @@ def _latency_summary(samples: list[float]) -> dict[str, float | int]:
 
 def _run_gradient_parity_gate() -> None:
     environment = os.environ.copy()
-    python_path = os.pathsep.join((str(REPOSITORY_ROOT / "python"), str(REPOSITORY_ROOT)))
+    python_path = os.pathsep.join(
+        (
+            str(REPOSITORY_ROOT / "python"),
+            str(REPOSITORY_ROOT / "python" / "tests"),
+            str(REPOSITORY_ROOT),
+        )
+    )
     if environment.get("PYTHONPATH"):
         python_path += os.pathsep + environment["PYTHONPATH"]
     environment["PYTHONPATH"] = python_path

@@ -707,6 +707,12 @@ reject dynamic step values during capability validation because Vulkan,
 OpenGL, and OpenGL ES cannot reliably report the required violation; dynamic
 bounds with a nonzero literal positive or negative step remain supported.
 
+`VernonTargetCapabilities` is the authoritative query for target-dependent
+test selection. In addition to graphics, compute, and atomic support, it
+reports dynamic range-step, f16, f64, and f64 device-atomic support. Test
+matrices consume these fields and must not reconstruct capability decisions
+from target names.
+
 Integer and floating literals remain symbolic during helper inference.
 Annotation, operand, constructor, call, branch, and return constraints resolve
 them; only an unconstrained specialization boundary applies the i32/f32
