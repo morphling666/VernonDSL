@@ -773,8 +773,10 @@ if(TARGET VernonRuntime)
                     Vernon::Runtime
                     ${module_program_cpu_fixture_targets}
                     ${typed_specialization_fixture_target})
-        target_include_directories(VernonModuleProgramRuntimeTests PRIVATE "${VERNON_TEST_ROOT}/support"
-                                                                           "${VERNON_TEST_BINARY_ROOT}/generated")
+        target_include_directories(
+            VernonModuleProgramRuntimeTests
+            PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib" "${VERNON_TEST_ROOT}/support"
+                    "${VERNON_TEST_BINARY_ROOT}/generated")
         target_compile_definitions(
             VernonModuleProgramRuntimeTests
             PRIVATE VERNON_MODULE_PROGRAM_MANIFEST="${module_program_cpu_manifest}"

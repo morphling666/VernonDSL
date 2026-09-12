@@ -151,7 +151,8 @@ load Program bundle
   -> create Program instance
   -> begin invocation
   -> bind Program Values and controls
-  -> forward
+  -> execute
+  -> commit or rollback
   -> optional reusable pullback
 ```
 

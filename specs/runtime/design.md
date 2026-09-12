@@ -34,8 +34,9 @@ textures, framebuffers, descriptor heaps, queues, command encoders, or fences.
 binding stores the Runtime and optional RHI host in one shared `RuntimeState`;
 an internally created OpenGL context is owned directly by that RHI host rather
 than by a Python helper. Destruction is ordered Runtime → RHI device → owned GL
-context. Runtime, executable, instance, invocation, builder, and pullback
-wrappers retain the shared state directly, so teardown does not depend on
+context. Runtime, executable, instance, invocation, and pullback wrappers
+retain the shared state directly; argument and graphics-control marshalling
+objects are owned by their invocation. Teardown therefore does not depend on
 Python garbage-collection order or binding-layer parent/child keep-alive
 edges. Its
 `RuntimeConfiguration` is immutable and canonical: non-OpenGL backends have no
@@ -142,18 +143,34 @@ manifest bytes
   -> VernonProgramInstance
   -> VernonProgramInvocation
   -> bind Values and controls
-  -> forward
+  -> execute
+  -> commit or rollback
   -> optional VernonPullback
 ```
 
 `VernonProgramBundle` is immutable deployment data.
 `VernonProgramExecutable` owns one immutable `ResolvedExecutionPlan`.
-`VernonProgramInstance` owns persistent binding state.
-`VernonProgramInvocation` owns concrete invocation descriptors and temporary
-physical state.
+`VernonProgramInstance` owns one persistent binding state for both arguments
+and graphics controls. `VernonProgramInvocation` owns one transaction over
+that state, its immutable execution snapshot, concrete invocation descriptors,
+invocation-local autodiff options, and temporary physical state. Persistent
+state and frozen snapshots share immutable binding maps; dirty updates create a
+copy-on-write revision, while a clean invocation reuses its snapshot without a
+map clone. Execute never mutates a published binding or control payload and
+performs the resolved plan without publishing staged persistent bindings. A
+successful execute must be followed by commit; every failed or abandoned
+invocation must roll back. Commit is the only operation that publishes staged
+binding revisions and transfers a retained pullback.
 
 Runtime has no pipeline-bundle compatibility loader, profile executor, direct
-Stage asset submit path, or unbound Program forward path. An optimized
+Stage asset submit path, unbound Program execution path, temporary instance,
+node-local direct-binding path, or executable-owned mutable invocation state.
+A ProgramGraph invocation binds only the canonical exported parameters and
+resolved graphics-control slots of its executable; Runtime maps those
+parameters to physical alias slots through indexes precomputed at resolution.
+Control binding validates both slot and control kind. Resource-backed argument
+and graphics-control revisions retain caller-provided owner leases for as long
+as the persistent revision or a frozen invocation references them. An optimized
 single-node schedule remains a Program execution optimization.
 
 ## 3. Resolve boundary
@@ -259,15 +276,16 @@ forward graph. The shared internal DAG planner supplies a
 Pullback application uses only `VernonProgramArgument` boundary bindings.
 Derivative leaf/group reflection is metadata, not another execution ABI.
 
-A ProgramGraph executable has no composite pullback or derivative ABI. If
-forward is called with a non-null pullback output, Runtime retains independent
-state for each differentiated child and leaves that output null. Before
-destroying the invocation, the caller transfers a node's retained handle with
+A ProgramGraph executable has no composite pullback or derivative ABI.
+Executing with pullback retention enabled prepares independent retained state
+for each differentiated child but exposes none of it before commit. Commit
+returns a null composite pullback. After commit and before destroying the
+invocation, the caller transfers each node's retained handle exactly once with
 `vernonRuntimeProgramInvocationGetNodePullback`. Applying that handle executes
 only the child Program's resolved backward plan in its original boundary-slot
 namespace. Runtime does not reverse ProgramGraph connections or accumulate
-cotangents between nodes. Passing a null pullback output performs primal-only
-graph execution and retains no node pullbacks.
+cotangents between nodes. Executing with retention disabled performs
+primal-only graph execution and retains no node pullbacks.
 
 ## 8. Private Command DAG
 

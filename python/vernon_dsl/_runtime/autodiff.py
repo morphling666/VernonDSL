@@ -139,10 +139,6 @@ class _KernelPullback:
         with _use_invocation_context(self.context):
             return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
 
-    def apply_logical(self, cotangent: Any) -> dict[str, Any]:
-        with _use_invocation_context(self.context):
-            return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
-
     def _canonical_cotangent(self, cotangent: Any) -> Any:
         if cotangent is None or not self.carrier_shape:
             return cotangent

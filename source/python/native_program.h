@@ -5,7 +5,6 @@
 #include "VernonRuntime.h"
 #include "compiler_python_bridge.h"
 #include "native_rhi.h"
-#include "runtime/program_instance.h"
 #include "runtime/tensor_bridge.h"
 
 #include <nanobind/nanobind.h>
@@ -445,10 +444,6 @@ struct ProgramInvocationBuilder {
         return prepared;
     }
 
-    ProgramInvocationBuilder &hostTensor(const nb::object &identifier, const nb::object &array) {
-        return ownedArgument(prepareHostTensor(identifier, array));
-    }
-
     std::unique_ptr<PreparedProgramArgument> prepareRhiTensor(const nb::object &identifier, RhiBuffer *buffer,
                                                               uint32_t access, const std::vector<uint64_t> &shape,
                                                               const std::vector<int64_t> &strides, size_t offset) {
@@ -477,12 +472,6 @@ struct ProgramInvocationBuilder {
         return prepared;
     }
 
-    ProgramInvocationBuilder &rhiTensor(const nb::object &identifier, RhiBuffer *buffer, uint32_t access,
-                                        const std::vector<uint64_t> &shape, const std::vector<int64_t> &strides,
-                                        size_t offset) {
-        return ownedArgument(prepareRhiTensor(identifier, buffer, access, shape, strides, offset));
-    }
-
     std::unique_ptr<PreparedProgramArgument> prepareRhiTexture(const nb::object &identifier, RhiImageView *view) {
         const ProgramParameterMetadata parameter = resolveParameter(identifier);
         const bool storage = parameter.imageBindingRole == VERNON_IMAGE_BINDING_STORAGE;
@@ -504,10 +493,6 @@ struct ProgramInvocationBuilder {
         return prepared;
     }
 
-    ProgramInvocationBuilder &rhiTexture(const nb::object &identifier, RhiImageView *view) {
-        return ownedArgument(prepareRhiTexture(identifier, view));
-    }
-
     std::unique_ptr<PreparedProgramArgument> prepareRhiSampler(const nb::object &identifier, RhiSampler *sampler) {
         if (!sampler)
             throw std::invalid_argument("RHI sampler is null");
@@ -520,12 +505,10 @@ struct ProgramInvocationBuilder {
         return prepared;
     }
 
-    ProgramInvocationBuilder &rhiSampler(const nb::object &identifier, RhiSampler *sampler) {
-        return ownedArgument(prepareRhiSampler(identifier, sampler));
-    }
-
-    ProgramInvocationBuilder &rhiColorAttachment(uint32_t location, RhiImageView *view, uint32_t loadOperation,
-                                                 uint32_t storeOperation, const std::array<float, 4> &clearColor) {
+    ProgramInvocationBuilder &rhiColorAttachment(uint32_t location, const nb::object &viewObject,
+                                                 uint32_t loadOperation, uint32_t storeOperation,
+                                                 const std::array<float, 4> &clearColor) {
+        auto *view = nb::cast<RhiImageView *>(viewObject);
         if (!view || !(view->image->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT) ||
             (view->format == VERNON_TEXTURE_D32_FLOAT || view->format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD)
@@ -538,11 +521,13 @@ struct ProgramInvocationBuilder {
         attachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         std::copy(clearColor.begin(), clearColor.end(), attachment.clear_color);
         attachments.push_back(attachment);
+        renderResourceOwners.push_back(viewObject);
         return *this;
     }
 
-    ProgramInvocationBuilder &rhiDepthAttachment(RhiImageView *view, uint32_t loadOperation, uint32_t storeOperation,
-                                                 float clearDepth) {
+    ProgramInvocationBuilder &rhiDepthAttachment(const nb::object &viewObject, uint32_t loadOperation,
+                                                 uint32_t storeOperation, float clearDepth) {
+        auto *view = nb::cast<RhiImageView *>(viewObject);
         if (!view || !(view->image->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT) ||
             (view->format != VERNON_TEXTURE_D32_FLOAT && view->format != VERNON_TEXTURE_D32_FLOAT_S8_UINT) ||
             loadOperation > VERNON_RHI_LOAD_DISCARD || storeOperation > VERNON_RHI_STORE_DISCARD || clearDepth < 0.0f ||
@@ -555,10 +540,12 @@ struct ProgramInvocationBuilder {
         depthAttachment.store_operation = static_cast<VernonRuntimeProviderStoreOperation>(storeOperation);
         depthAttachment.clear_depth = clearDepth;
         hasDepthAttachment = true;
+        renderResourceOwners.push_back(viewObject);
         return *this;
     }
 
-    ProgramInvocationBuilder &rhiIndexBinding(RhiBuffer *buffer, uint32_t count, size_t offset) {
+    ProgramInvocationBuilder &rhiIndexBinding(const nb::object &bufferObject, uint32_t count, size_t offset) {
+        auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
         if (!buffer || offset > buffer->size)
             throw std::invalid_argument("RHI index buffer is null");
         index = {};
@@ -569,6 +556,7 @@ struct ProgramInvocationBuilder {
         index.offset = offset;
         index.index_count = count;
         hasIndex = true;
+        drawResourceOwner = bufferObject;
         return *this;
     }
 
@@ -661,28 +649,32 @@ struct ProgramInvocationBuilder {
         return *this;
     }
 
+    void refreshGraphicsControls() const {
+        if (!hasGraphicsState)
+            return;
+        renderPass = {};
+        renderPass.struct_size = sizeof(renderPass);
+        renderPass.color_attachments = attachments.empty() ? nullptr : attachments.data();
+        renderPass.color_attachment_count = attachments.size();
+        renderPass.depth_attachment = hasDepthAttachment ? &depthAttachment : nullptr;
+        drawCommand = {};
+        drawCommand.struct_size = sizeof(drawCommand);
+        drawCommand.index_binding = hasIndex ? &index : nullptr;
+        drawCommand.vertex_count = vertexCount;
+        drawCommand.instance_count = instanceCount;
+        dynamicState = {};
+        dynamicState.struct_size = sizeof(dynamicState);
+        std::memcpy(dynamicState.viewport, viewport, sizeof(viewport));
+        std::memcpy(dynamicState.scissor, scissor, sizeof(scissor));
+        dynamicState.stencil_reference = stencilReference;
+    }
+
     void collectArguments(std::vector<VernonProgramArgument> &values) const {
         values.clear();
         values.reserve(arguments.size());
         for (const PreparedProgramArgument *argument : arguments)
             values.push_back(argument->value);
-        if (hasGraphicsState) {
-            renderPass = {};
-            renderPass.struct_size = sizeof(renderPass);
-            renderPass.color_attachments = attachments.empty() ? nullptr : attachments.data();
-            renderPass.color_attachment_count = attachments.size();
-            renderPass.depth_attachment = hasDepthAttachment ? &depthAttachment : nullptr;
-            drawCommand = {};
-            drawCommand.struct_size = sizeof(drawCommand);
-            drawCommand.index_binding = hasIndex ? &index : nullptr;
-            drawCommand.vertex_count = vertexCount;
-            drawCommand.instance_count = instanceCount;
-            dynamicState = {};
-            dynamicState.struct_size = sizeof(dynamicState);
-            std::memcpy(dynamicState.viewport, viewport, sizeof(viewport));
-            std::memcpy(dynamicState.scissor, scissor, sizeof(scissor));
-            dynamicState.stencil_reference = stencilReference;
-        }
+        refreshGraphicsControls();
     }
 
     std::shared_ptr<RuntimeState> owner;
@@ -692,6 +684,8 @@ struct ProgramInvocationBuilder {
     std::vector<std::unique_ptr<PreparedProgramArgument>> ownedArguments;
     std::unordered_set<uint32_t> slots;
     std::vector<VernonColorAttachment> attachments;
+    std::vector<nb::object> renderResourceOwners;
+    nb::object drawResourceOwner;
     VernonDepthAttachment depthAttachment{};
     VernonIndexBinding index{};
     bool hasDepthAttachment{};
@@ -763,10 +757,17 @@ inline std::string canonicalBindingToken(const nb::object &value) {
     return result;
 }
 
-struct PythonPreparedBindingLease {
-    explicit PythonPreparedBindingLease(nb::object value) : prepared(std::move(value)) {}
-    nb::object prepared;
-};
+inline void retainPythonProgramBinding(void *object) {
+    const PyGILState_STATE state = PyGILState_Ensure();
+    Py_INCREF(static_cast<PyObject *>(object));
+    PyGILState_Release(state);
+}
+
+inline void releasePythonProgramBinding(void *object) {
+    const PyGILState_STATE state = PyGILState_Ensure();
+    Py_DECREF(static_cast<PyObject *>(object));
+    PyGILState_Release(state);
+}
 
 struct PythonInvocationOutcome {
     VernonStatus status{VERNON_STATUS_OK};
@@ -784,40 +785,13 @@ struct PythonInvocationOutcome {
     }
 };
 
-struct NativeProgramForwardResult {
-    PythonInvocationOutcome outcome;
-    VernonPullback *pullback{};
-
-    NativeProgramForwardResult() = default;
-    NativeProgramForwardResult(const NativeProgramForwardResult &) = delete;
-    NativeProgramForwardResult &operator=(const NativeProgramForwardResult &) = delete;
-    NativeProgramForwardResult(NativeProgramForwardResult &&other) noexcept
-        : outcome(std::move(other.outcome)), pullback(std::exchange(other.pullback, nullptr)) {}
-    NativeProgramForwardResult &operator=(NativeProgramForwardResult &&other) noexcept {
-        if (this != &other) {
-            if (pullback)
-                vernonProgramPullbackDestroy(pullback);
-            outcome = std::move(other.outcome);
-            pullback = std::exchange(other.pullback, nullptr);
-        }
-        return *this;
-    }
-    ~NativeProgramForwardResult() {
-        if (pullback)
-            vernonProgramPullbackDestroy(pullback);
-    }
-};
-
 // Nanobind owns only Python object conversion. Transactional binding state,
 // token comparison, snapshots, telemetry, and payload leases live in the
 // runtime ProgramInstance referenced by this adapter.
 struct PythonProgramInvocationAdapter {
     PythonProgramInvocationAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
-                                   VernonProgramExecutable *executable,
-                                   vernon::runtime::program::ProgramInstance &instance,
-                                   VernonProgramInstance *nativeInstance)
+                                   VernonProgramExecutable *executable, VernonProgramInstance *nativeInstance)
         : builder(std::make_unique<ProgramInvocationBuilder>(std::move(owner), runtime, executable)),
-          transaction(instance.beginInvocation()),
           nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
         if (!nativeInvocation)
             throw std::runtime_error("failed to begin native Program invocation");
@@ -827,65 +801,86 @@ struct PythonProgramInvocationAdapter {
     ~PythonProgramInvocationAdapter() { vernonRuntimeProgramInvocationDestroy(nativeInvocation); }
 
     ProgramInvocationBuilder &builderView() const { return *builder; }
+    ProgramInvocationBuilder &newControlBuilder() {
+        controlBuilders.push_back(
+            std::make_unique<ProgramInvocationBuilder>(builder->owner, builder->runtime, builder->executable));
+        return *controlBuilders.back();
+    }
+
+    void setAutodiffOptions(const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
+        VernonProgramAutodiffInvocationOptions options{};
+        options.struct_size = sizeof(options);
+        options.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
+        options.has_checkpoint_memory_budget = !checkpointMemoryBudget.is_none();
+        if (options.has_checkpoint_memory_budget)
+            options.checkpoint_memory_budget = nb::cast<uint64_t>(checkpointMemoryBudget);
+        options.checkpoint_policy = {checkpointPolicy.data(), checkpointPolicy.size()};
+        if (vernonRuntimeProgramInvocationSetAutodiffOptions(nativeInvocation, &options) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to set Program invocation autodiff options");
+    }
 
     void bind(uint32_t slot, const nb::object &token, const nb::callable &prepare, uint64_t uploadBytes = 0,
-              uint64_t uploadRanges = 0, bool eagerUpload = false) {
+              uint64_t uploadRanges = 0, bool uploadPrecedesLookup = false) {
         const std::string key = canonicalBindingToken(token);
-        if (eagerUpload)
-            transaction->observeUploads(uploadBytes, uploadRanges);
-        if (const std::shared_ptr<void> *payload = transaction->find(slot, key)) {
-            auto lease = std::static_pointer_cast<PythonPreparedBindingLease>(*payload);
-            auto *argument = nb::cast<PreparedProgramArgument *>(lease->prepared);
-            builder->preparedArgument(*argument);
-            VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-            if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, nullptr,
-                                                   uploadBytes, uploadRanges) != VERNON_STATUS_OK)
-                throw std::runtime_error("failed to bind native Program argument");
+        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        uint8_t reused = 0;
+        const uint64_t reusedUploadBytes = uploadPrecedesLookup ? uploadBytes : 0;
+        const uint64_t reusedUploadRanges = uploadPrecedesLookup ? uploadRanges : 0;
+        if (vernonRuntimeProgramInvocationTryReuse(nativeInvocation, slot, &bindingToken, reusedUploadBytes,
+                                                   reusedUploadRanges, &reused) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to query native Program binding reuse");
+        if (reused)
             return;
-        }
         nb::object prepared = prepare();
         auto *argument = nb::cast<PreparedProgramArgument *>(prepared);
         if (!argument)
             throw std::invalid_argument("binding prepare callback did not return a prepared argument");
         builder->preparedArgument(*argument);
-        if (!eagerUpload)
-            transaction->observeUploads(uploadBytes, uploadRanges);
-        transaction->stage(slot, key, std::make_shared<PythonPreparedBindingLease>(std::move(prepared)), 0, 0);
-        VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
-        if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, nullptr, uploadBytes,
+        VernonProgramResourceLease lease{sizeof(lease), prepared.ptr(), retainPythonProgramBinding,
+                                         releasePythonProgramBinding};
+        if (vernonRuntimeProgramInvocationBind(nativeInvocation, &bindingToken, &argument->value, &lease, uploadBytes,
                                                uploadRanges) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program argument");
     }
 
     void bindRenderPass(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        std::vector<VernonProgramArgument> values;
-        control.collectArguments(values);
         if (!control.hasGraphicsState)
             throw std::invalid_argument("Program RenderPass control builder has no typed graphics state");
+        control.refreshGraphicsControls();
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        std::vector<VernonProgramResourceLease> leases;
+        leases.reserve(control.renderResourceOwners.size());
+        for (const nb::object &owner : control.renderResourceOwners)
+            leases.push_back({sizeof(VernonProgramResourceLease), owner.ptr(), retainPythonProgramBinding,
+                              releasePythonProgramBinding});
         if (vernonRuntimeProgramInvocationBindRenderPass(nativeInvocation, slot, &bindingToken, &control.renderPass,
-                                                         nullptr, 0) != VERNON_STATUS_OK)
+                                                         leases.data(), leases.size()) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program RenderPass control");
     }
 
     void bindDrawCommand(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        std::vector<VernonProgramArgument> values;
-        control.collectArguments(values);
         if (!control.hasGraphicsState)
             throw std::invalid_argument("Program DrawCommand control builder has no typed graphics state");
+        control.refreshGraphicsControls();
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
+        VernonProgramResourceLease lease{};
+        const VernonProgramResourceLease *leasePointer = nullptr;
+        if (control.drawResourceOwner.is_valid()) {
+            lease = {sizeof(lease), control.drawResourceOwner.ptr(), retainPythonProgramBinding,
+                     releasePythonProgramBinding};
+            leasePointer = &lease;
+        }
         if (vernonRuntimeProgramInvocationBindDrawCommand(nativeInvocation, slot, &bindingToken, &control.drawCommand,
-                                                          nullptr) != VERNON_STATUS_OK)
+                                                          leasePointer) != VERNON_STATUS_OK)
             throw std::runtime_error("failed to bind native Program DrawCommand control");
     }
 
     void bindDynamicState(uint32_t slot, const nb::object &token, ProgramInvocationBuilder &control) {
-        std::vector<VernonProgramArgument> values;
-        control.collectArguments(values);
         if (!control.hasGraphicsState)
             throw std::invalid_argument("Program DynamicState control builder has no typed graphics state");
+        control.refreshGraphicsControls();
         const std::string key = canonicalBindingToken(token);
         VernonProgramBindingToken bindingToken{sizeof(bindingToken), key.data(), key.size()};
         if (vernonRuntimeProgramInvocationBindDynamicState(nativeInvocation, slot, &bindingToken,
@@ -893,42 +888,51 @@ struct PythonProgramInvocationAdapter {
             throw std::runtime_error("failed to bind native Program DynamicState control");
     }
 
-    NativeProgramForwardResult executeForward(bool retainPullback) {
-        NativeProgramForwardResult result;
-        result.outcome.mutations.resize(vernonRuntimeProgramExecutableGetMutationCapacity(builder->executable));
+    PythonInvocationOutcome execute(bool retainPullback) {
+        PythonInvocationOutcome result;
+        result.mutations.resize(vernonRuntimeProgramExecutableGetMutationCapacity(builder->executable));
         VernonInvocationMutationOutcome outcome{sizeof(VernonInvocationMutationOutcome),
                                                 VERNON_INVOCATION_NOT_SUBMITTED,
-                                                result.outcome.mutations.data(),
-                                                result.outcome.mutations.size(),
+                                                result.mutations.data(),
+                                                result.mutations.size(),
                                                 0,
                                                 {}};
-        result.outcome.status = vernonRuntimeProgramInvocationForward(
-            nativeInvocation, retainPullback ? &result.pullback : nullptr, &outcome);
-        result.outcome.submission = outcome.submission;
-        result.outcome.mutations.resize(outcome.mutation_count);
-        if (result.outcome.status != VERNON_STATUS_OK)
-            result.outcome.error = nativeStringView(vernonRuntimeGetLastError(builder->runtime));
+        result.status = vernonRuntimeProgramInvocationExecute(nativeInvocation, retainPullback, &outcome);
+        result.submission = outcome.submission;
+        result.mutations.resize(outcome.mutation_count);
+        if (result.status != VERNON_STATUS_OK)
+            result.error = nativeStringView(vernonRuntimeGetLastError(builder->runtime));
         return result;
     }
 
-    PythonInvocationOutcome forward() { return executeForward(false).outcome; }
-
-    void commit() { snapshot = transaction->commit(); }
-    void rollback() {
-        transaction->rollback();
-        vernonRuntimeProgramInvocationRollback(nativeInvocation);
+    void commit() {
+        if (vernonRuntimeProgramInvocationCommit(nativeInvocation, nullptr) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to commit native Program invocation");
+        finished = true;
     }
+    VernonPullback *commitPullback() {
+        VernonPullback *pullback = nullptr;
+        if (vernonRuntimeProgramInvocationCommit(nativeInvocation, &pullback) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to commit native Program invocation");
+        finished = true;
+        return pullback;
+    }
+    void rollback() {
+        vernonRuntimeProgramInvocationRollback(nativeInvocation);
+        finished = true;
+    }
+    bool isFinished() const { return finished; }
 
     std::unique_ptr<ProgramInvocationBuilder> builder;
-    std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
-    std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
+    std::vector<std::unique_ptr<ProgramInvocationBuilder>> controlBuilders;
     VernonProgramInvocation *nativeInvocation{};
+    bool finished{};
 };
 
 struct PythonProgramInstanceAdapter {
     PythonProgramInstanceAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
                                  VernonProgramExecutable *executable)
-        : owner(std::move(owner)), runtime(runtime), executable(executable), nativeInstance(executable),
+        : owner(std::move(owner)), runtime(runtime), executable(executable),
           nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(executable)) {
         if (!nativeInvocationInstance)
             throw std::runtime_error("failed to create native Program instance");
@@ -938,25 +942,26 @@ struct PythonProgramInstanceAdapter {
     ~PythonProgramInstanceAdapter() { vernonRuntimeProgramInstanceDestroy(nativeInvocationInstance); }
 
     std::unique_ptr<PythonProgramInvocationAdapter> beginInvocation() {
-        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, executable, nativeInstance,
-                                                                nativeInvocationInstance);
+        return std::make_unique<PythonProgramInvocationAdapter>(owner, runtime, executable, nativeInvocationInstance);
     }
 
     nb::dict telemetryView() const {
-        const vernon::runtime::program::BindingTelemetry telemetry = nativeInstance.telemetry();
+        VernonProgramBindingTelemetry telemetry{};
+        telemetry.struct_size = sizeof(telemetry);
+        if (vernonRuntimeProgramInstanceGetTelemetry(nativeInvocationInstance, &telemetry) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to query native Program binding telemetry");
         nb::dict result;
-        result["prepare_count"] = telemetry.prepareCount;
-        result["reuse_count"] = telemetry.reuseCount;
-        result["rollback_count"] = telemetry.rollbackCount;
-        result["upload_bytes"] = telemetry.uploadBytes;
-        result["upload_ranges"] = telemetry.uploadRanges;
+        result["prepare_count"] = telemetry.prepare_count;
+        result["reuse_count"] = telemetry.reuse_count;
+        result["rollback_count"] = telemetry.rollback_count;
+        result["upload_bytes"] = telemetry.upload_bytes;
+        result["upload_ranges"] = telemetry.upload_ranges;
         return result;
     }
 
     std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
-    vernon::runtime::program::ProgramInstance nativeInstance;
     VernonProgramInstance *nativeInvocationInstance{};
 };
 

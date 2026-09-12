@@ -86,7 +86,9 @@ class _PersistentBindingTable:
             native_transaction.rollback()
             raise
         else:
-            native_transaction.commit()
+            if not native_transaction.finished:
+                native_transaction.rollback()
+                raise RuntimeError("Program invocation exited without explicit commit or rollback")
         finally:
             self._transactions.current = None
 
@@ -104,12 +106,19 @@ class _PersistentBindingTable:
         *,
         upload_bytes: int = 0,
         upload_ranges: int = 0,
-        eager_upload: bool = False,
+        upload_precedes_lookup: bool = False,
     ) -> None:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("binding update requires an active invocation transaction")
-        transaction.native.bind(parameter.slot, token, prepare, upload_bytes, upload_ranges, eager_upload)
+        transaction.native.bind(
+            parameter.slot,
+            token,
+            prepare,
+            upload_bytes,
+            upload_ranges,
+            upload_precedes_lookup,
+        )
 
     def bind_argument(
         self,
@@ -184,7 +193,7 @@ class _PersistentBindingTable:
                 ),
                 upload_bytes=sum(end - begin for begin, end in dirty_ranges),
                 upload_ranges=len(dirty_ranges),
-                eager_upload=True,
+                upload_precedes_lookup=True,
             )
         if isinstance(value, _TextureResource):
             if state.arch == cpu:
@@ -202,7 +211,7 @@ class _PersistentBindingTable:
                 lambda: builder.prepare_rhi_texture(parameter.slot, view),
                 upload_bytes=upload_bytes,
                 upload_ranges=len(dirty_mips),
-                eager_upload=True,
+                upload_precedes_lookup=True,
             )
 
         execution_token = ("execution-value", binding_token) if binding_token is not None else None
@@ -335,12 +344,6 @@ class _PersistentBindingTable:
         if transaction is None:
             raise RuntimeError("Program control update requires an active invocation transaction")
         transaction.native.bind_dynamic_state(slot, token, control)
-
-    def forward(self) -> Any:
-        transaction = getattr(self._transactions, "current", None)
-        if transaction is None:
-            raise RuntimeError("Program forward requires an active invocation transaction")
-        return transaction.native.forward()
 
 
 def _normalize_dispatch_borrows(

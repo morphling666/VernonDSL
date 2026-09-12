@@ -414,10 +414,11 @@ derivative semantics. Linking never constructs a composite backward graph,
 cotangent fan-in, or graph pullback.
 
 A differentiated cooked Program remains differentiable when used as one graph
-node. One graph forward retains that node's own immutable residual and tape
-state. After forward, the caller may retrieve a reusable pullback for that node
-and apply it with the child Program's original Cotangent and Gradient boundary
-slots. Pullbacks for different nodes are independent.
+node. Execute with retention enabled prepares that node's own immutable
+residual and tape state. Only after commit may the caller retrieve a reusable
+pullback for that node and apply it with the child Program's original
+Cotangent and Gradient boundary slots. Pullbacks for different nodes are
+independent.
 
 For `A -> B`, the caller applies `B`'s pullback, explicitly binds the resulting
 cotangent as input to `A`'s pullback, and decides whether or how to accumulate
@@ -444,19 +445,22 @@ exact Cotangent and Gradient boundary slots:
 VernonPullback *pullback = NULL;
 VernonProgramInvocation *invocation =
     vernonRuntimeProgramInstanceBeginInvocation(instance);
-/* Bind each exact primal boundary slot with vernonRuntimeProgramInvocationBind. */
-vernonRuntimeProgramInvocationForward(invocation, &pullback);
+/* Bind each canonical primal parameter with vernonRuntimeProgramInvocationBind. */
+vernonRuntimeProgramInvocationExecute(invocation, 1, NULL);
+vernonRuntimeProgramInvocationCommit(invocation, &pullback);
 vernonProgramPullbackApply(pullback, derivative_arguments, derivative_argument_count);
 vernonProgramPullbackDestroy(pullback);
 ```
 
-For a ProgramGraph, passing a non-null pullback output requests node-local
-retention but returns no composite pullback. The caller retrieves each retained
-child pullback explicitly before destroying the invocation:
+For a ProgramGraph, execute with retention enabled prepares node-local state,
+but no pullback is transferable until commit. Commit returns no composite
+pullback. The caller then retrieves each retained child pullback explicitly
+before destroying the invocation:
 
 ```c
 VernonPullback *composite = NULL;
-vernonRuntimeProgramInvocationForward(invocation, &composite); /* remains NULL */
+vernonRuntimeProgramInvocationExecute(invocation, 1, NULL);
+vernonRuntimeProgramInvocationCommit(invocation, &composite); /* remains NULL */
 vernonRuntimeProgramInvocationGetNodePullback(invocation, node, &pullback);
 ```
 

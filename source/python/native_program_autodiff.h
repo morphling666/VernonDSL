@@ -68,13 +68,13 @@ struct PythonPullback {
     ~PythonPullback() { vernonProgramPullbackDestroy(handle); }
 
     nb::dict applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
-                          const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                          const nb::object &context, const nb::callable &admit) {
-        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, context,
-                                       admit, nullptr);
+                          const nb::object &cotangentGroups, const nb::object &carrierShape, const nb::object &context,
+                          const nb::callable &admit) {
+        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, context, admit,
+                                       nullptr);
     }
     nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
-                                     const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
+                                     const nb::object &cotangentGroups, const nb::object &carrierShape,
                                      const nb::object &context, const nb::callable &admit,
                                      const VernonPullbackApplyOptions *options);
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
@@ -144,9 +144,8 @@ private:
         return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
     }
 
-    nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent, const nb::object &context,
-                       const nb::callable &admit, const VernonPullbackApplyOptions *options = nullptr) {
-        (void)logicalCotangent;
+    nb::dict applyImpl(const nb::object &cotangent, const nb::object &context, const nb::callable &admit,
+                       const VernonPullbackApplyOptions *options = nullptr) {
         ProgramInvocationBuilder builder(owner, runtime, executable);
         nb::dict result;
         std::unordered_map<PyObject *, nb::object> gradientsByOwner;
@@ -592,10 +591,6 @@ struct PythonProgramExecutable {
           retainedResults(std::move(retainedResults)), registeredCpuEntries(std::move(registeredCpuEntries)) {}
     ~PythonProgramExecutable();
 
-    std::unique_ptr<ProgramInvocationBuilder> invocationBuilder() {
-        return std::make_unique<ProgramInvocationBuilder>(owner, runtime, executable);
-    }
-
     std::array<uint32_t, 3> workgroupSize() const { return {0, 0, 0}; }
 
     nb::dict programAdSignature() const {
@@ -642,18 +637,12 @@ struct PythonProgramExecutable {
         return result;
     }
 
-    nb::tuple programVjpBound(PythonProgramInvocationAdapter &invocation, const nb::dict &programBindings,
-                              nb::object executableOwner, const nb::object &checkpointMemoryBudget,
-                              const std::string &checkpointPolicy) {
-        ProgramInvocationBuilder &builder = invocation.builderView();
+    nb::tuple programVjpTransaction(PythonProgramInvocationAdapter &invocation, const nb::dict &programBindings,
+                                    nb::object executableOwner, const nb::callable &publishOutcome,
+                                    const nb::object &checkpointMemoryBudget, const std::string &checkpointPolicy) {
         if (!vernonRuntimeProgramExecutableHasProgramAutodiff(executable))
             throw std::runtime_error("executable has no Program autodiff signature");
-        if (checkpointMemoryBudget.is_none())
-            vernon::runtime::autodiffSetProgramCheckpointPlan(executable, nullptr, checkpointPolicy);
-        else {
-            const uint64_t budget = nb::cast<uint64_t>(checkpointMemoryBudget);
-            vernon::runtime::autodiffSetProgramCheckpointPlan(executable, &budget, checkpointPolicy);
-        }
+        invocation.setAutodiffOptions(checkpointMemoryBudget, checkpointPolicy);
         const auto declaredDerivativePath = [&](VernonAdDerivativeRole role, const std::string &leafPath) {
             const size_t count = vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(executable);
             for (size_t groupIndex = 0; groupIndex < count; ++groupIndex) {
@@ -744,8 +733,6 @@ struct PythonProgramExecutable {
             return result;
         };
         nb::dict outputs;
-        if (builder.executable != executable)
-            throw std::invalid_argument("Program invocation builder belongs to another executable");
         std::vector<PythonAdMetadata> cotangents =
             reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_AD_DERIVATIVE_COTANGENT);
         const auto instantiateBoundMetadata = [&](PythonAdMetadata &leaf) {
@@ -769,12 +756,13 @@ struct PythonProgramExecutable {
                 leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
         }
-        NativeProgramForwardResult forward = invocation.executeForward(true);
-        if (!forward.outcome.ok())
-            return nb::make_tuple(std::move(forward.outcome), outputs, nb::none());
+        PythonInvocationOutcome outcome = invocation.execute(true);
+        publishOutcome(outcome);
+        if (!outcome.ok())
+            return nb::make_tuple(std::move(outcome), outputs, nb::none());
         std::unique_ptr<VernonPullback, decltype(&vernonProgramPullbackDestroy)> pullbackOwner(
-            std::exchange(forward.pullback, nullptr), &vernonProgramPullbackDestroy);
-        return nb::make_tuple(std::move(forward.outcome), outputs,
+            invocation.commitPullback(), &vernonProgramPullbackDestroy);
+        return nb::make_tuple(std::move(outcome), outputs,
                               std::make_unique<PythonPullback>(owner, runtime, executable, pullbackOwner.release(),
                                                                std::move(gradients), std::move(cotangents),
                                                                std::move(executableOwner), nb::dict(programBindings)));

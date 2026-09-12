@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import gc
+import sys
 import unittest
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, Any, cast
+from unittest.mock import patch
 
 import numpy as np
 import vernon_dsl as vd
@@ -682,6 +685,38 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             vd.dynamic_state(viewport=(0, 0, 16, 16)),
         )
         self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
+
+    @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
+    def test_program_instance_retains_native_attachment_owner(self, backend: BackendRow) -> None:
+        texture = vd.Texture.zeros(shape=(16, 16))
+        render_pass = vd.render_pass(
+            vd.RenderTarget.from_attachments(colors={0: texture}),
+            color=vd.clear((0.0, 0.0, 0.0, 1.0)),
+        )
+        attachment_view = render_pass.target._color_attachments()[0][1]
+        view_type = type(attachment_view)
+        resident_view = view_type._resident_view
+        captured: list[Any] = []
+
+        def capture_view(view: Any, context: Any) -> Any:
+            handle = resident_view(view, context)
+            if not captured:
+                captured.append(handle)
+            return handle
+
+        module = ManagedGraphics()
+        with patch.object(view_type, "_resident_view", capture_view):
+            module(
+                self._triangle_vertices(),
+                render_pass,
+                vd.draw(vertex_count=3),
+                vd.dynamic_state(viewport=(0, 0, 16, 16)),
+            )
+        native_view = captured[0]
+        retained_references = sys.getrefcount(native_view)
+        del module
+        gc.collect()
+        self.assertEqual(sys.getrefcount(native_view), retained_references - 1)
 
     @backend_matrix_test(BackendRequirements(gpu=True, graphics=True))
     def test_program_reuses_across_attachment_extents_and_dynamic_states(self, backend: BackendRow) -> None:

@@ -1,6 +1,7 @@
 #include "runtime/autodiff/retained_pullback_state.h"
 #include "runtime/content_hash.h"
 #include "runtime/program_execution/failure_injection.h"
+#include "runtime/program_execution/program_boundary_contract.h"
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution_manifest.h"
@@ -15,6 +16,20 @@
 #include <array>
 
 namespace {
+
+TEST(ProgramBoundaryContract, UsesOneAccessCapabilityLatticeForBindingAndExecution) {
+    using vernon::runtime::program_execution::valueAccessSatisfies;
+
+    EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_READ, VERNON_ACCESS_READ));
+    EXPECT_FALSE(valueAccessSatisfies(VERNON_ACCESS_READ, VERNON_ACCESS_WRITE));
+    EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_READ, VERNON_ACCESS_READ_WRITE));
+    EXPECT_FALSE(valueAccessSatisfies(VERNON_ACCESS_WRITE, VERNON_ACCESS_READ));
+    EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_WRITE, VERNON_ACCESS_WRITE));
+    EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_WRITE, VERNON_ACCESS_READ_WRITE));
+    EXPECT_FALSE(valueAccessSatisfies(VERNON_ACCESS_READ_WRITE, VERNON_ACCESS_READ));
+    EXPECT_FALSE(valueAccessSatisfies(VERNON_ACCESS_READ_WRITE, VERNON_ACCESS_WRITE));
+    EXPECT_TRUE(valueAccessSatisfies(VERNON_ACCESS_READ_WRITE, VERNON_ACCESS_READ_WRITE));
+}
 
 std::unique_ptr<VernonRuntimeContext> makeRuntimeContext() {
     auto created = VernonRuntimeContext::create();

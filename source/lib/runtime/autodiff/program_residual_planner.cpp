@@ -23,7 +23,7 @@ const Parameter *findParameter(const StageBindingPlan &stagePlan, const std::str
     return internal == stagePlan.runtimeParameters.end() ? nullptr : &*internal;
 }
 
-execution::detail::AutodiffCheckpointPolicy checkpointPolicy(const std::string &name) {
+execution::detail::AutodiffCheckpointPolicy checkpointPolicy(std::string_view name) {
     if (name == "min_memory")
         return execution::detail::AutodiffCheckpointPolicy::MinMemory;
     if (name == "min_runtime")
@@ -120,7 +120,7 @@ std::vector<AutodiffPullbackPassTelemetry> collectProgramPassTelemetry(const pro
 
 bool planProgramResiduals(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                           const StageBindingPlan &stagePlan, const std::vector<ProgramValueState> &materialized,
-                          const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, const std::string &policy,
+                          const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, std::string_view policy,
                           bool rematerializeTapes, ProgramResidualPlan &result, std::string &error) {
     const program::Graph *forward = program::findGraph(execution, "forward");
     if (!forward)

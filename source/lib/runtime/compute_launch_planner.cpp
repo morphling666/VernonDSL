@@ -1,6 +1,7 @@
 #include "compute_launch_planner.h"
 
 #include "pipeline_metadata.h"
+#include "program_execution/program_boundary_contract.h"
 #include "tensor_bridge.h"
 
 #include <algorithm>
@@ -238,10 +239,11 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
             parameter.tensorArgument == TensorRepresentation::WholeValue && parameter.valueLayout
                 ? *parameter.valueLayout
                 : parameter.elementLayout;
-        const bool accessCompatible = parameter.access.empty()      ? true
-                                      : parameter.access == "read"  ? tensor.access != VERNON_ACCESS_WRITE
-                                      : parameter.access == "write" ? tensor.access != VERNON_ACCESS_READ
-                                                                    : tensor.access == VERNON_ACCESS_READ_WRITE;
+        const VernonValueAccess requiredAccess = parameter.access == "read"    ? VERNON_ACCESS_READ
+                                                 : parameter.access == "write" ? VERNON_ACCESS_WRITE
+                                                                               : VERNON_ACCESS_READ_WRITE;
+        const bool accessCompatible =
+            parameter.access.empty() || program_execution::valueAccessSatisfies(requiredAccess, tensor.access);
         if (tensor.struct_size < sizeof(VernonTensorView)) {
             error = "pipeline Tensor argument '" + parameter.name + "' structure is incomplete";
             return false;

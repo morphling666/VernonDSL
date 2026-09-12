@@ -131,8 +131,8 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
         VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
-        << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
     EXPECT_FLOAT_EQ(outputValue, 9.0f);
 
     vernonRuntimeProgramInvocationDestroy(invocation);
@@ -210,7 +210,10 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 1, nullptr), VERNON_STATUS_OK)
+        << lastError(program.context);
+    EXPECT_EQ(pullback, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, &pullback), VERNON_STATUS_OK)
         << lastError(program.context);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(outputValue, 9.0f);

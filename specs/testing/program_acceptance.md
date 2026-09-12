@@ -15,8 +15,10 @@ is tracked in
   lower to Program.
 - Standalone executables are one-node Programs; Module differs only in node
   count.
-- C++ uses bundle → executable → instance → invocation → bind → forward.
-- VJP uses the same forward lifecycle and returns a reusable pullback.
+- C++ uses bundle → executable → instance → invocation → bind → execute →
+  commit or rollback.
+- VJP uses the same transaction lifecycle and transfers a reusable pullback
+  only after commit.
 - Public boundaries use stable slots and `VernonProgramArgument`.
 - Python pass descriptors and public ExecutionGraph authoring are not Program
   APIs.

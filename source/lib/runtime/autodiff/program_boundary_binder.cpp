@@ -1,5 +1,6 @@
 #include "program_boundary_binder.h"
 
+#include "runtime/program_execution/program_boundary_contract.h"
 #include "runtime/program_execution/program_image_binding.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
@@ -12,24 +13,6 @@
 namespace vernon::runtime::ad {
 using program_execution::ProgramStorageBacking;
 namespace {
-
-bool boundaryKindMatches(program::BoundaryCategory category, VernonProgramArgumentKind kind) {
-    if (category == program::BoundaryCategory::Texture)
-        return kind == VERNON_PROGRAM_IMAGE;
-    if (category == program::BoundaryCategory::Sampler)
-        return kind == VERNON_PROGRAM_SAMPLER;
-    return kind == VERNON_PROGRAM_TENSOR;
-}
-
-bool boundaryAccessMatches(program::BoundaryAccess access, VernonValueAccess supplied) {
-    if (supplied > VERNON_ACCESS_READ_WRITE)
-        return false;
-    if (access == program::BoundaryAccess::Read)
-        return supplied != VERNON_ACCESS_WRITE;
-    if (access == program::BoundaryAccess::Write)
-        return supplied != VERNON_ACCESS_READ;
-    return supplied == VERNON_ACCESS_READ_WRITE;
-}
 
 bool sameResourceReference(const VernonRuntimeProviderResourceReference &lhs,
                            const VernonRuntimeProviderResourceReference &rhs) {
@@ -152,9 +135,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             return false;
         }
         const program::BoundarySlot &boundary = execution.abi.boundarySlots[slot];
-        if (!boundaryKindMatches(boundary.category, supplied->second->kind) ||
-            (supplied->second->kind == VERNON_PROGRAM_TENSOR &&
-             !boundaryAccessMatches(boundary.access, supplied->second->tensor.access))) {
+        if (!program_execution::argumentMatchesBoundary(boundary, *supplied->second)) {
             error = "Program invocation argument does not match its canonical boundary contract";
             return false;
         }

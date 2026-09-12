@@ -1,6 +1,7 @@
 #include "runtime_autodiff_internal.h"
 
 #include "runtime/pipeline_metadata.h"
+#include "runtime/program_execution/program_forward.h"
 #include "runtime/program_execution_manifest.h"
 #include "runtime/resolved_execution_plan.h"
 #include "runtime/runtime_state.h"
@@ -223,20 +224,25 @@ void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const progr
     pullback.programSnapshot = std::move(snapshot);
 }
 
-VernonPullback *makeRetainedProgramPullback(VernonProgramExecutable &pipeline,
-                                            std::unique_ptr<ad::PullbackExecution> execution,
-                                            std::shared_ptr<const program::InvocationSnapshot> snapshot) {
+vernon::Result<std::unique_ptr<VernonPullback>, PullbackTransferError>
+makeRetainedProgramPullback(VernonProgramExecutable &pipeline, std::unique_ptr<ad::PullbackExecution> &execution,
+                            const std::shared_ptr<const program::InvocationSnapshot> &snapshot) noexcept {
     auto child = vernon::runtime::RuntimeChildLifecycle::reserve(pipeline.context->owner);
     if (child.isErr())
-        return nullptr;
-    auto result = std::make_unique<VernonPullback>();
+        return vernon::Result<std::unique_ptr<VernonPullback>, PullbackTransferError>{
+            vernon::err(PullbackTransferError::LifecycleUnavailable)};
+    std::unique_ptr<VernonPullback> result(new (std::nothrow) VernonPullback());
+    if (!result)
+        return vernon::Result<std::unique_ptr<VernonPullback>, PullbackTransferError>{
+            vernon::err(PullbackTransferError::AllocationFailure)};
     result->lifecycle.emplace(std::move(child).value());
     result->context = pipeline.context;
-    result->execution = std::move(execution);
-    result->programSnapshot = std::move(snapshot);
+    result->programSnapshot = snapshot;
     if (result->lifecycle.value().publish().isErr())
-        return nullptr;
-    return result.release();
+        return vernon::Result<std::unique_ptr<VernonPullback>, PullbackTransferError>{
+            vernon::err(PullbackTransferError::LifecycleUnavailable)};
+    result->execution = std::move(execution);
+    return vernon::Result<std::unique_ptr<VernonPullback>, PullbackTransferError>{vernon::ok(std::move(result))};
 }
 
 } // namespace vernon::runtime::program_execution
@@ -313,19 +319,11 @@ uint64_t vernon::runtime::autodiffPullbackPeakRuntimeManagedBytes(const VernonPu
     return pullback->execution->peakRuntimeManagedBytes();
 }
 
-void vernon::runtime::autodiffSetProgramCheckpointPlan(VernonProgramExecutable *pipeline, const uint64_t *memoryBudget,
-                                                       std::string_view policy) {
-    if (!pipeline)
-        return;
-    if (memoryBudget)
-        pipeline->programAutodiff.checkpointMemoryBudget = *memoryBudget;
-    else
-        pipeline->programAutodiff.checkpointMemoryBudget.reset();
-    pipeline->programAutodiff.checkpointPolicy = std::string(policy);
-}
-
 size_t vernon::runtime::autodiffHostTapeContextLimit(const VernonRuntimeContext *context) {
-    return context ? ad::autodiffMemoryContextLimit(context->autodiffMemoryPolicy) : 0;
+    if (!context)
+        return 0;
+    std::lock_guard lock(context->autodiffMemoryPolicyMutex);
+    return ad::autodiffMemoryContextLimit(context->autodiffMemoryPolicy);
 }
 
 VernonRhiDevice vernon::runtime::autodiffRhiDevice(const VernonRuntimeContext *context) {

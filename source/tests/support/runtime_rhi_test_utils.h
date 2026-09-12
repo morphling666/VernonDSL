@@ -151,9 +151,10 @@ struct CanonicalGraphicsControls {
 };
 
 /*
- * Run one canonical graphics invocation to completion: bind every argument and control, then forward.
+ * Run one canonical graphics invocation to completion: bind every argument and control, execute, then commit.
  *
- * Forward executes and waits, so this is the canonical equivalent of completeSubmission for a Program, and the
+ * Execute waits and commit publishes the transaction, so this is the canonical equivalent of completeSubmission, and
+ * the
  * arguments carry their own slots exactly as they do in a submit descriptor.
  */
 inline VernonStatus completeCanonicalInvocation(VernonProgramExecutable *pipeline,
@@ -179,8 +180,10 @@ inline VernonStatus completeCanonicalInvocation(VernonProgramExecutable *pipelin
     if (status == VERNON_STATUS_OK)
         status = controls.bind(invocation, controlSlots);
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr);
-    else
+        status = vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr);
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeProgramInvocationCommit(invocation, nullptr);
+    if (status != VERNON_STATUS_OK)
         vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
@@ -190,6 +193,8 @@ inline VernonStatus completeCanonicalInvocation(VernonProgramExecutable *pipelin
 inline VernonStatus completeCanonicalComputeInvocation(VernonProgramExecutable *pipeline,
                                                        const VernonProgramArgument *arguments, size_t argumentCount,
                                                        VernonLaunchSize grid, VernonPullback **pullback = nullptr) {
+    if (pullback)
+        *pullback = nullptr;
     std::vector<VernonProgramArgument> bindings(arguments, arguments + argumentCount);
     const size_t parameterCount = vernonRuntimeProgramExecutableGetParameterCount(pipeline);
     std::vector<VernonProgramParameterView> parameters(parameterCount);
@@ -252,8 +257,10 @@ inline VernonStatus completeCanonicalComputeInvocation(VernonProgramExecutable *
         status = vernonRuntimeProgramInvocationBind(invocation, &bindingToken, &bindings[index], nullptr, 0, 0);
     }
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeProgramInvocationForward(invocation, pullback, nullptr);
-    else
+        status = vernonRuntimeProgramInvocationExecute(invocation, pullback != nullptr, nullptr);
+    if (status == VERNON_STATUS_OK)
+        status = vernonRuntimeProgramInvocationCommit(invocation, pullback);
+    if (status != VERNON_STATUS_OK)
         vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);

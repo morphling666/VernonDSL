@@ -161,12 +161,20 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
         ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_INPUT,
                                                         {"output", 6}, &outputs[node]),
                   VERNON_STATUS_OK);
+        const std::string outputName = "node_" + std::to_string(node) + "_output";
+        ASSERT_EQ(
+            vernonRuntimeProgramGraphExportBoundary(graph, &outputs[node], {outputName.data(), outputName.size()}),
+            VERNON_STATUS_OK);
         for (size_t axis = 0; axis < 3; ++axis) {
             grids[node][axis].struct_size = sizeof(VernonProgramNodeBindingToken);
             const std::string name = "__grid_" + std::string(1, "xyz"[axis]);
             ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, nodes[node], VERNON_PROGRAM_BOUNDARY_INPUT,
                                                             {name.data(), name.size()}, &grids[node][axis]),
                       VERNON_STATUS_OK);
+            const std::string gridName = "node_" + std::to_string(node) + "_grid_" + std::string(1, "xyz"[axis]);
+            ASSERT_EQ(
+                vernonRuntimeProgramGraphExportBoundary(graph, &grids[node][axis], {gridName.data(), gridName.size()}),
+                VERNON_STATUS_OK);
         }
     }
     VernonProgramExecutable *executable = vernonRuntimeResolveProgramGraph(graph);
@@ -186,7 +194,26 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
     constexpr uint64_t shape[]{10};
     constexpr int64_t strides[]{sizeof(int32_t)};
     const uint32_t gridValues[3]{2, 1, 1};
+    const size_t parameterCount = vernonRuntimeProgramExecutableGetParameterCount(executable);
+    const auto bindExport = [&](const std::string &exportName, VernonProgramArgument argument) {
+        size_t matches = 0;
+        for (size_t index = 0; index < parameterCount; ++index) {
+            VernonProgramParameterView parameter{};
+            if (vernonRuntimeProgramExecutableGetParameterByIndex(executable, index, &parameter) != VERNON_STATUS_OK ||
+                std::string_view(parameter.name.data, parameter.name.size) != exportName)
+                continue;
+            argument.slot = parameter.slot;
+            const std::string tokenText = exportName + "-" + std::to_string(parameter.slot);
+            const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), tokenText.data(),
+                                                  tokenText.size()};
+            EXPECT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &argument, nullptr, 0, 0),
+                      VERNON_STATUS_OK);
+            ++matches;
+        }
+        EXPECT_GT(matches, 0u);
+    };
     for (size_t node = 0; node < 2; ++node) {
+        const std::string outputName = "node_" + std::to_string(node) + "_output";
         VernonProgramArgument output{};
         output.kind = VERNON_PROGRAM_TENSOR;
         output.tensor.struct_size = sizeof(VernonTensorView);
@@ -198,9 +225,9 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
         output.tensor.shape = shape;
         output.tensor.byte_strides = strides;
         output.tensor.byte_size = sizeof(results[node]);
-        ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &outputs[node], &output, nullptr, 0, 0),
-                  VERNON_STATUS_OK);
+        bindExport(outputName, output);
         for (size_t axis = 0; axis < 3; ++axis) {
+            const std::string gridName = "node_" + std::to_string(node) + "_grid_" + std::string(1, "xyz"[axis]);
             VernonProgramArgument grid{};
             grid.kind = VERNON_PROGRAM_TENSOR;
             grid.tensor.struct_size = sizeof(VernonTensorView);
@@ -209,11 +236,12 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
             grid.tensor.element_layout = vernonRuntimeGetScalarValueLayout(VERNON_DATA_U32);
             grid.tensor.access = VERNON_ACCESS_READ;
             grid.tensor.byte_size = sizeof(uint32_t);
-            ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &grids[node][axis], &grid, nullptr, 0, 0),
-                      VERNON_STATUS_OK);
+            bindExport(gridName, grid);
         }
     }
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+        << stringValue(vernonRuntimeGetLastError(runtime));
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
         << stringValue(vernonRuntimeGetLastError(runtime));
     verifySynchronizationResult(results[0]);
     verifySynchronizationResult(results[1]);

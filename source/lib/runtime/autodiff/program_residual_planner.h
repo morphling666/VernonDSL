@@ -6,6 +6,8 @@
 #include "runtime/autodiff/runtime_autodiff_internal.h"
 #include "runtime/program_execution/program_invocation_state.h"
 
+#include <string_view>
+
 namespace vernon::runtime::ad {
 
 struct ProgramResidualPlan {
@@ -22,7 +24,7 @@ collectProgramPassTelemetry(const program::Graph &forward, const program::Progra
 bool planProgramResiduals(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
                           const StageBindingPlan &stagePlan,
                           const std::vector<program_execution::ProgramValueState> &materialized,
-                          const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, const std::string &policy,
+                          const ProgramTapeScratch &tapeScratch, uint64_t memoryBudget, std::string_view policy,
                           bool rematerializeTapes, ProgramResidualPlan &result, std::string &error);
 
 } // namespace vernon::runtime::ad

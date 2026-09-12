@@ -391,6 +391,7 @@ bool HostTapeDispatchBudget::beginRecycledConstruction() {
 
 #ifdef VERNON_HOST_TAPE_INSTRUMENTATION
 void setHostTapeMemoryPolicyForTesting(VernonRuntimeContext &context, std::shared_ptr<HostTapeMemoryPolicy> policy) {
+    std::lock_guard lock(context.autodiffMemoryPolicyMutex);
     context.autodiffMemoryPolicy = std::move(policy);
 }
 

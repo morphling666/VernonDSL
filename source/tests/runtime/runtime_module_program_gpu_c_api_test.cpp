@@ -145,7 +145,7 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     vernon::runtime::program_execution::setFailureInjectionForTesting(
         vernon::runtime::program_execution::FailureBoundary::Submission);
     resetOutcome();
-    EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback, &mutationOutcome), VERNON_STATUS_OK);
+    EXPECT_NE(vernonRuntimeProgramInvocationExecute(invocation, 1, &mutationOutcome), VERNON_STATUS_OK);
     EXPECT_EQ(mutationOutcome.submission, VERNON_INVOCATION_NOT_SUBMITTED);
     EXPECT_EQ(mutationState(outputParameter.slot), VERNON_BOUNDARY_MUTATION_UNCHANGED);
     vernon::runtime::program_execution::clearFailureInjectionForTesting();
@@ -165,7 +165,7 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     vernon::runtime::program_execution::setFailureInjectionForTesting(
         vernon::runtime::program_execution::FailureBoundary::Completion);
     resetOutcome();
-    EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback, &mutationOutcome), VERNON_STATUS_OK);
+    EXPECT_NE(vernonRuntimeProgramInvocationExecute(invocation, 1, &mutationOutcome), VERNON_STATUS_OK);
     EXPECT_EQ(mutationOutcome.submission, VERNON_INVOCATION_INDETERMINATE);
     EXPECT_EQ(mutationState(outputParameter.slot), VERNON_BOUNDARY_MUTATION_UNCHANGED);
     vernon::runtime::program_execution::clearFailureInjectionForTesting();
@@ -184,7 +184,7 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     vernon::runtime::program_execution::setFailureInjectionForTesting(
         vernon::runtime::program_execution::FailureBoundary::Commit);
     resetOutcome();
-    EXPECT_NE(vernonRuntimeProgramInvocationForward(invocation, &pullback, &mutationOutcome), VERNON_STATUS_OK);
+    EXPECT_NE(vernonRuntimeProgramInvocationExecute(invocation, 1, &mutationOutcome), VERNON_STATUS_OK);
     EXPECT_EQ(mutationOutcome.submission, VERNON_INVOCATION_COMPLETED);
     EXPECT_EQ(mutationState(outputParameter.slot), VERNON_BOUNDARY_MUTATION_UNCHANGED);
     vernon::runtime::program_execution::clearFailureInjectionForTesting();
@@ -201,8 +201,10 @@ void runModuleProgram(vernon::tests::OwnedRhiRuntime &owned, const std::filesyst
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
     resetOutcome();
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback, &mutationOutcome), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 1, &mutationOutcome), VERNON_STATUS_OK)
         << lastError(context);
+    EXPECT_EQ(pullback, nullptr);
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, &pullback), VERNON_STATUS_OK) << lastError(context);
     EXPECT_EQ(mutationOutcome.submission, VERNON_INVOCATION_COMPLETED);
     EXPECT_EQ(mutationState(outputParameter.slot), VERNON_BOUNDARY_MUTATION_COMMITTED);
     vernonRuntimeProgramInvocationDestroy(invocation);
@@ -303,6 +305,10 @@ void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const st
     ASSERT_EQ(vernonRuntimeProgramGraphFindBoundary(graph, node, VERNON_PROGRAM_BOUNDARY_OUTPUT,
                                                     {"output", std::strlen("output")}, &outputToken),
               VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &sourceToken, {"source", std::strlen("source")}),
+              VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeProgramGraphExportBoundary(graph, &outputToken, {"output", std::strlen("output")}),
+              VERNON_STATUS_OK);
     VernonProgramExecutable *composite = vernonRuntimeResolveProgramGraph(graph);
     ASSERT_NE(composite, nullptr) << lastError(context);
     EXPECT_EQ(vernonRuntimeProgramExecutableHasProgramAutodiff(composite), 0u);
@@ -332,18 +338,23 @@ void runProgramGraphNodePullback(vernon::tests::OwnedRhiRuntime &owned, const st
     ASSERT_EQ(vernonRhiDeviceUploadBuffer(owned.device(), gradientBuffer, 0, &zero, sizeof(zero)),
               VERNON_RHI_STATUS_OK);
 
-    VernonProgramArgument sourceArgument = tensorArgument(context, sourceBuffer, parameter(standalone, "source"));
-    VernonProgramArgument outputArgument = tensorArgument(context, outputBuffer, parameter(standalone, "output"));
+    VernonProgramArgument sourceArgument = tensorArgument(context, sourceBuffer, parameter(composite, "source"));
+    VernonProgramArgument outputArgument = tensorArgument(context, outputBuffer, parameter(composite, "output"));
+    const VernonProgramBindingToken sourceBinding = bindingToken("graph-source");
+    const VernonProgramBindingToken outputBinding = bindingToken("graph-output");
     VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(composite);
     ASSERT_NE(instance, nullptr);
     VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
     ASSERT_NE(invocation, nullptr);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &sourceToken, &sourceArgument, nullptr, 0, 0),
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &sourceBinding, &sourceArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
+    ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputBinding, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
     VernonPullback *compositePullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &compositePullback, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 1, nullptr), VERNON_STATUS_OK) << lastError(context);
+    EXPECT_NE(vernonRuntimeProgramInvocationGetNodePullback(invocation, node, &compositePullback), VERNON_STATUS_OK);
+    compositePullback = nullptr;
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, &compositePullback), VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_EQ(compositePullback, nullptr);
     VernonPullback *nodePullback = nullptr;
@@ -507,7 +518,9 @@ void runReusedStageModule(vernon::tests::OwnedRhiRuntime &owned, const std::file
         ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &arguments[index], nullptr, 0, 0),
                   VERNON_STATUS_OK);
     }
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+        << lastError(owned.runtime());
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
         << lastError(owned.runtime());
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
@@ -579,7 +592,9 @@ void runTensorViewChainModule(vernon::tests::OwnedRhiRuntime &owned, const std::
         ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &arguments[index], nullptr, 0, 0),
                   VERNON_STATUS_OK);
     }
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+        << lastError(owned.runtime());
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
         << lastError(owned.runtime());
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
@@ -659,7 +674,9 @@ void runDynamicShapeGridReuse(vernon::tests::OwnedRhiRuntime &owned, const std::
             ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &token, &arguments[index], nullptr, 0, 0),
                       VERNON_STATUS_OK);
         }
-        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+        ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+            << lastError(owned.runtime());
+        ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
             << lastError(owned.runtime());
         vernonRuntimeProgramInvocationDestroy(invocation);
         std::vector<float> output(count);

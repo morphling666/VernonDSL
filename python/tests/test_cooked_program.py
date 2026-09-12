@@ -12,7 +12,7 @@ from vernon_dsl._runtime.session import cpu
 class _BindingCache:
     @contextmanager
     def invocation(self, executable, context):
-        yield SimpleNamespace(builder=object())
+        yield SimpleNamespace(builder=object(), finished=True)
 
     def bind_argument(self, builder, executable, parameter, value) -> None:
         pass
@@ -25,17 +25,19 @@ class CookedProgramTests(unittest.TestCase):
             SimpleNamespace(name="output", access=1, slot=1),
         )
         native_pullback = SimpleNamespace()
+        outcome = SimpleNamespace(ok=True, mutations=(), error="")
+
+        def program_vjp_transaction(invocation, bindings, publish_outcome):
+            publish_outcome(outcome)
+            return outcome, {}, native_pullback
+
         native = SimpleNamespace(
             parameters=parameters,
             derivative_groups=(
                 ("gradient", "source", ("source",)),
                 ("cotangent", "output", ("output",)),
             ),
-            program_vjp_bound=lambda invocation, bindings: (
-                SimpleNamespace(ok=True, mutations=(), error=""),
-                {},
-                native_pullback,
-            ),
+            program_vjp_transaction=program_vjp_transaction,
         )
         native_module = SimpleNamespace(
             ACCESS_READ=0,

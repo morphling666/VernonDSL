@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -164,10 +165,6 @@ struct ProgramGraphStorage {
     VernonProgramGraphStorage storage{sizeof(VernonProgramGraphStorage), 0, 0, VERNON_PROGRAM_TENSOR};
 };
 
-struct ProgramNodeGraphics {
-    VernonProgramNodeGraphicsToken token{sizeof(VernonProgramNodeGraphicsToken), 0, 0, 0};
-};
-
 class ProgramGraph;
 class ProgramInvocation;
 namespace detail {
@@ -181,11 +178,6 @@ struct ProgramGraphState {
 class ProgramNode {
 public:
     ProgramNodeBinding boundary(VernonProgramBoundaryRole role, std::string_view name) const;
-    ProgramNodeGraphics graphics(std::string_view name) const;
-    ProgramNodeGraphics graphics(size_t index) const;
-    size_t graphicsCount() const noexcept {
-        return owner_ ? vernonRuntimeProgramGraphGetGraphicsNodeCount(owner_->handle, id_) : 0;
-    }
     VernonProgramNodeId id() const noexcept { return id_; }
 
 private:
@@ -353,56 +345,8 @@ inline ProgramNodeBinding ProgramNode::boundary(VernonProgramBoundaryRole role, 
     return result;
 }
 
-inline ProgramNodeGraphics ProgramNode::graphics(std::string_view name) const {
-    if (!owner_)
-        throw std::logic_error("ProgramGraph node is empty");
-    ProgramNodeGraphics result;
-    const VernonStringView view{name.data(), name.size()};
-    if (vernonRuntimeProgramGraphFindGraphicsNode(owner_->handle, id_, view, &result.token) != VERNON_STATUS_OK)
-        throw std::runtime_error("ProgramGraph graphics node was not found");
-    return result;
-}
-
-inline ProgramNodeGraphics ProgramNode::graphics(size_t index) const {
-    if (!owner_)
-        throw std::logic_error("ProgramGraph node is empty");
-    ProgramNodeGraphics result;
-    if (vernonRuntimeProgramGraphGetGraphicsNodeByIndex(owner_->handle, id_, index, &result.token) != VERNON_STATUS_OK)
-        throw std::runtime_error("ProgramGraph graphics node index is out of range");
-    return result;
-}
-
 class ProgramInvocation {
 public:
-    class NodeFrame {
-    public:
-        NodeFrame &bind(ProgramNodeBinding binding, const VernonProgramArgument &argument,
-                        const VernonProgramResourceLease *lease = nullptr, uint64_t uploadBytes = 0,
-                        uint64_t uploadRanges = 0) {
-            if (binding.token.node != node_)
-                throw std::invalid_argument("ProgramGraph binding belongs to another node");
-            invocation_->bind(binding, argument, lease, uploadBytes, uploadRanges);
-            return *this;
-        }
-
-        NodeFrame &bind(ProgramNodeGraphics graphics, const VernonRenderPass &renderPass, const VernonDrawCommand &draw,
-                        const VernonDynamicState &dynamicState,
-                        const VernonProgramResourceLease *renderPassLeases = nullptr, size_t renderPassLeaseCount = 0,
-                        const VernonProgramResourceLease *drawLease = nullptr) {
-            if (graphics.token.node != node_)
-                throw std::invalid_argument("ProgramGraph graphics token belongs to another node");
-            invocation_->bind(graphics, renderPass, draw, dynamicState, renderPassLeases, renderPassLeaseCount,
-                              drawLease);
-            return *this;
-        }
-
-    private:
-        NodeFrame(ProgramInvocation &invocation, VernonProgramNodeId node) : invocation_(&invocation), node_(node) {}
-        ProgramInvocation *invocation_{};
-        VernonProgramNodeId node_{};
-        friend class ProgramInvocation;
-    };
-
     ProgramInvocation() = default;
     explicit ProgramInvocation(VernonProgramInvocation *handle,
                                std::shared_ptr<detail::ProgramGraphState> graphOwner = {})
@@ -430,37 +374,6 @@ public:
         return *this;
     }
 
-    ProgramInvocation &bind(ProgramNodeBinding node, const VernonProgramArgument &argument,
-                            const VernonProgramResourceLease *lease = nullptr, uint64_t uploadBytes = 0,
-                            uint64_t uploadRanges = 0) {
-        if (!handle_ || vernonRuntimeProgramInvocationBindNode(handle_, &node.token, &argument, lease, uploadBytes,
-                                                               uploadRanges) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind ProgramGraph node");
-        return *this;
-    }
-
-    ProgramInvocation &bind(ProgramGraphStorage storage, const VernonProgramArgument &argument,
-                            const VernonProgramResourceLease *lease = nullptr, uint64_t uploadBytes = 0,
-                            uint64_t uploadRanges = 0) {
-        if (!handle_ || vernonRuntimeProgramInvocationBindGraphStorage(handle_, &storage.storage, &argument, lease,
-                                                                       uploadBytes, uploadRanges) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind ProgramGraph Storage");
-        return *this;
-    }
-
-    ProgramInvocation &bind(ProgramNodeGraphics node, const VernonRenderPass &renderPass, const VernonDrawCommand &draw,
-                            const VernonDynamicState &dynamicState,
-                            const VernonProgramResourceLease *renderPassLeases = nullptr,
-                            size_t renderPassLeaseCount = 0, const VernonProgramResourceLease *drawLease = nullptr) {
-        if (!handle_ || vernonRuntimeProgramInvocationBindNodeGraphics(handle_, &node.token, &renderPass,
-                                                                       renderPassLeases, renderPassLeaseCount, &draw,
-                                                                       drawLease, &dynamicState) != VERNON_STATUS_OK)
-            throw std::runtime_error("failed to bind ProgramGraph graphics controls");
-        return *this;
-    }
-
-    NodeFrame node(const ProgramNodeHandle &node) { return NodeFrame(*this, node.id()); }
-
     ProgramInvocation &bindRenderPass(uint32_t slot, const VernonProgramBindingToken &token,
                                       const VernonRenderPass &renderPass,
                                       const VernonProgramResourceLease *leases = nullptr, size_t leaseCount = 0) {
@@ -487,13 +400,32 @@ public:
         return *this;
     }
 
-    Pullback forward(bool retainPullback = true) {
+    ProgramInvocation &setAutodiffOptions(const std::optional<uint64_t> &checkpointMemoryBudget,
+                                          std::string_view checkpointPolicy) {
+        VernonProgramAutodiffInvocationOptions options{};
+        options.struct_size = sizeof(options);
+        options.abi_version = VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION;
+        options.has_checkpoint_memory_budget = checkpointMemoryBudget.has_value();
+        options.checkpoint_memory_budget = checkpointMemoryBudget.value_or(0);
+        options.checkpoint_policy = {checkpointPolicy.data(), checkpointPolicy.size()};
+        if (!handle_ || vernonRuntimeProgramInvocationSetAutodiffOptions(handle_, &options) != VERNON_STATUS_OK)
+            throw std::runtime_error("failed to set Program invocation autodiff options");
+        return *this;
+    }
+
+    void execute(bool retainPullback = true) {
+        if (!handle_)
+            throw std::logic_error("Program invocation is empty");
+        if (vernonRuntimeProgramInvocationExecute(handle_, retainPullback, nullptr) != VERNON_STATUS_OK)
+            throw std::runtime_error("Program invocation execution failed");
+    }
+
+    Pullback commit() {
         if (!handle_)
             throw std::logic_error("Program invocation is empty");
         VernonPullback *pullback = nullptr;
-        if (vernonRuntimeProgramInvocationForward(handle_, retainPullback ? &pullback : nullptr, nullptr) !=
-            VERNON_STATUS_OK)
-            throw std::runtime_error("Program invocation failed");
+        if (vernonRuntimeProgramInvocationCommit(handle_, &pullback) != VERNON_STATUS_OK)
+            throw std::runtime_error("Program invocation commit failed");
         return Pullback(pullback);
     }
 

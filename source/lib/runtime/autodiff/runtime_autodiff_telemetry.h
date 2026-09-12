@@ -68,8 +68,6 @@ struct AutodiffPullbackPassTelemetry {
 AutodiffPullbackCheckpointPlan autodiffPullbackCheckpointPlan(const VernonPullback *pullback);
 std::vector<AutodiffPullbackPassTelemetry> autodiffPullbackPassTelemetry(const VernonPullback *pullback);
 uint64_t autodiffPullbackPeakRuntimeManagedBytes(const VernonPullback *pullback);
-void autodiffSetProgramCheckpointPlan(VernonProgramExecutable *pipeline, const uint64_t *memoryBudget,
-                                      std::string_view policy);
 
 } // namespace vernon::runtime
 

@@ -53,7 +53,7 @@ class NestedRecord:
 
 @expand_backend_matrix_tests
 class TensorStorageRuntimeTests(unittest.TestCase):
-    def test_persistent_binding_table_commits_typed_updates(self) -> None:
+    def test_persistent_binding_table_requires_explicit_commit_for_typed_updates(self) -> None:
         cache = _PersistentBindingTable()
         instance = mock.Mock()
         transaction = mock.Mock()
@@ -73,6 +73,7 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         with cache.invocation(pipeline, _TEST_CONTEXT) as active:
             self.assertIs(active, transaction)
             cache.bind_argument(active.builder, pipeline, parameter, np.float32(2.0), binding_token=11)
+            active.commit()
 
         pipeline.program_instance.assert_called_once_with()
         instance.begin_invocation.assert_called_once_with()
@@ -94,6 +95,22 @@ class TensorStorageRuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "dispatch failed"):
             with table.invocation(pipeline, _TEST_CONTEXT):
                 raise RuntimeError("dispatch failed")
+
+        transaction.rollback.assert_called_once_with()
+        transaction.commit.assert_not_called()
+
+    def test_persistent_binding_table_rejects_implicit_completion(self) -> None:
+        table = _PersistentBindingTable()
+        instance = mock.Mock()
+        transaction = mock.Mock()
+        pipeline = mock.Mock()
+        pipeline.program_instance.return_value = instance
+        instance.begin_invocation.return_value = transaction
+        transaction.finished = False
+
+        with self.assertRaisesRegex(RuntimeError, "without explicit commit or rollback"):
+            with table.invocation(pipeline, _TEST_CONTEXT):
+                pass
 
         transaction.rollback.assert_called_once_with()
         transaction.commit.assert_not_called()

@@ -16,6 +16,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -58,6 +59,7 @@ struct VernonRuntimeContext {
     void (*destroyBackendState)(void *){};
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     vernon::Option<vernon::ChildLease> rhiDeviceLease;
+    mutable std::mutex autodiffMemoryPolicyMutex;
     std::shared_ptr<vernon::runtime::ad::AutodiffMemoryPolicy> autodiffMemoryPolicy;
     std::mutex cpuEntriesMutex;
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
@@ -160,8 +162,6 @@ struct VernonProgramBundle {
 struct CanonicalProgramAutodiffState {
     std::shared_ptr<vernon::runtime::ad::CanonicalProgramExecution> canonicalExecution;
     std::vector<vernon::runtime::AutodiffDerivativeGroup> derivativeGroups;
-    std::optional<uint64_t> checkpointMemoryBudget;
-    std::string checkpointPolicy;
 };
 
 struct VernonProgramExecutable;
@@ -188,9 +188,10 @@ struct VernonProgramExecutable {
     std::string id;
     uint64_t programGraphId{};
     const std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> executionPlan;
-    std::map<uint64_t, std::vector<uint32_t>> programGraphBoundarySlots;
-    std::map<uint32_t, std::vector<uint32_t>> programGraphStorageSlots;
-    std::map<uint64_t, VernonProgramGraphicsControlsView> programGraphGraphicsControls;
+    std::vector<uint32_t> publicParameterSlots;
+    std::unordered_set<uint32_t> bindableParameterSlots;
+    std::unordered_map<uint64_t, std::vector<uint32_t>> bindingAliases;
+    std::unordered_set<uint64_t> graphicsControlKeys;
     std::map<VernonProgramNodeId, ProgramGraphNodeAutodiffState> programGraphNodeAutodiff;
     CanonicalProgramAutodiffState programAutodiff;
 };

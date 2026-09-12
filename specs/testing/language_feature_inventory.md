@@ -264,8 +264,8 @@ compile failure with the stated stable reason, never a runtime skip.
 
 ### `LANG-INTEROP-001` — RawBuffer boundary
 
-- Valid: runtime-only `vd.interop.RawBuffer` with explicit external byte ABI
-  and typed-view validation.
+- Valid: runtime-only `vd.interop.RawBuffer` copy-in with explicit byte ABI,
+  owned storage, no mutable source alias, and typed-view validation.
 - Invalid: RawBuffer in kernel, shader, or shared-function annotations, or
   implicit typed shape/alias guarantees.
 - Capabilities: compile `none`; runtime `storage_buffers`.

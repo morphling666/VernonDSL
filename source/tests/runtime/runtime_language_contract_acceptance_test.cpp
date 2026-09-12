@@ -349,7 +349,9 @@ void runArgumentFreeTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, Vernon
     VernonProgramGraphicsControlsView controls{};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls), VERNON_STATUS_OK);
     ASSERT_EQ(graphics.bind(invocation, controls), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationExecute(invocation, 0, nullptr), VERNON_STATUS_OK)
+        << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
+    ASSERT_EQ(vernonRuntimeProgramInvocationCommit(invocation, nullptr), VERNON_STATUS_OK)
         << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);

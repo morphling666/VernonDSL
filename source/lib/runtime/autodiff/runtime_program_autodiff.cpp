@@ -14,6 +14,7 @@
 #include "runtime/program_execution/publication_transaction.h"
 #include "runtime/program_execution/resolved_transfer_executor.h"
 #include "runtime/program_execution_manifest.h"
+#include "runtime/program_invocation_context.h"
 #include "runtime/runtime_dispatch.h"
 #include "runtime/runtime_state.h"
 #include "runtime_autodiff_memory_usage.h"
@@ -609,11 +610,13 @@ private:
             return error = "Program pullback retention requires a differentiated Program", false;
         ProgramResidualPlan plan;
         uint64_t memoryBudget = context_->autodiffMemoryPolicy->invocationLimit();
-        const bool rematerializeTapes = programAutodiff_->checkpointMemoryBudget.has_value();
+        const ProgramInvocationContext *invocation = arena.invocationContext();
+        const bool rematerializeTapes = invocation && invocation->checkpointMemoryBudget.has_value();
         if (rematerializeTapes)
-            memoryBudget = *programAutodiff_->checkpointMemoryBudget;
+            memoryBudget = *invocation->checkpointMemoryBudget;
+        const std::string_view checkpointPolicy = invocation ? invocation->checkpointPolicy : std::string_view{};
         if (!planProgramResiduals(*execution, topology.get(), stagePlan_, arena.values(), tapeScratch, memoryBudget,
-                                  programAutodiff_->checkpointPolicy, rematerializeTapes, plan, error))
+                                  checkpointPolicy, rematerializeTapes, plan, error))
             return false;
         for (uint32_t value : plan.retainedValues) {
             if (value >= arena.values().size())
@@ -677,8 +680,11 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
         invocationDiagnostic(*pipeline.context) = "Program execution topology requires a forward graph";
         return false;
     }
-    if (!pipeline.context->autodiffMemoryPolicy)
-        pipeline.context->autodiffMemoryPolicy = std::make_shared<AutodiffMemoryPolicy>();
+    {
+        std::lock_guard lock(pipeline.context->autodiffMemoryPolicyMutex);
+        if (!pipeline.context->autodiffMemoryPolicy)
+            pipeline.context->autodiffMemoryPolicy = std::make_shared<AutodiffMemoryPolicy>();
+    }
     auto executable = std::make_shared<ProgramExecutable>(*pipeline.context, pipeline.executionPlan, state,
                                                           StageBindingPlan{}, &pipeline.programGraphNodeAutodiff);
     std::vector<AutodiffDerivativeGroup> groups = derivativeGroups;

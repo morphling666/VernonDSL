@@ -39,22 +39,6 @@ class _CookedProgramPullback:
                     self.gradient_groups,
                     self.cotangent_groups,
                     self.carrier_shape,
-                    False,
-                    context,
-                    lambda requests: _DispatchBorrowLease(list(requests), context),
-                )
-            )
-
-    def apply_logical(self, cotangent: Any) -> dict[str, Any]:
-        with _use_invocation_context(self.context):
-            context = _execution_context()
-            return dict(
-                self.native.apply_grouped(
-                    cotangent,
-                    self.gradient_groups,
-                    self.cotangent_groups,
-                    self.carrier_shape,
-                    True,
                     context,
                     lambda requests: _DispatchBorrowLease(list(requests), context),
                 )
@@ -188,10 +172,11 @@ class CookedProgram:
                     loaded.binding_cache.bind_sampler(builder, native, parameter, value)
                 else:
                     loaded.binding_cache.bind_argument(builder, native, parameter, value)
-            outcome = native_invocation.forward()
+            outcome = native_invocation.execute()
             lease.resolve(outcome)
             if not outcome.ok:
                 _raise_invocation_error(outcome, "cooked Program forward failed", context)
+            native_invocation.commit()
 
     def vjp(
         self,
@@ -247,8 +232,11 @@ class CookedProgram:
                 for parameter in parameters:
                     value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
                     loaded.binding_cache.bind_argument(builder, native, parameter, value)
-                outcome, output, native_pullback = native.program_vjp_bound(native_invocation, bindings)
-                lease.resolve(outcome)
+                outcome, output, native_pullback = native.program_vjp_transaction(
+                    native_invocation,
+                    bindings,
+                    lease.resolve,
+                )
                 if not outcome.ok:
                     _raise_invocation_error(outcome, "cooked Program autodiff forward failed", context)
         except BaseException:

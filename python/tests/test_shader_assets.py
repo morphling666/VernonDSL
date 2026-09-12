@@ -1290,7 +1290,8 @@ asset = vd.program_asset(id="module/square", program=Square())
                                     ("test", parameter.slot),
                                     lambda prepared=prepared: prepared,
                                 )
-                        invocation.forward()
+                        outcome = invocation.execute()
+                        self.assertTrue(outcome.ok, outcome.error)
                         invocation.commit()
                         if output_buffer is not None:
                             return np.frombuffer(output_buffer.download(), dtype=np.float32)

@@ -47,7 +47,7 @@ class _ProgramDeployment:
 
 
 def _bind_program_graphics_controls(
-    executable: Any,
+    native_invocation: Any,
     cache: _PersistentBindingTable,
     invocation: Any,
     context: Any,
@@ -70,7 +70,7 @@ def _bind_program_graphics_controls(
         render_slot, render_pass = controls["render_pass"]
         draw_slot, draw = controls["draw"]
         dynamic_slot, dynamic = controls["dynamic_state"]
-        builder = executable.invocation_builder()
+        builder = native_invocation.control_builder()
         colors = tuple(render_pass.target._color_attachments())
         color_operations = dict(render_pass.colors)
         for location, texture in colors:
@@ -231,7 +231,7 @@ def _bound_program_invocation(
                         host_value=slot.get("category") == "value",
                         annotation=invocation.input_annotations.get(path),
                     )
-            _bind_program_graphics_controls(executable, cache, invocation, context)
+            _bind_program_graphics_controls(native_invocation, cache, invocation, context)
             yield builder, native_invocation, lease, resolved
     finally:
         lease.release()
@@ -306,7 +306,6 @@ class ProgramNativePullback:
                 self._gradient_groups,
                 self._cotangent_groups,
                 carrier_shape,
-                False,
                 context,
                 lambda requests: _admit_pullback_accesses(requests, context),
             )
@@ -404,13 +403,13 @@ class ProgramAutodiffSpecialization:
             lease,
             _,
         ):
-            outcome, native_outputs, native_pullback = executable.program_vjp_bound(
+            outcome, native_outputs, native_pullback = executable.program_vjp_transaction(
                 native_invocation,
                 program_bindings,
+                lease.resolve,
                 checkpoint_memory_budget=checkpoint_memory_budget,
                 checkpoint_policy=checkpoint_policy,
             )
-            lease.resolve(outcome)
             if not outcome.ok:
                 _raise_invocation_error(outcome, "Program autodiff forward failed", context)
         derivative_groups = _program_derivative_groups(executable)
@@ -449,11 +448,17 @@ class ProgramSpecialization:
 
         executable = self._loaded_executable()
         targets = flatten_program_outputs(invocation.outputs)
-        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (_, _, lease, _):
-            outcome = self.binding_cache.forward()
+        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
+            _,
+            native_invocation,
+            lease,
+            _,
+        ):
+            outcome = native_invocation.execute()
             lease.resolve(outcome)
             if not outcome.ok:
                 _raise_invocation_error(outcome, "Program invocation failed", _execution_context())
+            native_invocation.commit()
         return invocation.outputs
 
 

@@ -15,7 +15,7 @@ released version is 0.1.1. These contract numbers remain fixed throughout the
 - Cooked assets contain one Program plus target-specific ArtifactSystem
   variants and content-addressed Stage artifacts.
 - The public C/C++ lifecycle is bundle → executable → instance → invocation →
-  bind → forward.
+  bind → execute → commit or rollback.
 - Runtime owns command recording and submission internally.
 - Legacy pipeline manifests, profile executors, Stage binding tables, direct
   asset submit paths, and compatibility normalization were removed.

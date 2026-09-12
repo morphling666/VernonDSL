@@ -12,6 +12,7 @@
 #include "runtime/program_execution/device_commands.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/materialized_node_frame.h"
+#include "runtime/program_execution/program_boundary_contract.h"
 #include "runtime/program_execution/program_forward.h"
 #include "runtime/program_execution/program_invocation_state.h"
 #include "runtime/program_execution/resolved_transfer_executor.h"
@@ -45,21 +46,25 @@
 #include <utility>
 #include <vector>
 
-struct RuntimeProgramBinding {
-    VernonProgramArgument argument{};
+struct RuntimeProgramBindingMetadata {
     std::vector<uint64_t> shape;
     std::vector<int64_t> strides;
     std::string layoutHash;
     std::vector<VernonValueLeafView> leaves;
+};
+
+struct RuntimeProgramBinding {
+    VernonProgramArgument argument{};
+    std::shared_ptr<const RuntimeProgramBindingMetadata> metadata;
     std::shared_ptr<void> lease;
 
     void refresh() {
         if (argument.kind != VERNON_PROGRAM_TENSOR)
             return;
-        argument.tensor.shape = shape.empty() ? nullptr : shape.data();
-        argument.tensor.byte_strides = strides.empty() ? nullptr : strides.data();
-        argument.tensor.element_layout.layout_hash = {layoutHash.data(), layoutHash.size()};
-        argument.tensor.element_layout.leaves = leaves.empty() ? nullptr : leaves.data();
+        argument.tensor.shape = metadata->shape.empty() ? nullptr : metadata->shape.data();
+        argument.tensor.byte_strides = metadata->strides.empty() ? nullptr : metadata->strides.data();
+        argument.tensor.element_layout.layout_hash = {metadata->layoutHash.data(), metadata->layoutHash.size()};
+        argument.tensor.element_layout.leaves = metadata->leaves.empty() ? nullptr : metadata->leaves.data();
     }
 };
 
@@ -85,8 +90,7 @@ struct RuntimeProgramControl {
 struct RuntimeProgramInstanceState {
     RuntimeProgramInstanceState(VernonProgramExecutable &value, vernon::runtime::RuntimeChildLifecycle childLifecycle,
                                 vernon::OwnerRef invocationOwner) noexcept
-        : lifecycle(std::move(childLifecycle)), owner(std::move(invocationOwner)), pipeline(&value), bindings(&value),
-          controls(&value) {}
+        : lifecycle(std::move(childLifecycle)), owner(std::move(invocationOwner)), pipeline(&value), bindings(&value) {}
     ~RuntimeProgramInstanceState() noexcept {
         if (!lifecycle.published())
             return;
@@ -101,7 +105,6 @@ struct RuntimeProgramInstanceState {
     vernon::OwnerRef owner;
     VernonProgramExecutable *pipeline;
     vernon::runtime::program::ProgramInstance bindings;
-    vernon::runtime::program::ProgramInstance controls;
 };
 
 struct VernonProgramInstance {
@@ -111,16 +114,22 @@ struct VernonProgramInstance {
 };
 
 struct VernonProgramInvocation {
-    VernonProgramInvocation(VernonProgramInstance &value, vernon::runtime::RuntimeChildLifecycle childLifecycle)
-        : instance(value.state), lifecycle(std::move(childLifecycle)),
-          transaction(instance->bindings.beginInvocation()), controlTransaction(instance->controls.beginInvocation()) {}
+    VernonProgramInvocation(VernonProgramInstance &value, vernon::runtime::RuntimeChildLifecycle childLifecycle,
+                            std::unique_ptr<vernon::runtime::program::BindingTransaction> bindingTransaction) noexcept
+        : instance(value.state), lifecycle(std::move(childLifecycle)), transaction(std::move(bindingTransaction)) {}
+    ~VernonProgramInvocation() {
+        if (pendingPullback)
+            vernonProgramPullbackDestroy(pendingPullback);
+    }
     std::shared_ptr<RuntimeProgramInstanceState> instance;
     vernon::runtime::RuntimeChildLifecycle lifecycle;
     std::unique_ptr<vernon::runtime::program::BindingTransaction> transaction;
-    std::unique_ptr<vernon::runtime::program::BindingTransaction> controlTransaction;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> snapshot;
-    std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> controlSnapshot;
     std::map<VernonProgramNodeId, std::unique_ptr<vernon::runtime::ad::PullbackExecution>> nodePullbacks;
+    VernonPullback *pendingPullback{};
+    std::optional<uint64_t> checkpointMemoryBudget;
+    std::string checkpointPolicy;
+    bool executed{};
     bool finished{};
     bool succeeded{};
 };
@@ -156,7 +165,7 @@ struct VernonProgramGraph {
 };
 
 namespace {
-uint32_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind);
+uint64_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind);
 
 struct RuntimeDiagnosticState {
     std::string pending;
@@ -327,6 +336,75 @@ const program::BoundarySlot *findPublicBoundary(const program::Program &program,
                    (name.size == 0 || std::equal(name.data, name.data + name.size, slot.path.data()));
         });
     return found == program.abi.boundarySlots.end() ? nullptr : &*found;
+}
+
+const program::BoundarySlot *parameterBoundaryAt(const VernonProgramExecutable &pipeline, size_t index) {
+    const program::Program &program = *executableProgram(pipeline);
+    if (!pipeline.programGraphId)
+        return publicBoundaryAt(program, index);
+    if (index >= pipeline.publicParameterSlots.size())
+        return nullptr;
+    const uint32_t slot = pipeline.publicParameterSlots[index];
+    return slot < program.abi.boundarySlots.size() ? &program.abi.boundarySlots[slot] : nullptr;
+}
+
+const program::BoundarySlot *findParameterBoundary(const VernonProgramExecutable &pipeline, VernonStringView name) {
+    if (!pipeline.programGraphId)
+        return findPublicBoundary(*executableProgram(pipeline), name);
+    for (size_t index = 0; index < pipeline.publicParameterSlots.size(); ++index) {
+        const program::BoundarySlot *slot = parameterBoundaryAt(pipeline, index);
+        if (slot && name.size == slot->path.size() &&
+            (!name.size || std::equal(name.data, name.data + name.size, slot->path.data())))
+            return slot;
+    }
+    return nullptr;
+}
+
+uint64_t programOwnerKey(const program::ProgramOwnerId &owner) {
+    return (static_cast<uint64_t>(owner.kind) << 32) | owner.id;
+}
+
+uint64_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind) {
+    return (static_cast<uint64_t>(kind) + 1) << 32 | slot;
+}
+
+void buildExecutableBindingIndex(VernonProgramExecutable &pipeline) {
+    const program::Program &program = *executableProgram(pipeline);
+    pipeline.bindableParameterSlots.clear();
+    pipeline.bindingAliases.clear();
+    pipeline.graphicsControlKeys.clear();
+    if (pipeline.programGraphId)
+        pipeline.bindableParameterSlots.insert(pipeline.publicParameterSlots.begin(),
+                                               pipeline.publicParameterSlots.end());
+    for (const program::BoundarySlot &slot : program.abi.boundarySlots) {
+        if (!pipeline.programGraphId && publicBoundarySlot(program, slot))
+            pipeline.bindableParameterSlots.insert(slot.id);
+        if (publicBoundarySlot(program, slot))
+            pipeline.bindingAliases[programOwnerKey(slot.aliasOwner)].push_back(slot.id);
+    }
+    for (const program::Graph &graph : program.graphs)
+        for (const program::Node &node : graph.nodes)
+            if (program::executionKind(node) == program::ExecutionKind::Graphics) {
+                const program::GraphicsOperation &graphics = program::graphicsOperation(node);
+                pipeline.graphicsControlKeys.insert(
+                    programControlKey(graphics.renderPassControl, RuntimeProgramControl::RenderPass));
+                pipeline.graphicsControlKeys.insert(
+                    programControlKey(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand));
+                pipeline.graphicsControlKeys.insert(
+                    programControlKey(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState));
+            }
+}
+
+bool bindableParameterSlot(const VernonProgramExecutable &pipeline, uint32_t slot) {
+    return pipeline.bindableParameterSlots.find(slot) != pipeline.bindableParameterSlots.end();
+}
+
+const std::vector<uint32_t> *bindingAliasSlots(const VernonProgramExecutable &pipeline, uint32_t slot) {
+    const program::Program &program = *executableProgram(pipeline);
+    if (slot >= program.abi.boundarySlots.size())
+        return nullptr;
+    const auto found = pipeline.bindingAliases.find(programOwnerKey(program.abi.boundarySlots[slot].aliasOwner));
+    return found == pipeline.bindingAliases.end() ? nullptr : &found->second;
 }
 
 std::optional<program::BoundaryRole> reflectedBoundaryRole(VernonProgramBoundaryRole boundary) {
@@ -902,16 +980,6 @@ bool fillParameterView(const Parameter &source, VernonProgramParameterView &dest
 
 bool fillBoundaryParameterView(const VernonProgramExecutable &pipeline, const program::BoundarySlot &source,
                                VernonProgramParameterView &destination) {
-    VernonProgramArgumentKind kind = VERNON_PROGRAM_TENSOR;
-    if (source.category == program::BoundaryCategory::Texture)
-        kind = VERNON_PROGRAM_IMAGE;
-    else if (source.category == program::BoundaryCategory::Sampler)
-        kind = VERNON_PROGRAM_SAMPLER;
-    VernonValueAccess access = VERNON_ACCESS_READ;
-    if (source.access == program::BoundaryAccess::Write)
-        access = VERNON_ACCESS_WRITE;
-    else if (source.access == program::BoundaryAccess::ReadWrite)
-        access = VERNON_ACCESS_READ_WRITE;
     const ValueLayout *layout = boundaryLayoutView(pipeline, source);
     if ((source.category == program::BoundaryCategory::Value ||
          source.category == program::BoundaryCategory::StorageView) &&
@@ -919,9 +987,9 @@ bool fillBoundaryParameterView(const VernonProgramExecutable &pipeline, const pr
         return false;
     destination = {source.id,
                    {source.path.data(), source.path.size()},
-                   kind,
+                   program_execution::boundaryArgumentKind(source.category),
                    layout ? valueLayoutView(*layout) : VernonValueLayoutView{},
-                   access,
+                   program_execution::boundaryValueAccess(source.access),
                    static_cast<uint32_t>(source.outerShape.size()),
                    source.outerShape.empty() ? nullptr : source.outerShape.data()};
     return true;
@@ -993,28 +1061,6 @@ const program::BoundarySlot *programGraphBoundary(const VernonProgramGraph &grap
     return token->local_slot < boundaries.size() && boundaries[token->local_slot].id == token->local_slot
                ? &boundaries[token->local_slot]
                : nullptr;
-}
-
-VernonStatus bindProgramGraphSlots(VernonProgramInvocation *invocation, const std::vector<uint32_t> &slots,
-                                   uint32_t domain, const VernonProgramArgument &argument,
-                                   const VernonProgramResourceLease *lease, uint64_t uploadBytes,
-                                   uint64_t uploadRanges) {
-    struct BindingIdentity {
-        uint32_t domain;
-        uint32_t slot;
-    };
-    for (uint32_t slot : slots) {
-        VernonProgramArgument remapped = argument;
-        remapped.slot = slot;
-        const BindingIdentity bindingIdentity{domain, slot};
-        const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), &bindingIdentity,
-                                              sizeof(bindingIdentity)};
-        const VernonStatus status =
-            vernonRuntimeProgramInvocationBind(invocation, &token, &remapped, lease, uploadBytes, uploadRanges);
-        if (status != VERNON_STATUS_OK)
-            return status;
-    }
-    return VERNON_STATUS_OK;
 }
 
 } // namespace
@@ -1125,9 +1171,7 @@ VernonStatus vernonRuntimeProgramGraphFindBoundary(const VernonProgramGraph *gra
     token->graph_id = graph->id;
     token->node = node;
     token->local_slot = found->id;
-    token->kind = found->category == program::BoundaryCategory::Texture   ? VERNON_PROGRAM_IMAGE
-                  : found->category == program::BoundaryCategory::Sampler ? VERNON_PROGRAM_SAMPLER
-                                                                          : VERNON_PROGRAM_TENSOR;
+    token->kind = vernon::runtime::program_execution::boundaryArgumentKind(found->category);
     return VERNON_STATUS_OK;
 }
 
@@ -1280,76 +1324,6 @@ VernonStatus vernonRuntimeProgramGraphExportStorage(VernonProgramGraph *graph, c
     return vernonRuntimeProgramGraphExportBoundary(graph, &token, graphName);
 }
 
-VernonStatus vernonRuntimeProgramGraphFindGraphicsNode(const VernonProgramGraph *graph, VernonProgramNodeId node,
-                                                       VernonStringView name, VernonProgramNodeGraphicsToken *token) {
-    RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
-    if (!graph || !token || token->struct_size < sizeof(*token) || !name.data || !name.size ||
-        node >= graph->nodes.size())
-        return fail(graph ? graph->context : nullptr, "invalid ProgramGraph graphics node lookup");
-    auto graphPin = graph->lifecycle.pin();
-    if (graphPin.isErr())
-        return fail(graph->context, "ProgramGraph is closing");
-    const auto findNode = [&](const ProgramVariantDeployment &deployment) -> const program::Node * {
-        const program::Graph *forward = program::findGraph(deployment.program, "forward");
-        if (!forward)
-            return nullptr;
-        const auto found = std::find_if(forward->nodes.begin(), forward->nodes.end(), [&](const program::Node &entry) {
-            return program::executionKind(entry) == program::ExecutionKind::Graphics &&
-                   stringViewEquals(name, entry.name);
-        });
-        return found == forward->nodes.end() ? nullptr : &*found;
-    };
-    const program::Node *selected = findNode(graph->nodes[node].deployment);
-    if (!selected)
-        return fail(graph->context, "ProgramGraph graphics node was not found");
-    token->graph_id = graph->id;
-    token->node = node;
-    token->local_node = selected->id;
-    return VERNON_STATUS_OK;
-}
-
-size_t vernonRuntimeProgramGraphGetGraphicsNodeCount(const VernonProgramGraph *graph, VernonProgramNodeId node) {
-    if (!graph || node >= graph->nodes.size())
-        return 0;
-    auto graphPin = graph->lifecycle.pin();
-    if (graphPin.isErr())
-        return 0;
-    const program::Graph *forward = program::findGraph(graph->nodes[node].deployment.program, "forward");
-    return forward ? static_cast<size_t>(std::count_if(forward->nodes.begin(), forward->nodes.end(),
-                                                       [](const program::Node &candidate) {
-                                                           return program::executionKind(candidate) ==
-                                                                  program::ExecutionKind::Graphics;
-                                                       }))
-                   : 0;
-}
-
-VernonStatus vernonRuntimeProgramGraphGetGraphicsNodeByIndex(const VernonProgramGraph *graph, VernonProgramNodeId node,
-                                                             size_t index, VernonProgramNodeGraphicsToken *token) {
-    RuntimeDiagnosticScope diagnostic(graph ? graph->context : nullptr);
-    if (!graph || !token || token->struct_size < sizeof(*token) || node >= graph->nodes.size())
-        return fail(graph ? graph->context : nullptr, "invalid ProgramGraph graphics node index");
-    auto graphPin = graph->lifecycle.pin();
-    if (graphPin.isErr())
-        return fail(graph->context, "ProgramGraph is closing");
-    const auto findNode = [&](const ProgramVariantDeployment &deployment) -> const program::Node * {
-        const program::Graph *forward = program::findGraph(deployment.program, "forward");
-        if (!forward)
-            return nullptr;
-        size_t current = 0;
-        for (const program::Node &candidate : forward->nodes)
-            if (program::executionKind(candidate) == program::ExecutionKind::Graphics && current++ == index)
-                return &candidate;
-        return nullptr;
-    };
-    const program::Node *selected = findNode(graph->nodes[node].deployment);
-    if (!selected)
-        return fail(graph->context, "ProgramGraph graphics node index is out of range");
-    token->graph_id = graph->id;
-    token->node = node;
-    token->local_node = selected->id;
-    return VERNON_STATUS_OK;
-}
-
 VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *graph) {
     if (!graph)
         return nullptr;
@@ -1420,41 +1394,14 @@ VernonProgramExecutable *vernonRuntimeResolveProgramGraph(VernonProgramGraph *gr
         }
         executable->id = linked.id;
         executable->programGraphId = graph->id;
-        for (const auto &[key, slot] : linked.boundarySlots) {
-            const program::ProgramOwnerId owner = linked.deployment.program.abi.boundarySlots[slot].aliasOwner;
-            std::vector<uint32_t> aliases;
-            for (const program::BoundarySlot &candidate : linked.deployment.program.abi.boundarySlots)
-                if (candidate.aliasOwner.kind == owner.kind && candidate.aliasOwner.id == owner.id)
-                    aliases.push_back(candidate.id);
-            executable->programGraphBoundarySlots.emplace((static_cast<uint64_t>(key.node) << 32) | key.slot,
-                                                          std::move(aliases));
+        executable->publicParameterSlots.reserve(graph->exports.size());
+        for (const ProgramGraphExport &exported : graph->exports) {
+            const uint32_t slot = linked.boundarySlots.at(exported.boundary);
+            if (std::find(executable->publicParameterSlots.begin(), executable->publicParameterSlots.end(), slot) ==
+                executable->publicParameterSlots.end())
+                executable->publicParameterSlots.push_back(slot);
         }
-        for (uint32_t storage = 0; storage < graph->storages.size(); ++storage) {
-            const ProgramGraphBoundaryKey finalBoundary = graph->storages[storage].versions.back();
-            const uint32_t slot = linked.boundarySlots.at(finalBoundary);
-            const program::ProgramOwnerId owner = linked.deployment.program.abi.boundarySlots[slot].aliasOwner;
-            std::vector<uint32_t> aliases;
-            for (const program::BoundarySlot &candidate : linked.deployment.program.abi.boundarySlots)
-                if (candidate.aliasOwner.kind == owner.kind && candidate.aliasOwner.id == owner.id)
-                    aliases.push_back(candidate.id);
-            executable->programGraphStorageSlots.emplace(storage, std::move(aliases));
-        }
-        const program::Graph *forward = program::findGraph(linked.deployment.program, "forward");
-        if (!forward)
-            throw std::logic_error("linked Program has no forward graph");
-        for (const auto &[key, globalNode] : linked.graphicsNodes) {
-            const uint32_t linkedNode = globalNode;
-            const auto node = std::find_if(forward->nodes.begin(), forward->nodes.end(),
-                                           [&](const program::Node &candidate) { return candidate.id == linkedNode; });
-            if (node == forward->nodes.end())
-                throw std::logic_error("linked graphics node is unavailable");
-            const program::GraphicsOperation &graphics = program::graphicsOperation(*node);
-            executable->programGraphGraphicsControls.emplace(
-                (static_cast<uint64_t>(key.node) << 32) | key.localNode,
-                VernonProgramGraphicsControlsView{sizeof(VernonProgramGraphicsControlsView), node->id,
-                                                  graphics.renderPassControl, graphics.drawCommandControl,
-                                                  graphics.dynamicStateControl});
-        }
+        buildExecutableBindingIndex(*executable);
         return executable.release();
     } catch (const std::exception &error) {
         fail(graph->context, error.what(), VERNON_STATUS_INTERNAL_ERROR);
@@ -1475,8 +1422,10 @@ VernonProgramExecutable *vernonRuntimeResolveProgram(VernonProgramBundle *bundle
             selectProgramDeployment(*bundle->context, bundle->deployments, selector);
         VernonProgramExecutable *executable =
             selected ? resolveProgramDeployment(*bundle->context, *selected, bundle->bundleRoot) : nullptr;
-        if (executable)
+        if (executable) {
             executable->id = bundle->id;
+            buildExecutableBindingIndex(*executable);
+        }
         return executable;
     } catch (const std::bad_alloc &) {
         fail(bundle->context, "cannot allocate resolved pipeline", VERNON_STATUS_INTERNAL_ERROR);
@@ -1495,7 +1444,8 @@ size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecut
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return 0;
-    return publicBoundaryCount(*executableProgram(*pipeline));
+    return pipeline->programGraphId ? pipeline->publicParameterSlots.size()
+                                    : publicBoundaryCount(*executableProgram(*pipeline));
 }
 
 size_t vernonRuntimeProgramExecutableGetMutationCapacity(const VernonProgramExecutable *pipeline) {
@@ -1514,7 +1464,7 @@ VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(const VernonProgr
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return vernon::toVernonStatus(pipelinePin.error());
-    const program::BoundarySlot *slot = publicBoundaryAt(*executableProgram(*pipeline), index);
+    const program::BoundarySlot *slot = parameterBoundaryAt(*pipeline, index);
     if (!slot)
         return VERNON_STATUS_INVALID_ARGUMENT;
     return fillBoundaryParameterView(*pipeline, *slot, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
@@ -1528,7 +1478,7 @@ VernonStatus vernonRuntimeProgramExecutableFindParameter(const VernonProgramExec
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return vernon::toVernonStatus(pipelinePin.error());
-    const program::BoundarySlot *slot = findPublicBoundary(*executableProgram(*pipeline), name);
+    const program::BoundarySlot *slot = findParameterBoundary(*pipeline, name);
     if (!slot)
         return VERNON_STATUS_INVALID_ARGUMENT;
     return fillBoundaryParameterView(*pipeline, *slot, *parameter) ? VERNON_STATUS_OK : VERNON_STATUS_PARSE_ERROR;
@@ -1544,7 +1494,7 @@ VernonStatus vernonRuntimeProgramExecutableGetParameterValueLeaf(const VernonPro
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return vernon::toVernonStatus(pipelinePin.error());
-    const program::BoundarySlot *slot = findPublicBoundary(*executableProgram(*pipeline), parameterName);
+    const program::BoundarySlot *slot = findParameterBoundary(*pipeline, parameterName);
     const ValueLayout *layout = slot ? boundaryLayoutView(*pipeline, *slot) : nullptr;
     if (!slot || !layout ||
         (slot->category != program::BoundaryCategory::Value &&
@@ -1643,7 +1593,7 @@ VernonStatus vernonRuntimeProgramExecutableGetImageConstraintByParameterIndex(
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return vernon::toVernonStatus(pipelinePin.error());
-    const program::BoundarySlot *slot = publicBoundaryAt(*executableProgram(*pipeline), parameterIndex);
+    const program::BoundarySlot *slot = parameterBoundaryAt(*pipeline, parameterIndex);
     return slot ? fillBoundaryImageConstraintView(*slot, *constraint) : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
@@ -1657,7 +1607,7 @@ VernonStatus vernonRuntimeProgramExecutableFindImageConstraint(const VernonProgr
     auto pipelinePin = pipeline->lifecycle.pin();
     if (pipelinePin.isErr())
         return vernon::toVernonStatus(pipelinePin.error());
-    const program::BoundarySlot *slot = findPublicBoundary(*executableProgram(*pipeline), parameterName);
+    const program::BoundarySlot *slot = findParameterBoundary(*pipeline, parameterName);
     return slot ? fillBoundaryImageConstraintView(*slot, *constraint) : VERNON_STATUS_INVALID_ARGUMENT;
 }
 
@@ -2037,7 +1987,7 @@ VernonStatus executePipelineProgramGraphImpl(
                              RuntimeProgramControl::Kind kind) -> std::shared_ptr<RuntimeProgramControl> {
         if (!invocationContext)
             return nullptr;
-        const std::shared_ptr<void> *payload = invocationContext->controls.find(programControlKey(slot, kind));
+        const std::shared_ptr<void> *payload = invocationContext->bindings.find(programControlKey(slot, kind));
         return payload ? std::static_pointer_cast<RuntimeProgramControl>(*payload) : nullptr;
     };
     std::string controlBindingError;
@@ -2047,7 +1997,6 @@ VernonStatus executePipelineProgramGraphImpl(
                 auto renderPass = control(slot, RuntimeProgramControl::RenderPass);
                 if (!renderPass)
                     return nullptr;
-                renderPass->refresh();
                 return &renderPass->renderPass;
             },
             controlBindingError))
@@ -2085,7 +2034,6 @@ VernonStatus executePipelineProgramGraphImpl(
                     return fail(&context, "managed graphics node has no bound RenderPass control");
                 auto draw = control(graphics.drawCommandControl, RuntimeProgramControl::DrawCommand);
                 auto dynamic = control(graphics.dynamicStateControl, RuntimeProgramControl::DynamicState);
-                renderPass->refresh();
                 const auto *graphicsControls = std::get_if<program::ResolvedGraphicsControls>(&resolvedNode->controls);
                 if (!graphicsControls)
                     return fail(&context, "managed graphics node has no resolved attachment controls");
@@ -2129,8 +2077,6 @@ VernonStatus executePipelineProgramGraphImpl(
                     return status;
                 if (transferCommandsAppended)
                     graphicsBatch.reset();
-                if (draw)
-                    draw->refresh();
                 auto graphicsContext = std::make_shared<ManagedGraphicsCommandContext>(
                     ManagedGraphicsCommandContext{*resolvedNode->stage, std::move(materializedNodes.back()),
                                                   std::move(renderPass), std::move(draw), std::move(dynamic)});
@@ -2492,12 +2438,93 @@ VernonProgramInvocation *vernonRuntimeProgramInstanceBeginInvocation(VernonProgr
         auto child = RuntimeChildLifecycle::reserve(instance->state->owner);
         if (child.isErr())
             return nullptr;
-        auto invocation = std::make_unique<VernonProgramInvocation>(*instance, std::move(child).value());
+        auto transaction = instance->state->bindings.beginInvocation();
+        if (transaction.isErr())
+            return nullptr;
+        auto invocation = std::make_unique<VernonProgramInvocation>(*instance, std::move(child).value(),
+                                                                    std::move(transaction).value());
         if (invocation->lifecycle.publish().isErr())
             return nullptr;
         return invocation.release();
     } catch (...) {
         return nullptr;
+    }
+}
+
+VernonStatus vernonRuntimeProgramInvocationSetAutodiffOptions(VernonProgramInvocation *invocation,
+                                                              const VernonProgramAutodiffInvocationOptions *options) {
+    VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
+                                        ? invocation->instance->pipeline->context
+                                        : nullptr;
+    try {
+        RuntimeDiagnosticScope diagnostic(context);
+        const bool reservedBytesSet =
+            options && std::any_of(std::begin(options->reserved_bytes), std::end(options->reserved_bytes),
+                                   [](uint8_t value) { return value != 0; });
+        const bool reservedWordsSet = options && std::any_of(std::begin(options->reserved), std::end(options->reserved),
+                                                             [](uint32_t value) { return value != 0; });
+        if (!invocation || invocation->executed || invocation->finished || !options ||
+            options->struct_size < sizeof(*options) ||
+            options->abi_version != VERNON_PROGRAM_AUTODIFF_INVOCATION_OPTIONS_VERSION ||
+            options->has_checkpoint_memory_budget > 1 || reservedBytesSet || reservedWordsSet ||
+            (options->checkpoint_policy.size && !options->checkpoint_policy.data))
+            return fail(context, "invalid Program autodiff invocation options");
+        auto invocationPin = invocation->lifecycle.pin();
+        if (invocationPin.isErr())
+            return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
+        std::string policy;
+        if (options->checkpoint_policy.size)
+            policy.assign(options->checkpoint_policy.data, options->checkpoint_policy.size);
+        if (!policy.empty() && policy != "min_memory" && policy != "balanced" && policy != "min_runtime")
+            return fail(context, "Program autodiff invocation checkpoint policy is invalid");
+        invocation->checkpointMemoryBudget = options->has_checkpoint_memory_budget
+                                                 ? std::optional<uint64_t>(options->checkpoint_memory_budget)
+                                                 : std::nullopt;
+        invocation->checkpointPolicy.swap(policy);
+        return VERNON_STATUS_OK;
+    } catch (const std::exception &exception) {
+        return fail(context, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
+VernonStatus vernonRuntimeProgramInvocationTryReuse(VernonProgramInvocation *invocation, uint32_t slot,
+                                                    const VernonProgramBindingToken *token, uint64_t uploadBytes,
+                                                    uint64_t uploadRanges, uint8_t *reused) {
+    VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
+                                        ? invocation->instance->pipeline->context
+                                        : nullptr;
+    try {
+        RuntimeDiagnosticScope diagnostic(context);
+        if (reused)
+            *reused = 0;
+        if (!invocation || invocation->executed || invocation->finished || !token ||
+            token->struct_size < sizeof(*token) || !token->size || !token->data || !reused)
+            return fail(context, "invalid persistent Program binding reuse query");
+        auto invocationPin = invocation->lifecycle.pin();
+        if (invocationPin.isErr())
+            return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
+        if (!bindableParameterSlot(*invocation->instance->pipeline, slot))
+            return fail(context, "Program binding reuse query does not reference an exported parameter");
+        const std::string_view key(static_cast<const char *>(token->data), token->size);
+        const std::vector<uint32_t> *aliases = bindingAliasSlots(*invocation->instance->pipeline, slot);
+        if (!aliases)
+            return fail(context, "Program binding reuse query has no resolved aliases", VERNON_STATUS_INTERNAL_ERROR);
+        bool allMatch = true;
+        for (uint32_t alias : *aliases) {
+            auto matches = invocation->transaction->matches(alias, key);
+            if (matches.isErr())
+                return fail(context, "Program binding reuse query is not in the staging phase");
+            allMatch &= matches.value();
+        }
+        if (allMatch) {
+            if (invocation->transaction->observeReuses(aliases->size()).isErr() ||
+                invocation->transaction->observeUploads(uploadBytes, uploadRanges).isErr())
+                return fail(context, "Program binding reuse telemetry is not in the staging phase");
+            *reused = 1;
+        }
+        return VERNON_STATUS_OK;
+    } catch (const std::exception &exception) {
+        return fail(context, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
     }
 }
 
@@ -2511,16 +2538,38 @@ VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocat
                                         : nullptr;
     try {
         RuntimeDiagnosticScope diagnostic(context);
-        if (!invocation || invocation->finished || !token || token->struct_size < sizeof(*token) || !token->size ||
-            !token->data || !argument || argument->kind < VERNON_PROGRAM_TENSOR ||
-            argument->kind > VERNON_PROGRAM_SAMPLER)
+        if (!invocation || invocation->executed || invocation->finished || !token ||
+            token->struct_size < sizeof(*token) || !token->size || !token->data || !argument ||
+            argument->kind < VERNON_PROGRAM_TENSOR || argument->kind > VERNON_PROGRAM_SAMPLER)
             return fail(context, "invalid persistent Program binding update");
         auto invocationPin = invocation->lifecycle.pin();
         if (invocationPin.isErr())
             return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
+        const program::Program &program = *executableProgram(*invocation->instance->pipeline);
+        if (!bindableParameterSlot(*invocation->instance->pipeline, argument->slot))
+            return fail(context, "Program binding does not reference an exported parameter");
+        const program::BoundarySlot &sourceBoundary = program.abi.boundarySlots[argument->slot];
+        if (!vernon::runtime::program_execution::argumentMatchesBoundary(sourceBoundary, *argument))
+            return fail(context, "Program binding does not match its canonical boundary contract");
         const std::string_view key(static_cast<const char *>(token->data), token->size);
-        if (invocation->transaction->find(argument->slot, key)) {
-            invocation->transaction->observeUploads(uploadBytes, uploadRanges);
+        const std::vector<uint32_t> *aliases = bindingAliasSlots(*invocation->instance->pipeline, argument->slot);
+        if (!aliases)
+            return fail(context, "Program binding has no resolved aliases", VERNON_STATUS_INTERNAL_ERROR);
+        for (uint32_t alias : *aliases) {
+            if (alias >= program.abi.boundarySlots.size() || program.abi.boundarySlots[alias].id != alias)
+                return fail(context, "Program binding alias does not reference a canonical boundary slot");
+        }
+        bool allMatch = true;
+        for (uint32_t alias : *aliases) {
+            auto matches = invocation->transaction->matches(alias, key);
+            if (matches.isErr())
+                return fail(context, "Program binding update is not in the staging phase");
+            allMatch &= matches.value();
+        }
+        if (allMatch) {
+            if (invocation->transaction->observeReuses(aliases->size()).isErr() ||
+                invocation->transaction->observeUploads(uploadBytes, uploadRanges).isErr())
+                return fail(context, "Program binding telemetry update is not in the staging phase");
             return VERNON_STATUS_OK;
         }
         auto binding = std::make_shared<RuntimeProgramBinding>();
@@ -2533,129 +2582,53 @@ VernonStatus vernonRuntimeProgramInvocationBind(VernonProgramInvocation *invocat
                 (tensor.element_layout.layout_hash.size && !tensor.element_layout.layout_hash.data) ||
                 (tensor.element_layout.leaf_count && !tensor.element_layout.leaves))
                 return fail(context, "persistent Program Tensor binding has incomplete metadata");
+            auto metadata = std::make_shared<RuntimeProgramBindingMetadata>();
             if (tensor.rank) {
-                binding->shape.assign(tensor.shape, tensor.shape + tensor.rank);
-                binding->strides.assign(tensor.byte_strides, tensor.byte_strides + tensor.rank);
+                metadata->shape.assign(tensor.shape, tensor.shape + tensor.rank);
+                metadata->strides.assign(tensor.byte_strides, tensor.byte_strides + tensor.rank);
             }
             if (tensor.element_layout.layout_hash.size)
-                binding->layoutHash.assign(tensor.element_layout.layout_hash.data,
-                                           tensor.element_layout.layout_hash.size);
+                metadata->layoutHash.assign(tensor.element_layout.layout_hash.data,
+                                            tensor.element_layout.layout_hash.size);
             if (tensor.element_layout.leaf_count)
-                binding->leaves.assign(tensor.element_layout.leaves,
-                                       tensor.element_layout.leaves + tensor.element_layout.leaf_count);
+                metadata->leaves.assign(tensor.element_layout.leaves,
+                                        tensor.element_layout.leaves + tensor.element_layout.leaf_count);
+            binding->metadata = std::move(metadata);
         }
         if (lease) {
             if (lease->struct_size < sizeof(*lease) || (lease->retain == nullptr) != (lease->release == nullptr))
                 return fail(context, "persistent Program resource lease is invalid");
             if (lease->retain) {
                 lease->retain(lease->object);
-                binding->lease =
-                    std::shared_ptr<void>(lease->object, [release = lease->release](void *object) { release(object); });
+                std::shared_ptr<void> retained(lease->object,
+                                               [release = lease->release](void *object) { release(object); });
+                binding->lease = std::move(retained);
             }
         }
         binding->refresh();
-        invocation->transaction->stage(argument->slot, std::string(key), binding, uploadBytes, uploadRanges);
+        std::vector<std::pair<uint64_t, vernon::runtime::program::BindingEntry>> staged;
+        staged.reserve(aliases->size());
+        for (uint32_t alias : *aliases) {
+            auto remapped = std::make_shared<RuntimeProgramBinding>(*binding);
+            remapped->argument.slot = alias;
+            if (remapped->argument.kind == VERNON_PROGRAM_TENSOR) {
+                const program::BoundarySlot &boundary = program.abi.boundarySlots[alias];
+                remapped->argument.tensor.access =
+                    vernon::runtime::program_execution::boundaryValueAccess(boundary.access);
+            }
+            remapped->refresh();
+            staged.emplace_back(alias, vernon::runtime::program::BindingEntry{std::string(key), std::move(remapped)});
+        }
+        if (invocation->transaction->stageMany(std::move(staged), uploadBytes, uploadRanges).isErr())
+            return fail(context, "cannot stage persistent Program binding", VERNON_STATUS_INTERNAL_ERROR);
         return VERNON_STATUS_OK;
     } catch (const std::exception &exception) {
         return fail(context, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
     }
 }
 
-VernonStatus vernonRuntimeProgramInvocationBindNode(VernonProgramInvocation *invocation,
-                                                    const VernonProgramNodeBindingToken *nodeToken,
-                                                    const VernonProgramArgument *argument,
-                                                    const VernonProgramResourceLease *lease, uint64_t uploadBytes,
-                                                    uint64_t uploadRanges) {
-    VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
-                                        ? invocation->instance->pipeline->context
-                                        : nullptr;
-    RuntimeDiagnosticScope diagnostic(context);
-    if (!invocation || !nodeToken || nodeToken->struct_size < sizeof(*nodeToken) || !argument ||
-        argument->kind != nodeToken->kind || nodeToken->graph_id != invocation->instance->pipeline->programGraphId)
-        return fail(context, "invalid ProgramGraph node binding");
-    auto invocationPin = invocation->lifecycle.pin();
-    if (invocationPin.isErr())
-        return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
-    const uint64_t identity = (static_cast<uint64_t>(nodeToken->node) << 32) | nodeToken->local_slot;
-    const auto found = invocation->instance->pipeline->programGraphBoundarySlots.find(identity);
-    if (found == invocation->instance->pipeline->programGraphBoundarySlots.end())
-        return fail(context, "ProgramGraph node binding is not an external graph boundary");
-    return bindProgramGraphSlots(invocation, found->second, 0x50474e44, *argument, lease, uploadBytes, uploadRanges);
-}
-
-VernonStatus vernonRuntimeProgramInvocationBindGraphStorage(VernonProgramInvocation *invocation,
-                                                            const VernonProgramGraphStorage *storage,
-                                                            const VernonProgramArgument *argument,
-                                                            const VernonProgramResourceLease *lease,
-                                                            uint64_t uploadBytes, uint64_t uploadRanges) {
-    VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
-                                        ? invocation->instance->pipeline->context
-                                        : nullptr;
-    RuntimeDiagnosticScope diagnostic(context);
-    if (!invocation || !storage || storage->struct_size < sizeof(*storage) || !argument ||
-        argument->kind != storage->kind || storage->graph_id != invocation->instance->pipeline->programGraphId)
-        return fail(context, "invalid ProgramGraph Storage binding");
-    auto invocationPin = invocation->lifecycle.pin();
-    if (invocationPin.isErr())
-        return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
-    const auto found = invocation->instance->pipeline->programGraphStorageSlots.find(storage->id);
-    if (found == invocation->instance->pipeline->programGraphStorageSlots.end())
-        return fail(context, "ProgramGraph Storage is not externally bindable");
-    return bindProgramGraphSlots(invocation, found->second, 0x50475354, *argument, lease, uploadBytes, uploadRanges);
-}
-
-VernonStatus vernonRuntimeProgramInvocationBindNodeGraphics(
-    VernonProgramInvocation *invocation, const VernonProgramNodeGraphicsToken *node, const VernonRenderPass *renderPass,
-    const VernonProgramResourceLease *renderPassLeases, size_t renderPassLeaseCount, const VernonDrawCommand *draw,
-    const VernonProgramResourceLease *drawLease, const VernonDynamicState *dynamicState) {
-    VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
-                                        ? invocation->instance->pipeline->context
-                                        : nullptr;
-    RuntimeDiagnosticScope diagnostic(context);
-    if (!invocation || !node || node->struct_size < sizeof(*node) || !renderPass || !draw || !dynamicState ||
-        node->graph_id != invocation->instance->pipeline->programGraphId)
-        return fail(context, "invalid ProgramGraph graphics binding");
-    auto invocationPin = invocation->lifecycle.pin();
-    if (invocationPin.isErr())
-        return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
-    const uint64_t identity = (static_cast<uint64_t>(node->node) << 32) | node->local_node;
-    const auto found = invocation->instance->pipeline->programGraphGraphicsControls.find(identity);
-    if (found == invocation->instance->pipeline->programGraphGraphicsControls.end())
-        return fail(context, "ProgramGraph graphics node is not part of this executable");
-    struct ControlIdentity {
-        uint32_t domain;
-        uint32_t node;
-        uint32_t kind;
-    };
-    const ControlIdentity renderIdentity{0x50474354, found->second.node, 0};
-    const VernonProgramBindingToken renderToken{sizeof(VernonProgramBindingToken), &renderIdentity,
-                                                sizeof(renderIdentity)};
-    VernonStatus status =
-        vernonRuntimeProgramInvocationBindRenderPass(invocation, found->second.render_pass_control, &renderToken,
-                                                     renderPass, renderPassLeases, renderPassLeaseCount);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    const ControlIdentity drawIdentity{0x50474354, found->second.node, 1};
-    const VernonProgramBindingToken drawToken{sizeof(VernonProgramBindingToken), &drawIdentity, sizeof(drawIdentity)};
-    status = vernonRuntimeProgramInvocationBindDrawCommand(invocation, found->second.draw_command_control, &drawToken,
-                                                           draw, drawLease);
-    if (status != VERNON_STATUS_OK)
-        return status;
-    const ControlIdentity dynamicIdentity{0x50474354, found->second.node, 2};
-    const VernonProgramBindingToken dynamicToken{sizeof(VernonProgramBindingToken), &dynamicIdentity,
-                                                 sizeof(dynamicIdentity)};
-    return vernonRuntimeProgramInvocationBindDynamicState(invocation, found->second.dynamic_state_control,
-                                                          &dynamicToken, dynamicState);
-}
-
 extern "C++" {
 namespace {
-uint32_t programControlKey(uint32_t slot, RuntimeProgramControl::Kind kind) {
-    if (slot > (UINT32_MAX - static_cast<uint32_t>(kind)) / 3)
-        throw std::invalid_argument("Program control slot is out of range");
-    return slot * 3 + static_cast<uint32_t>(kind);
-}
-
 std::string_view programControlToken(const VernonProgramBindingToken *token) {
     if (!token || token->struct_size < sizeof(*token) || !token->data || !token->size)
         throw std::invalid_argument("Program control binding token is invalid");
@@ -2668,7 +2641,8 @@ void retainProgramControlLease(RuntimeProgramControl &control, const VernonProgr
     if (!lease.retain)
         return;
     lease.retain(lease.object);
-    control.leases.emplace_back(lease.object, [release = lease.release](void *object) { release(object); });
+    std::shared_ptr<void> retained(lease.object, [release = lease.release](void *object) { release(object); });
+    control.leases.push_back(std::move(retained));
 }
 
 VernonStatus stageProgramControl(VernonProgramInvocation *invocation, uint32_t slot,
@@ -2677,17 +2651,27 @@ VernonStatus stageProgramControl(VernonProgramInvocation *invocation, uint32_t s
     VernonRuntimeContext *context = invocation && invocation->instance && invocation->instance->pipeline
                                         ? invocation->instance->pipeline->context
                                         : nullptr;
-    if (!invocation || invocation->finished || !control)
+    if (!invocation || invocation->executed || invocation->finished || !control)
         return fail(context, "invalid persistent Program control update");
     auto invocationPin = invocation->lifecycle.pin();
     if (invocationPin.isErr())
         return fail(context, "Program invocation is closing", vernon::toVernonStatus(invocationPin.error()));
     const std::string_view key = programControlToken(token);
-    const uint32_t storageSlot = programControlKey(slot, control->kind);
-    if (invocation->controlTransaction->find(storageSlot, key))
+    const uint64_t storageSlot = programControlKey(slot, control->kind);
+    if (invocation->instance->pipeline->graphicsControlKeys.find(storageSlot) ==
+        invocation->instance->pipeline->graphicsControlKeys.end())
+        return fail(context, "Program control does not reference a resolved slot of the requested kind");
+    auto matches = invocation->transaction->matches(storageSlot, key);
+    if (matches.isErr())
+        return fail(context, "Program control update is not in the staging phase");
+    if (matches.value()) {
+        if (invocation->transaction->observeReuses(1).isErr())
+            return fail(context, "Program control reuse telemetry is not in the staging phase");
         return VERNON_STATUS_OK;
+    }
     control->refresh();
-    invocation->controlTransaction->stage(storageSlot, std::string(key), std::move(control), 0, 0);
+    if (invocation->transaction->stage(storageSlot, std::string(key), std::move(control), 0, 0).isErr())
+        return fail(context, "cannot stage persistent Program control", VERNON_STATUS_INTERNAL_ERROR);
     return VERNON_STATUS_OK;
 }
 } // namespace
@@ -2765,14 +2749,12 @@ VernonStatus vernonRuntimeProgramInvocationBindDynamicState(VernonProgramInvocat
     }
 }
 
-VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation, VernonPullback **outputPullback,
+VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invocation, uint8_t retainPullback,
                                                    VernonInvocationMutationOutcome *publicOutcome) {
     VernonProgramExecutable *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
     try {
         RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
-        if (outputPullback)
-            *outputPullback = nullptr;
-        if (!invocation || invocation->finished || !pipeline)
+        if (!invocation || invocation->executed || invocation->finished || !pipeline)
             return fail(pipeline ? pipeline->context : nullptr, "invalid persistent Program invocation");
         if (!vernon::runtime::program_execution::preparePublicOutcome(publicOutcome, mutationCapacity(*pipeline)))
             return fail(pipeline->context, "invalid Program mutation outcome storage");
@@ -2780,8 +2762,11 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         if (invocationPin.isErr())
             return fail(pipeline->context, "Program invocation is closing",
                         vernon::toVernonStatus(invocationPin.error()));
-        invocation->snapshot = invocation->transaction->freeze();
-        invocation->controlSnapshot = invocation->controlTransaction->freeze();
+        invocation->executed = true;
+        auto snapshot = invocation->transaction->freeze();
+        if (snapshot.isErr())
+            return fail(pipeline->context, "cannot freeze Program invocation bindings", VERNON_STATUS_INTERNAL_ERROR);
+        invocation->snapshot = std::move(snapshot).value();
         std::vector<VernonProgramArgument> arguments;
         const program::Program &program = *executableProgram(*pipeline);
         const size_t count = publicBoundaryCount(program);
@@ -2795,40 +2780,63 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
                 return fail(pipeline->context,
                             "persistent Program invocation has an unbound boundary slot '" + parameter->path + "'");
             auto binding = std::static_pointer_cast<RuntimeProgramBinding>(*payload);
-            binding->refresh();
             arguments.push_back(binding->argument);
         }
-        const ProgramInvocationContext programContext{*invocation->controlSnapshot};
+        const ProgramInvocationContext programContext{
+            *invocation->snapshot,
+            invocation->checkpointMemoryBudget,
+            invocation->checkpointPolicy,
+        };
         VernonPullback *pullback = nullptr;
         vernon::runtime::program_execution::InvocationMutationOutcome outcome;
         const VernonStatus status = vernon::runtime::program_execution::forwardProgramInvocation(
             *pipeline, arguments.data(), arguments.size(), pullback, outcome, &programContext,
-            pipeline->programGraphId && outputPullback ? &invocation->nodePullbacks : nullptr,
-            outputPullback != nullptr);
+            pipeline->programGraphId && retainPullback ? &invocation->nodePullbacks : nullptr, retainPullback != 0);
         vernon::runtime::program_execution::publishPublicOutcome(outcome, publicOutcome);
         if (status != VERNON_STATUS_OK) {
-            invocation->transaction->rollback();
-            invocation->controlTransaction->rollback();
-            invocation->finished = true;
+            if (pullback)
+                vernonProgramPullbackDestroy(pullback);
             return status;
         }
-        invocation->snapshot = invocation->transaction->commit();
-        invocation->controlSnapshot = invocation->controlTransaction->commit();
-        invocation->finished = true;
+        invocation->pendingPullback = pullback;
         invocation->succeeded = true;
-        if (pullback)
-            vernon::runtime::program_execution::attachProgramSnapshot(*pullback, invocation->snapshot);
-        if (outputPullback)
-            *outputPullback = pullback;
-        else if (pullback)
-            vernonProgramPullbackDestroy(pullback);
         return VERNON_STATUS_OK;
     } catch (const std::exception &exception) {
-        if (invocation && !invocation->finished) {
-            invocation->transaction->rollback();
-            invocation->controlTransaction->rollback();
-            invocation->finished = true;
+        if (invocation)
+            invocation->executed = true;
+        return fail(pipeline ? pipeline->context : nullptr, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
+    }
+}
+
+VernonStatus vernonRuntimeProgramInvocationCommit(VernonProgramInvocation *invocation,
+                                                  VernonPullback **outputPullback) {
+    VernonProgramExecutable *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
+    try {
+        RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+        if (outputPullback)
+            *outputPullback = nullptr;
+        if (!invocation || !invocation->executed || !invocation->succeeded || invocation->finished || !pipeline)
+            return fail(pipeline ? pipeline->context : nullptr, "invalid Program invocation commit");
+        auto invocationPin = invocation->lifecycle.pin();
+        if (invocationPin.isErr())
+            return fail(pipeline->context, "Program invocation is closing",
+                        vernon::toVernonStatus(invocationPin.error()));
+        auto snapshot = invocation->transaction->commit();
+        if (snapshot.isErr())
+            return fail(pipeline->context, "cannot commit Program invocation bindings", VERNON_STATUS_INTERNAL_ERROR);
+        invocation->snapshot = std::move(snapshot).value();
+        invocation->finished = true;
+        if (invocation->pendingPullback)
+            vernon::runtime::program_execution::attachProgramSnapshot(*invocation->pendingPullback,
+                                                                      invocation->snapshot);
+        if (outputPullback)
+            *outputPullback = std::exchange(invocation->pendingPullback, nullptr);
+        else if (invocation->pendingPullback) {
+            vernonProgramPullbackDestroy(invocation->pendingPullback);
+            invocation->pendingPullback = nullptr;
         }
+        return VERNON_STATUS_OK;
+    } catch (const std::exception &exception) {
         return fail(pipeline ? pipeline->context : nullptr, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
     }
 }
@@ -2851,17 +2859,13 @@ VernonStatus vernonRuntimeProgramInvocationGetNodePullback(VernonProgramInvocati
     const auto retained = invocation->nodePullbacks.find(node);
     if (retained == invocation->nodePullbacks.end() || !retained->second)
         return fail(pipeline->context, "ProgramGraph node pullback is unavailable");
-    try {
-        VernonPullback *pullback = vernon::runtime::program_execution::makeRetainedProgramPullback(
-            *pipeline, std::move(retained->second), invocation->snapshot);
-        invocation->nodePullbacks.erase(retained);
-        if (!pullback)
-            return fail(pipeline->context, "cannot retain ProgramGraph node pullback", VERNON_STATUS_INTERNAL_ERROR);
-        *outputPullback = pullback;
-        return VERNON_STATUS_OK;
-    } catch (const std::exception &exception) {
-        return fail(pipeline->context, exception.what(), VERNON_STATUS_INTERNAL_ERROR);
-    }
+    auto transfer = vernon::runtime::program_execution::makeRetainedProgramPullback(*pipeline, retained->second,
+                                                                                    invocation->snapshot);
+    if (transfer.isErr())
+        return fail(pipeline->context, "cannot retain ProgramGraph node pullback", VERNON_STATUS_INTERNAL_ERROR);
+    *outputPullback = std::move(transfer).value().release();
+    invocation->nodePullbacks.erase(retained);
+    return VERNON_STATUS_OK;
 }
 
 void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation) {
@@ -2871,7 +2875,12 @@ void vernonRuntimeProgramInvocationRollback(VernonProgramInvocation *invocation)
     if (invocationPin.isErr())
         return;
     invocation->transaction->rollback();
-    invocation->controlTransaction->rollback();
+    if (invocation->pendingPullback) {
+        vernonProgramPullbackDestroy(invocation->pendingPullback);
+        invocation->pendingPullback = nullptr;
+    }
+    invocation->nodePullbacks.clear();
+    invocation->succeeded = false;
     invocation->finished = true;
 }
 

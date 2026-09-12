@@ -276,7 +276,7 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("submission",
                      [](const PythonInvocationOutcome &outcome) { return static_cast<uint32_t>(outcome.submission); })
         .def_prop_ro("mutations", &PythonInvocationOutcome::mutationList);
-    nb::class_<ProgramInvocationBuilder>(module, "ProgramInvocationBuilder")
+    nb::class_<ProgramInvocationBuilder>(module, "_ProgramInvocationBuilder")
         .def("prepare_host_tensor", &ProgramInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
         .def("prepare_rhi_tensor", &ProgramInvocationBuilder::prepareRhiTensor, nb::arg("parameter"), nb::arg("buffer"),
@@ -285,17 +285,6 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("texture"))
         .def("prepare_rhi_sampler", &ProgramInvocationBuilder::prepareRhiSampler, nb::arg("parameter"),
              nb::arg("sampler"))
-        .def("prepared_argument", &ProgramInvocationBuilder::preparedArgument, nb::arg("argument"),
-             nb::rv_policy::reference_internal, nb::keep_alive<1, 2>())
-        .def("host_tensor", &ProgramInvocationBuilder::hostTensor, nb::arg("parameter"), nb::arg("array"),
-             nb::rv_policy::reference_internal)
-        .def("rhi_tensor", &ProgramInvocationBuilder::rhiTensor, nb::arg("parameter"), nb::arg("buffer"),
-             nb::arg("access"), nb::arg("shape"), nb::arg("strides"), nb::arg("offset") = 0,
-             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_texture", &ProgramInvocationBuilder::rhiTexture, nb::arg("parameter"), nb::arg("texture"),
-             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
-        .def("rhi_sampler", &ProgramInvocationBuilder::rhiSampler, nb::arg("parameter"), nb::arg("sampler"),
-             nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
         .def("rhi_color_attachment", &ProgramInvocationBuilder::rhiColorAttachment, nb::arg("location"),
              nb::arg("texture"), nb::arg("load_operation"), nb::arg("store_operation"), nb::arg("clear_color"),
              nb::rv_policy::reference_internal, nb::keep_alive<1, 3>())
@@ -317,24 +306,26 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::rv_policy::reference_internal);
     nb::class_<PythonProgramInvocationAdapter>(module, "_ProgramInvocation")
         .def_prop_ro("builder", &PythonProgramInvocationAdapter::builderView, nb::rv_policy::reference_internal)
+        .def("control_builder", &PythonProgramInvocationAdapter::newControlBuilder, nb::rv_policy::reference_internal)
         .def("bind", &PythonProgramInvocationAdapter::bind, nb::arg("slot"), nb::arg("token"), nb::arg("prepare"),
-             nb::arg("upload_bytes") = 0, nb::arg("upload_ranges") = 0, nb::arg("eager_upload") = false)
+             nb::arg("upload_bytes") = 0, nb::arg("upload_ranges") = 0, nb::arg("upload_precedes_lookup") = false)
         .def("bind_render_pass", &PythonProgramInvocationAdapter::bindRenderPass, nb::arg("slot"), nb::arg("token"),
              nb::arg("control"))
         .def("bind_draw_command", &PythonProgramInvocationAdapter::bindDrawCommand, nb::arg("slot"), nb::arg("token"),
              nb::arg("control"))
         .def("bind_dynamic_state", &PythonProgramInvocationAdapter::bindDynamicState, nb::arg("slot"), nb::arg("token"),
              nb::arg("control"))
-        .def("forward", &PythonProgramInvocationAdapter::forward, nb::call_guard<nb::gil_scoped_release>())
+        .def("execute", &PythonProgramInvocationAdapter::execute, nb::arg("retain_pullback") = false,
+             nb::call_guard<nb::gil_scoped_release>())
         .def("commit", &PythonProgramInvocationAdapter::commit)
-        .def("rollback", &PythonProgramInvocationAdapter::rollback);
+        .def("rollback", &PythonProgramInvocationAdapter::rollback)
+        .def_prop_ro("finished", &PythonProgramInvocationAdapter::isFinished);
     nb::class_<PythonProgramInstanceAdapter>(module, "ProgramInstance")
         .def("begin_invocation", &PythonProgramInstanceAdapter::beginInvocation, nb::keep_alive<0, 1>())
         .def_prop_ro("telemetry", &PythonProgramInstanceAdapter::telemetryView);
     nb::class_<PythonPullback>(module, "Pullback")
         .def("apply_grouped", &PythonPullback::applyGrouped, nb::arg("cotangent").none(), nb::arg("gradient_groups"),
-             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"), nb::arg("context"),
-             nb::arg("admit"))
+             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("context"), nb::arg("admit"))
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
         .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)
@@ -354,7 +345,6 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("temporary_allocation_traffic_bytes", &PythonPullback::temporaryAllocationTrafficBytes)
         .def_prop_ro("device_wait_nanoseconds", &PythonPullback::deviceWaitNanoseconds);
     nb::class_<PythonProgramExecutable>(module, "ProgramExecutable")
-        .def("invocation_builder", &PythonProgramExecutable::invocationBuilder, nb::keep_alive<0, 1>())
         .def(
             "program_instance",
             [](PythonProgramExecutable &executable) {
@@ -363,14 +353,16 @@ void bindNativeCompiler(nb::module_ &module) {
             },
             nb::keep_alive<0, 1>())
         .def(
-            "program_vjp_bound",
+            "program_vjp_transaction",
             [](PythonProgramExecutable &executable, PythonProgramInvocationAdapter &invocation,
-               const nb::dict &bindings, nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
-                return executable.programVjpBound(invocation, bindings, nb::cast(&executable, nb::rv_policy::reference),
-                                                  checkpoint_memory_budget, checkpoint_policy);
+               const nb::dict &bindings, const nb::callable &publish_outcome, nb::object checkpoint_memory_budget,
+               const std::string &checkpoint_policy) {
+                return executable.programVjpTransaction(invocation, bindings,
+                                                        nb::cast(&executable, nb::rv_policy::reference),
+                                                        publish_outcome, checkpoint_memory_budget, checkpoint_policy);
             },
-            nb::arg("invocation"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
-            nb::arg("checkpoint_policy") = std::string())
+            nb::arg("invocation"), nb::arg("bindings"), nb::arg("publish_outcome"),
+            nb::arg("checkpoint_memory_budget") = nb::none(), nb::arg("checkpoint_policy") = std::string())
         .def_prop_ro("derivative_groups", &PythonProgramExecutable::derivativeGroups)
         .def_prop_ro("program_ad_signature", &PythonProgramExecutable::programAdSignature)
         .def_prop_ro("program_abi", &PythonProgramExecutable::programAbi)

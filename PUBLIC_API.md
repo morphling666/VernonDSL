@@ -62,13 +62,15 @@ are stable once published in a release. Unreleased API drafts may be
 replaced without compatibility wrappers before their first release.
 
 Canonical Program execution uses bundle → executable → instance → invocation
-→ bind → forward.
-`vernonRuntimeProgramInvocationForward` records, submits, and completes the
-resolved Program plan inside the Runtime; a Program caller does not provide a
-command encoder or submit descriptor. Version 0.1.2 has no public direct-Stage
-loader, binding, submit, or encode facility and no public ExecutionGraph
-authoring model. Stage objects and the Command DAG are private post-resolution
-runtime implementation.
+→ bind → execute → commit or rollback.
+`vernonRuntimeProgramInvocationExecute` records, submits, and completes the
+resolved Program plan inside the Runtime without publishing staged persistent
+bindings or transferring pullbacks. A successful execute is finalized by
+`vernonRuntimeProgramInvocationCommit`; failure or abandonment is finalized by
+rollback. A Program caller does not provide a command encoder or submit
+descriptor. Version 0.1.2 has no public direct-Stage loader, binding, submit,
+or encode facility and no public ExecutionGraph authoring model. Stage objects
+and the Command DAG are private post-resolution runtime implementation.
 
 Python `vd.init(...)` returns the selected `RuntimeSession`. Repeating it with
 the same canonical `RuntimeConfiguration` returns that session idempotently;
@@ -89,19 +91,22 @@ part of this release.
 `VernonProgramGraph` is the public pre-resolution composition builder. It adds
 loaded cooked Program bundles as node-scoped components, connects compatible
 symbolic graph Values and ordered Storage-version chains, and resolves to the
-same `VernonProgramExecutable` lifecycle. Node boundary and graphics-control
-tokens are stable and scoped. Graph Storage handles bind a shared resource
-once. Global resolve emits static graphics fusion-candidate regions;
-invocation materializes only their resolved fused or split paths. Only
-graph-level invocation forward submits work. ProgramGraph does not accept
-resolved executables, raw Stages, native resources, encoders, or callbacks.
+same `VernonProgramExecutable` lifecycle. Node boundary tokens and Graph
+Storage handles are graph-construction metadata only. Execution binds the resolved
+executable's canonical exported parameters and graphics-control slots; there
+is no node-local or Graph-Storage direct-binding invocation API. Global resolve
+emits static graphics fusion-candidate regions; invocation materializes only
+their resolved fused or split paths. Only the resolved graph executable
+submits work. ProgramGraph does not accept resolved executables, raw Stages,
+native resources, encoders, or callbacks.
 
 ProgramGraph connections are primal scheduling relationships, not derivative
-relationships. A differentiated child may retain its own pullback during graph
-forward; `vernonRuntimeProgramInvocationGetNodePullback` transfers that
-node-scoped handle before invocation destruction. The graph executable itself
-has no autodiff signature or composite pullback, and Runtime performs no
-reverse traversal or cotangent accumulation across connections.
+relationships. A differentiated child may prepare its own pullback during
+execute, but `vernonRuntimeProgramInvocationGetNodePullback` can transfer that
+node-scoped handle only after commit and before invocation destruction. The
+graph executable itself has no autodiff signature or composite pullback, and
+Runtime performs no reverse traversal or cotangent accumulation across
+connections.
 
 Borrowed Vulkan and DirectX 12 command targets are queued by their external
 owner. Their completions remain pending until that owner has observed its GPU

@@ -83,7 +83,8 @@ inline bool invokeProgram(VernonRuntimeContext *runtime, vernon::runtime::Progra
                 .bindDrawCommand(controls.draw_command_control, drawToken, *graphics->drawCommand)
                 .bindDynamicState(controls.dynamic_state_control, dynamicToken, *graphics->dynamicState);
         }
-        invocation.forward(false);
+        invocation.execute(false);
+        (void)invocation.commit();
         return true;
     } catch (const std::exception &exception) {
         error = programRuntimeError(runtime);
