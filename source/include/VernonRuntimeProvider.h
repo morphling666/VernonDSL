@@ -283,8 +283,6 @@ typedef struct VernonRuntimeDeviceProvider {
                                    VernonRuntimeProviderImageDescription *description);
     VernonStatus (*create_binding_set)(void *user_data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
                                        VernonRuntimeProviderObject *bindings);
-    VernonStatus (*update_binding_set)(void *user_data, VernonRuntimeProviderObject bindings,
-                                       const VernonRuntimeProviderBindingValue *values, size_t value_count);
 
     VernonStatus (*encode_dispatch)(void *user_data, VernonRuntimeProviderObject command_encoder,
                                     const VernonRuntimeProviderDispatchDescriptor *descriptor);

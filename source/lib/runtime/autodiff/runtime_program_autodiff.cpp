@@ -170,7 +170,6 @@ public:
         const bool device = context_->backend != VERNON_RUNTIME_CPU;
         if (program_execution::injectFailure(program_execution::FailureBoundary::Submission))
             return fail(*context_, "injected Program pullback submission failure");
-        VernonProgramExecutable proxy(*context_, topology_);
         if (replay) {
             if (device) {
                 std::vector<ProgramTapeState> tapeStates;
@@ -179,7 +178,7 @@ public:
                     return fail(*context_, error);
                 for (;;) {
                     const VernonStatus replayStatus =
-                        executePipelineProgramGraph(proxy, *replay, values, resolvePhysicalEndpoint);
+                        executePipelineProgramGraph(*context_, *topology_, *replay, values, resolvePhysicalEndpoint);
                     if (replayStatus != VERNON_STATUS_OK)
                         return replayStatus;
                     bool retry = false;
@@ -198,14 +197,15 @@ public:
                 }
             } else {
                 const VernonStatus replayStatus =
-                    executePipelineProgramGraph(proxy, *replay, values, resolvePhysicalEndpoint);
+                    executePipelineProgramGraph(*context_, *topology_, *replay, values, resolvePhysicalEndpoint);
                 if (replayStatus != VERNON_STATUS_OK)
                     return replayStatus;
                 if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
                     return fail(*context_, error);
             }
         }
-        const VernonStatus status = executePipelineProgramGraph(proxy, *backward, values, resolvePhysicalEndpoint);
+        const VernonStatus status =
+            executePipelineProgramGraph(*context_, *topology_, *backward, values, resolvePhysicalEndpoint);
         if (status != VERNON_STATUS_OK)
             return status;
 
@@ -438,7 +438,6 @@ public:
             return arena.argument(value);
         };
         arena.setInvocationContext(target.programContext);
-        VernonProgramExecutable proxy(*context_, topology);
         for (const program::Node &node : forward->nodes)
             if (program::executionKind(node) == program::ExecutionKind::Compute)
                 for (const program::ControlComponent &control : program::computeOperation(node).workgroups) {
@@ -456,7 +455,7 @@ public:
                 return fail(*context_, error);
             for (;;) {
                 const VernonStatus status =
-                    executePipelineProgramGraph(proxy, *forward, arena, resolvePhysicalEndpoint);
+                    executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint);
                 if (status != VERNON_STATUS_OK)
                     return status;
                 bool retry = false;
@@ -472,7 +471,8 @@ public:
                         return fail(*context_, error);
             }
         } else {
-            const VernonStatus status = executePipelineProgramGraph(proxy, *forward, arena, resolvePhysicalEndpoint);
+            const VernonStatus status =
+                executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint);
             if (status != VERNON_STATUS_OK)
                 return status;
             if (!validateProgramTapeValues(arena.values(), tapeScratch, error))

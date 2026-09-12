@@ -60,6 +60,12 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         invocationDiagnostic(context) = "CPU Runtime does not use a Vernon RHI device";
         return false;
     }
+    auto deviceLease = rhi::retainDeviceLease(device);
+    if (deviceLease.isErr()) {
+        invocationDiagnostic(context) = "cannot retain Vernon RHI device for Runtime context";
+        return false;
+    }
+    context.rhiDeviceLease.emplace(std::move(deviceLease).value());
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, backend);
     if (!adapter) {
         invocationDiagnostic(context) = "cannot create Runtime adapter for Vernon RHI device";
@@ -142,13 +148,12 @@ bool initializeBackendForRhiDevice(VernonRuntimeContext &context, VernonRhiDevic
         invocationDiagnostic(context) = "Runtime backend is unavailable for Vernon RHI device";
         return false;
     }
-    context.borrowedRhiDevice = true;
     context.rhiDevice = device;
     return true;
 }
 
 VernonRuntimeRhiAdapter *borrowedRhiAdapter(VernonRuntimeContext &context) {
-    if (!context.borrowedRhiDevice)
+    if (!context.rhiDeviceLease)
         return nullptr;
     VernonRuntimeRhiAdapter *adapter = nullptr;
     switch (context.backend) {
@@ -305,6 +310,7 @@ void destroyBackend(VernonRuntimeContext &context) {
     if (VernonRuntimeRhiAdapter *adapter = borrowedRhiAdapter(context))
         vernonRuntimeRhiAdapterDestroy(adapter);
     destroyRuntimeBackendState(context);
+    context.rhiDeviceLease.reset();
 }
 
 void fillBackendCapabilities(const VernonRuntimeContext &context, VernonRuntimeCapabilities &result) {

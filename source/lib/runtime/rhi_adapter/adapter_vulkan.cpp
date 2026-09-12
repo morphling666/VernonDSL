@@ -57,9 +57,7 @@ RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexc
 uint64_t resourceIdentity(const void *state) noexcept {
     return reinterpret_cast<uintptr_t>(static_cast<const VulkanAdapterState *>(state)->device);
 }
-void invalidateBackend(void *) noexcept {}
-
-const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity};
 
 template <typename Handle> Handle nativeHandle(uint64_t value) {
     if constexpr (std::is_pointer_v<Handle>)
@@ -166,16 +164,7 @@ struct PreparedBindingSet {
         VernonRuntimeProviderBindingValue value{};
         std::vector<uint8_t> inlineStorage;
     };
-    struct SnapshotKey {
-        uint64_t revision{};
-
-        bool operator==(const SnapshotKey &other) const { return revision == other.revision; }
-    };
-    struct SnapshotKeyHash {
-        size_t operator()(const SnapshotKey &key) const { return std::hash<uint64_t>{}(key.revision); }
-    };
     struct Snapshot {
-        SnapshotKey key;
         rhi::vulkan::DeviceState *device{};
         std::vector<VkDescriptorSet> descriptorSets;
         std::vector<Slot> slots;
@@ -188,13 +177,9 @@ struct PreparedBindingSet {
     rhi::vulkan::DeviceState *device{};
     PreparedLayout *layout{};
     std::vector<Slot> slots;
-    std::unordered_map<uint32_t, size_t> slotIndices;
     std::unordered_map<uint64_t, size_t> samplerByBinding;
-    std::vector<size_t> valueIndices;
-    std::vector<uint8_t> seenSlots;
     std::vector<uint8_t> pushConstantStorage;
-    std::unordered_map<SnapshotKey, std::unique_ptr<Snapshot>, SnapshotKeyHash> snapshots;
-    uint64_t resourceRevision{1};
+    std::unique_ptr<Snapshot> snapshot;
     std::mutex mutex;
 
     ~PreparedBindingSet();
@@ -912,24 +897,31 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     }
 }
 
-RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"vulkan_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
-    std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
+    std::unordered_map<uint32_t, size_t> slotIndices;
+    std::vector<size_t> valueIndices(bindings.slots.size());
+    std::vector<uint8_t> seenSlots(bindings.slots.size());
+    slotIndices.reserve(bindings.slots.size());
+    for (size_t index = 0; index < bindings.slots.size(); ++index)
+        if (!slotIndices.emplace(bindings.slots[index].entry.layout.slot, index).second)
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_layout_contains_duplicate_slots", 0, 0}})};
     for (size_t index = 0; index < valueCount; ++index) {
-        const auto found = bindings.slotIndices.find(values[index].slot);
-        if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
+        const auto found = slotIndices.find(values[index].slot);
+        if (found == slotIndices.end() || seenSlots[found->second])
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_slot_is_invalid_or_duplicated", 0, 0}})};
-        bindings.seenSlots[found->second] = 1;
-        bindings.valueIndices[found->second] = index;
+        seenSlots[found->second] = 1;
+        valueIndices[found->second] = index;
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         const auto &slot = bindings.slots[index];
-        const auto *value = &values[bindings.valueIndices[index]];
+        const auto *value = &values[valueIndices[index]];
         if (value->kind != slot.entry.layout.kind)
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_slot_or_kind_is_invalid", 0, 0}})};
@@ -948,35 +940,9 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                     vernon::ProviderErrorCode::InvalidArgument, {"vulkan_vertex_binding_has_no_stride", 0, 0}})};
         }
     }
-    bool changed = false;
-    bool resourcesChanged = false;
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        const auto &slot = bindings.slots[index];
-        const auto &value = values[bindings.valueIndices[index]];
-        const auto *oldResource = providerBindingResource(slot.value);
-        const auto *newResource = providerBindingResource(value);
-        bool slotChanged =
-            slot.value.slot != value.slot || slot.value.kind != value.kind || slot.value.flags != value.flags;
-        if (packedUniformBytes(slot.entry.layout.kind, slot.entry.layout.interface_kind)) {
-            slotChanged |= slot.value.payload.inline_value.size != value.payload.inline_value.size ||
-                           (value.payload.inline_value.data &&
-                            std::memcmp(slot.inlineStorage.data(), value.payload.inline_value.data,
-                                        value.payload.inline_value.size));
-        } else {
-            slotChanged |=
-                !oldResource || !newResource || std::memcmp(oldResource, newResource, sizeof(*newResource)) != 0;
-            if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
-                value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
-                slotChanged |= slot.value.payload.buffer.stride != value.payload.buffer.stride;
-        }
-        changed |= slotChanged;
-        resourcesChanged |= slotChanged && slot.entry.inlineOffset == UINT32_MAX;
-    }
-    if (!changed)
-        return RhiAdapterResult<void>{vernon::ok()};
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         auto &slot = bindings.slots[index];
-        slot.value = values[bindings.valueIndices[index]];
+        slot.value = values[valueIndices[index]];
         if (slot.value.payload.inline_value.data &&
             packedUniformBytes(slot.value.kind, slot.entry.layout.interface_kind)) {
             std::memcpy(slot.inlineStorage.data(), slot.value.payload.inline_value.data,
@@ -986,15 +952,6 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                             slot.value.payload.inline_value.data, slot.value.payload.inline_value.size);
             slot.value.payload = {};
         }
-    }
-    if (resourcesChanged) {
-        if (++bindings.resourceRevision == 0)
-            bindings.resourceRevision = 1;
-        for (auto snapshot = bindings.snapshots.begin(); snapshot != bindings.snapshots.end();)
-            if (snapshot->second->commandReferences == 0)
-                snapshot = bindings.snapshots.erase(snapshot);
-            else
-                ++snapshot;
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
@@ -1044,12 +1001,9 @@ void releaseCommandBindingSnapshot(void *context, uint64_t object) {
     if (!bindings || !snapshot)
         return;
     std::lock_guard<std::mutex> guard(bindings->mutex);
-    const auto found = bindings->snapshots.find(snapshot->key);
-    if (found == bindings->snapshots.end() || found->second.get() != snapshot || snapshot->commandReferences == 0)
+    if (bindings->snapshot.get() != snapshot || snapshot->commandReferences == 0)
         return;
     --snapshot->commandReferences;
-    if (snapshot->commandReferences == 0 && snapshot->key.revision != bindings->resourceRevision)
-        bindings->snapshots.erase(found);
 }
 
 RhiAdapterResult<void> retainBindingSnapshot(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
@@ -1071,19 +1025,16 @@ snapshotBindings(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject e
     if (!retainBindingResources(adapter, encoder, &bindings))
         return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_could_not_retain_resources", 0, 0}})};
-    const PreparedBindingSet::SnapshotKey key{bindings.resourceRevision};
-    const auto existing = bindings.snapshots.find(key);
-    if (existing != bindings.snapshots.end()) {
-        if (!retainBindingSnapshot(adapter, encoder, bindings, *existing->second))
+    if (bindings.snapshot) {
+        if (!retainBindingSnapshot(adapter, encoder, bindings, *bindings.snapshot))
             return RhiAdapterResult<PreparedBindingSet::Snapshot *>{
                 vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
                                                   {"vulkan_binding_snapshot_cleanup_registration_failed", 0, 0}})};
         recordPushConstants(command, pipeline, bindings);
-        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::ok(existing->second.get())};
+        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::ok(bindings.snapshot.get())};
     }
 
     auto snapshot = std::make_unique<PreparedBindingSet::Snapshot>();
-    snapshot->key = key;
     snapshot->device = bindings.device;
     snapshot->slots = bindings.slots;
     snapshot->inlineOffsets.resize(snapshot->slots.size(), VK_WHOLE_SIZE);
@@ -1216,17 +1167,11 @@ snapshotBindings(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject e
         rhi::vulkan::driver().updateDescriptorSets(bindings.device->device, static_cast<uint32_t>(writes.size()),
                                                    writes.data(), 0, nullptr);
 
-    PreparedBindingSet::Snapshot *result = snapshot.get();
-    try {
-        bindings.snapshots.emplace(key, std::move(snapshot));
-    } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_allocation_failed", 0, 0}})};
-    }
+    bindings.snapshot = std::move(snapshot);
+    PreparedBindingSet::Snapshot *result = bindings.snapshot.get();
     adapter.bindingSnapshotCreations.fetch_add(1, std::memory_order_relaxed);
     if (!retainBindingSnapshot(adapter, encoder, bindings, *result)) {
-        auto owned = std::move(bindings.snapshots.find(key)->second);
-        bindings.snapshots.erase(key);
+        bindings.snapshot.reset();
         return RhiAdapterResult<PreparedBindingSet::Snapshot *>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"vulkan_binding_snapshot_cleanup_registration_failed", 0, 0}})};
     }
@@ -1249,18 +1194,12 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
     bindings->device = &vulkanDevice(adapter);
     bindings->layout = layout;
     bindings->slots.reserve(layout->entries.size());
-    bindings->slotIndices.reserve(layout->entries.size());
     bindings->samplerByBinding.reserve(layout->entries.size());
-    bindings->valueIndices.resize(layout->entries.size());
-    bindings->seenSlots.resize(layout->entries.size());
     bindings->pushConstantStorage.resize(layout->pushConstantSize);
     for (size_t index = 0; index < layout->entries.size(); ++index) {
         const auto &entry = layout->entries[index];
         PreparedBindingSet::Slot slot;
         slot.entry = entry;
-        if (!bindings->slotIndices.emplace(entry.layout.slot, index).second)
-            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-                vernon::ProviderErrorCode::InvalidArgument, {"vulkan_binding_layout_contains_duplicate_slots", 0, 0}})};
         if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
             !bindings->samplerByBinding.emplace(descriptorBindingKey(entry.layout.set, entry.layout.binding), index)
                  .second)
@@ -1271,23 +1210,12 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
             slot.inlineStorage.resize(entry.layout.element_size);
         bindings->slots.push_back(std::move(slot));
     }
-    auto status = updateBindingsImplResult(adapter, *bindings, descriptor->values, descriptor->value_count);
+    auto status = initializeBindingsResult(adapter, *bindings, descriptor->values, descriptor->value_count);
     if (!status)
         return status;
     *output = toHandle(bindings.release());
     adapter.bindingCreations.fetch_add(1, std::memory_order_relaxed);
     return RhiAdapterResult<void>{vernon::ok()};
-}
-
-RhiAdapterResult<void> updateBindingsResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *bindings = fromHandle<PreparedBindingSet>(handle);
-    if (!bindings)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"vulkan_adapter_received_an_invalid_binding_set", 0, 0}})};
-    std::lock_guard<std::mutex> guard(bindings->mutex);
-    return updateBindingsImplResult(adapter, *bindings, values, valueCount);
 }
 
 void restoreImageLayout(void *context, uint64_t layout) {
@@ -1922,12 +1850,6 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
     return providerStatus(adapter, createBindingsResult(data, descriptor, output),
                           "Vulkan binding-set creation failed");
 }
-VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
-                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, updateBindingsResult(data, handle, values, valueCount),
-                          "Vulkan binding-set update failed");
-}
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1954,7 +1876,6 @@ void initializeVulkanProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindings;
-    adapter.provider.update_binding_set = updateBindings;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
     adapter.provider.destroy_shader = destroyShader;

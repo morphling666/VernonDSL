@@ -16,7 +16,11 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
                                                        size_t artifactSize, const std::string &entry,
                                                        VernonCpuEntryPoint cpuEntry,
                                                        const std::vector<NativeResourceSlot> &nativeSlots) {
+    auto child = RuntimeChildLifecycle::reserve(context.owner);
+    if (child.isErr())
+        return nullptr;
     auto pipeline = std::make_unique<VernonStageExecutable>();
+    pipeline->lifecycle.emplace(std::move(child).value());
     pipeline->context = &context;
     pipeline->bindingProjection = std::move(stagePlan);
     pipeline->workgroupSize = {reflection.workgroup[0], reflection.workgroup[1], reflection.workgroup[2]};
@@ -30,6 +34,8 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
         if (!prepareCpuComputePipeline(context, std::move(kernel), std::move(reflection), *state))
             return nullptr;
         installRuntimeBackendState(*pipeline, state.release());
+        if (pipeline->lifecycle.value().publish().isErr())
+            return nullptr;
         return pipeline.release();
     }
     if (!artifact || !artifactSize)
@@ -54,6 +60,8 @@ VernonStageExecutable *loadBackendTypedComputePipeline(VernonRuntimeContext &con
     inputs.context = &context;
     inputs.artifacts.emplace(stage.entry, std::move(stage));
     if (!resolveBackendPipeline(inputs, pipeline->bindingProjection, *pipeline))
+        return nullptr;
+    if (pipeline->lifecycle.value().publish().isErr())
         return nullptr;
     return pipeline.release();
 }

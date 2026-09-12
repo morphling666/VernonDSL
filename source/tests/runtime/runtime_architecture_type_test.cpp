@@ -11,8 +11,11 @@ static_assert(!std::is_convertible_v<VernonStageExecutable *, VernonProgramExecu
 static_assert(!std::is_convertible_v<VernonProgramExecutable *, VernonStageExecutable *>);
 static_assert(std::is_default_constructible_v<VernonStageExecutable>);
 static_assert(!std::is_default_constructible_v<VernonProgramExecutable>);
-static_assert(std::is_constructible_v<VernonProgramExecutable, VernonRuntimeContext &,
-                                      std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan>>);
+static_assert(!std::is_constructible_v<VernonProgramExecutable, VernonRuntimeContext &,
+                                       std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan>>);
+static_assert(
+    std::is_constructible_v<VernonProgramExecutable, VernonRuntimeContext &, vernon::runtime::RuntimeChildLifecycle,
+                            vernon::OwnerRef, std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan>>);
 
 TEST(RuntimeArchitectureTypes, StageAndProgramHandlesAreNominallyDistinct) {
     EXPECT_FALSE((std::is_convertible_v<VernonStageExecutable *, VernonProgramExecutable *>));

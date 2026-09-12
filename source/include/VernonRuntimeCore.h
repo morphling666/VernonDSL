@@ -114,11 +114,6 @@ VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDispatch(const Vern
                                                                       const uint32_t group_count[3],
                                                                       const void *push_constants,
                                                                       size_t push_constant_size);
-VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDraw(const VernonRuntimeCorePipeline *pipeline,
-                                                                  const VernonRuntimeCoreBindings *bindings,
-                                                                  VernonRuntimeProviderObject command_encoder,
-                                                                  uint32_t vertex_count, uint32_t instance_count,
-                                                                  uint32_t first_vertex, uint32_t first_instance);
 VERNON_RUNTIME_CORE_CAPI VernonStatus vernonRuntimeCoreEncodeDrawInvocation(
     const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
     const VernonRuntimeCoreDrawInvocation *invocation);

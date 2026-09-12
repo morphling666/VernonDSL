@@ -42,15 +42,6 @@ struct OpenGLAdapterState {
     bool framebufferValid{};
     bool viewportValid{};
     bool scissorValid{};
-
-    void invalidate() {
-        programValid = false;
-        vertexArrayValid = false;
-        framebufferValid = false;
-        viewportValid = false;
-        scissorValid = false;
-        framebufferSignatures.clear();
-    }
 };
 
 OpenGLAdapterState &openGLState(VernonRuntimeRhiAdapter &adapter) {
@@ -83,9 +74,7 @@ uint64_t resourceIdentity(const void *state) noexcept {
     return reinterpret_cast<uintptr_t>(static_cast<const OpenGLAdapterState *>(state)->device);
 }
 
-void invalidateBackend(void *state) noexcept { static_cast<OpenGLAdapterState *>(state)->invalidate(); }
-
-const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity};
 
 struct PreparedLayout;
 
@@ -176,13 +165,7 @@ struct PreparedBindingSet {
     };
     rhi::opengl::DeviceState *device{};
     std::vector<Slot> slots;
-    std::unordered_map<uint32_t, size_t> slotIndices;
     std::unordered_map<uint32_t, size_t> vertexSlotByBinding;
-    std::vector<size_t> valueIndices;
-    std::vector<uint8_t> seenSlots;
-    std::vector<uint64_t> resolvedValues;
-    std::vector<VernonRhiImageDescriptor> resolvedImageDescriptors;
-    std::mutex mutex;
 
     ~PreparedBindingSet() {
         if (!device)
@@ -596,25 +579,29 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     }
 }
 
-RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+                                                const std::unordered_map<uint32_t, size_t> &slotIndices,
                                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     std::string backendDiagnostic;
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"opengl_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
-    std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
+    std::vector<size_t> valueIndices(bindings.slots.size());
+    std::vector<uint8_t> seenSlots(bindings.slots.size());
+    std::vector<uint64_t> resolvedValues(bindings.slots.size());
+    std::vector<VernonRhiImageDescriptor> resolvedImageDescriptors(bindings.slots.size());
     for (size_t index = 0; index < valueCount; ++index) {
-        const auto found = bindings.slotIndices.find(values[index].slot);
-        if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
+        const auto found = slotIndices.find(values[index].slot);
+        if (found == slotIndices.end() || seenSlots[found->second])
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"opengl_binding_slot_is_invalid_or_duplicated", 0, 0}})};
-        bindings.seenSlots[found->second] = 1;
-        bindings.valueIndices[found->second] = index;
+        seenSlots[found->second] = 1;
+        valueIndices[found->second] = index;
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         const auto &slot = bindings.slots[index];
-        const auto *value = &values[bindings.valueIndices[index]];
+        const auto *value = &values[valueIndices[index]];
         if (value->kind != slot.kind)
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"opengl_binding_slot_or_kind_is_invalid", 0, 0}})};
@@ -627,7 +614,7 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                  (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 && slot.columnCount <= 1))
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"opengl_inline_binding_is_invalid", 0, 0}})};
-            bindings.resolvedValues[index] = 0;
+            resolvedValues[index] = 0;
         } else {
             const bool defaultResource = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
             const VernonRuntimeProviderResourceReference &resource =
@@ -663,14 +650,14 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                     if (!described)
                         return RhiAdapterResult<void>{vernon::err(std::move(described).error())};
                 }
-                bindings.resolvedImageDescriptors[index] = imageDescriptor;
+                resolvedImageDescriptors[index] = imageDescriptor;
             }
-            bindings.resolvedValues[index] = native;
+            resolvedValues[index] = native;
         }
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         auto &slot = bindings.slots[index];
-        const auto *value = &values[bindings.valueIndices[index]];
+        const auto *value = &values[valueIndices[index]];
         if (packedUniformBytes(slot.kind, slot.interfaceKind)) {
             std::memcpy(slot.storage.data(), value->payload.inline_value.data, value->payload.inline_value.size);
             if (slot.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
@@ -685,7 +672,7 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
             }
         } else {
             const bool defaultResource = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
-            const uint64_t native = bindings.resolvedValues[index];
+            const uint64_t native = resolvedValues[index];
             const VernonRuntimeProviderResourceReference &resource =
                 slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE || slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE
                     ? value->payload.image.view
@@ -697,8 +684,8 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
             slot.resourceStride = value->payload.buffer.stride;
             if (slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                 slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
-                slot.resourceTarget = bindings.resolvedImageDescriptors[index].dimension;
-                slot.textureFormat = bindings.resolvedImageDescriptors[index].format;
+                slot.resourceTarget = resolvedImageDescriptors[index].dimension;
+                slot.textureFormat = resolvedImageDescriptors[index].format;
             }
         }
         slot.flags = value->flags;
@@ -732,18 +719,15 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
     try {
         auto bindings = std::make_unique<PreparedBindingSet>();
         bindings->device = openGLState(adapter).device;
+        std::unordered_map<uint32_t, size_t> slotIndices;
         bindings->slots.reserve(layout->entries.size());
-        bindings->slotIndices.reserve(layout->entries.size());
+        slotIndices.reserve(layout->entries.size());
         bindings->vertexSlotByBinding.reserve(layout->entries.size());
-        bindings->valueIndices.resize(layout->entries.size());
-        bindings->seenSlots.resize(layout->entries.size());
-        bindings->resolvedValues.resize(layout->entries.size());
-        bindings->resolvedImageDescriptors.resize(layout->entries.size());
         for (size_t index = 0; index < layout->entries.size(); ++index) {
             const auto &entry = layout->entries[index];
             PreparedBindingSet::Slot slot;
             slot.slot = entry.layout.slot;
-            if (!bindings->slotIndices.emplace(slot.slot, index).second)
+            if (!slotIndices.emplace(slot.slot, index).second)
                 return RhiAdapterResult<void>{
                     vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                                       {"opengl_binding_layout_contains_duplicate_slots", 0, 0}})};
@@ -777,7 +761,8 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
             }
             bindings->slots.push_back(std::move(slot));
         }
-        auto status = updateBindingsImplResult(adapter, *bindings, descriptor->values, descriptor->value_count);
+        auto status =
+            initializeBindingsResult(adapter, *bindings, slotIndices, descriptor->values, descriptor->value_count);
         if (!status)
             return status;
         *output = toHandle(bindings.release());
@@ -787,17 +772,6 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"opengl_binding_preparation_ran_out_of_memory", 0, 0}})};
     }
-}
-
-RhiAdapterResult<void> updateBindingsResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *bindings = fromHandle<PreparedBindingSet>(handle);
-    if (!bindings)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_binding_set", 0, 0}})};
-    std::lock_guard<std::mutex> guard(bindings->mutex);
-    return updateBindingsImplResult(adapter, *bindings, values, valueCount);
 }
 
 RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject commandEncoder,
@@ -812,9 +786,6 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"opengl_adapter_received_an_invalid_compute_dispatch", 0, 0}})};
-    std::unique_lock<std::mutex> guard;
-    if (bindings)
-        guard = std::unique_lock<std::mutex>(bindings->mutex);
     auto &device = *pipeline->native->device;
     auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
     if (!nativeCommand)
@@ -882,9 +853,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         (descriptor->index_count != 0 && descriptor->index_type != 0))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_draw", 0, 0}})};
-    std::unique_lock<std::mutex> bindingGuard;
     if (bindings) {
-        bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
         if (bindings->slots.size() != pipeline->native->bindings.size())
             return RhiAdapterResult<void>{
                 vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
@@ -1405,12 +1374,6 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
     return providerStatus(adapter, createBindingsResult(data, descriptor, output),
                           "OpenGL binding-set creation failed");
 }
-VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
-                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, updateBindingsResult(data, handle, values, valueCount),
-                          "OpenGL binding-set update failed");
-}
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1437,7 +1400,6 @@ void initializeOpenGLProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindings;
-    adapter.provider.update_binding_set = updateBindings;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
     adapter.provider.destroy_shader = destroyShader;

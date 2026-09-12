@@ -18,6 +18,7 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] Result<CommandDeviceStateRef, RhiError> retain() const noexcept;
+    [[nodiscard]] Result<ChildLease, RhiError> retainDeviceLease() const noexcept;
 
 private:
     explicit CommandDeviceStateRef(CheckedIntrusiveRef<CommandDeviceStateControl> control) noexcept;

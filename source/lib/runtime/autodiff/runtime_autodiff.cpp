@@ -204,9 +204,15 @@ VernonStatus forwardProgramInvocation(
         return status;
     if (!execution)
         return VERNON_STATUS_OK;
+    auto child = vernon::runtime::RuntimeChildLifecycle::reserve(pipeline.context->owner);
+    if (child.isErr())
+        return vernon::toVernonStatus(child.error());
     auto result = std::make_unique<VernonPullback>();
-    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
+    result->lifecycle.emplace(std::move(child).value());
+    result->context = pipeline.context;
     result->execution = std::move(execution);
+    if (result->lifecycle.value().publish().isErr())
+        return VERNON_STATUS_INTERNAL_ERROR;
     pullback = result.release();
     return VERNON_STATUS_OK;
 }
@@ -218,10 +224,16 @@ void attachProgramSnapshot(VernonPullback &pullback, std::shared_ptr<const progr
 VernonPullback *makeRetainedProgramPullback(VernonProgramExecutable &pipeline,
                                             std::unique_ptr<ad::PullbackExecution> execution,
                                             std::shared_ptr<const program::InvocationSnapshot> snapshot) {
+    auto child = vernon::runtime::RuntimeChildLifecycle::reserve(pipeline.context->owner);
+    if (child.isErr())
+        return nullptr;
     auto result = std::make_unique<VernonPullback>();
-    result->contextLease = vernon::runtime::acquireContextLease(*pipeline.context);
+    result->lifecycle.emplace(std::move(child).value());
+    result->context = pipeline.context;
     result->execution = std::move(execution);
     result->programSnapshot = std::move(snapshot);
+    if (result->lifecycle.value().publish().isErr())
+        return nullptr;
     return result.release();
 }
 
@@ -322,11 +334,21 @@ extern "C" {
 
 uint8_t vernonRuntimeProgramExecutableHasProgramAutodiff(const VernonProgramExecutable *pipeline) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline)
+        return 0;
+    auto pin = pipeline->lifecycle.pin();
+    if (pin.isErr())
+        return 0;
     return programExecution(pipeline) ? 1 : 0;
 }
 
 size_t vernonRuntimeProgramExecutableGetAdDerivativeGroupCount(const VernonProgramExecutable *pipeline) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline)
+        return 0;
+    auto pin = pipeline->lifecycle.pin();
+    if (pin.isErr())
+        return 0;
     const auto *autodiff = canonicalProgramAutodiff(pipeline);
     return autodiff ? autodiff->derivativeGroups.size() : 0;
 }
@@ -335,6 +357,11 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupByIndex(const Ver
                                                                        size_t groupIndex,
                                                                        VernonAdDerivativeGroupView *view) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    auto pin = pipeline->lifecycle.pin();
+    if (pin.isErr())
+        return vernon::toVernonStatus(pin.error());
     const auto *autodiff = canonicalProgramAutodiff(pipeline);
     if (!autodiff || !view || view->struct_size < sizeof(*view) || groupIndex >= autodiff->derivativeGroups.size())
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group query");
@@ -352,6 +379,11 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
                                                                     size_t groupIndex, size_t leafIndex,
                                                                     VernonStringView *leafPath) {
     vernon::runtime::RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline)
+        return VERNON_STATUS_INVALID_ARGUMENT;
+    auto pin = pipeline->lifecycle.pin();
+    if (pin.isErr())
+        return vernon::toVernonStatus(pin.error());
     const auto *autodiff = canonicalProgramAutodiff(pipeline);
     if (!autodiff || !leafPath || groupIndex >= autodiff->derivativeGroups.size()) {
         return fail(pipeline ? pipeline->context : nullptr, "invalid autodiff derivative group leaf query");
@@ -366,16 +398,19 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
 
 VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, const VernonProgramArgument *arguments,
                                                    size_t argumentCount, const VernonPullbackApplyOptions *options) {
-    VernonRuntimeContext *context = pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr;
+    VernonRuntimeContext *context = pullback ? pullback->context : nullptr;
     try {
         using namespace vernon::runtime::ad;
         vernon::runtime::RuntimeDiagnosticScope diagnostic(context);
-        if (!pullback || !pullback->execution || (argumentCount && !arguments) || !options ||
+        if (!pullback || !pullback->lifecycle || !pullback->execution || (argumentCount && !arguments) || !options ||
             options->struct_size != sizeof(VernonPullbackApplyOptions) ||
             options->abi_version != VERNON_PULLBACK_APPLY_OPTIONS_VERSION ||
             std::any_of(std::begin(options->reserved), std::end(options->reserved),
                         [](uint32_t value) { return value != 0; }))
             return fail(context, "invalid pullback invocation");
+        auto pin = pullback->lifecycle.value().pin();
+        if (pin.isErr())
+            return vernon::toVernonStatus(pin.error());
         const auto boundedSize = [](uint64_t value) {
             return value > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
                                                               : static_cast<size_t>(value);
@@ -401,8 +436,16 @@ VernonStatus vernonProgramPullbackApply(VernonPullback *pullback, const VernonPr
 }
 
 void vernonProgramPullbackDestroy(VernonPullback *pullback) {
-    vernon::runtime::RuntimeDiagnosticScope diagnostic(
-        pullback && pullback->contextLease ? &pullback->contextLease->get() : nullptr);
+    vernon::runtime::RuntimeDiagnosticScope diagnostic(pullback ? pullback->context : nullptr);
+    if (!pullback)
+        return;
+    if (!pullback->lifecycle)
+        vernon::resultContractViolation();
+    auto destruction = pullback->lifecycle.value().beginDestroy();
+    if (destruction.isErr())
+        return;
+    if (destruction.value().commit().isErr())
+        vernon::resultContractViolation();
     delete pullback;
 }
 

@@ -19,8 +19,8 @@ BindingTransaction::~BindingTransaction() {
         rollback();
 }
 
-const std::shared_ptr<void> *BindingTransaction::find(uint32_t slot, const std::string &token) {
-    if (finished_)
+const std::shared_ptr<void> *BindingTransaction::find(uint32_t slot, std::string_view token) {
+    if (finished_ || frozen_)
         throw std::logic_error("Program binding transaction is already finished");
     const auto updated = updates_.find(slot);
     if (updated != updates_.end()) {
@@ -37,7 +37,7 @@ const std::shared_ptr<void> *BindingTransaction::find(uint32_t slot, const std::
 }
 
 void BindingTransaction::observeUploads(uint64_t uploadBytes, uint64_t uploadRanges) {
-    if (finished_)
+    if (finished_ || frozen_)
         throw std::logic_error("Program binding transaction is already finished");
     uploadBytes_ += uploadBytes;
     uploadRanges_ += uploadRanges;
@@ -45,7 +45,7 @@ void BindingTransaction::observeUploads(uint64_t uploadBytes, uint64_t uploadRan
 
 void BindingTransaction::stage(uint32_t slot, std::string token, std::shared_ptr<void> payload, uint64_t uploadBytes,
                                uint64_t uploadRanges) {
-    if (finished_)
+    if (finished_ || frozen_)
         throw std::logic_error("Program binding transaction is already finished");
     if (!payload)
         throw std::invalid_argument("Program binding payload must not be null");
@@ -54,18 +54,22 @@ void BindingTransaction::stage(uint32_t slot, std::string token, std::shared_ptr
     uploadRanges_ += uploadRanges;
 }
 
-std::shared_ptr<const InvocationSnapshot> BindingTransaction::snapshot() const {
-    if (finished_)
+std::shared_ptr<const InvocationSnapshot> BindingTransaction::freeze() {
+    if (finished_ || frozen_)
         throw std::logic_error("Program binding transaction is already finished");
     auto entries = snapshot_;
     for (const auto &[slot, entry] : updates_)
         entries.insert_or_assign(slot, entry);
-    return std::shared_ptr<const InvocationSnapshot>(new InvocationSnapshot(std::move(entries)));
+    frozenSnapshot_ = std::shared_ptr<const InvocationSnapshot>(new InvocationSnapshot(std::move(entries)));
+    frozen_ = true;
+    return frozenSnapshot_;
 }
 
 std::shared_ptr<const InvocationSnapshot> BindingTransaction::commit() {
     if (finished_)
         throw std::logic_error("Program binding transaction is already finished");
+    if (!frozen_)
+        freeze();
     std::lock_guard lock(state_->mutex_);
     if (state_->executable_ != executable_ || state_->generation_ != generation_)
         throw std::runtime_error("Program executable changed before binding transaction commit");
@@ -78,7 +82,7 @@ std::shared_ptr<const InvocationSnapshot> BindingTransaction::commit() {
     state_->telemetry_.uploadBytes += uploadBytes_;
     state_->telemetry_.uploadRanges += uploadRanges_;
     finished_ = true;
-    return std::shared_ptr<const InvocationSnapshot>(new InvocationSnapshot(std::move(snapshot_)));
+    return std::move(frozenSnapshot_);
 }
 
 void BindingTransaction::rollback() {

@@ -76,9 +76,7 @@ RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexc
 uint64_t resourceIdentity(const void *state) noexcept {
     return reinterpret_cast<uintptr_t>(static_cast<const DirectX12AdapterState *>(state)->device);
 }
-void invalidateBackend(void *) noexcept {}
-
-const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity};
 
 struct PreparedShader {
     uint32_t stage{};
@@ -135,20 +133,14 @@ struct PreparedBindingSet {
     rhi::directx12::DeviceState *device{};
     std::vector<Slot> slots;
     std::unordered_map<uint32_t, size_t> slotIndices;
-    std::vector<size_t> valueIndices;
-    std::vector<uint8_t> seenSlots;
-    std::vector<uint64_t> resolvedValues;
     uint32_t resourceDescriptorCount{};
     uint32_t samplerDescriptorCount{};
-    uint64_t descriptorContentRevision{1};
     uint64_t descriptorEncoder{};
-    uint64_t descriptorRevision{};
     ID3D12DescriptorHeap *resourceHeap{};
     ID3D12DescriptorHeap *samplerHeap{};
     D3D12_GPU_DESCRIPTOR_HANDLE resourceGpu{};
     D3D12_GPU_DESCRIPTOR_HANDLE samplerGpu{};
     uint64_t computeDescriptorEncoder{};
-    uint64_t computeDescriptorRevision{};
     ID3D12DescriptorHeap *computeResourceHeap{};
     D3D12_GPU_DESCRIPTOR_HANDLE computeResourceGpu{};
     std::mutex mutex;
@@ -726,24 +718,26 @@ RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProv
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
-RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
         return RhiAdapterResult<void>{
             vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                               {"d3d12_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
-    std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
+    std::vector<size_t> valueIndices(bindings.slots.size());
+    std::vector<uint8_t> seenSlots(bindings.slots.size());
+    std::vector<uint64_t> resolvedValues(bindings.slots.size());
     for (size_t index = 0; index < valueCount; ++index) {
         const auto found = bindings.slotIndices.find(values[index].slot);
-        if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
+        if (found == bindings.slotIndices.end() || seenSlots[found->second])
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"d3d12_binding_slot_is_invalid_or_duplicated", 0, 0}})};
-        bindings.seenSlots[found->second] = 1;
-        bindings.valueIndices[found->second] = index;
+        seenSlots[found->second] = 1;
+        valueIndices[found->second] = index;
     }
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
         auto &slot = bindings.slots[index];
-        const auto *value = &values[bindings.valueIndices[index]];
+        const auto *value = &values[valueIndices[index]];
         if (value->kind != slot.layout.kind)
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                 vernon::ProviderErrorCode::InvalidArgument, {"d3d12_binding_slot_or_kind_is_invalid", 0, 0}})};
@@ -752,7 +746,7 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                 return RhiAdapterResult<void>{vernon::err(
                     vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                           {"d3d12_inline_or_uniform_buffer_binding_size_is_invalid", 0, 0}})};
-            bindings.resolvedValues[index] = 0;
+            resolvedValues[index] = 0;
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
             const auto &resource = value->payload.buffer.resource;
             auto resolved = resolveRhiResource(adapter, resource);
@@ -764,12 +758,12 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                 resource.offset > resource.size || slot.layout.element_size > resource.size - resource.offset)
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
                     vernon::ProviderErrorCode::InvalidArgument, {"d3d12_storage_binding_is_invalid", 0, 0}})};
-            bindings.resolvedValues[index] = native;
+            resolvedValues[index] = native;
         } else {
             const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                                         (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
             if (defaultSampler)
-                bindings.resolvedValues[index] = 0;
+                resolvedValues[index] = 0;
             else {
                 const auto *resource = providerBindingResource(*value);
                 const bool image = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
@@ -790,39 +784,18 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                     return RhiAdapterResult<void>{
                         vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
                                                           {"d3d12_graphics_resource_binding_is_invalid", 0, 0}})};
-                bindings.resolvedValues[index] = native;
+                resolvedValues[index] = native;
             }
         }
     }
-    const auto sameResource = [](const VernonRuntimeProviderResourceReference &left,
-                                 const VernonRuntimeProviderResourceReference &right) {
-        return left.identity == right.identity && left.resource.value == right.resource.value &&
-               left.offset == right.offset && left.size == right.size;
-    };
-    bool descriptorsChanged = false;
     for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        const auto &slot = bindings.slots[index];
-        const auto &value = values[bindings.valueIndices[index]];
+        auto &slot = bindings.slots[index];
+        const auto &value = values[valueIndices[index]];
         const bool defaultSampler = slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                                     (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
         const auto *bindingResource = providerBindingResource(value);
         const VernonRuntimeProviderResourceReference resource =
             defaultSampler || !bindingResource ? VernonRuntimeProviderResourceReference{} : *bindingResource;
-        const bool slotChanged =
-            slot.flags != value.flags || !sameResource(slot.resourceReference, resource) ||
-            (value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && slot.stride != value.payload.buffer.stride) ||
-            (packedUniformBytes(value.kind, slot.layout.interface_kind) && value.payload.inline_value.data &&
-             std::memcmp(slot.inlineStorage.data(), value.payload.inline_value.data, value.payload.inline_value.size));
-        const bool graphicsRootConstant = slot.layout.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
-                                          slot.layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM &&
-                                          (slot.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX ||
-                                           slot.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT);
-        descriptorsChanged |=
-            slotChanged && !graphicsRootConstant && slot.layout.kind != VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER;
-    }
-    for (size_t index = 0; index < bindings.slots.size(); ++index) {
-        auto &slot = bindings.slots[index];
-        const auto &value = values[bindings.valueIndices[index]];
         slot.flags = value.flags;
         slot.resourceReference = {};
         if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
@@ -831,14 +804,14 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
             slot.offset = 0;
             slot.size = slot.inlineStorage.size();
         } else if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER) {
-            auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(bindings.resolvedValues[index]);
+            auto *buffer = reinterpret_cast<rhi::directx12::Buffer *>(resolvedValues[index]);
             slot.resource = buffer->resource;
             slot.opaqueResource = buffer;
             slot.resourceReference = value.payload.buffer.resource;
             slot.offset = value.payload.buffer.resource.offset;
             slot.size = value.payload.buffer.resource.size - value.payload.buffer.resource.offset;
         } else {
-            slot.opaqueResource = reinterpret_cast<void *>(bindings.resolvedValues[index]);
+            slot.opaqueResource = reinterpret_cast<void *>(resolvedValues[index]);
             if (!slot.opaqueResource) {
                 slot.offset = 0;
                 slot.size = 0;
@@ -852,10 +825,6 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
                 slot.resource = static_cast<rhi::directx12::Buffer *>(slot.opaqueResource)->resource;
         }
-    }
-    if (descriptorsChanged) {
-        if (++bindings.descriptorContentRevision == 0)
-            bindings.descriptorContentRevision = 1;
     }
     return RhiAdapterResult<void>{vernon::ok()};
 }
@@ -893,9 +862,6 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
         bindings->device = &directX12Device(adapter);
         bindings->slots.resize(layout->entries.size());
         bindings->slotIndices.reserve(layout->entries.size());
-        bindings->valueIndices.resize(layout->entries.size());
-        bindings->seenSlots.resize(layout->entries.size());
-        bindings->resolvedValues.resize(layout->entries.size());
         for (size_t index = 0; index < layout->entries.size(); ++index) {
             auto &slot = bindings->slots[index];
             slot.layout = layout->entries[index];
@@ -932,7 +898,7 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
                                                  slot.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
             bindings->samplerDescriptorCount += slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER;
         }
-        auto status = updateBindingsImplResult(adapter, *bindings, descriptor->values, descriptor->value_count);
+        auto status = initializeBindingsResult(adapter, *bindings, descriptor->values, descriptor->value_count);
         if (!status) {
             destroyBindingSetImpl(*bindings);
             return status;
@@ -944,17 +910,6 @@ RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProvi
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
             vernon::ProviderErrorCode::BackendFailure, {"d3d12_binding_preparation_ran_out_of_memory", 0, 0}})};
     }
-}
-
-RhiAdapterResult<void> updateBindingsResult(void *data, VernonRuntimeProviderObject handle,
-                                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    auto *bindings = fromHandle<PreparedBindingSet>(handle);
-    if (!bindings)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
-            vernon::ProviderErrorCode::InvalidArgument, {"d3d12_adapter_received_an_invalid_binding_set", 0, 0}})};
-    std::lock_guard<std::mutex> guard(bindings->mutex);
-    return updateBindingsImplResult(adapter, *bindings, values, valueCount);
 }
 
 RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject commandEncoder,
@@ -988,8 +943,7 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
     if (bindings)
         bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
     const size_t slotCount = bindings ? bindings->slots.size() : 0;
-    const bool reuseDescriptors = bindings && bindings->computeDescriptorEncoder == commandEncoder.value &&
-                                  bindings->computeDescriptorRevision == bindings->descriptorContentRevision;
+    const bool reuseDescriptors = bindings && bindings->computeDescriptorEncoder == commandEncoder.value;
     if (reuseDescriptors) {
         heap = bindings->computeResourceHeap;
         gpu = bindings->computeResourceGpu;
@@ -1038,7 +992,6 @@ RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObj
                 cpu.ptr += increment;
             }
             bindings->computeDescriptorEncoder = commandEncoder.value;
-            bindings->computeDescriptorRevision = bindings->descriptorContentRevision;
             bindings->computeResourceHeap = heap;
             bindings->computeResourceGpu = gpu;
         }
@@ -1101,8 +1054,7 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
     const uint32_t resourceCount = bindings ? bindings->resourceDescriptorCount : 0;
     const uint32_t samplerCount = bindings ? bindings->samplerDescriptorCount : 0;
-    const bool reuseDescriptors = bindings && bindings->descriptorEncoder == commandEncoder.value &&
-                                  bindings->descriptorRevision == bindings->descriptorContentRevision;
+    const bool reuseDescriptors = bindings && bindings->descriptorEncoder == commandEncoder.value;
     if (reuseDescriptors) {
         resourceHeap = bindings->resourceHeap;
         samplerHeap = bindings->samplerHeap;
@@ -1457,7 +1409,6 @@ RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject 
         }
         if (!reuseDescriptors) {
             bindings->descriptorEncoder = commandEncoder.value;
-            bindings->descriptorRevision = bindings->descriptorContentRevision;
             bindings->resourceHeap = resourceHeap;
             bindings->samplerHeap = samplerHeap;
             bindings->resourceGpu = resourceGpu;
@@ -1623,12 +1574,6 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     return providerStatus(adapter, createBindingsResult(data, descriptor, output), "D3D12 binding-set creation failed");
 }
-VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
-                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, updateBindingsResult(data, handle, values, valueCount),
-                          "D3D12 binding-set update failed");
-}
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1655,7 +1600,6 @@ void initializeDirectX12Provider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindings;
-    adapter.provider.update_binding_set = updateBindings;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
     adapter.provider.destroy_shader = destroyShader;

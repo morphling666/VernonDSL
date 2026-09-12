@@ -39,17 +39,21 @@ ResourceAccess access(AccessKind kind, uint32_t storage, uint32_t value, const c
 }
 
 struct PlanFixture {
-    VernonRuntimeContext context;
+    std::unique_ptr<VernonRuntimeContext> context = [] {
+        auto created = VernonRuntimeContext::create();
+        return created.isOk() ? std::move(created).value() : nullptr;
+    }();
     std::shared_ptr<VernonStageExecutable> compute = std::make_shared<VernonStageExecutable>();
     std::shared_ptr<VernonStageExecutable> graphics = std::make_shared<VernonStageExecutable>();
     std::shared_ptr<ResolvedProgram> resolved = std::make_shared<ResolvedProgram>();
     ResolvedExecutionPlan plan;
 
     PlanFixture() {
-        context.backend = VERNON_RUNTIME_OPENGL;
-        compute->context = &context;
+        EXPECT_NE(context, nullptr);
+        context->backend = VERNON_RUNTIME_OPENGL;
+        compute->context = context.get();
         compute->bindingProjection.parameters.resize(2);
-        graphics->context = &context;
+        graphics->context = context.get();
 
         Program &program = resolved->program;
         program.storages = {{0}, {1}};
@@ -323,7 +327,7 @@ TEST(ResolvedExecutionPlan, OrdersDeviceResultTransferBeforeUniformConsumer) {
 
 TEST(ResolvedExecutionPlan, CpuUsesSameLogicalUniformProjectionWithoutDeviceTransfer) {
     PlanFixture fixture;
-    fixture.context.backend = VERNON_RUNTIME_CPU;
+    fixture.context->backend = VERNON_RUNTIME_CPU;
     fixture.plan.nodes.at({GraphDirection::Forward, 1}).projections[0].target.carrier = TargetCarrier::UniformBuffer;
     Diagnostic diagnostic;
     ASSERT_TRUE(buildResolvedExecutionPolicies(fixture.plan, diagnostic)) << diagnostic.message;

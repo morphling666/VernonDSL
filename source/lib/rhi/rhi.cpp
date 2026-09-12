@@ -91,6 +91,13 @@ vernon::rhi::commandState(VernonRhiDevice device) noexcept {
     return backend->commandState(device);
 }
 
+vernon::Result<vernon::ChildLease, vernon::RhiError> vernon::rhi::retainDeviceLease(VernonRhiDevice device) noexcept {
+    auto state = commandState(device);
+    if (state.isErr())
+        return Result<ChildLease, RhiError>{err(std::move(state).error())};
+    return state.value().retainDeviceLease();
+}
+
 uint64_t vernon::rhi::getTrackedBufferState(VernonRhiDevice device, VernonRhiBuffer buffer) {
     const BackendDispatch *backend = dispatch(device);
     return backend && backend->trackedBufferState ? backend->trackedBufferState(device, buffer) : UINT64_MAX;

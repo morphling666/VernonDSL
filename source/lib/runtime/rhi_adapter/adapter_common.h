@@ -20,7 +20,6 @@ struct RhiAdapterBackendOps {
     void (*destroy)(void *) noexcept;
     RhiAdapterResult<void> (*synchronize)(void *, std::string &) noexcept;
     uint64_t (*resourceIdentity)(const void *) noexcept;
-    void (*invalidate)(void *) noexcept;
 };
 
 struct RhiAdapterBackendStorage {
@@ -45,6 +44,7 @@ struct VernonRuntimeRhiAdapter {
 
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRhiBackend rhiBackend{};
+    vernon::Option<vernon::ChildLease> rhiDeviceLease;
     RhiAdapterBackendStorage backend;
     VernonRuntimeDeviceProvider provider{};
     std::string error;

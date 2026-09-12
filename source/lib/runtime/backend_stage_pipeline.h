@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "pipeline_metadata.h"
 #include "resolved_stage_types.h"
+#include "runtime_lifecycle.h"
 #include "stage_artifact.h"
 #include "stage_binding_plan.h"
 
@@ -35,6 +36,7 @@ struct VernonStageExecutable {
     VernonStageExecutable &operator=(VernonStageExecutable &&) = delete;
     ~VernonStageExecutable();
 
+    vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
     VernonRuntimeContext *context{};
     vernon::runtime::StageBindingPlan bindingProjection;
     VernonLaunchSize workgroupSize{1, 1, 1};

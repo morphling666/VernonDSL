@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 
 namespace vernon::runtime::program {
@@ -41,11 +42,11 @@ public:
     BindingTransaction(const BindingTransaction &) = delete;
     BindingTransaction &operator=(const BindingTransaction &) = delete;
 
-    const std::shared_ptr<void> *find(uint32_t slot, const std::string &token);
+    const std::shared_ptr<void> *find(uint32_t slot, std::string_view token);
     void observeUploads(uint64_t uploadBytes, uint64_t uploadRanges);
     void stage(uint32_t slot, std::string token, std::shared_ptr<void> payload, uint64_t uploadBytes,
                uint64_t uploadRanges);
-    std::shared_ptr<const InvocationSnapshot> snapshot() const;
+    std::shared_ptr<const InvocationSnapshot> freeze();
     std::shared_ptr<const InvocationSnapshot> commit();
     void rollback();
 
@@ -62,6 +63,8 @@ private:
     uint64_t reuseCount_{};
     uint64_t uploadBytes_{};
     uint64_t uploadRanges_{};
+    std::shared_ptr<const InvocationSnapshot> frozenSnapshot_;
+    bool frozen_{};
     bool finished_{};
 };
 

@@ -1,8 +1,10 @@
 #ifndef VERNON_RUNTIME_RUNTIME_STATE_H
 #define VERNON_RUNTIME_RUNTIME_STATE_H
 
+#include "VernonLifecycle.hpp"
 #include "VernonRuntime.h"
 #include "program_execution_manifest.h"
+#include "runtime_lifecycle.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -28,16 +30,34 @@ struct ResolvedExecutionPlan;
 } // namespace vernon::runtime::program
 // Internal definitions for the opaque C ABI handles.
 struct VernonRuntimeContext {
+    [[nodiscard]] static vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError> create() noexcept {
+        using Result = vernon::Result<std::unique_ptr<VernonRuntimeContext>, vernon::RuntimeError>;
+        auto ownerControl = vernon::OwnerControlBlock::create();
+        if (ownerControl.isErr())
+            return Result{vernon::err(vernon::toRuntimeError(std::move(ownerControl).error()))};
+        auto operationControl = vernon::OperationControlBlock::create();
+        if (operationControl.isErr())
+            return Result{vernon::err(vernon::toRuntimeError(std::move(operationControl).error()))};
+        auto context = vernon::tryMakeUnique<VernonRuntimeContext>(std::move(ownerControl).value(),
+                                                                   std::move(operationControl).value());
+        if (context.isErr())
+            return Result{vernon::err(vernon::toRuntimeError(context.error(), {"create_runtime_context", 0, 0}))};
+        return Result{vernon::ok(std::move(context).value())};
+    }
+
+    VernonRuntimeContext(vernon::OwnerRef ownerControl, vernon::OperationRef operationControl) noexcept
+        : owner(std::move(ownerControl)), operations(std::move(operationControl)) {}
+    VernonRuntimeContext(const VernonRuntimeContext &) = delete;
+    VernonRuntimeContext &operator=(const VernonRuntimeContext &) = delete;
+
+    vernon::OwnerRef owner;
+    vernon::OperationRef operations;
     VernonRuntimeBackend backend{VERNON_RUNTIME_CPU};
-    size_t liveBundles{};
-    size_t liveProgramGraphs{};
-    uint64_t nextProgramGraphId{1};
-    size_t livePipelines{};
-    size_t liveContextLeases{};
+    std::atomic<uint64_t> nextProgramGraphId{1};
     void *backendState{};
     void (*destroyBackendState)(void *){};
-    bool borrowedRhiDevice{};
     VernonRhiDevice rhiDevice{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+    vernon::Option<vernon::ChildLease> rhiDeviceLease;
     std::shared_ptr<vernon::runtime::ad::AutodiffMemoryPolicy> autodiffMemoryPolicy;
     std::mutex cpuEntriesMutex;
     std::unordered_map<std::string, std::pair<VernonCpuEntryPoint, size_t>> cpuEntries;
@@ -46,23 +66,6 @@ struct VernonRuntimeContext {
 };
 
 namespace vernon::runtime {
-
-class ContextLease {
-public:
-    explicit ContextLease(VernonRuntimeContext &context) : context_(&context) { ++context_->liveContextLeases; }
-    ContextLease(const ContextLease &) = delete;
-    ContextLease &operator=(const ContextLease &) = delete;
-    ~ContextLease() { --context_->liveContextLeases; }
-
-    VernonRuntimeContext &get() const { return *context_; }
-
-private:
-    VernonRuntimeContext *context_;
-};
-
-inline std::shared_ptr<ContextLease> acquireContextLease(VernonRuntimeContext &context) {
-    return std::make_shared<ContextLease>(context);
-}
 
 std::string &invocationDiagnostic(VernonRuntimeContext &context);
 const std::string *currentInvocationDiagnostic(const VernonRuntimeContext &context);
@@ -82,7 +85,8 @@ private:
 } // namespace vernon::runtime
 
 struct VernonSubmission {
-    std::shared_ptr<vernon::runtime::ContextLease> contextLease;
+    vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
+    VernonRuntimeContext *context{};
     VernonSubmissionState state{VERNON_SUBMISSION_PENDING};
     VernonStatus status{VERNON_STATUS_OK};
     VernonRhiDevice device{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
@@ -142,6 +146,10 @@ struct ProgramVariantDeployment {
 } // namespace vernon::runtime
 
 struct VernonProgramBundle {
+    explicit VernonProgramBundle(vernon::runtime::RuntimeChildLifecycle childLifecycle) noexcept
+        : lifecycle(std::move(childLifecycle)) {}
+
+    vernon::runtime::RuntimeChildLifecycle lifecycle;
     VernonRuntimeContext *context{};
     std::string id;
     std::string contentHash;
@@ -165,14 +173,17 @@ struct ProgramGraphNodeAutodiffState {
 };
 
 struct VernonProgramExecutable {
-    VernonProgramExecutable(VernonRuntimeContext &runtime,
-                            std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan);
+    VernonProgramExecutable(VernonRuntimeContext &runtime, vernon::runtime::RuntimeChildLifecycle childLifecycle,
+                            vernon::OwnerRef instanceOwner,
+                            std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan) noexcept;
     VernonProgramExecutable(const VernonProgramExecutable &) = delete;
     VernonProgramExecutable &operator=(const VernonProgramExecutable &) = delete;
     VernonProgramExecutable(VernonProgramExecutable &&) = delete;
     VernonProgramExecutable &operator=(VernonProgramExecutable &&) = delete;
     ~VernonProgramExecutable() = default;
 
+    vernon::runtime::RuntimeChildLifecycle lifecycle;
+    vernon::OwnerRef instanceOwner;
     VernonRuntimeContext *context;
     std::string id;
     uint64_t programGraphId{};
@@ -185,10 +196,10 @@ struct VernonProgramExecutable {
 };
 
 inline VernonProgramExecutable::VernonProgramExecutable(
-    VernonRuntimeContext &runtime, std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan)
-    : context(&runtime), executionPlan(std::move(plan)) {
-    if (!executionPlan)
-        throw std::invalid_argument("ProgramExecutable requires a resolved execution plan");
-}
+    VernonRuntimeContext &runtime, vernon::runtime::RuntimeChildLifecycle childLifecycle,
+    vernon::OwnerRef executableInstanceOwner,
+    std::shared_ptr<const vernon::runtime::program::ResolvedExecutionPlan> plan) noexcept
+    : lifecycle(std::move(childLifecycle)), instanceOwner(std::move(executableInstanceOwner)), context(&runtime),
+      executionPlan(std::move(plan)) {}
 
 #endif

@@ -39,8 +39,8 @@ void destroyBackendPipeline(VernonStageExecutable &pipeline);
 VernonStatus invokeBackendPipeline(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation,
                                    const PlannedGraphicsInvocation &plan);
 VernonStatus invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
-VernonStatus executePipelineProgramGraph(VernonProgramExecutable &pipeline, const program::Graph &graph,
-                                         program_execution::ProgramInvocationState &frame,
+VernonStatus executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
+                                         const program::Graph &graph, program_execution::ProgramInvocationState &frame,
                                          const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,

@@ -1,3 +1,4 @@
+#include "VernonLifecycle.hpp"
 #include "VernonRuntimeCore.h"
 #include "graphics_variant_key.h"
 #include "provider_image_description.h"
@@ -6,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -29,11 +31,33 @@ struct VernonRuntimeCorePipeline {
     std::atomic<uint32_t> references{1};
 };
 
-struct VernonRuntimeCoreBindings {
-    VernonRuntimeCorePipeline *pipeline{};
+struct RuntimeCoreBindingRevision : vernon::CheckedIntrusiveControl<RuntimeCoreBindingRevision> {
+    struct SnapshotEntry {
+        uint32_t slot{};
+        VernonRuntimeProviderBindingKind kind{};
+        uint32_t flags{};
+        VernonRuntimeProviderResourceReference resource{};
+        uint32_t stride{};
+        std::vector<uint8_t> inlineBytes;
+    };
+
+    ~RuntimeCoreBindingRevision() noexcept {
+        if (handle.value != 0)
+            provider.destroy_binding_set(provider.user_data, handle);
+        for (auto resource = resources.rbegin(); resource != resources.rend(); ++resource)
+            provider.release_resource(provider.user_data, *resource);
+    }
+
+    VernonRuntimeDeviceProvider provider{};
     VernonRuntimeProviderObject handle{};
     std::vector<VernonRuntimeProviderResourceReference> resources;
-    std::vector<VernonRuntimeProviderResourceReference> pendingResources;
+    std::vector<SnapshotEntry> snapshot;
+};
+
+struct VernonRuntimeCoreBindings {
+    VernonRuntimeCorePipeline *pipeline{};
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+    mutable std::mutex mutex;
 };
 
 struct VernonRuntimeCoreGraphicsVariant {
@@ -50,13 +74,6 @@ bool packedUniformBytes(const VernonRuntimeProviderBindingLayoutEntry &layout) {
            layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
            (layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
             layout.interface_kind == VERNON_RUNTIME_PROVIDER_INTERFACE_UNIFORM);
-}
-
-const VernonRuntimeProviderBindingLayoutEntry *layoutForSlot(const VernonRuntimeCorePipeline &pipeline, uint32_t slot) {
-    const auto found =
-        std::find_if(pipeline.bindings.begin(), pipeline.bindings.end(),
-                     [slot](const VernonRuntimeProviderBindingLayoutEntry &layout) { return layout.slot == slot; });
-    return found == pipeline.bindings.end() ? nullptr : &*found;
 }
 
 const VernonRuntimeProviderResourceReference *bindingResource(const VernonRuntimeProviderBindingValue &value) {
@@ -80,9 +97,8 @@ bool providerIsValid(const VernonRuntimeDeviceProvider &provider, VernonRuntimeP
     if (provider.struct_size < sizeof(VernonRuntimeDeviceProvider) || provider.abi_version != VERNON_PROGRAM_VERSION ||
         !provider.get_capabilities || !provider.get_device_identity || !provider.prepare_shader ||
         !provider.prepare_pipeline_layout || !provider.prepare_pipeline || !provider.create_binding_set ||
-        !provider.update_binding_set || !provider.retain_resource || !provider.release_resource ||
-        !provider.destroy_shader || !provider.destroy_pipeline_layout || !provider.destroy_pipeline ||
-        !provider.destroy_binding_set)
+        !provider.retain_resource || !provider.release_resource || !provider.destroy_shader ||
+        !provider.destroy_pipeline_layout || !provider.destroy_pipeline || !provider.destroy_binding_set)
         return false;
     return kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE ? provider.encode_dispatch != nullptr
                                                             : provider.encode_draw != nullptr;
@@ -170,12 +186,12 @@ void releaseResources(const VernonRuntimeDeviceProvider &provider,
 VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const VernonRuntimeProviderBindingValue *values,
                              size_t valueCount, std::vector<VernonRuntimeProviderResourceReference> &resources) {
     const VernonRuntimeDeviceProvider &provider = pipeline.provider;
-    if (valueCount != 0 && !values)
+    if (valueCount != pipeline.bindings.size() || (valueCount != 0 && !values))
         return VERNON_STATUS_INVALID_ARGUMENT;
     size_t resourceCount = 0;
     for (size_t index = 0; index < valueCount; ++index) {
-        const auto *layout = layoutForSlot(pipeline, values[index].slot);
-        resourceCount += layout && !packedUniformBytes(*layout) &&
+        const auto &layout = pipeline.bindings[index];
+        resourceCount += !packedUniformBytes(layout) &&
                          (values[index].flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0;
     }
     try {
@@ -184,10 +200,10 @@ VernonStatus retainResources(const VernonRuntimeCorePipeline &pipeline, const Ve
         return VERNON_STATUS_INTERNAL_ERROR;
     }
     for (size_t index = 0; index < valueCount; ++index) {
-        const auto *layout = layoutForSlot(pipeline, values[index].slot);
-        if (!layout)
+        const auto &layout = pipeline.bindings[index];
+        if (layout.slot != values[index].slot)
             return VERNON_STATUS_INVALID_ARGUMENT;
-        if (packedUniformBytes(*layout)) {
+        if (packedUniformBytes(layout)) {
             if (!values[index].payload.inline_value.data || values[index].payload.inline_value.size == 0) {
                 releaseResources(provider, resources);
                 resources.clear();
@@ -219,6 +235,8 @@ VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
     if (valueCount != pipeline.bindings.size() || (valueCount && !values))
         return VERNON_STATUS_INVALID_ARGUMENT;
     for (size_t index = 0; index < valueCount; ++index) {
+        if (values[index].slot != pipeline.bindings[index].slot)
+            return VERNON_STATUS_INVALID_ARGUMENT;
         const auto found = std::lower_bound(
             pipeline.bindings.begin(), pipeline.bindings.end(), values[index].slot,
             [](const VernonRuntimeProviderBindingLayoutEntry &entry, uint32_t slot) { return entry.slot < slot; });
@@ -251,6 +269,69 @@ VernonStatus validateImageBindings(const VernonRuntimeCorePipeline &pipeline,
             return VERNON_STATUS_INVALID_ARGUMENT;
     }
     return VERNON_STATUS_OK;
+}
+
+bool bindingSnapshotMatches(const VernonRuntimeCorePipeline &pipeline,
+                            const std::vector<RuntimeCoreBindingRevision::SnapshotEntry> &snapshot,
+                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    if (snapshot.size() != valueCount)
+        return false;
+    for (size_t index = 0; index < valueCount; ++index) {
+        const auto &saved = snapshot[index];
+        const auto &value = values[index];
+        const auto &layout = pipeline.bindings[index];
+        if (saved.slot != value.slot || saved.kind != value.kind || saved.flags != value.flags)
+            return false;
+        if (packedUniformBytes(layout)) {
+            if (saved.inlineBytes.size() != value.payload.inline_value.size ||
+                (saved.inlineBytes.size() &&
+                 std::memcmp(saved.inlineBytes.data(), value.payload.inline_value.data, saved.inlineBytes.size()) != 0))
+                return false;
+            continue;
+        }
+        if ((value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0)
+            continue;
+        const VernonRuntimeProviderResourceReference *resource = bindingResource(value);
+        if (!resource || saved.resource.identity != resource->identity ||
+            saved.resource.resource.value != resource->resource.value || saved.resource.offset != resource->offset ||
+            saved.resource.size != resource->size ||
+            ((value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+              value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) &&
+             saved.stride != value.payload.buffer.stride))
+            return false;
+    }
+    return true;
+}
+
+VernonStatus captureBindingSnapshot(const VernonRuntimeCorePipeline &pipeline,
+                                    const VernonRuntimeProviderBindingValue *values, size_t valueCount,
+                                    std::vector<RuntimeCoreBindingRevision::SnapshotEntry> &output) {
+    try {
+        std::vector<RuntimeCoreBindingRevision::SnapshotEntry> candidate;
+        candidate.reserve(valueCount);
+        for (size_t index = 0; index < valueCount; ++index) {
+            const auto &value = values[index];
+            const auto &layout = pipeline.bindings[index];
+            RuntimeCoreBindingRevision::SnapshotEntry entry;
+            entry.slot = value.slot;
+            entry.kind = value.kind;
+            entry.flags = value.flags;
+            if (packedUniformBytes(layout)) {
+                const auto *begin = static_cast<const uint8_t *>(value.payload.inline_value.data);
+                entry.inlineBytes.assign(begin, begin + value.payload.inline_value.size);
+            } else if ((value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) == 0) {
+                entry.resource = *bindingResource(value);
+                if (value.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
+                    value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER)
+                    entry.stride = value.payload.buffer.stride;
+            }
+            candidate.push_back(std::move(entry));
+        }
+        output = std::move(candidate);
+        return VERNON_STATUS_OK;
+    } catch (const std::bad_alloc &) {
+        return VERNON_STATUS_INTERNAL_ERROR;
+    }
 }
 
 bool drawInvocationIsValid(const VernonRuntimeCorePipeline *pipeline, const VernonRuntimeCoreBindings *bindings,
@@ -455,32 +536,27 @@ extern "C" VernonStatus vernonRuntimeCoreCreateBindings(VernonRuntimeCorePipelin
     if (!bindings)
         return VERNON_STATUS_INTERNAL_ERROR;
     bindings->pipeline = pipeline;
+    auto *revisionStorage = new (std::nothrow) RuntimeCoreBindingRevision();
+    if (!revisionStorage)
+        return VERNON_STATUS_INTERNAL_ERROR;
+    auto revision = vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>::adopt(revisionStorage);
+    revision->provider = pipeline->provider;
     VernonStatus status = validateImageBindings(*pipeline, values, valueCount);
     if (status != VERNON_STATUS_OK)
         return status;
-    status = retainResources(*pipeline, values, valueCount, bindings->resources);
+    status = captureBindingSnapshot(*pipeline, values, valueCount, revision->snapshot);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    status = retainResources(*pipeline, values, valueCount, revision->resources);
     if (status != VERNON_STATUS_OK)
         return status;
     const VernonRuntimeProviderBindingSetDescriptor descriptor{
         sizeof(VernonRuntimeProviderBindingSetDescriptor), pipeline->layout, values, valueCount, {0, 0, 0, 0}};
-    status = pipeline->provider.create_binding_set(pipeline->provider.user_data, &descriptor, &bindings->handle);
-    if (status != VERNON_STATUS_OK || !present(bindings->handle)) {
-        releaseResources(pipeline->provider, bindings->resources);
+    status = pipeline->provider.create_binding_set(pipeline->provider.user_data, &descriptor, &revision->handle);
+    if (status != VERNON_STATUS_OK || !present(revision->handle)) {
         return status == VERNON_STATUS_OK ? VERNON_STATUS_INTERNAL_ERROR : status;
     }
-    try {
-        size_t resourceSlotCount = 0;
-        for (size_t index = 0; index < valueCount; ++index) {
-            const auto *layout = layoutForSlot(*pipeline, values[index].slot);
-            resourceSlotCount += layout && !packedUniformBytes(*layout);
-        }
-        bindings->resources.reserve(resourceSlotCount);
-        bindings->pendingResources.reserve(resourceSlotCount);
-    } catch (const std::bad_alloc &) {
-        pipeline->provider.destroy_binding_set(pipeline->provider.user_data, bindings->handle);
-        releaseResources(pipeline->provider, bindings->resources);
-        return VERNON_STATUS_INTERNAL_ERROR;
-    }
+    bindings->revision.emplace(std::move(revision));
     pipeline->references.fetch_add(1, std::memory_order_relaxed);
     *output = bindings.release();
     return VERNON_STATUS_OK;
@@ -491,23 +567,50 @@ extern "C" VernonStatus vernonRuntimeCoreUpdateBindings(VernonRuntimeCoreBinding
                                                         size_t valueCount) {
     if (!bindings)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    bindings->pendingResources.clear();
     VernonStatus status = validateImageBindings(*bindings->pipeline, values, valueCount);
     if (status != VERNON_STATUS_OK)
         return status;
-    status = retainResources(*bindings->pipeline, values, valueCount, bindings->pendingResources);
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> current;
+    {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        auto retained = bindings->revision.value().retain();
+        if (retained.isErr())
+            return VERNON_STATUS_INTERNAL_ERROR;
+        current.emplace(std::move(retained).value());
+    }
+    if (bindingSnapshotMatches(*bindings->pipeline, current.value()->snapshot, values, valueCount))
+        return VERNON_STATUS_OK;
+    auto *candidateStorage = new (std::nothrow) RuntimeCoreBindingRevision();
+    if (!candidateStorage)
+        return VERNON_STATUS_INTERNAL_ERROR;
+    auto candidate = vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>::adopt(candidateStorage);
+    candidate->provider = bindings->pipeline->provider;
+    status = captureBindingSnapshot(*bindings->pipeline, values, valueCount, candidate->snapshot);
     if (status != VERNON_STATUS_OK)
         return status;
-    status = bindings->pipeline->provider.update_binding_set(bindings->pipeline->provider.user_data, bindings->handle,
-                                                             values, valueCount);
-    if (status != VERNON_STATUS_OK) {
-        releaseResources(bindings->pipeline->provider, bindings->pendingResources);
-        bindings->pendingResources.clear();
+    status = retainResources(*bindings->pipeline, values, valueCount, candidate->resources);
+    if (status != VERNON_STATUS_OK)
+        return status;
+    const VernonRuntimeProviderBindingSetDescriptor descriptor{sizeof(VernonRuntimeProviderBindingSetDescriptor),
+                                                               bindings->pipeline->layout,
+                                                               values,
+                                                               valueCount,
+                                                               {0, 0, 0, 0}};
+    status = bindings->pipeline->provider.create_binding_set(bindings->pipeline->provider.user_data, &descriptor,
+                                                             &candidate->handle);
+    if (status != VERNON_STATUS_OK || !present(candidate->handle)) {
+        if (status == VERNON_STATUS_OK)
+            status = VERNON_STATUS_INTERNAL_ERROR;
         return status;
     }
-    releaseResources(bindings->pipeline->provider, bindings->resources);
-    bindings->resources.swap(bindings->pendingResources);
-    bindings->pendingResources.clear();
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> replaced;
+    {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        if (!bindingSnapshotMatches(*bindings->pipeline, bindings->revision.value()->snapshot, values, valueCount)) {
+            replaced = bindings->revision.take();
+            bindings->revision.emplace(std::move(candidate));
+        }
+    }
     return VERNON_STATUS_OK;
 }
 
@@ -515,9 +618,13 @@ extern "C" void vernonRuntimeCoreBindingsDestroy(VernonRuntimeCoreBindings *bind
     if (!bindings)
         return;
     VernonRuntimeCorePipeline *pipeline = bindings->pipeline;
-    pipeline->provider.destroy_binding_set(pipeline->provider.user_data, bindings->handle);
-    releaseResources(pipeline->provider, bindings->resources);
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+    {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        revision = bindings->revision.take();
+    }
     delete bindings;
+    revision.reset();
     releasePipeline(pipeline);
 }
 
@@ -634,30 +741,23 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDispatch(const VernonRuntimeCoreP
         groupCount[1] == 0 || groupCount[2] == 0 || (bindings && bindings->pipeline != pipeline) ||
         pushConstantSize > pipeline->pushConstantSize || (pushConstantSize != 0 && !pushConstants))
         return VERNON_STATUS_INVALID_ARGUMENT;
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+    if (bindings) {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        auto retained = bindings->revision.value().retain();
+        if (retained.isErr())
+            return VERNON_STATUS_INTERNAL_ERROR;
+        revision.emplace(std::move(retained).value());
+    }
     const VernonRuntimeProviderDispatchDescriptor descriptor{sizeof(VernonRuntimeProviderDispatchDescriptor),
                                                              pipeline->pipeline,
-                                                             bindings ? bindings->handle
+                                                             revision ? revision.value()->handle
                                                                       : VernonRuntimeProviderObject{},
                                                              {groupCount[0], groupCount[1], groupCount[2]},
                                                              pushConstants,
                                                              pushConstantSize,
                                                              {0, 0, 0, 0}};
     return pipeline->provider.encode_dispatch(pipeline->provider.user_data, commandEncoder, &descriptor);
-}
-
-extern "C" VernonStatus vernonRuntimeCoreEncodeDraw(const VernonRuntimeCorePipeline *pipeline,
-                                                    const VernonRuntimeCoreBindings *bindings,
-                                                    VernonRuntimeProviderObject commandEncoder, uint32_t vertexCount,
-                                                    uint32_t instanceCount, uint32_t firstVertex,
-                                                    uint32_t firstInstance) {
-    VernonRuntimeCoreDrawInvocation invocation{};
-    invocation.struct_size = sizeof(invocation);
-    invocation.command_encoder = commandEncoder;
-    invocation.vertex_count = vertexCount;
-    invocation.instance_count = instanceCount;
-    invocation.first_vertex = firstVertex;
-    invocation.first_instance = firstInstance;
-    return vernonRuntimeCoreEncodeDrawInvocation(pipeline, bindings, &invocation);
 }
 
 extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntimeCorePipeline *pipeline,
@@ -668,10 +768,18 @@ extern "C" VernonStatus vernonRuntimeCoreEncodeDrawInvocation(const VernonRuntim
     const VernonStatus attachmentStatus = validateDrawAttachments(*pipeline, *invocation);
     if (attachmentStatus != VERNON_STATUS_OK)
         return attachmentStatus;
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+    if (bindings) {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        auto retained = bindings->revision.value().retain();
+        if (retained.isErr())
+            return VERNON_STATUS_INTERNAL_ERROR;
+        revision.emplace(std::move(retained).value());
+    }
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
         pipeline->pipeline,
-        bindings ? bindings->handle : VernonRuntimeProviderObject{},
+        revision ? revision.value()->handle : VernonRuntimeProviderObject{},
         invocation->vertex_count,
         invocation->instance_count,
         invocation->first_vertex,
@@ -707,10 +815,18 @@ vernonRuntimeCoreEncodeGraphicsVariantDrawInvocation(const VernonRuntimeCoreGrap
     const VernonStatus attachmentStatus = validateDrawAttachments(*pipeline, *invocation);
     if (attachmentStatus != VERNON_STATUS_OK)
         return attachmentStatus;
+    vernon::Option<vernon::CheckedIntrusiveRef<RuntimeCoreBindingRevision>> revision;
+    if (bindings) {
+        std::lock_guard<std::mutex> guard(bindings->mutex);
+        auto retained = bindings->revision.value().retain();
+        if (retained.isErr())
+            return VERNON_STATUS_INTERNAL_ERROR;
+        revision.emplace(std::move(retained).value());
+    }
     const VernonRuntimeProviderDrawDescriptor descriptor{
         sizeof(VernonRuntimeProviderDrawDescriptor),
         variant->handle,
-        bindings ? bindings->handle : VernonRuntimeProviderObject{},
+        revision ? revision.value()->handle : VernonRuntimeProviderObject{},
         invocation->vertex_count,
         invocation->instance_count,
         invocation->first_vertex,

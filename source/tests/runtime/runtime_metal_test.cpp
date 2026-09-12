@@ -947,7 +947,9 @@ kernel void add_value(constant AddArguments &arguments [[buffer(0)]],
     ASSERT_EQ(provider->create_binding_set(provider->user_data, &bindingDescriptor, &bindings), VERNON_STATUS_OK);
     auto invalidValues = values;
     invalidValues[1].payload.inline_value.size = 0;
-    EXPECT_EQ(provider->update_binding_set(provider->user_data, bindings, invalidValues.data(), invalidValues.size()),
+    bindingDescriptor.values = invalidValues.data();
+    VernonRuntimeProviderObject invalidBindings{};
+    EXPECT_EQ(provider->create_binding_set(provider->user_data, &bindingDescriptor, &invalidBindings),
               VERNON_STATUS_INVALID_ARGUMENT);
 
     VernonRuntimeProviderPipelineDescriptor pipelineDescriptor{};
@@ -1110,8 +1112,12 @@ TEST(RuntimeMetal, ProviderBindsMoreThanThirtyBuffersAcrossDescriptorSetsAndReta
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceBuffer(adapter, replacement, 0, sizeof(replacementValue),
                                                      &values.back().payload.buffer.resource),
               VERNON_STATUS_OK);
-    ASSERT_EQ(provider->update_binding_set(provider->user_data, bindings, values.data(), values.size()),
+    bindingDescriptor.values = values.data();
+    VernonRuntimeProviderObject replacementBindings{};
+    ASSERT_EQ(provider->create_binding_set(provider->user_data, &bindingDescriptor, &replacementBindings),
               VERNON_STATUS_OK);
+    provider->destroy_binding_set(provider->user_data, bindings);
+    bindings = replacementBindings;
     for (size_t index = 1; index < buffers.size(); ++index)
         ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, buffers[index]), VERNON_RHI_STATUS_OK);
     ASSERT_EQ(vernonRhiCommandEncoderFinish(device, command), VERNON_RHI_STATUS_OK);

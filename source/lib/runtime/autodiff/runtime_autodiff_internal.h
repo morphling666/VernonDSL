@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/program_execution/execution_control_plane.h"
+#include "runtime/runtime_lifecycle.h"
 #include "runtime/stage_artifact.h"
 #include "runtime/stage_binding_plan.h"
 
@@ -19,7 +20,6 @@
 struct VernonRuntimeContext;
 
 namespace vernon::runtime {
-class ContextLease;
 struct ProgramInvocationContext;
 } // namespace vernon::runtime
 namespace vernon::runtime::program {
@@ -121,7 +121,8 @@ bool resolveProgramAutodiff(VernonProgramExecutable &pipeline,
 } // namespace vernon::runtime::ad
 
 struct VernonPullback {
-    std::shared_ptr<vernon::runtime::ContextLease> contextLease;
+    vernon::Option<vernon::runtime::RuntimeChildLifecycle> lifecycle;
+    VernonRuntimeContext *context{};
     std::unique_ptr<vernon::runtime::ad::PullbackExecution> execution;
     std::shared_ptr<const vernon::runtime::program::InvocationSnapshot> programSnapshot;
 };

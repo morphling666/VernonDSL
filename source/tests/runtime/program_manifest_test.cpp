@@ -16,6 +16,12 @@
 
 namespace {
 
+std::unique_ptr<VernonRuntimeContext> makeRuntimeContext() {
+    auto created = VernonRuntimeContext::create();
+    EXPECT_TRUE(created.isOk());
+    return created.isOk() ? std::move(created).value() : nullptr;
+}
+
 vernon::runtime::ProgramVariantDeployment graphLinkFixture(bool output) {
     using namespace vernon::runtime;
     using namespace vernon::runtime::program;
@@ -320,8 +326,9 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     ASSERT_TRUE(invalid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
     ASSERT_TRUE(
         invalid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination) * 2), error));
-    VernonRuntimeContext context{};
-    EXPECT_EQ(invalid.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    auto context = makeRuntimeContext();
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(invalid.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::Poisoned);
     EXPECT_EQ(firstDestination, -1.0f);
     EXPECT_EQ(secondDestination, -2.0f);
@@ -329,7 +336,7 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     program_execution::PublicationTransaction valid(plan.publications);
     ASSERT_TRUE(valid.bindHostCommit(0, targets[0], hostTensor(&firstDestination, sizeof(firstDestination)), error));
     ASSERT_TRUE(valid.bindHostCommit(1, targets[1], hostTensor(&secondDestination, sizeof(secondDestination)), error));
-    ASSERT_EQ(valid.commit(context, invocation, error), VERNON_STATUS_OK) << error;
+    ASSERT_EQ(valid.commit(*context, invocation, error), VERNON_STATUS_OK) << error;
     EXPECT_EQ(valid.status(), program_execution::PublicationTransaction::Status::Committed);
     EXPECT_EQ(firstDestination, firstSource);
     EXPECT_EQ(secondDestination, secondSource);
@@ -368,8 +375,9 @@ TEST(ProgramPublication, CommitInjectionLeavesHostDestinationUnchanged) {
     std::string error;
     ASSERT_TRUE(transaction.bindHostCommit(0, target, hostTensor(&destination, sizeof(destination)), error));
     program_execution::setFailureInjectionForTesting(program_execution::FailureBoundary::Commit);
-    VernonRuntimeContext context{};
-    EXPECT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_INTERNAL_ERROR);
+    auto context = makeRuntimeContext();
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_INTERNAL_ERROR);
     program_execution::clearFailureInjectionForTesting();
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -3.0f);
@@ -404,8 +412,9 @@ TEST(ProgramPublication, CommitsStridedHostOutputByValidatedRegions) {
     program_execution::PublicationTransaction transaction(plan.publications);
     std::string error;
     ASSERT_TRUE(transaction.bindHostCommit(0, target, output, error));
-    VernonRuntimeContext context{};
-    ASSERT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_OK) << error;
+    auto context = makeRuntimeContext();
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_OK) << error;
     EXPECT_EQ(destination, (std::array<float, 6>{1, 2, -1, 3, 4, -1}));
 }
 
@@ -481,8 +490,9 @@ TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
     std::string error;
     ASSERT_TRUE(
         transaction.bindDeviceCommit(0, target, deviceTensor(sizeof(destination)), VernonRhiBuffer{1, 1}, error));
-    VernonRuntimeContext context{};
-    EXPECT_EQ(transaction.commit(context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
+    auto context = makeRuntimeContext();
+    ASSERT_NE(context, nullptr);
+    EXPECT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
     EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::Poisoned);
     EXPECT_EQ(destination, -1.0f);
 }

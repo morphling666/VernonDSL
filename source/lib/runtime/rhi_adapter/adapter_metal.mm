@@ -64,9 +64,7 @@ RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexc
 uint64_t resourceIdentity(const void *state) noexcept {
     return reinterpret_cast<uintptr_t>(static_cast<const MetalAdapterState *>(state)->device);
 }
-void invalidateBackend(void *) noexcept {}
-
-const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity, invalidateBackend};
+const RhiAdapterBackendOps backendOps{destroyBackend, synchronizeBackend, resourceIdentity};
 
 struct PreparedShader {
     id<MTLLibrary> library;
@@ -135,7 +133,6 @@ struct PreparedBindingSet {
     PreparedLayout *layout{};
     std::vector<Slot> slots;
     std::vector<ArgumentBuffer> argumentBuffers;
-    std::unordered_map<uint32_t, size_t> slotIndices;
     std::mutex mutex;
 };
 
@@ -738,15 +735,15 @@ RhiAdapterResult<void> encodeArgumentBuffersResult(VernonRuntimeRhiAdapter &adap
     }
 }
 
-RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+RhiAdapterResult<void> initializeBindingsResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
                                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     if (valueCount != bindings.slots.size() || (valueCount && !values))
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
     std::vector<size_t> valueIndices(bindings.slots.size());
     std::vector<uint8_t> seen(bindings.slots.size());
     for (size_t index = 0; index < valueCount; ++index) {
-        const auto found = bindings.slotIndices.find(values[index].slot);
-        if (found == bindings.slotIndices.end() || seen[found->second])
+        const auto found = bindings.layout->slotIndices.find(values[index].slot);
+        if (found == bindings.layout->slotIndices.end() || seen[found->second])
             return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_binding_slot_is_invalid_or_duplicated", 0, 0}})};
         seen[found->second] = 1;
         valueIndices[found->second] = index;
@@ -779,9 +776,8 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
                 return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_vertex_binding_has_no_stride", 0, 0}})};
         }
     }
-    auto updatedSlots = bindings.slots;
-    for (size_t index = 0; index < updatedSlots.size(); ++index) {
-        auto &slot = updatedSlots[index];
+    for (size_t index = 0; index < bindings.slots.size(); ++index) {
+        auto &slot = bindings.slots[index];
         const auto &value = values[valueIndices[index]];
         if (packedUniformBytes(slot.layout.kind, slot.layout.interface_kind)) {
             slot.resource = {};
@@ -807,27 +803,22 @@ RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter
             slot.stride = value.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER ? value.payload.buffer.stride : 0;
             if (slot.layout.kind == VERNON_RUNTIME_PROVIDER_SAMPLER &&
                 (value.flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE)) {
-                if (!slot.defaultSampler) {
-                    MTLSamplerDescriptor *descriptor = [[MTLSamplerDescriptor alloc] init];
-                    descriptor.minFilter = MTLSamplerMinMagFilterLinear;
-                    descriptor.magFilter = MTLSamplerMinMagFilterLinear;
-                    descriptor.mipFilter = MTLSamplerMipFilterLinear;
-                    descriptor.supportArgumentBuffers = YES;
-                    slot.defaultSampler = [metalDevice(adapter).device newSamplerStateWithDescriptor:descriptor];
-                    if (!slot.defaultSampler)
-                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_default_sampler_creation_failed", 0, 0}})};
-                }
+                MTLSamplerDescriptor *descriptor = [[MTLSamplerDescriptor alloc] init];
+                descriptor.minFilter = MTLSamplerMinMagFilterLinear;
+                descriptor.magFilter = MTLSamplerMinMagFilterLinear;
+                descriptor.mipFilter = MTLSamplerMipFilterLinear;
+                descriptor.supportArgumentBuffers = YES;
+                slot.defaultSampler = [metalDevice(adapter).device newSamplerStateWithDescriptor:descriptor];
+                if (!slot.defaultSampler)
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_default_sampler_creation_failed", 0, 0}})};
             } else {
                 slot.defaultSampler = nil;
             }
         }
     }
-    auto encodedArgumentBuffers = bindings.argumentBuffers;
-    auto encodeStatus = encodeArgumentBuffersResult(adapter, updatedSlots, encodedArgumentBuffers);
+    auto encodeStatus = encodeArgumentBuffersResult(adapter, bindings.slots, bindings.argumentBuffers);
     if (!encodeStatus)
         return encodeStatus;
-    bindings.slots = std::move(updatedSlots);
-    bindings.argumentBuffers = std::move(encodedArgumentBuffers);
     return RhiAdapterResult<void>{vernon::ok()};
 }
 
@@ -841,13 +832,12 @@ RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimePro
         auto bindings = std::make_unique<PreparedBindingSet>();
         bindings->layout = layout;
         bindings->slots.resize(layout->entries.size());
-        bindings->slotIndices = layout->slotIndices;
         for (size_t index = 0; index < layout->entries.size(); ++index)
             bindings->slots[index].layout = layout->entries[index];
         auto argumentStatus = createArgumentBuffersResult(adapter, *layout, bindings->argumentBuffers, false);
         if (!argumentStatus)
             return argumentStatus;
-        auto status = updateBindingsImplResult(adapter, *bindings, descriptor->values, descriptor->value_count);
+        auto status = initializeBindingsResult(adapter, *bindings, descriptor->values, descriptor->value_count);
         if (!status)
             return status;
         *output = toHandle(bindings.release());
@@ -855,20 +845,6 @@ RhiAdapterResult<void> createBindingSetResult(void *data, const VernonRuntimePro
         return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
         return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_binding_set_preparation_ran_out_of_memory", 0, 0}})};
-    }
-}
-
-RhiAdapterResult<void> updateBindingSetResult(void *data, VernonRuntimeProviderObject handle,
-                                              const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    PreparedBindingSet *bindings = fromHandle<PreparedBindingSet>(handle);
-    if (!bindings)
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument, {"metal_adapter_received_an_invalid_binding_set", 0, 0}})};
-    try {
-        std::lock_guard<std::mutex> guard(bindings->mutex);
-        return updateBindingsImplResult(adapter, *bindings, values, valueCount);
-    } catch (const std::bad_alloc &) {
-        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"metal_binding_update_ran_out_of_memory", 0, 0}})};
     }
 }
 
@@ -1359,12 +1335,6 @@ VernonStatus createBindingSet(void *data, const VernonRuntimeProviderBindingSetD
     return providerStatus(adapter, createBindingSetResult(data, descriptor, output),
                           "Metal binding-set creation failed");
 }
-VernonStatus updateBindingSet(void *data, VernonRuntimeProviderObject handle,
-                              const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return providerStatus(adapter, updateBindingSetResult(data, handle, values, valueCount),
-                          "Metal binding-set update failed");
-}
 VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
                             const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
@@ -1391,7 +1361,6 @@ void initializeMetalProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindingSet;
-    adapter.provider.update_binding_set = updateBindingSet;
     adapter.provider.encode_dispatch = encodeDispatch;
     adapter.provider.encode_draw = encodeDraw;
     adapter.provider.destroy_shader = destroyShader;

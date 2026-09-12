@@ -243,14 +243,6 @@ VernonStatus createCpuBindingSet(void *data, const VernonRuntimeProviderBindingS
     return VERNON_STATUS_OK;
 }
 
-VernonStatus updateCpuBindingSet(void *data, VernonRuntimeProviderObject handle,
-                                 const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
-    auto &context = *static_cast<CpuContextState *>(data);
-    auto *bindings = fromHandle<CpuPreparedBindings>(handle);
-    return bindings ? updateCpuBindingsImpl(context, *bindings, values, valueCount)
-                    : fail(context.error, "invalid CPU provider binding set");
-}
-
 VernonStatus encodeCpuDispatch(void *data, VernonRuntimeProviderObject,
                                const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &context = *static_cast<CpuContextState *>(data);
@@ -311,7 +303,6 @@ bool initializeCpuContext(VernonRuntimeContext &context, uint32_t deviceIndex) {
     state->provider.retain_resource = retainCpuResource;
     state->provider.release_resource = releaseCpuResource;
     state->provider.create_binding_set = createCpuBindingSet;
-    state->provider.update_binding_set = updateCpuBindingSet;
     state->provider.encode_dispatch = encodeCpuDispatch;
     state->provider.encode_draw = unsupportedCpuDraw;
     state->provider.destroy_shader = destroyCpuShader;

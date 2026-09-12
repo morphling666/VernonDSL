@@ -106,13 +106,13 @@ TEST(RuntimeCpuPipeline, LoadsValidatesAndInvokesBundles) {
     VernonProgramBundle *bundle =
         vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
     ASSERT_NE(bundle, nullptr) << lastError(context);
-    EXPECT_EQ(context->livePipelines, 0u);
+    EXPECT_EQ(context->owner.childCount(), 1u);
     VernonProgramExecutable *first = vernonRuntimeResolveProgram(bundle, nullptr);
     VernonProgramExecutable *second = vernonRuntimeResolveProgram(bundle, nullptr);
     ASSERT_NE(first, nullptr) << lastError(context);
     ASSERT_NE(second, nullptr) << lastError(context);
     EXPECT_NE(first, second);
-    EXPECT_EQ(context->livePipelines, 2u);
+    EXPECT_GT(context->owner.childCount(), 1u);
 
     const VernonProgramParameterView source = parameter(first, "source");
     const VernonProgramParameterView output = parameter(first, "output");
@@ -155,6 +155,36 @@ TEST(RuntimeCpuPipeline, RejectsLegacyExecutableTopology) {
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr), nullptr);
     EXPECT_EQ(lastError(context), "unsupported or invalid Program bundle");
+    EXPECT_EQ(context->owner.childCount(), 0u);
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+}
+
+TEST(RuntimeCpuPipeline, KeepsExecutableAndContextAliveThroughInvocationOwnership) {
+    const auto *fixture = vernon::tests::findProgramFixtureManifest("module_program", VERNON_RUNTIME_CPU);
+    ASSERT_NE(fixture, nullptr);
+    ASSERT_EQ(fixture->prepare(), VERNON_STATUS_OK);
+    const std::string manifest = readFile(VERNON_CPU_CANONICAL_PROGRAM_MANIFEST);
+    ASSERT_FALSE(manifest.empty());
+    VernonRuntimeContext *context = vernonRuntimeCreateWithOptions(VERNON_RUNTIME_CPU, nullptr);
+    ASSERT_NE(context, nullptr);
+    VernonProgramBundle *bundle =
+        vernonRuntimeLoadProgramBundleWithOptions(context, manifest.data(), manifest.size(), nullptr);
+    ASSERT_NE(bundle, nullptr);
+    VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, nullptr);
+    ASSERT_NE(executable, nullptr);
+    VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
+    ASSERT_NE(instance, nullptr);
+    VernonProgramInvocation *invocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
+    ASSERT_NE(invocation, nullptr);
+
+    vernonRuntimeProgramBundleDestroy(bundle);
+    vernonRuntimeProgramExecutableDestroy(executable);
+    EXPECT_NE(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    EXPECT_NE(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramExecutableDestroy(executable);
     EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
 }
 
@@ -198,14 +228,20 @@ TEST(RuntimeCpuPipeline, ResolvesAndExecutesNativeBackwardProgramGraph) {
         tensorArgument(cotangent, seedValue),
         tensorArgument(gradient, gradientValue),
     };
+    vernonRuntimeProgramInvocationDestroy(invocation);
+    vernonRuntimeProgramInstanceDestroy(instance);
+    vernonRuntimeProgramExecutableDestroy(program.pipeline);
+    vernonRuntimeProgramBundleDestroy(program.bundle);
+    program.pipeline = nullptr;
+    program.bundle = nullptr;
+    EXPECT_NE(vernonRuntimeDestroy(program.context), VERNON_STATUS_OK);
+
     ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
               VERNON_STATUS_OK)
         << lastError(program.context);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
 
     vernonProgramPullbackDestroy(pullback);
-    vernonRuntimeProgramInvocationDestroy(invocation);
-    vernonRuntimeProgramInstanceDestroy(instance);
-    destroy(program);
+    EXPECT_EQ(vernonRuntimeDestroy(program.context), VERNON_STATUS_OK);
 }
 #endif

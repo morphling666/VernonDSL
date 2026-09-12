@@ -16,6 +16,7 @@ VERNON_RHI_CAPI bool deviceExists(VernonRhiDevice device);
 VERNON_RHI_CAPI uint32_t deviceCommandCapabilities(VernonRhiDevice device);
 VERNON_RHI_CAPI bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
 VERNON_RHI_CAPI Result<CommandDeviceStateRef, RhiError> commandState(VernonRhiDevice device) noexcept;
+VERNON_RHI_CAPI Result<ChildLease, RhiError> retainDeviceLease(VernonRhiDevice device) noexcept;
 VERNON_RHI_CAPI void *deviceState(VernonRhiDevice device, VernonRhiBackend backend);
 VERNON_RHI_CAPI uint64_t bufferResource(VernonRhiDevice device, VernonRhiBuffer buffer);
 VERNON_RHI_CAPI uint64_t imageResource(VernonRhiDevice device, VernonRhiImage image);

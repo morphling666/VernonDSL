@@ -107,17 +107,11 @@ VernonRuntimeRhiAdapter::~VernonRuntimeRhiAdapter() {
     retainedLeaseHead.reset();
 }
 
-extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateCuda(uint32_t deviceIndex) {
-#if defined(VERNON_HAS_CUDA_RHI)
-    return vernon::runtime::createOwnedCudaRhiAdapter(deviceIndex);
-#else
-    (void)deviceIndex;
-    return nullptr;
-#endif
-}
-
 extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(VernonRhiDevice device,
                                                                            VernonRhiBackend backend) {
+    auto deviceLease = vernon::rhi::retainDeviceLease(device);
+    if (deviceLease.isErr())
+        return nullptr;
     VernonRuntimeRhiAdapter *adapter = nullptr;
     switch (backend) {
 #if defined(VERNON_HAS_CUDA_RHI)
@@ -150,6 +144,7 @@ extern "C" VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateForDevice(Verno
     if (adapter) {
         adapter->rhiDevice = device;
         adapter->rhiBackend = backend;
+        adapter->rhiDeviceLease.emplace(std::move(deviceLease).value());
     }
     return adapter;
 }
@@ -171,12 +166,6 @@ extern "C" VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapt
     if (adapter->error.empty())
         recordProviderError(*adapter, error, "RHI adapter synchronization failed");
     return vernon::toVernonStatus(error);
-}
-
-extern "C" void vernonRuntimeRhiAdapterInvalidateState(VernonRuntimeRhiAdapter *adapter) {
-    if (!adapter || !adapter->backend.state || !adapter->backend.ops)
-        return;
-    adapter->backend.ops->invalidate(adapter->backend.state);
 }
 
 extern "C" VernonStringView vernonRuntimeRhiAdapterGetLastError(const VernonRuntimeRhiAdapter *adapter) {

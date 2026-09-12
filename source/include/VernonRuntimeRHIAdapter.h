@@ -20,14 +20,12 @@ extern "C" {
 
 typedef struct VernonRuntimeRhiAdapter VernonRuntimeRhiAdapter;
 
-VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonRuntimeRhiAdapter *vernonRuntimeRhiAdapterCreateCuda(uint32_t device_index);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonRuntimeRhiAdapter *
 vernonRuntimeRhiAdapterCreateForDevice(VernonRhiDevice device, VernonRhiBackend backend);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI void vernonRuntimeRhiAdapterDestroy(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI const VernonRuntimeDeviceProvider *
 vernonRuntimeRhiAdapterGetProvider(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus vernonRuntimeRhiAdapterSynchronize(VernonRuntimeRhiAdapter *adapter);
-VERNON_RUNTIME_RHI_ADAPTER_CAPI void vernonRuntimeRhiAdapterInvalidateState(VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStringView
 vernonRuntimeRhiAdapterGetLastError(const VernonRuntimeRhiAdapter *adapter);
 VERNON_RUNTIME_RHI_ADAPTER_CAPI VernonStatus

@@ -186,7 +186,8 @@ if(TARGET VernonRuntime)
     add_dependencies(VernonRuntimeCoreProviderTests VernonRhiPublicCHeaderCheck)
     vernon_discover_gtests(VernonRuntimeCoreProviderTests)
 
-    add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp runtime/lifecycle_benchmark_test.cpp)
+    add_executable(VernonRuntimeSupportTests runtime/fallible_value_test.cpp runtime/lifecycle_benchmark_test.cpp
+                                             runtime/runtime_binding_benchmark_test.cpp)
     target_link_libraries(VernonRuntimeSupportTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonRuntimeSupportTests)
     add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
@@ -248,6 +249,23 @@ if(TARGET VernonRuntime)
                        TRUE
                        SKIP_RETURN_CODE
                        77)
+
+        set(_vernon_runtime_binding_baseline
+            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-binding-phase4-${_vernon_lifecycle_baseline_configuration}.json"
+        )
+        add_test(
+            NAME VernonRuntimeBindingPhase4PerformanceGate
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_binding_benchmark.py" --benchmark
+                "$<TARGET_FILE:VernonRuntimeSupportTests>" --baseline "${_vernon_runtime_binding_baseline}")
+        set_tests_properties(
+            VernonRuntimeBindingPhase4PerformanceGate
+            PROPERTIES RUN_SERIAL
+                       TRUE
+                       SKIP_RETURN_CODE
+                       77
+                       LABELS
+                       benchmark)
 
         set(_vernon_rhi_command_baseline
             "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-rhi-command-phase3-${_vernon_lifecycle_baseline_configuration}.json"

@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdint>
+#include <utility>
 
 namespace {
 
@@ -16,12 +17,17 @@ struct MockProvider {
     uint32_t failedPipelinePreparation{};
     uint32_t destroyedPipelines{};
     uint32_t bindingCreations{};
+    uint32_t destroyedBindings{};
     uint32_t dispatches{};
     uint32_t retainedResources{};
     uint32_t releasedResources{};
     VernonRuntimeProviderObject lastEncoder{};
     VernonRuntimeProviderDispatchDescriptor lastDispatch{};
     VernonRuntimeProviderDrawDescriptor lastDraw{};
+    bool failNextBindingCreation{};
+    VernonRuntimeCoreBindings *bindingsToReplaceDuringDispatch{};
+    const VernonRuntimeProviderBindingValue *replacementValue{};
+    VernonStatus replacementStatus{VERNON_STATUS_INTERNAL_ERROR};
 };
 
 VernonRuntimeProviderObject next(MockProvider &mock) { return {mock.nextObject++}; }
@@ -108,17 +114,23 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
                                      VernonRuntimeProviderObject *bindings) {
         auto &state = *static_cast<MockProvider *>(data);
         ++state.bindingCreations;
+        if (std::exchange(state.failNextBindingCreation, false)) {
+            *bindings = next(state);
+            return VERNON_STATUS_INTERNAL_ERROR;
+        }
         *bindings = next(state);
         return VERNON_STATUS_OK;
     };
-    provider.update_binding_set = [](void *, VernonRuntimeProviderObject, const VernonRuntimeProviderBindingValue *,
-                                     size_t) { return VERNON_STATUS_OK; };
     provider.encode_dispatch = [](void *data, VernonRuntimeProviderObject encoder,
                                   const VernonRuntimeProviderDispatchDescriptor *descriptor) {
         auto &state = *static_cast<MockProvider *>(data);
         ++state.dispatches;
         state.lastEncoder = encoder;
         state.lastDispatch = *descriptor;
+        if (state.bindingsToReplaceDuringDispatch) {
+            VernonRuntimeCoreBindings *bindings = std::exchange(state.bindingsToReplaceDuringDispatch, nullptr);
+            state.replacementStatus = vernonRuntimeCoreUpdateBindings(bindings, state.replacementValue, 1);
+        }
         return VERNON_STATUS_OK;
     };
     provider.encode_draw = [](void *data, VernonRuntimeProviderObject,
@@ -131,7 +143,9 @@ VernonRuntimeDeviceProvider makeProvider(MockProvider &mock, uint32_t capabiliti
     provider.destroy_pipeline = [](void *data, VernonRuntimeProviderObject) {
         ++static_cast<MockProvider *>(data)->destroyedPipelines;
     };
-    provider.destroy_binding_set = [](void *, VernonRuntimeProviderObject) {};
+    provider.destroy_binding_set = [](void *data, VernonRuntimeProviderObject) {
+        ++static_cast<MockProvider *>(data)->destroyedBindings;
+    };
     return provider;
 }
 
@@ -255,6 +269,74 @@ TEST(RuntimeForeignProvider, PreparesBindsAndEncodesWithNumericSlots) {
 
     vernonRuntimeCorePipelineDestroy(pipeline);
     vernonRuntimeCoreBindingsDestroy(bindings);
+    EXPECT_EQ(mock.retainedResources, mock.releasedResources);
+}
+
+TEST(RuntimeForeignProvider, BindingReplacementPublishesOnlyCompleteCandidates) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderBindingValue value{};
+    value.slot = 0;
+    value.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    value.payload.buffer.resource = {99, {100}, 0, 4096};
+    VernonRuntimeCoreBindings *bindings = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
+    const uint32_t groups[3]{1, 1, 1};
+    ASSERT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {200}, groups, nullptr, 0), VERNON_STATUS_OK);
+    const VernonRuntimeProviderObject original = mock.lastDispatch.bindings;
+
+    value.payload.buffer.resource = {100, {101}, 0, 4096};
+    mock.failNextBindingCreation = true;
+    EXPECT_EQ(vernonRuntimeCoreUpdateBindings(bindings, &value, 1), VERNON_STATUS_INTERNAL_ERROR);
+    ASSERT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {200}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.lastDispatch.bindings.value, original.value);
+    EXPECT_EQ(mock.destroyedBindings, 1u);
+
+    ASSERT_EQ(vernonRuntimeCoreUpdateBindings(bindings, &value, 1), VERNON_STATUS_OK);
+    ASSERT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {200}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_NE(mock.lastDispatch.bindings.value, original.value);
+    EXPECT_EQ(mock.destroyedBindings, 2u);
+
+    vernonRuntimeCoreBindingsDestroy(bindings);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+    EXPECT_EQ(mock.destroyedBindings, 3u);
+    EXPECT_EQ(mock.retainedResources, mock.releasedResources);
+}
+
+TEST(RuntimeForeignProvider, ProviderEncodePinsImmutableBindingRevisionWithoutHoldingPublicationLock) {
+    MockProvider mock;
+    VernonRuntimeDeviceProvider provider = makeProvider(mock, VERNON_RUNTIME_PROVIDER_COMPUTE);
+    VernonRuntimeCorePipelineDescriptor descriptor = computePipelineDescriptor();
+    VernonRuntimeCorePipeline *pipeline = nullptr;
+    ASSERT_EQ(vernonRuntimeCorePreparePipeline(&provider, &descriptor, &pipeline), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderBindingValue value{};
+    value.slot = 0;
+    value.kind = VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER;
+    value.payload.buffer.resource = {99, {100}, 0, 4096};
+    VernonRuntimeCoreBindings *bindings = nullptr;
+    ASSERT_EQ(vernonRuntimeCoreCreateBindings(pipeline, &value, 1, &bindings), VERNON_STATUS_OK);
+
+    VernonRuntimeProviderBindingValue replacement = value;
+    replacement.payload.buffer.resource = {100, {101}, 0, 4096};
+    mock.bindingsToReplaceDuringDispatch = bindings;
+    mock.replacementValue = &replacement;
+    const uint32_t groups[3]{1, 1, 1};
+    ASSERT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {200}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_EQ(mock.replacementStatus, VERNON_STATUS_OK);
+    const VernonRuntimeProviderObject encodedRevision = mock.lastDispatch.bindings;
+    EXPECT_EQ(mock.destroyedBindings, 1u);
+
+    ASSERT_EQ(vernonRuntimeCoreEncodeDispatch(pipeline, bindings, {200}, groups, nullptr, 0), VERNON_STATUS_OK);
+    EXPECT_NE(mock.lastDispatch.bindings.value, encodedRevision.value);
+
+    vernonRuntimeCoreBindingsDestroy(bindings);
+    vernonRuntimeCorePipelineDestroy(pipeline);
+    EXPECT_EQ(mock.destroyedBindings, 2u);
     EXPECT_EQ(mock.retainedResources, mock.releasedResources);
 }
 

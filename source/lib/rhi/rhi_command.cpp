@@ -204,6 +204,19 @@ Result<CommandDeviceStateRef, RhiError> CommandDeviceStateRef::retain() const no
     return Result<CommandDeviceStateRef, RhiError>{ok(CommandDeviceStateRef{std::move(retained).value()})};
 }
 
+Result<ChildLease, RhiError> CommandDeviceStateRef::retainDeviceLease() const noexcept {
+    if (!control_)
+        return Result<ChildLease, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"retain_device_lease", 0, 0}})};
+    auto reservation = control_.value()->owner.reserveChild();
+    if (reservation.isErr())
+        return Result<ChildLease, RhiError>{err(toRhiError(std::move(reservation).error()))};
+    auto committed = std::move(reservation).value().commit();
+    if (committed.isErr())
+        return Result<ChildLease, RhiError>{err(toRhiError(std::move(committed).error()))};
+    return Result<ChildLease, RhiError>{ok(std::move(committed).value())};
+}
+
 Result<CommandDeviceStateRef, RhiError> createCommandDeviceState(OwnerRef owner) noexcept {
     auto *control = new (std::nothrow) CommandDeviceStateControl(std::move(owner));
     if (!control)

@@ -598,6 +598,24 @@ TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
     vernonRuntimeRhiAdapterDestroy(adapter);
 }
 
+TEST_P(RhiResourceLifetime, RuntimeContextAndAdapterRetainTheirRhiDevice) {
+    const auto backend = GetParam();
+    const VernonRhiDevice retainedDevice = device();
+    VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(retainedDevice, *backend.rhi);
+    ASSERT_NE(adapter, nullptr);
+    vernonRhiDestroyDevice(retainedDevice);
+    EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
+    vernonRuntimeRhiAdapterDestroy(adapter);
+
+    VernonRuntimeContext *context = vernonRuntimeCreateForRhiDevice(backend.runtime, retainedDevice);
+    ASSERT_NE(context, nullptr);
+
+    vernonRhiDestroyDevice(retainedDevice);
+    EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
+    EXPECT_EQ(vernonRuntimeDestroy(context), VERNON_STATUS_OK);
+    EXPECT_TRUE(vernon::rhi::deviceExists(retainedDevice));
+}
+
 TEST_P(RhiResourceLifetime, CommandGraphRetainsImportedImageViewAndParent) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();

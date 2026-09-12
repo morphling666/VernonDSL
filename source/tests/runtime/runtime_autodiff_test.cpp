@@ -599,18 +599,22 @@ TEST(RuntimeAutodiff, ParsesBackendNeutralPlanningPolicies) {
 }
 
 TEST(RuntimeAutodiff, AutodiffMemoryPolicyIsLazyForOrdinaryRuntimeContexts) {
-    VernonRuntimeContext context;
-    EXPECT_EQ(context.autodiffMemoryPolicy, nullptr);
+    auto context = VernonRuntimeContext::create();
+    ASSERT_TRUE(context.isOk());
+    EXPECT_EQ(context.value()->autodiffMemoryPolicy, nullptr);
 }
 
 TEST(RuntimeAutodiff, ReplacesStaleInvocationDiagnosticAtPublicBoundary) {
-    VernonRuntimeContext context;
-    context.backend = VERNON_RUNTIME_CPU;
-    vernon::runtime::invocationDiagnostic(context) = "stale autodiff diagnostic";
+    auto created = VernonRuntimeContext::create();
+    ASSERT_TRUE(created.isOk());
+    auto context = std::move(created).value();
+    context->backend = VERNON_RUNTIME_CPU;
+    vernon::runtime::invocationDiagnostic(*context) = "stale autodiff diagnostic";
     constexpr char invalidBundle[] = "{";
-    EXPECT_EQ(vernonRuntimeLoadProgramBundleWithOptions(&context, invalidBundle, sizeof(invalidBundle) - 1, nullptr),
-              nullptr);
-    const VernonStringView error = vernonRuntimeGetLastError(&context);
+    EXPECT_EQ(
+        vernonRuntimeLoadProgramBundleWithOptions(context.get(), invalidBundle, sizeof(invalidBundle) - 1, nullptr),
+        nullptr);
+    const VernonStringView error = vernonRuntimeGetLastError(context.get());
     const std::string message(error.data, error.size);
     EXPECT_FALSE(message.empty());
     EXPECT_NE(message, "stale autodiff diagnostic");

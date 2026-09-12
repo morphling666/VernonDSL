@@ -155,7 +155,13 @@ VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context
         else if (module.role == "fragment")
             stagePlan.fragment = key;
     }
+    auto child = RuntimeChildLifecycle::reserve(context.owner);
+    if (child.isErr())
+        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages",
+                      "runtime context cannot admit a graphics Stage"),
+               nullptr;
     auto pipeline = std::make_unique<VernonStageExecutable>();
+    pipeline->lifecycle.emplace(std::move(child).value());
     pipeline->context = &context;
     pipeline->bindingProjection = std::move(stagePlan);
     rebuildStageBindingLayoutViews(pipeline->bindingProjection);
@@ -163,6 +169,9 @@ VernonStageExecutable *loadGraphicsProgramPipeline(VernonRuntimeContext &context
         return reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/artifact_system/artifacts/" + resolvedStage.artifact,
                       invocationDiagnostic(context)),
                nullptr;
+    auto published = pipeline->lifecycle.value().publish();
+    if (published.isErr())
+        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "/stages", "cannot publish graphics Stage"), nullptr;
     return pipeline.release();
 }
 
@@ -212,6 +221,16 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
                                                     const ArtifactSystem &artifacts,
                                                     const std::filesystem::path &bundleRoot, Diagnostic &diagnostic) {
     diagnostic = {};
+    auto child = RuntimeChildLifecycle::reserve(context.owner);
+    if (child.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "runtime context cannot admit a Program executable");
+        return nullptr;
+    }
+    auto instanceOwner = vernon::OwnerControlBlock::create();
+    if (instanceOwner.isErr()) {
+        reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot create Program executable lifecycle");
+        return nullptr;
+    }
     ResolvedExecutablePlan executable;
     if (!buildResolvedExecutablePlan(*program, context.backend, executable, diagnostic))
         return nullptr;
@@ -234,7 +253,8 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
                 executionKind(*node.node) == ExecutionKind::Graphics
                     ? loadGraphicsProgramPipeline(context, *plan->resolvedProgram, artifacts, bundleRoot, *node.node,
                                                   *node.stage, diagnostic)
-                    : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic));
+                    : loadComputeNodePipeline(context, artifacts, bundleRoot, node, diagnostic),
+                vernon::runtime::destroyResolvedStage);
             if (!child) {
                 if (diagnostic.code.empty())
                     reject(diagnostic, "PROGRAM_BACKEND_LOAD", "/stages/" + node.node->stage,
@@ -288,13 +308,16 @@ VernonProgramExecutable *loadBackendProgramPipeline(VernonRuntimeContext &contex
     }
     if (!buildResolvedExecutionPolicies(*plan, diagnostic) || !validateResolvedExecutionPlan(*plan, diagnostic))
         return nullptr;
-    auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(plan));
+    auto pipeline = std::make_unique<VernonProgramExecutable>(context, std::move(child).value(),
+                                                              std::move(instanceOwner).value(), std::move(plan));
     if (!vernon::runtime::ad::resolveProgramAutodiff(*pipeline, {}))
         return reject(diagnostic, "PROGRAM_ABI_MISMATCH", "/abi",
                       invocationDiagnostic(context).empty() ? "Program execution topology is invalid"
                                                             : invocationDiagnostic(context)),
                nullptr;
-    ++context.livePipelines;
+    auto published = pipeline->lifecycle.publish();
+    if (published.isErr())
+        return reject(diagnostic, "PROGRAM_RUNTIME_LIFECYCLE", "", "cannot publish Program executable"), nullptr;
     return pipeline.release();
 }
 

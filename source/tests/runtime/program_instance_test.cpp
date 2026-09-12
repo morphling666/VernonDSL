@@ -48,6 +48,20 @@ TEST(ProgramInstance, RollbackDoesNotPublishStagedBindings) {
     EXPECT_EQ(instance.telemetry().prepareCount, 0u);
 }
 
+TEST(ProgramInstance, CommitPublishesTheFrozenInvocationSnapshotWithoutRebuildingIt) {
+    int executable = 0;
+    ProgramInstance instance(&executable);
+    auto invocation = instance.beginInvocation();
+    invocation->stage(1, "frozen", std::make_shared<int>(7), 0, 0);
+
+    const auto frozen = invocation->freeze();
+    const auto committed = invocation->commit();
+
+    EXPECT_EQ(frozen.get(), committed.get());
+    ASSERT_NE(committed->find(1), nullptr);
+    EXPECT_EQ(*std::static_pointer_cast<int>(*committed->find(1)), 7);
+}
+
 TEST(ProgramInstance, ConcurrentInvocationsRetainIndependentSnapshots) {
     int executable = 0;
     ProgramInstance instance(&executable);
