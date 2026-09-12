@@ -208,7 +208,7 @@ void runSignedStrideVjpHostOracle(VernonProgramExecutable *executable, const Acc
         hostTensorArgument(gradientParameter, gradient.data(), sizeof(gradient), 1, sourceShape, sourceStrides,
                            3 * sizeof(float)),
     };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments.data(), derivativeArguments.size()),
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments.data(), derivativeArguments.size(), nullptr),
               VERNON_STATUS_OK);
     for (size_t index = 0; index < gradient.size(); ++index)
         EXPECT_FLOAT_EQ(gradient[index], static_cast<float>(acceptance.expected[index + 1]));
@@ -349,7 +349,7 @@ void runArgumentFreeTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, Vernon
     VernonProgramGraphicsControlsView controls{};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controls), VERNON_STATUS_OK);
     ASSERT_EQ(graphics.bind(invocation, controls), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
         << vernon::tests::runtimeDiagnostic(vernonRuntimeGetLastError(owned.runtime()));
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
@@ -357,6 +357,7 @@ void runArgumentFreeTriangleOracle(vernon::tests::OwnedRhiRuntime &owned, Vernon
     std::vector<uint8_t> pixels(extent * extent * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = extent;
     download.height = extent;
     download.depth = 1;
@@ -403,6 +404,7 @@ void runStorageTextureOracle(vernon::tests::OwnedRhiRuntime &owned, VernonProgra
     std::array<float, 4> texel{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 1;
     download.height = 1;
     download.depth = 1;

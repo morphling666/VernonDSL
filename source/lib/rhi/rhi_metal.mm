@@ -509,6 +509,29 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "download_buffer_ranges");
+    if (pinned.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    MetalBufferPayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferDownloadRange &range = ranges[index];
+        if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > payload.descriptor.size || range.size > payload.descriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+    return device.state.downloadBufferRanges(payload.native, ranges, rangeCount, device.error)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
 VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto anchor = lookupMetalDevice(handle);
     if (anchor.isErr())
@@ -765,6 +788,27 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
     if (!required || size != *required)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     return device.state.downloadImage(payload.native, payload.descriptor, *download, destination, size, device.error)
+               ? VERNON_RHI_STATUS_OK
+               : VERNON_RHI_STATUS_INTERNAL_ERROR;
+}
+
+VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
+                                   const VernonRhiImageDownload *downloads, size_t downloadCount) {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !downloads || downloadCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "download_image_batch");
+    if (pinned.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    MetalImagePayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    for (size_t index = 0; index < downloadCount; ++index) {
+        const auto required = vernon::rhi::imageDownloadByteSize(payload.descriptor, downloads[index].descriptor);
+        if (!downloads[index].destination || !required || downloads[index].size != *required)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+    return device.state.downloadImageBatch(payload.native, payload.descriptor, downloads, downloadCount, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
@@ -1423,6 +1467,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
+        downloadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,
@@ -1431,6 +1476,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         nullptr,
         uploadImage,
         downloadImage,
+        downloadImageBatch,
         generateImageMipmaps,
         nullptr,
         destroyImage,

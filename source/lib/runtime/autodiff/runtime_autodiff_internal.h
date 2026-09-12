@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_RUNTIME_AUTODIFF_INTERNAL_H
 
 #include "VernonRuntime.h"
+#include "runtime/autodiff/runtime_autodiff_apply.h"
 #include "runtime/autodiff/runtime_autodiff_telemetry.h"
 #include "runtime/program_execution/execution_control_plane.h"
 #include "runtime/runtime_lifecycle.h"
@@ -78,13 +79,16 @@ struct ForwardExecutionTarget {
     const ProgramInvocationContext *programContext{};
     std::map<VernonProgramNodeId, std::unique_ptr<class PullbackExecution>> *nodePullbacks{};
     bool retainPullback{};
+    program_execution::InvocationMutationOutcome &outcome;
 };
 
 class PullbackExecution {
 public:
     virtual ~PullbackExecution() = default;
     virtual VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
-                               const PullbackApplyOptions &options) = 0;
+                               const PullbackApplyOptions &options,
+                               program_execution::InvocationMutationOutcome &outcome) = 0;
+    virtual size_t mutationCapacity() const = 0;
     virtual PullbackMemoryUsage memoryUsage() const = 0;
     virtual program_execution::ExecutionControlPlaneUsage controlPlaneUsage() const { return {}; }
     virtual AutodiffPullbackCheckpointPlan checkpointPlan() const { return {}; }

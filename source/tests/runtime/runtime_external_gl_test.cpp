@@ -599,6 +599,7 @@ TEST(RuntimeExternalGl, CreatesAndReadsBackD32S8Image) {
     std::array<uint8_t, 2 * 2 * 8> data{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL;
     download.width = descriptor.width;
     download.height = descriptor.height;
     download.depth = descriptor.depth;
@@ -650,6 +651,7 @@ TEST(RuntimeExternalGl, ReadsEveryThreeDimensionalImageLayer) {
     std::array<uint8_t, 3 * 2 * 2 * 4> volume{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = descriptor.width;
     download.height = descriptor.height;
     download.depth = descriptor.depth;

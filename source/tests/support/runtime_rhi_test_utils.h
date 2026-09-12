@@ -179,7 +179,7 @@ inline VernonStatus completeCanonicalInvocation(VernonProgramExecutable *pipelin
     if (status == VERNON_STATUS_OK)
         status = controls.bind(invocation, controlSlots);
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeProgramInvocationForward(invocation, nullptr);
+        status = vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr);
     else
         vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
@@ -252,7 +252,7 @@ inline VernonStatus completeCanonicalComputeInvocation(VernonProgramExecutable *
         status = vernonRuntimeProgramInvocationBind(invocation, &bindingToken, &bindings[index], nullptr, 0, 0);
     }
     if (status == VERNON_STATUS_OK)
-        status = vernonRuntimeProgramInvocationForward(invocation, pullback);
+        status = vernonRuntimeProgramInvocationForward(invocation, pullback, nullptr);
     else
         vernonRuntimeProgramInvocationRollback(invocation);
     vernonRuntimeProgramInvocationDestroy(invocation);
@@ -352,8 +352,9 @@ inline VernonStatus applyCanonicalPullback(VernonProgramExecutable *pipeline, Ve
          append(*cotangents, VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_ACCESS_READ) != VERNON_STATUS_OK) ||
         append(*gradients, VERNON_PROGRAM_BOUNDARY_GRADIENT, VERNON_ACCESS_WRITE) != VERNON_STATUS_OK)
         return VERNON_STATUS_INVALID_ARGUMENT;
-    return options ? vernonProgramPullbackApplyWithOptions(pullback, arguments.data(), arguments.size(), options)
-                   : vernonProgramPullbackApply(pullback, arguments.data(), arguments.size());
+    return options
+               ? vernonProgramPullbackApplyWithOptions(pullback, arguments.data(), arguments.size(), options, nullptr)
+               : vernonProgramPullbackApply(pullback, arguments.data(), arguments.size(), nullptr);
 }
 
 inline VernonRhiStatus completeSubmission(VernonRhiDevice device, VernonRhiCommandEncoder encoder,

@@ -188,9 +188,10 @@ namespace vernon::runtime::program_execution {
 
 VernonStatus forwardProgramInvocation(
     VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments, size_t argumentCount,
-    VernonPullback *&pullback, const ProgramInvocationContext *programContext,
+    VernonPullback *&pullback, InvocationMutationOutcome &outcome, const ProgramInvocationContext *programContext,
     std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks, bool retainPullback) {
     pullback = nullptr;
+    outcome = {};
     const auto *autodiff = canonicalProgramAutodiff(&pipeline);
     auto *executable = autodiff ? autodiff->canonicalExecution.get() : nullptr;
     if (!executable || (argumentCount && !arguments)) {
@@ -198,7 +199,8 @@ VernonStatus forwardProgramInvocation(
         return VERNON_STATUS_INVALID_ARGUMENT;
     }
     std::unique_ptr<ad::PullbackExecution> execution;
-    const ad::ForwardExecutionTarget target{arguments, argumentCount, programContext, nodePullbacks, retainPullback};
+    const ad::ForwardExecutionTarget target{arguments,     argumentCount,  programContext,
+                                            nodePullbacks, retainPullback, outcome};
     const VernonStatus status = executable->forward(target, execution);
     if (status != VERNON_STATUS_OK)
         return status;
@@ -396,8 +398,13 @@ VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGroupLeaf(const Vernon
     return VERNON_STATUS_OK;
 }
 
-VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, const VernonProgramArgument *arguments,
-                                                   size_t argumentCount, const VernonPullbackApplyOptions *options) {
+extern "C++" {
+namespace vernon::runtime::ad {
+
+VernonStatus applyPullback(VernonPullback *pullback, const VernonProgramArgument *arguments, size_t argumentCount,
+                           const VernonPullbackApplyOptions *options,
+                           program_execution::InvocationMutationOutcome &outcome) {
+    outcome = {};
     VernonRuntimeContext *context = pullback ? pullback->context : nullptr;
     try {
         using namespace vernon::runtime::ad;
@@ -416,7 +423,7 @@ VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, con
                                                               : static_cast<size_t>(value);
         };
         const PullbackApplyOptions runtimeOptions{boundedSize(options->maximum_temporary_bytes)};
-        return pullback->execution->apply(arguments, argumentCount, runtimeOptions);
+        return pullback->execution->apply(arguments, argumentCount, runtimeOptions, outcome);
     } catch (const std::bad_alloc &) {
         return fail(context, "cannot allocate pullback state", VERNON_STATUS_INTERNAL_ERROR);
     } catch (const std::length_error &) {
@@ -426,13 +433,30 @@ VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, con
     }
 }
 
+} // namespace vernon::runtime::ad
+} // extern "C++"
+
+VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback, const VernonProgramArgument *arguments,
+                                                   size_t argumentCount, const VernonPullbackApplyOptions *options,
+                                                   VernonInvocationMutationOutcome *publicOutcome) {
+    using namespace vernon::runtime::program_execution;
+    const size_t capacity = pullback && pullback->execution ? pullback->execution->mutationCapacity() : 0;
+    if (!preparePublicOutcome(publicOutcome, capacity))
+        return fail(pullback ? pullback->context : nullptr, "invalid pullback mutation outcome storage");
+    InvocationMutationOutcome outcome;
+    const VernonStatus status =
+        vernon::runtime::ad::applyPullback(pullback, arguments, argumentCount, options, outcome);
+    publishPublicOutcome(outcome, publicOutcome);
+    return status;
+}
+
 VernonStatus vernonProgramPullbackApply(VernonPullback *pullback, const VernonProgramArgument *arguments,
-                                        size_t argumentCount) {
+                                        size_t argumentCount, VernonInvocationMutationOutcome *outcome) {
     const VernonPullbackApplyOptions options{sizeof(VernonPullbackApplyOptions),
                                              VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
                                              std::numeric_limits<uint64_t>::max(),
                                              {}};
-    return vernonProgramPullbackApplyWithOptions(pullback, arguments, argumentCount, &options);
+    return vernonProgramPullbackApplyWithOptions(pullback, arguments, argumentCount, &options, outcome);
 }
 
 void vernonProgramPullbackDestroy(VernonPullback *pullback) {

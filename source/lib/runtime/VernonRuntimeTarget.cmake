@@ -204,7 +204,6 @@ function(vernon_add_runtime)
         ${_VERNON_RUNTIME_IMPL_DIR}/autodiff/autodiff_metadata.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/compute_launch_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/content_hash.cpp
-        ${_VERNON_RUNTIME_IMPL_DIR}/dirty_index_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/dirty_range_set.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_invocation_planner.cpp
         ${_VERNON_RUNTIME_IMPL_DIR}/graphics_scope_materializer.cpp

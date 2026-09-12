@@ -45,8 +45,10 @@ public:
         if (auto structure = mlir::dyn_cast<mlir::vernon::StructType>(type))
             return readStruct(structure);
         if (auto texture = mlir::dyn_cast<mlir::vernon::TextureType>(type)) {
-            const llvm::StringRef format =
-                texture.getFormat() == "d32_float" ? llvm::StringRef("depth32_float") : texture.getFormat();
+            const llvm::StringRef format = texture.getFormat() == "d32_float" ? llvm::StringRef("depth32_float")
+                                           : texture.getFormat() == "d32_float_s8_uint"
+                                               ? llvm::StringRef("depth32_float_stencil8")
+                                               : texture.getFormat();
             SemanticType result;
             result.kind = SemanticTypeKind::Image;
             result.parameter = format.str();

@@ -42,7 +42,8 @@ public:
             throw std::logic_error("pullback is empty");
         const VernonPullbackApplyOptions options{
             sizeof(VernonPullbackApplyOptions), VERNON_PULLBACK_APPLY_OPTIONS_VERSION, maximumTemporaryBytes, {}};
-        if (vernonProgramPullbackApplyWithOptions(handle_, arguments, argumentCount, &options) != VERNON_STATUS_OK)
+        if (vernonProgramPullbackApplyWithOptions(handle_, arguments, argumentCount, &options, nullptr) !=
+            VERNON_STATUS_OK)
             throw std::runtime_error("pullback application failed");
     }
 
@@ -490,7 +491,8 @@ public:
         if (!handle_)
             throw std::logic_error("Program invocation is empty");
         VernonPullback *pullback = nullptr;
-        if (vernonRuntimeProgramInvocationForward(handle_, retainPullback ? &pullback : nullptr) != VERNON_STATUS_OK)
+        if (vernonRuntimeProgramInvocationForward(handle_, retainPullback ? &pullback : nullptr, nullptr) !=
+            VERNON_STATUS_OK)
             throw std::runtime_error("Program invocation failed");
         return Pullback(pullback);
     }

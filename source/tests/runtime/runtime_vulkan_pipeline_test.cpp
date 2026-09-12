@@ -151,6 +151,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
                                           0,
+                                          VERNON_RHI_IMAGE_ASPECT_COLOR,
                                           0,
                                           0,
                                           0,
@@ -263,6 +264,7 @@ TEST(RuntimeVulkanPipeline, ReusesGraphicsObjectsAcrossInvocations) {
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;

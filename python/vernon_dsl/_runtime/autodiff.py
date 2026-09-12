@@ -124,7 +124,6 @@ def execute_direct_vjp(
             outputs=specialization.output_recipe.resolve(inputs, ()),
         )
         _, pullback = specialization.compiled.invoke(invocation)
-        pullback._lease.release()
         extent = tuple(count * size for count, size in zip(grid, specialization.workgroup_size, strict=True))
         carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
         return None, _KernelPullback(pullback, carrier_shape, context)
@@ -149,7 +148,7 @@ class _KernelPullback:
             return cotangent
         if isinstance(cotangent, dict):
             return {path: self._canonical_cotangent(value) for path, value in cotangent.items()}
-        source = cotangent._native_host_array() if hasattr(cotangent, "_native_host_array") else cotangent
+        source = cotangent.to_numpy() if hasattr(cotangent, "to_numpy") else cotangent
         array = np.asarray(source)
         rank = len(self.carrier_shape)
         if tuple(array.shape[:rank]) == self.carrier_shape:

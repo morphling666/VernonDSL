@@ -324,6 +324,7 @@ TEST(RuntimeMetal, RoundTripsTextureGeneratesMipmapsAndCreatesSampler) {
         source[index] = static_cast<uint8_t>(index * 3);
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     upload.width = descriptor.width;
     upload.height = descriptor.height;
     upload.depth = 1;
@@ -335,6 +336,7 @@ TEST(RuntimeMetal, RoundTripsTextureGeneratesMipmapsAndCreatesSampler) {
     std::array<uint8_t, source.size()> destination{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = descriptor.width;
     download.height = descriptor.height;
     download.depth = 1;
@@ -388,6 +390,7 @@ TEST(RuntimeMetal, CopiesImageMipLayerRegionsAndRejectsInvalidCopies) {
     const std::array<uint8_t, 16> expected{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     upload.mip_level = 1;
     upload.array_layer = 1;
     upload.width = 2;
@@ -415,6 +418,7 @@ TEST(RuntimeMetal, CopiesImageMipLayerRegionsAndRejectsInvalidCopies) {
     std::array<uint8_t, 16> actual{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.mip_level = 1;
     download.array_layer = 1;
     download.width = 2;
@@ -479,6 +483,7 @@ TEST(RuntimeMetal, CopiesThreeDimensionalImageDepthExtent) {
     const std::array<uint8_t, 8> expected{1, 2, 3, 4, 5, 6, 7, 8};
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     upload.width = 2;
     upload.height = 2;
     upload.depth = 2;
@@ -502,6 +507,7 @@ TEST(RuntimeMetal, CopiesThreeDimensionalImageDepthExtent) {
     std::array<uint8_t, 8> actual{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 2;
     download.height = 2;
     download.depth = 2;
@@ -536,6 +542,7 @@ TEST(RuntimeMetal, CopiesDepthImageAspect) {
     const std::array<float, 4> expected{0.1f, 0.25f, 0.5f, 1.0f};
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
     upload.width = 2;
     upload.height = 2;
     upload.depth = 1;
@@ -559,6 +566,7 @@ TEST(RuntimeMetal, CopiesDepthImageAspect) {
     std::array<float, 4> actual{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
     download.width = 2;
     download.height = 2;
     download.depth = 1;
@@ -779,6 +787,8 @@ TEST(RuntimeMetal, RoundTripsThreeDimensionalCubeAndDepthTextures) {
         std::vector<VernonRhiImageUploadDescriptor> uploads(layers);
         for (uint32_t layer = 0; layer < layers; ++layer) {
             uploads[layer].struct_size = sizeof(VernonRhiImageUploadDescriptor);
+            uploads[layer].aspect =
+                format == VERNON_RHI_FORMAT_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH : VERNON_RHI_IMAGE_ASPECT_COLOR;
             uploads[layer].array_layer = dimension == VERNON_RHI_IMAGE_3D ? 0 : layer;
             uploads[layer].width = width;
             uploads[layer].height = height;
@@ -791,17 +801,22 @@ TEST(RuntimeMetal, RoundTripsThreeDimensionalCubeAndDepthTextures) {
         std::vector<uint8_t> destination(byteSize);
         VernonRhiImageDownloadDescriptor download{};
         download.struct_size = sizeof(download);
+        download.aspect =
+            format == VERNON_RHI_FORMAT_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH : VERNON_RHI_IMAGE_ASPECT_COLOR;
         download.width = width;
         download.height = height;
         download.depth = depth;
         download.destination_format = sourceFormat;
         download.destination_type = sourceType;
+        std::vector<VernonRhiImageDownload> downloads(layers);
         for (uint32_t layer = 0; layer < layers; ++layer) {
-            download.array_layer = dimension == VERNON_RHI_IMAGE_3D ? 0 : layer;
-            EXPECT_EQ(vernonRhiDeviceDownloadImage(device, image, &download, destination.data() + layer * layerSize,
-                                                   layerSize),
-                      VERNON_RHI_STATUS_OK);
+            downloads[layer].descriptor = download;
+            downloads[layer].descriptor.array_layer = dimension == VERNON_RHI_IMAGE_3D ? 0 : layer;
+            downloads[layer].destination = destination.data() + layer * layerSize;
+            downloads[layer].size = layerSize;
         }
+        EXPECT_EQ(vernonRhiDeviceDownloadImageBatch(device, image, downloads.data(), downloads.size()),
+                  VERNON_RHI_STATUS_OK);
         EXPECT_EQ(std::memcmp(destination.data(), source, byteSize), 0);
         EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
     };
@@ -1211,6 +1226,7 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
     constexpr std::array<uint8_t, 4> color{51, 102, 153, 255};
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     upload.width = upload.height = upload.depth = 1;
     upload.source_format = VERNON_RHI_IMAGE_DATA_RGBA;
     upload.source_type = VERNON_RHI_IMAGE_DATA_UINT8;
@@ -1266,6 +1282,7 @@ kernel void copy_texture(constant TextureArguments &arguments [[buffer(0)]]) {
     std::array<uint8_t, 4> result{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 1;
     download.height = 1;
     download.depth = 1;
@@ -1514,6 +1531,7 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
     std::array<uint8_t, 4 * 4 * 4> pixels{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 4;
     download.height = 4;
     download.depth = 1;
@@ -1528,6 +1546,7 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
         EXPECT_EQ(pixels[index + 3], 255);
     }
     std::array<uint8_t, 4 * 4 * 8> depthStencil{};
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL;
     download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH_STENCIL;
     download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
     ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, &download, depthStencil.data(), depthStencil.size()),
@@ -1538,6 +1557,20 @@ fragment float4 fragment_main(VertexOutput input [[stage_in]], uint primitive [[
         EXPECT_FLOAT_EQ(depth, 0.5f);
         EXPECT_EQ(depthStencil[index + 4], 3);
     }
+    std::array<uint8_t, 4 * 4> stencil{};
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_STENCIL;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_STENCIL;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_UINT8;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, &download, stencil.data(), stencil.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_TRUE(std::all_of(stencil.begin(), stencil.end(), [](uint8_t value) { return value == 3; }));
+    std::array<float, 4 * 4> depth{};
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
+    download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
+    download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;
+    ASSERT_EQ(vernonRhiDeviceDownloadImage(device, depthImage, &download, depth.data(), sizeof(depth)),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_TRUE(std::all_of(depth.begin(), depth.end(), [](float value) { return value == 0.5f; }));
 
     EXPECT_EQ(vernonRhiDeviceDestroyImageView(device, depthView), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, depthImage), VERNON_RHI_STATUS_OK);
@@ -1735,6 +1768,7 @@ TEST(RuntimeMetal, PublicRuntimeBindsCookedResolutionUniform) {
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;
@@ -1822,6 +1856,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
                                           0,
+                                          VERNON_RHI_IMAGE_ASPECT_COLOR,
                                           0,
                                           0,
                                           0,
@@ -1916,6 +1951,7 @@ TEST(RuntimeMetal, PublicRuntimeLoadsAndDrawsCookedGraphicsBundle) {
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;

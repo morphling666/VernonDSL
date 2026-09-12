@@ -83,6 +83,7 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
         uploads[index] = {sizeof(VernonRhiImageUploadDescriptor),
                           0,
                           static_cast<uint32_t>(index),
+                          VERNON_RHI_IMAGE_ASPECT_COLOR,
                           0,
                           0,
                           0,
@@ -167,6 +168,7 @@ TEST(RuntimeVulkanCubeMap, CooksSamplesAndRendersBothAttachments) {
     std::vector<uint8_t> bloomPixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;

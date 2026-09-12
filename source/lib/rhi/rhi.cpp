@@ -136,6 +136,12 @@ extern "C" VernonRhiStatus vernonRhiDeviceUploadBufferRanges(VernonRhiDevice dev
     VERNON_DISPATCH_STATUS(device, uploadBufferRanges, buffer, ranges, rangeCount);
 }
 
+extern "C" VernonRhiStatus vernonRhiDeviceDownloadBufferRanges(VernonRhiDevice device, VernonRhiBuffer buffer,
+                                                               const VernonRhiBufferDownloadRange *ranges,
+                                                               size_t rangeCount) {
+    VERNON_DISPATCH_STATUS(device, downloadBufferRanges, buffer, ranges, rangeCount);
+}
+
 extern "C" VernonRhiStatus vernonRhiDeviceDownloadBuffer(VernonRhiDevice device, VernonRhiBuffer buffer,
                                                          uint64_t offset, void *destination, uint64_t size) {
     VERNON_DISPATCH_STATUS(device, downloadBuffer, buffer, offset, destination, size);
@@ -190,6 +196,12 @@ extern "C" VernonRhiStatus vernonRhiDeviceDownloadImage(VernonRhiDevice device, 
                                                         const VernonRhiImageDownloadDescriptor *descriptor,
                                                         void *destination, size_t size) {
     VERNON_DISPATCH_STATUS(device, downloadImage, image, descriptor, destination, size);
+}
+
+extern "C" VernonRhiStatus vernonRhiDeviceDownloadImageBatch(VernonRhiDevice device, VernonRhiImage image,
+                                                             const VernonRhiImageDownload *downloads,
+                                                             size_t downloadCount) {
+    VERNON_DISPATCH_STATUS(device, downloadImageBatch, image, downloads, downloadCount);
 }
 
 extern "C" VernonRhiStatus vernonRhiDeviceGenerateImageMipmaps(VernonRhiDevice device, VernonRhiImage image) {

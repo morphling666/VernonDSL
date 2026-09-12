@@ -3,6 +3,7 @@
 #include "compiler_json.h"
 #include "compiler_program_storage.h"
 
+#include <algorithm>
 #include <optional>
 
 namespace vernon::compiler {
@@ -111,14 +112,28 @@ bool planProgramBoundaries(const llvm::json::Object &signature, const llvm::json
                            const llvm::json::Array &storages, const llvm::json::Array &graphs,
                            ProgramBoundaryPlan &plan, std::string &error) {
     plan = {};
-    return appendProgramBoundaries(signature, "inputs", ProgramBoundaryRole::Input, ProgramBoundaryDirection::Input,
-                                   values, storages, graphs, plan, error) &&
-           appendProgramBoundaries(signature, "outputs", ProgramBoundaryRole::Output, ProgramBoundaryDirection::Output,
-                                   values, storages, graphs, plan, error) &&
-           appendProgramBoundaries(signature, "cotangents", ProgramBoundaryRole::Cotangent,
-                                   ProgramBoundaryDirection::Input, values, storages, graphs, plan, error) &&
-           appendProgramBoundaries(signature, "gradients", ProgramBoundaryRole::Gradient,
-                                   ProgramBoundaryDirection::Output, values, storages, graphs, plan, error);
+    if (!appendProgramBoundaries(signature, "inputs", ProgramBoundaryRole::Input, ProgramBoundaryDirection::Input,
+                                 values, storages, graphs, plan, error) ||
+        !appendProgramBoundaries(signature, "outputs", ProgramBoundaryRole::Output, ProgramBoundaryDirection::Output,
+                                 values, storages, graphs, plan, error) ||
+        !appendProgramBoundaries(signature, "cotangents", ProgramBoundaryRole::Cotangent,
+                                 ProgramBoundaryDirection::Input, values, storages, graphs, plan, error) ||
+        !appendProgramBoundaries(signature, "gradients", ProgramBoundaryRole::Gradient,
+                                 ProgramBoundaryDirection::Output, values, storages, graphs, plan, error))
+        return false;
+    for (ProgramBoundarySlotPlan &slot : plan.slots) {
+        if (slot.direction != ProgramBoundaryDirection::Input || !slot.storage ||
+            slot.access == ProgramBoundaryAccess::Read)
+            continue;
+        const bool hasOutputOwner =
+            std::any_of(plan.slots.begin(), plan.slots.end(), [&](const ProgramBoundarySlotPlan &candidate) {
+                return candidate.direction == ProgramBoundaryDirection::Output &&
+                       candidate.owner.storage == slot.owner.storage && candidate.owner.id == slot.owner.id;
+            });
+        if (!hasOutputOwner)
+            slot.publication = ProgramBoundaryPublication::InPlace;
+    }
+    return true;
 }
 
 llvm::StringRef programBoundaryRoleName(ProgramBoundaryRole role) {

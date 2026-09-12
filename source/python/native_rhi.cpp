@@ -152,6 +152,37 @@ nb::bytes RhiBuffer::download() const {
     return nb::bytes(data.data(), data.size());
 }
 
+nb::list RhiBuffer::downloadRanges(const nb::list &ranges) const {
+    std::vector<size_t> offsets;
+    std::vector<std::string> downloads;
+    std::vector<VernonRhiBufferDownloadRange> nativeRanges;
+    offsets.reserve(nb::len(ranges));
+    downloads.reserve(nb::len(ranges));
+    nativeRanges.reserve(nb::len(ranges));
+    for (nb::handle item : ranges) {
+        nb::tuple range = nb::cast<nb::tuple>(item);
+        if (range.size() != 2)
+            throw std::invalid_argument("RHI buffer download range must contain begin and end");
+        const size_t begin = nb::cast<size_t>(range[0]);
+        const size_t end = nb::cast<size_t>(range[1]);
+        if (begin > end || end > size)
+            throw std::invalid_argument("RHI buffer download range is outside the buffer");
+        offsets.push_back(begin);
+        downloads.emplace_back(end - begin, '\0');
+    }
+    nb::list result;
+    if (downloads.empty())
+        return result;
+    for (size_t index = 0; index < downloads.size(); ++index)
+        nativeRanges.push_back({offsets[index], downloads[index].data(), downloads[index].size()});
+    if (vernonRhiDeviceDownloadBufferRanges(host->device, handle, nativeRanges.data(), nativeRanges.size()) !=
+        VERNON_RHI_STATUS_OK)
+        throw std::runtime_error("RHI buffer range download failed");
+    for (size_t index = 0; index < downloads.size(); ++index)
+        result.append(nb::make_tuple(offsets[index], nb::bytes(downloads[index].data(), downloads[index].size())));
+    return result;
+}
+
 RhiImage::RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t height, uint32_t depth,
                    VernonTextureFormat format, VernonTextureDimension dimension, uint32_t mipLevels, uint32_t usage)
     : host(std::move(host)), width(width), height(height), depth(depth), format(format), dimension(dimension),
@@ -180,7 +211,8 @@ RhiImage::RhiImage(std::shared_ptr<RhiHostState> host, uint32_t width, uint32_t 
 RhiImage::~RhiImage() { vernonRhiDeviceDestroyImage(host->device, handle); }
 
 void RhiImage::upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ,
-                      uint32_t uploadWidth, uint32_t uploadHeight, uint32_t uploadDepth) {
+                      uint32_t uploadWidth, uint32_t uploadHeight, uint32_t uploadDepth, uint32_t baseArrayLayer,
+                      uint32_t arrayLayerCount, uint32_t aspects) {
     if (!(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
         throw std::runtime_error("image format does not support upload");
     if (mipLevel >= mipLevels)
@@ -191,19 +223,27 @@ void RhiImage::upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX
     uploadWidth = uploadWidth ? uploadWidth : mipWidth - offsetX;
     uploadHeight = uploadHeight ? uploadHeight : mipHeight - offsetY;
     uploadDepth = uploadDepth ? uploadDepth : mipDepth - offsetZ;
+    arrayLayerCount = arrayLayerCount ? arrayLayerCount : layers - baseArrayLayer;
     if (offsetX >= mipWidth || offsetY >= mipHeight || offsetZ >= mipDepth || uploadWidth > mipWidth - offsetX ||
-        uploadHeight > mipHeight - offsetY || uploadDepth > mipDepth - offsetZ)
+        uploadHeight > mipHeight - offsetY || uploadDepth > mipDepth - offsetZ || baseArrayLayer >= layers ||
+        arrayLayerCount > layers - baseArrayLayer)
         throw std::invalid_argument("RHI image upload region is out of range");
-    const Layout layout = dataLayout(format);
+    if (!aspects)
+        aspects = format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                  : format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                      ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
+                      : VERNON_RHI_IMAGE_ASPECT_COLOR;
+    const Layout layout = dataLayout(format, aspects);
     const size_t layerSize = checkedByteSize(uploadWidth, uploadHeight, uploadDepth, layout.pixelSize);
-    if (data.size() != layerSize * layers)
+    if (data.size() != layerSize * arrayLayerCount)
         throw std::runtime_error("RHI image upload size does not match its extent");
-    std::vector<VernonRhiImageUploadDescriptor> descriptors(layers);
-    for (uint32_t layer = 0; layer < layers; ++layer) {
+    std::vector<VernonRhiImageUploadDescriptor> descriptors(arrayLayerCount);
+    for (uint32_t layer = 0; layer < arrayLayerCount; ++layer) {
         VernonRhiImageUploadDescriptor &descriptor = descriptors[layer];
         descriptor.struct_size = sizeof(descriptor);
         descriptor.mip_level = mipLevel;
-        descriptor.array_layer = layer;
+        descriptor.array_layer = baseArrayLayer + layer;
+        descriptor.aspect = aspects;
         descriptor.offset_x = offsetX;
         descriptor.offset_y = offsetY;
         descriptor.offset_z = offsetZ;
@@ -219,8 +259,36 @@ void RhiImage::upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX
         throw std::runtime_error("RHI image upload failed: " + stringView(vernonRhiDeviceGetLastError(host->device)));
 }
 
+void RhiImage::uploadRegions(const nb::list &regions) {
+    if (!(usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION))
+        throw std::runtime_error("image format does not support upload");
+    std::vector<nb::bytes> sources;
+    std::vector<VernonRhiImageUploadDescriptor> descriptors;
+    sources.reserve(nb::len(regions));
+    for (nb::handle item : regions) {
+        nb::dict request = nb::cast<nb::dict>(item);
+        const Region region = parseRegion(request);
+        sources.push_back(nb::cast<nb::bytes>(request["data"]));
+        const Layout layout = dataLayout(format, region.aspects);
+        const size_t layerSize = checkedByteSize(region.width, region.height, region.depth, layout.pixelSize);
+        if (region.arrayLayerCount > (std::numeric_limits<size_t>::max)() / layerSize ||
+            sources.back().size() != layerSize * region.arrayLayerCount)
+            throw std::invalid_argument("RHI image upload size does not match its region");
+        for (uint32_t layer = 0; layer < region.arrayLayerCount; ++layer)
+            descriptors.push_back({sizeof(VernonRhiImageUploadDescriptor), region.mipLevel,
+                                   region.baseArrayLayer + layer, region.aspects, region.offsetX, region.offsetY,
+                                   region.offsetZ, region.width, region.height, region.depth, layout.format,
+                                   layout.type, sources.back().c_str() + layerSize * layer});
+    }
+    if (!descriptors.empty() && vernonRhiDeviceUploadImage(host->device, handle, descriptors.data(),
+                                                           descriptors.size()) != VERNON_RHI_STATUS_OK)
+        throw std::runtime_error("RHI image batch upload failed: " +
+                                 stringView(vernonRhiDeviceGetLastError(host->device)));
+}
+
 nb::bytes RhiImage::download(uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ,
-                             uint32_t downloadWidth, uint32_t downloadHeight, uint32_t downloadDepth) const {
+                             uint32_t downloadWidth, uint32_t downloadHeight, uint32_t downloadDepth,
+                             uint32_t baseArrayLayer, uint32_t arrayLayerCount, uint32_t aspects) const {
     if (!(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
         throw std::runtime_error("image format does not support download");
     if (mipLevel >= mipLevels)
@@ -231,17 +299,26 @@ nb::bytes RhiImage::download(uint32_t mipLevel, uint32_t offsetX, uint32_t offse
     downloadWidth = downloadWidth ? downloadWidth : mipWidth - offsetX;
     downloadHeight = downloadHeight ? downloadHeight : mipHeight - offsetY;
     downloadDepth = downloadDepth ? downloadDepth : mipDepth - offsetZ;
+    arrayLayerCount = arrayLayerCount ? arrayLayerCount : layers - baseArrayLayer;
     if (offsetX >= mipWidth || offsetY >= mipHeight || offsetZ >= mipDepth || downloadWidth > mipWidth - offsetX ||
-        downloadHeight > mipHeight - offsetY || downloadDepth > mipDepth - offsetZ)
+        downloadHeight > mipHeight - offsetY || downloadDepth > mipDepth - offsetZ || baseArrayLayer >= layers ||
+        arrayLayerCount > layers - baseArrayLayer)
         throw std::invalid_argument("RHI image download region is out of range");
-    const Layout layout = dataLayout(format);
+    if (!aspects)
+        aspects = format == VERNON_TEXTURE_D32_FLOAT ? VERNON_RHI_IMAGE_ASPECT_DEPTH
+                  : format == VERNON_TEXTURE_D32_FLOAT_S8_UINT
+                      ? VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL
+                      : VERNON_RHI_IMAGE_ASPECT_COLOR;
+    const Layout layout = dataLayout(format, aspects);
     const size_t layerSize = checkedByteSize(downloadWidth, downloadHeight, downloadDepth, layout.pixelSize);
-    std::string data(layerSize * layers, '\0');
-    for (uint32_t layer = 0; layer < layers; ++layer) {
-        VernonRhiImageDownloadDescriptor descriptor{};
+    std::string data(layerSize * arrayLayerCount, '\0');
+    std::vector<VernonRhiImageDownload> downloads(arrayLayerCount);
+    for (uint32_t layer = 0; layer < arrayLayerCount; ++layer) {
+        VernonRhiImageDownloadDescriptor &descriptor = downloads[layer].descriptor;
         descriptor.struct_size = sizeof(descriptor);
         descriptor.mip_level = mipLevel;
-        descriptor.array_layer = layer;
+        descriptor.array_layer = baseArrayLayer + layer;
+        descriptor.aspect = aspects;
         descriptor.offset_x = offsetX;
         descriptor.offset_y = offsetY;
         descriptor.offset_z = offsetZ;
@@ -250,12 +327,55 @@ nb::bytes RhiImage::download(uint32_t mipLevel, uint32_t offsetX, uint32_t offse
         descriptor.depth = downloadDepth;
         descriptor.destination_format = layout.format;
         descriptor.destination_type = layout.type;
-        if (vernonRhiDeviceDownloadImage(host->device, handle, &descriptor, data.data() + layer * layerSize,
-                                         layerSize) != VERNON_RHI_STATUS_OK)
-            throw std::runtime_error("RHI image download failed: " +
-                                     stringView(vernonRhiDeviceGetLastError(host->device)));
+        downloads[layer].destination = data.data() + layer * layerSize;
+        downloads[layer].size = layerSize;
     }
+    if (vernonRhiDeviceDownloadImageBatch(host->device, handle, downloads.data(), downloads.size()) !=
+        VERNON_RHI_STATUS_OK)
+        throw std::runtime_error("RHI image download failed: " + stringView(vernonRhiDeviceGetLastError(host->device)));
     return nb::bytes(data.data(), data.size());
+}
+
+nb::list RhiImage::downloadRegions(const nb::list &regions) const {
+    if (!(usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE))
+        throw std::runtime_error("image format does not support download");
+    std::vector<std::string> destinations;
+    std::vector<VernonRhiImageDownload> downloads;
+    destinations.reserve(nb::len(regions));
+    for (nb::handle item : regions) {
+        const Region region = parseRegion(nb::cast<nb::dict>(item));
+        const Layout layout = dataLayout(format, region.aspects);
+        const size_t layerSize = checkedByteSize(region.width, region.height, region.depth, layout.pixelSize);
+        if (region.arrayLayerCount > (std::numeric_limits<size_t>::max)() / layerSize)
+            throw std::overflow_error("RHI image batch download size overflows");
+        destinations.emplace_back(layerSize * region.arrayLayerCount, '\0');
+        for (uint32_t layer = 0; layer < region.arrayLayerCount; ++layer) {
+            VernonRhiImageDownload download{};
+            download.descriptor = {sizeof(VernonRhiImageDownloadDescriptor),
+                                   region.mipLevel,
+                                   region.baseArrayLayer + layer,
+                                   region.aspects,
+                                   region.offsetX,
+                                   region.offsetY,
+                                   region.offsetZ,
+                                   region.width,
+                                   region.height,
+                                   region.depth,
+                                   layout.format,
+                                   layout.type};
+            download.destination = destinations.back().data() + layerSize * layer;
+            download.size = layerSize;
+            downloads.push_back(download);
+        }
+    }
+    if (!downloads.empty() && vernonRhiDeviceDownloadImageBatch(host->device, handle, downloads.data(),
+                                                                downloads.size()) != VERNON_RHI_STATUS_OK)
+        throw std::runtime_error("RHI image batch download failed: " +
+                                 stringView(vernonRhiDeviceGetLastError(host->device)));
+    nb::list result;
+    for (const std::string &destination : destinations)
+        result.append(nb::bytes(destination.data(), destination.size()));
+    return result;
 }
 
 void RhiImage::generateMipmaps() {
@@ -271,7 +391,15 @@ uint32_t RhiImage::mipExtent(uint32_t extent, uint32_t level) {
     return value ? value : 1;
 }
 
-RhiImage::Layout RhiImage::dataLayout(VernonTextureFormat format) {
+RhiImage::Layout RhiImage::dataLayout(VernonTextureFormat format, uint32_t aspects) {
+    if (format == VERNON_TEXTURE_D32_FLOAT_S8_UINT) {
+        if (aspects == VERNON_RHI_IMAGE_ASPECT_DEPTH)
+            return {4, VERNON_RHI_IMAGE_DATA_DEPTH, VERNON_RHI_IMAGE_DATA_FLOAT32};
+        if (aspects == VERNON_RHI_IMAGE_ASPECT_STENCIL)
+            return {1, VERNON_RHI_IMAGE_DATA_STENCIL, VERNON_RHI_IMAGE_DATA_UINT8};
+        if (aspects != (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL))
+            throw std::invalid_argument("unsupported depth/stencil transfer aspects");
+    }
     switch (format) {
     case VERNON_TEXTURE_R8_UNORM:
         return {1, VERNON_RHI_IMAGE_DATA_RED, VERNON_RHI_IMAGE_DATA_UINT8};
@@ -308,6 +436,34 @@ size_t RhiImage::checkedByteSize(uint32_t width, uint32_t height, uint32_t depth
         size *= extent;
     }
     return size;
+}
+
+RhiImage::Region RhiImage::parseRegion(const nb::dict &region) const {
+    Region parsed{
+        nb::cast<uint32_t>(region["mip_level"]),
+        nb::cast<uint32_t>(region["offset_x"]),
+        nb::cast<uint32_t>(region["offset_y"]),
+        nb::cast<uint32_t>(region["offset_z"]),
+        nb::cast<uint32_t>(region["width"]),
+        nb::cast<uint32_t>(region["height"]),
+        nb::cast<uint32_t>(region["depth"]),
+        nb::cast<uint32_t>(region["base_array_layer"]),
+        nb::cast<uint32_t>(region["array_layer_count"]),
+        nb::cast<uint32_t>(region["aspects"]),
+    };
+    if (parsed.mipLevel >= mipLevels || !parsed.width || !parsed.height || !parsed.depth || !parsed.arrayLayerCount)
+        throw std::invalid_argument("RHI image transfer region has an invalid extent");
+    const uint32_t mipWidth = mipExtent(width, parsed.mipLevel);
+    const uint32_t mipHeight = mipExtent(height, parsed.mipLevel);
+    const uint32_t mipDepth = dimension == VERNON_TEXTURE_3D ? mipExtent(depth, parsed.mipLevel) : depth;
+    if (parsed.offsetX >= mipWidth || parsed.offsetY >= mipHeight || parsed.offsetZ >= mipDepth ||
+        parsed.width > mipWidth - parsed.offsetX || parsed.height > mipHeight - parsed.offsetY ||
+        parsed.depth > mipDepth - parsed.offsetZ || parsed.baseArrayLayer >= layers ||
+        parsed.arrayLayerCount > layers - parsed.baseArrayLayer ||
+        (dimension != VERNON_TEXTURE_3D && (parsed.offsetZ != 0 || parsed.depth != 1)))
+        throw std::invalid_argument("RHI image transfer region is out of range");
+    (void)dataLayout(format, parsed.aspects);
+    return parsed;
 }
 
 RhiImageView::RhiImageView(RhiImage *image, VernonTextureFormat format, VernonTextureDimension dimension,

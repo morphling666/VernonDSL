@@ -13,7 +13,7 @@ std::vector<std::string> derivativeGroupLeaves(const nb::handle &group) {
 
 nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
                                                  const nb::object &cotangentGroups, const nb::object &carrierShape,
-                                                 bool logical, const nb::object &context,
+                                                 bool logical, const nb::object &context, const nb::callable &admit,
                                                  const VernonPullbackApplyOptions *options) {
     (void)carrierShape;
     const size_t cotangentGroupCount = nb::len(cotangentGroups);
@@ -40,7 +40,7 @@ nb::dict PythonPullback::applyGroupedWithOptions(const nb::object &cotangent, co
         nativeCotangent = std::move(supplied);
     }
 
-    nb::dict leafResults = applyImpl(nativeCotangent, logical, context, options);
+    nb::dict leafResults = applyImpl(nativeCotangent, logical, context, admit, options);
     nb::dict grouped;
     for (nb::handle group : nb::iter(gradientGroups)) {
         const std::vector<std::string> paths = derivativeGroupLeaves(group);

@@ -40,6 +40,18 @@ using program_execution::ProgramValueState;
 using program_execution::PublicationTransaction;
 using program_execution::ResolvedTransferExecutor;
 
+void recordRenderPassMutations(const program::Graph &graph, program_execution::SubmissionState submission,
+                               program_execution::InvocationMutationOutcome &outcome) {
+    if (submission == program_execution::SubmissionState::NotSubmitted)
+        return;
+    const VernonBoundaryMutationState state = submission == program_execution::SubmissionState::Completed
+                                                  ? VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED
+                                                  : VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+    for (const program::Node &node : graph.nodes)
+        if (program::executionKind(node) == program::ExecutionKind::Graphics)
+            outcome.set(VERNON_MUTATION_RENDER_PASS_CONTROL, program::graphicsOperation(node).renderPassControl, state);
+}
+
 bool validateProgramTapeValues(const std::vector<HostProgramValue> &storage, const ProgramTapeScratch &tapeScratch,
                                std::string &error) {
     if (program_execution::injectFailure(program_execution::FailureBoundary::TapeValidation))
@@ -104,7 +116,9 @@ public:
     }
 
     VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
-                       const PullbackApplyOptions &options) override {
+                       const PullbackApplyOptions &options,
+                       program_execution::InvocationMutationOutcome &outcome) override {
+        outcome = {};
         const std::lock_guard lock(applyMutex_);
         if (!topology_->resolvedProgram || !state_)
             return fail(*context_, "Program pullback has no retained canonical state");
@@ -131,6 +145,11 @@ public:
         const std::vector<std::vector<uint64_t>> &captureShapes = state_->captureShapes();
         std::vector<ProgramValueState> storage;
         PublicationTransaction publication(topology_->publications);
+        struct OutcomePublication {
+            const PublicationTransaction &publication;
+            program_execution::InvocationMutationOutcome &outcome;
+            ~OutcomePublication() { outcome.merge(publication.mutationOutcome()); }
+        } outcomePublication{publication, outcome};
         PullbackInvocationSpec frame{
             required, {arguments, argumentCount, derivativeBindings_, publication},
             captures, captureShapes,
@@ -177,8 +196,10 @@ public:
                                               tapeStates, error))
                     return fail(*context_, error);
                 for (;;) {
-                    const VernonStatus replayStatus =
-                        executePipelineProgramGraph(*context_, *topology_, *replay, values, resolvePhysicalEndpoint);
+                    program_execution::SubmissionState replaySubmission;
+                    const VernonStatus replayStatus = executePipelineProgramGraph(
+                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                    publication.noteSubmission(replaySubmission);
                     if (replayStatus != VERNON_STATUS_OK)
                         return replayStatus;
                     bool retry = false;
@@ -196,16 +217,20 @@ public:
                             return fail(*context_, error);
                 }
             } else {
-                const VernonStatus replayStatus =
-                    executePipelineProgramGraph(*context_, *topology_, *replay, values, resolvePhysicalEndpoint);
+                program_execution::SubmissionState replaySubmission;
+                const VernonStatus replayStatus = executePipelineProgramGraph(
+                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
+                publication.noteSubmission(replaySubmission);
                 if (replayStatus != VERNON_STATUS_OK)
                     return replayStatus;
                 if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
                     return fail(*context_, error);
             }
         }
-        const VernonStatus status =
-            executePipelineProgramGraph(*context_, *topology_, *backward, values, resolvePhysicalEndpoint);
+        program_execution::SubmissionState backwardSubmission;
+        const VernonStatus status = executePipelineProgramGraph(*context_, *topology_, *backward, values,
+                                                                resolvePhysicalEndpoint, backwardSubmission);
+        publication.noteInPlaceSubmission(backwardSubmission);
         if (status != VERNON_STATUS_OK)
             return status;
 
@@ -218,14 +243,17 @@ public:
         }
         if (const VernonStatus publicationStatus =
                 program_execution::executePublicationCommit(*context_, publication, values, error);
-            publicationStatus != VERNON_STATUS_OK)
+            publicationStatus != VERNON_STATUS_OK) {
             return error.empty() ? publicationStatus : fail(*context_, error);
+        }
         ++usage_.submissions;
         ++usage_.waits;
         ++usage_.atomicPublications;
         usage_.temporaryAllocationBytes += temporaryBytes;
         return VERNON_STATUS_OK;
     }
+
+    size_t mutationCapacity() const override { return topology_->publications.transactions.size(); }
 
     PullbackMemoryUsage memoryUsage() const override {
         MemoryAccounting memory;
@@ -397,6 +425,7 @@ public:
     const Signature &signature() const override { return signature_; }
 
     VernonStatus forward(const ForwardExecutionTarget &target, std::unique_ptr<PullbackExecution> &pullback) override {
+        target.outcome = {};
         const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
         const program::Program *execution =
             topology && topology->resolvedProgram ? &topology->resolvedProgram->program : nullptr;
@@ -414,6 +443,11 @@ public:
             if (value < required.size())
                 required[value] = 1;
         PublicationTransaction publication(topology->publications);
+        struct OutcomePublication {
+            const PublicationTransaction &publication;
+            program_execution::InvocationMutationOutcome &outcome;
+            ~OutcomePublication() { outcome.merge(publication.mutationOutcome()); }
+        } outcomePublication{publication, target.outcome};
         ForwardInvocationSpec frame{
             required,
             {target.arguments, target.argumentCount, forwardBindings_, publication},
@@ -454,8 +488,11 @@ public:
                                           error))
                 return fail(*context_, error);
             for (;;) {
-                const VernonStatus status =
-                    executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint);
+                program_execution::SubmissionState submission;
+                const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
+                                                                        resolvePhysicalEndpoint, submission);
+                publication.noteInPlaceSubmission(submission);
+                recordRenderPassMutations(*forward, submission, target.outcome);
                 if (status != VERNON_STATUS_OK)
                     return status;
                 bool retry = false;
@@ -471,8 +508,11 @@ public:
                         return fail(*context_, error);
             }
         } else {
+            program_execution::SubmissionState submission;
             const VernonStatus status =
-                executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint);
+                executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint, submission);
+            publication.noteInPlaceSubmission(submission);
+            recordRenderPassMutations(*forward, submission, target.outcome);
             if (status != VERNON_STATUS_OK)
                 return status;
             if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
@@ -550,8 +590,9 @@ public:
         }
         if (const VernonStatus publicationStatus =
                 program_execution::executePublicationCommit(*context_, publication, arena, error);
-            publicationStatus != VERNON_STATUS_OK)
+            publicationStatus != VERNON_STATUS_OK) {
             return error.empty() ? publicationStatus : fail(*context_, error);
+        }
         return VERNON_STATUS_OK;
     }
 

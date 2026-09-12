@@ -364,14 +364,9 @@ bool buildResolvedExecutionPolicies(ResolvedExecutionPlan &plan, Diagnostic &dia
     plan.autodiff.checkpointPolicy = compiledReplay ? CheckpointPolicy::Rematerialize : CheckpointPolicy::Retain;
 
     plan.publications = {};
-    std::set<std::pair<ProgramOwnerKind, uint32_t>> publicationOwners;
     for (const BoundarySlot &slot : program.abi.boundarySlots) {
         if (slot.publication == BoundaryPublication::None)
             continue;
-        const auto owner = std::make_pair(slot.aliasOwner.kind, slot.aliasOwner.id);
-        if (!publicationOwners.insert(owner).second)
-            return reject(diagnostic, "/abi/boundary_slots/" + std::to_string(slot.id),
-                          "publication owner has more than one transaction");
         const PublicationCommitMode mode = slot.publication == BoundaryPublication::CommitAfterSuccess
                                                ? PublicationCommitMode::CommitAfterSuccess
                                                : PublicationCommitMode::InPlace;

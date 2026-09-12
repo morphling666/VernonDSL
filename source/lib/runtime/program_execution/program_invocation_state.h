@@ -72,7 +72,7 @@ struct CanonicalValueSnapshot {
     uint32_t value{};
     ProgramValueState logical;
     VernonProgramArgument residentArgument{};
-    std::shared_ptr<const void> deviceOwner;
+    std::shared_ptr<DeviceBuffer> deviceOwner;
 };
 
 bool resolveProgramControl(const program::Program &program, const std::vector<ProgramValueState> &values,

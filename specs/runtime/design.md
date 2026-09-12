@@ -28,6 +28,108 @@ VernonRHI.
 RuntimeCore stores opaque provider resource references. It does not own native
 textures, framebuffers, descriptor heaps, queues, command encoders, or fences.
 
+### Python RuntimeSession ownership
+
+`RuntimeSession` selects one fully constructed native Runtime. The native
+binding stores the Runtime and optional RHI host in one shared `RuntimeState`;
+an internally created OpenGL context is owned directly by that RHI host rather
+than by a Python helper. Destruction is ordered Runtime → RHI device → owned GL
+context. Runtime, executable, instance, invocation, builder, and pullback
+wrappers retain the shared state directly, so teardown does not depend on
+Python garbage-collection order or binding-layer parent/child keep-alive
+edges. Its
+`RuntimeConfiguration` is immutable and canonical: non-OpenGL backends have no
+API version, while OpenGL configurations include the effective API version and
+the registered external-context identity.
+
+`vd.init(...)` transactionally selects the process default. An identical
+canonical configuration returns the existing session without reconstruction.
+Concurrent initialization of one configuration joins one construction flight;
+different configurations may probe concurrently. A candidate is fully
+constructed and capability-probed before a short registry critical section
+publishes it. Probe failure leaves the current default unchanged. Replacement
+retires the old default but does not invalidate its native objects; Runtime,
+RHI, executable, invocation, resource, and pullback owner leases determine
+final teardown.
+
+`RuntimeSession` is also a context manager. Its selection uses `ContextVar`, so
+nested and concurrent scopes do not mutate the process default. Every public
+Program, Kernel, pipeline, cooked-asset, VJP, and pullback entry creates one
+immutable invocation context for the complete operation. Binding transactions,
+resource claims, residency, compilation, and execution receive that context
+and never rediscover the process default.
+
+Executable caches are session-local weak-key partitions. A cache miss is
+published through a transient per-session, per-key construction flight, so
+unrelated sessions and specializations compile concurrently while one native
+executable is created for a shared key. Hits read an immutable snapshot.
+Epoch-based clearing cancels stale publication without detaching active
+waiters. A completed flight remains only until its final participant leaves
+and retains no permanent per-key lock. Kernel and pipeline frontend lowering
+uses the same publication protocol in a backend-independent semantic cache.
+Artifact hashes remain pure semantic/target identities; a
+Runtime session identity selects only the native executable partition and
+never enters capture, compile, cook, manifest, or artifact identity. Retiring
+a session therefore requires neither global cache clearing nor a child
+weak-set invalidation pass.
+
+Every mutable Python resource owner has one `ResourceControlBlock`. It owns
+the stable monotonic owner identity, owner-local lock, active host/device
+claims, authority version, poisoned/unknown state, adapter coherence state,
+and session-partitioned native residencies. Buffer coherence records host and
+device byte ranges; image coherence records exact aspect/mip/layer
+subresources. Tensor, RawBuffer, and Texture views cache only projections and
+never own independent authority, dirty, version, or residency state.
+
+An invocation locks all participating control blocks in stable owner order,
+validates every claim, publishes all claims atomically, and releases the locks
+before residency preparation, backend calls, or waits. Same-session reads and
+non-overlapping projected accesses may coexist. Cross-session overlap fails
+before materialization. Host APIs publish a projected claim before
+synchronization and retain it until copying or mutation finishes. Buffer
+readback downloads only dirty ranges intersecting that claim, so a disjoint
+device operation is never covered by an incidental full-allocation readback.
+
+Allocation, migration, upload, download, and wait run through explicit
+reservation tickets outside the owner lock. A first allocation or
+cross-session migration reserves the full backing before doing I/O. Concurrent
+creation for one `(owner, session)` joins one materialization flight; existing
+residencies permit non-overlapping tickets to proceed independently. Publishing
+a ticket revalidates its exact dirty snapshot and preserves unrelated dirty
+ranges or subresources created concurrently.
+
+Every invocation returns one canonical mutation outcome. Its overall
+submission is `NotSubmitted`, `Completed`, or `Indeterminate`; each writable
+Program boundary or RenderPass control independently reports `Unchanged`,
+`Committed`, `InPlaceCommitted`, or `Indeterminate`. Commit-after-success
+destinations remain unchanged after planning, allocation, transfer, execution,
+readback, or pre-commit failure. Only an in-place boundary whose submitted work
+has unknown completion poisons its owner. Host reads and new device claims then
+fail until a complete authoritative host replacement recovers that owner.
+Python resolves this outcome while its write claims are still held and never
+infers mutation from an exception or aggregate success flag.
+
+Fragmented host writes may conservatively expand their claim to a contiguous
+span, synchronize device-written gaps under that expanded claim, and issue one
+preserving upload; they never touch a gap outside the acquired claim.
+Fragmented readback remains a set of exact ranges and uses one native batched
+transfer. Texture transfer descriptors carry exact box, mip, array layer, and
+aspect. A residency operation submits all selected ranges or subresources as
+one native batch; cube faces and depth/stencil planes are not widened in
+Python.
+
+Pullback construction retains only runtime-owned host bytes, device buffers,
+and tape carriers selected by the resolved residual plan. No Python resource
+claim survives the forward invocation. Pullback apply first prepares a typed
+cotangent/gradient boundary plan without residency work, admits every exact
+claim in stable owner order, then materializes and executes. Device and
+packed-host publication must both succeed before gradient write claims are
+released.
+
+Mutable resources retain one residency per session identity, allowing
+authority to migrate without discarding live native owners. Samplers remain
+immutable session-local residencies and need no mutable access claims.
+
 ## 2. Canonical Program lifecycle
 
 The only deployment lifecycle is:
@@ -310,7 +412,84 @@ Destroying a public owner does not release a resource still retained by an
 in-flight invocation or pullback. Runtime generation changes invalidate
 cached native handles.
 
+Each RHI device registry publishes an immutable lookup snapshot. Device-local
+resource and command slots have stable addresses, are allocated fallibly
+before native creation, and publish only after their device-child reservation
+and native payload are complete. Buffer, Image, ImageView, Sampler,
+NativeDescriptorRange, CommandEncoder, and Completion therefore have one
+lifecycle authority; there is no parallel binding-reference record.
+
+Persistent binding, graph, encoder, and completion ownership is represented by
+move-only typed retained leases. A retained lease delays native recycle, while
+an operation pin protects only one admitted operation. Native resolution and
+descriptor access validate the exact device, generation, resource kind, key,
+and retained lease before pinning. Public destroy hides a retained resource
+immediately and tears it down only when its final retained lease is released.
+
+Command state belongs to its device. Encoder and completion lookup uses
+acquire-published stable slot pages rather than a process-global command
+registry or hot-path registry mutex. Submit transactionally moves retained
+resource leases and cleanup state from the encoder to the completion; failed
+native submit rolls the encoder destruction attempt back.
+
+Each `RuntimeContext` has the same owner state machine and a separate local
+operation control. Bundles, ProgramGraphs, resolved Stages, Program
+executables, submissions, and retained pullbacks hold committed context-child
+leases. Executables own instance admission; instance state owns invocation
+admission and remains alive until its final invocation is destroyed. Context
+close therefore rejects live direct or transitive work without relying on raw
+pointer counts. Device-backed contexts and their RHI adapters each retain an
+explicit RHI device-child lease, so an attempted device destroy cannot
+invalidate adapter state.
+
+RuntimeCore publishes an immutable binding revision containing the provider
+object, retained resources, and canonical value snapshot. Replacement
+validates and constructs a complete candidate before swapping one retained
+revision reference under the binding-set-local lock. Encode retains the
+published revision under that short lock, releases the lock, and only then
+calls the provider; an old revision is destroyed after its final in-flight
+encode reference is released. Failure releases only candidate state and leaves
+the published revision unchanged. Unchanged canonical bindings are recognized
+without allocation or provider mutation. Providers expose creation and
+destruction only; in-place binding mutation is not part of the provider
+contract.
+
+Backend and built-in provider implementation boundaries return allocation-free
+`Result` errors. Public C ABI and provider-vtable callbacks are the only layers
+that map those errors to status values and cold diagnostics.
+
 Public C entry points contain exceptions. Backend, provider, allocation,
 validation, and execution failures become stable status codes and diagnostics.
 No failure silently changes backend, narrows dtype, serializes an invalid
 dispatch, or falls back to a compatibility path.
+
+The native Runtime/RHI support layer provides move-aware, non-sentinel
+`Option<T>`, `Result<T, E>`, and `Result<void, E>` values. Inactive-alternative
+access is a contract violation. Lifecycle, RHI, Runtime, and resource-access
+errors, together with provider-boundary errors, are allocation-free values
+with stable codes and bounded numeric/static context; explicit adapters map
+them to the existing C statuses. Checked arithmetic, checked atomic
+retain/release, and non-throwing allocation helpers use these results.
+Emergency diagnostic rendering is bounded and does not allocate.
+
+The shared lifecycle support layer uses one owner-local atomic word for
+`Open`, `Closing`, or `Closed` together with its admitted child count. Child
+admission and the `Open -> Closing` transition therefore have one atomic
+linearization order: an admission that wins blocks close, while close that
+wins rejects the admission before native mutation. A move-only child
+reservation owns a checked parent reference and rolls back unless publication
+commits it into a child lease. Close and destruction attempts are move-only
+rollback guards; failure or abandonment restores `Open`, while successful
+commit is the only route to `Closed`.
+
+Already admitted children use their own local operation control block.
+Operation pins increment its checked atomic pin count without consulting a
+process-global registry. Destruction first enters `Closing`; outstanding pins
+reject that attempt with a stable count snapshot, and no new pin can enter
+until rollback restores `Open`. A zero-pin attempt may destroy native state
+and commit `Closed`. Operation controls are created fallibly and destroyed only
+through checked intrusive references. Each pin and destruction attempt owns
+such a reference, so dropping the registry or creator reference cannot
+invalidate an in-flight guard. Explicit guard completion releases its retained
+control-block reference immediately rather than keeping counters artificially
+saturated until lexical scope exit.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from typing import Annotated, Any, get_args, get_origin
+from weakref import WeakValueDictionary
 
 import numpy as np
 
@@ -18,8 +20,8 @@ from ..host_values import (
     unpack_tangent_value,
 )
 from ..types import TypeExpr, _Scalar
-from .residency import _ResourceAccessDomain, _SingleResidency
-from .session import _InvocationContext
+from .residency import _BufferRegion, _ResourceControlBlock, _scoped_host_access
+from .session import _InvocationContext, cpu
 
 _ACCESS_MODES = frozenset({"read", "write", "read_write"})
 _VALUE_FIELD = "__value"
@@ -76,16 +78,6 @@ def _address_range(shape: tuple[int, ...], strides: tuple[int, ...], offset: int
         low += min(span, 0)
         high += max(span, 0)
     return low, high
-
-
-def _borrow_ranges_may_overlap(left: TensorView, right: TensorView) -> bool:
-    if left.owner is not right.owner or any(extent == 0 for extent in left.shape + right.shape):
-        return False
-    left_range = _address_range(left.shape, left._strides, left._offset)
-    right_range = _address_range(right.shape, right._strides, right._offset)
-    if left_range is None or right_range is None:
-        return False
-    return left_range[0] <= right_range[1] and right_range[0] <= left_range[1]
 
 
 def _matches_logical_value(value: Any, element_type: Any) -> bool:
@@ -156,6 +148,56 @@ def _coalesced_byte_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int
     return result
 
 
+def _intersect_byte_ranges(
+    left: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+    right: tuple[tuple[int, int], ...] | list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    left_ranges = _coalesced_byte_ranges(list(left))
+    right_ranges = _coalesced_byte_ranges(list(right))
+    intersections: list[tuple[int, int]] = []
+    left_index = 0
+    right_index = 0
+    while left_index < len(left_ranges) and right_index < len(right_ranges):
+        left_begin, left_end = left_ranges[left_index]
+        right_begin, right_end = right_ranges[right_index]
+        begin = max(left_begin, right_begin)
+        end = min(left_end, right_end)
+        if begin < end:
+            intersections.append((begin, end))
+        if left_end <= right_end:
+            left_index += 1
+        else:
+            right_index += 1
+    return intersections
+
+
+def _subtract_byte_ranges(
+    ranges: list[tuple[int, int]],
+    removed: list[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    source = _coalesced_byte_ranges(ranges)
+    exclusions = _coalesced_byte_ranges(removed)
+    remaining: list[tuple[int, int]] = []
+    exclusion_index = 0
+    for begin, end in source:
+        cursor = begin
+        while exclusion_index < len(exclusions) and exclusions[exclusion_index][1] <= cursor:
+            exclusion_index += 1
+        current = exclusion_index
+        while current < len(exclusions) and exclusions[current][0] < end:
+            removed_begin, removed_end = exclusions[current]
+            if cursor < removed_begin:
+                remaining.append((cursor, min(removed_begin, end)))
+            cursor = max(cursor, removed_end)
+            if cursor >= end:
+                break
+            current += 1
+        if cursor < end:
+            remaining.append((cursor, end))
+        exclusion_index = current
+    return remaining
+
+
 class _DirtyRangeSet:
     """Python resource adapter for runtime-owned dirty byte tracking."""
 
@@ -178,8 +220,149 @@ class _DirtyRangeSet:
     def clear(self) -> None:
         self._native.clear()
 
+    def discard(self, ranges: list[tuple[int, int]]) -> None:
+        remaining = _subtract_byte_ranges(list(self.ranges), ranges)
+        self.clear()
+        self.mark(remaining, allow_full=False)
+
     def __bool__(self) -> bool:
         return bool(self._native)
+
+
+@dataclass
+class _BufferCoherence:
+    dirty_ranges: _DirtyRangeSet
+    device_dirty_ranges: list[tuple[int, int]] = field(default_factory=list)
+    device_dirty: bool = False
+
+
+def _buffer_bytes(owner: Any) -> np.ndarray:
+    return owner._array.reshape(-1).view(np.uint8)
+
+
+def _synchronize_buffer(owner: Any, region: _BufferRegion) -> None:
+    control = owner._control
+    reservation = None
+    with control.lock:
+        coherence = control.coherence
+        residency = control.residencies.latest()
+        if not coherence.device_dirty or residency is None:
+            return
+        downloads = _intersect_byte_ranges(coherence.device_dirty_ranges, region.ranges)
+        if not downloads:
+            return
+        io_region = _BufferRegion(tuple(downloads))
+        reservation = control.reserve_io(io_region, "write")
+        handle = residency.handle
+    try:
+        downloaded = handle.download_ranges(downloads)
+        with control.lock:
+            bytes_view = _buffer_bytes(owner)
+            for begin, data in downloaded:
+                bytes_view[begin : begin + len(data)] = np.frombuffer(data, dtype=np.uint8)
+            coherence.device_dirty_ranges = _subtract_byte_ranges(coherence.device_dirty_ranges, downloads)
+            coherence.device_dirty = bool(coherence.device_dirty_ranges)
+            if not coherence.device_dirty:
+                control.host_version = control.version
+    finally:
+        with control.lock:
+            control.release_io(reservation)
+
+
+def _materialize_buffer(
+    owner: Any,
+    context: _InvocationContext,
+    region: _BufferRegion,
+    access: str,
+) -> Any:
+    state = context.session
+    if state.rhi_host is None:
+        raise RuntimeError("device buffer residency requires a GPU RHI host")
+    control = owner._control
+    reservation = None
+    retry = False
+    with control.lock:
+        coherence = control.coherence
+        residency = control.residencies.get(state)
+        if residency is not None and not coherence.device_dirty and (access == "write" or not coherence.dirty_ranges):
+            return residency.handle
+        latest = control.residencies.latest()
+        migration = coherence.device_dirty and (residency is None or residency is not latest)
+        create = residency is None
+        if create or migration:
+            io_region = owner._region
+            upload_ranges = list(owner._region.ranges)
+            download_ranges = list(coherence.device_dirty_ranges) if migration else []
+        else:
+            io_region = region
+            download_ranges = []
+            upload_ranges = (
+                _intersect_byte_ranges(coherence.dirty_ranges.ranges, region.ranges)
+                if access in {"read", "read_write"}
+                else []
+            )
+        if not create and not migration and not upload_ranges:
+            return residency.handle
+        expected_state = (
+            residency.handle if residency is not None else None,
+            latest.handle if latest is not None else None,
+            control.version,
+            tuple(coherence.device_dirty_ranges),
+            tuple(coherence.dirty_ranges.ranges),
+        )
+        reservation = control.reserve_io(io_region, "write")
+        current_residency = control.residencies.get(state)
+        current_latest = control.residencies.latest()
+        current_state = (
+            current_residency.handle if current_residency is not None else None,
+            current_latest.handle if current_latest is not None else None,
+            control.version,
+            tuple(coherence.device_dirty_ranges),
+            tuple(coherence.dirty_ranges.ranges),
+        )
+        retry = current_state != expected_state
+        if retry:
+            control.release_io(reservation)
+            reservation = None
+        else:
+            generation = control.version
+            host_bytes = bytes(_buffer_bytes(owner))
+            source_handle = latest.handle if migration and latest is not None else None
+            target_handle = residency.handle if residency is not None else None
+    if retry:
+        return _materialize_buffer(owner, context, region, access)
+    try:
+        if download_ranges:
+            if source_handle is None:
+                raise RuntimeError("device-dirty buffer has no authoritative residency")
+            merged = bytearray(host_bytes)
+            for begin, data in source_handle.download_ranges(download_ranges):
+                merged[begin : begin + len(data)] = data
+            host_bytes = bytes(merged)
+        if target_handle is None:
+            target_handle = state.rhi_host.create_buffer(owner._array.nbytes)
+        uploads = [(begin, host_bytes[begin:end]) for begin, end in upload_ranges]
+        if uploads:
+            target_handle.upload_ranges(uploads)
+        with control.lock:
+            if residency is None:
+                residency = control.residencies.replace(state, target_handle)
+            if download_ranges:
+                bytes_view = _buffer_bytes(owner)
+                bytes_view[:] = np.frombuffer(host_bytes, dtype=np.uint8)
+                coherence.device_dirty_ranges = _subtract_byte_ranges(
+                    coherence.device_dirty_ranges,
+                    download_ranges,
+                )
+                coherence.device_dirty = bool(coherence.device_dirty_ranges)
+            coherence.dirty_ranges.discard(upload_ranges)
+            residency.version = max(residency.version, generation)
+            if not coherence.device_dirty:
+                control.host_version = generation
+            return residency.handle
+    finally:
+        with control.lock:
+            control.release_io(reservation)
 
 
 def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[int, int]]:
@@ -224,11 +407,9 @@ class TensorStorage:
         self._element_type = element_type
         self._element_layout = element_layout
         self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
-        self._residency = _SingleResidency()
-        self._dirty_ranges = _DirtyRangeSet(array.nbytes, dirty=True)
-        self._device_dirty = False
-        self._access_domain = _ResourceAccessDomain()
-        self._full_views: dict[str, TensorView] = {}
+        self._control = _ResourceControlBlock(_BufferCoherence(_DirtyRangeSet(array.nbytes, dirty=True)))
+        self._region = _BufferRegion(((0, array.nbytes),))
+        self._full_views: WeakValueDictionary[str, TensorView] = WeakValueDictionary()
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
@@ -448,8 +629,8 @@ class TensorStorage:
         view._components = tuple(range(start, start + len(indices)))
         return view
 
+    @_scoped_host_access("read")
     def to_numpy(self) -> np.ndarray:
-        self._ensure_host_read_allowed()
         self.synchronize()
         return self._native_host_array().copy(order="C")
 
@@ -505,32 +686,34 @@ class TensorStorage:
     def _add_gradients(left: TensorStorage, right: TensorStorage | np.ndarray) -> TensorStorage:
         if not isinstance(left, TensorStorage):
             raise TypeError("graph gradient accumulation requires TensorStorage")
-        left._ensure_host_read_allowed()
-        left.synchronize()
-        if isinstance(right, TensorStorage):
-            right._ensure_host_read_allowed()
-            right.synchronize()
-            layout = TensorStorage._gradient_layout(left, right)
-            if layout is not None:
-                result = TensorStorage._empty_gradient_like(left)
-                for output, left_view, right_view in TensorStorage._gradient_add_views(result, left, right):
-                    np.add(
-                        left_view._native_host_array(),
-                        right_view._native_host_array(),
-                        out=output._native_host_array(),
-                    )
-                return result
-            right_array = right._native_host_array()
-        else:
-            if left._element_layout is not None:
-                raise ValueError("packed tangent cotangents require matching TensorStorage contributions")
-            right_array = np.asarray(right)
-        left_array = left._native_host_array()
-        if left_array.shape != right_array.shape or left_array.dtype != right_array.dtype:
-            raise ValueError("graph cotangent contributions have incompatible shapes or dtypes")
-        result = TensorStorage(np.empty_like(left_array, order="C"))
-        np.add(left_array, right_array, out=result._native_host_array())
-        return result
+        owners = [left] if not isinstance(right, TensorStorage) or right is left else sorted((left, right), key=id)
+        with ExitStack() as claims:
+            for owner in owners:
+                claims.enter_context(owner._control.host_access(owner._region, "read", "TensorStorage"))
+            left.synchronize()
+            if isinstance(right, TensorStorage):
+                right.synchronize()
+                layout = TensorStorage._gradient_layout(left, right)
+                if layout is not None:
+                    result = TensorStorage._empty_gradient_like(left)
+                    for output, left_view, right_view in TensorStorage._gradient_add_views(result, left, right):
+                        np.add(
+                            left_view._native_host_array(),
+                            right_view._native_host_array(),
+                            out=output._native_host_array(),
+                        )
+                    return result
+                right_array = right._native_host_array()
+            else:
+                if left._element_layout is not None:
+                    raise ValueError("packed tangent cotangents require matching TensorStorage contributions")
+                right_array = np.asarray(right)
+            left_array = left._native_host_array()
+            if left_array.shape != right_array.shape or left_array.dtype != right_array.dtype:
+                raise ValueError("graph cotangent contributions have incompatible shapes or dtypes")
+            result = TensorStorage(np.empty_like(left_array, order="C"))
+            np.add(left_array, right_array, out=result._native_host_array())
+            return result
 
     def _materialize_gradient(
         self,
@@ -565,8 +748,8 @@ class TensorStorage:
     ) -> tuple[tuple[int, ...], tuple[int, ...], int]:
         return self._full_view("read")._gradient_boundary_layout(destination, element_byte_size)
 
+    @_scoped_host_access("write")
     def copy_from_numpy(self, array: np.ndarray) -> None:
-        self._ensure_host_mutation_allowed()
         target = self._native_host_array()
         if (
             not isinstance(array, np.ndarray)
@@ -578,9 +761,9 @@ class TensorStorage:
         np.copyto(target, array)
         self._mark_host_dirty([(0, self._array.nbytes)])
 
+    @_scoped_host_access("write")
     def update(self, indices: int | slice | list[int] | np.ndarray, values: np.ndarray) -> None:
         """Replace selected first-axis elements and dirty only their backing byte ranges."""
-        self._ensure_host_mutation_allowed()
         if not self.shape:
             raise ValueError("partial TensorStorage updates require a non-scalar storage shape")
         target = self._native_host_array()
@@ -628,13 +811,13 @@ class TensorStorage:
                 for index in normalized_indices
                 for byte_range in _array_byte_ranges(target[int(index) : int(index) + 1], self._array)
             ]
-        self._prepare_partial_host_write(ranges)
+        dirty_ranges = self._prepare_partial_host_write(ranges)
         target[selection] = values
-        self._mark_host_dirty(ranges, host_complete=False)
+        self._mark_host_dirty(dirty_ranges, host_complete=False)
 
+    @_scoped_host_access("write")
     def update_values(self, indices: int | list[int] | np.ndarray, values: Any) -> None:
         """Replace selected logical struct elements without repacking unchanged elements."""
-        self._ensure_host_mutation_allowed()
         if (
             self._element_layout is None
             or isinstance(self._element_layout, TangentLayout)
@@ -665,17 +848,17 @@ class TensorStorage:
             for index in normalized_indices
             for byte_range in _array_byte_ranges(self._array[int(index) : int(index) + 1], self._array)
         ]
-        self._prepare_partial_host_write(ranges)
+        dirty_ranges = self._prepare_partial_host_write(ranges)
         for index, logical_value in zip(normalized_indices, logical_values, strict=True):
             packed = pack_host_value(self._element_type, logical_value)
             if self._element_layout.dtype.subdtype is None:
                 self._array[int(index)] = packed
             else:
                 self._array[_VALUE_FIELD][int(index)] = packed
-        self._mark_host_dirty(ranges, host_complete=False)
+        self._mark_host_dirty(dirty_ranges, host_complete=False)
 
+    @_scoped_host_access("write")
     def copy_from_values(self, values: Any) -> None:
-        self._ensure_host_mutation_allowed()
         if (
             self._element_layout is None
             or isinstance(self._element_layout, TangentLayout)
@@ -697,18 +880,31 @@ class TensorStorage:
         self._mark_host_dirty([(0, self._array.nbytes)])
 
     def _mark_host_dirty(self, ranges: list[tuple[int, int]], *, host_complete: bool = True) -> None:
-        self._dirty_ranges.mark(ranges, allow_full=host_complete or not self._device_dirty)
+        coherence = self._control.coherence
         if host_complete:
-            self._device_dirty = False
+            coherence.device_dirty_ranges.clear()
+        else:
+            coherence.device_dirty_ranges = _subtract_byte_ranges(coherence.device_dirty_ranges, ranges)
+        coherence.device_dirty = bool(coherence.device_dirty_ranges)
+        coherence.dirty_ranges.mark(ranges, allow_full=not coherence.device_dirty)
+        self._control.publish_host_write(
+            host_complete=not coherence.device_dirty,
+            recovers_unknown=host_complete,
+        )
 
-    def _prepare_partial_host_write(self, ranges: list[tuple[int, int]]) -> None:
-        if self._device_dirty and self._dirty_ranges.should_promote_full(ranges):
-            self.synchronize()
+    def _prepare_partial_host_write(self, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        coherence = self._control.coherence
+        if coherence.device_dirty and coherence.dirty_ranges.should_promote_full(ranges):
+            coalesced = _coalesced_byte_ranges(ranges)
+            promoted = [(coalesced[0][0], coalesced[-1][1])]
+            self.synchronize(_BufferRegion(tuple(promoted)))
+            return promoted
+        return ranges
 
+    @_scoped_host_access("read")
     def to_values(self) -> Any:
         if self._element_layout is None or self._element_type is None:
             raise TypeError("to_values requires a Struct TensorStorage")
-        self._ensure_host_read_allowed()
         self.synchronize()
         element_layout = self._element_layout
 
@@ -724,55 +920,55 @@ class TensorStorage:
 
         return materialize((), 0)
 
-    def synchronize(self) -> None:
-        residency = self._residency.current
-        if not self._device_dirty or residency is None:
+    def synchronize(self, region: _BufferRegion | None = None) -> None:
+        _synchronize_buffer(self, self._region if region is None else region)
+
+    def _device_claim_region(self, context: _InvocationContext, region: _BufferRegion, access: str) -> _BufferRegion:
+        if context.session.arch == cpu:
+            return region
+        residency = self._control.residencies.get(context.session)
+        latest = self._control.residencies.latest()
+        if residency is None or (self._control.coherence.device_dirty and residency is not latest):
+            return self._region
+        return region
+
+    def _resident_buffer(
+        self,
+        context: _InvocationContext,
+        region: _BufferRegion | None = None,
+        access: str = "read_write",
+    ) -> Any:
+        return _materialize_buffer(self, context, self._region if region is None else region, access)
+
+    def _publish_device_write(
+        self,
+        context: _InvocationContext,
+        regions: tuple[_BufferRegion, ...],
+    ) -> None:
+        if not regions:
             return
-        if self._dirty_ranges:
-            self._upload_dirty_ranges(residency.handle)
-        downloaded = np.frombuffer(residency.handle.download(), dtype=self._array.dtype).reshape(self.shape)
-        np.copyto(self._array, downloaded)
-        self._device_dirty = False
-        self._dirty_ranges.clear()
-
-    def _resident_buffer(self, context: _InvocationContext) -> Any:
-        with self._access_domain.lock:
-            return self._resident_buffer_locked(context)
-
-    def _resident_buffer_locked(self, context: _InvocationContext) -> Any:
-        state = context.session
-        if state.rhi_host is None:
-            raise RuntimeError("device TensorStorage residency requires a GPU RHI host")
-        buffer = self._residency.handle_for(state.identity)
-        if buffer is None:
-            if self._residency.current is not None and self._device_dirty:
-                self.synchronize()
-            buffer = self._residency.replace(state.identity, state.rhi_host.create_buffer(self._array.nbytes))
-            self._dirty_ranges.mark_all()
-            self._device_dirty = False
-        if self._dirty_ranges:
-            self._upload_dirty_ranges(buffer)
-        return buffer
-
-    def _upload_dirty_ranges(self, buffer: Any) -> None:
-        bytes_view = self._array.reshape(-1).view(np.uint8)
-        uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
-        buffer.upload_ranges(uploads)
-        self._dirty_ranges.clear()
-
-    def _mark_device_dirty(self) -> None:
-        self._device_dirty = True
-        self._dirty_ranges.clear()
-
-    def _ensure_host_mutation_allowed(self) -> None:
-        self._access_domain.require_host_mutation("TensorStorage")
-
-    def _ensure_host_read_allowed(self) -> None:
-        self._access_domain.require_host_read("TensorStorage")
+        coherence = self._control.coherence
+        if context.session.arch == cpu:
+            self._control.publish_host_write(host_complete=True)
+            coherence.device_dirty = False
+            coherence.dirty_ranges.mark(
+                [byte_range for region in regions for byte_range in region.ranges],
+                allow_full=True,
+            )
+            return
+        self._control.publish_device_write(context.session)
+        coherence.device_dirty = True
+        coherence.device_dirty_ranges = _coalesced_byte_ranges(
+            [
+                *coherence.device_dirty_ranges,
+                *(byte_range for region in regions for byte_range in region.ranges),
+            ]
+        )
+        coherence.dirty_ranges.clear()
 
 
 class RawBuffer:
-    """Explicitly aligned external bytes with typed-view construction."""
+    """Owned raw bytes with explicit alignment and typed-view construction."""
 
     def __init__(self, buffer: Any, *, alignment: int):
         if not isinstance(alignment, int) or isinstance(alignment, bool) or alignment <= 0:
@@ -783,15 +979,10 @@ class RawBuffer:
             raise TypeError("RawBuffer requires a contiguous buffer-protocol object") from error
         if not view.c_contiguous:
             raise ValueError("RawBuffer requires contiguous external bytes")
-        self._external_owner = buffer
-        self._array = np.frombuffer(view, dtype=np.uint8)
+        self._array = np.frombuffer(view, dtype=np.uint8).copy()
         self._alignment = alignment
-        self._readonly = view.readonly
-        self._residency = _SingleResidency()
-        self._host_version = 1
-        self._uploaded_version = 0
-        self._device_dirty = False
-        self._access_domain = _ResourceAccessDomain()
+        self._control = _ResourceControlBlock(_BufferCoherence(_DirtyRangeSet(self._array.nbytes, dirty=True)))
+        self._region = _BufferRegion(((0, self._array.nbytes),))
 
     @classmethod
     def allocate(cls, byte_size: int, *, alignment: int) -> RawBuffer:
@@ -841,8 +1032,6 @@ class RawBuffer:
             raise ValueError("RawBuffer byte_offset must be an integer")
         if any(stride % item_size != 0 for stride in byte_strides) or byte_offset % item_size != 0:
             raise ValueError("RawBuffer byte layout must be divisible by the typed element size")
-        if access != "read" and self._readonly:
-            raise ValueError("writable TensorView requires writable RawBuffer bytes")
         if self._alignment < element_alignment or (self._array.ctypes.data + byte_offset) % element_alignment:
             raise ValueError("RawBuffer typed view does not satisfy element alignment")
         return TensorView(
@@ -855,44 +1044,70 @@ class RawBuffer:
             element_type=element_type,
         )
 
-    def synchronize(self) -> None:
-        residency = self._residency.current
-        if not self._device_dirty or residency is None:
+    def _mark_host_dirty(self, ranges: list[tuple[int, int]], *, recovers_unknown: bool = False) -> None:
+        coherence = self._control.coherence
+        coherence.device_dirty_ranges = _subtract_byte_ranges(coherence.device_dirty_ranges, ranges)
+        coherence.device_dirty = bool(coherence.device_dirty_ranges)
+        coherence.dirty_ranges.mark(ranges, allow_full=not coherence.device_dirty)
+        self._control.publish_host_write(
+            host_complete=not coherence.device_dirty,
+            recovers_unknown=recovers_unknown,
+        )
+
+    def synchronize(self, region: _BufferRegion | None = None) -> None:
+        _synchronize_buffer(self, self._region if region is None else region)
+
+    def _prepare_partial_host_write(self, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        coherence = self._control.coherence
+        if coherence.device_dirty and coherence.dirty_ranges.should_promote_full(ranges):
+            coalesced = _coalesced_byte_ranges(ranges)
+            promoted = [(coalesced[0][0], coalesced[-1][1])]
+            self.synchronize(_BufferRegion(tuple(promoted)))
+            return promoted
+        return ranges
+
+    def _device_claim_region(self, context: _InvocationContext, region: _BufferRegion, access: str) -> _BufferRegion:
+        if context.session.arch == cpu:
+            return region
+        residency = self._control.residencies.get(context.session)
+        latest = self._control.residencies.latest()
+        if residency is None or (self._control.coherence.device_dirty and residency is not latest):
+            return self._region
+        return region
+
+    def _resident_buffer(
+        self,
+        context: _InvocationContext,
+        region: _BufferRegion | None = None,
+        access: str = "read_write",
+    ) -> Any:
+        return _materialize_buffer(self, context, self._region if region is None else region, access)
+
+    def _publish_device_write(
+        self,
+        context: _InvocationContext,
+        regions: tuple[_BufferRegion, ...],
+    ) -> None:
+        if not regions:
             return
-        downloaded = residency.handle.download()
-        self._array[:] = np.frombuffer(downloaded, dtype=np.uint8)
-        self._device_dirty = False
-        self._host_version += 1
-        self._uploaded_version = self._host_version
-
-    def _resident_buffer(self, context: _InvocationContext) -> Any:
-        with self._access_domain.lock:
-            return self._resident_buffer_locked(context)
-
-    def _resident_buffer_locked(self, context: _InvocationContext) -> Any:
-        state = context.session
-        if state.rhi_host is None:
-            raise RuntimeError("device RawBuffer residency requires a GPU RHI host")
-        buffer = self._residency.handle_for(state.identity)
-        if buffer is None:
-            if self._residency.current is not None and self._device_dirty:
-                self.synchronize()
-            buffer = self._residency.replace(state.identity, state.rhi_host.create_buffer(self.byte_size))
-            self._uploaded_version = 0
-            self._device_dirty = False
-        if self._uploaded_version != self._host_version:
-            buffer.upload(self._array.tobytes())
-            self._uploaded_version = self._host_version
-        return buffer
-
-    def _mark_device_dirty(self) -> None:
-        self._device_dirty = True
-
-    def _ensure_host_mutation_allowed(self) -> None:
-        self._access_domain.require_host_mutation("RawBuffer")
-
-    def _ensure_host_read_allowed(self) -> None:
-        self._access_domain.require_host_read("RawBuffer")
+        coherence = self._control.coherence
+        if context.session.arch == cpu:
+            self._control.publish_host_write(host_complete=True)
+            coherence.device_dirty = False
+            coherence.dirty_ranges.mark(
+                [byte_range for region in regions for byte_range in region.ranges],
+                allow_full=True,
+            )
+            return
+        self._control.publish_device_write(context.session)
+        coherence.device_dirty = True
+        coherence.device_dirty_ranges = _coalesced_byte_ranges(
+            [
+                *coherence.device_dirty_ranges,
+                *(byte_range for region in regions for byte_range in region.ranges),
+            ]
+        )
+        coherence.dirty_ranges.clear()
 
 
 class TensorView:
@@ -943,6 +1158,7 @@ class TensorView:
         self._dtype = dtype
         self._element_type = element_type
         self._components: tuple[int, ...] | None = None
+        self._region = _BufferRegion(tuple(_array_byte_ranges(self._native_host_array(), owner._array)))
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
@@ -950,31 +1166,36 @@ class TensorView:
             arguments = (arguments,)
         return TypeExpr("TensorView", arguments)
 
+    @_scoped_host_access("read")
     def __getitem__(self, index: Any) -> Any:
         if self.access == "write":
             raise PermissionError("cannot read from a write-only TensorView")
         return self._borrowed_array()[index]
 
+    @_scoped_host_access("write")
     def __setitem__(self, index: Any, value: Any) -> None:
-        self._owner._ensure_host_mutation_allowed()
         if self.access == "read":
             raise PermissionError("cannot write through a read-only TensorView")
-        if not isinstance(self._owner, TensorStorage):
-            self._owner.synchronize()
         target = self._native_host_array()
-        ranges = _array_byte_ranges(target, self._owner._array) if isinstance(self._owner, TensorStorage) else []
-        if isinstance(self._owner, TensorStorage):
-            self._owner._prepare_partial_host_write(ranges)
+        ranges = _array_byte_ranges(target, self._owner._array)
+        dirty_ranges = self._owner._prepare_partial_host_write(ranges)
         target[index] = value
         if isinstance(self._owner, TensorStorage):
-            self._owner._mark_host_dirty(ranges, host_complete=False)
+            self._owner._mark_host_dirty(dirty_ranges, host_complete=False)
         else:
-            self._owner._host_version += 1
-            self._owner._device_dirty = False
+            self._owner._mark_host_dirty(dirty_ranges)
 
     @property
     def owner(self) -> TensorStorage | RawBuffer:
         return self._owner
+
+    def _host_access_region(self, access: str) -> _BufferRegion:
+        if access != "write":
+            return self._region
+        coherence = self._owner._control.coherence
+        if not coherence.device_dirty or not coherence.dirty_ranges.should_promote_full(list(self._region.ranges)):
+            return self._region
+        return _BufferRegion(((self._region.ranges[0][0], self._region.ranges[-1][1]),))
 
     @property
     def access(self) -> str:
@@ -1023,14 +1244,14 @@ class TensorView:
         result._components = self._components
         return result
 
+    @_scoped_host_access("read")
     def to_numpy(self) -> np.ndarray:
         if self.access == "write":
             raise PermissionError("cannot read from a write-only TensorView")
         return np.array(self._borrowed_array(), copy=True, order="C")
 
     def _borrowed_array(self) -> np.ndarray:
-        self._owner._ensure_host_read_allowed()
-        self._owner.synchronize()
+        self._owner.synchronize(self._host_access_region("read"))
         return self._native_host_array()
 
     def _native_host_array(self) -> np.ndarray:
@@ -1174,12 +1395,10 @@ class TensorView:
             self._offset * element_byte_size,
         )
 
+    @_scoped_host_access("write")
     def copy_from_numpy(self, array: np.ndarray) -> None:
-        self._owner._ensure_host_mutation_allowed()
         if self.access == "read":
             raise PermissionError("cannot write through a read-only TensorView")
-        if not isinstance(self._owner, TensorStorage):
-            self._owner.synchronize()
         target = self._native_host_array()
         if (
             not isinstance(array, np.ndarray)
@@ -1188,18 +1407,13 @@ class TensorView:
             or not array.flags.c_contiguous
         ):
             raise ValueError("upload requires matching dtype and shape")
-        ranges = _array_byte_ranges(target, self._owner._array) if isinstance(self._owner, TensorStorage) else []
-        if isinstance(self._owner, TensorStorage):
-            self._owner._prepare_partial_host_write(ranges)
+        ranges = _array_byte_ranges(target, self._owner._array)
+        dirty_ranges = self._owner._prepare_partial_host_write(ranges)
         np.copyto(target, array)
         if isinstance(self._owner, TensorStorage):
-            self._owner._mark_host_dirty(ranges, host_complete=False)
+            self._owner._mark_host_dirty(dirty_ranges, host_complete=False)
         else:
-            self._owner._host_version += 1
-            self._owner._device_dirty = False
+            self._owner._mark_host_dirty(dirty_ranges, recovers_unknown=self._region == self._owner._region)
 
     def _resident_buffer(self, context: _InvocationContext) -> Any:
-        return self._owner._resident_buffer(context)
-
-    def _mark_device_dirty(self) -> None:
-        self._owner._mark_device_dirty()
+        return self._owner._resident_buffer(context, self._region, self.access)

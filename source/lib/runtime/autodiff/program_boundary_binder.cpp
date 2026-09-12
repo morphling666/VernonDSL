@@ -189,8 +189,18 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             return false;
         const auto ownerKey = std::make_pair(owner.kind, owner.id);
         if (inPlaceOwners.count(ownerKey)) {
-            if (owner.kind != program::ProgramOwnerKind::Storage || supplied->second->kind != VERNON_PROGRAM_TENSOR) {
-                error = "in-place Program output owner is not Tensor Storage";
+            if (owner.kind != program::ProgramOwnerKind::Storage) {
+                error = "in-place Program output owner is not Storage-backed";
+                return false;
+            }
+            if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
+                backings[owner.id].external = *supplied->second;
+                externalValues.emplace(value, *supplied->second);
+                live[value] = 1;
+                continue;
+            }
+            if (supplied->second->kind != VERNON_PROGRAM_TENSOR) {
+                error = "in-place Program output owner has no physical Storage";
                 return false;
             }
             ProgramStorageBacking &backing = backings[owner.id];

@@ -685,52 +685,6 @@ struct ProgramInvocationBuilder {
         }
     }
 
-    VernonStatus forwardProgram(VernonPullback **pullback) const {
-        if (pullback)
-            *pullback = nullptr;
-        std::vector<VernonProgramArgument> values;
-        collectArguments(values);
-
-        VernonProgramInstance *instance = vernonRuntimeProgramInstanceCreate(executable);
-        if (!instance)
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        VernonProgramInvocation *programInvocation = vernonRuntimeProgramInstanceBeginInvocation(instance);
-        if (!programInvocation) {
-            vernonRuntimeProgramInstanceDestroy(instance);
-            return VERNON_STATUS_INVALID_ARGUMENT;
-        }
-        VernonStatus status = VERNON_STATUS_OK;
-        for (size_t index = 0; index < values.size() && status == VERNON_STATUS_OK; ++index) {
-            const std::string text = "python-argument-" + std::to_string(index);
-            const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
-            status = vernonRuntimeProgramInvocationBind(programInvocation, &token, &values[index], nullptr, 0, 0);
-        }
-        const size_t graphicsCount = vernonRuntimeProgramExecutableGetGraphicsNodeCount(executable);
-        for (size_t index = 0; index < graphicsCount && status == VERNON_STATUS_OK; ++index) {
-            VernonProgramGraphicsControlsView controls{};
-            controls.struct_size = sizeof(controls);
-            status = vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, index, &controls);
-            const std::string text = "python-graphics-" + std::to_string(index);
-            const VernonProgramBindingToken token{sizeof(VernonProgramBindingToken), text.data(), text.size()};
-            if (status == VERNON_STATUS_OK && hasGraphicsState)
-                status = vernonRuntimeProgramInvocationBindRenderPass(programInvocation, controls.render_pass_control,
-                                                                      &token, &renderPass, nullptr, 0);
-            if (status == VERNON_STATUS_OK && hasGraphicsState)
-                status = vernonRuntimeProgramInvocationBindDrawCommand(programInvocation, controls.draw_command_control,
-                                                                       &token, &drawCommand, nullptr);
-            if (status == VERNON_STATUS_OK && hasGraphicsState)
-                status = vernonRuntimeProgramInvocationBindDynamicState(
-                    programInvocation, controls.dynamic_state_control, &token, &dynamicState);
-        }
-        if (status == VERNON_STATUS_OK)
-            status = vernonRuntimeProgramInvocationForward(programInvocation, pullback);
-        else
-            vernonRuntimeProgramInvocationRollback(programInvocation);
-        vernonRuntimeProgramInvocationDestroy(programInvocation);
-        vernonRuntimeProgramInstanceDestroy(instance);
-        return status;
-    }
-
     std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
@@ -812,6 +766,46 @@ inline std::string canonicalBindingToken(const nb::object &value) {
 struct PythonPreparedBindingLease {
     explicit PythonPreparedBindingLease(nb::object value) : prepared(std::move(value)) {}
     nb::object prepared;
+};
+
+struct PythonInvocationOutcome {
+    VernonStatus status{VERNON_STATUS_OK};
+    VernonInvocationSubmissionState submission{VERNON_INVOCATION_NOT_SUBMITTED};
+    std::vector<VernonBoundaryMutation> mutations;
+    std::string error;
+
+    bool ok() const { return status == VERNON_STATUS_OK; }
+    nb::list mutationList() const {
+        nb::list result;
+        for (const VernonBoundaryMutation &mutation : mutations)
+            result.append(nb::make_tuple(static_cast<uint32_t>(mutation.kind), mutation.slot,
+                                         static_cast<uint32_t>(mutation.state)));
+        return result;
+    }
+};
+
+struct NativeProgramForwardResult {
+    PythonInvocationOutcome outcome;
+    VernonPullback *pullback{};
+
+    NativeProgramForwardResult() = default;
+    NativeProgramForwardResult(const NativeProgramForwardResult &) = delete;
+    NativeProgramForwardResult &operator=(const NativeProgramForwardResult &) = delete;
+    NativeProgramForwardResult(NativeProgramForwardResult &&other) noexcept
+        : outcome(std::move(other.outcome)), pullback(std::exchange(other.pullback, nullptr)) {}
+    NativeProgramForwardResult &operator=(NativeProgramForwardResult &&other) noexcept {
+        if (this != &other) {
+            if (pullback)
+                vernonProgramPullbackDestroy(pullback);
+            outcome = std::move(other.outcome);
+            pullback = std::exchange(other.pullback, nullptr);
+        }
+        return *this;
+    }
+    ~NativeProgramForwardResult() {
+        if (pullback)
+            vernonProgramPullbackDestroy(pullback);
+    }
 };
 
 // Nanobind owns only Python object conversion. Transactional binding state,
@@ -899,11 +893,25 @@ struct PythonProgramInvocationAdapter {
             throw std::runtime_error("failed to bind native Program DynamicState control");
     }
 
-    void forward() {
-        if (vernonRuntimeProgramInvocationForward(nativeInvocation, nullptr) != VERNON_STATUS_OK)
-            throw std::runtime_error("native Program invocation failed: " +
-                                     nativeStringView(vernonRuntimeGetLastError(builder->runtime)));
+    NativeProgramForwardResult executeForward(bool retainPullback) {
+        NativeProgramForwardResult result;
+        result.outcome.mutations.resize(vernonRuntimeProgramExecutableGetMutationCapacity(builder->executable));
+        VernonInvocationMutationOutcome outcome{sizeof(VernonInvocationMutationOutcome),
+                                                VERNON_INVOCATION_NOT_SUBMITTED,
+                                                result.outcome.mutations.data(),
+                                                result.outcome.mutations.size(),
+                                                0,
+                                                {}};
+        result.outcome.status = vernonRuntimeProgramInvocationForward(
+            nativeInvocation, retainPullback ? &result.pullback : nullptr, &outcome);
+        result.outcome.submission = outcome.submission;
+        result.outcome.mutations.resize(outcome.mutation_count);
+        if (result.outcome.status != VERNON_STATUS_OK)
+            result.outcome.error = nativeStringView(vernonRuntimeGetLastError(builder->runtime));
+        return result;
     }
+
+    PythonInvocationOutcome forward() { return executeForward(false).outcome; }
 
     void commit() { snapshot = transaction->commit(); }
     void rollback() {

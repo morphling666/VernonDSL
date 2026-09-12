@@ -5,7 +5,7 @@
 namespace vernon::runtime::ad {
 namespace {
 
-program_execution::CanonicalValueSnapshot ownHostBytes(program_execution::CanonicalValueSnapshot snapshot) {
+program_execution::CanonicalValueSnapshot ownRetainedStorage(program_execution::CanonicalValueSnapshot snapshot) {
     auto &logical = snapshot.logical;
     if (!snapshot.deviceOwner && logical.ownedHostBytes.empty() && logical.argument.kind == VERNON_PROGRAM_TENSOR &&
         logical.argument.tensor.storage == VERNON_TENSOR_HOST && logical.argument.tensor.host_data &&
@@ -23,14 +23,14 @@ captureValues(const ProgramResidualPlan &plan, const program_execution::ProgramI
     std::vector<program_execution::CanonicalValueSnapshot> result;
     result.reserve(plan.retainedValues.size());
     for (uint32_t value : plan.retainedValues)
-        result.push_back(ownHostBytes(invocation.snapshotValue(value)));
+        result.push_back(ownRetainedStorage(invocation.snapshotValue(value)));
     return result;
 }
 
 std::vector<program_execution::CanonicalValueSnapshot>
-ownHostBytes(std::vector<program_execution::CanonicalValueSnapshot> values) {
+ownRetainedStorage(std::vector<program_execution::CanonicalValueSnapshot> values) {
     for (auto &value : values)
-        value = ownHostBytes(std::move(value));
+        value = ownRetainedStorage(std::move(value));
     return values;
 }
 
@@ -93,7 +93,7 @@ RetainedPullbackState::RetainedPullbackState(ProgramResidualPlan plan, const pro
                                              std::vector<program_execution::CanonicalValueSnapshot> values,
                                              std::map<uint32_t, program_execution::ProgramStorageBacking> storages,
                                              ProgramTapeScratch tapeScratch)
-    : residualPlan_(std::move(plan)), values_(ownHostBytes(std::move(values))),
+    : residualPlan_(std::move(plan)), values_(ownRetainedStorage(std::move(values))),
       storages_(sanitizeStorages(std::move(storages))), residualCaptures_(captureBytes(program.values.size(), values_)),
       captureShapes_(makeCaptureShapes(program.values.size(), values_)), tapeValues_(captureTapeValues(program)),
       tape_(tapeScratch.releaseSnapshot()) {}
@@ -133,6 +133,15 @@ const void *RetainedPullbackState::snapshotHostIdentity(uint32_t value) const {
 
 size_t RetainedPullbackState::residentBytes() const {
     size_t result{};
+    std::vector<const program_execution::DeviceBuffer *> deviceSnapshots;
+    deviceSnapshots.reserve(values_.size());
+    for (const auto &value : values_) {
+        if (!value.deviceOwner ||
+            std::find(deviceSnapshots.begin(), deviceSnapshots.end(), value.deviceOwner.get()) != deviceSnapshots.end())
+            continue;
+        deviceSnapshots.push_back(value.deviceOwner.get());
+        result += value.deviceOwner->size();
+    }
     for (const auto &capture : residualCaptures_)
         result += capture.size();
     for (const auto &batch : tape_.hostBatches)

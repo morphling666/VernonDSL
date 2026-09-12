@@ -1329,9 +1329,17 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/access",
                         "ProgramABI access disagrees with the canonical Program");
         if (slot.direction == BoundaryDirection::Input) {
-            if (row.contains("publication"))
-                return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
-                            "input ProgramABI boundary cannot publish");
+            if (slot.access == BoundaryAccess::Read) {
+                if (row.contains("publication"))
+                    return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                                "read-only input ProgramABI boundary cannot publish");
+            } else if (row.contains("publication")) {
+                if (row["publication"] != "in_place" || !logicalValue.storage ||
+                    program.storages[*logicalValue.storage].mutability != StorageMutability::Mutable)
+                    return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
+                                "writable input ProgramABI boundary requires in_place publication");
+                slot.publication = BoundaryPublication::InPlace;
+            }
         } else {
             if (!row.contains("publication") || !row["publication"].is_string())
                 return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", path + "/publication",
@@ -1350,6 +1358,21 @@ bool parse(const nlohmann::json &value, Program &program, Diagnostic &diagnostic
             }
         }
         program.abi.boundarySlots.push_back(std::move(slot));
+    }
+    for (const BoundarySlot &slot : program.abi.boundarySlots) {
+        if (slot.direction != BoundaryDirection::Input || slot.access == BoundaryAccess::Read)
+            continue;
+        const bool hasOutputOwner = std::any_of(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
+                                                [&](const BoundarySlot &candidate) {
+                                                    return candidate.direction == BoundaryDirection::Output &&
+                                                           candidate.aliasOwner.kind == slot.aliasOwner.kind &&
+                                                           candidate.aliasOwner.id == slot.aliasOwner.id;
+                                                });
+        if ((slot.publication == BoundaryPublication::InPlace) == hasOutputOwner)
+            return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse",
+                        "/abi/boundary_slots/" + std::to_string(slot.id) + "/publication",
+                        hasOutputOwner ? "writable input aliases an explicit output publication"
+                                       : "writable input requires in_place publication");
     }
     program.abi.publication = derivePublicationPlan(program.abi.boundarySlots);
 

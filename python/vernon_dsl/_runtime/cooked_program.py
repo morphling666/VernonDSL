@@ -9,7 +9,7 @@ from typing import Any
 
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..types import Specialization, SpecializationAssignment, specialization_key
-from .binding import _dispatch_borrow_scope, _PersistentBindingTable
+from .binding import _dispatch_borrow_scope, _DispatchBorrowLease, _PersistentBindingTable, _raise_invocation_error
 from .sampler import SamplerState
 from .session import (
     _execution_context,
@@ -17,7 +17,6 @@ from .session import (
     _InvocationContext,
     _SessionArtifactCache,
     _use_invocation_context,
-    cpu,
 )
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
@@ -33,6 +32,7 @@ class _CookedProgramPullback:
 
     def __call__(self, cotangent: Any = None) -> dict[str, Any]:
         with _use_invocation_context(self.context):
+            context = _execution_context()
             return dict(
                 self.native.apply_grouped(
                     cotangent,
@@ -40,12 +40,14 @@ class _CookedProgramPullback:
                     self.cotangent_groups,
                     self.carrier_shape,
                     False,
-                    _execution_context(),
+                    context,
+                    lambda requests: _DispatchBorrowLease(list(requests), context),
                 )
             )
 
     def apply_logical(self, cotangent: Any) -> dict[str, Any]:
         with _use_invocation_context(self.context):
+            context = _execution_context()
             return dict(
                 self.native.apply_grouped(
                     cotangent,
@@ -53,7 +55,8 @@ class _CookedProgramPullback:
                     self.cotangent_groups,
                     self.carrier_shape,
                     True,
-                    _execution_context(),
+                    context,
+                    lambda requests: _DispatchBorrowLease(list(requests), context),
                 )
             )
 
@@ -169,11 +172,15 @@ class CookedProgram:
         }
         resolved = [(parameters[slot["slot"]], bindings[slot["path"]]) for slot in slots]
         borrows = [
-            (parameter.name, value, access_names[parameter.access])
+            (parameter.slot, value, access_names[parameter.access])
             for parameter, value in resolved
             if isinstance(value, (TensorStorage, TensorView, _TextureResource))
         ]
-        with _dispatch_borrow_scope(borrows, context), loaded.binding_cache.invocation(native, context) as builder:
+        with (
+            _dispatch_borrow_scope(borrows, context) as lease,
+            loaded.binding_cache.invocation(native, context) as native_invocation,
+        ):
+            builder = native_invocation.builder
             for parameter, value in resolved:
                 if parameter.kind == state.native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
@@ -181,11 +188,10 @@ class CookedProgram:
                     loaded.binding_cache.bind_sampler(builder, native, parameter, value)
                 else:
                     loaded.binding_cache.bind_argument(builder, native, parameter, value)
-            native.program_forward_bound(builder)
-        if state.arch != cpu:
-            for parameter, value in resolved:
-                if parameter.access != state.native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
-                    value._mark_device_dirty()
+            outcome = native_invocation.forward()
+            lease.resolve(outcome)
+            if not outcome.ok:
+                _raise_invocation_error(outcome, "cooked Program forward failed", context)
 
     def vjp(
         self,
@@ -229,23 +235,26 @@ class CookedProgram:
             state.native.ACCESS_READ_WRITE: "read_write",
         }
         borrows = [
-            (parameter.name, bindings[parameter.name], access_names[parameter.access])
+            (parameter.slot, bindings[parameter.name], access_names[parameter.access])
             for parameter in parameters
             if parameter.name not in grid_values
-            if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
+            if isinstance(bindings[parameter.name], (TensorStorage, TensorView, _TextureResource))
         ]
-        with _dispatch_borrow_scope(borrows, context), loaded.binding_cache.invocation(native, context) as builder:
-            for parameter in parameters:
-                value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
-                loaded.binding_cache.bind_argument(builder, native, parameter, value)
-            output, native_pullback = native.program_vjp_bound(builder, bindings)
-        if state.arch != cpu:
-            for parameter in parameters:
-                if parameter.name in grid_values:
-                    continue
-                value = bindings[parameter.name]
-                if parameter.access != state.native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
-                    value._mark_device_dirty()
+        lease = _DispatchBorrowLease(borrows, context)
+        try:
+            with loaded.binding_cache.invocation(native, context) as native_invocation:
+                builder = native_invocation.builder
+                for parameter in parameters:
+                    value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
+                    loaded.binding_cache.bind_argument(builder, native, parameter, value)
+                outcome, output, native_pullback = native.program_vjp_bound(native_invocation, bindings)
+                lease.resolve(outcome)
+                if not outcome.ok:
+                    _raise_invocation_error(outcome, "cooked Program autodiff forward failed", context)
+        except BaseException:
+            raise
+        finally:
+            lease.release()
         groups = tuple(
             DerivativeGroup(str(role), str(path), tuple(str(leaf) for leaf in leaves))
             for role, path, leaves in native.derivative_groups

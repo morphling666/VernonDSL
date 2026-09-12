@@ -21,13 +21,10 @@ DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, size_t size) : context
         handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 }
 
-DeviceBuffer::DeviceBuffer(VernonRuntimeContext &context, VernonRhiBuffer handle, size_t size)
-    : context_(&context), handle_(handle), size_(size), owned_(false) {}
-
 DeviceBuffer::DeviceBuffer(DeviceBuffer &&other) noexcept
     : context_(std::exchange(other.context_, nullptr)),
       handle_(std::exchange(other.handle_, VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0})),
-      size_(std::exchange(other.size_, 0)), owned_(std::exchange(other.owned_, true)) {}
+      size_(std::exchange(other.size_, 0)) {}
 
 DeviceBuffer &DeviceBuffer::operator=(DeviceBuffer &&other) noexcept {
     if (this == &other)
@@ -36,7 +33,6 @@ DeviceBuffer &DeviceBuffer::operator=(DeviceBuffer &&other) noexcept {
     context_ = std::exchange(other.context_, nullptr);
     handle_ = std::exchange(other.handle_, VernonRhiBuffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0});
     size_ = std::exchange(other.size_, 0);
-    owned_ = std::exchange(other.owned_, true);
     return *this;
 }
 
@@ -96,12 +92,11 @@ bool DeviceBuffer::reference(size_t offset, size_t size, VernonRuntimeProviderRe
 }
 
 void DeviceBuffer::reset() {
-    if (owned_ && context_ && handle_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
+    if (context_ && handle_.index != VERNON_RHI_INVALID_HANDLE_INDEX)
         (void)vernonRhiDeviceDestroyBuffer(context_->rhiDevice, handle_);
     context_ = nullptr;
     handle_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     size_ = 0;
-    owned_ = true;
 }
 
 } // namespace vernon::runtime::program_execution

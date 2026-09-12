@@ -16,7 +16,7 @@ from .._program_assets.compile_orchestration import (
 from ..bundle import build_program_manifest, build_program_plan, canonical_json, make_target_options
 from ..storage import TensorStorage, TensorView
 from .autodiff import _program_derivative_groups
-from .binding import _DispatchBorrowLease, _PersistentBindingTable
+from .binding import _DispatchBorrowLease, _PersistentBindingTable, _raise_invocation_error
 from .sampler import SamplerState
 from .session import (
     _execution_context,
@@ -51,7 +51,7 @@ def _bind_program_graphics_controls(
     cache: _PersistentBindingTable,
     invocation: Any,
     context: Any,
-) -> list[Any]:
+) -> None:
     from ..render import ColorBlendState, LoadOperation, StoreOperation, lines, points, triangles
 
     state = context.session
@@ -64,7 +64,6 @@ def _bind_program_graphics_controls(
         StoreOperation.PRESERVE: state.native.ATTACHMENT_STORE,
         StoreOperation.DISCARD: state.native.ATTACHMENT_DONT_CARE,
     }
-    written: list[Any] = []
     operations = {operation.id: operation for operation in invocation.graph.operations}
     for node_id, controls in invocation.graphics_controls.items():
         operation = operations[node_id]
@@ -88,7 +87,6 @@ def _bind_program_graphics_controls(
                 store_values[attachment.store],
                 list(clear_value),
             )
-            written.append(texture)
         depth_texture = render_pass.target._depth_attachment()
         if depth_texture is not None:
             if render_pass.depth is None:
@@ -101,7 +99,6 @@ def _bind_program_graphics_controls(
                 store_values[attachment.store],
                 clear_depth,
             )
-            written.append(depth_texture)
         if draw is not None and draw.index_buffer is not None:
             index_view = draw.index_buffer.view
             builder.rhi_index_binding(
@@ -147,7 +144,6 @@ def _bind_program_graphics_controls(
         cache.bind_render_pass_control(render_slot, render_token, builder)
         cache.bind_draw_command_control(draw_slot, draw_token, builder)
         cache.bind_dynamic_state_control(dynamic_slot, dynamic_token, builder)
-    return written
 
 
 def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
@@ -159,23 +155,13 @@ def _program_storage_leaf(value: Any, root: str, leaf_path: str) -> Any:
     return projection
 
 
-def _program_host_array(value: Any) -> np.ndarray:
-    if hasattr(value, "_native_host_array"):
-        return np.asarray(value._native_host_array())
-    if hasattr(value, "to_numpy"):
-        return np.asarray(value.to_numpy())
-    return np.asarray(value)
-
-
 @contextmanager
 def _bound_program_invocation(
     executable: Any,
     cache: _PersistentBindingTable,
     invocation: Any,
     targets: Mapping[str, Any],
-    *,
-    retain_borrows: bool = False,
-) -> Iterator[tuple[Any, list[Any], _DispatchBorrowLease]]:
+) -> Iterator[tuple[Any, Any, _DispatchBorrowLease, list[Any]]]:
     context = _execution_context()
     state = context.session
     parameters = tuple(executable.parameters)
@@ -209,28 +195,28 @@ def _bound_program_invocation(
         (parameter, boundary_slots_by_slot[parameter.slot], *binding(boundary_slots_by_slot[parameter.slot]))
         for parameter in parameters
     ]
-    borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]] = [
-        (path, value, access_names[parameter.access])
+    borrows: list[tuple[Any, TensorStorage | RawBuffer | TensorView | _TextureResource, str]] = [
+        (parameter.slot, value, access_names[parameter.access])
         for parameter, _, path, value in resolved
         if isinstance(value, (TensorStorage, TensorView, _TextureResource))
     ]
     for controls in invocation.graphics_controls.values():
+        render_slot = int(controls["render_pass"][0])
         render_pass = controls["render_pass"][1]
         borrows.extend(
-            (f"render_attachment_{location}", texture, "write")
+            (("render_pass", render_slot), texture, "write")
             for location, texture in render_pass.target._color_attachments()
         )
         depth = render_pass.target._depth_attachment()
         if depth is not None:
-            borrows.append(("depth_attachment", depth, "write"))
+            borrows.append((("render_pass", render_slot), depth, "write"))
         draw = controls["draw"][1]
         if draw is not None and draw.index_buffer is not None:
             borrows.append(("index_buffer", draw.index_buffer.view, "read"))
-    written: list[Any] = []
     lease = _DispatchBorrowLease(borrows, context)
-    succeeded = False
     try:
-        with cache.invocation(executable, context) as builder:
+        with cache.invocation(executable, context) as native_invocation:
+            builder = native_invocation.builder
             for parameter, slot, path, value in resolved:
                 if parameter.kind == state.native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
@@ -245,20 +231,14 @@ def _bound_program_invocation(
                         host_value=slot.get("category") == "value",
                         annotation=invocation.input_annotations.get(path),
                     )
-                if (
-                    state.arch != cpu
-                    and parameter.access != state.native.ACCESS_READ
-                    and hasattr(value, "_mark_device_dirty")
-                ):
-                    written.append(value)
-            written.extend(_bind_program_graphics_controls(executable, cache, invocation, context))
-            yield builder, written, lease
-        succeeded = True
+            _bind_program_graphics_controls(executable, cache, invocation, context)
+            yield builder, native_invocation, lease, resolved
     finally:
-        if retain_borrows and succeeded:
-            lease.release_writes()
-        else:
-            lease.release()
+        lease.release()
+
+
+def _admit_pullback_accesses(requests: Any, context: _InvocationContext) -> _DispatchBorrowLease:
+    return _DispatchBorrowLease(list(requests), context)
 
 
 class ProgramNativePullback:
@@ -266,17 +246,13 @@ class ProgramNativePullback:
         self,
         native: Any,
         signature: Mapping[str, Any],
-        outputs: Mapping[str, Any],
         inputs: Mapping[str, Any],
         derivative_groups: tuple[Any, ...],
-        lease: _DispatchBorrowLease,
         context: _InvocationContext,
     ) -> None:
         self._native = native
         self._signature = signature
-        self._outputs = dict(outputs)
         self._inputs = dict(inputs)
-        self._lease = lease
         self._context = context
         self._storage_gradients = {
             path for path, value in inputs.items() if isinstance(value, (TensorStorage, TensorView))
@@ -320,22 +296,21 @@ class ProgramNativePullback:
                 value = grouped_cotangents[root]
                 if isinstance(value, TensorStorage) and any(leaf != root for leaf in group.leaf_paths):
                     grouped_cotangents[root] = {
-                        leaf: _program_storage_leaf(value, root, leaf)._native_host_array() for leaf in group.leaf_paths
+                        leaf: _program_storage_leaf(value, root, leaf).to_numpy() for leaf in group.leaf_paths
                     }
             supplied = grouped_cotangents
-        try:
-            gradients = dict(
-                self._native.apply_grouped(
-                    supplied,
-                    self._gradient_groups,
-                    self._cotangent_groups,
-                    carrier_shape,
-                    False,
-                    _execution_context(),
-                )
+        context = _execution_context()
+        gradients = dict(
+            self._native.apply_grouped(
+                supplied,
+                self._gradient_groups,
+                self._cotangent_groups,
+                carrier_shape,
+                False,
+                context,
+                lambda requests: _admit_pullback_accesses(requests, context),
             )
-        finally:
-            self._lease.release()
+        )
         return {
             path: (
                 value
@@ -344,11 +319,6 @@ class ProgramNativePullback:
             )
             for path, value in gradients.items()
         }
-
-    def __del__(self) -> None:
-        lease = getattr(self, "_lease", None)
-        if lease is not None:
-            lease.release()
 
     @property
     def logical_residual_bytes(self) -> int:
@@ -428,29 +398,27 @@ class ProgramAutodiffSpecialization:
         targets = flatten_program_outputs(invocation.outputs)
         program_bindings = dict(invocation.inputs)
         program_bindings.update(targets)
-        with _bound_program_invocation(
-            executable,
-            self.binding_cache,
-            invocation,
-            targets,
-            retain_borrows=True,
-        ) as (builder, written, lease):
-            native_outputs, native_pullback = executable.program_vjp_bound(
-                builder,
+        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
+            _,
+            native_invocation,
+            lease,
+            _,
+        ):
+            outcome, native_outputs, native_pullback = executable.program_vjp_bound(
+                native_invocation,
                 program_bindings,
                 checkpoint_memory_budget=checkpoint_memory_budget,
                 checkpoint_policy=checkpoint_policy,
             )
-            for value in written:
-                value._mark_device_dirty()
+            lease.resolve(outcome)
+            if not outcome.ok:
+                _raise_invocation_error(outcome, "Program autodiff forward failed", context)
         derivative_groups = _program_derivative_groups(executable)
         pullback = ProgramNativePullback(
             native_pullback,
             signature,
-            targets,
             invocation.inputs,
             derivative_groups,
-            lease,
             context,
         )
         expected_output_leaves = {row["path"] for row in signature["outputs"]}
@@ -481,14 +449,11 @@ class ProgramSpecialization:
 
         executable = self._loaded_executable()
         targets = flatten_program_outputs(invocation.outputs)
-        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (
-            builder,
-            written,
-            _,
-        ):
-            self.binding_cache.forward()
-            for value in written:
-                value._mark_device_dirty()
+        with _bound_program_invocation(executable, self.binding_cache, invocation, targets) as (_, _, lease, _):
+            outcome = self.binding_cache.forward()
+            lease.resolve(outcome)
+            if not outcome.ok:
+                _raise_invocation_error(outcome, "Program invocation failed", _execution_context())
         return invocation.outputs
 
 

@@ -30,6 +30,7 @@ struct VERNON_RHI_CAPI DeviceState {
     Result upload(DevicePointer destination, const void *source, size_t size);
     Result uploadRanges(DevicePointer destination, const VernonRhiBufferUploadRange *ranges, size_t rangeCount);
     Result download(void *destination, DevicePointer source, size_t size);
+    Result downloadRanges(DevicePointer source, const VernonRhiBufferDownloadRange *ranges, size_t rangeCount);
     Result copy(DevicePointer destination, DevicePointer source, size_t size);
 
     Device device{};

@@ -340,7 +340,8 @@ class RuntimeSessionTests(unittest.TestCase):
         try:
             with self.assertRaisesRegex(RuntimeError, "another RuntimeSession"):
                 _DispatchBorrowLease([("storage", storage, "read")], second_context)
-            self.assertIsNone(storage._residency.current)
+            self.assertIsNone(storage._control.residencies.get(first))
+            self.assertIsNone(storage._control.residencies.get(second))
         finally:
             lease.release()
 

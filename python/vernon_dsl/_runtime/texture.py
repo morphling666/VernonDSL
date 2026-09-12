@@ -1,47 +1,23 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from .. import _native
 from ..types import TypeExpr
-from .residency import _ResourceAccessDomain, _SingleResidency
+from .residency import _ImageRegion, _ResidencySet, _resource_transaction_scope, _ResourceControlBlock
 from .session import _invocation_context, _InvocationContext
 
+_ImageSubresource = tuple[str, int, int]
 
-class _DirtyMipSet:
-    """Set-like adapter for runtime-owned texture dirty state."""
 
-    def __init__(self, mip_levels: int, dirty: Any = ()) -> None:
-        self._native = _native._DirtyIndexSet(mip_levels)
-        self.update(dirty)
-
-    def __iter__(self) -> Any:
-        return iter(self._native.indices)
-
-    def __contains__(self, mip_level: object) -> bool:
-        return isinstance(mip_level, int) and not isinstance(mip_level, bool) and mip_level in self._native
-
-    def __bool__(self) -> bool:
-        return bool(self._native)
-
-    def add(self, mip_level: int) -> None:
-        self._native.add(mip_level)
-
-    def discard(self, mip_level: int) -> None:
-        self._native.discard(mip_level)
-
-    def update(self, mip_levels: Any) -> None:
-        self._native.update(list(mip_levels))
-
-    def difference_update(self, mip_levels: Any) -> None:
-        self._native.difference_update(list(mip_levels))
-
-    def clear(self) -> None:
-        self._native.clear()
+@dataclass
+class _TextureCoherence:
+    host_dirty_subresources: set[_ImageSubresource]
+    device_dirty_subresources: set[_ImageSubresource]
+    view_residencies: dict[tuple[Any, ...], _ResidencySet] = field(default_factory=dict)
 
 
 class _TextureResource:
@@ -54,15 +30,6 @@ class _TextureResource:
 
     def _resident_view(self, context: _InvocationContext) -> Any:
         raise NotImplementedError
-
-    def _mark_device_dirty(self) -> None:
-        raise NotImplementedError
-
-    def _ensure_host_mutation_allowed(self) -> None:
-        self._access_domain.require_host_mutation("Texture")
-
-    def _ensure_host_read_allowed(self) -> None:
-        self._access_domain.require_host_read("Texture")
 
 
 @dataclass(frozen=True)
@@ -93,6 +60,22 @@ d32_float = TextureFormat(
     False,
     frozenset({"depth"}),
 )
+_DEPTH_STENCIL_DTYPE = np.dtype(
+    {
+        "names": ("depth", "stencil"),
+        "formats": (np.float32, np.uint8),
+        "offsets": (0, 4),
+        "itemsize": 8,
+    }
+)
+d32_float_s8_uint = TextureFormat(
+    "d32_float_s8_uint",
+    "D32_FLOAT_S8_UINT",
+    _DEPTH_STENCIL_DTYPE,
+    1,
+    False,
+    frozenset({"depth", "stencil"}),
+)
 
 _TEXTURE_FORMATS = (
     rgba8_unorm,
@@ -106,6 +89,7 @@ _TEXTURE_FORMATS = (
     rgb8_unorm,
     r11g11b10_float,
     d32_float,
+    d32_float_s8_uint,
 )
 _TEXTURE_FORMAT_SET = frozenset(_TEXTURE_FORMATS)
 _TEXTURE_USAGES = frozenset(
@@ -224,7 +208,6 @@ class Texture(_TextureResource):
         usage: frozenset[str],
         host_array: np.ndarray | None,
     ) -> None:
-        self._access_domain = _ResourceAccessDomain()
         self._shape = shape
         self._array = host_array
         self._mip_arrays: dict[int, np.ndarray] = {} if host_array is None else {0: host_array}
@@ -232,10 +215,30 @@ class Texture(_TextureResource):
         self._dimension = dimension
         self._mip_levels = mip_levels
         self._usage = usage
-        self._texture_residency = _SingleResidency()
-        self._view_residency = _SingleResidency()
-        self._host_dirty_mips = _DirtyMipSet(mip_levels, self._mip_arrays)
-        self._device_dirty_mips = _DirtyMipSet(mip_levels)
+        layers = 6 if dimension == "cube" else 1
+        self._region = _ImageRegion(
+            frozenset(
+                (aspect, mip_level, layer)
+                for aspect in format.aspects
+                for mip_level in range(mip_levels)
+                for layer in range(layers)
+            )
+        )
+        initial_host_dirty = (
+            {subresource for subresource in self._region.subresources if subresource[1] == 0}
+            if host_array is not None
+            else set()
+        )
+        self._control = _ResourceControlBlock(_TextureCoherence(initial_host_dirty, set()))
+        self._view_key = (
+            format.name,
+            dimension,
+            0,
+            mip_levels,
+            0,
+            layers,
+            tuple(sorted(format.aspects)),
+        )
 
     @staticmethod
     def _logical_shape(array_shape: tuple[int, ...], dimension: str, channels: int) -> tuple[int, ...]:
@@ -246,6 +249,53 @@ class Texture(_TextureResource):
         if not isinstance(mip_level, int) or isinstance(mip_level, bool) or not 0 <= mip_level < self._mip_levels:
             raise ValueError("Texture mip level is out of range")
         return tuple(max(1, extent >> mip_level) for extent in self.shape)
+
+    def _mip_region(self, mip_level: int) -> _ImageRegion:
+        layers = 6 if self._dimension == "cube" else 1
+        return _ImageRegion(
+            frozenset((aspect, mip_level, layer) for aspect in self._format.aspects for layer in range(layers))
+        )
+
+    @staticmethod
+    def _dirty_mips(subresources: set[_ImageSubresource]) -> tuple[int, ...]:
+        return tuple(sorted({mip_level for _, mip_level, _ in subresources}))
+
+    @staticmethod
+    def _contiguous_layers(layers: set[int]) -> tuple[tuple[int, int], ...]:
+        if not layers:
+            return ()
+        ordered = sorted(layers)
+        groups: list[tuple[int, int]] = []
+        begin = previous = ordered[0]
+        for layer in ordered[1:]:
+            if layer != previous + 1:
+                groups.append((begin, previous - begin + 1))
+                begin = layer
+            previous = layer
+        groups.append((begin, previous - begin + 1))
+        return tuple(groups)
+
+    @staticmethod
+    def _aspect_layer_groups(
+        subresources: set[_ImageSubresource],
+        mip_level: int,
+    ) -> tuple[tuple[frozenset[str], set[int]], ...]:
+        aspects_by_layer: dict[int, set[str]] = {}
+        for aspect, candidate_mip, layer in subresources:
+            if candidate_mip == mip_level:
+                aspects_by_layer.setdefault(layer, set()).add(aspect)
+        layers_by_aspects: dict[frozenset[str], set[int]] = {}
+        for layer, aspects in aspects_by_layer.items():
+            layers_by_aspects.setdefault(frozenset(aspects), set()).add(layer)
+        return tuple(layers_by_aspects.items())
+
+    @staticmethod
+    def _aspect_mask(aspects: frozenset[str]) -> int:
+        values = {"color": 1, "depth": 2, "stencil": 4}
+        return sum(values[aspect] for aspect in aspects)
+
+    def _mip_is_device_dirty(self, mip_level: int) -> bool:
+        return bool(self._control.coherence.device_dirty_subresources & self._mip_region(mip_level).subresources)
 
     def _array_shape(self, mip_level: int) -> tuple[int, ...]:
         logical = self._mip_shape(mip_level)
@@ -259,9 +309,13 @@ class Texture(_TextureResource):
         origin: tuple[int, ...],
         shape: tuple[int, ...],
     ) -> None:
-        residency = self._texture_residency.current
-        if residency is None:
-            raise RuntimeError("device-dirty Texture has no allocation")
+        reservation = None
+        with self._control.lock:
+            residency = self._control.residencies.latest()
+            if residency is None:
+                raise RuntimeError("device-dirty Texture has no allocation")
+            reservation = self._control.reserve_io(self._mip_region(mip_level), "write")
+            texture = residency.handle
         if self._dimension == "3d":
             offset_z, offset_y, offset_x = origin
             download_depth, download_height, download_width = shape
@@ -270,34 +324,74 @@ class Texture(_TextureResource):
             offset_z = 0
             download_height, download_width = shape
             download_depth = 1
-        downloaded_shape = (6, *shape) if self._dimension == "cube" else shape
-        if self._format.channels != 1:
-            downloaded_shape = (*downloaded_shape, self._format.channels)
-        downloaded = np.frombuffer(
-            residency.handle.download(
-                mip_level,
-                offset_x,
-                offset_y,
-                offset_z,
-                download_width,
-                download_height,
-                download_depth,
-            ),
-            dtype=self._format.dtype,
-        ).reshape(downloaded_shape)
-        target = self._mip_arrays.setdefault(
-            mip_level, np.zeros(self._array_shape(mip_level), dtype=self._format.dtype)
-        )
-        if mip_level == 0:
-            self._array = target
-        slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
-        if self._dimension == "cube":
-            slices = (slice(None), *slices)
-        if self._format.channels != 1:
-            slices = (*slices, slice(None))
-        np.copyto(target[slices], downloaded)
-        if origin == (0,) * len(shape) and shape == self._mip_shape(mip_level):
-            self._device_dirty_mips.discard(mip_level)
+        try:
+            with self._control.lock:
+                dirty_subresources = {
+                    subresource
+                    for subresource in self._control.coherence.device_dirty_subresources
+                    if subresource[1] == mip_level
+                }
+            requests: list[dict[str, object]] = []
+            groups: list[tuple[int, int, frozenset[str], tuple[int, ...], np.dtype[Any]]] = []
+            for aspects, dirty_layers in self._aspect_layer_groups(dirty_subresources, mip_level):
+                layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                for base_layer, layer_count in layer_groups:
+                    downloaded_shape = ((layer_count, *shape) if self._dimension == "cube" else shape) + (
+                        () if self._format.channels == 1 else (self._format.channels,)
+                    )
+                    transfer_dtype = (
+                        np.dtype(np.float32)
+                        if self._format is d32_float_s8_uint and aspects == {"depth"}
+                        else np.dtype(np.uint8)
+                        if self._format is d32_float_s8_uint and aspects == {"stencil"}
+                        else self._format.dtype
+                    )
+                    requests.append(
+                        {
+                            "mip_level": mip_level,
+                            "offset_x": offset_x,
+                            "offset_y": offset_y,
+                            "offset_z": offset_z,
+                            "width": download_width,
+                            "height": download_height,
+                            "depth": download_depth,
+                            "base_array_layer": base_layer,
+                            "array_layer_count": layer_count,
+                            "aspects": self._aspect_mask(aspects),
+                        }
+                    )
+                    groups.append((base_layer, layer_count, aspects, downloaded_shape, transfer_dtype))
+            downloaded_groups = [
+                (base_layer, layer_count, aspects, np.frombuffer(raw, dtype=transfer_dtype).reshape(downloaded_shape))
+                for raw, (base_layer, layer_count, aspects, downloaded_shape, transfer_dtype) in zip(
+                    texture.download_regions(requests), groups, strict=True
+                )
+            ]
+            with self._control.lock:
+                target = self._mip_arrays.setdefault(
+                    mip_level,
+                    np.zeros(self._array_shape(mip_level), dtype=self._format.dtype),
+                )
+                if mip_level == 0:
+                    self._array = target
+                spatial_slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
+                for base_layer, layer_count, aspects, downloaded in downloaded_groups:
+                    slices = spatial_slices
+                    if self._dimension == "cube":
+                        slices = (slice(base_layer, base_layer + layer_count), *slices)
+                    if self._format.channels != 1:
+                        slices = (*slices, slice(None))
+                    destination = (
+                        target[next(iter(aspects))]
+                        if self._format is d32_float_s8_uint and len(aspects) == 1
+                        else target
+                    )
+                    np.copyto(destination[slices], downloaded)
+                if origin == (0,) * len(shape) and shape == self._mip_shape(mip_level):
+                    self._control.coherence.device_dirty_subresources.difference_update(dirty_subresources)
+        finally:
+            with self._control.lock:
+                self._control.release_io(reservation)
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
@@ -438,7 +532,6 @@ class Texture(_TextureResource):
         mip_level: int = 0,
         origin: tuple[int, ...] | None = None,
     ) -> None:
-        self._ensure_host_mutation_allowed()
         if "transfer_destination" not in self._usage:
             raise RuntimeError("Texture was not created with transfer_destination usage")
         mip_shape = self._mip_shape(mip_level)
@@ -471,22 +564,29 @@ class Texture(_TextureResource):
         ):
             raise ValueError("Texture upload region exceeds the selected mip level")
         full_region = origin == (0,) * len(mip_shape) and region_shape == mip_shape
-        if mip_level in self._device_dirty_mips and not full_region:
-            self._download_device_region(mip_level, (0,) * len(mip_shape), mip_shape)
-        destination = self._mip_arrays.get(mip_level)
-        if destination is None:
-            destination = np.zeros(self._array_shape(mip_level), dtype=self._format.dtype)
-            self._mip_arrays[mip_level] = destination
-            if mip_level == 0:
-                self._array = destination
-        slices = tuple(slice(start, start + size) for start, size in zip(origin, region_shape, strict=True))
-        if layer_rank:
-            slices = (slice(None), *slices)
-        if channel_rank:
-            slices = (*slices, slice(None))
-        np.copyto(destination[slices], array)
-        self._host_dirty_mips.add(mip_level)
-        self._device_dirty_mips.discard(mip_level)
+        with self._control.host_access(self._mip_region(mip_level), "write", "Texture"):
+            coherence = self._control.coherence
+            if self._mip_is_device_dirty(mip_level) and not full_region:
+                self._download_device_region(mip_level, (0,) * len(mip_shape), mip_shape)
+            destination = self._mip_arrays.get(mip_level)
+            if destination is None:
+                destination = np.zeros(self._array_shape(mip_level), dtype=self._format.dtype)
+                self._mip_arrays[mip_level] = destination
+                if mip_level == 0:
+                    self._array = destination
+            slices = tuple(slice(start, start + size) for start, size in zip(origin, region_shape, strict=True))
+            if layer_rank:
+                slices = (slice(None), *slices)
+            if channel_rank:
+                slices = (*slices, slice(None))
+            np.copyto(destination[slices], array)
+            mip_subresources = self._mip_region(mip_level).subresources
+            coherence.host_dirty_subresources.update(mip_subresources)
+            coherence.device_dirty_subresources.difference_update(mip_subresources)
+            self._control.publish_host_write(
+                host_complete=not coherence.device_dirty_subresources,
+                recovers_unknown=self._mip_levels == 1 and full_region,
+            )
 
     def download(
         self,
@@ -495,7 +595,6 @@ class Texture(_TextureResource):
         origin: tuple[int, ...] | None = None,
         shape: tuple[int, ...] | None = None,
     ) -> np.ndarray:
-        self._ensure_host_read_allowed()
         if "transfer_source" not in self._usage:
             raise RuntimeError("Texture was not created with transfer_source usage")
         mip_shape = self._mip_shape(mip_level)
@@ -519,67 +618,176 @@ class Texture(_TextureResource):
             )
         ):
             raise ValueError("Texture download region exceeds the selected mip level")
-        if mip_level in self._device_dirty_mips:
-            self._download_device_region(mip_level, origin, shape)
-        array = self._mip_arrays.get(mip_level)
-        if array is None:
-            raise RuntimeError("Texture mip level has not been initialized")
-        slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
-        if self._dimension == "cube":
-            slices = (slice(None), *slices)
-        if self._format.channels != 1:
-            slices = (*slices, slice(None))
-        return array[slices].copy(order="C")
+        with self._control.host_access(self._mip_region(mip_level), "read", "Texture"):
+            if self._mip_is_device_dirty(mip_level):
+                self._download_device_region(mip_level, origin, shape)
+            array = self._mip_arrays.get(mip_level)
+            if array is None:
+                raise RuntimeError("Texture mip level has not been initialized")
+            slices = tuple(slice(start, start + size) for start, size in zip(origin, shape, strict=True))
+            if self._dimension == "cube":
+                slices = (slice(None), *slices)
+            if self._format.channels != 1:
+                slices = (*slices, slice(None))
+            return array[slices].copy(order="C")
 
     def to_numpy(self) -> np.ndarray:
         return self.download()
 
     def generate_mipmaps(self) -> None:
         with _invocation_context() as context:
-            self._ensure_host_mutation_allowed()
             if self._mip_levels < 2:
                 raise RuntimeError("Texture has no mip chain to generate")
             if not {"transfer_source", "transfer_destination"}.issubset(self._usage):
                 raise RuntimeError("mipmap generation requires transfer_source and transfer_destination usage")
-            texture = self._resident_texture(context)
-            texture.generate_mipmaps()
-            self._mip_arrays = {} if self._array is None else {0: self._array}
-            self._host_dirty_mips.clear()
-            self._device_dirty_mips.update(range(1, self._mip_levels))
+            written = self.view(base_mip_level=1, mip_level_count=self._mip_levels - 1)
+            with _resource_transaction_scope(
+                [
+                    (1, self, self._mip_region(0), "read"),
+                    (0, self, written._region, "write"),
+                ],
+                context,
+            ) as transaction:
+                texture = self._resident_texture(context)
+                try:
+                    texture.generate_mipmaps()
+                    with self._control.lock:
+                        self._mip_arrays = {} if self._array is None else {0: self._array}
+                        self._control.coherence.host_dirty_subresources.clear()
+                    transaction.resolve_mutations({0: 2})
+                except BaseException:
+                    transaction.resolve_mutations({0: 3})
+                    raise
 
-    def _resident_texture(self, context: _InvocationContext) -> Any:
-        with self._access_domain.lock:
-            return self._resident_texture_locked(context)
-
-    def _resident_texture_locked(self, context: _InvocationContext) -> Any:
+    def _resident_texture(
+        self,
+        context: _InvocationContext,
+        region: _ImageRegion | None = None,
+        access: str = "read_write",
+    ) -> Any:
         state = context.session
-        texture = self._texture_residency.handle_for(state.identity)
-        if texture is None:
-            if self._texture_residency.current is not None and "transfer_source" in self._usage:
-                for mip_level in sorted(self._device_dirty_mips):
-                    self._download_device_region(
+        if state.rhi_host is None:
+            raise RuntimeError("Texture requires a GPU RHI host")
+        reservation = None
+        retry = False
+        with self._control.lock:
+            coherence = self._control.coherence
+            residency = self._control.residencies.get(state)
+            latest = self._control.residencies.latest()
+            migration = bool(coherence.device_dirty_subresources) and (residency is None or residency is not latest)
+            if migration and "transfer_source" not in self._usage:
+                raise RuntimeError("cannot migrate device-dirty Texture without transfer_source usage")
+            requested = self._region if region is None else region
+            create = residency is None
+            io_region = self._region if create or migration else requested
+            expected_state = (
+                residency.handle if residency is not None else None,
+                latest.handle if latest is not None else None,
+                self._control.version,
+                frozenset(coherence.device_dirty_subresources),
+                frozenset(coherence.host_dirty_subresources),
+            )
+            reservation = self._control.reserve_io(io_region, "write")
+            current_residency = self._control.residencies.get(state)
+            current_latest = self._control.residencies.latest()
+            current_state = (
+                current_residency.handle if current_residency is not None else None,
+                current_latest.handle if current_latest is not None else None,
+                self._control.version,
+                frozenset(coherence.device_dirty_subresources),
+                frozenset(coherence.host_dirty_subresources),
+            )
+            retry = current_state != expected_state
+            if retry:
+                self._control.release_io(reservation)
+                reservation = None
+            else:
+                generation = self._control.version
+                dirty_device = set(coherence.device_dirty_subresources) if migration else set()
+                dirty_host = (
+                    set(coherence.host_dirty_subresources)
+                    if create or migration
+                    else set(coherence.host_dirty_subresources & io_region.subresources)
+                    if access in {"read", "read_write"}
+                    else set()
+                )
+                source = latest.handle if migration and latest is not None else None
+                texture = residency.handle if residency is not None else None
+                arrays = {level: array.copy(order="C") for level, array in self._mip_arrays.items()}
+        if retry:
+            return self._resident_texture(context, region, access)
+        try:
+            downloaded: dict[int, np.ndarray] = {}
+            if source is not None:
+                download_requests: list[dict[str, object]] = []
+                download_groups: list[tuple[int, int, int, frozenset[str], tuple[int, ...], np.dtype[Any]]] = []
+                for mip_level in self._dirty_mips(dirty_device):
+                    shape = self._mip_shape(mip_level)
+                    target = arrays.get(
                         mip_level,
-                        (0,) * len(self._mip_shape(mip_level)),
-                        self._mip_shape(mip_level),
+                        np.zeros(self._array_shape(mip_level), dtype=self._format.dtype),
+                    ).copy()
+                    for aspects, dirty_layers in self._aspect_layer_groups(dirty_device, mip_level):
+                        layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                        for base_layer, layer_count in layer_groups:
+                            downloaded_shape = ((layer_count, *shape) if self._dimension == "cube" else shape) + (
+                                () if self._format.channels == 1 else (self._format.channels,)
+                            )
+                            transfer_dtype = (
+                                np.dtype(np.float32)
+                                if self._format is d32_float_s8_uint and aspects == {"depth"}
+                                else np.dtype(np.uint8)
+                                if self._format is d32_float_s8_uint and aspects == {"stencil"}
+                                else self._format.dtype
+                            )
+                            offset_x = offset_y = offset_z = 0
+                            depth, height, width = shape if self._dimension == "3d" else (1, *shape)
+                            download_requests.append(
+                                {
+                                    "mip_level": mip_level,
+                                    "offset_x": offset_x,
+                                    "offset_y": offset_y,
+                                    "offset_z": offset_z,
+                                    "width": width,
+                                    "height": height,
+                                    "depth": depth,
+                                    "base_array_layer": base_layer,
+                                    "array_layer_count": layer_count,
+                                    "aspects": self._aspect_mask(aspects),
+                                }
+                            )
+                            download_groups.append(
+                                (mip_level, base_layer, layer_count, aspects, downloaded_shape, transfer_dtype)
+                            )
+                    downloaded[mip_level] = target
+                for raw, (mip_level, base_layer, layer_count, aspects, downloaded_shape, transfer_dtype) in zip(
+                    source.download_regions(download_requests), download_groups, strict=True
+                ):
+                    values = np.frombuffer(raw, dtype=transfer_dtype).reshape(downloaded_shape)
+                    target = downloaded[mip_level]
+                    destination = (
+                        target[next(iter(aspects))]
+                        if self._format is d32_float_s8_uint and len(aspects) == 1
+                        else target
                     )
-            else:
-                self._device_dirty_mips.clear()
-            if self._dimension == "3d":
-                depth, height, width = self.shape
-            else:
-                height, width = self.shape
-                depth = 1
-            if state.rhi_host is None:
-                raise RuntimeError("Texture requires a GPU RHI host")
-            native_format = getattr(state.native.TextureFormat, self._format._native_name)
-            native_dimension = {
-                "2d": state.native.TextureDimension.TEXTURE_2D,
-                "3d": state.native.TextureDimension.TEXTURE_3D,
-                "cube": state.native.TextureDimension.CUBE,
-            }[self._dimension]
-            texture = self._texture_residency.replace(
-                state.identity,
-                state.rhi_host.create_image(
+                    if self._dimension == "cube":
+                        destination[base_layer : base_layer + layer_count] = values
+                    else:
+                        destination[...] = values
+            arrays.update(downloaded)
+            if texture is None:
+                if self._dimension == "3d":
+                    depth, height, width = self.shape
+                else:
+                    height, width = self.shape
+                    depth = 1
+                native_format = getattr(state.native.TextureFormat, self._format._native_name)
+                native_dimension = {
+                    "2d": state.native.TextureDimension.TEXTURE_2D,
+                    "3d": state.native.TextureDimension.TEXTURE_3D,
+                    "cube": state.native.TextureDimension.CUBE,
+                }[self._dimension]
+                texture = state.rhi_host.create_image(
                     width,
                     height,
                     native_format,
@@ -587,49 +795,137 @@ class Texture(_TextureResource):
                     depth,
                     self._mip_levels,
                     self._native_usage(state),
-                ),
-            )
-            self._view_residency.clear()
-            self._host_dirty_mips.clear()
-            self._host_dirty_mips.update(self._mip_arrays)
-            self._device_dirty_mips.clear()
-        for mip_level in sorted(self._host_dirty_mips):
-            array = self._mip_arrays[mip_level]
-            texture.upload(array.tobytes(order="C"), mip_level)
-        self._host_dirty_mips.clear()
-        return texture
+                )
+                dirty_host.update(
+                    subresource for mip_level in arrays for subresource in self._mip_region(mip_level).subresources
+                )
+            elif migration:
+                dirty_host.update(
+                    subresource for mip_level in arrays for subresource in self._mip_region(mip_level).subresources
+                )
+            upload_requests: list[dict[str, object]] = []
+            for mip_level in self._dirty_mips(dirty_host):
+                shape = self._mip_shape(mip_level)
+                depth, height, width = shape if self._dimension == "3d" else (1, *shape)
+                for aspects, dirty_layers in self._aspect_layer_groups(dirty_host, mip_level):
+                    layer_groups = self._contiguous_layers(dirty_layers) if self._dimension == "cube" else ((0, 1),)
+                    for base_layer, layer_count in layer_groups:
+                        array = arrays[mip_level]
+                        if self._dimension == "cube":
+                            array = array[base_layer : base_layer + layer_count]
+                        if self._format is d32_float_s8_uint and len(aspects) == 1:
+                            array = np.ascontiguousarray(array[next(iter(aspects))])
+                        upload_requests.append(
+                            {
+                                "data": array.tobytes(order="C"),
+                                "mip_level": mip_level,
+                                "offset_x": 0,
+                                "offset_y": 0,
+                                "offset_z": 0,
+                                "width": width,
+                                "height": height,
+                                "depth": depth,
+                                "base_array_layer": base_layer,
+                                "array_layer_count": layer_count,
+                                "aspects": self._aspect_mask(aspects),
+                            }
+                        )
+            if upload_requests:
+                texture.upload_regions(upload_requests)
+            with self._control.lock:
+                if residency is None:
+                    residency = self._control.residencies.replace(state, texture)
+                self._mip_arrays.update(downloaded)
+                coherence.device_dirty_subresources.difference_update(dirty_device)
+                coherence.host_dirty_subresources.difference_update(dirty_host)
+                residency.version = max(residency.version, generation)
+                if not coherence.device_dirty_subresources:
+                    self._control.host_version = generation
+                return residency.handle
+        finally:
+            with self._control.lock:
+                self._control.release_io(reservation)
+
+    def _device_claim_region(self, context: _InvocationContext, region: _ImageRegion, access: str) -> _ImageRegion:
+        if context.session.rhi_host is None:
+            return region
+        residency = self._control.residencies.get(context.session)
+        latest = self._control.residencies.latest()
+        if residency is None or (self._control.coherence.device_dirty_subresources and residency is not latest):
+            return self._region
+        return region
 
     def _resident_view(self, context: _InvocationContext) -> Any:
-        with self._access_domain.lock:
-            texture = self._resident_texture_locked(context)
-            view = self._view_residency.handle_for(context.identity)
-            if view is None:
-                state = context.session
-                native_format = getattr(state.native.TextureFormat, self._format._native_name)
-                native_dimension = {
-                    "2d": state.native.TextureDimension.TEXTURE_2D,
-                    "3d": state.native.TextureDimension.TEXTURE_3D,
-                    "cube": state.native.TextureDimension.CUBE,
-                }[self._dimension]
-                aspect_names = {
-                    "color": "IMAGE_ASPECT_COLOR",
-                    "depth": "IMAGE_ASPECT_DEPTH",
-                    "stencil": "IMAGE_ASPECT_STENCIL",
-                }
-                native_aspects = sum(int(getattr(state.native, aspect_names[value])) for value in self._format.aspects)
-                view = self._view_residency.replace(
-                    context.identity,
-                    texture.create_view(
-                        native_format,
-                        native_dimension,
-                        0,
-                        self._mip_levels,
-                        0,
-                        6 if self._dimension == "cube" else 1,
-                        native_aspects,
-                    ),
-                )
-            return view
+        return self._resident_image_view(
+            context,
+            self._view_key,
+            self._region,
+            self._format,
+            self._dimension,
+            0,
+            self._mip_levels,
+            0,
+            6 if self._dimension == "cube" else 1,
+            self._format.aspects,
+        )
+
+    def _resident_image_view(
+        self,
+        context: _InvocationContext,
+        view_key: tuple[Any, ...],
+        region: _ImageRegion,
+        format: TextureFormat,
+        dimension: str,
+        base_mip_level: int,
+        mip_level_count: int,
+        base_array_layer: int,
+        array_layer_count: int,
+        aspects: frozenset[str],
+    ) -> Any:
+        texture = self._resident_texture(context, region)
+        reservation = None
+        with self._control.lock:
+            residencies = self._control.coherence.view_residencies.get(view_key)
+            if residencies is None:
+                residencies = _ResidencySet()
+                self._control.coherence.view_residencies[view_key] = residencies
+            view_residency = residencies.get(context.session)
+            if view_residency is not None:
+                return view_residency.handle
+            reservation = self._control.reserve_io(region, "write")
+            view_residency = residencies.get(context.session)
+            if view_residency is not None:
+                self._control.release_io(reservation)
+                return view_residency.handle
+        try:
+            state = context.session
+            native_format = getattr(state.native.TextureFormat, format._native_name)
+            native_dimension = {
+                "2d": state.native.TextureDimension.TEXTURE_2D,
+                "3d": state.native.TextureDimension.TEXTURE_3D,
+                "cube": state.native.TextureDimension.CUBE,
+            }[dimension]
+            aspect_names = {
+                "color": "IMAGE_ASPECT_COLOR",
+                "depth": "IMAGE_ASPECT_DEPTH",
+                "stencil": "IMAGE_ASPECT_STENCIL",
+            }
+            native_aspects = sum(int(getattr(state.native, aspect_names[value])) for value in aspects)
+            handle = texture.create_view(
+                native_format,
+                native_dimension,
+                base_mip_level,
+                mip_level_count,
+                base_array_layer,
+                array_layer_count,
+                native_aspects,
+            )
+            with self._control.lock:
+                view_residency = residencies.replace(context.session, handle)
+            return view_residency.handle
+        finally:
+            with self._control.lock:
+                self._control.release_io(reservation)
 
     def _native_usage(self, state: Any) -> int:
         names = {
@@ -642,9 +938,18 @@ class Texture(_TextureResource):
         }
         return sum(int(getattr(state.native, names[item])) for item in self._usage)
 
-    def _mark_device_dirty(self) -> None:
-        self._device_dirty_mips.add(0)
-        self._host_dirty_mips.discard(0)
+    def _publish_device_write(
+        self,
+        context: _InvocationContext,
+        regions: tuple[_ImageRegion, ...],
+    ) -> None:
+        if not regions:
+            return
+        self._control.publish_device_write(context.session)
+        written = {subresource for region in regions for subresource in region.subresources}
+        coherence = self._control.coherence
+        coherence.device_dirty_subresources.update(written)
+        coherence.host_dirty_subresources.difference_update(written)
 
 
 class TextureView(_TextureResource):
@@ -725,7 +1030,29 @@ class TextureView(_TextureResource):
         self._base_array_layer = base_array_layer
         self._array_layer_count = array_layer_count
         self._aspects = frozenset(aspects)
-        self._view_residency = _SingleResidency()
+        self._view_key = (
+            format.name,
+            dimension,
+            base_mip_level,
+            mip_level_count,
+            base_array_layer,
+            array_layer_count,
+            tuple(sorted(self._aspects)),
+        )
+        self._region = _ImageRegion(
+            frozenset(
+                (aspect, mip_level, layer)
+                for aspect in self._aspects
+                for mip_level in range(
+                    self._base_mip_level,
+                    self._base_mip_level + self._mip_level_count,
+                )
+                for layer in range(
+                    self._base_array_layer,
+                    self._base_array_layer + self._array_layer_count,
+                )
+            )
+        )
 
     @property
     def owner(self) -> Texture:
@@ -756,51 +1083,21 @@ class TextureView(_TextureResource):
         return self._aspects
 
     def _resident_texture(self, context: _InvocationContext) -> Any:
-        return self._owner._resident_texture(context)
+        return self._owner._resident_texture(context, self._region)
 
     def _resident_view(self, context: _InvocationContext) -> Any:
-        with self._owner._access_domain.lock:
-            state = context.session
-            texture = self._owner._resident_texture_locked(context)
-            view = self._view_residency.handle_for(state.identity)
-            if view is None:
-                native_format = getattr(state.native.TextureFormat, self._format._native_name)
-                native_dimension = {
-                    "2d": state.native.TextureDimension.TEXTURE_2D,
-                    "3d": state.native.TextureDimension.TEXTURE_3D,
-                    "cube": state.native.TextureDimension.CUBE,
-                }[self._dimension]
-                aspect_names = {
-                    "color": "IMAGE_ASPECT_COLOR",
-                    "depth": "IMAGE_ASPECT_DEPTH",
-                    "stencil": "IMAGE_ASPECT_STENCIL",
-                }
-                native_aspects = sum(int(getattr(state.native, aspect_names[value])) for value in self._aspects)
-                view = self._view_residency.replace(
-                    state.identity,
-                    texture.create_view(
-                        native_format,
-                        native_dimension,
-                        self._base_mip_level,
-                        self._mip_level_count,
-                        self._base_array_layer,
-                        self._array_layer_count,
-                        native_aspects,
-                    ),
-                )
-            return view
-
-    def _mark_device_dirty(self) -> None:
-        self._owner._device_dirty_mips.update(range(self._base_mip_level, self._base_mip_level + self._mip_level_count))
-        self._owner._host_dirty_mips.difference_update(
-            range(self._base_mip_level, self._base_mip_level + self._mip_level_count)
+        return self._owner._resident_image_view(
+            context,
+            self._view_key,
+            self._region,
+            self._format,
+            self._dimension,
+            self._base_mip_level,
+            self._mip_level_count,
+            self._base_array_layer,
+            self._array_layer_count,
+            self._aspects,
         )
-
-    def _ensure_host_mutation_allowed(self) -> None:
-        self._owner._ensure_host_mutation_allowed()
-
-    def _ensure_host_read_allowed(self) -> None:
-        self._owner._ensure_host_read_allowed()
 
 
 class RenderTarget:

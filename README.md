@@ -340,9 +340,9 @@ platform and architecture. Single-configuration generators default to Release.
 Tests and the staged-file formatting Git hook are enabled by default. Each
 setting remains available as a `-D` override.
 
-CMake places the development `_native` and `_gl_context` modules in
-`python/vernon_dsl/`. Source-checkout Python commands therefore use
-`PYTHONPATH=python` and `uv run --frozen --no-sync`.
+CMake places the development `_native` module in `python/vernon_dsl/`.
+Source-checkout Python commands therefore use `PYTHONPATH=python` and
+`uv run --frozen --no-sync`.
 
 Build a release wheel:
 

@@ -51,6 +51,7 @@ bool PublicationTransaction::bindHostCommit(uint32_t slot, const program::Public
         destination.tensor.storage != VERNON_TENSOR_HOST || !destination.tensor.host_data || slotIsBound(slot))
         return error = "host publication endpoint does not match its exact resolved slot", false;
     entries_.push_back(HostCommitEntry{resolved, &target, destination});
+    boundMutations_.push_back({slot, false});
     return true;
 }
 
@@ -65,6 +66,7 @@ bool PublicationTransaction::bindDeviceCommit(uint32_t slot, const program::Publ
         destinationBuffer.index == VERNON_RHI_INVALID_HANDLE_INDEX || slotIsBound(slot))
         return error = "device publication endpoint does not match its exact resolved slot", false;
     entries_.push_back(DeviceCommitEntry{resolved, &target, destination, destinationBuffer});
+    boundMutations_.push_back({slot, false});
     return true;
 }
 
@@ -105,6 +107,7 @@ bool PublicationTransaction::bindImageCommit(VernonRuntimeContext &context, uint
     }
     entries_.push_back(ImageCommitEntry{resolved, &target, destination, context.rhiDevice, destinationImage,
                                         stagingImage, stagingView, image, view});
+    boundMutations_.push_back({slot, false});
     return true;
 }
 
@@ -119,6 +122,7 @@ bool PublicationTransaction::bindInPlace(uint32_t slot, const VernonProgramArgum
     if (!resolved || (!writableTensor && destination.kind != VERNON_PROGRAM_IMAGE) || slotIsBound(slot))
         return error = "in-place publication requires one writable resource bound at its exact resolved slot", false;
     entries_.push_back(InPlaceEntry{resolved, destination});
+    boundMutations_.push_back({slot, true});
     return true;
 }
 
@@ -238,7 +242,7 @@ VernonStatus PublicationTransaction::prepareCommit(const ProgramInvocationState 
         const uint32_t value = transaction->value;
         const VernonProgramArgument *staged = value < state.values().size() ? &state.values()[value].argument : nullptr;
         if (!staged || staged->kind != VERNON_PROGRAM_TENSOR) {
-            poison();
+            rollback();
             return error = "publication staged Value has no Tensor", VERNON_STATUS_INVALID_ARGUMENT;
         }
         VernonTensorView source = staged->tensor;
@@ -249,13 +253,13 @@ VernonStatus PublicationTransaction::prepareCommit(const ProgramInvocationState 
             if (sourceBuffer.index == VERNON_RHI_INVALID_HANDLE_INDEX ||
                 (sourceBuffer.index == publication->destinationBuffer.index &&
                  sourceBuffer.generation == publication->destinationBuffer.generation)) {
-                poison();
+                rollback();
                 return error = "commit-after-success device execution backing aliases its destination",
                        VERNON_STATUS_INVALID_ARGUMENT;
             }
             source.byte_offset = 0;
             if (!planProgramTensorCopy(source, destination, regions, error)) {
-                poison();
+                rollback();
                 return VERNON_STATUS_INVALID_ARGUMENT;
             }
             for (const ProgramTensorCopyRegion &region : regions)
@@ -268,7 +272,7 @@ VernonStatus PublicationTransaction::prepareCommit(const ProgramInvocationState 
             if (source.storage != VERNON_TENSOR_HOST || !source.host_data ||
                 destination.storage != VERNON_TENSOR_HOST || !destination.host_data ||
                 !planProgramTensorCopy(source, destination, regions, error)) {
-                poison();
+                rollback();
                 return VERNON_STATUS_INVALID_ARGUMENT;
             }
             for (const ProgramTensorCopyRegion &region : regions) {
@@ -362,6 +366,45 @@ void PublicationTransaction::poison() {
     hostRegions_.clear();
     preparedHostCopies_.clear();
     status_ = Status::Poisoned;
+}
+
+void PublicationTransaction::noteSubmission(SubmissionState state) {
+    if (overallSubmission_ == SubmissionState::Indeterminate)
+        return;
+    if (state == SubmissionState::Indeterminate || state == SubmissionState::Completed)
+        overallSubmission_ = state;
+}
+
+void PublicationTransaction::noteInPlaceSubmission(SubmissionState state) {
+    noteSubmission(state);
+    if (inPlaceSubmission_ != SubmissionState::Indeterminate &&
+        (state == SubmissionState::Indeterminate || state == SubmissionState::Completed))
+        inPlaceSubmission_ = state;
+}
+
+InvocationMutationOutcome PublicationTransaction::mutationOutcome() const {
+    InvocationMutationOutcome outcome;
+    outcome.submission = status_ == Status::Poisoned || overallSubmission_ == SubmissionState::Indeterminate
+                             ? SubmissionState::Indeterminate
+                         : status_ == Status::Committed || overallSubmission_ == SubmissionState::Completed
+                             ? SubmissionState::Completed
+                             : SubmissionState::NotSubmitted;
+    outcome.boundaries.reserve(boundMutations_.size());
+    for (const BoundMutation &entry : boundMutations_) {
+        VernonBoundaryMutationState state = VERNON_BOUNDARY_MUTATION_UNCHANGED;
+        if (entry.inPlace) {
+            if (inPlaceSubmission_ == SubmissionState::Completed)
+                state = VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED;
+            else if (inPlaceSubmission_ == SubmissionState::Indeterminate)
+                state = VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+        } else if (status_ == Status::Committed) {
+            state = VERNON_BOUNDARY_MUTATION_COMMITTED;
+        } else if (status_ == Status::Poisoned) {
+            state = VERNON_BOUNDARY_MUTATION_INDETERMINATE;
+        }
+        outcome.set(entry.slot, state);
+    }
+    return outcome;
 }
 
 void PublicationTransaction::releaseDeviceImages() {

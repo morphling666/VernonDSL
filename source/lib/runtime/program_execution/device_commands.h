@@ -4,6 +4,7 @@
 #include "VernonRuntime.h"
 #include "execution_control_plane.h"
 #include "execution_graph/execution_command_model.h"
+#include "invocation_outcome.h"
 #include "runtime/resolved_stage_types.h"
 
 #include <cstddef>
@@ -74,7 +75,8 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
                                        const execution::detail::RhiCommandExecutionPlan &plan,
                                        ExecutionControlPlaneUsage *telemetry = nullptr,
-                                       execution::detail::RhiCommandPlanSink *sink = nullptr, bool flush = false);
+                                       execution::detail::RhiCommandPlanSink *sink = nullptr, bool flush = false,
+                                       SubmissionState *submission = nullptr);
 VernonStatus buildPipelineCommandPlan(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &copiesBefore,
                                       const std::vector<DeviceBufferUpload> &uploadsBefore,
                                       VernonStageExecutable &pipeline,

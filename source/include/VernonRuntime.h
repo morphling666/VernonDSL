@@ -406,6 +406,39 @@ typedef struct VernonPullbackApplyOptions {
     uint32_t reserved[4];
 } VernonPullbackApplyOptions;
 
+typedef enum VernonInvocationSubmissionState {
+    VERNON_INVOCATION_NOT_SUBMITTED = 0,
+    VERNON_INVOCATION_COMPLETED = 1,
+    VERNON_INVOCATION_INDETERMINATE = 2
+} VernonInvocationSubmissionState;
+
+typedef enum VernonBoundaryMutationState {
+    VERNON_BOUNDARY_MUTATION_UNCHANGED = 0,
+    VERNON_BOUNDARY_MUTATION_COMMITTED = 1,
+    VERNON_BOUNDARY_MUTATION_IN_PLACE_COMMITTED = 2,
+    VERNON_BOUNDARY_MUTATION_INDETERMINATE = 3
+} VernonBoundaryMutationState;
+
+typedef enum VernonMutationBoundaryKind {
+    VERNON_MUTATION_PROGRAM_BOUNDARY = 0,
+    VERNON_MUTATION_RENDER_PASS_CONTROL = 1
+} VernonMutationBoundaryKind;
+
+typedef struct VernonBoundaryMutation {
+    VernonMutationBoundaryKind kind;
+    uint32_t slot;
+    VernonBoundaryMutationState state;
+} VernonBoundaryMutation;
+
+typedef struct VernonInvocationMutationOutcome {
+    uint32_t struct_size;
+    VernonInvocationSubmissionState submission;
+    VernonBoundaryMutation *mutations;
+    size_t mutation_capacity;
+    size_t mutation_count;
+    uint32_t reserved[4];
+} VernonInvocationMutationOutcome;
+
 typedef struct VernonProgramBundleLoadOptions {
     uint32_t struct_size;
     /*
@@ -471,6 +504,7 @@ VERNON_RUNTIME_CAPI VernonProgramExecutable *vernonRuntimeResolveProgram(VernonP
 VERNON_RUNTIME_CAPI void vernonRuntimeProgramExecutableDestroy(VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStringView vernonRuntimeProgramExecutableGetId(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecutable *pipeline);
+VERNON_RUNTIME_CAPI size_t vernonRuntimeProgramExecutableGetMutationCapacity(const VernonProgramExecutable *pipeline);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(
     const VernonProgramExecutable *pipeline, size_t index, VernonProgramParameterView *parameter);
 /*
@@ -552,7 +586,8 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationBindDynamicState(
     VernonProgramInvocation *invocation, uint32_t control_slot, const VernonProgramBindingToken *token,
     const VernonDynamicState *dynamic_state);
 VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
-                                                                       VernonPullback **output_pullback);
+                                                                       VernonPullback **output_pullback,
+                                                                       VernonInvocationMutationOutcome *outcome);
 /*
  * A non-null output_pullback requests retention. For a ProgramGraph it remains
  * null because the graph has no composite VJP; retrieve each differentiated
@@ -593,10 +628,12 @@ VERNON_RUNTIME_CAPI VernonStatus vernonRuntimeProgramExecutableGetAdDerivativeGr
 VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApplyWithOptions(VernonPullback *pullback,
                                                                        const VernonProgramArgument *arguments,
                                                                        size_t argument_count,
-                                                                       const VernonPullbackApplyOptions *options);
+                                                                       const VernonPullbackApplyOptions *options,
+                                                                       VernonInvocationMutationOutcome *outcome);
 VERNON_RUNTIME_CAPI VernonStatus vernonProgramPullbackApply(VernonPullback *pullback,
                                                             const VernonProgramArgument *arguments,
-                                                            size_t argument_count);
+                                                            size_t argument_count,
+                                                            VernonInvocationMutationOutcome *outcome);
 VERNON_RUNTIME_CAPI void vernonProgramPullbackDestroy(VernonPullback *pullback);
 
 #ifdef __cplusplus

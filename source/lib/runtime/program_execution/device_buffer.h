@@ -12,7 +12,6 @@ class DeviceBuffer {
 public:
     DeviceBuffer() = default;
     DeviceBuffer(VernonRuntimeContext &context, size_t size);
-    DeviceBuffer(VernonRuntimeContext &context, VernonRhiBuffer handle, size_t size);
     DeviceBuffer(DeviceBuffer &&other) noexcept;
     DeviceBuffer &operator=(DeviceBuffer &&other) noexcept;
     DeviceBuffer(const DeviceBuffer &) = delete;
@@ -38,7 +37,6 @@ private:
     VernonRuntimeContext *context_{};
     VernonRhiBuffer handle_{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     size_t size_{};
-    bool owned_{true};
 };
 
 } // namespace vernon::runtime::program_execution

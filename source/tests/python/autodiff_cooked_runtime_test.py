@@ -12,6 +12,7 @@ def main() -> None:
     import vernon_cooked_autodiff_fixture  # noqa: F401
     import vernon_dsl as vd
     from autodiff_cooked_aggregate_asset import objective
+    from vernon_dsl import _native
 
     vd.init(arch=vd.cpu)
     cooked = vd.load_program(manifest)
@@ -117,6 +118,27 @@ def main() -> None:
         np.testing.assert_array_equal(reused["value"], np.array(expected_output, dtype=np.float32))
         np.testing.assert_array_equal(reused["parameters.factor"], np.float32(0.0))
         np.testing.assert_array_equal(reused["parameters.selector"], np.float32(0.0))
+
+    failed_output = output_storage()
+    _native._testing_set_program_failure("completion")
+    try:
+        try:
+            cooked.vjp(
+                {
+                    "value": np.array([2.0, 3.0], dtype=np.float32),
+                    "parameters": parameters(1.0, 1.0),
+                    "count": np.int32(2),
+                    "output": failed_output,
+                },
+                (1, 1, 1),
+            )
+        except RuntimeError as error:
+            assert "wait failure" in str(error), error
+        else:
+            raise AssertionError("expected submitted cooked Program failure")
+    finally:
+        _native._testing_set_program_failure("")
+    np.testing.assert_array_equal(failed_output.to_numpy(), np.zeros((2,), dtype=np.float32))
 
     # factor=0 proves the untaken division branch is never evaluated.
     run_case(0.0, 1.0, [4.0, 6.0], [2.0, 4.0])

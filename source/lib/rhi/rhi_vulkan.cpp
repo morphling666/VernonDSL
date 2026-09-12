@@ -1272,6 +1272,59 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
     return VERNON_RHI_STATUS_OK;
 }
 
+VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!ranges || rangeCount == 0 || rangeCount > (std::numeric_limits<uint32_t>::max)())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto pinned =
+        findAndPinVulkanSlot(device.value().device(), device->buffers,
+                             typedHandle<vernon::rhi::BufferResourceTag>(buffer), "download_vulkan_buffer_ranges");
+    if (pinned.isErr())
+        return status(std::move(pinned).error());
+    VulkanBufferSlot *slot = pinned.value().slot;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    std::vector<VkBufferCopy> copies;
+    copies.reserve(rangeCount);
+    VkDeviceSize stagingSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferDownloadRange &range = ranges[index];
+        if (!range.destination || range.size == 0 || range.offset > slot->ownedDescriptor.size ||
+            range.size > slot->ownedDescriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        const VkDeviceSize begin = range.offset & ~VkDeviceSize{3};
+        const VkDeviceSize end = (range.offset + range.size + 3) & ~VkDeviceSize{3};
+        stagingSize = (stagingSize + 3) & ~VkDeviceSize{3};
+        if (end - begin > (std::numeric_limits<VkDeviceSize>::max)() - stagingSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        copies.push_back({begin, stagingSize, end - begin});
+        stagingSize += end - begin;
+    }
+    VkBuffer staging{};
+    VkDeviceSize stagingOffset{};
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(false, stagingSize, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    for (VkBufferCopy &copy : copies)
+        copy.dstOffset += stagingOffset;
+    VkCommandBuffer command{};
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    vernon::rhi::vulkan::driver().cmdCopyBuffer(command, slot->buffer.buffer, staging,
+                                                static_cast<uint32_t>(copies.size()), copies.data());
+    if (!device->state.submitCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VkDeviceSize begin = ranges[index].offset & ~VkDeviceSize{3};
+        const VkDeviceSize mappedOffset = copies[index].dstOffset - stagingOffset;
+        std::memcpy(ranges[index].destination, mapped + mappedOffset + ranges[index].offset - begin,
+                    static_cast<size_t>(ranges[index].size));
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
 uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupVulkanDevice(handle);
     if (!device) {
@@ -1417,13 +1470,14 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
                                   : descriptor.dimension == VERNON_RHI_IMAGE_3D
                                       ? vernon::rhi::imageMipExtent(descriptor.depth, upload.mip_level)
                                       : descriptor.depth;
-        const auto uploadSize =
-            vernon::rhi::imageRegionByteSize(descriptor.format, upload.width, upload.height, upload.depth);
+        const auto uploadSize = vernon::rhi::imageTransferRegionByteSize(descriptor.format, upload.aspect, upload.width,
+                                                                         upload.height, upload.depth);
         if (upload.struct_size < sizeof(upload) || !validMip || !validLayer || !upload.width || !upload.height ||
             !upload.depth || upload.offset_x >= mipWidth || upload.width > mipWidth - upload.offset_x ||
             upload.offset_y >= mipHeight || upload.height > mipHeight - upload.offset_y ||
             upload.offset_z >= mipDepth || upload.depth > mipDepth - upload.offset_z ||
-            !vernon::rhi::uploadLayoutMatches(descriptor.format, upload.source_format, upload.source_type) ||
+            !vernon::rhi::imageTransferAspectMatches(descriptor.format, upload.aspect, upload.source_format,
+                                                     upload.source_type) ||
             !upload.data || !uploadSize)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
         if (*uploadSize > (std::numeric_limits<size_t>::max)() - totalSize)
@@ -1436,20 +1490,45 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     uint8_t *mapped = nullptr;
     if (!device->state.acquireStaging(true, totalSize, 16, staging, stagingOffset, mapped, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    std::vector<VkBufferImageCopy> regions(uploadCount);
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(uploadCount * 2);
     size_t byteOffset = 0;
     for (size_t index = 0; index < uploadCount; ++index) {
-        std::memcpy(mapped + byteOffset, uploads[index].data, uploadSizes[index]);
-        VkBufferImageCopy &region = regions[index];
+        const VernonRhiImageUploadDescriptor &upload = uploads[index];
+        const bool packedDepthStencil =
+            upload.aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
+        const size_t pixels = static_cast<size_t>(upload.width) * upload.height * upload.depth;
+        if (packedDepthStencil) {
+            const auto *source = static_cast<const uint8_t *>(upload.data);
+            for (size_t pixel = 0; pixel < pixels; ++pixel) {
+                float depth{};
+                uint8_t stencil{};
+                vernon::rhi::loadPackedDepthStencil(source + pixel * vernon::rhi::packedDepthStencilPixelSize, depth,
+                                                    stencil);
+                std::memcpy(mapped + byteOffset + pixel * sizeof(float), &depth, sizeof(depth));
+                mapped[byteOffset + pixels * sizeof(float) + pixel] = stencil;
+            }
+        } else {
+            std::memcpy(mapped + byteOffset, upload.data, uploadSizes[index]);
+        }
+        VkBufferImageCopy region{};
         region.bufferOffset = stagingOffset + byteOffset;
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = uploads[index].mip_level;
-        region.imageSubresource.baseArrayLayer = uploads[index].array_layer;
+        region.imageSubresource.aspectMask = (upload.aspect & VERNON_RHI_IMAGE_ASPECT_COLOR) ? VK_IMAGE_ASPECT_COLOR_BIT
+                                             : (upload.aspect & VERNON_RHI_IMAGE_ASPECT_DEPTH)
+                                                 ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                 : VK_IMAGE_ASPECT_STENCIL_BIT;
+        region.imageSubresource.mipLevel = upload.mip_level;
+        region.imageSubresource.baseArrayLayer = upload.array_layer;
         region.imageSubresource.layerCount = 1;
-        region.imageOffset = {static_cast<int32_t>(uploads[index].offset_x),
-                              static_cast<int32_t>(uploads[index].offset_y),
-                              static_cast<int32_t>(uploads[index].offset_z)};
-        region.imageExtent = {uploads[index].width, uploads[index].height, uploads[index].depth};
+        region.imageOffset = {static_cast<int32_t>(upload.offset_x), static_cast<int32_t>(upload.offset_y),
+                              static_cast<int32_t>(upload.offset_z)};
+        region.imageExtent = {upload.width, upload.height, upload.depth};
+        regions.push_back(region);
+        if (packedDepthStencil) {
+            region.bufferOffset += pixels * sizeof(float);
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            regions.push_back(region);
+        }
         byteOffset += uploadSizes[index];
     }
     VkCommandBuffer command = VK_NULL_HANDLE;
@@ -1494,11 +1573,14 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
     if (!device->state.beginCommands(command, device->error))
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    const bool depthStencil = slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT;
+    const bool depthStencil = download->aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
     const size_t pixels = static_cast<size_t>(download->width) * download->height * download->depth;
     std::array<VkBufferImageCopy, 2> regions{};
     regions[0].bufferOffset = stagingOffset;
-    regions[0].imageSubresource.aspectMask = vernon::rhi::vulkan::imagePrimaryCopyAspectMask(slot->image.format);
+    regions[0].imageSubresource.aspectMask =
+        (download->aspect & VERNON_RHI_IMAGE_ASPECT_COLOR)   ? VK_IMAGE_ASPECT_COLOR_BIT
+        : (download->aspect & VERNON_RHI_IMAGE_ASPECT_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                             : VK_IMAGE_ASPECT_STENCIL_BIT;
     regions[0].imageSubresource.mipLevel = download->mip_level;
     regions[0].imageSubresource.baseArrayLayer = download->array_layer;
     regions[0].imageSubresource.layerCount = 1;
@@ -1527,6 +1609,97 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
             std::memcpy(&depth, mapped + index * sizeof(depth), sizeof(depth));
             vernon::rhi::storePackedDepthStencil(output + index * vernon::rhi::packedDepthStencilPixelSize, depth,
                                                  stencil[index]);
+        }
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
+VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
+                                   const VernonRhiImageDownload *downloads, size_t downloadCount) {
+    auto device = lookupVulkanDevice(handle);
+    if (!device)
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    if (!downloads || downloadCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto pinned =
+        findAndPinVulkanSlot(device.value().device(), device->images, typedHandle<vernon::rhi::ImageResourceTag>(image),
+                             "download_vulkan_image_batch");
+    if (pinned.isErr())
+        return status(std::move(pinned).error());
+    VulkanImageSlot *slot = pinned.value().slot;
+    std::lock_guard<std::mutex> guard(device->mutex);
+    if (!slot->image.owned)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::vector<size_t> offsets;
+    offsets.reserve(downloadCount);
+    size_t totalSize = 0;
+    for (size_t index = 0; index < downloadCount; ++index) {
+        const auto expected = imageDownloadByteSize(slot->ownedDescriptor, downloads[index].descriptor);
+        if (!downloads[index].destination || !expected || downloads[index].size != *expected ||
+            totalSize > (std::numeric_limits<size_t>::max)() - 15)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        totalSize = (totalSize + 15) & ~size_t{15};
+        offsets.push_back(totalSize);
+        if (*expected > (std::numeric_limits<size_t>::max)() - totalSize)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        totalSize += *expected;
+    }
+    VkBuffer staging = VK_NULL_HANDLE;
+    VkDeviceSize stagingOffset = 0;
+    uint8_t *mapped = nullptr;
+    if (!device->state.acquireStaging(false, totalSize, 16, staging, stagingOffset, mapped, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::vector<VkBufferImageCopy> regions;
+    regions.reserve(downloadCount * 2);
+    for (size_t index = 0; index < downloadCount; ++index) {
+        const VernonRhiImageDownloadDescriptor &download = downloads[index].descriptor;
+        VkBufferImageCopy region{};
+        region.bufferOffset = stagingOffset + offsets[index];
+        region.imageSubresource.aspectMask =
+            (download.aspect & VERNON_RHI_IMAGE_ASPECT_COLOR)   ? VK_IMAGE_ASPECT_COLOR_BIT
+            : (download.aspect & VERNON_RHI_IMAGE_ASPECT_DEPTH) ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                                                : VK_IMAGE_ASPECT_STENCIL_BIT;
+        region.imageSubresource.mipLevel = download.mip_level;
+        region.imageSubresource.baseArrayLayer = download.array_layer;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {static_cast<int32_t>(download.offset_x), static_cast<int32_t>(download.offset_y),
+                              static_cast<int32_t>(download.offset_z)};
+        region.imageExtent = {download.width, download.height, download.depth};
+        regions.push_back(region);
+        if (download.aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL)) {
+            region.bufferOffset +=
+                static_cast<size_t>(download.width) * download.height * download.depth * sizeof(float);
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+            regions.push_back(region);
+        }
+    }
+    const VkImageLayout restore = slot->image.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                      ? defaultVulkanImageLayout(slot->ownedDescriptor)
+                                      : slot->image.layout;
+    VkCommandBuffer command = VK_NULL_HANDLE;
+    if (!device->state.beginCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    transitionVulkanImage(command, *slot, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    vernon::rhi::vulkan::driver().cmdCopyImageToBuffer(command, slot->image.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                       staging, static_cast<uint32_t>(regions.size()), regions.data());
+    transitionVulkanImage(command, *slot, restore);
+    if (!device->state.submitCommands(command, device->error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    for (size_t index = 0; index < downloadCount; ++index) {
+        const VernonRhiImageDownloadDescriptor &download = downloads[index].descriptor;
+        if (download.aspect != (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL)) {
+            std::memcpy(downloads[index].destination, mapped + offsets[index], downloads[index].size);
+            continue;
+        }
+        const size_t pixels = static_cast<size_t>(download.width) * download.height * download.depth;
+        auto *output = static_cast<uint8_t *>(downloads[index].destination);
+        const uint8_t *depth = mapped + offsets[index];
+        const uint8_t *stencil = depth + pixels * sizeof(float);
+        for (size_t pixel = 0; pixel < pixels; ++pixel) {
+            float depthValue{};
+            std::memcpy(&depthValue, depth + pixel * sizeof(float), sizeof(depthValue));
+            vernon::rhi::storePackedDepthStencil(output + pixel * vernon::rhi::packedDepthStencilPixelSize, depthValue,
+                                                 stencil[pixel]);
         }
     }
     return VERNON_RHI_STATUS_OK;
@@ -2317,6 +2490,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
+        downloadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,
@@ -2325,6 +2499,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::vulkanBackendDispatch() {
         setImageSampler,
         uploadImage,
         downloadImage,
+        downloadImageBatch,
         generateImageMipmaps,
         bindImage,
         destroyImage,

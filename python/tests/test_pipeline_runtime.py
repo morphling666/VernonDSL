@@ -1200,6 +1200,24 @@ class VulkanPipelineTests(unittest.TestCase):
     def test_aggregate_attribute_renders(self) -> None:
         assert_aggregate_attribute_renders(self)
 
+    def test_submitted_pipeline_failure_poisons_attachment_until_full_replacement(self) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        render = vd.pipeline(triangle_vertex, solid_fragment)
+        positions = vd.storage.from_numpy(np.array(((-0.75, -0.75), (0.75, -0.75), (0.0, 0.75)), dtype=np.float32))
+        target = vd.Texture.zeros(shape=(16, 16))
+        _native._testing_set_program_failure("completion")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "wait failure"):
+                render(position=positions, render_pass=render_target(target))
+        finally:
+            _native._testing_set_program_failure("")
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            target.to_numpy()
+        replacement = np.zeros((16, 16, 4), dtype=np.uint8)
+        target.upload(replacement)
+        np.testing.assert_array_equal(target.to_numpy(), replacement)
+
     def test_small_multidimensional_aggregate_attribute_renders(self) -> None:
         assert_small_multidimensional_aggregate_attribute_renders(self)
 

@@ -18,6 +18,7 @@
 
 namespace {
 
+using vernon::rhi::opengl::Buffer;
 using vernon::rhi::opengl::DeviceState;
 using vernon::rhi::opengl::Enum;
 using vernon::rhi::opengl::Image;
@@ -315,7 +316,7 @@ Int samplerAddress(uint32_t value) {
 }
 
 Enum imageDataFormat(VernonRhiImageDataFormat format) {
-    constexpr Enum values[] = {0x1903, 0x8227, 0x1907, 0x80E0, 0x1908, 0x80E1, 0x1902, 0x84F9};
+    constexpr Enum values[] = {0x1903, 0x8227, 0x1907, 0x80E0, 0x1908, 0x80E1, 0x1902, 0x84F9, 0x1901};
     return static_cast<uint32_t>(format) < sizeof(values) / sizeof(values[0]) ? values[static_cast<uint32_t>(format)]
                                                                               : 0;
 }
@@ -515,6 +516,56 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
+VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    auto device = lookupDevice(handle);
+    if (device.isErr() || !ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    OpenGLDevice &state = device.value().device();
+    BufferSlot *slot = indexedSlot(state.buffers, buffer.index);
+    auto pin = pinSlot(slot, buffer);
+    if (pin.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    size_t totalSize = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferDownloadRange &range = ranges[index];
+        if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
+            return fail(state, "OpenGL RHI buffer readback range is invalid");
+        if (range.size > (std::numeric_limits<size_t>::max)() - totalSize)
+            return fail(state, "OpenGL RHI batched buffer readback size overflows");
+        totalSize += static_cast<size_t>(range.size);
+    }
+    Buffer staging;
+    if (!state.state.createBuffer(staging, totalSize, state.error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::vector<size_t> stagingOffsets;
+    stagingOffsets.reserve(rangeCount);
+    size_t stagingOffset = 0;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        stagingOffsets.push_back(stagingOffset);
+        if (!state.state.copyBuffer(slot->buffer, static_cast<size_t>(ranges[index].offset), staging, stagingOffset,
+                                    static_cast<size_t>(ranges[index].size), state.error)) {
+            state.state.destroyBuffer(staging);
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        }
+        stagingOffset += static_cast<size_t>(ranges[index].size);
+    }
+    std::vector<uint8_t> packed(totalSize);
+    if (!state.state.downloadBuffer(staging, 0, packed.data(), packed.size(), state.error)) {
+        state.state.destroyBuffer(staging);
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    state.state.destroyBuffer(staging);
+    for (size_t index = 0; index < rangeCount; ++index)
+        std::memcpy(ranges[index].destination, packed.data() + stagingOffsets[index],
+                    static_cast<size_t>(ranges[index].size));
+    return VERNON_RHI_STATUS_OK;
+}
+
 uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
 
     auto device = lookupDevice(handle);
@@ -645,15 +696,9 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     if (pin.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(state.mutex);
-    state.state.makeCurrent();
-    auto &driver = state.state.driver;
-    driver.bindTexture(slot->target, slot->image.name);
-    driver.pixelStorei(0x0CF5, 1);
     FormatInfo storageFormat;
-    if (!formatInfo(slot->descriptor.format, storageFormat)) {
-        driver.bindTexture(slot->target, 0);
+    if (!slot || !formatInfo(slot->descriptor.format, storageFormat))
         return fail(state, "OpenGL RHI image storage format is invalid");
-    }
     for (size_t index = 0; index < uploadCount; ++index) {
         const VernonRhiImageUploadDescriptor &upload = uploads[index];
         const Enum sourceFormat = imageDataFormat(upload.source_format);
@@ -672,10 +717,17 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
             upload.offset_x >= mipWidth || upload.width > mipWidth - upload.offset_x || upload.offset_y >= mipHeight ||
             upload.height > mipHeight - upload.offset_y || upload.offset_z >= mipDepth ||
             upload.depth > mipDepth - upload.offset_z ||
-            !vernon::rhi::uploadLayoutMatches(slot->descriptor.format, upload.source_format, upload.source_type)) {
-            driver.bindTexture(slot->target, 0);
+            !vernon::rhi::imageTransferAspectMatches(slot->descriptor.format, upload.aspect, upload.source_format,
+                                                     upload.source_type))
             return fail(state, "OpenGL RHI image upload descriptor is invalid");
-        }
+    }
+    state.state.makeCurrent();
+    auto &driver = state.state.driver;
+    driver.bindTexture(slot->target, slot->image.name);
+    driver.pixelStorei(0x0CF5, 1);
+    for (size_t index = 0; index < uploadCount; ++index) {
+        const VernonRhiImageUploadDescriptor &upload = uploads[index];
+        const Enum sourceFormat = imageDataFormat(upload.source_format);
         const Enum type = upload.source_type == VERNON_RHI_IMAGE_DATA_UINT8              ? 0x1401
                           : upload.source_type == VERNON_RHI_IMAGE_DATA_FLOAT16          ? 0x140B
                           : upload.source_type == VERNON_RHI_IMAGE_DATA_FLOAT32          ? 0x1406
@@ -698,10 +750,68 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
     return VERNON_RHI_STATUS_OK;
 }
 
+bool validImageDownload(const ImageSlot &slot, const VernonRhiImageDownloadDescriptor &download,
+                        const void *destination, size_t size) {
+    FormatInfo format;
+    const auto expected = imageDownloadByteSize(slot.descriptor, download);
+    return destination && expected && size == *expected && formatInfo(slot.descriptor.format, format);
+}
+
+VernonRhiStatus downloadImageLocked(OpenGLDevice &state, const ImageSlot &slot,
+                                    const VernonRhiImageDownloadDescriptor &download, void *destination) {
+    const size_t expected = *imageDownloadByteSize(slot.descriptor, download);
+    FormatInfo format;
+    formatInfo(slot.descriptor.format, format);
+    Enum externalFormat = format.external;
+    Enum allocationType = format.allocationType;
+    const bool packedDepthStencil =
+        download.aspect == (VERNON_RHI_IMAGE_ASPECT_DEPTH | VERNON_RHI_IMAGE_ASPECT_STENCIL);
+    if (slot.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT && !packedDepthStencil) {
+        externalFormat = download.aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL ? 0x1901 : 0x1902;
+        allocationType = download.aspect == VERNON_RHI_IMAGE_ASPECT_STENCIL ? 0x1401 : 0x1406;
+    }
+    if (slot.descriptor.dimension == VERNON_RHI_IMAGE_3D)
+        return state.state.downloadImage3D(slot.image, static_cast<Int>(download.mip_level),
+                                           static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
+                                           static_cast<Int>(download.offset_z), static_cast<Size>(download.width),
+                                           static_cast<Size>(download.height), static_cast<Size>(download.depth),
+                                           externalFormat, allocationType, expected / download.depth, destination,
+                                           state.error)
+                   ? VERNON_RHI_STATUS_OK
+                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    const Enum target = slot.descriptor.dimension == VERNON_RHI_IMAGE_CUBE
+                            ? vernon::rhi::opengl::kTextureCubeMapPositiveX + download.array_layer
+                            : slot.target;
+    if (!packedDepthStencil)
+        return state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level),
+                                           static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
+                                           static_cast<Size>(download.width), static_cast<Size>(download.height),
+                                           externalFormat, allocationType, destination, state.error)
+                   ? VERNON_RHI_STATUS_OK
+                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    std::vector<uint8_t> native(expected);
+    if (!state.state.downloadImage2D(slot.image, target, static_cast<Int>(download.mip_level),
+                                     static_cast<Int>(download.offset_x), static_cast<Int>(download.offset_y),
+                                     static_cast<Size>(download.width), static_cast<Size>(download.height),
+                                     format.external, format.allocationType, native.data(), state.error))
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    auto *output = static_cast<uint8_t *>(destination);
+    const size_t pixels = static_cast<size_t>(download.width) * download.height;
+    for (size_t index = 0; index < pixels; ++index) {
+        float depth{};
+        uint32_t stencilWord{};
+        std::memcpy(&depth, native.data() + index * packedDepthStencilPixelSize, sizeof(depth));
+        std::memcpy(&stencilWord, native.data() + index * packedDepthStencilPixelSize + sizeof(depth),
+                    sizeof(stencilWord));
+        storePackedDepthStencil(output + index * packedDepthStencilPixelSize, depth,
+                                static_cast<uint8_t>(stencilWord & 0xff));
+    }
+    return VERNON_RHI_STATUS_OK;
+}
+
 VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
                               const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
-
-    if (!download || download->struct_size < sizeof(*download) || !destination)
+    if (!download || download->struct_size < sizeof(*download))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     auto device = lookupDevice(handle);
     if (device.isErr())
@@ -712,46 +822,38 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
     if (pin.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> guard(state.mutex);
-    state.state.makeCurrent();
-    const auto expected = slot ? imageDownloadByteSize(slot->descriptor, *download) : std::nullopt;
-    FormatInfo format;
-    if (!slot || !expected || size != *expected || !formatInfo(slot->descriptor.format, format))
+    if (!slot || !validImageDownload(*slot, *download, destination, size))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (slot->descriptor.dimension == VERNON_RHI_IMAGE_3D)
-        return state.state.downloadImage3D(slot->image, static_cast<Int>(download->mip_level),
-                                           static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
-                                           static_cast<Int>(download->offset_z), static_cast<Size>(download->width),
-                                           static_cast<Size>(download->height), static_cast<Size>(download->depth),
-                                           format.external, format.allocationType, *expected / download->depth,
-                                           destination, state.error)
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
-    const Enum target = slot->descriptor.dimension == VERNON_RHI_IMAGE_CUBE
-                            ? vernon::rhi::opengl::kTextureCubeMapPositiveX + download->array_layer
-                            : slot->target;
-    if (slot->descriptor.format != VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
-        return state.state.downloadImage2D(slot->image, target, static_cast<Int>(download->mip_level),
-                                           static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
-                                           static_cast<Size>(download->width), static_cast<Size>(download->height),
-                                           format.external, format.allocationType, destination, state.error)
-                   ? VERNON_RHI_STATUS_OK
-                   : VERNON_RHI_STATUS_INTERNAL_ERROR;
-    std::vector<uint8_t> native(*expected);
-    if (!state.state.downloadImage2D(slot->image, target, static_cast<Int>(download->mip_level),
-                                     static_cast<Int>(download->offset_x), static_cast<Int>(download->offset_y),
-                                     static_cast<Size>(download->width), static_cast<Size>(download->height),
-                                     format.external, format.allocationType, native.data(), state.error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    auto *output = static_cast<uint8_t *>(destination);
-    const size_t pixels = static_cast<size_t>(download->width) * download->height;
-    for (size_t index = 0; index < pixels; ++index) {
-        float depth{};
-        uint32_t stencilWord{};
-        std::memcpy(&depth, native.data() + index * packedDepthStencilPixelSize, sizeof(depth));
-        std::memcpy(&stencilWord, native.data() + index * packedDepthStencilPixelSize + sizeof(depth),
-                    sizeof(stencilWord));
-        storePackedDepthStencil(output + index * packedDepthStencilPixelSize, depth,
-                                static_cast<uint8_t>(stencilWord & 0xff));
+    state.state.makeCurrent();
+    return downloadImageLocked(state, *slot, *download, destination);
+}
+
+VernonRhiStatus downloadImageBatch(VernonRhiDevice handle, VernonRhiImage image,
+                                   const VernonRhiImageDownload *downloads, size_t downloadCount) {
+    if (!downloads || downloadCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto device = lookupDevice(handle);
+    if (device.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    OpenGLDevice &state = device.value().device();
+    ImageSlot *slot = indexedSlot(state.images, image.index);
+    auto pin = pinSlot(slot, image);
+    if (pin.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(state.mutex);
+    if (!slot)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    for (size_t index = 0; index < downloadCount; ++index)
+        if (downloads[index].descriptor.struct_size < sizeof(downloads[index].descriptor) ||
+            !validImageDownload(*slot, downloads[index].descriptor, downloads[index].destination,
+                                downloads[index].size))
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    state.state.makeCurrent();
+    for (size_t index = 0; index < downloadCount; ++index) {
+        const VernonRhiStatus status =
+            downloadImageLocked(state, *slot, downloads[index].descriptor, downloads[index].destination);
+        if (status != VERNON_RHI_STATUS_OK)
+            return status;
     }
     return VERNON_RHI_STATUS_OK;
 }
@@ -1492,6 +1594,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
+        downloadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,
@@ -1500,6 +1603,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::openGLBackendDispatch() {
         setImageSampler,
         uploadImage,
         downloadImage,
+        downloadImageBatch,
         generateImageMipmaps,
         bindImage,
         destroyImage,

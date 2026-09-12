@@ -86,6 +86,7 @@ TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
     }
     VernonRhiImageUploadDescriptor upload{};
     upload.struct_size = sizeof(upload);
+    upload.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     upload.width = 4;
     upload.height = 4;
     upload.depth = 1;
@@ -96,6 +97,7 @@ TEST(RuntimeDirectX12Pipeline, GeneratesMipmapsWithEmbeddedComputeShader) {
     ASSERT_EQ(vernonRhiDeviceGenerateImageMipmaps(context.device, image), VERNON_RHI_STATUS_OK);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.mip_level = 1;
     download.width = 2;
     download.height = 2;
@@ -224,6 +226,7 @@ TEST(RuntimeDirectX12Pipeline, RendersSampledTriangleWithWarp) {
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;
@@ -303,6 +306,7 @@ TEST(RuntimeDirectX12Pipeline, SuppliesEffectiveResolutionWithWarp) {
     std::vector<uint8_t> pixels(32 * 32 * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = 32;
     download.height = 32;
     download.depth = 1;

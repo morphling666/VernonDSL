@@ -94,6 +94,16 @@ TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 4, partialDownload.data(), partialDownload.size()),
               VERNON_RHI_STATUS_OK);
     EXPECT_EQ(partialDownload, first);
+    std::array<uint8_t, 3> batchedFirst{};
+    std::array<uint8_t, 4> batchedSecond{};
+    const std::array<VernonRhiBufferDownloadRange, 2> downloads{
+        VernonRhiBufferDownloadRange{4, batchedFirst.data(), batchedFirst.size()},
+        VernonRhiBufferDownloadRange{20, batchedSecond.data(), batchedSecond.size()},
+    };
+    ASSERT_EQ(vernonRhiDeviceDownloadBufferRanges(device, buffer, downloads.data(), downloads.size()),
+              VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(batchedFirst, first);
+    EXPECT_EQ(batchedSecond, second);
 
     const std::array<uint8_t, 2> rejected{9, 9};
     const std::array<VernonRhiBufferUploadRange, 2> invalid{
@@ -105,7 +115,18 @@ TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
     ASSERT_EQ(vernonRhiDeviceDownloadBuffer(device, buffer, 0, contents.data(), contents.size()), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(contents[0], 0);
     EXPECT_EQ(contents[1], 0);
+    batchedFirst.fill(0xaa);
+    batchedSecond.fill(0xbb);
+    const std::array<VernonRhiBufferDownloadRange, 2> invalidDownloads{
+        VernonRhiBufferDownloadRange{4, batchedFirst.data(), batchedFirst.size()},
+        VernonRhiBufferDownloadRange{31, batchedSecond.data(), batchedSecond.size()},
+    };
+    EXPECT_EQ(vernonRhiDeviceDownloadBufferRanges(device, buffer, invalidDownloads.data(), invalidDownloads.size()),
+              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(batchedFirst, (std::array<uint8_t, 3>{0xaa, 0xaa, 0xaa}));
+    EXPECT_EQ(batchedSecond, (std::array<uint8_t, 4>{0xbb, 0xbb, 0xbb, 0xbb}));
     EXPECT_EQ(vernonRhiDeviceUploadBufferRanges(device, buffer, nullptr, 0), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiDeviceDownloadBufferRanges(device, buffer, nullptr, 0), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
 }

@@ -184,7 +184,7 @@ TEST(RuntimeStructuredAggregateAutodiff, ExecutesAggregateInputAndStorageObjecti
         argument(parametersGradientParameter, &parametersGradient, sizeof(parametersGradient), 0, nullptr, nullptr),
         argument(valueGradientParameter, valueGradient, sizeof(valueGradient), 0, nullptr, nullptr),
     };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments), nullptr),
               VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_FLOAT_EQ(parametersGradient.bias, 12.0f);

@@ -61,29 +61,22 @@ nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &le
 struct PythonPullback {
     PythonPullback(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
                    VernonProgramExecutable *executable, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
-                   std::vector<PythonAdMetadata> cotangents, bool hasCarrierDimensions, nb::object executableOwner,
-                   nb::dict bindings)
+                   std::vector<PythonAdMetadata> cotangents, nb::object executableOwner, nb::dict bindings)
         : owner(std::move(owner)), runtime(runtime), executable(executable), handle(handle),
           gradients(std::move(gradients)), cotangents(std::move(cotangents)),
-          hasCarrierDimensions(hasCarrierDimensions), executableOwner(std::move(executableOwner)),
-          bindings(std::move(bindings)) {}
+          executableOwner(std::move(executableOwner)), bindings(std::move(bindings)) {}
     ~PythonPullback() { vernonProgramPullbackDestroy(handle); }
 
-    nb::dict apply(const nb::object &cotangent, const nb::object &context) {
-        return applyImpl(cotangent, false, context);
-    }
-    nb::dict applyLogical(const nb::object &cotangent, const nb::object &context) {
-        return applyImpl(cotangent, true, context);
-    }
     nb::dict applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
                           const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                          const nb::object &context) {
+                          const nb::object &context, const nb::callable &admit) {
         return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, context,
-                                       nullptr);
+                                       admit, nullptr);
     }
     nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
                                      const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                                     const nb::object &context, const VernonPullbackApplyOptions *options);
+                                     const nb::object &context, const nb::callable &admit,
+                                     const VernonPullbackApplyOptions *options);
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
@@ -152,7 +145,7 @@ private:
     }
 
     nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent, const nb::object &context,
-                       const VernonPullbackApplyOptions *options = nullptr) {
+                       const nb::callable &admit, const VernonPullbackApplyOptions *options = nullptr) {
         (void)logicalCotangent;
         ProgramInvocationBuilder builder(owner, runtime, executable);
         nb::dict result;
@@ -431,6 +424,79 @@ private:
                 throw std::invalid_argument("pullback requires one cotangent per canonical boundary");
             supplied[nb::str(cotangentBoundaries.front().name.c_str())] = cotangent;
         }
+        nb::list deviceAccessRequests;
+        const auto appendDeviceAccess = [&](uint32_t slot, nb::object resource, const char *access) {
+            if (nb::hasattr(resource, "_resident_buffer"))
+                deviceAccessRequests.append(nb::make_tuple(slot, std::move(resource), access));
+        };
+        for (const ProgramParameterMetadata &parameter : cotangentBoundaries) {
+            nb::str root(parameter.name.c_str());
+            if (!supplied.contains(root))
+                throw std::invalid_argument("missing canonical cotangent boundary '" + parameter.name + "'");
+            nb::object source = nb::borrow<nb::object>(supplied[root]);
+            if (nb::isinstance<nb::dict>(source)) {
+                nb::dict leaves = nb::cast<nb::dict>(source);
+                for (size_t leafIndex = 0; leafIndex < parameter.elementLeafPaths.size(); ++leafIndex) {
+                    nb::str path(leafPath(parameter, leafIndex).c_str());
+                    if (leaves.contains(path))
+                        appendDeviceAccess(parameter.slot, nb::borrow<nb::object>(leaves[path]), "read");
+                }
+                continue;
+            }
+            bool projected = false;
+            for (size_t leafIndex = 0; leafIndex < parameter.elementLeafPaths.size(); ++leafIndex) {
+                const std::string path = leafPath(parameter, leafIndex);
+                const auto found =
+                    std::find_if(cotangents.begin(), cotangents.end(),
+                                 [&](const PythonAdMetadata &candidate) { return candidate.path == path; });
+                if (found == cotangents.end())
+                    continue;
+                nb::object binding = derivativeBinding(*found);
+                if (nb::hasattr(source, "_resident_buffer") && !binding.is_none() &&
+                    nb::hasattr(binding, "_gradient_device_view")) {
+                    appendDeviceAccess(parameter.slot,
+                                       binding.attr("_gradient_device_view")(path, source, found->shape), "read");
+                    projected = true;
+                }
+            }
+            if (!projected)
+                appendDeviceAccess(parameter.slot, std::move(source), "read");
+        }
+        const auto gradientBoundaries = boundaryMetadata(VERNON_PROGRAM_BOUNDARY_GRADIENT);
+        for (const PythonAdMetadata &metadata : gradients) {
+            nb::str path(metadata.path.c_str());
+            if (!result.contains(path))
+                throw std::runtime_error("missing canonical gradient publication owner");
+            nb::object source = nb::borrow<nb::object>(result[path]);
+            nb::object binding = derivativeBinding(metadata);
+            if (nb::hasattr(source, "_resident_buffer") && !binding.is_none() &&
+                nb::hasattr(binding, "_gradient_device_view"))
+                source = binding.attr("_gradient_device_view")(metadata.path, source, metadata.shape);
+            const auto boundary = std::find_if(
+                gradientBoundaries.begin(), gradientBoundaries.end(), [&](const ProgramParameterMetadata &candidate) {
+                    const std::string prefix = candidate.name + ".";
+                    return metadata.path == candidate.name || (metadata.path.size() > prefix.size() &&
+                                                               metadata.path.compare(0, prefix.size(), prefix) == 0);
+                });
+            if (boundary == gradientBoundaries.end())
+                throw std::runtime_error("gradient projection has no canonical boundary slot");
+            appendDeviceAccess(boundary->slot, std::move(source), "write");
+        }
+        nb::object deviceAccessLease = nb::none();
+        if (deviceAccessRequests.size())
+            deviceAccessLease = admit(deviceAccessRequests);
+        struct DeviceAccessLeaseGuard {
+            nb::object &lease;
+            ~DeviceAccessLeaseGuard() {
+                if (lease.is_none())
+                    return;
+                try {
+                    lease.attr("release")();
+                } catch (...) {
+                    PyErr_Clear();
+                }
+            }
+        } deviceAccessLeaseGuard{deviceAccessLease};
         for (const ProgramParameterMetadata &parameter : cotangentBoundaries) {
             nb::str path(parameter.name.c_str());
             if (!supplied.contains(path))
@@ -440,8 +506,7 @@ private:
                 source = packBoundary(parameter, nb::cast<nb::dict>(source), false);
             addDerivativeBoundary(parameter, source, VERNON_ACCESS_READ, VERNON_AD_DERIVATIVE_COTANGENT);
         }
-        std::vector<nb::object> devicePublishedGradients;
-        for (const ProgramParameterMetadata &parameter : boundaryMetadata(VERNON_PROGRAM_BOUNDARY_GRADIENT)) {
+        for (const ProgramParameterMetadata &parameter : gradientBoundaries) {
             const std::string leaf = firstGroupLeaf(VERNON_AD_DERIVATIVE_GRADIENT, parameter.name);
             nb::str path(leaf.c_str());
             if (!result.contains(path))
@@ -449,34 +514,61 @@ private:
             nb::object source = nb::borrow<nb::object>(result[path]);
             if (parameter.elementLeaves.size() > 1 && !nb::hasattr(source, "_native_host_array"))
                 source = packBoundary(parameter, result, true);
-            if (nb::hasattr(source, "_resident_buffer")) {
-                devicePublishedGradients.push_back(nb::borrow<nb::object>(result[path]));
-            }
             addDerivativeBoundary(parameter, source, VERNON_ACCESS_WRITE, VERNON_AD_DERIVATIVE_GRADIENT);
         }
         std::vector<VernonProgramArgument> arguments;
         builder.collectArguments(arguments);
-        const VernonStatus status =
-            options ? vernonProgramPullbackApplyWithOptions(handle, arguments.data(), arguments.size(), options)
-                    : vernonProgramPullbackApply(handle, arguments.data(), arguments.size());
+        const VernonPullbackApplyOptions defaultOptions{sizeof(VernonPullbackApplyOptions),
+                                                        VERNON_PULLBACK_APPLY_OPTIONS_VERSION,
+                                                        std::numeric_limits<uint64_t>::max(),
+                                                        {}};
+        PythonInvocationOutcome outcome;
+        outcome.mutations.resize(vernonRuntimeProgramExecutableGetParameterCount(executable));
+        VernonInvocationMutationOutcome nativeOutcome{sizeof(VernonInvocationMutationOutcome),
+                                                      VERNON_INVOCATION_NOT_SUBMITTED,
+                                                      outcome.mutations.data(),
+                                                      outcome.mutations.size(),
+                                                      0,
+                                                      {}};
+        const VernonStatus status = vernonProgramPullbackApplyWithOptions(
+            handle, arguments.data(), arguments.size(), options ? options : &defaultOptions, &nativeOutcome);
+        outcome.status = status;
+        outcome.submission = nativeOutcome.submission;
+        outcome.mutations.resize(nativeOutcome.mutation_count);
         if (status != VERNON_STATUS_OK)
+            outcome.error = nativeStringView(vernonRuntimeGetLastError(runtime));
+        if (status != VERNON_STATUS_OK) {
+            if (!deviceAccessLease.is_none()) {
+                deviceAccessLease.attr("resolve")(nb::cast(outcome));
+                deviceAccessLease.attr("release")();
+            }
             throw std::runtime_error("pullback application failed: " +
                                      nativeStringView(vernonRuntimeGetLastError(runtime)));
+        }
         nb::object numpy = nb::module_::import_("numpy");
-        for (nb::object &gradient : devicePublishedGradients)
-            if (nb::hasattr(gradient, "_mark_device_dirty"))
-                gradient.attr("_mark_device_dirty")();
-        for (PackedPublication &publication : packedPublications) {
-            nb::object packedBytes = publication.bytes.attr("reshape")(-1, publication.elementByteSize);
-            for (auto &[destination, offset, bytes] : publication.destinations) {
-                nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
-                    nb::slice(nb::none(), nb::none(), nb::none()), nb::slice(offset, offset + bytes, size_t{1})));
-                nb::object typed = region.attr("copy")()
-                                       .attr("reshape")(-1)
-                                       .attr("view")(destination.attr("dtype"))
-                                       .attr("reshape")(destination.attr("shape"));
-                numpy.attr("add")(destination, typed, nb::arg("out") = destination);
+        try {
+            for (PackedPublication &publication : packedPublications) {
+                nb::object packedBytes = publication.bytes.attr("reshape")(-1, publication.elementByteSize);
+                for (auto &[destination, offset, bytes] : publication.destinations) {
+                    nb::object region = packedBytes.attr("__getitem__")(nb::make_tuple(
+                        nb::slice(nb::none(), nb::none(), nb::none()), nb::slice(offset, offset + bytes, size_t{1})));
+                    nb::object typed = region.attr("copy")()
+                                           .attr("reshape")(-1)
+                                           .attr("view")(destination.attr("dtype"))
+                                           .attr("reshape")(destination.attr("shape"));
+                    numpy.attr("add")(destination, typed, nb::arg("out") = destination);
+                }
             }
+            if (!deviceAccessLease.is_none()) {
+                deviceAccessLease.attr("resolve")(nb::cast(outcome));
+                deviceAccessLease.attr("release")();
+            }
+        } catch (...) {
+            if (!deviceAccessLease.is_none()) {
+                deviceAccessLease.attr("resolve")(nb::cast(outcome));
+                deviceAccessLease.attr("release")();
+            }
+            throw;
         }
         return result;
     }
@@ -487,7 +579,6 @@ private:
     VernonPullback *handle{};
     std::vector<PythonAdMetadata> gradients;
     std::vector<PythonAdMetadata> cotangents;
-    bool hasCarrierDimensions{};
     nb::object executableOwner;
     nb::dict bindings;
 };
@@ -551,20 +642,10 @@ struct PythonProgramExecutable {
         return result;
     }
 
-    void programForwardBound(ProgramInvocationBuilder &builder) {
-        if (builder.executable != executable)
-            throw std::invalid_argument("Program invocation builder belongs to another executable");
-        VernonPullback *pullback = nullptr;
-        const VernonStatus status = builder.forwardProgram(&pullback);
-        if (pullback)
-            vernonProgramPullbackDestroy(pullback);
-        if (status != VERNON_STATUS_OK)
-            throw std::runtime_error("Program forward failed: " + nativeStringView(vernonRuntimeGetLastError(runtime)));
-    }
-
-    nb::tuple programVjpBound(ProgramInvocationBuilder &builder, const nb::dict &programBindings,
+    nb::tuple programVjpBound(PythonProgramInvocationAdapter &invocation, const nb::dict &programBindings,
                               nb::object executableOwner, const nb::object &checkpointMemoryBudget,
                               const std::string &checkpointPolicy) {
+        ProgramInvocationBuilder &builder = invocation.builderView();
         if (!vernonRuntimeProgramExecutableHasProgramAutodiff(executable))
             throw std::runtime_error("executable has no Program autodiff signature");
         if (checkpointMemoryBudget.is_none())
@@ -665,17 +746,6 @@ struct PythonProgramExecutable {
         nb::dict outputs;
         if (builder.executable != executable)
             throw std::invalid_argument("Program invocation builder belongs to another executable");
-        VernonPullback *pullback = nullptr;
-        const VernonStatus status = builder.forwardProgram(&pullback);
-        if (status != VERNON_STATUS_OK) {
-            const std::string error = nativeStringView(vernonRuntimeGetLastError(runtime));
-            if (status == VERNON_STATUS_INVALID_ARGUMENT || error.find("memory budget") != std::string::npos)
-                throw std::invalid_argument(error);
-            throw std::runtime_error("Program autodiff forward failed: " + error);
-        }
-        std::unique_ptr<VernonPullback, decltype(&vernonProgramPullbackDestroy)> pullbackOwner(
-            pullback, &vernonProgramPullbackDestroy);
-
         std::vector<PythonAdMetadata> cotangents =
             reflectedDerivativeLeaves(VERNON_PROGRAM_BOUNDARY_COTANGENT, VERNON_AD_DERIVATIVE_COTANGENT);
         const auto instantiateBoundMetadata = [&](PythonAdMetadata &leaf) {
@@ -699,20 +769,15 @@ struct PythonProgramExecutable {
                 leaf.binding.resize(separator);
             instantiateBoundMetadata(leaf);
         }
-        return nb::make_tuple(outputs,
+        NativeProgramForwardResult forward = invocation.executeForward(true);
+        if (!forward.outcome.ok())
+            return nb::make_tuple(std::move(forward.outcome), outputs, nb::none());
+        std::unique_ptr<VernonPullback, decltype(&vernonProgramPullbackDestroy)> pullbackOwner(
+            std::exchange(forward.pullback, nullptr), &vernonProgramPullbackDestroy);
+        return nb::make_tuple(std::move(forward.outcome), outputs,
                               std::make_unique<PythonPullback>(owner, runtime, executable, pullbackOwner.release(),
-                                                               std::move(gradients), std::move(cotangents), false,
+                                                               std::move(gradients), std::move(cotangents),
                                                                std::move(executableOwner), nb::dict(programBindings)));
-    }
-
-    nb::list writeFootprints() const {
-        nb::list result;
-        return result;
-    }
-
-    nb::list readFootprints() const {
-        nb::list result;
-        return result;
     }
 
     nb::list derivativeGroups() const {

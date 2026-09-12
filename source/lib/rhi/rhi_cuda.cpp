@@ -394,6 +394,31 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
     return statusOf(downloadBufferResult(handle, buffer, offset, destination, size));
 }
 
+VernonRhiStatus downloadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
+                                     const VernonRhiBufferDownloadRange *ranges, size_t rangeCount) {
+    if (!ranges || rangeCount == 0)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto anchored = lookupCudaDevice(handle);
+    if (anchored.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    CudaDevice &device = anchored.value().device();
+    auto pinned = pinBuffer(device, {buffer.index, buffer.generation});
+    if (pinned.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    CudaBufferSlot &slot = *pinned.value().slot;
+    for (size_t index = 0; index < rangeCount; ++index) {
+        const VernonRhiBufferDownloadRange &range = ranges[index];
+        if (!range.destination || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
+            range.offset > slot.descriptor.size || range.size > slot.descriptor.size - range.offset)
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    }
+    const auto status = device.state.downloadRanges(slot.pointer, ranges, rangeCount);
+    return status == vernon::rhi::cuda::kSuccess
+               ? VERNON_RHI_STATUS_OK
+               : statusOf(Result<void, RhiError>{err(backendFailure(device, status, "batched cuMemcpyDtoHAsync"))});
+}
+
 uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto anchored = lookupCudaDevice(handle);
     if (anchored.isErr())
@@ -559,10 +584,12 @@ const vernon::rhi::BackendDispatch &vernon::rhi::cudaBackendDispatch() {
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
+        downloadBufferRanges,
         downloadBuffer,
         destroyBuffer,
         isBufferValid,
         getBufferNativeHandle,
+        nullptr,
         nullptr,
         nullptr,
         nullptr,

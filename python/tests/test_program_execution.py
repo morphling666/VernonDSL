@@ -619,6 +619,43 @@ class ProgramExecutionTests(unittest.TestCase):
 
 @expand_backend_matrix_tests
 class ProgramGpuExecutionTests(unittest.TestCase):
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
+    def test_failed_staged_execution_preserves_untouched_destination(self, backend: BackendRow) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+
+        _native._testing_set_program_failure("completion")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "wait failure"):
+                program_increment(output, source, grid=(1, 1, 1))
+        finally:
+            _native._testing_set_program_failure("")
+        np.testing.assert_array_equal(output.to_numpy(), np.array([0.0], dtype=np.float32))
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
+    def test_failed_in_place_execution_poisons_only_mutated_texture(self, backend: BackendRow) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        image = vd.Texture.from_numpy(
+            np.zeros((2, 2, 2, 4), dtype=np.float32),
+            dimension="3d",
+            format=vd.rgba32_float,
+            usage=("storage", "transfer_source", "transfer_destination"),
+        )
+        marker = vd.storage.from_numpy(np.array([7.0], dtype=np.float32))
+        _native._testing_set_program_failure("completion")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "wait failure"):
+                TextureRoundTrip()(image, marker)
+        finally:
+            _native._testing_set_program_failure("")
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            image.to_numpy()
+        image.upload(np.zeros((2, 2, 2, 4), dtype=np.float32))
+        np.testing.assert_array_equal(image.to_numpy(), np.zeros((2, 2, 2, 4), dtype=np.float32))
+
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_texture=True))
     def test_gpu_module_binds_texture_as_forward_resource(self, backend: BackendRow) -> None:
         image = vd.Texture.from_numpy(
@@ -671,6 +708,40 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         self.assertEqual(dirty_telemetry["upload_ranges"] - changed_telemetry["upload_ranges"], 1)
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_failed_vjp_forward_preserves_staged_destination(self, backend: BackendRow) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        transformed = vd.ad.vjp(program_square, wrt=("source",), outputs=("output",))
+        _native._testing_set_program_failure("completion")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "wait failure"):
+                transformed(source, output, grid=(1, 1, 1))
+        finally:
+            _native._testing_set_program_failure("")
+        np.testing.assert_array_equal(output.to_numpy(), np.zeros((1,), dtype=np.float32))
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_failed_pullback_keeps_inputs_readable_and_can_retry(self, backend: BackendRow) -> None:
+        from vernon_dsl import _native  # pyright: ignore[reportAttributeAccessIssue]
+
+        source = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        _, pullback = vd.ad.vjp(program_square, wrt=("source",), outputs=("output",))(source, output, grid=(1, 1, 1))
+        _native._testing_set_program_failure("completion")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "wait failure"):
+                pullback(None)
+        finally:
+            _native._testing_set_program_failure("")
+        np.testing.assert_array_equal(source.to_numpy(), np.array([3.0], dtype=np.float32))
+        np.testing.assert_array_equal(
+            pullback(None)["source"].to_numpy(),
+            np.array([6.0], dtype=np.float32),
+        )
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
     def test_gpu_module_vjp_accumulates_branch_fan_in(self, backend: BackendRow) -> None:
         outputs, pullback = vd.ad.vjp(
             FanOut(),
@@ -687,6 +758,21 @@ class ProgramGpuExecutionTests(unittest.TestCase):
             }
         )["source"]
         np.testing.assert_array_equal(gradient.to_numpy(), np.array([28.0], dtype=np.float32))
+
+    @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
+    def test_gpu_pullback_releases_inputs_owned_by_native_snapshots(self, backend: BackendRow) -> None:
+        unrelated = vd.storage.from_numpy(np.array([3.0], dtype=np.float32))
+        source = vd.storage.from_numpy(np.array([2.0], dtype=np.float32))
+        _, pullback = vd.ad.vjp(
+            UnrelatedAndSquare(),
+            wrt=("source",),
+            outputs=("square",),
+        )(unrelated, source)
+
+        unrelated.copy_from_numpy(np.array([11.0], dtype=np.float32))
+        source.copy_from_numpy(np.array([13.0], dtype=np.float32))
+        gradient = pullback({"square": np.ones((1,), dtype=np.float32)})["source"]
+        np.testing.assert_array_equal(gradient.to_numpy(), np.array([4.0], dtype=np.float32))
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True, program_vjp=True))
     def test_gpu_module_vjp_preserves_structured_storage_gradients(self, backend: BackendRow) -> None:

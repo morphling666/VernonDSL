@@ -69,6 +69,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool uploadBufferRanges(const Buffer &buffer, const VernonRhiBufferUploadRange *ranges, size_t rangeCount,
                             std::string &error);
     bool downloadBuffer(const Buffer &buffer, uint64_t offset, void *destination, uint64_t size, std::string &error);
+    bool downloadBufferRanges(const Buffer &buffer, const VernonRhiBufferDownloadRange *ranges, size_t rangeCount,
+                              std::string &error);
 
     bool createImage(Image &image, const VernonRhiImageDescriptor &descriptor, std::string &error);
     void destroyImage(Image &image);
@@ -77,6 +79,8 @@ struct VERNON_RHI_CAPI DeviceState {
     bool downloadImage(const Image &image, const VernonRhiImageDescriptor &descriptor,
                        const VernonRhiImageDownloadDescriptor &download, void *destination, size_t size,
                        std::string &error);
+    bool downloadImageBatch(const Image &image, const VernonRhiImageDescriptor &descriptor,
+                            const VernonRhiImageDownload *downloads, size_t downloadCount, std::string &error);
     bool generateImageMipmaps(const Image &image, uint32_t mipLevels, std::string &error);
     bool createImageView(ImageView &view, const Image &image, const VernonRhiImageViewDescriptor &descriptor,
                          std::string &error);

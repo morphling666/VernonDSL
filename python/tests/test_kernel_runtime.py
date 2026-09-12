@@ -1072,7 +1072,8 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             access="read",
             layout_units="bytes",
         )
-        tensor_output = vd.interop.RawBuffer.from_buffer(tensor_output_bytes, alignment=4).typed_view(
+        tensor_output_buffer = vd.interop.RawBuffer.from_buffer(tensor_output_bytes, alignment=4)
+        tensor_output = tensor_output_buffer.typed_view(
             dtype=tensor_type,
             shape=(2,),
             byte_strides=(8,),
@@ -1080,9 +1081,15 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             layout_units="bytes",
         )
         copy_value_tensor_view(tensor_output, tensor_source, grid=(1, 1, 1))
-        tensor_output.owner.synchronize()
+        tensor_output_read = tensor_output_buffer.typed_view(
+            dtype=tensor_type,
+            shape=(2,),
+            byte_strides=(8,),
+            access="read",
+            layout_units="bytes",
+        )
         np.testing.assert_array_equal(
-            np.frombuffer(tensor_output_bytes, dtype=np.float32).reshape(2, 2),
+            tensor_output_read.to_numpy(),
             np.asarray(tensor_values),
         )
 

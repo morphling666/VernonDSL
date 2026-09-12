@@ -39,6 +39,8 @@ struct BackendDispatch {
     VernonRhiStatus (*createBuffer)(VernonRhiDevice, const VernonRhiBufferDescriptor *, VernonRhiBuffer *);
     VernonRhiStatus (*uploadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, const void *, uint64_t);
     VernonRhiStatus (*uploadBufferRanges)(VernonRhiDevice, VernonRhiBuffer, const VernonRhiBufferUploadRange *, size_t);
+    VernonRhiStatus (*downloadBufferRanges)(VernonRhiDevice, VernonRhiBuffer, const VernonRhiBufferDownloadRange *,
+                                            size_t);
     VernonRhiStatus (*downloadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, void *, uint64_t);
     VernonRhiStatus (*destroyBuffer)(VernonRhiDevice, VernonRhiBuffer);
     uint32_t (*isBufferValid)(VernonRhiDevice, VernonRhiBuffer);
@@ -49,6 +51,7 @@ struct BackendDispatch {
     VernonRhiStatus (*uploadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageUploadDescriptor *, size_t);
     VernonRhiStatus (*downloadImage)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageDownloadDescriptor *, void *,
                                      size_t);
+    VernonRhiStatus (*downloadImageBatch)(VernonRhiDevice, VernonRhiImage, const VernonRhiImageDownload *, size_t);
     VernonRhiStatus (*generateImageMipmaps)(VernonRhiDevice, VernonRhiImage);
     VernonRhiStatus (*bindImage)(VernonRhiDevice, VernonRhiImage, uint32_t);
     VernonRhiStatus (*destroyImage)(VernonRhiDevice, VernonRhiImage);

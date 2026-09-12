@@ -14,7 +14,9 @@ VernonStatus fail(VernonRuntimeContext &context, std::string message,
 }
 
 VernonStatus executeCopies(VernonRuntimeContext &context, const std::vector<DeviceBufferCopy> &buffers,
-                           const std::vector<DeviceImageCopy> &images, std::string &error) {
+                           const std::vector<DeviceImageCopy> &images, std::string &error,
+                           SubmissionState &submission) {
+    submission = SubmissionState::NotSubmitted;
     if (buffers.empty() && images.empty())
         return VERNON_STATUS_OK;
     execution::detail::RhiCommandExecutionPlan plan;
@@ -23,14 +25,15 @@ VernonStatus executeCopies(VernonRuntimeContext &context, const std::vector<Devi
         return status;
     if (!execution::detail::validateRhiCommandExecutionPlan(plan, error))
         return fail(context, error, VERNON_STATUS_INVALID_ARGUMENT);
-    return executeCommandPlanAndWait(context, plan);
+    return executeCommandPlanAndWait(context, plan, nullptr, nullptr, false, &submission);
 }
 
 } // namespace
 
 VernonStatus executePublicationInitialization(VernonRuntimeContext &context, const PublicationTransaction &transaction,
                                               std::string &error) {
-    return executeCopies(context, {}, transaction.initializationImageCopies(), error);
+    SubmissionState submission;
+    return executeCopies(context, {}, transaction.initializationImageCopies(), error, submission);
 }
 
 VernonStatus executePublicationCommit(VernonRuntimeContext &context, PublicationTransaction &transaction,
@@ -44,9 +47,14 @@ VernonStatus executePublicationCommit(VernonRuntimeContext &context, Publication
         transaction.rollback();
         return fail(context, "publication submission failed before destination mutation");
     }
-    status = executeCopies(context, buffers, images, error);
+    SubmissionState submission;
+    status = executeCopies(context, buffers, images, error, submission);
+    transaction.noteSubmission(submission);
     if (status != VERNON_STATUS_OK) {
-        transaction.poison();
+        if (submission == SubmissionState::Indeterminate)
+            transaction.poison();
+        else
+            transaction.rollback();
         if (error.empty())
             error = invocationDiagnostic(context);
         return status;

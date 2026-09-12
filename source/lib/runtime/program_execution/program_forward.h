@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_PROGRAM_FORWARD_H
 
 #include "VernonRuntime.h"
+#include "invocation_outcome.h"
 
 #include <map>
 #include <memory>
@@ -20,7 +21,7 @@ namespace vernon::runtime::program_execution {
 
 VernonStatus
 forwardProgramInvocation(VernonProgramExecutable &pipeline, const VernonProgramArgument *arguments,
-                         size_t argumentCount, VernonPullback *&pullback,
+                         size_t argumentCount, VernonPullback *&pullback, InvocationMutationOutcome &outcome,
                          const ProgramInvocationContext *programContext = nullptr,
                          std::map<VernonProgramNodeId, std::unique_ptr<ad::PullbackExecution>> *nodePullbacks = nullptr,
                          bool retainPullback = true);

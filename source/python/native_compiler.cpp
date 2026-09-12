@@ -2,8 +2,8 @@
 
 #include "VernonProgramCapabilities.h"
 #include "native_runtime.h"
-#include "runtime/dirty_index_set.h"
 #include "runtime/dirty_range_set.h"
+#include "runtime/program_execution/failure_injection.h"
 
 #include <algorithm>
 #include <string>
@@ -168,7 +168,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
         .def("upload", &RhiBuffer::upload, nb::arg("data"), nb::arg("offset") = 0)
         .def("upload_ranges", &RhiBuffer::uploadRanges, nb::arg("ranges"))
-        .def("download", &RhiBuffer::download);
+        .def("download", &RhiBuffer::download)
+        .def("download_ranges", &RhiBuffer::downloadRanges, nb::arg("ranges"));
     nb::class_<RhiImage>(module, "RhiImage")
         .def_prop_ro("width", [](const RhiImage &value) { return value.width; })
         .def_prop_ro("height", [](const RhiImage &value) { return value.height; })
@@ -176,10 +177,14 @@ void bindNativeCompiler(nb::module_ &module) {
         .def_prop_ro("mip_levels", [](const RhiImage &value) { return value.mipLevels; })
         .def("upload", &RhiImage::upload, nb::arg("data"), nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
              nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
-             nb::arg("depth") = 0)
+             nb::arg("depth") = 0, nb::arg("base_array_layer") = 0, nb::arg("array_layer_count") = 0,
+             nb::arg("aspects") = 0)
+        .def("upload_regions", &RhiImage::uploadRegions, nb::arg("regions"))
         .def("download", &RhiImage::download, nb::arg("mip_level") = 0, nb::arg("offset_x") = 0,
              nb::arg("offset_y") = 0, nb::arg("offset_z") = 0, nb::arg("width") = 0, nb::arg("height") = 0,
-             nb::arg("depth") = 0)
+             nb::arg("depth") = 0, nb::arg("base_array_layer") = 0, nb::arg("array_layer_count") = 0,
+             nb::arg("aspects") = 0)
+        .def("download_regions", &RhiImage::downloadRegions, nb::arg("regions"))
         .def("generate_mipmaps", &RhiImage::generateMipmaps)
         .def(
             "create_view",
@@ -262,18 +267,15 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("mark_all", &vernon::runtime::DirtyRangeSet::markAll)
         .def("clear", &vernon::runtime::DirtyRangeSet::clear)
         .def("__bool__", [](const vernon::runtime::DirtyRangeSet &ranges) { return !ranges.empty(); });
-    nb::class_<vernon::runtime::DirtyIndexSet>(module, "_DirtyIndexSet")
-        .def(nb::init<size_t>(), nb::arg("count"))
-        .def_prop_ro("indices", &vernon::runtime::DirtyIndexSet::indices)
-        .def("__contains__", &vernon::runtime::DirtyIndexSet::contains)
-        .def("add", &vernon::runtime::DirtyIndexSet::add)
-        .def("discard", &vernon::runtime::DirtyIndexSet::discard)
-        .def("update", &vernon::runtime::DirtyIndexSet::update)
-        .def("difference_update", &vernon::runtime::DirtyIndexSet::difference)
-        .def("mark_all", &vernon::runtime::DirtyIndexSet::markAll)
-        .def("clear", &vernon::runtime::DirtyIndexSet::clear)
-        .def("__bool__", [](const vernon::runtime::DirtyIndexSet &indices) { return !indices.empty(); });
     nb::class_<PreparedProgramArgument>(module, "_PreparedProgramArgument");
+    nb::class_<PythonInvocationOutcome>(module, "_InvocationOutcome")
+        .def_prop_ro("ok", &PythonInvocationOutcome::ok)
+        .def_prop_ro("status",
+                     [](const PythonInvocationOutcome &outcome) { return static_cast<uint32_t>(outcome.status); })
+        .def_ro("error", &PythonInvocationOutcome::error)
+        .def_prop_ro("submission",
+                     [](const PythonInvocationOutcome &outcome) { return static_cast<uint32_t>(outcome.submission); })
+        .def_prop_ro("mutations", &PythonInvocationOutcome::mutationList);
     nb::class_<ProgramInvocationBuilder>(module, "ProgramInvocationBuilder")
         .def("prepare_host_tensor", &ProgramInvocationBuilder::prepareHostTensor, nb::arg("parameter"),
              nb::arg("array"))
@@ -330,10 +332,9 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("begin_invocation", &PythonProgramInstanceAdapter::beginInvocation, nb::keep_alive<0, 1>())
         .def_prop_ro("telemetry", &PythonProgramInstanceAdapter::telemetryView);
     nb::class_<PythonPullback>(module, "Pullback")
-        .def("__call__", &PythonPullback::apply, nb::arg("cotangent"), nb::arg("context"))
-        .def("apply_logical", &PythonPullback::applyLogical, nb::arg("cotangent"), nb::arg("context"))
         .def("apply_grouped", &PythonPullback::applyGrouped, nb::arg("cotangent").none(), nb::arg("gradient_groups"),
-             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"), nb::arg("context"))
+             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"), nb::arg("context"),
+             nb::arg("admit"))
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
         .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)
@@ -361,16 +362,14 @@ void bindNativeCompiler(nb::module_ &module) {
                                                                       executable.executable);
             },
             nb::keep_alive<0, 1>())
-        .def("program_forward_bound", &PythonProgramExecutable::programForwardBound, nb::arg("builder"),
-             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "program_vjp_bound",
-            [](PythonProgramExecutable &executable, ProgramInvocationBuilder &builder, const nb::dict &bindings,
-               nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
-                return executable.programVjpBound(builder, bindings, nb::cast(&executable, nb::rv_policy::reference),
+            [](PythonProgramExecutable &executable, PythonProgramInvocationAdapter &invocation,
+               const nb::dict &bindings, nb::object checkpoint_memory_budget, const std::string &checkpoint_policy) {
+                return executable.programVjpBound(invocation, bindings, nb::cast(&executable, nb::rv_policy::reference),
                                                   checkpoint_memory_budget, checkpoint_policy);
             },
-            nb::arg("builder"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
+            nb::arg("invocation"), nb::arg("bindings"), nb::arg("checkpoint_memory_budget") = nb::none(),
             nb::arg("checkpoint_policy") = std::string())
         .def_prop_ro("derivative_groups", &PythonProgramExecutable::derivativeGroups)
         .def_prop_ro("program_ad_signature", &PythonProgramExecutable::programAdSignature)
@@ -399,4 +398,28 @@ void bindNativeCompiler(nb::module_ &module) {
     });
     module.def("runtime_available",
                [](VernonRuntimeBackend backend) { return vernonRuntimeGetCapabilities(backend).available != 0; });
+    module.def(
+        "_testing_set_program_failure",
+        [](const std::string &boundary, size_t occurrence) {
+            using namespace vernon::runtime::program_execution;
+            FailureBoundary selected = FailureBoundary::None;
+            if (boundary == "planning")
+                selected = FailureBoundary::Planning;
+            else if (boundary == "allocation")
+                selected = FailureBoundary::Allocation;
+            else if (boundary == "transfer")
+                selected = FailureBoundary::Transfer;
+            else if (boundary == "submission")
+                selected = FailureBoundary::Submission;
+            else if (boundary == "completion")
+                selected = FailureBoundary::Completion;
+            else if (boundary == "readback")
+                selected = FailureBoundary::Readback;
+            else if (boundary == "commit")
+                selected = FailureBoundary::Commit;
+            else if (!boundary.empty())
+                throw std::invalid_argument("unknown Program failure boundary");
+            setFailureInjectionForTesting(selected, occurrence);
+        },
+        nb::arg("boundary"), nb::arg("occurrence") = 1);
 }

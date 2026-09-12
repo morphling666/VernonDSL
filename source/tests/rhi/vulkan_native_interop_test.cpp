@@ -112,6 +112,7 @@ TEST(VulkanOwnedDevice, DownloadsDepthOnlyImageThroughDepthAspect) {
     float depth{};
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_DEPTH;
     download.width = download.height = download.depth = 1;
     download.destination_format = VERNON_RHI_IMAGE_DATA_DEPTH;
     download.destination_type = VERNON_RHI_IMAGE_DATA_FLOAT32;

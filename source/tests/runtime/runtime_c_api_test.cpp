@@ -5,7 +5,7 @@
 static VernonStatus registered_stub(const VernonCpuInvocation *) { return VERNON_STATUS_OK; }
 
 TEST(RuntimeCApi, PullbackOpaqueHandleRejectsInvalidCalls) {
-    EXPECT_EQ(vernonProgramPullbackApply(nullptr, nullptr, 0), VERNON_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonProgramPullbackApply(nullptr, nullptr, 0, nullptr), VERNON_STATUS_INVALID_ARGUMENT);
     vernonProgramPullbackDestroy(nullptr);
 }
 

@@ -11,6 +11,7 @@ enum class FailureBoundary {
     Allocation,
     Transfer,
     Submission,
+    Completion,
     TapeValidation,
     Readback,
     Commit,

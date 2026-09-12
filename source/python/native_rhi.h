@@ -35,6 +35,7 @@ struct RhiBuffer {
     void upload(const nb::bytes &data, size_t offset);
     void uploadRanges(const nb::list &ranges);
     nb::bytes download() const;
+    nb::list downloadRanges(const nb::list &ranges) const;
 
     std::shared_ptr<RhiHostState> host;
     VernonRhiBuffer handle{};
@@ -49,9 +50,13 @@ struct RhiImage {
     ~RhiImage();
 
     void upload(const nb::bytes &data, uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ,
-                uint32_t uploadWidth, uint32_t uploadHeight, uint32_t uploadDepth);
+                uint32_t uploadWidth, uint32_t uploadHeight, uint32_t uploadDepth, uint32_t baseArrayLayer,
+                uint32_t arrayLayerCount, uint32_t aspects);
+    void uploadRegions(const nb::list &regions);
     nb::bytes download(uint32_t mipLevel, uint32_t offsetX, uint32_t offsetY, uint32_t offsetZ, uint32_t downloadWidth,
-                       uint32_t downloadHeight, uint32_t downloadDepth) const;
+                       uint32_t downloadHeight, uint32_t downloadDepth, uint32_t baseArrayLayer,
+                       uint32_t arrayLayerCount, uint32_t aspects) const;
+    nb::list downloadRegions(const nb::list &regions) const;
     void generateMipmaps();
 
     std::shared_ptr<RhiHostState> host;
@@ -71,10 +76,23 @@ private:
         VernonRhiImageDataFormat format;
         VernonRhiImageDataType type;
     };
+    struct Region {
+        uint32_t mipLevel;
+        uint32_t offsetX;
+        uint32_t offsetY;
+        uint32_t offsetZ;
+        uint32_t width;
+        uint32_t height;
+        uint32_t depth;
+        uint32_t baseArrayLayer;
+        uint32_t arrayLayerCount;
+        uint32_t aspects;
+    };
 
     static uint32_t mipExtent(uint32_t extent, uint32_t level);
-    static Layout dataLayout(VernonTextureFormat format);
+    static Layout dataLayout(VernonTextureFormat format, uint32_t aspects);
     static size_t checkedByteSize(uint32_t width, uint32_t height, uint32_t depth, size_t pixelSize);
+    Region parseRegion(const nb::dict &region) const;
 };
 
 struct RhiImageView {

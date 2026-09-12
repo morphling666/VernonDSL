@@ -329,7 +329,7 @@ TEST(ProgramPublication, ValidatesEveryTargetBeforeCommit) {
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(invalid.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::Poisoned);
+    EXPECT_EQ(invalid.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(firstDestination, -1.0f);
     EXPECT_EQ(secondDestination, -2.0f);
 
@@ -470,7 +470,7 @@ TEST(ProgramPublication, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
     vernon::tests::destroyRhiRuntime(runtime);
 }
 
-TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
+TEST(ProgramPublication, InvalidDeviceCommitRollsBackBeforeSubmission) {
     using namespace vernon::runtime;
     using namespace vernon::runtime::program;
     float source = 1.0f;
@@ -493,7 +493,7 @@ TEST(ProgramPublication, InvalidDeviceCommitPoisonsTransaction) {
     auto context = makeRuntimeContext();
     ASSERT_NE(context, nullptr);
     EXPECT_EQ(transaction.commit(*context, invocation, error), VERNON_STATUS_INVALID_ARGUMENT);
-    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::Poisoned);
+    EXPECT_EQ(transaction.status(), program_execution::PublicationTransaction::Status::RolledBack);
     EXPECT_EQ(destination, -1.0f);
 }
 

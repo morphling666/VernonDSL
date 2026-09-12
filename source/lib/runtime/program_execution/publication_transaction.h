@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_PROGRAM_EXECUTION_PUBLICATION_TRANSACTION_H
 
 #include "device_commands.h"
+#include "invocation_outcome.h"
 #include "program_invocation_state.h"
 
 #include <variant>
@@ -34,9 +35,13 @@ public:
     VernonStatus commit(VernonRuntimeContext &context, const ProgramInvocationState &state, std::string &error);
     void rollback();
     void poison();
+    void noteSubmission(SubmissionState state);
+    void noteInPlaceSubmission(SubmissionState state);
+    InvocationMutationOutcome mutationOutcome() const;
 
     Status status() const { return status_; }
     bool empty() const { return entries_.empty() && hostRegions_.empty(); }
+    size_t mutationCount() const { return boundMutations_.size(); }
 
 private:
     struct HostCommitEntry {
@@ -75,6 +80,10 @@ private:
         void *destination{};
         std::vector<uint8_t> bytes;
     };
+    struct BoundMutation {
+        uint32_t slot{};
+        bool inPlace{};
+    };
 
     const program::ResolvedPublicationTransaction *resolve(uint32_t slot, program::PublicationCommitMode mode,
                                                            std::string &error) const;
@@ -83,9 +92,12 @@ private:
 
     const program::ResolvedPublicationPlan *plan_;
     std::vector<Entry> entries_;
+    std::vector<BoundMutation> boundMutations_;
     std::vector<HostRegion> hostRegions_;
     std::vector<PreparedHostCopy> preparedHostCopies_;
     Status status_{Status::Open};
+    SubmissionState overallSubmission_{SubmissionState::NotSubmitted};
+    SubmissionState inPlaceSubmission_{SubmissionState::NotSubmitted};
 };
 
 } // namespace vernon::runtime::program_execution

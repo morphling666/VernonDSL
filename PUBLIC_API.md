@@ -70,6 +70,22 @@ loader, binding, submit, or encode facility and no public ExecutionGraph
 authoring model. Stage objects and the Command DAG are private post-resolution
 runtime implementation.
 
+Python `vd.init(...)` returns the selected `RuntimeSession`. Repeating it with
+the same canonical `RuntimeConfiguration` returns that session idempotently;
+concurrent requests for one configuration share one construction probe;
+replacement publishes only a fully probed candidate and does not invalidate
+work owned by the retired session. `RuntimeSession` may be used as a context
+manager for context-local selection, and `vd.current_session()` reports the
+effective anchored, scoped, or process-default session. Program invocation
+captures that selection once in an immutable invocation context. Native
+executable, instance, invocation, and pullback wrappers directly share the
+selected Runtime state. Internally owned OpenGL contexts belong to the native
+RHI owner and are destroyed after the Runtime and RHI device, so validity does
+not depend on the lifetime or finalization order of Python session or host
+wrappers. Concurrent cross-session use of one Tensor, Texture, or RawBuffer
+fails before native materialization; multi-device residency coherence is not
+part of this release.
+
 `VernonProgramGraph` is the public pre-resolution composition builder. It adds
 loaded cooked Program bundles as node-scoped components, connects compatible
 symbolic graph Values and ordered Storage-version chains, and resolves to the

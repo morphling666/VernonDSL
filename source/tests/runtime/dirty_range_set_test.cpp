@@ -1,4 +1,3 @@
-#include "runtime/dirty_index_set.h"
 #include "runtime/dirty_range_set.h"
 
 #include <gtest/gtest.h>
@@ -9,23 +8,7 @@
 
 namespace {
 
-using vernon::runtime::DirtyIndexSet;
 using vernon::runtime::DirtyRangeSet;
-
-TEST(DirtyIndexSet, UpdatesAndClearsSelectedIndices) {
-    DirtyIndexSet dirty(4);
-    dirty.update({0, 2, 3});
-    dirty.difference({2});
-
-    EXPECT_EQ(dirty.indices(), (std::vector<size_t>{0, 3}));
-    EXPECT_TRUE(dirty.contains(0));
-    EXPECT_FALSE(dirty.contains(1));
-}
-
-TEST(DirtyIndexSet, RejectsIndicesOutsideResource) {
-    DirtyIndexSet dirty(2);
-    EXPECT_THROW(dirty.add(2), std::out_of_range);
-}
 
 TEST(DirtyRangeSet, CoalescesOverlappingAndAdjacentRanges) {
     DirtyRangeSet dirty(64);

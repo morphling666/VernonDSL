@@ -168,7 +168,7 @@ void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &m
     VernonProgramGraphicsControlsView controlSlots{};
     ASSERT_EQ(vernonRuntimeProgramExecutableGetGraphicsControlsByIndex(executable, 0, &controlSlots), VERNON_STATUS_OK);
     ASSERT_EQ(graphics.bind(invocation, controlSlots), VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
         << lastError(runtime.runtime);
     vernonRuntimeProgramInvocationDestroy(invocation);
     vernonRuntimeProgramInstanceDestroy(instance);
@@ -176,6 +176,7 @@ void invokeAndExpectTriangle(RhiRuntime &runtime, const std::filesystem::path &m
     std::vector<uint8_t> pixels(extent * extent * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = extent;
     download.height = extent;
     download.depth = 1;
@@ -274,13 +275,14 @@ void reuseGraphicsProgramAcrossExtentsAndDynamicStates(RhiRuntime &runtime, cons
         ASSERT_EQ(vernonRuntimeProgramInvocationBindDynamicState(invocation, slots.dynamic_state_control, &dynamicToken,
                                                                  &graphics.dynamic),
                   VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
             << lastError(runtime.runtime);
         vernonRuntimeProgramInvocationDestroy(invocation);
 
         std::vector<uint8_t> pixels(width * height * 4);
         VernonRhiImageDownloadDescriptor download{};
         download.struct_size = sizeof(download);
+        download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
         download.width = width;
         download.height = height;
         download.depth = 1;
@@ -409,7 +411,7 @@ void expectProgramGraphFusion(RhiRuntime &runtime, const std::filesystem::path &
                       invocation, &overlayGraphics, &overlayControls.renderPass, nullptr, 0, &overlayControls.draw,
                       nullptr, &overlayControls.dynamic),
                   VERNON_STATUS_OK);
-        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+        ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
             << lastError(runtime.runtime);
         vernonRuntimeProgramInvocationDestroy(invocation);
     }

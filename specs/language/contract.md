@@ -243,15 +243,17 @@ Interleaved structured storage is a core dense layout. For a record
 
 Each projection is internally injective although all three share one owner.
 Field projection from `TensorStorage[Vertex]` is the canonical form. A typed
-view over `RawBuffer` is permitted only for an exact external byte ABI.
+view over `RawBuffer` is permitted only for an exact byte ABI.
 
 ### 3.4 RawBuffer
 
-`vd.interop.RawBuffer` is a low-level host/runtime interop escape hatch for
-externally defined bytes, explicit alignment, and typed view construction. It
-is not a source-language type: the frontend parser/model must reject
-`RawBuffer` in kernel, shader, and shared-function annotations. It provides no
-implicit element type, shape, or safe aliasing guarantee.
+`vd.interop.RawBuffer` is a low-level host/runtime boundary for copying
+externally defined bytes into an owned allocation with explicit alignment and
+typed view construction. The source buffer is never a mutable alias of the
+runtime allocation; host mutation occurs only through claim-scoped
+`TensorView` operations. `RawBuffer` is not a source-language type: the
+frontend parser/model must reject it in kernel, shader, and shared-function
+annotations. It provides no implicit element type or shape.
 
 The public `Buffer` spelling is removed. A shaped kernel storage parameter uses
 `TensorView`; ownership uses `TensorStorage`; untyped host bytes use

@@ -172,7 +172,8 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
     ASSERT_EQ(vernonRuntimeProgramInvocationBindDynamicState(invocation, 0, &dynamicStateToken, &dynamicState),
               VERNON_STATUS_OK);
     VernonPullback *pullback = nullptr;
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &pullback, nullptr), VERNON_STATUS_OK)
+        << lastError(context);
     vernonRuntimeProgramInvocationDestroy(invocation);
     ASSERT_NE(pullback, nullptr);
     EXPECT_FLOAT_EQ(output, 9.0f);
@@ -191,7 +192,7 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
         tensorArgument(cotangent, seedValue),
         tensorArgument(gradient, gradientValue),
     };
-    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments)),
+    ASSERT_EQ(vernonProgramPullbackApply(pullback, derivativeArguments, std::size(derivativeArguments), nullptr),
               VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_FLOAT_EQ(gradientValue, 6.0f);
@@ -203,7 +204,8 @@ TEST(RuntimeModuleProgramCApi, ComputeModuleForward9AndVjpGradient6ThroughPublic
               VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+        << lastError(context);
     vernonRuntimeProgramInvocationDestroy(invocation);
     EXPECT_FLOAT_EQ(output, 9.0f);
 
@@ -295,7 +297,7 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
     ASSERT_EQ(vernonRuntimeProgramInvocationBindNode(invocation, &secondOutput, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
     VernonPullback *compositePullback = reinterpret_cast<VernonPullback *>(uintptr_t{1});
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &compositePullback), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, &compositePullback, nullptr), VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_EQ(compositePullback, nullptr);
     EXPECT_FLOAT_EQ(output, 81.0f);
@@ -324,7 +326,7 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
         tensorArgument(cotangent, seed),
         tensorArgument(gradient, intermediateCotangent),
     };
-    ASSERT_EQ(vernonProgramPullbackApply(secondPullback, secondDerivatives, std::size(secondDerivatives)),
+    ASSERT_EQ(vernonProgramPullbackApply(secondPullback, secondDerivatives, std::size(secondDerivatives), nullptr),
               VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_FLOAT_EQ(intermediateCotangent, 18.0f);
@@ -333,7 +335,7 @@ TEST(RuntimeModuleProgramCApi, ProgramGraphRetainsNodeLocalPullbackWithoutCompos
         tensorArgument(cotangent, intermediateCotangent),
         tensorArgument(gradient, result),
     };
-    ASSERT_EQ(vernonProgramPullbackApply(firstPullback, firstDerivatives, std::size(firstDerivatives)),
+    ASSERT_EQ(vernonProgramPullbackApply(firstPullback, firstDerivatives, std::size(firstDerivatives), nullptr),
               VERNON_STATUS_OK)
         << lastError(context);
     EXPECT_FLOAT_EQ(result, 108.0f);
@@ -399,7 +401,8 @@ TEST(RuntimeModuleProgramCApi, LoadsCanonicalBundleThroughBundleThenResolve) {
               VERNON_STATUS_OK);
     ASSERT_EQ(vernonRuntimeProgramInvocationBind(invocation, &outputToken, &outputArgument, nullptr, 0, 0),
               VERNON_STATUS_OK);
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK) << lastError(context);
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
+        << lastError(context);
     vernonRuntimeProgramInvocationDestroy(invocation);
     EXPECT_FLOAT_EQ(output, 25.0f);
 

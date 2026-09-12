@@ -4,6 +4,7 @@
 #include "backend_stage_pipeline.h"
 #include "compute_launch_planner.h"
 #include "graphics_invocation_planner.h"
+#include "program_execution/invocation_outcome.h"
 #include "program_execution/materialized_node_frame.h"
 #include "program_execution/program_invocation_state.h"
 #include "program_execution_manifest.h"
@@ -41,7 +42,8 @@ VernonStatus invokeBackendPipeline(VernonStageExecutable &pipeline, const Vernon
 VernonStatus invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
 VernonStatus executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
                                          const program::Graph &graph, program_execution::ProgramInvocationState &frame,
-                                         const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint);
+                                         const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+                                         program_execution::SubmissionState &submission);
 
 VernonStatus referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset,
                                        uint64_t size, VernonRuntimeProviderResourceReference &output);

@@ -21,6 +21,7 @@ inline void runSampledTextureRuntimeOracle(OwnedRhiRuntime &owned, VernonProgram
     VernonRhiImageUploadDescriptor upload{sizeof(VernonRhiImageUploadDescriptor),
                                           0,
                                           0,
+                                          VERNON_RHI_IMAGE_ASPECT_COLOR,
                                           0,
                                           0,
                                           0,
@@ -81,6 +82,7 @@ inline void runSampledTextureRuntimeOracle(OwnedRhiRuntime &owned, VernonProgram
     std::vector<uint8_t> pixels(extent * extent * 4);
     VernonRhiImageDownloadDescriptor download{};
     download.struct_size = sizeof(download);
+    download.aspect = VERNON_RHI_IMAGE_ASPECT_COLOR;
     download.width = extent;
     download.height = extent;
     download.depth = 1;

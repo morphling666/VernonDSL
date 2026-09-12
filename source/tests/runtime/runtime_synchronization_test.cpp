@@ -213,7 +213,7 @@ TEST(CompilerRuntimeSynchronization, ProgramGraphScopesDuplicateNodeBindings) {
                       VERNON_STATUS_OK);
         }
     }
-    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr), VERNON_STATUS_OK)
+    ASSERT_EQ(vernonRuntimeProgramInvocationForward(invocation, nullptr, nullptr), VERNON_STATUS_OK)
         << stringValue(vernonRuntimeGetLastError(runtime));
     verifySynchronizationResult(results[0]);
     verifySynchronizationResult(results[1]);

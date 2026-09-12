@@ -10,6 +10,7 @@
 #include "runtime/graphics_scope_materializer.h"
 #include "runtime/pipeline_metadata.h"
 #include "runtime/program_execution/device_commands.h"
+#include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/materialized_node_frame.h"
 #include "runtime/program_execution/program_forward.h"
 #include "runtime/program_execution/program_invocation_state.h"
@@ -298,6 +299,18 @@ size_t publicBoundaryCount(const program::Program &program) {
     return static_cast<size_t>(
         std::count_if(program.abi.boundarySlots.begin(), program.abi.boundarySlots.end(),
                       [&](const program::BoundarySlot &slot) { return publicBoundarySlot(program, slot); }));
+}
+
+size_t mutationCapacity(const VernonProgramExecutable &pipeline) {
+    if (!pipeline.executionPlan || !pipeline.executionPlan->resolvedProgram)
+        return 0;
+    const program::Program &program = pipeline.executionPlan->resolvedProgram->program;
+    std::set<uint32_t> renderPassControls;
+    for (const program::Graph &graph : program.graphs)
+        for (const program::Node &node : graph.nodes)
+            if (program::executionKind(node) == program::ExecutionKind::Graphics)
+                renderPassControls.insert(program::graphicsOperation(node).renderPassControl);
+    return pipeline.executionPlan->publications.transactions.size() + renderPassControls.size();
 }
 
 const program::BoundarySlot *publicBoundaryAt(const program::Program &program, size_t publicIndex) {
@@ -1485,6 +1498,14 @@ size_t vernonRuntimeProgramExecutableGetParameterCount(const VernonProgramExecut
     return publicBoundaryCount(*executableProgram(*pipeline));
 }
 
+size_t vernonRuntimeProgramExecutableGetMutationCapacity(const VernonProgramExecutable *pipeline) {
+    RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
+    if (!pipeline)
+        return 0;
+    auto pipelinePin = pipeline->lifecycle.pin();
+    return pipelinePin.isOk() ? mutationCapacity(*pipeline) : 0;
+}
+
 VernonStatus vernonRuntimeProgramExecutableGetParameterByIndex(const VernonProgramExecutable *pipeline, size_t index,
                                                                VernonProgramParameterView *parameter) {
     RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
@@ -1998,7 +2019,9 @@ VernonRhiStatus encodeManagedGraphicsBatch(void *opaque, VernonRhiCommandEncoder
 VernonStatus executePipelineProgramGraphImpl(
     VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution, const program::Graph &graph,
     vernon::runtime::program_execution::ProgramInvocationState &arena,
-    const vernon::runtime::program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint) {
+    const vernon::runtime::program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+    vernon::runtime::program_execution::SubmissionState &submission) {
+    submission = vernon::runtime::program_execution::SubmissionState::NotSubmitted;
     const program::ResolvedProgram &resolved = *execution.resolvedProgram;
     const program::Program &canonicalProgram = resolved.program;
     const std::vector<VernonProgramArgument> &valueArguments = arena.arguments();
@@ -2043,8 +2066,8 @@ VernonStatus executePipelineProgramGraphImpl(
                 return VERNON_STATUS_OK;
             graphicsBatch.reset();
             graphicsScopeMaterializer.reset();
-            const VernonStatus status =
-                vernon::runtime::program_execution::executeCommandPlanAndWait(context, commandPlan);
+            const VernonStatus status = vernon::runtime::program_execution::executeCommandPlanAndWait(
+                context, commandPlan, nullptr, nullptr, false, &submission);
             commandPlan = {};
             return status;
         };
@@ -2280,12 +2303,17 @@ VernonStatus executePipelineProgramGraphImpl(
     std::shared_ptr<vernon::execution::CompiledCommandGraph> compiled = commandGraph.compile(error);
     if (!compiled)
         return fail(&context, "cannot compile pipeline CommandGraph: " + error);
-    vernon::execution::ExecutionSubmission submission = compiled->submit();
-    if (submission.wait() != VERNON_RHI_STATUS_OK) {
+    vernon::execution::ExecutionSubmission executionSubmission = compiled->submit();
+    submission = vernon::runtime::program_execution::SubmissionState::Indeterminate;
+    if (executionSubmission.wait() != VERNON_RHI_STATUS_OK) {
         const std::string detail = invocationDiagnostic(context);
         return fail(&context, detail.empty() ? "pipeline CommandGraph submission failed"
                                              : "pipeline CommandGraph submission failed: " + detail);
     }
+    if (vernon::runtime::program_execution::injectFailure(
+            vernon::runtime::program_execution::FailureBoundary::Completion))
+        return fail(&context, "injected pipeline CommandGraph wait failure", VERNON_STATUS_INTERNAL_ERROR);
+    submission = vernon::runtime::program_execution::SubmissionState::Completed;
     return VERNON_STATUS_OK;
 }
 
@@ -2737,8 +2765,8 @@ VernonStatus vernonRuntimeProgramInvocationBindDynamicState(VernonProgramInvocat
     }
 }
 
-VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation,
-                                                   VernonPullback **outputPullback) {
+VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invocation, VernonPullback **outputPullback,
+                                                   VernonInvocationMutationOutcome *publicOutcome) {
     VernonProgramExecutable *pipeline = invocation && invocation->instance ? invocation->instance->pipeline : nullptr;
     try {
         RuntimeDiagnosticScope diagnostic(pipeline ? pipeline->context : nullptr);
@@ -2746,6 +2774,8 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
             *outputPullback = nullptr;
         if (!invocation || invocation->finished || !pipeline)
             return fail(pipeline ? pipeline->context : nullptr, "invalid persistent Program invocation");
+        if (!vernon::runtime::program_execution::preparePublicOutcome(publicOutcome, mutationCapacity(*pipeline)))
+            return fail(pipeline->context, "invalid Program mutation outcome storage");
         auto invocationPin = invocation->lifecycle.pin();
         if (invocationPin.isErr())
             return fail(pipeline->context, "Program invocation is closing",
@@ -2770,10 +2800,12 @@ VernonStatus vernonRuntimeProgramInvocationForward(VernonProgramInvocation *invo
         }
         const ProgramInvocationContext programContext{*invocation->controlSnapshot};
         VernonPullback *pullback = nullptr;
+        vernon::runtime::program_execution::InvocationMutationOutcome outcome;
         const VernonStatus status = vernon::runtime::program_execution::forwardProgramInvocation(
-            *pipeline, arguments.data(), arguments.size(), pullback, &programContext,
+            *pipeline, arguments.data(), arguments.size(), pullback, outcome, &programContext,
             pipeline->programGraphId && outputPullback ? &invocation->nodePullbacks : nullptr,
             outputPullback != nullptr);
+        vernon::runtime::program_execution::publishPublicOutcome(outcome, publicOutcome);
         if (status != VERNON_STATUS_OK) {
             invocation->transaction->rollback();
             invocation->controlTransaction->rollback();
@@ -2972,8 +3004,9 @@ VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *conte
 VernonStatus vernon::runtime::executePipelineProgramGraph(
     VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution, const program::Graph &graph,
     program_execution::ProgramInvocationState &arena,
-    const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint) {
-    return executePipelineProgramGraphImpl(context, execution, graph, arena, resolvePhysicalEndpoint);
+    const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+    program_execution::SubmissionState &submission) {
+    return executePipelineProgramGraphImpl(context, execution, graph, arena, resolvePhysicalEndpoint, submission);
 }
 
 VernonStageExecutable::~VernonStageExecutable() {

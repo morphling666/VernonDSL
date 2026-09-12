@@ -10,10 +10,40 @@ import numpy as np
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ..host_values import host_abi_layout, pack_host_value
+from .residency import _ResourceTransaction
 from .sampler import SamplerState
 from .session import _InvocationContext, cpu
-from .tensor import RawBuffer, TensorStorage, TensorView, _borrow_ranges_may_overlap, _checked_access
+from .tensor import RawBuffer, TensorStorage, TensorView, _checked_access
 from .texture import TextureView, _TextureResource
+
+
+def _raise_invocation_error(outcome: Any, prefix: str, context: _InvocationContext) -> None:
+    error_type = (
+        ValueError if int(outcome.status) == context.session.native.Status.INVALID_ARGUMENT.value else RuntimeError
+    )
+    raise error_type(f"{prefix}: {outcome.error}")
+
+
+def _program_tensor_layout(
+    parameter: Any, value: TensorStorage | TensorView
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    shape = tuple(value.shape)
+    byte_strides = tuple(value.layout.byte_strides)
+    rank = len(shape)
+    element_size = value.dtype.itemsize
+    if element_size != parameter.element_byte_size:
+        while rank > len(parameter.shape):
+            rank -= 1
+            if byte_strides[rank] != element_size:
+                raise ValueError(
+                    f"bound storage for Program value {parameter.name!r} does not have contiguous aggregate elements"
+                )
+            element_size *= shape[rank]
+        if element_size != parameter.element_byte_size:
+            raise ValueError(
+                f"bound storage element size for Program value {parameter.name!r} does not match its declared layout"
+            )
+    return shape[:rank], byte_strides[:rank]
 
 
 @dataclass(frozen=True)
@@ -51,7 +81,7 @@ class _PersistentBindingTable:
         transaction = _ActiveBindingTransaction(native_transaction, context)
         self._transactions.current = transaction
         try:
-            yield native_transaction.builder
+            yield native_transaction
         except BaseException:
             native_transaction.rollback()
             raise
@@ -97,11 +127,23 @@ class _PersistentBindingTable:
             raise RuntimeError("argument binding requires an active invocation transaction")
         state = transaction.context.session
         if isinstance(value, (TensorStorage, TensorView)):
+            declared_shape = tuple(parameter.shape)
+            actual_shape, actual_byte_strides = _program_tensor_layout(parameter, value)
+            if len(actual_shape) != len(declared_shape) or any(
+                declared != 0 and declared != actual
+                for declared, actual in zip(declared_shape, actual_shape, strict=True)
+            ):
+                raise ValueError(
+                    f"bound shape for Program value {parameter.slot} conflicts with the declared Program shape: "
+                    f"value {parameter.name!r} bound {list(actual_shape)}, declared {list(declared_shape)}"
+                )
             if state.arch == cpu or host_value:
+                owner = value.owner if isinstance(value, TensorView) else value
+                owner.synchronize()
                 array = value._native_host_array()
                 token = (
                     "host-resource",
-                    int(array.ctypes.data),
+                    owner._control.owner_id,
                     array.dtype.str,
                     tuple(array.shape),
                     tuple(array.strides),
@@ -115,16 +157,17 @@ class _PersistentBindingTable:
             if state.rhi_host is None:
                 raise RuntimeError("device Tensor arguments require a GPU RHI host")
             owner = value.owner if isinstance(value, TensorView) else value
-            dirty_tracker = getattr(owner, "_dirty_ranges", None)
+            dirty_tracker = getattr(owner._control.coherence, "dirty_ranges", None)
             dirty_ranges = tuple(dirty_tracker.ranges) if dirty_tracker is not None else ()
             buffer = value._resident_buffer(transaction.context)
             layout = value.layout
             token = (
                 "rhi-tensor",
-                id(buffer),
+                owner._control.owner_id,
+                state.identity,
                 parameter.access,
-                tuple(value.shape),
-                tuple(layout.byte_strides),
+                actual_shape,
+                actual_byte_strides,
                 layout.byte_offset,
             )
             return self._bind(
@@ -135,8 +178,8 @@ class _PersistentBindingTable:
                     parameter.slot,
                     buffer,
                     parameter.access,
-                    list(value.shape),
-                    list(layout.byte_strides),
+                    list(actual_shape),
+                    list(actual_byte_strides),
                     layout.byte_offset,
                 ),
                 upload_bytes=sum(end - begin for begin, end in dirty_ranges),
@@ -149,13 +192,13 @@ class _PersistentBindingTable:
             if state.rhi_host is None:
                 raise RuntimeError("Texture arguments require a GPU RHI host")
             owner = value.owner if isinstance(value, TextureView) else value
-            dirty_mips = tuple(owner._host_dirty_mips)
+            dirty_mips = owner._dirty_mips(owner._control.coherence.host_dirty_subresources)
             upload_bytes = sum(owner._mip_arrays[level].nbytes for level in dirty_mips)
             view = value._resident_view(transaction.context)
             return self._bind(
                 builder,
                 parameter,
-                ("rhi-texture", id(view)),
+                ("rhi-texture", owner._control.owner_id, state.identity, value._view_key),
                 lambda: builder.prepare_rhi_texture(parameter.slot, view),
                 upload_bytes=upload_bytes,
                 upload_ranges=len(dirty_mips),
@@ -271,7 +314,7 @@ class _PersistentBindingTable:
         self._bind(
             builder,
             parameter,
-            ("rhi-sampler", id(resident)),
+            ("rhi-sampler", sampler._address, transaction.context.identity),
             lambda: builder.prepare_rhi_sampler(parameter.slot, resident),
         )
 
@@ -293,11 +336,11 @@ class _PersistentBindingTable:
             raise RuntimeError("Program control update requires an active invocation transaction")
         transaction.native.bind_dynamic_state(slot, token, control)
 
-    def forward(self) -> None:
+    def forward(self) -> Any:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("Program forward requires an active invocation transaction")
-        transaction.native.forward()
+        return transaction.native.forward()
 
 
 def _normalize_dispatch_borrows(
@@ -317,33 +360,12 @@ def _normalize_dispatch_borrows(
 
 
 def _dispatch_borrow_owner(
-    resource: RawBuffer | TensorView | _TextureResource,
+    resource: TensorStorage | RawBuffer | TensorView | _TextureResource,
 ) -> TensorStorage | RawBuffer | _TextureResource:
     return resource.owner if isinstance(resource, (TensorView, TextureView)) else resource
 
 
-def _dispatch_borrows_overlap(
-    left: RawBuffer | TensorView | _TextureResource,
-    right: RawBuffer | TensorView | _TextureResource,
-) -> bool:
-    if isinstance(left, TensorView) and isinstance(right, TensorView):
-        return _borrow_ranges_may_overlap(left, right)
-    if isinstance(left, TextureView) and isinstance(right, TextureView) and left.owner is right.owner:
-        left_mip_end = left._base_mip_level + left._mip_level_count
-        right_mip_end = right._base_mip_level + right._mip_level_count
-        left_layer_end = left._base_array_layer + left._array_layer_count
-        right_layer_end = right._base_array_layer + right._array_layer_count
-        return (
-            left._base_mip_level < right_mip_end
-            and right._base_mip_level < left_mip_end
-            and left._base_array_layer < right_layer_end
-            and right._base_array_layer < left_layer_end
-            and not left._aspects.isdisjoint(right._aspects)
-        )
-    return True
-
-
-class _DispatchBorrowLease:
+class _DispatchBorrowLease(_ResourceTransaction):
     """An acquired resource borrow released only after dispatch completion."""
 
     def __init__(
@@ -351,74 +373,23 @@ class _DispatchBorrowLease:
         borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
         context: _InvocationContext,
     ):
-        self._owners: list[TensorStorage | RawBuffer | _TextureResource] = []
-        self._token: object | None = None
         normalized = _normalize_dispatch_borrows(borrows)
-        self._owners = sorted({_dispatch_borrow_owner(resource) for _, resource, _ in normalized}, key=id)
-        self._token = object()
-        session_identity = context.identity
-        for owner in self._owners:
-            owner._access_domain.lock.acquire()
-        try:
-            for owner in self._owners:
-                owner._access_domain.validate_session(session_identity)
-            for name, resource, access in normalized:
-                owner = _dispatch_borrow_owner(resource)
-                for _, active_resource, active_access in owner._access_domain.claims:
-                    if access == active_access == "read":
-                        continue
-                    if isinstance(active_resource, (RawBuffer, TensorView, _TextureResource)) and (
-                        _dispatch_borrows_overlap(resource, active_resource)
-                    ):
-                        raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
-            for _, resource, access in normalized:
-                owner = _dispatch_borrow_owner(resource)
-                owner._access_domain.add(self._token, resource, access, session_identity)
-        finally:
-            for owner in reversed(self._owners):
-                owner._access_domain.lock.release()
-
-    def release(self) -> None:
-        token = self._token
-        if token is None:
-            return
-        self._token = None
-        for owner in self._owners:
-            owner._access_domain.lock.acquire()
-        try:
-            for owner in self._owners:
-                owner._access_domain.release(token)
-        finally:
-            for owner in reversed(self._owners):
-                owner._access_domain.lock.release()
-
-    def release_writes(self) -> None:
-        token = self._token
-        if token is None:
-            return
-        for owner in self._owners:
-            owner._access_domain.lock.acquire()
-        try:
-            for owner in self._owners:
-                owner._access_domain.release(token, writes_only=True)
-        finally:
-            for owner in reversed(self._owners):
-                owner._access_domain.lock.release()
-
-    def __enter__(self) -> _DispatchBorrowLease:
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        self.release()
-
-    def __del__(self) -> None:
-        self.release()
+        super().__init__(
+            [
+                (name, _dispatch_borrow_owner(resource), resource._region, access)
+                for name, resource, access in normalized
+            ],
+            context,
+        )
 
 
 @contextmanager
 def _dispatch_borrow_scope(
     borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
     context: _InvocationContext,
-) -> Iterator[None]:
-    with _DispatchBorrowLease(borrows, context):
-        yield
+) -> Iterator[_DispatchBorrowLease]:
+    lease = _DispatchBorrowLease(borrows, context)
+    try:
+        yield lease
+    finally:
+        lease.release()

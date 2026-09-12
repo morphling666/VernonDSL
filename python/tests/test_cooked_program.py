@@ -12,7 +12,7 @@ from vernon_dsl._runtime.session import cpu
 class _BindingCache:
     @contextmanager
     def invocation(self, executable, context):
-        yield object()
+        yield SimpleNamespace(builder=object())
 
     def bind_argument(self, builder, executable, parameter, value) -> None:
         pass
@@ -21,17 +21,21 @@ class _BindingCache:
 class CookedProgramTests(unittest.TestCase):
     def test_fixed_grid_module_vjp_does_not_require_public_grid_values(self) -> None:
         parameters = (
-            SimpleNamespace(name="source", access=0),
-            SimpleNamespace(name="output", access=1),
+            SimpleNamespace(name="source", access=0, slot=0),
+            SimpleNamespace(name="output", access=1, slot=1),
         )
-        native_pullback = object()
+        native_pullback = SimpleNamespace()
         native = SimpleNamespace(
             parameters=parameters,
             derivative_groups=(
                 ("gradient", "source", ("source",)),
                 ("cotangent", "output", ("output",)),
             ),
-            program_vjp_bound=lambda builder, bindings: ({}, native_pullback),
+            program_vjp_bound=lambda invocation, bindings: (
+                SimpleNamespace(ok=True, mutations=(), error=""),
+                {},
+                native_pullback,
+            ),
         )
         native_module = SimpleNamespace(
             ACCESS_READ=0,

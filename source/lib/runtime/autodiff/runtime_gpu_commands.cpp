@@ -235,7 +235,7 @@ public:
     bool validationPhase() const override { return true; }
 
     void complete(bool succeeded, const execution::detail::RhiCommandDagExecutionStats &) override {
-        if (!succeeded || !injectFailure(FailureBoundary::Submission))
+        if (!succeeded || !injectFailure(FailureBoundary::Completion))
             return;
         invocationDiagnostic(context_) = "injected GPU command DAG wait failure";
         throw std::runtime_error("injected GPU command DAG wait failure");
@@ -279,7 +279,10 @@ VernonStatus encodePipelineCommand(VernonRuntimeContext &context, VernonRhiComma
 VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
                                        const execution::detail::RhiCommandExecutionPlan &plan,
                                        ExecutionControlPlaneUsage *telemetry,
-                                       execution::detail::RhiCommandPlanSink *sink, bool flush) {
+                                       execution::detail::RhiCommandPlanSink *sink, bool flush,
+                                       SubmissionState *submission) {
+    if (submission)
+        *submission = SubmissionState::NotSubmitted;
     if (sink) {
         execution::detail::RhiCommandExecutionPlan deferred = plan;
         const auto firstCommand =
@@ -293,8 +296,15 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
         if (sink->append(std::move(deferred)) != VERNON_RHI_STATUS_OK)
             return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
         sink->onCompletion(std::make_shared<WaitFailureCompletion>(context));
-        if (flush && sink->flush() != VERNON_RHI_STATUS_OK)
-            return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
+        if (flush) {
+            if (sink->flush() != VERNON_RHI_STATUS_OK) {
+                if (submission)
+                    *submission = SubmissionState::Indeterminate;
+                return fail(context, "GPU autodiff command program failed", VERNON_STATUS_INTERNAL_ERROR);
+            }
+            if (submission)
+                *submission = SubmissionState::Completed;
+        }
         return VERNON_STATUS_OK;
     }
     if (injectFailure(FailureBoundary::Submission))
@@ -312,10 +322,18 @@ VernonStatus executeCommandPlanAndWait(VernonRuntimeContext &context,
         telemetry->waits += stats.waits;
         telemetry->deviceWaitNanoseconds += stats.deviceWaitNanoseconds;
     }
-    if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Submission))
+    if (status == VERNON_RHI_STATUS_OK && injectFailure(FailureBoundary::Completion)) {
+        if (submission)
+            *submission = SubmissionState::Indeterminate;
         return fail(context, "injected GPU command DAG wait failure", VERNON_STATUS_INTERNAL_ERROR);
-    if (status == VERNON_RHI_STATUS_OK)
+    }
+    if (status == VERNON_RHI_STATUS_OK) {
+        if (submission)
+            *submission = SubmissionState::Completed;
         return VERNON_STATUS_OK;
+    }
+    if (submission && stats.submissions)
+        *submission = SubmissionState::Indeterminate;
     const std::string detail = invocationDiagnostic(context);
     return fail(context, detail.empty() ? "GPU autodiff command program failed" : detail, VERNON_STATUS_INTERNAL_ERROR);
 }
