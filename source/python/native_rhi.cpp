@@ -1,5 +1,11 @@
 #include "native_rhi.h"
 
+#include "native_lifecycle_test_hooks.h"
+
+#if defined(VERNON_HAS_GLFW_CONTEXT_OWNER)
+#include "glfw_context_owner.h"
+#endif
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -53,6 +59,21 @@ VernonRhiImageDimension rhiDimension(VernonTextureDimension dimension) {
     throw std::invalid_argument("unsupported texture dimension");
 }
 
+#if defined(VERNON_HAS_GLFW_CONTEXT_OWNER)
+class OwnedGlfwContext final : public RhiContextOwner {
+public:
+    OwnedGlfwContext(vernon::host::GlfwContextApi api, uint16_t apiMajor, uint16_t apiMinor)
+        : context(api, apiMajor, apiMinor) {}
+
+    ~OwnedGlfwContext() override { vernon::python::testing::noteOwnedContextDestroyed(); }
+
+    VernonOpenGLContextCallbacks callbacks() noexcept { return context.callbacks(); }
+
+private:
+    vernon::host::GlfwContextOwner context;
+};
+#endif
+
 } // namespace
 
 RhiHostState::RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex) : backend(backend) {
@@ -65,7 +86,9 @@ RhiHostState::RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex) : bac
         throw std::runtime_error("cannot create Vernon RHI device");
 }
 
-RhiHostState::RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCallbacks &callbacks) : backend(backend) {
+RhiHostState::RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCallbacks &callbacks,
+                           std::shared_ptr<RhiContextOwner> contextOwner)
+    : backend(backend), contextOwner(std::move(contextOwner)) {
     VernonRhiOwnedDeviceDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
     descriptor.backend = backend;
@@ -75,7 +98,10 @@ RhiHostState::RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCa
         throw std::runtime_error("cannot create external OpenGL RHI device");
 }
 
-RhiHostState::~RhiHostState() { vernonRhiDestroyDevice(device); }
+RhiHostState::~RhiHostState() {
+    vernonRhiDestroyDevice(device);
+    vernon::python::testing::noteRhiDeviceDestroyed();
+}
 
 RhiBuffer::RhiBuffer(std::shared_ptr<RhiHostState> host, size_t size) : host(std::move(host)), size(size) {
     VernonRhiBufferDescriptor descriptor{};
@@ -349,6 +375,22 @@ std::unique_ptr<RhiHost> RhiHost::createExternalOpenGL(VernonRhiBackend backend,
     callbacks.api_version_major = apiMajor;
     callbacks.api_version_minor = apiMinor;
     return std::make_unique<RhiHost>(std::make_shared<RhiHostState>(backend, callbacks));
+}
+
+std::unique_ptr<RhiHost> RhiHost::createOwnedOpenGL(VernonRhiBackend backend, uint16_t apiMajor, uint16_t apiMinor) {
+#if defined(VERNON_HAS_GLFW_CONTEXT_OWNER)
+    if (backend != VERNON_RHI_BACKEND_OPENGL && backend != VERNON_RHI_BACKEND_OPENGL_ES)
+        throw std::invalid_argument("owned OpenGL host requires an OpenGL backend");
+    const auto api = backend == VERNON_RHI_BACKEND_OPENGL_ES ? vernon::host::GlfwContextApi::OpenGLES
+                                                             : vernon::host::GlfwContextApi::OpenGL;
+    auto owner = std::make_shared<OwnedGlfwContext>(api, apiMajor, apiMinor);
+    return std::make_unique<RhiHost>(std::make_shared<RhiHostState>(backend, owner->callbacks(), owner));
+#else
+    (void)backend;
+    (void)apiMajor;
+    (void)apiMinor;
+    throw std::runtime_error("owned OpenGL context support is unavailable");
+#endif
 }
 
 std::unique_ptr<RhiBuffer> RhiHost::createBuffer(size_t size) { return std::make_unique<RhiBuffer>(state, size); }

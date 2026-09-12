@@ -180,9 +180,10 @@ def probe_runtime(row: BackendRow, requirements: BackendRequirements) -> ProbeRe
         vd.init(arch=vd.cpu)
         return ProbeResult(ProbeKind.DEVICE_OR_CONTEXT_UNAVAILABLE, str(error))
 
-    native_runtime = runtime_session._native_runtime
-    if native_runtime is None:
+    selected_session = runtime_session.current_session()
+    if selected_session is None:
         raise RuntimeError(f"{row.name} initialization succeeded without creating a runtime context")
+    native_runtime = selected_session.native_runtime
     capabilities: dict[str, Any] = dict(native_runtime.capabilities)
     if not capabilities["available"]:
         raise RuntimeError(f"{row.name} created context reported unavailable capabilities")

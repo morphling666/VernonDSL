@@ -702,7 +702,10 @@ class ModuleVjpExpression:
         self.planning_policy = planning_policy
 
     def __call__(self, *arguments: Any, **keywords: Any) -> tuple[Any, Any]:
-        return execute_module_vjp(self, arguments, keywords)
+        from ._runtime.session import _invocation_context
+
+        with _invocation_context():
+            return execute_module_vjp(self, arguments, keywords)
 
 
 def _capture_module(module: Any, parameter_types: Mapping[str, Any]) -> tuple[ProgramCapture, Any]:
@@ -1395,16 +1398,62 @@ def _resolve_module_program_controls(
 
 
 def execute_module_primal(module: Any, arguments: tuple[Any, ...], keywords: Mapping[str, Any]) -> Any:
+    from ._runtime.session import _session_state
+
     arguments, keywords = _resolve_module_program_controls(module, arguments, keywords)
     key = module._program_specialization_key(arguments, keywords, variant="primal")
-    specialization = module._program_cache.get(key)
-    if not isinstance(specialization, _PrimalSpecialization):
-        capture, outputs = _capture_module(module, _parameter_types_from_values(module, arguments, keywords))
+    runtime_state = _session_state()
+
+    def compile_primal() -> _PrimalSpecialization:
+        capture, outputs = _capture_module(
+            module,
+            _parameter_types_from_values(module, arguments, keywords),
+        )
         template = ProgramTemplate.compile(capture)
         invocation = template.bind(capture, outputs)
-        specialization = _primal_specialization(module, capture, outputs, invocation)
-        module._program_cache[key] = specialization
+        return _primal_specialization(module, capture, outputs, invocation)
+
+    specialization = module._program_cache.get_or_create(runtime_state, key, compile_primal)
     return specialization.invoke(arguments, keywords)
+
+
+def _compile_module_vjp_specialization(
+    expression: ModuleVjpExpression,
+    arguments: tuple[Any, ...],
+    keywords: Mapping[str, Any],
+) -> _VjpSpecialization:
+    module = expression.module
+    capture, outputs = _capture_module(
+        module,
+        _parameter_types_from_values(module, arguments, keywords),
+    )
+    if capture.graphics_calls:
+        raise TypeError("graphics Module programs do not support autodiff")
+    template = ProgramTemplate.compile(capture)
+    invocation = template.bind(capture, outputs)
+    selected_outputs = expression.outputs or tuple(invocation.graph.outputs)
+    unknown_outputs = tuple(path for path in selected_outputs if path not in invocation.graph.outputs)
+    if unknown_outputs:
+        raise ValueError(f"Program autodiff outputs do not identify Module output paths: {unknown_outputs}")
+    from .program_frontend import parse_program
+
+    parsed_program = parse_program(
+        invocation,
+        vjp_wrt=expression.wrt,
+        vjp_outputs=selected_outputs,
+        autodiff_planning_policy=expression.planning_policy,
+    )
+    from ._runtime.program_autodiff import compile_program_autodiff
+
+    compiled = compile_program_autodiff(parsed_program, template)
+    allocations, output_recipe = _capture_recipes(capture, outputs)
+    return _VjpSpecialization(
+        compiled,
+        invocation,
+        type(module)._module_definition.signature,
+        allocations,
+        output_recipe,
+    )
 
 
 def execute_module_vjp(
@@ -1412,6 +1461,8 @@ def execute_module_vjp(
     arguments: tuple[Any, ...],
     keywords: Mapping[str, Any],
 ) -> tuple[Any, Any]:
+    from ._runtime.session import _session_state
+
     module = expression.module
     key = module._program_specialization_key(
         arguments,
@@ -1423,40 +1474,12 @@ def execute_module_vjp(
             expression.planning_policy,
         ),
     )
-    specialization = module._program_cache.get(key)
-    if not isinstance(specialization, _VjpSpecialization):
-        capture, outputs = _capture_module(
-            module,
-            _parameter_types_from_values(module, arguments, keywords),
-        )
-        if capture.graphics_calls:
-            raise TypeError("graphics Module programs do not support autodiff")
-        template = ProgramTemplate.compile(capture)
-        invocation = template.bind(capture, outputs)
-        selected_outputs = expression.outputs or tuple(invocation.graph.outputs)
-        unknown_outputs = tuple(path for path in selected_outputs if path not in invocation.graph.outputs)
-        if unknown_outputs:
-            raise ValueError(f"Program autodiff outputs do not identify Module output paths: {unknown_outputs}")
-        from .program_frontend import parse_program
-
-        parsed_program = parse_program(
-            invocation,
-            vjp_wrt=expression.wrt,
-            vjp_outputs=selected_outputs,
-            autodiff_planning_policy=expression.planning_policy,
-        )
-        from ._runtime.program_autodiff import compile_program_autodiff
-
-        compiled = compile_program_autodiff(parsed_program, template)
-        allocations, output_recipe = _capture_recipes(capture, outputs)
-        specialization = _VjpSpecialization(
-            compiled,
-            invocation,
-            type(module)._module_definition.signature,
-            allocations,
-            output_recipe,
-        )
-        module._program_cache[key] = specialization
+    runtime_state = _session_state()
+    specialization = module._program_cache.get_or_create(
+        runtime_state,
+        key,
+        lambda: _compile_module_vjp_specialization(expression, arguments, keywords),
+    )
     budget = getattr(module, "checkpoint_memory_budget", None)
     if not isinstance(budget, int):
         budget = None

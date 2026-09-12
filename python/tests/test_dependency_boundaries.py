@@ -45,16 +45,23 @@ class DependencyBoundaryTests(unittest.TestCase):
 
     def test_runtime_resource_modules_follow_dependency_boundaries(self) -> None:
         runtime = ROOT / "_runtime"
-        common_tree = ast.parse((runtime / "resource_common.py").read_text(encoding="utf-8"))
-        common_definitions = {
-            node.name
-            for node in common_tree.body
-            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-        self.assertEqual(common_definitions, {"_session_state"})
+        session_imports = imported_modules(runtime / "session.py")
+        self.assertFalse(
+            session_imports
+            & {
+                ".binding",
+                ".cooked_program",
+                ".kernel",
+                ".pipeline",
+                ".sampler",
+                ".tensor",
+                ".texture",
+            }
+        )
 
         for leaf in ("tensor.py", "texture.py", "sampler.py"):
             with self.subTest(module=leaf):
+                self.assertIn(".session", imported_modules(runtime / leaf))
                 self.assertNotIn(".binding", imported_modules(runtime / leaf))
 
         for path in runtime.rglob("*.py"):

@@ -131,8 +131,8 @@ std::pair<std::string, std::string> buildProgramBuiltin(const std::string &opera
 std::string specializeKernelHostConstants(const std::string &moduleText, const std::string &entry,
                                           const std::vector<std::string> &names, const nb::list &values);
 
-struct Runtime;
-RhiHostState *runtimeRhiHost(const Runtime *runtime);
+struct RuntimeState;
+RhiHostState *runtimeRhiHost(const RuntimeState *runtime);
 struct CompiledProgram;
 struct PythonProgramExecutable;
 struct ProgramInvocationBuilder;
@@ -259,8 +259,9 @@ struct PreparedProgramArgument {
 };
 
 struct ProgramInvocationBuilder {
-    ProgramInvocationBuilder(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable)
-        : owner(owner), runtime(runtime), executable(executable) {}
+    ProgramInvocationBuilder(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
+                             VernonProgramExecutable *executable)
+        : owner(std::move(owner)), runtime(runtime), executable(executable) {}
     ProgramInvocationBuilder(const ProgramInvocationBuilder &) = delete;
     ProgramInvocationBuilder &operator=(const ProgramInvocationBuilder &) = delete;
 
@@ -730,7 +731,7 @@ struct ProgramInvocationBuilder {
         return status;
     }
 
-    Runtime *owner{};
+    std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
     std::vector<PreparedProgramArgument *> arguments;
@@ -817,10 +818,11 @@ struct PythonPreparedBindingLease {
 // token comparison, snapshots, telemetry, and payload leases live in the
 // runtime ProgramInstance referenced by this adapter.
 struct PythonProgramInvocationAdapter {
-    PythonProgramInvocationAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable,
+    PythonProgramInvocationAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
+                                   VernonProgramExecutable *executable,
                                    vernon::runtime::program::ProgramInstance &instance,
                                    VernonProgramInstance *nativeInstance)
-        : builder(std::make_unique<ProgramInvocationBuilder>(owner, runtime, executable)),
+        : builder(std::make_unique<ProgramInvocationBuilder>(std::move(owner), runtime, executable)),
           transaction(instance.beginInvocation()),
           nativeInvocation(vernonRuntimeProgramInstanceBeginInvocation(nativeInstance)) {
         if (!nativeInvocation)
@@ -916,8 +918,9 @@ struct PythonProgramInvocationAdapter {
 };
 
 struct PythonProgramInstanceAdapter {
-    PythonProgramInstanceAdapter(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable)
-        : owner(owner), runtime(runtime), executable(executable), nativeInstance(executable),
+    PythonProgramInstanceAdapter(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
+                                 VernonProgramExecutable *executable)
+        : owner(std::move(owner)), runtime(runtime), executable(executable), nativeInstance(executable),
           nativeInvocationInstance(vernonRuntimeProgramInstanceCreate(executable)) {
         if (!nativeInvocationInstance)
             throw std::runtime_error("failed to create native Program instance");
@@ -942,7 +945,7 @@ struct PythonProgramInstanceAdapter {
         return result;
     }
 
-    Runtime *owner{};
+    std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
     vernon::runtime::program::ProgramInstance nativeInstance;

@@ -267,6 +267,21 @@ if(TARGET VernonRuntime)
                        LABELS
                        benchmark)
 
+        set(_vernon_runtime_session_baseline
+            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-session-phase5-${_vernon_lifecycle_baseline_configuration}.json"
+        )
+        add_test(NAME VernonRuntimeSessionPhase5PerformanceGate
+                 COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_session_benchmark.py"
+                         --repository "${VERNON_REPOSITORY_ROOT}" --baseline "${_vernon_runtime_session_baseline}")
+        set_tests_properties(
+            VernonRuntimeSessionPhase5PerformanceGate
+            PROPERTIES RUN_SERIAL
+                       TRUE
+                       SKIP_RETURN_CODE
+                       77
+                       LABELS
+                       benchmark)
+
         set(_vernon_rhi_command_baseline
             "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-rhi-command-phase3-${_vernon_lifecycle_baseline_configuration}.json"
         )

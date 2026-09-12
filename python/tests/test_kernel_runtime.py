@@ -4,6 +4,7 @@ import importlib.util
 import runpy
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 from typing import Annotated
@@ -981,7 +982,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
         copy_tensor_view(second_output, transposed_reversed)
         np.testing.assert_array_equal(second_output.to_numpy(), owner.to_numpy().T[::-1])
         self.assertEqual(copy_tensor_view.compile_count, 1)
-        self.assertEqual(len(type(copy_tensor_view)._cache), 1)
+        self.assertEqual(len(type(copy_tensor_view)._cache._partition(vd.current_session()).snapshot), 1)
 
     @backend_matrix_test(BackendRequirements(gpu=True, compute=True, storage_buffers=True))
     def test_gpu_written_storage_survives_runtime_reinitialization(self, backend: BackendRow) -> None:
@@ -1014,7 +1015,7 @@ class KernelTensorRuntimeTests(unittest.TestCase):
             copy_tensor_view(output, invalid_access)
 
         self.assertEqual(copy_tensor_view.compile_count, 1)
-        self.assertEqual(len(type(copy_tensor_view)._cache), 1)
+        self.assertEqual(len(type(copy_tensor_view)._cache._partition(vd.current_session()).snapshot), 1)
 
     @backend_matrix_test(BackendRequirements(compute=True, storage_buffers=True))
     def test_aggregate_tensor_view_dispatch(self, backend: BackendRow) -> None:
@@ -1159,6 +1160,7 @@ class KernelTests(unittest.TestCase):
     def setUp(self) -> None:
         vd.init(arch=vd.cpu)
         fill.compile_count = 0
+        fill._frontend_cache.clear()
         type(fill).clear_cache()
 
     def test_explicit_grid_and_cache(self) -> None:
@@ -1170,6 +1172,15 @@ class KernelTests(unittest.TestCase):
         )
         self.assertEqual(fill.compile_count, 1)
         fill(output, 20.0, grid=(3, 2, 1))
+        self.assertEqual(fill.compile_count, 1)
+
+    def test_concurrent_specialize_publishes_one_native_executable(self) -> None:
+        with mock.patch.object(fill, "_lower_uncached", wraps=fill._lower_uncached) as lower:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                specializations = tuple(executor.map(lambda _: fill.specialize(), range(4)))
+
+        self.assertTrue(all(specialization is specializations[0] for specialization in specializations))
+        self.assertEqual(lower.call_count, 1)
         self.assertEqual(fill.compile_count, 1)
 
     def test_kernel_uses_program_control_boundaries_and_access(self) -> None:

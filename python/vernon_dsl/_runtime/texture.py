@@ -1,21 +1,22 @@
 from __future__ import annotations
 
-import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
+from .. import _native
 from ..types import TypeExpr
-from .resource_common import _session_state
+from .residency import _ResourceAccessDomain, _SingleResidency
+from .session import _invocation_context, _InvocationContext
 
 
 class _DirtyMipSet:
     """Set-like adapter for runtime-owned texture dirty state."""
 
     def __init__(self, mip_levels: int, dirty: Any = ()) -> None:
-        self._native = _session_state()._native._DirtyIndexSet(mip_levels)
+        self._native = _native._DirtyIndexSet(mip_levels)
         self.update(dirty)
 
     def __iter__(self) -> Any:
@@ -48,24 +49,20 @@ class _TextureResource:
     def shape(self) -> tuple[int, ...]:
         raise NotImplementedError
 
-    def _resident_texture(self) -> Any:
+    def _resident_texture(self, context: _InvocationContext) -> Any:
         raise NotImplementedError
 
-    def _resident_view(self) -> Any:
+    def _resident_view(self, context: _InvocationContext) -> Any:
         raise NotImplementedError
 
     def _mark_device_dirty(self) -> None:
         raise NotImplementedError
 
     def _ensure_host_mutation_allowed(self) -> None:
-        with self._borrow_lock:
-            if self._active_borrows:
-                raise RuntimeError("host mutation is forbidden while a device dispatch borrows Texture")
+        self._access_domain.require_host_mutation("Texture")
 
     def _ensure_host_read_allowed(self) -> None:
-        with self._borrow_lock:
-            if any(access != "read" for _, _, access in self._active_borrows):
-                raise RuntimeError("host reads are forbidden while a device dispatch writes Texture")
+        self._access_domain.require_host_read("Texture")
 
 
 @dataclass(frozen=True)
@@ -227,8 +224,7 @@ class Texture(_TextureResource):
         usage: frozenset[str],
         host_array: np.ndarray | None,
     ) -> None:
-        self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, object, str]] = []
+        self._access_domain = _ResourceAccessDomain()
         self._shape = shape
         self._array = host_array
         self._mip_arrays: dict[int, np.ndarray] = {} if host_array is None else {0: host_array}
@@ -236,12 +232,10 @@ class Texture(_TextureResource):
         self._dimension = dimension
         self._mip_levels = mip_levels
         self._usage = usage
-        self._native_texture: Any | None = None
-        self._native_view: Any | None = None
-        self._native_generation = -1
+        self._texture_residency = _SingleResidency()
+        self._view_residency = _SingleResidency()
         self._host_dirty_mips = _DirtyMipSet(mip_levels, self._mip_arrays)
         self._device_dirty_mips = _DirtyMipSet(mip_levels)
-        _session_state()._runtime_children.add(self)
 
     @staticmethod
     def _logical_shape(array_shape: tuple[int, ...], dimension: str, channels: int) -> tuple[int, ...]:
@@ -265,7 +259,8 @@ class Texture(_TextureResource):
         origin: tuple[int, ...],
         shape: tuple[int, ...],
     ) -> None:
-        if self._native_texture is None:
+        residency = self._texture_residency.current
+        if residency is None:
             raise RuntimeError("device-dirty Texture has no allocation")
         if self._dimension == "3d":
             offset_z, offset_y, offset_x = origin
@@ -279,7 +274,7 @@ class Texture(_TextureResource):
         if self._format.channels != 1:
             downloaded_shape = (*downloaded_shape, self._format.channels)
         downloaded = np.frombuffer(
-            self._native_texture.download(
+            residency.handle.download(
                 mip_level,
                 offset_x,
                 offset_y,
@@ -490,31 +485,7 @@ class Texture(_TextureResource):
         if channel_rank:
             slices = (*slices, slice(None))
         np.copyto(destination[slices], array)
-        state = _session_state()
-        resident = self._native_texture is not None and self._native_generation == state._runtime_generation
-        if resident:
-            assert self._native_texture is not None
-            if self._dimension == "3d":
-                offset_z, offset_y, offset_x = origin
-                upload_depth, upload_height, upload_width = region_shape
-            else:
-                offset_y, offset_x = origin
-                offset_z = 0
-                upload_height, upload_width = region_shape
-                upload_depth = 1
-            self._native_texture.upload(
-                array.tobytes(order="C"),
-                mip_level,
-                offset_x,
-                offset_y,
-                offset_z,
-                upload_width,
-                upload_height,
-                upload_depth,
-            )
-            self._host_dirty_mips.discard(mip_level)
-        else:
-            self._host_dirty_mips.add(mip_level)
+        self._host_dirty_mips.add(mip_level)
         self._device_dirty_mips.discard(mip_level)
 
     def download(
@@ -564,37 +535,27 @@ class Texture(_TextureResource):
         return self.download()
 
     def generate_mipmaps(self) -> None:
-        self._ensure_host_mutation_allowed()
-        if self._mip_levels < 2:
-            raise RuntimeError("Texture has no mip chain to generate")
-        if not {"transfer_source", "transfer_destination"}.issubset(self._usage):
-            raise RuntimeError("mipmap generation requires transfer_source and transfer_destination usage")
-        texture = self._resident_texture()
-        texture.generate_mipmaps()
-        self._mip_arrays = {} if self._array is None else {0: self._array}
-        self._host_dirty_mips.clear()
-        self._device_dirty_mips.update(range(1, self._mip_levels))
+        with _invocation_context() as context:
+            self._ensure_host_mutation_allowed()
+            if self._mip_levels < 2:
+                raise RuntimeError("Texture has no mip chain to generate")
+            if not {"transfer_source", "transfer_destination"}.issubset(self._usage):
+                raise RuntimeError("mipmap generation requires transfer_source and transfer_destination usage")
+            texture = self._resident_texture(context)
+            texture.generate_mipmaps()
+            self._mip_arrays = {} if self._array is None else {0: self._array}
+            self._host_dirty_mips.clear()
+            self._device_dirty_mips.update(range(1, self._mip_levels))
 
-    def _release_runtime_native(self) -> None:
-        if "transfer_source" in self._usage:
-            for mip_level in sorted(self._device_dirty_mips):
-                self._download_device_region(
-                    mip_level,
-                    (0,) * len(self._mip_shape(mip_level)),
-                    self._mip_shape(mip_level),
-                )
-        else:
-            self._device_dirty_mips.clear()
-        self._native_texture = None
-        self._native_view = None
-        self._native_generation = -1
+    def _resident_texture(self, context: _InvocationContext) -> Any:
+        with self._access_domain.lock:
+            return self._resident_texture_locked(context)
 
-    def _resident_texture(self) -> Any:
-        state = _session_state()
-        if state._native_runtime is None:
-            raise RuntimeError("Texture requires an initialized native runtime")
-        if self._native_texture is None or self._native_generation != state._runtime_generation:
-            if self._native_texture is not None and "transfer_source" in self._usage:
+    def _resident_texture_locked(self, context: _InvocationContext) -> Any:
+        state = context.session
+        texture = self._texture_residency.handle_for(state.identity)
+        if texture is None:
+            if self._texture_residency.current is not None and "transfer_source" in self._usage:
                 for mip_level in sorted(self._device_dirty_mips):
                     self._download_device_region(
                         mip_level,
@@ -608,64 +569,69 @@ class Texture(_TextureResource):
             else:
                 height, width = self.shape
                 depth = 1
-            if state._rhi_host is None:
+            if state.rhi_host is None:
                 raise RuntimeError("Texture requires a GPU RHI host")
-            native_format = getattr(state._native.TextureFormat, self._format._native_name)
+            native_format = getattr(state.native.TextureFormat, self._format._native_name)
             native_dimension = {
-                "2d": state._native.TextureDimension.TEXTURE_2D,
-                "3d": state._native.TextureDimension.TEXTURE_3D,
-                "cube": state._native.TextureDimension.CUBE,
+                "2d": state.native.TextureDimension.TEXTURE_2D,
+                "3d": state.native.TextureDimension.TEXTURE_3D,
+                "cube": state.native.TextureDimension.CUBE,
             }[self._dimension]
-            self._native_texture = state._rhi_host.create_image(
-                width,
-                height,
-                native_format,
-                native_dimension,
-                depth,
-                self._mip_levels,
-                self._native_usage(),
+            texture = self._texture_residency.replace(
+                state.identity,
+                state.rhi_host.create_image(
+                    width,
+                    height,
+                    native_format,
+                    native_dimension,
+                    depth,
+                    self._mip_levels,
+                    self._native_usage(state),
+                ),
             )
-            self._native_view = None
-            self._native_generation = state._runtime_generation
+            self._view_residency.clear()
             self._host_dirty_mips.clear()
             self._host_dirty_mips.update(self._mip_arrays)
             self._device_dirty_mips.clear()
-        assert self._native_texture is not None
         for mip_level in sorted(self._host_dirty_mips):
             array = self._mip_arrays[mip_level]
-            self._native_texture.upload(array.tobytes(order="C"), mip_level)
+            texture.upload(array.tobytes(order="C"), mip_level)
         self._host_dirty_mips.clear()
-        return self._native_texture
+        return texture
 
-    def _resident_view(self) -> Any:
-        texture = self._resident_texture()
-        if self._native_view is None:
-            state = _session_state()
-            native_format = getattr(state._native.TextureFormat, self._format._native_name)
-            native_dimension = {
-                "2d": state._native.TextureDimension.TEXTURE_2D,
-                "3d": state._native.TextureDimension.TEXTURE_3D,
-                "cube": state._native.TextureDimension.CUBE,
-            }[self._dimension]
-            aspect_names = {
-                "color": "IMAGE_ASPECT_COLOR",
-                "depth": "IMAGE_ASPECT_DEPTH",
-                "stencil": "IMAGE_ASPECT_STENCIL",
-            }
-            native_aspects = sum(int(getattr(state._native, aspect_names[value])) for value in self._format.aspects)
-            self._native_view = texture.create_view(
-                native_format,
-                native_dimension,
-                0,
-                self._mip_levels,
-                0,
-                6 if self._dimension == "cube" else 1,
-                native_aspects,
-            )
-        return self._native_view
+    def _resident_view(self, context: _InvocationContext) -> Any:
+        with self._access_domain.lock:
+            texture = self._resident_texture_locked(context)
+            view = self._view_residency.handle_for(context.identity)
+            if view is None:
+                state = context.session
+                native_format = getattr(state.native.TextureFormat, self._format._native_name)
+                native_dimension = {
+                    "2d": state.native.TextureDimension.TEXTURE_2D,
+                    "3d": state.native.TextureDimension.TEXTURE_3D,
+                    "cube": state.native.TextureDimension.CUBE,
+                }[self._dimension]
+                aspect_names = {
+                    "color": "IMAGE_ASPECT_COLOR",
+                    "depth": "IMAGE_ASPECT_DEPTH",
+                    "stencil": "IMAGE_ASPECT_STENCIL",
+                }
+                native_aspects = sum(int(getattr(state.native, aspect_names[value])) for value in self._format.aspects)
+                view = self._view_residency.replace(
+                    context.identity,
+                    texture.create_view(
+                        native_format,
+                        native_dimension,
+                        0,
+                        self._mip_levels,
+                        0,
+                        6 if self._dimension == "cube" else 1,
+                        native_aspects,
+                    ),
+                )
+            return view
 
-    def _native_usage(self) -> int:
-        state = _session_state()
+    def _native_usage(self, state: Any) -> int:
         names = {
             "sampled": "IMAGE_SAMPLED",
             "storage": "IMAGE_STORAGE",
@@ -674,7 +640,7 @@ class Texture(_TextureResource):
             "color_attachment": "IMAGE_COLOR_ATTACHMENT",
             "depth_stencil_attachment": "IMAGE_DEPTH_STENCIL_ATTACHMENT",
         }
-        return sum(int(getattr(state._native, names[item])) for item in self._usage)
+        return sum(int(getattr(state.native, names[item])) for item in self._usage)
 
     def _mark_device_dirty(self) -> None:
         self._device_dirty_mips.add(0)
@@ -759,8 +725,7 @@ class TextureView(_TextureResource):
         self._base_array_layer = base_array_layer
         self._array_layer_count = array_layer_count
         self._aspects = frozenset(aspects)
-        self._native_view: Any | None = None
-        self._native_generation = -1
+        self._view_residency = _SingleResidency()
 
     @property
     def owner(self) -> Texture:
@@ -790,36 +755,40 @@ class TextureView(_TextureResource):
     def aspects(self) -> frozenset[str]:
         return self._aspects
 
-    def _resident_texture(self) -> Any:
-        return self._owner._resident_texture()
+    def _resident_texture(self, context: _InvocationContext) -> Any:
+        return self._owner._resident_texture(context)
 
-    def _resident_view(self) -> Any:
-        state = _session_state()
-        texture = self._resident_texture()
-        if self._native_view is None or self._native_generation != state._runtime_generation:
-            native_format = getattr(state._native.TextureFormat, self._format._native_name)
-            native_dimension = {
-                "2d": state._native.TextureDimension.TEXTURE_2D,
-                "3d": state._native.TextureDimension.TEXTURE_3D,
-                "cube": state._native.TextureDimension.CUBE,
-            }[self._dimension]
-            aspect_names = {
-                "color": "IMAGE_ASPECT_COLOR",
-                "depth": "IMAGE_ASPECT_DEPTH",
-                "stencil": "IMAGE_ASPECT_STENCIL",
-            }
-            native_aspects = sum(int(getattr(state._native, aspect_names[value])) for value in self._aspects)
-            self._native_view = texture.create_view(
-                native_format,
-                native_dimension,
-                self._base_mip_level,
-                self._mip_level_count,
-                self._base_array_layer,
-                self._array_layer_count,
-                native_aspects,
-            )
-            self._native_generation = state._runtime_generation
-        return self._native_view
+    def _resident_view(self, context: _InvocationContext) -> Any:
+        with self._owner._access_domain.lock:
+            state = context.session
+            texture = self._owner._resident_texture_locked(context)
+            view = self._view_residency.handle_for(state.identity)
+            if view is None:
+                native_format = getattr(state.native.TextureFormat, self._format._native_name)
+                native_dimension = {
+                    "2d": state.native.TextureDimension.TEXTURE_2D,
+                    "3d": state.native.TextureDimension.TEXTURE_3D,
+                    "cube": state.native.TextureDimension.CUBE,
+                }[self._dimension]
+                aspect_names = {
+                    "color": "IMAGE_ASPECT_COLOR",
+                    "depth": "IMAGE_ASPECT_DEPTH",
+                    "stencil": "IMAGE_ASPECT_STENCIL",
+                }
+                native_aspects = sum(int(getattr(state.native, aspect_names[value])) for value in self._aspects)
+                view = self._view_residency.replace(
+                    state.identity,
+                    texture.create_view(
+                        native_format,
+                        native_dimension,
+                        self._base_mip_level,
+                        self._mip_level_count,
+                        self._base_array_layer,
+                        self._array_layer_count,
+                        native_aspects,
+                    ),
+                )
+            return view
 
     def _mark_device_dirty(self) -> None:
         self._owner._device_dirty_mips.update(range(self._base_mip_level, self._base_mip_level + self._mip_level_count))

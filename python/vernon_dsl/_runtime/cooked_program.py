@@ -10,8 +10,15 @@ from typing import Any
 from ..frontend.autodiff_profiles import DerivativeGroup
 from ..types import Specialization, SpecializationAssignment, specialization_key
 from .binding import _dispatch_borrow_scope, _PersistentBindingTable
-from .resource_common import _session_state
 from .sampler import SamplerState
+from .session import (
+    _execution_context,
+    _invocation_context,
+    _InvocationContext,
+    _SessionArtifactCache,
+    _use_invocation_context,
+    cpu,
+)
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
 
@@ -22,28 +29,33 @@ class _CookedProgramPullback:
     gradient_groups: tuple[DerivativeGroup, ...]
     cotangent_groups: tuple[DerivativeGroup, ...]
     carrier_shape: tuple[int, ...]
+    context: _InvocationContext
 
     def __call__(self, cotangent: Any = None) -> dict[str, Any]:
-        return dict(
-            self.native.apply_grouped(
-                cotangent,
-                self.gradient_groups,
-                self.cotangent_groups,
-                self.carrier_shape,
-                False,
+        with _use_invocation_context(self.context):
+            return dict(
+                self.native.apply_grouped(
+                    cotangent,
+                    self.gradient_groups,
+                    self.cotangent_groups,
+                    self.carrier_shape,
+                    False,
+                    _execution_context(),
+                )
             )
-        )
 
     def apply_logical(self, cotangent: Any) -> dict[str, Any]:
-        return dict(
-            self.native.apply_grouped(
-                cotangent,
-                self.gradient_groups,
-                self.cotangent_groups,
-                self.carrier_shape,
-                True,
+        with _use_invocation_context(self.context):
+            return dict(
+                self.native.apply_grouped(
+                    cotangent,
+                    self.gradient_groups,
+                    self.cotangent_groups,
+                    self.carrier_shape,
+                    True,
+                    _execution_context(),
+                )
             )
-        )
 
     @property
     def logical_residual_bytes(self) -> int:
@@ -67,35 +79,40 @@ class _CookedProgramPullback:
 
 
 @dataclass
+class _LoadedCookedProgram:
+    native: Any
+    binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable)
+
+
+@dataclass(eq=False)
 class CookedProgram:
     """Callable Program executable loaded through the canonical asset loader."""
 
     _bundle: bytes
     _directory: str
     _specializations: tuple[SpecializationAssignment, ...]
-    _native: Any = None
-    _runtime_generation: int = -1
-    _binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
+    _loaded: _SessionArtifactCache = field(default_factory=_SessionArtifactCache, init=False, repr=False)
 
-    def _load(self) -> None:
-        state = _session_state()
-        if state._native_runtime is None:
-            raise RuntimeError("cooked Program assets require the native runtime")
-        if self._native is not None and self._runtime_generation == state._runtime_generation:
-            return
-        self._native = state._native_runtime.load_program(
-            self._bundle,
-            self._directory,
-            [assignment.manifest for assignment in self._specializations],
+    def _load(self) -> _LoadedCookedProgram:
+        context = _execution_context()
+        state = context.session
+        return self._loaded.get_or_create(
+            state,
+            "program",
+            lambda: _LoadedCookedProgram(
+                state.native_runtime.load_program(
+                    self._bundle,
+                    self._directory,
+                    [assignment.manifest for assignment in self._specializations],
+                )
+            ),
         )
-        self._runtime_generation = state._runtime_generation
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
-        self._load()
-        return tuple(
-            parameter.name for parameter in self._native.parameters if not parameter.name.startswith("__grid_")
-        )
+        with _invocation_context():
+            native = self._load().native
+            return tuple(parameter.name for parameter in native.parameters if not parameter.name.startswith("__grid_"))
 
     def __call__(
         self,
@@ -103,8 +120,18 @@ class CookedProgram:
         grid: tuple[int, int, int] = (1, 1, 1),
         **keywords: Any,
     ) -> None:
-        self._load()
-        names = self.parameter_names
+        with _invocation_context():
+            self._invoke(arguments, grid, keywords)
+
+    def _invoke(
+        self,
+        arguments: tuple[Any, ...],
+        grid: tuple[int, int, int],
+        keywords: Mapping[str, Any],
+    ) -> None:
+        loaded = self._load()
+        native = loaded.native
+        names = tuple(parameter.name for parameter in native.parameters if not parameter.name.startswith("__grid_"))
         if len(arguments) > len(names):
             raise TypeError(f"Program executable expects at most {len(names)} positional arguments")
         bindings = dict(zip(names, arguments, strict=False))
@@ -128,18 +155,17 @@ class CookedProgram:
         ):
             raise ValueError("grid must contain three positive integers")
 
-        state = _session_state()
+        context = _execution_context()
+        state = context.session
         bindings.update({"__grid_x": grid[0], "__grid_y": grid[1], "__grid_z": grid[2]})
-        parameters = {parameter.slot: parameter for parameter in self._native.parameters}
-        slots = tuple(
-            slot for slot in self._native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"}
-        )
+        parameters = {parameter.slot: parameter for parameter in native.parameters}
+        slots = tuple(slot for slot in native.program_abi["boundary_slots"] if slot["role"] in {"input", "output"})
         if set(parameters) != {slot["slot"] for slot in slots}:
             raise RuntimeError("cooked Program parameters do not match compiler-emitted ProgramABI")
         access_names = {
-            state._native.ACCESS_READ: "read",
-            state._native.ACCESS_WRITE: "write",
-            state._native.ACCESS_READ_WRITE: "read_write",
+            state.native.ACCESS_READ: "read",
+            state.native.ACCESS_WRITE: "write",
+            state.native.ACCESS_READ_WRITE: "read_write",
         }
         resolved = [(parameters[slot["slot"]], bindings[slot["path"]]) for slot in slots]
         borrows = [
@@ -147,18 +173,18 @@ class CookedProgram:
             for parameter, value in resolved
             if isinstance(value, (TensorStorage, TensorView, _TextureResource))
         ]
-        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
+        with _dispatch_borrow_scope(borrows, context), loaded.binding_cache.invocation(native, context) as builder:
             for parameter, value in resolved:
-                if parameter.kind == state._native.PROGRAM_SAMPLER:
+                if parameter.kind == state.native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
-                    self._binding_cache.bind_sampler(builder, self._native, parameter, value)
+                    loaded.binding_cache.bind_sampler(builder, native, parameter, value)
                 else:
-                    self._binding_cache.bind_argument(builder, self._native, parameter, value)
-            self._native.program_forward_bound(builder)
-        if state._architecture != state.cpu:
+                    loaded.binding_cache.bind_argument(builder, native, parameter, value)
+            native.program_forward_bound(builder)
+        if state.arch != cpu:
             for parameter, value in resolved:
-                if parameter.access != state._native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
+                if parameter.access != state.native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
                     value._mark_device_dirty()
 
     def vjp(
@@ -166,8 +192,17 @@ class CookedProgram:
         bindings: dict[str, Any],
         grid: tuple[int, int, int] | None = None,
     ) -> tuple[Any, _CookedProgramPullback]:
-        self._load()
-        parameters = tuple(self._native.parameters)
+        with _invocation_context():
+            return self._vjp(bindings, grid)
+
+    def _vjp(
+        self,
+        bindings: dict[str, Any],
+        grid: tuple[int, int, int] | None,
+    ) -> tuple[Any, _CookedProgramPullback]:
+        loaded = self._load()
+        native = loaded.native
+        parameters = tuple(native.parameters)
         grid_names = ("__grid_x", "__grid_y", "__grid_z")
         grid_parameters = {parameter.name for parameter in parameters if parameter.name in grid_names}
         if grid_parameters == set(grid_names):
@@ -186,11 +221,12 @@ class CookedProgram:
             grid_values = {}
         if set(bindings) != {parameter.name for parameter in parameters} - grid_parameters:
             raise ValueError("autodiff bindings do not match Program parameters")
-        state = _session_state()
+        context = _execution_context()
+        state = context.session
         access_names = {
-            state._native.ACCESS_READ: "read",
-            state._native.ACCESS_WRITE: "write",
-            state._native.ACCESS_READ_WRITE: "read_write",
+            state.native.ACCESS_READ: "read",
+            state.native.ACCESS_WRITE: "write",
+            state.native.ACCESS_READ_WRITE: "read_write",
         }
         borrows = [
             (parameter.name, bindings[parameter.name], access_names[parameter.access])
@@ -198,28 +234,28 @@ class CookedProgram:
             if parameter.name not in grid_values
             if isinstance(bindings[parameter.name], (TensorStorage, TensorView))
         ]
-        with _dispatch_borrow_scope(borrows), self._binding_cache.invocation(self._native) as builder:
+        with _dispatch_borrow_scope(borrows, context), loaded.binding_cache.invocation(native, context) as builder:
             for parameter in parameters:
                 value = grid_values[parameter.name] if parameter.name in grid_values else bindings[parameter.name]
-                self._binding_cache.bind_argument(builder, self._native, parameter, value)
-            output, native_pullback = self._native.program_vjp_bound(builder, bindings)
-        if state._architecture != state.cpu:
+                loaded.binding_cache.bind_argument(builder, native, parameter, value)
+            output, native_pullback = native.program_vjp_bound(builder, bindings)
+        if state.arch != cpu:
             for parameter in parameters:
                 if parameter.name in grid_values:
                     continue
                 value = bindings[parameter.name]
-                if parameter.access != state._native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
+                if parameter.access != state.native.ACCESS_READ and hasattr(value, "_mark_device_dirty"):
                     value._mark_device_dirty()
         groups = tuple(
             DerivativeGroup(str(role), str(path), tuple(str(leaf) for leaf in leaves))
-            for role, path, leaves in self._native.derivative_groups
+            for role, path, leaves in native.derivative_groups
         )
         if not groups or {group.role for group in groups} != {"gradient", "cotangent"}:
             raise RuntimeError("cooked Program has no validated derivative groups")
         if grid is None:
             carrier_shape = ()
         else:
-            workgroup = tuple(getattr(self._native, "workgroup_size", (1, 1, 1)))
+            workgroup = tuple(getattr(native, "workgroup_size", (1, 1, 1)))
             extent = tuple(count * size for count, size in zip(grid, workgroup, strict=True))
             carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
         return output, _CookedProgramPullback(
@@ -227,6 +263,7 @@ class CookedProgram:
             tuple(group for group in groups if group.role == "gradient"),
             tuple(group for group in groups if group.role == "cotangent"),
             carrier_shape,
+            context,
         )
 
 
@@ -235,16 +272,17 @@ def load_program(
     *,
     specializations: Mapping[Specialization, object] | None = None,
 ) -> CookedProgram:
-    manifest_path = Path(manifest).resolve()
-    assignments = specialization_key(specializations)
-    bundle = manifest_path.read_bytes()
-    executable = CookedProgram(
-        bundle,
-        str(manifest_path.parent),
-        assignments,
-    )
-    executable._load()
-    return executable
+    with _invocation_context():
+        manifest_path = Path(manifest).resolve()
+        assignments = specialization_key(specializations)
+        bundle = manifest_path.read_bytes()
+        executable = CookedProgram(
+            bundle,
+            str(manifest_path.parent),
+            assignments,
+        )
+        executable._load()
+        return executable
 
 
 __all__ = ["CookedProgram", "load_program"]

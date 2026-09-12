@@ -25,7 +25,19 @@ from ..types import (
     specialization_key,
 )
 from ..types import bool as dsl_bool
-from .resource_common import _session_state
+from .session import (
+    _ArtifactCache,
+    _invocation_context,
+    _session_state,
+    _SessionArtifactCache,
+    cpu,
+    cuda,
+    directx,
+    metal,
+    opengl,
+    opengles,
+    vulkan,
+)
 from .tensor import TensorStorage, TensorView
 from .texture import _TextureResource
 
@@ -56,7 +68,7 @@ class _DependencyTracked(Protocol):
 class Kernel:
     """Device kernel: lower source to MLIR, specialize MLIR to a native artifact, bind tensors at launch."""
 
-    _cache: ClassVar[dict[str, _CompiledKernel]] = {}
+    _cache: ClassVar[_SessionArtifactCache] = _SessionArtifactCache()
 
     def __init__(self, function: Any, *, workgroup_size: tuple[int, int, int] = (1, 1, 1)):
         if len(workgroup_size) != 3 or any(not isinstance(value, int) or value <= 0 for value in workgroup_size):
@@ -70,6 +82,7 @@ class Kernel:
         self._entry = function.__name__
         self._workgroup_size = workgroup_size
         self._globals = function.__globals__
+        self._frontend_cache = _ArtifactCache()
         self.compile_count = 0
 
     @classmethod
@@ -101,6 +114,15 @@ class Kernel:
             return all(
                 hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == digest
                 for path, digest in compiled.dependency_hashes
+            )
+        except OSError:
+            return False
+
+    def _frontend_dependencies_current(self, frontend: FrontendCompileResult) -> bool:
+        try:
+            return all(
+                hashlib.sha256(path.read_text(encoding="utf-8").encode("utf-8")).hexdigest() == digest
+                for path, digest in self._dependency_hashes(frontend)
             )
         except OSError:
             return False
@@ -317,26 +339,40 @@ class Kernel:
 
     def _session_target(self) -> tuple[Any, Any, Any]:
         state = _session_state()
-        if state._native is None or state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} kernel execution requires the native runtime")
+        if state.native is None:
+            raise RuntimeError(f"{state.arch.name} kernel execution requires the native runtime")
         target = {
-            state.cpu: state._native.Target.CPU,
-            state.cuda: state._native.Target.CUDA,
-            state.vulkan: state._native.Target.VULKAN,
-            state.directx: state._native.Target.DIRECTX,
-            state.metal: state._native.Target.METAL,
-            state.opengl: state._native.Target.OPENGL,
-            state.opengles: state._native.Target.OPENGL_ES,
-        }.get(state._architecture)
+            cpu: state.native.Target.CPU,
+            cuda: state.native.Target.CUDA,
+            vulkan: state.native.Target.VULKAN,
+            directx: state.native.Target.DIRECTX,
+            metal: state.native.Target.METAL,
+            opengl: state.native.Target.OPENGL,
+            opengles: state.native.Target.OPENGL_ES,
+        }.get(state.arch)
         options = make_target_options(
-            state._architecture.name,
-            {"version": state._interactive_glsl_version()}
-            if state._architecture in {state.opengl, state.opengles}
-            else {},
+            state.arch.name,
+            {"version": state.interactive_glsl_version} if state.arch in {opengl, opengles} else {},
         )
         return state, target, options
 
     def _lower(
+        self,
+        specializations: tuple[SpecializationAssignment, ...] = (),
+        *,
+        autodiff_planning_policy: str | None = None,
+    ) -> _LoweredKernel:
+        key = (specializations, autodiff_planning_policy)
+        return self._frontend_cache.get_or_create(
+            key,
+            lambda: self._lower_uncached(
+                specializations,
+                autodiff_planning_policy=autodiff_planning_policy,
+            ),
+            lambda lowered: self._frontend_dependencies_current(lowered.frontend),
+        )
+
+    def _lower_uncached(
         self,
         specializations: tuple[SpecializationAssignment, ...] = (),
         *,
@@ -435,6 +471,15 @@ class Kernel:
         *,
         lowered: _LoweredKernel | None = None,
     ) -> _CompiledKernel:
+        with _invocation_context():
+            return self._specialize(specializations, lowered=lowered)
+
+    def _specialize(
+        self,
+        specializations: Mapping[Specialization, object] | None = None,
+        *,
+        lowered: _LoweredKernel | None = None,
+    ) -> _CompiledKernel:
         key_assignments = specialization_key(specializations)
         lowered = lowered or self._lower(key_assignments)
         frontend = lowered.frontend
@@ -449,15 +494,29 @@ class Kernel:
                 }
             ).encode()
         ).hexdigest()
-        cached = self._cache.get(key)
-        if cached is not None:
-            if not cached.dependency_hashes:
-                cached.dependency_hashes = self._dependency_hashes(frontend)
-            if self._dependencies_current(cached):
-                return cached
-            del self._cache[key]
+
+        def compile_specialization() -> _CompiledKernel:
+            compiled = self._compile_specialization(lowered, state, target, key_assignments)
+            self.compile_count += 1
+            return compiled
+
+        return self._cache.get_or_create(
+            state,
+            key,
+            compile_specialization,
+            self._dependencies_current,
+        )
+
+    def _compile_specialization(
+        self,
+        lowered: _LoweredKernel,
+        state: Any,
+        target: Any,
+        key_assignments: tuple[SpecializationAssignment, ...],
+    ) -> _CompiledKernel:
         if target is None:
-            raise RuntimeError(f"unsupported kernel architecture {state._architecture.name!r}")
+            raise RuntimeError(f"unsupported kernel architecture {state.arch.name!r}")
+        frontend = lowered.frontend
         entry = next(
             (function for function in frontend.typed_functions if function.source.name == self._entry),
             None,
@@ -506,8 +565,6 @@ class Kernel:
             specialization,
             self._dependency_hashes(frontend),
         )
-        self._cache[key] = cached
-        self.compile_count += 1
         return cached
 
     def _invoke(
@@ -555,7 +612,8 @@ class Kernel:
         grid: tuple[int, int, int] | None = None,
         specializations: Mapping[Specialization, object] | None = None,
     ) -> None:
-        self._invoke(arguments, grid, specializations)
+        with _invocation_context():
+            self._invoke(arguments, grid, specializations)
 
 
 atexit.register(Kernel.clear_cache)

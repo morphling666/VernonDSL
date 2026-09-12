@@ -133,7 +133,10 @@ class BackendTestMatrixTests(unittest.TestCase):
         with (
             mock.patch("backend_test_matrix._native", SimpleNamespace()),
             mock.patch("backend_test_matrix.vd.init"),
-            mock.patch("backend_test_matrix.runtime_session._native_runtime", runtime),
+            mock.patch(
+                "backend_test_matrix.runtime_session.current_session",
+                return_value=SimpleNamespace(native_runtime=runtime),
+            ),
         ):
             result = probe_runtime(BACKEND_TEST_MATRIX[5], BackendRequirements(compute=True))
         self.assertIs(result.kind, ProbeKind.CAPABILITY_UNSUPPORTED)

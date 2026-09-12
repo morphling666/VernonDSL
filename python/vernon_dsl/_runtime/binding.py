@@ -3,16 +3,23 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ..host_values import host_abi_layout, pack_host_value
-from .resource_common import _session_state
 from .sampler import SamplerState
+from .session import _InvocationContext, cpu
 from .tensor import RawBuffer, TensorStorage, TensorView, _borrow_ranges_may_overlap, _checked_access
 from .texture import TextureView, _TextureResource
+
+
+@dataclass(frozen=True)
+class _ActiveBindingTransaction:
+    native: Any
+    context: _InvocationContext
 
 
 class _PersistentBindingTable:
@@ -37,18 +44,19 @@ class _PersistentBindingTable:
             self._instance = None
 
     @contextmanager
-    def invocation(self, native_program: Any) -> Iterator[Any]:
-        transaction = self._native_instance(native_program).begin_invocation()
+    def invocation(self, native_program: Any, context: _InvocationContext) -> Iterator[Any]:
+        native_transaction = self._native_instance(native_program).begin_invocation()
         if getattr(self._transactions, "current", None) is not None:
             raise RuntimeError("persistent binding invocations cannot be nested on one thread")
+        transaction = _ActiveBindingTransaction(native_transaction, context)
         self._transactions.current = transaction
         try:
-            yield transaction.builder
+            yield native_transaction.builder
         except BaseException:
-            transaction.rollback()
+            native_transaction.rollback()
             raise
         else:
-            transaction.commit()
+            native_transaction.commit()
         finally:
             self._transactions.current = None
 
@@ -71,7 +79,7 @@ class _PersistentBindingTable:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("binding update requires an active invocation transaction")
-        transaction.bind(parameter.slot, token, prepare, upload_bytes, upload_ranges, eager_upload)
+        transaction.native.bind(parameter.slot, token, prepare, upload_bytes, upload_ranges, eager_upload)
 
     def bind_argument(
         self,
@@ -84,9 +92,12 @@ class _PersistentBindingTable:
         annotation: Any | None = None,
         binding_token: int | None = None,
     ) -> Any:
-        state = _session_state()
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("argument binding requires an active invocation transaction")
+        state = transaction.context.session
         if isinstance(value, (TensorStorage, TensorView)):
-            if state._architecture == state.cpu or host_value:
+            if state.arch == cpu or host_value:
                 array = value._native_host_array()
                 token = (
                     "host-resource",
@@ -101,12 +112,12 @@ class _PersistentBindingTable:
                     token,
                     lambda: builder.prepare_host_tensor(parameter.slot, array),
                 )
-            if state._rhi_host is None:
+            if state.rhi_host is None:
                 raise RuntimeError("device Tensor arguments require a GPU RHI host")
             owner = value.owner if isinstance(value, TensorView) else value
             dirty_tracker = getattr(owner, "_dirty_ranges", None)
             dirty_ranges = tuple(dirty_tracker.ranges) if dirty_tracker is not None else ()
-            buffer = value._resident_buffer()
+            buffer = value._resident_buffer(transaction.context)
             layout = value.layout
             token = (
                 "rhi-tensor",
@@ -133,14 +144,14 @@ class _PersistentBindingTable:
                 eager_upload=True,
             )
         if isinstance(value, _TextureResource):
-            if state._architecture == state.cpu:
+            if state.arch == cpu:
                 raise TypeError("CPU kernels do not support Texture arguments")
-            if state._rhi_host is None:
+            if state.rhi_host is None:
                 raise RuntimeError("Texture arguments require a GPU RHI host")
             owner = value.owner if isinstance(value, TextureView) else value
             dirty_mips = tuple(owner._host_dirty_mips)
             upload_bytes = sum(owner._mip_arrays[level].nbytes for level in dirty_mips)
-            view = value._resident_view()
+            view = value._resident_view(transaction.context)
             return self._bind(
                 builder,
                 parameter,
@@ -165,12 +176,12 @@ class _PersistentBindingTable:
             host_array[()] = pack_host_value(canonical_annotation, value, parameter.name)
         else:
             numpy_dtypes = {
-                state._native.DATA_BOOL: NUMPY_DTYPE_BY_SCALAR["bool"],
-                state._native.DATA_I32: NUMPY_DTYPE_BY_SCALAR["i32"],
-                state._native.DATA_U32: NUMPY_DTYPE_BY_SCALAR["u32"],
-                state._native.DATA_F16: NUMPY_DTYPE_BY_SCALAR["f16"],
-                state._native.DATA_F32: NUMPY_DTYPE_BY_SCALAR["f32"],
-                state._native.DATA_F64: NUMPY_DTYPE_BY_SCALAR["f64"],
+                state.native.DATA_BOOL: NUMPY_DTYPE_BY_SCALAR["bool"],
+                state.native.DATA_I32: NUMPY_DTYPE_BY_SCALAR["i32"],
+                state.native.DATA_U32: NUMPY_DTYPE_BY_SCALAR["u32"],
+                state.native.DATA_F16: NUMPY_DTYPE_BY_SCALAR["f16"],
+                state.native.DATA_F32: NUMPY_DTYPE_BY_SCALAR["f32"],
+                state.native.DATA_F64: NUMPY_DTYPE_BY_SCALAR["f64"],
             }
             leaves = tuple(parameter.element_leaves)
             dtype = numpy_dtypes.get(leaves[0][0]) if len(leaves) == 1 and leaves[0][2] == 0 else None
@@ -253,7 +264,10 @@ class _PersistentBindingTable:
         )
 
     def bind_sampler(self, builder: Any, native_program: Any, parameter: Any, sampler: SamplerState) -> None:
-        resident = sampler._resident_sampler()
+        transaction = getattr(self._transactions, "current", None)
+        if transaction is None:
+            raise RuntimeError("sampler binding requires an active invocation transaction")
+        resident = sampler._resident_sampler(transaction.context)
         self._bind(
             builder,
             parameter,
@@ -265,25 +279,25 @@ class _PersistentBindingTable:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("Program control update requires an active invocation transaction")
-        transaction.bind_render_pass(slot, token, control)
+        transaction.native.bind_render_pass(slot, token, control)
 
     def bind_draw_command_control(self, slot: int, token: tuple[Any, ...], control: Any) -> None:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("Program control update requires an active invocation transaction")
-        transaction.bind_draw_command(slot, token, control)
+        transaction.native.bind_draw_command(slot, token, control)
 
     def bind_dynamic_state_control(self, slot: int, token: tuple[Any, ...], control: Any) -> None:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("Program control update requires an active invocation transaction")
-        transaction.bind_dynamic_state(slot, token, control)
+        transaction.native.bind_dynamic_state(slot, token, control)
 
     def forward(self) -> None:
         transaction = getattr(self._transactions, "current", None)
         if transaction is None:
             raise RuntimeError("Program forward requires an active invocation transaction")
-        transaction.forward()
+        transaction.native.forward()
 
 
 def _normalize_dispatch_borrows(
@@ -335,18 +349,22 @@ class _DispatchBorrowLease:
     def __init__(
         self,
         borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
+        context: _InvocationContext,
     ):
         self._owners: list[TensorStorage | RawBuffer | _TextureResource] = []
         self._token: object | None = None
         normalized = _normalize_dispatch_borrows(borrows)
         self._owners = sorted({_dispatch_borrow_owner(resource) for _, resource, _ in normalized}, key=id)
         self._token = object()
+        session_identity = context.identity
         for owner in self._owners:
-            owner._borrow_lock.acquire()
+            owner._access_domain.lock.acquire()
         try:
+            for owner in self._owners:
+                owner._access_domain.validate_session(session_identity)
             for name, resource, access in normalized:
                 owner = _dispatch_borrow_owner(resource)
-                for _, active_resource, active_access in owner._active_borrows:
+                for _, active_resource, active_access in owner._access_domain.claims:
                     if access == active_access == "read":
                         continue
                     if isinstance(active_resource, (RawBuffer, TensorView, _TextureResource)) and (
@@ -354,10 +372,11 @@ class _DispatchBorrowLease:
                     ):
                         raise RuntimeError(f"dispatch argument '{name}' conflicts with an outstanding device borrow")
             for _, resource, access in normalized:
-                _dispatch_borrow_owner(resource)._active_borrows.append((self._token, resource, access))
+                owner = _dispatch_borrow_owner(resource)
+                owner._access_domain.add(self._token, resource, access, session_identity)
         finally:
             for owner in reversed(self._owners):
-                owner._borrow_lock.release()
+                owner._access_domain.lock.release()
 
     def release(self) -> None:
         token = self._token
@@ -365,28 +384,26 @@ class _DispatchBorrowLease:
             return
         self._token = None
         for owner in self._owners:
-            owner._borrow_lock.acquire()
+            owner._access_domain.lock.acquire()
         try:
             for owner in self._owners:
-                owner._active_borrows[:] = [active for active in owner._active_borrows if active[0] is not token]
+                owner._access_domain.release(token)
         finally:
             for owner in reversed(self._owners):
-                owner._borrow_lock.release()
+                owner._access_domain.lock.release()
 
     def release_writes(self) -> None:
         token = self._token
         if token is None:
             return
         for owner in self._owners:
-            owner._borrow_lock.acquire()
+            owner._access_domain.lock.acquire()
         try:
             for owner in self._owners:
-                owner._active_borrows[:] = [
-                    active for active in owner._active_borrows if active[0] is not token or active[2] == "read"
-                ]
+                owner._access_domain.release(token, writes_only=True)
         finally:
             for owner in reversed(self._owners):
-                owner._borrow_lock.release()
+                owner._access_domain.lock.release()
 
     def __enter__(self) -> _DispatchBorrowLease:
         return self
@@ -401,6 +418,7 @@ class _DispatchBorrowLease:
 @contextmanager
 def _dispatch_borrow_scope(
     borrows: list[tuple[str, TensorStorage | RawBuffer | TensorView | _TextureResource, str]],
+    context: _InvocationContext,
 ) -> Iterator[None]:
-    with _DispatchBorrowLease(borrows):
+    with _DispatchBorrowLease(borrows, context):
         yield

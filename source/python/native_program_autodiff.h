@@ -59,24 +59,31 @@ PythonAdMetadata adInputLeafMetadata(VernonProgramExecutable *executable, const 
 nb::object resolveProgramInputLeaf(const nb::dict &inputs, const std::string &leafPath);
 
 struct PythonPullback {
-    PythonPullback(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramExecutable *executable,
-                   VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
+    PythonPullback(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
+                   VernonProgramExecutable *executable, VernonPullback *handle, std::vector<PythonAdMetadata> gradients,
                    std::vector<PythonAdMetadata> cotangents, bool hasCarrierDimensions, nb::object executableOwner,
                    nb::dict bindings)
-        : owner(owner), runtime(runtime), executable(executable), handle(handle), gradients(std::move(gradients)),
-          cotangents(std::move(cotangents)), hasCarrierDimensions(hasCarrierDimensions),
-          executableOwner(std::move(executableOwner)), bindings(std::move(bindings)) {}
+        : owner(std::move(owner)), runtime(runtime), executable(executable), handle(handle),
+          gradients(std::move(gradients)), cotangents(std::move(cotangents)),
+          hasCarrierDimensions(hasCarrierDimensions), executableOwner(std::move(executableOwner)),
+          bindings(std::move(bindings)) {}
     ~PythonPullback() { vernonProgramPullbackDestroy(handle); }
 
-    nb::dict apply(const nb::object &cotangent) { return applyImpl(cotangent, false); }
-    nb::dict applyLogical(const nb::object &cotangent) { return applyImpl(cotangent, true); }
+    nb::dict apply(const nb::object &cotangent, const nb::object &context) {
+        return applyImpl(cotangent, false, context);
+    }
+    nb::dict applyLogical(const nb::object &cotangent, const nb::object &context) {
+        return applyImpl(cotangent, true, context);
+    }
     nb::dict applyGrouped(const nb::object &cotangent, const nb::object &gradientGroups,
-                          const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical) {
-        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, nullptr);
+                          const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
+                          const nb::object &context) {
+        return applyGroupedWithOptions(cotangent, gradientGroups, cotangentGroups, carrierShape, logical, context,
+                                       nullptr);
     }
     nb::dict applyGroupedWithOptions(const nb::object &cotangent, const nb::object &gradientGroups,
                                      const nb::object &cotangentGroups, const nb::object &carrierShape, bool logical,
-                                     const VernonPullbackApplyOptions *options);
+                                     const nb::object &context, const VernonPullbackApplyOptions *options);
     size_t logicalResidualBytes() const { return memoryUsage().logicalResidualBytes; }
     size_t residentBytes() const { return memoryUsage().residentBytes; }
     size_t allocatedBytes() const { return memoryUsage().allocatedBytes; }
@@ -144,7 +151,7 @@ private:
         return vernon::runtime::autodiffPullbackControlPlaneUsage(handle);
     }
 
-    nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent,
+    nb::dict applyImpl(const nb::object &cotangent, bool logicalCotangent, const nb::object &context,
                        const VernonPullbackApplyOptions *options = nullptr) {
         (void)logicalCotangent;
         ProgramInvocationBuilder builder(owner, runtime, executable);
@@ -294,7 +301,7 @@ private:
                 throw std::invalid_argument("Program derivative boundary must be a Tensor");
             if (nb::hasattr(source, "_resident_buffer") && nb::hasattr(source, "layout") &&
                 vernon::runtime::autodiffRhiDevice(runtime).index != VERNON_RHI_INVALID_HANDLE_INDEX) {
-                nb::object bufferObject = source.attr("_resident_buffer")();
+                nb::object bufferObject = source.attr("_resident_buffer")(context);
                 auto *buffer = nb::cast<RhiBuffer *>(bufferObject);
                 nb::object layout = source.attr("layout");
                 builder.ownedArgument(builder.prepareRhiTensor(
@@ -365,7 +372,7 @@ private:
                 const std::vector<uint64_t> shape = nb::cast<std::vector<uint64_t>>(boundaryLayout[0]);
                 const std::vector<int64_t> strides = nb::cast<std::vector<int64_t>>(boundaryLayout[1]);
                 directDevice &= injectiveLayout(shape, strides, parameter.elementByteSize);
-                bufferObject = source.attr("_resident_buffer")();
+                bufferObject = source.attr("_resident_buffer")(context);
                 if (role == VERNON_AD_DERIVATIVE_GRADIENT) {
                     if (std::find(deviceGradientBuffers.begin(), deviceGradientBuffers.end(), bufferObject.ptr()) !=
                         deviceGradientBuffers.end())
@@ -474,7 +481,7 @@ private:
         return result;
     }
 
-    Runtime *owner{};
+    std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramExecutable *executable{};
     VernonPullback *handle{};
@@ -486,17 +493,13 @@ private:
 };
 
 struct PythonProgramExecutable {
-    PythonProgramExecutable(Runtime *owner, VernonRuntimeContext *runtime, VernonProgramBundle *bundle,
-                            VernonProgramExecutable *executable, std::vector<SharedCompileResult> retainedResults = {},
+    PythonProgramExecutable(std::shared_ptr<RuntimeState> owner, VernonRuntimeContext *runtime,
+                            VernonProgramBundle *bundle, VernonProgramExecutable *executable,
+                            std::vector<SharedCompileResult> retainedResults = {},
                             std::vector<std::pair<std::string, VernonCpuEntryPoint>> registeredCpuEntries = {})
-        : owner(owner), runtime(runtime), bundle(bundle), executable(executable),
+        : owner(std::move(owner)), runtime(runtime), bundle(bundle), executable(executable),
           retainedResults(std::move(retainedResults)), registeredCpuEntries(std::move(registeredCpuEntries)) {}
-    ~PythonProgramExecutable() {
-        vernonRuntimeProgramExecutableDestroy(executable);
-        for (const auto &[symbol, entry] : registeredCpuEntries)
-            vernonRuntimeUnregisterCpuEntry(runtime, {symbol.data(), symbol.size()}, entry);
-        vernonRuntimeProgramBundleDestroy(bundle);
-    }
+    ~PythonProgramExecutable();
 
     std::unique_ptr<ProgramInvocationBuilder> invocationBuilder() {
         return std::make_unique<ProgramInvocationBuilder>(owner, runtime, executable);
@@ -772,7 +775,7 @@ struct PythonProgramExecutable {
         return result;
     }
 
-    Runtime *owner{};
+    std::shared_ptr<RuntimeState> owner;
     VernonRuntimeContext *runtime{};
     VernonProgramBundle *bundle{};
     VernonProgramExecutable *executable{};

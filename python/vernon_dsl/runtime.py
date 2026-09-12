@@ -4,8 +4,12 @@ from ._runtime.kernel import Kernel
 from ._runtime.pipeline import Pipeline, PrimitiveTopology, lines, pipeline, points, triangles
 from ._runtime.sampler import SamplerState, sampler
 from ._runtime.session import (
+    Architecture,
+    RuntimeConfiguration,
+    RuntimeSession,
     cpu,
     cuda,
+    current_session,
     directx,
     init,
     metal,
@@ -35,11 +39,14 @@ from ._runtime.texture import (
 from .render import LoadOperation, StoreOperation
 
 __all__ = [
+    "Architecture",
     "Kernel",
     "LoadOperation",
     "Pipeline",
     "PrimitiveTopology",
     "RenderTarget",
+    "RuntimeConfiguration",
+    "RuntimeSession",
     "SamplerState",
     "StoreOperation",
     "TensorLayout",
@@ -61,6 +68,7 @@ __all__ = [
     "rgba8_unorm",
     "cpu",
     "cuda",
+    "current_session",
     "directx",
     "init",
     "lines",

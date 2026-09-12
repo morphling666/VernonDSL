@@ -13,13 +13,19 @@
 
 namespace nb = nanobind;
 
+struct RhiContextOwner {
+    virtual ~RhiContextOwner() = default;
+};
+
 struct RhiHostState {
     RhiHostState(VernonRhiBackend backend, uint32_t deviceIndex);
-    RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCallbacks &callbacks);
+    RhiHostState(VernonRhiBackend backend, const VernonOpenGLContextCallbacks &callbacks,
+                 std::shared_ptr<RhiContextOwner> contextOwner = {});
     ~RhiHostState();
 
     VernonRhiBackend backend;
     VernonRhiDevice device{};
+    std::shared_ptr<RhiContextOwner> contextOwner;
 };
 
 struct RhiBuffer {
@@ -106,6 +112,7 @@ struct RhiHost {
     static std::unique_ptr<RhiHost> createExternalOpenGL(VernonRhiBackend backend, uintptr_t userData,
                                                          uintptr_t makeCurrent, uintptr_t getProcAddress,
                                                          uint16_t apiMajor, uint16_t apiMinor);
+    static std::unique_ptr<RhiHost> createOwnedOpenGL(VernonRhiBackend backend, uint16_t apiMajor, uint16_t apiMinor);
     std::unique_ptr<RhiBuffer> createBuffer(size_t size);
     std::unique_ptr<RhiImage> createImage(uint32_t width, uint32_t height, VernonTextureFormat format,
                                           VernonTextureDimension dimension, uint32_t depth, uint32_t mipLevels,

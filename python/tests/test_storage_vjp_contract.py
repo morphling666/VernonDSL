@@ -636,7 +636,14 @@ def objective(
             np.testing.assert_array_equal(pullback(cotangent)["values"].to_numpy(), expected_gradient)
             np.testing.assert_array_equal(cotangent, cotangent_before)
         self.assertEqual(
-            len(runtime_autodiff._kernel_state(storage_objective_vjp.program, storage_objective_vjp).compiled),
+            len(
+                runtime_autodiff._kernel_state(
+                    storage_objective_vjp.program,
+                    storage_objective_vjp,
+                )
+                .compiled._partition(vd.current_session())
+                .snapshot
+            ),
             1,
         )
 
@@ -667,7 +674,9 @@ def objective(
                 runtime_autodiff._kernel_state(
                     partially_dynamic_objective_vjp.program,
                     partially_dynamic_objective_vjp,
-                ).compiled
+                )
+                .compiled._partition(vd.current_session())
+                .snapshot
             ),
             1,
         )

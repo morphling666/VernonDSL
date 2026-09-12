@@ -34,7 +34,7 @@ from ..types import (
     specialization_key,
     specialization_key_data,
 )
-from .resource_common import _session_state
+from .session import _ArtifactCache, _invocation_context, _session_state, _SessionArtifactCache, cpu, opengl, opengles
 from .tensor import TensorStorage, TensorView
 
 
@@ -88,21 +88,43 @@ class Pipeline:
         self._stages = stages
         self._vertex = stages[0]
         self._fragment = stages[-1]
-        self._cache: dict[str, _CompiledPipeline] = {}
+        self._cache = _SessionArtifactCache()
+        self._frontend_cache = _ArtifactCache()
         self.compile_count = 0
 
     def _frontends(
         self,
         specializations: tuple[SpecializationAssignment, ...] | None = None,
     ) -> tuple[Any, ...]:
-        compiler = Compiler()
         selected = self._variant if specializations is None else specializations
+        return self._frontend_cache.get_or_create(
+            selected,
+            lambda: self._compile_frontends(selected),
+            self._frontends_current,
+        )
+
+    def _compile_frontends(
+        self,
+        specializations: tuple[SpecializationAssignment, ...],
+    ) -> tuple[Any, ...]:
+        compiler = Compiler()
         result = []
         for stage in self._stages:
             function = stage.function
             source = Path(inspect.getsourcefile(function) or "").resolve()
-            result.append(compiler.compile_request(FrontendCompileRequest(source, function.__name__, selected)))
+            result.append(compiler.compile_request(FrontendCompileRequest(source, function.__name__, specializations)))
         return tuple(result)
+
+    @staticmethod
+    def _frontends_current(frontends: tuple[Any, ...]) -> bool:
+        try:
+            return all(
+                hashlib.sha256(Path(path).read_bytes()).hexdigest() == digest
+                for frontend in frontends
+                for path, digest in frontend.semantic_inputs.get("dependencies", ())
+            )
+        except OSError:
+            return False
 
     def _parameter_types(
         self,
@@ -208,12 +230,8 @@ class Pipeline:
 
         state = _session_state()
         options = make_target_options(
-            state._architecture.name,
-            (
-                {"version": state._interactive_glsl_version()}
-                if state._architecture in {state.opengl, state.opengles}
-                else {}
-            ),
+            state.arch.name,
+            ({"version": state.interactive_glsl_version} if state.arch in {opengl, opengles} else {}),
         )
         depth = target._depth_attachment()
         return hashlib.sha256(
@@ -248,16 +266,27 @@ class Pipeline:
         dynamic_state: DynamicState | None,
     ) -> _CompiledPipeline:
         state = _session_state()
-        if state._native is None or state._native_runtime is None:
+        if state.native is None:
             raise RuntimeError("graphics requires the native Program runtime")
-        if state._architecture == state.cpu:
+        if state.arch == cpu:
             raise RuntimeError("CPU graphics pipelines require a software rasterizer, which Vernon does not provide")
         frontends = self._frontends()
         parameter_types = self._parameter_types(arguments, frontends, render_pass, draw, dynamic_state)
         identity = self._identity(render_pass, parameter_types)
-        cached = self._cache.get(identity)
-        if cached is not None:
-            return cached
+
+        def compile_pipeline() -> _CompiledPipeline:
+            compiled = self._compile_uncached(arguments, parameter_types, identity)
+            self.compile_count += 1
+            return compiled
+
+        return self._cache.get_or_create(state, identity, compile_pipeline)
+
+    def _compile_uncached(
+        self,
+        arguments: Mapping[str, Any],
+        parameter_types: Mapping[str, Any],
+        identity: str,
+    ) -> _CompiledPipeline:
         from ..program import _one_node_program
 
         template, invocation, parsed = _one_node_program(
@@ -279,8 +308,6 @@ class Pipeline:
         except ProgramCompileError as error:
             raise RuntimeError(str(error)) from None
         compiled = _CompiledPipeline(identity, invocation, specialization)
-        self._cache[identity] = compiled
-        self.compile_count += 1
         return compiled
 
     def _invoke(
@@ -313,7 +340,8 @@ class Pipeline:
             raise TypeError("draw must be a DrawCommand or None")
         if dynamic_state is not None and not isinstance(dynamic_state, DynamicState):
             raise TypeError("dynamic_state must be a DynamicState or None")
-        self._invoke(dict(arguments), render_pass, draw, dynamic_state)
+        with _invocation_context():
+            self._invoke(dict(arguments), render_pass, draw, dynamic_state)
 
 
 def pipeline(

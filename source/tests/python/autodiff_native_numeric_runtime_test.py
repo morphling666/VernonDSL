@@ -12,7 +12,8 @@ def main() -> None:
     from vernon_dsl._runtime import session
 
     vd.init(arch=vd.cpu)
-    assert session._native_runtime is not None
+    selected_session = session.current_session()
+    assert selected_session is not None and selected_session.native_runtime is not None
     __import__("vernon_native_autodiff_numeric_cpu_fixture")
 
     try:

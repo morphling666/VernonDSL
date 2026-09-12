@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 from vernon_dsl._runtime.cooked_program import CookedProgram
+from vernon_dsl._runtime.session import cpu
 
 
 class _BindingCache:
     @contextmanager
-    def invocation(self, executable):
+    def invocation(self, executable, context):
         yield object()
 
     def bind_argument(self, builder, executable, parameter, value) -> None:
@@ -38,27 +39,25 @@ class CookedProgramTests(unittest.TestCase):
             ACCESS_READ_WRITE=2,
         )
         state = SimpleNamespace(
-            _native=native_module,
-            _architecture=object(),
-            cpu=object(),
+            native=native_module,
+            arch=cpu,
         )
         program = CookedProgram(b"", "", ())
-        program._native = native
-        program._binding_cache = _BindingCache()  # type: ignore[assignment]
+        loaded = SimpleNamespace(native=native, binding_cache=_BindingCache())
 
         with (
-            mock.patch.object(program, "_load"),
+            mock.patch.object(program, "_load", return_value=loaded),
             mock.patch(
-                "vernon_dsl._runtime.cooked_program._session_state",
-                return_value=state,
+                "vernon_dsl._runtime.cooked_program._execution_context",
+                return_value=SimpleNamespace(session=state, identity=1),
             ),
         ):
-            output, pullback = program.vjp({"source": 1, "output": 2})
+            output, pullback = program._vjp({"source": 1, "output": 2}, None)
             self.assertEqual(output, {})
             self.assertIs(pullback.native, native_pullback)
 
             with self.assertRaisesRegex(ValueError, "owns its launch grids"):
-                program.vjp({"source": 1, "output": 2}, (1, 1, 1))
+                program._vjp({"source": 1, "output": 2}, (1, 1, 1))
 
 
 if __name__ == "__main__":

@@ -816,23 +816,14 @@ class PipelineContractTests(unittest.TestCase):
             tensor.swizzle("zx")
 
     def test_owned_gl_context_is_selected_and_retained(self) -> None:
-        created: list[object] = []
         runtime_calls: list[tuple[object, ...]] = []
-
-        class FakeContext:
-            def __init__(self, backend: str, major: int, minor: int):
-                self.request = (backend, major, minor)
-                self.user_data = 11
-                self.make_current = 12
-                self.get_proc_address = 13
-                created.append(self)
 
         class FakeRhiHost:
             def create_runtime(self) -> object:
-                return object()
+                return types.SimpleNamespace(capabilities={"available": True})
 
             @staticmethod
-            def create_external_opengl(*arguments: object) -> object:
+            def create_owned_opengl(*arguments: object) -> object:
                 runtime_calls.append(arguments)
                 return FakeRhiHost()
 
@@ -841,26 +832,23 @@ class PipelineContractTests(unittest.TestCase):
             RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
-        helper = types.SimpleNamespace(Context=FakeContext)
-        with (
-            mock.patch.object(runtime_module, "_native", fake_native),
-            mock.patch.object(runtime_module, "_gl_context", helper),
-        ):
-            vd.init(arch=vd.opengl)
-            self.assertEqual(created[-1].request, ("opengl", 4, 3))
-            self.assertIs(runtime_module._owned_opengl_context, created[-1])
-            self.assertEqual(runtime_calls[-1], (3, 11, 12, 13, 4, 3))
-            vd.init(arch=vd.opengles)
-            self.assertEqual(created[-1].request, ("opengles", 3, 1))
-            self.assertEqual(runtime_calls[-1], (4, 11, 12, 13, 3, 1))
-            runtime_module._release_runtime()
+        previous_default = runtime_module._registry._default
+        try:
+            with mock.patch.object(runtime_module, "_native", fake_native):
+                session = vd.init(arch=vd.opengl)
+                self.assertIsNotNone(session.rhi_host)
+                self.assertEqual(runtime_calls[-1], (3, 4, 3))
+                vd.init(arch=vd.opengles)
+                self.assertEqual(runtime_calls[-1], (4, 3, 1))
+        finally:
+            runtime_module._registry._default = previous_default
 
     def test_registered_context_takes_priority_over_owned_factory(self) -> None:
         class FakeRhiHost:
             calls: list[tuple[object, ...]] = []
 
             def create_runtime(self) -> object:
-                return object()
+                return types.SimpleNamespace(capabilities={"available": True})
 
             @staticmethod
             def create_external_opengl(*arguments: object) -> object:
@@ -872,8 +860,10 @@ class PipelineContractTests(unittest.TestCase):
             RhiBackend=types.SimpleNamespace(OPENGL=3, OPENGL_ES=4),
             RuntimeBackend=types.SimpleNamespace(CPU=0, CUDA=1, VULKAN=2, OPENGL=3, OPENGL_ES=4),
         )
-        helper = mock.Mock()
-        previous = runtime_module._external_opengl_contexts.pop(vd.opengl, None)
+        registry = runtime_module._registry
+        with registry._lock:
+            previous = registry._external_opengl_contexts.pop(vd.opengl, None)
+            previous_default = registry._default
         try:
             vd.register_external_opengl_context(
                 arch=vd.opengl,
@@ -882,18 +872,15 @@ class PipelineContractTests(unittest.TestCase):
                 get_proc_address=23,
                 api_version=(3, 3),
             )
-            with (
-                mock.patch.object(runtime_module, "_native", fake_native),
-                mock.patch.object(runtime_module, "_gl_context", helper),
-            ):
+            with mock.patch.object(runtime_module, "_native", fake_native):
                 vd.init(arch=vd.opengl)
-                helper.Context.assert_not_called()
                 self.assertEqual(FakeRhiHost.calls[-1], (3, 21, 22, 23, 3, 3))
-                runtime_module._release_runtime()
         finally:
-            runtime_module._external_opengl_contexts.pop(vd.opengl, None)
-            if previous is not None:
-                runtime_module._external_opengl_contexts[vd.opengl] = previous
+            with registry._lock:
+                registry._default = previous_default
+                registry._external_opengl_contexts.pop(vd.opengl, None)
+                if previous is not None:
+                    registry._external_opengl_contexts[vd.opengl] = previous
 
 
 class OpenGLPipelineTests(unittest.TestCase):
@@ -974,7 +961,7 @@ class OpenGLPipelineTests(unittest.TestCase):
             render_pass=render_pass,
             dynamic_state=dynamic_state,
         )
-        compiled = next(iter(render._cache.values()))
+        compiled = next(iter(render._cache._partition(vd.current_session()).snapshot.values()))
         initial_telemetry = dict(compiled.specialization.binding_telemetry)
         target.upload(np.zeros((32, 32, 4), dtype=np.uint8))
         render(position=positions, render_pass=render_pass, dynamic_state=dynamic_state)
@@ -1308,7 +1295,7 @@ class VulkanPipelineTests(unittest.TestCase):
             side_effect=AssertionError("subprocess prohibited"),
         ):
             render(position=positions, render_pass=render_target(target))
-        compiled = next(iter(render._cache.values()))
+        compiled = next(iter(render._cache._partition(vd.current_session()).snapshot.values()))
         self.assertGreater(len(compiled.specialization.executable.program_abi["boundary_slots"]), 0)
         self.assertEqual(len(compiled.invocation.graph.operations), 1)
 
@@ -1318,7 +1305,7 @@ class VulkanPipelineTests(unittest.TestCase):
         target = vd.Texture.zeros(shape=(16, 16))
         attachments = render_target(target)
         render(position=positions, render_pass=attachments)
-        compiled = next(iter(render._cache.values()))
+        compiled = next(iter(render._cache._partition(vd.current_session()).snapshot.values()))
         native = compiled.specialization.executable
         self.assertEqual(
             [(parameter.name, parameter.slot, tuple(parameter.shape)) for parameter in native.parameters],

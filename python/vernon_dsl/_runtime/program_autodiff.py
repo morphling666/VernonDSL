@@ -15,10 +15,18 @@ from .._program_assets.compile_orchestration import (
 )
 from ..bundle import build_program_manifest, build_program_plan, canonical_json, make_target_options
 from ..storage import TensorStorage, TensorView
-from . import session as state
 from .autodiff import _program_derivative_groups
 from .binding import _DispatchBorrowLease, _PersistentBindingTable
 from .sampler import SamplerState
+from .session import (
+    _execution_context,
+    _InvocationContext,
+    _session_state,
+    _use_invocation_context,
+    cpu,
+    opengl,
+    opengles,
+)
 from .tensor import RawBuffer
 from .texture import _TextureResource
 
@@ -30,26 +38,31 @@ class _ProgramDeployment:
     compiled_stages: list[tuple[str, str, Any]]
 
     def load(self) -> Any:
-        if state._native_runtime is None:
-            raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
-        return state._native_runtime.load_in_memory_program(
+        state = _session_state()
+        return state.native_runtime.load_in_memory_program(
             self.manifest,
             self.directory.name,
             self.compiled_stages,
         )
 
 
-def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTable, invocation: Any) -> list[Any]:
+def _bind_program_graphics_controls(
+    executable: Any,
+    cache: _PersistentBindingTable,
+    invocation: Any,
+    context: Any,
+) -> list[Any]:
     from ..render import ColorBlendState, LoadOperation, StoreOperation, lines, points, triangles
 
+    state = context.session
     load_values = {
-        LoadOperation.CLEAR: state._native.ATTACHMENT_CLEAR,
-        LoadOperation.PRESERVE: state._native.ATTACHMENT_PRESERVE,
-        LoadOperation.DISCARD: state._native.ATTACHMENT_DISCARD,
+        LoadOperation.CLEAR: state.native.ATTACHMENT_CLEAR,
+        LoadOperation.PRESERVE: state.native.ATTACHMENT_PRESERVE,
+        LoadOperation.DISCARD: state.native.ATTACHMENT_DISCARD,
     }
     store_values = {
-        StoreOperation.PRESERVE: state._native.ATTACHMENT_STORE,
-        StoreOperation.DISCARD: state._native.ATTACHMENT_DONT_CARE,
+        StoreOperation.PRESERVE: state.native.ATTACHMENT_STORE,
+        StoreOperation.DISCARD: state.native.ATTACHMENT_DONT_CARE,
     }
     written: list[Any] = []
     operations = {operation.id: operation for operation in invocation.graph.operations}
@@ -70,7 +83,7 @@ def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTa
             )
             builder.rhi_color_attachment(
                 location,
-                texture._resident_view(),
+                texture._resident_view(context),
                 load_values[attachment.load],
                 store_values[attachment.store],
                 list(clear_value),
@@ -83,7 +96,7 @@ def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTa
             attachment = render_pass.depth
             clear_depth = float(attachment.clear_value) if attachment.load is LoadOperation.CLEAR else 1.0
             builder.rhi_depth_attachment(
-                depth_texture._resident_view(),
+                depth_texture._resident_view(context),
                 load_values[attachment.load],
                 store_values[attachment.store],
                 clear_depth,
@@ -92,14 +105,14 @@ def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTa
         if draw is not None and draw.index_buffer is not None:
             index_view = draw.index_buffer.view
             builder.rhi_index_binding(
-                index_view._resident_buffer(),
+                index_view._resident_buffer(context),
                 draw.index_buffer.count,
                 index_view.layout.byte_offset,
             )
         topology = {
-            triangles: state._native.TOPOLOGY_TRIANGLE_LIST,
-            lines: state._native.TOPOLOGY_LINE_LIST,
-            points: state._native.TOPOLOGY_POINT_LIST,
+            triangles: state.native.TOPOLOGY_TRIANGLE_LIST,
+            lines: state.native.TOPOLOGY_LINE_LIST,
+            points: state.native.TOPOLOGY_POINT_LIST,
         }[operation.pipeline._topology]
         builder.topology(topology)
         builder.counts(
@@ -127,7 +140,7 @@ def _bind_program_graphics_controls(executable: Any, cache: _PersistentBindingTa
             "render-pass",
             node_id,
             repr(render_pass).encode(),
-            *(id(texture._resident_view()) for _, texture in colors),
+            *(id(texture._resident_view(context)) for _, texture in colors),
         )
         draw_token = ("draw-command", node_id, repr(draw).encode())
         dynamic_token = ("dynamic-state", node_id, repr(dynamic).encode())
@@ -163,6 +176,8 @@ def _bound_program_invocation(
     *,
     retain_borrows: bool = False,
 ) -> Iterator[tuple[Any, list[Any], _DispatchBorrowLease]]:
+    context = _execution_context()
+    state = context.session
     parameters = tuple(executable.parameters)
     parameters_by_slot = {parameter.slot: parameter for parameter in parameters}
     if len(parameters_by_slot) != len(parameters):
@@ -186,9 +201,9 @@ def _bound_program_invocation(
         return path, values[path]
 
     access_names = {
-        state._native.ACCESS_READ: "read",
-        state._native.ACCESS_WRITE: "write",
-        state._native.ACCESS_READ_WRITE: "read_write",
+        state.native.ACCESS_READ: "read",
+        state.native.ACCESS_WRITE: "write",
+        state.native.ACCESS_READ_WRITE: "read_write",
     }
     resolved = [
         (parameter, boundary_slots_by_slot[parameter.slot], *binding(boundary_slots_by_slot[parameter.slot]))
@@ -212,12 +227,12 @@ def _bound_program_invocation(
         if draw is not None and draw.index_buffer is not None:
             borrows.append(("index_buffer", draw.index_buffer.view, "read"))
     written: list[Any] = []
-    lease = _DispatchBorrowLease(borrows)
+    lease = _DispatchBorrowLease(borrows, context)
     succeeded = False
     try:
-        with cache.invocation(executable) as builder:
+        with cache.invocation(executable, context) as builder:
             for parameter, slot, path, value in resolved:
-                if parameter.kind == state._native.PROGRAM_SAMPLER:
+                if parameter.kind == state.native.PROGRAM_SAMPLER:
                     if not isinstance(value, SamplerState):
                         raise TypeError(f"sampler {parameter.name!r} must be a SamplerState")
                     cache.bind_sampler(builder, executable, parameter, value)
@@ -231,12 +246,12 @@ def _bound_program_invocation(
                         annotation=invocation.input_annotations.get(path),
                     )
                 if (
-                    state._architecture != state.cpu
-                    and parameter.access != state._native.ACCESS_READ
+                    state.arch != cpu
+                    and parameter.access != state.native.ACCESS_READ
                     and hasattr(value, "_mark_device_dirty")
                 ):
                     written.append(value)
-            written.extend(_bind_program_graphics_controls(executable, cache, invocation))
+            written.extend(_bind_program_graphics_controls(executable, cache, invocation, context))
             yield builder, written, lease
         succeeded = True
     finally:
@@ -255,12 +270,14 @@ class ProgramNativePullback:
         inputs: Mapping[str, Any],
         derivative_groups: tuple[Any, ...],
         lease: _DispatchBorrowLease,
+        context: _InvocationContext,
     ) -> None:
         self._native = native
         self._signature = signature
         self._outputs = dict(outputs)
         self._inputs = dict(inputs)
         self._lease = lease
+        self._context = context
         self._storage_gradients = {
             path for path, value in inputs.items() if isinstance(value, (TensorStorage, TensorView))
         }
@@ -271,6 +288,14 @@ class ProgramNativePullback:
         return self.apply_with_carrier(cotangents, ())
 
     def apply_with_carrier(
+        self,
+        cotangents: Any,
+        carrier_shape: tuple[int, ...],
+    ) -> dict[str, Any]:
+        with _use_invocation_context(self._context):
+            return self._apply_with_carrier(cotangents, carrier_shape)
+
+    def _apply_with_carrier(
         self,
         cotangents: Any,
         carrier_shape: tuple[int, ...],
@@ -306,6 +331,7 @@ class ProgramNativePullback:
                     self._cotangent_groups,
                     carrier_shape,
                     False,
+                    _execution_context(),
                 )
             )
         finally:
@@ -373,16 +399,7 @@ class ProgramAutodiffSpecialization:
     executable: Any
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
-    def __post_init__(self) -> None:
-        state._runtime_children.add(self)
-
-    def _release_runtime_native(self) -> None:
-        self.binding_cache.clear()
-        self.executable = None
-
     def _loaded_executable(self) -> Any:
-        if self.executable is None:
-            self.executable = self.deployment.load()
         return self.executable
 
     @property
@@ -396,6 +413,7 @@ class ProgramAutodiffSpecialization:
         checkpoint_memory_budget: int | None = None,
         checkpoint_policy: str = "",
     ) -> tuple[Any, ProgramNativePullback]:
+        context = _execution_context()
         executable = self._loaded_executable()
         signature = executable.program_ad_signature
         expected_inputs = {row["path"] for row in signature["inputs"]}
@@ -433,6 +451,7 @@ class ProgramAutodiffSpecialization:
             invocation.inputs,
             derivative_groups,
             lease,
+            context,
         )
         expected_output_leaves = {row["path"] for row in signature["outputs"]}
         if native_outputs and set(native_outputs) != expected_output_leaves:
@@ -450,16 +469,7 @@ class ProgramSpecialization:
     executable: Any
     binding_cache: _PersistentBindingTable = field(default_factory=_PersistentBindingTable, init=False, repr=False)
 
-    def __post_init__(self) -> None:
-        state._runtime_children.add(self)
-
-    def _release_runtime_native(self) -> None:
-        self.binding_cache.clear()
-        self.executable = None
-
     def _loaded_executable(self) -> Any:
-        if self.executable is None:
-            self.executable = self.deployment.load()
         return self.executable
 
     @property
@@ -483,12 +493,11 @@ class ProgramSpecialization:
 
 
 def _compile_program(parsed: Any) -> _ProgramDeployment:
-    if state._native_runtime is None:
-        raise RuntimeError(f"{state._architecture.name} Program execution requires the native runtime")
-    native = state._native
+    state = _session_state()
+    native = state.native
     target = make_target_options(
-        state._architecture.name,
-        {"version": state._interactive_glsl_version()} if state._architecture in {state.opengl, state.opengles} else {},
+        state.arch.name,
+        {"version": state.interactive_glsl_version} if state.arch in {opengl, opengles} else {},
     )
     compiler = native.Compiler()
     retained_programs: list[tuple[Any, Any]] = []
@@ -500,7 +509,7 @@ def _compile_program(parsed: Any) -> _ProgramDeployment:
         compiler=compiler,
         native=native,
         native_target=_native_target(native, target.target),
-        retained_programs=retained_programs if state._architecture == state.cpu else None,
+        retained_programs=retained_programs if state.arch == cpu else None,
     )
     plan = build_program_plan(
         f"interactive/program-ad/{parsed.identity}",

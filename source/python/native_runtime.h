@@ -1,6 +1,7 @@
 #ifndef VERNON_PYTHON_NATIVE_RUNTIME_H
 #define VERNON_PYTHON_NATIVE_RUNTIME_H
 
+#include "native_lifecycle_test_hooks.h"
 #include "native_program_autodiff.h"
 #include "runtime/program_execution_backend.h"
 
@@ -9,28 +10,84 @@
 #include <mutex>
 #include <unordered_map>
 
-struct Runtime {
-    explicit Runtime(VernonRuntimeContext *handle, std::shared_ptr<RhiHostState> rhiHost = {})
-        : handle(handle), rhiHost(std::move(rhiHost)) {}
-    explicit Runtime(VernonRuntimeBackend backend) {
-        VernonRuntimeCreateOptions options{};
-        options.struct_size = sizeof(options);
-        handle = vernonRuntimeCreateWithOptions(backend, &options);
-        if (!handle)
-            throw std::runtime_error("requested runtime backend is unavailable");
+struct RuntimeContextDeleter {
+    void operator()(VernonRuntimeContext *handle) const noexcept {
+        if (handle) {
+            vernonRuntimeDestroy(handle);
+            vernon::python::testing::noteRuntimeDestroyed();
+        }
     }
-    ~Runtime() { vernonRuntimeDestroy(handle); }
+};
+
+struct ProgramBundleDeleter {
+    void operator()(VernonProgramBundle *bundle) const noexcept {
+        if (bundle)
+            vernonRuntimeProgramBundleDestroy(bundle);
+    }
+};
+
+struct ProgramExecutableDeleter {
+    void operator()(VernonProgramExecutable *executable) const noexcept {
+        if (executable)
+            vernonRuntimeProgramExecutableDestroy(executable);
+    }
+};
+
+using RuntimeContextOwner = std::unique_ptr<VernonRuntimeContext, RuntimeContextDeleter>;
+using ProgramBundleOwner = std::unique_ptr<VernonProgramBundle, ProgramBundleDeleter>;
+using ProgramExecutableOwner = std::unique_ptr<VernonProgramExecutable, ProgramExecutableDeleter>;
+
+inline RuntimeContextOwner createRuntimeContext(VernonRuntimeBackend backend) {
+    VernonRuntimeCreateOptions options{};
+    options.struct_size = sizeof(options);
+    RuntimeContextOwner handle(vernonRuntimeCreateWithOptions(backend, &options));
+    if (!handle)
+        throw std::runtime_error("requested runtime backend is unavailable");
+    return handle;
+}
+
+struct RuntimeState {
+    explicit RuntimeState(RuntimeContextOwner handle, std::shared_ptr<RhiHostState> rhiHost = {})
+        : rhiHost(std::move(rhiHost)), context(std::move(handle)) {}
+
+    VernonRuntimeContext *handle() const noexcept { return context.get(); }
+
+    void releaseInternedCpuJit(const std::string &symbol, const std::shared_ptr<InternedCpuJit> &jit) {
+        std::lock_guard<std::mutex> lock(internedCpuMutex);
+        const auto found = internedCpuEntries.find(symbol);
+        if (found == internedCpuEntries.end())
+            return;
+        std::shared_ptr<InternedCpuJit> current = found->second.lock();
+        if (current == jit && current.use_count() == 2)
+            internedCpuEntries.erase(found);
+    }
+
+    std::shared_ptr<RhiHostState> rhiHost;
+    RuntimeContextOwner context;
+    std::mutex internedCpuMutex;
+    std::unordered_map<std::string, std::weak_ptr<InternedCpuJit>> internedCpuEntries;
+};
+
+struct Runtime {
+    explicit Runtime(RuntimeContextOwner handle, std::shared_ptr<RhiHostState> rhiHost = {})
+        : state(std::make_shared<RuntimeState>(std::move(handle), std::move(rhiHost))) {}
+    explicit Runtime(VernonRuntimeBackend backend) : Runtime(createRuntimeContext(backend)) {}
 
     std::shared_ptr<InternedCpuJit> internCpuJit(const std::string &symbol, SharedCompileResult result,
                                                  VernonCpuEntryPoint entry) {
-        std::lock_guard<std::mutex> lock(internedCpuMutex);
-        std::weak_ptr<InternedCpuJit> &slot = internedCpuEntries[symbol];
-        if (std::shared_ptr<InternedCpuJit> existing = slot.lock())
-            return existing;
+        std::lock_guard<std::mutex> lock(state->internedCpuMutex);
+        const auto found = state->internedCpuEntries.find(symbol);
+        if (found != state->internedCpuEntries.end()) {
+            if (std::shared_ptr<InternedCpuJit> existing = found->second.lock())
+                return existing;
+        }
         auto interned = std::make_shared<InternedCpuJit>();
         interned->result = std::move(result);
         interned->entry = entry;
-        slot = interned;
+        if (found == state->internedCpuEntries.end())
+            state->internedCpuEntries.emplace(symbol, interned);
+        else
+            found->second = interned;
         return interned;
     }
 
@@ -39,9 +96,14 @@ struct Runtime {
                                    std::vector<SharedCompileResult> &retained,
                                    std::vector<std::pair<std::string, VernonCpuEntryPoint>> &registered,
                                    std::vector<std::shared_ptr<InternedCpuJit>> &interned) {
+        size_t registeredCount = 0;
         const auto rollback = [&]() {
-            for (const auto &[symbol, entry] : registered)
-                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
+            for (size_t index = 0; index < registeredCount; ++index) {
+                const auto &[symbol, entry] = registered[index];
+                vernonRuntimeUnregisterCpuEntry(state->handle(), {symbol.data(), symbol.size()}, entry);
+            }
+            for (size_t index = 0; index < registered.size() && index < interned.size(); ++index)
+                state->releaseInternedCpuJit(registered[index].first, interned[index]);
             registered.clear();
             retained.clear();
             interned.clear();
@@ -63,12 +125,13 @@ struct Runtime {
                 if (!entry)
                     throw std::runtime_error(std::string(missingEntryPrefix) + "'" + entryName + "' was not found");
                 std::shared_ptr<InternedCpuJit> internedJit = internCpuJit(symbol, program.result, entry);
-                if (vernonRuntimeRegisterCpuEntry(handle, {symbol.data(), symbol.size()}, internedJit->entry) !=
-                    VERNON_STATUS_OK)
-                    throw std::runtime_error(std::string(registerFailurePrefix) + "'" + symbol + "'");
                 retained.push_back(internedJit->result);
                 registered.emplace_back(symbol, internedJit->entry);
-                interned.push_back(std::move(internedJit));
+                interned.push_back(internedJit);
+                if (vernonRuntimeRegisterCpuEntry(state->handle(), {symbol.data(), symbol.size()},
+                                                  internedJit->entry) != VERNON_STATUS_OK)
+                    throw std::runtime_error(std::string(registerFailurePrefix) + "'" + symbol + "'");
+                ++registeredCount;
             }
         } catch (...) {
             rollback();
@@ -119,18 +182,20 @@ struct Runtime {
         }
         const VernonProgramVariantSelector selector{
             sizeof(VernonProgramVariantSelector), specializations.data(), specializations.size(), {}};
-        VernonProgramBundle *bundle =
-            vernonRuntimeLoadProgramBundleWithOptions(handle, data.c_str(), data.size(), &options);
+        ProgramBundleOwner bundle(
+            vernonRuntimeLoadProgramBundleWithOptions(state->handle(), data.c_str(), data.size(), &options));
         if (!bundle)
             throw std::runtime_error("cannot load Program bundle: " +
-                                     nativeStringView(vernonRuntimeGetLastError(handle)));
-        VernonProgramExecutable *executable = vernonRuntimeResolveProgram(bundle, &selector);
+                                     nativeStringView(vernonRuntimeGetLastError(state->handle())));
+        ProgramExecutableOwner executable(vernonRuntimeResolveProgram(bundle.get(), &selector));
         if (!executable) {
-            const std::string error = nativeStringView(vernonRuntimeGetLastError(handle));
-            vernonRuntimeProgramBundleDestroy(bundle);
+            const std::string error = nativeStringView(vernonRuntimeGetLastError(state->handle()));
             throw std::runtime_error("cannot resolve Program bundle: " + error);
         }
-        return std::make_unique<PythonProgramExecutable>(this, handle, bundle, executable);
+        auto result = std::make_unique<PythonProgramExecutable>(state, state->handle(), bundle.get(), executable.get());
+        bundle.release();
+        executable.release();
+        return result;
     }
 
     std::unique_ptr<PythonProgramExecutable>
@@ -140,8 +205,15 @@ struct Runtime {
         std::vector<std::pair<std::string, VernonCpuEntryPoint>> registered;
         std::vector<std::shared_ptr<InternedCpuJit>> interned;
         const auto unregister = [&]() {
-            for (const auto &[symbol, entry] : registered)
-                vernonRuntimeUnregisterCpuEntry(handle, {symbol.data(), symbol.size()}, entry);
+            for (size_t index = 0; index < registered.size(); ++index) {
+                const auto &[symbol, entry] = registered[index];
+                vernonRuntimeUnregisterCpuEntry(state->handle(), {symbol.data(), symbol.size()}, entry);
+                if (index < interned.size())
+                    state->releaseInternedCpuJit(symbol, interned[index]);
+            }
+            registered.clear();
+            retained.clear();
+            interned.clear();
         };
         try {
             registerInternedCpuStages(compiledStages, "compiled in-memory Program stage metadata is invalid",
@@ -150,21 +222,22 @@ struct Runtime {
             VernonProgramBundleLoadOptions options{};
             options.struct_size = sizeof(options);
             options.bundle_directory = directory.c_str();
-            VernonProgramBundle *bundle =
-                vernonRuntimeLoadProgramBundleWithOptions(handle, manifestData.c_str(), manifestData.size(), &options);
+            ProgramBundleOwner bundle(vernonRuntimeLoadProgramBundleWithOptions(state->handle(), manifestData.c_str(),
+                                                                                manifestData.size(), &options));
             if (!bundle)
                 throw std::runtime_error("cannot load in-memory Program bundle: " +
-                                         nativeStringView(vernonRuntimeGetLastError(handle)));
-            VernonProgramExecutable *loaded = vernonRuntimeResolveProgram(bundle, nullptr);
+                                         nativeStringView(vernonRuntimeGetLastError(state->handle())));
+            ProgramExecutableOwner loaded(vernonRuntimeResolveProgram(bundle.get(), nullptr));
             if (!loaded) {
-                error = nativeStringView(vernonRuntimeGetLastError(handle));
-                vernonRuntimeProgramBundleDestroy(bundle);
+                error = nativeStringView(vernonRuntimeGetLastError(state->handle()));
                 throw std::runtime_error(error);
             }
-            auto executable =
-                std::make_unique<PythonProgramExecutable>(this, handle, bundle, loaded, std::move(retained));
+            auto executable = std::make_unique<PythonProgramExecutable>(state, state->handle(), bundle.get(),
+                                                                        loaded.get(), std::move(retained));
             executable->internedCpuJits = std::move(interned);
             executable->registeredCpuEntries = std::move(registered);
+            bundle.release();
+            loaded.release();
             return executable;
         } catch (...) {
             unregister();
@@ -172,13 +245,10 @@ struct Runtime {
         }
     }
 
-    VernonRuntimeContext *handle{};
-    std::shared_ptr<RhiHostState> rhiHost;
-    std::mutex internedCpuMutex;
-    std::unordered_map<std::string, std::weak_ptr<InternedCpuJit>> internedCpuEntries;
+    std::shared_ptr<RuntimeState> state;
 };
 
-RhiHostState *runtimeRhiHost(const Runtime *runtime);
+RhiHostState *runtimeRhiHost(const RuntimeState *runtime);
 
 std::unique_ptr<Runtime> createRhiRuntime(RhiHost &host);
 

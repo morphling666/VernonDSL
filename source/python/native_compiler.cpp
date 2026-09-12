@@ -98,6 +98,20 @@ void bindNativeCompiler(nb::module_ &module) {
     module.attr("IMAGE_ASPECT_COLOR") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_COLOR);
     module.attr("IMAGE_ASPECT_DEPTH") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_DEPTH);
     module.attr("IMAGE_ASPECT_STENCIL") = static_cast<uint32_t>(VERNON_RHI_IMAGE_ASPECT_STENCIL);
+#if defined(VERNON_ENABLE_LIFECYCLE_TEST_HOOKS)
+    module.def("_reset_lifecycle_test_counts", &vernon::python::testing::resetLifecycleCounts);
+    module.def("_lifecycle_test_counts", []() {
+        const vernon::python::testing::LifecycleCounts counts = vernon::python::testing::lifecycleCounts();
+        nb::dict result;
+        result["runtimes"] = counts.runtimes;
+        result["rhi_devices"] = counts.rhiDevices;
+        result["owned_contexts"] = counts.ownedContexts;
+        result["runtime_order"] = counts.runtimeOrder;
+        result["rhi_device_order"] = counts.rhiDeviceOrder;
+        result["owned_context_order"] = counts.ownedContextOrder;
+        return result;
+    });
+#endif
     module.def("_plan_value_abi", &planValueAbi, nb::arg("module"), nb::arg("logical_dtypes"));
     nb::class_<StructuredVjp>(module, "_StructuredVjp")
         .def_prop_ro("tape_bytes", &StructuredVjp::tapeBytes)
@@ -139,6 +153,8 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("has_cpu_entry", &CompiledProgram::hasCpuEntry);
     nb::class_<RhiHost>(module, "RhiHost")
         .def(nb::init<VernonRhiBackend, uint32_t>(), nb::arg("backend"), nb::arg("device_index") = 0)
+        .def_static("create_owned_opengl", &RhiHost::createOwnedOpenGL, nb::arg("backend"), nb::arg("api_major"),
+                    nb::arg("api_minor"))
         .def_static("create_external_opengl", &RhiHost::createExternalOpenGL, nb::arg("backend"), nb::arg("user_data"),
                     nb::arg("make_current"), nb::arg("get_proc_address"), nb::arg("api_major"), nb::arg("api_minor"))
         .def("create_buffer", &RhiHost::createBuffer)
@@ -147,7 +163,7 @@ void bindNativeCompiler(nb::module_ &module) {
              nb::arg("depth") = 1, nb::arg("mip_levels") = 1, nb::arg("usage") = 0)
         .def("create_attachment_image", &RhiHost::createAttachmentImage)
         .def("create_sampler", &RhiHost::createSampler, nb::arg("address") = VERNON_RHI_ADDRESS_REPEAT)
-        .def("create_runtime", &createRhiRuntime, nb::keep_alive<0, 1>());
+        .def("create_runtime", &createRhiRuntime);
     nb::class_<RhiBuffer>(module, "RhiBuffer")
         .def_prop_ro("size", [](const RhiBuffer &value) { return value.size; })
         .def("upload", &RhiBuffer::upload, nb::arg("data"), nb::arg("offset") = 0)
@@ -201,11 +217,11 @@ void bindNativeCompiler(nb::module_ &module) {
         .def(nb::init<VernonRuntimeBackend>(), nb::arg("backend"))
         .def_prop_ro("capabilities",
                      [](const Runtime &runtime) {
-                         return runtimeCapabilitiesDict(vernonRuntimeGetContextCapabilities(runtime.handle));
+                         return runtimeCapabilitiesDict(vernonRuntimeGetContextCapabilities(runtime.state->handle()));
                      })
-        .def("load_program", &Runtime::loadProgramAsset, nb::keep_alive<0, 1>())
+        .def("load_program", &Runtime::loadProgramAsset)
         .def("load_in_memory_program", &Runtime::loadInMemoryProgram, nb::arg("manifest"), nb::arg("directory"),
-             nb::arg("compiled_stages"), nb::keep_alive<0, 1>());
+             nb::arg("compiled_stages"));
     nb::class_<ProgramParameterMetadata>(module, "ProgramParameter")
         .def_ro("slot", &ProgramParameterMetadata::slot)
         .def_ro("name", &ProgramParameterMetadata::name)
@@ -314,10 +330,10 @@ void bindNativeCompiler(nb::module_ &module) {
         .def("begin_invocation", &PythonProgramInstanceAdapter::beginInvocation, nb::keep_alive<0, 1>())
         .def_prop_ro("telemetry", &PythonProgramInstanceAdapter::telemetryView);
     nb::class_<PythonPullback>(module, "Pullback")
-        .def("__call__", &PythonPullback::apply, nb::arg("cotangent") = nb::none())
-        .def("apply_logical", &PythonPullback::applyLogical, nb::arg("cotangent"))
+        .def("__call__", &PythonPullback::apply, nb::arg("cotangent"), nb::arg("context"))
+        .def("apply_logical", &PythonPullback::applyLogical, nb::arg("cotangent"), nb::arg("context"))
         .def("apply_grouped", &PythonPullback::applyGrouped, nb::arg("cotangent").none(), nb::arg("gradient_groups"),
-             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"))
+             nb::arg("cotangent_groups"), nb::arg("carrier_shape"), nb::arg("logical"), nb::arg("context"))
         .def_prop_ro("logical_residual_bytes", &PythonPullback::logicalResidualBytes)
         .def_prop_ro("resident_bytes", &PythonPullback::residentBytes)
         .def_prop_ro("allocated_bytes", &PythonPullback::allocatedBytes)

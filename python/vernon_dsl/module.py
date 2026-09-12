@@ -12,6 +12,7 @@ from typing import Any, ClassVar
 
 import numpy as np
 
+from ._runtime.session import _SessionArtifactCache
 from ._runtime.tensor import TensorStorage, TensorView
 
 
@@ -72,7 +73,7 @@ class Module:
     _module_definition: ClassVar[ModuleDefinition]
     _module_initialized: bool
     _modules: dict[str, Module]
-    _program_cache: dict[tuple[Any, ...], Any]
+    _program_cache: _SessionArtifactCache
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -87,7 +88,7 @@ class Module:
     def __init__(self) -> None:
         object.__setattr__(self, "_module_initialized", True)
         object.__setattr__(self, "_modules", {})
-        object.__setattr__(self, "_program_cache", {})
+        object.__setattr__(self, "_program_cache", _SessionArtifactCache())
 
     def __setattr__(self, name: str, value: Any) -> None:
         initialized = self.__dict__.get("_module_initialized", False)
@@ -117,9 +118,11 @@ class Module:
 
     def __call__(self, *arguments: Any, **keywords: Any) -> Any:
         self._require_initialized()
+        from ._runtime.session import _invocation_context
         from .program import execute_module_primal
 
-        return execute_module_primal(self, arguments, keywords)
+        with _invocation_context():
+            return execute_module_primal(self, arguments, keywords)
 
     def named_modules(self, prefix: str = "") -> tuple[tuple[str, Module], ...]:
         self._require_initialized()
@@ -136,8 +139,6 @@ class Module:
         *,
         variant: Any,
     ) -> tuple[Any, ...]:
-        from ._runtime import session
-
         def signature(value: Any) -> Any:
             from .render import DrawCommand, DynamicState, RenderPass
 
@@ -228,8 +229,6 @@ class Module:
             return signature(value)
 
         return (
-            session._runtime_generation,
-            session._architecture.name,
             definition.source_identity,
             configuration,
             tuple((name, invocation_signature(name, value)) for name, value in bound.arguments.items()),

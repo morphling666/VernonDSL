@@ -338,7 +338,7 @@ class ProgramExecutionTests(unittest.TestCase):
         with self.subTest(case=case.id):
             np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 12.0)
-        self.assertEqual(len(module._program_cache), 1)
+        self.assertEqual(len(module._program_cache._partition(vd.current_session()).snapshot), 1)
 
     def test_module_dynamic_tensor_view_shape_reuses_annotation_static_program(self) -> None:
         module = DynamicIncrement()
@@ -354,7 +354,7 @@ class ProgramExecutionTests(unittest.TestCase):
 
         np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 1.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(7, dtype=np.float32) + 1.0)
-        self.assertEqual(len(module._program_cache), 1)
+        self.assertEqual(len(module._program_cache._partition(vd.current_session()).snapshot), 1)
 
     def test_module_scalar_argument_is_bound_per_invocation(self) -> None:
         source = vd.storage.from_numpy(np.arange(4, dtype=np.float32))
@@ -365,7 +365,7 @@ class ProgramExecutionTests(unittest.TestCase):
 
         np.testing.assert_array_equal(first.to_numpy(), np.arange(4, dtype=np.float32) + 2.0)
         np.testing.assert_array_equal(second.to_numpy(), np.arange(4, dtype=np.float32) + 5.0)
-        self.assertEqual(len(module._program_cache), 1)
+        self.assertEqual(len(module._program_cache._partition(vd.current_session()).snapshot), 1)
 
     def test_module_allows_concurrent_invocation_snapshots(self) -> None:
         module = ParameterizedIncrement()
@@ -643,7 +643,7 @@ class ProgramGpuExecutionTests(unittest.TestCase):
         module = PersistentlyBoundIncrement()
 
         first = module(output, source, np.float32(2.0)).to_numpy().copy()
-        specialization = next(iter(module._program_cache.values()))
+        specialization = next(iter(module._program_cache._partition(vd.current_session()).snapshot.values()))
         first_telemetry = dict(specialization.native_program.binding_telemetry)
         unchanged = module(output, source, np.float32(2.0)).to_numpy().copy()
         unchanged_telemetry = dict(specialization.native_program.binding_telemetry)

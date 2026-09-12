@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import Annotated, Any, get_args, get_origin
 
 import numpy as np
 
+from .. import _native
 from .._dtypes import NUMPY_DTYPE_BY_SCALAR
 from ..host_values import (
     HostAbiLayout,
@@ -18,7 +18,8 @@ from ..host_values import (
     unpack_tangent_value,
 )
 from ..types import TypeExpr, _Scalar
-from .resource_common import _session_state
+from .residency import _ResourceAccessDomain, _SingleResidency
+from .session import _InvocationContext
 
 _ACCESS_MODES = frozenset({"read", "write", "read_write"})
 _VALUE_FIELD = "__value"
@@ -159,7 +160,7 @@ class _DirtyRangeSet:
     """Python resource adapter for runtime-owned dirty byte tracking."""
 
     def __init__(self, byte_size: int, *, dirty: bool = False):
-        self._native = _session_state()._native._DirtyRangeSet(byte_size, dirty)
+        self._native = _native._DirtyRangeSet(byte_size, dirty)
 
     @property
     def ranges(self) -> tuple[tuple[int, int], ...]:
@@ -203,49 +204,6 @@ def _array_byte_ranges(array: np.ndarray, allocation: np.ndarray) -> list[tuple[
     return _coalesced_byte_ranges(ranges)
 
 
-class _PlannedTensorState:
-    def __init__(self, owner: TensorStorage, mode: str):
-        self._owner: TensorStorage | None = owner
-        self._mode = mode
-        self._buffer = owner._native_buffer
-        self._generation = owner._native_generation
-        self._device_dirty = owner._device_dirty
-        self._dirty_ranges = owner._dirty_ranges.ranges
-        if mode == "write":
-            owner._planned_device_writes += 1
-
-    def __del__(self) -> None:
-        self._rollback_planned_state()
-
-    def _commit_planned_state(self) -> None:
-        owner = self._owner
-        if owner is None:
-            return
-        self._owner = None
-        if self._mode == "write":
-            owner._planned_device_writes -= 1
-        owner._dirty_ranges.clear()
-        owner._device_dirty = self._mode == "write"
-
-    def _rollback_planned_state(self) -> None:
-        owner = self._owner
-        if owner is None:
-            return
-        self._owner = None
-        if self._mode == "write":
-            owner._planned_device_writes -= 1
-            owner._native_buffer = None
-            owner._native_generation = -1
-            owner._device_dirty = False
-            owner._dirty_ranges.mark_all()
-            return
-        owner._native_buffer = self._buffer
-        owner._native_generation = self._generation
-        owner._device_dirty = self._device_dirty
-        owner._dirty_ranges.clear()
-        owner._dirty_ranges.mark(list(self._dirty_ranges), allow_full=False)
-
-
 class TensorStorage:
     """Host owner of a dense row-major allocation with one canonical element layout."""
 
@@ -266,15 +224,11 @@ class TensorStorage:
         self._element_type = element_type
         self._element_layout = element_layout
         self._element_alignment = element_layout.alignment if element_layout is not None else array.dtype.itemsize
-        self._native_buffer: Any | None = None
-        self._native_generation = -1
-        self._planned_device_writes = 0
+        self._residency = _SingleResidency()
         self._dirty_ranges = _DirtyRangeSet(array.nbytes, dirty=True)
         self._device_dirty = False
-        self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, object, str]] = []
+        self._access_domain = _ResourceAccessDomain()
         self._full_views: dict[str, TensorView] = {}
-        _session_state()._runtime_children.add(self)
 
     @classmethod
     def __class_getitem__(cls, arguments: Any) -> TypeExpr:
@@ -771,89 +725,39 @@ class TensorStorage:
         return materialize((), 0)
 
     def synchronize(self) -> None:
-        if not self._device_dirty or self._native_buffer is None:
+        residency = self._residency.current
+        if not self._device_dirty or residency is None:
             return
         if self._dirty_ranges:
-            self._upload_dirty_ranges()
-        downloaded = np.frombuffer(self._native_buffer.download(), dtype=self._array.dtype).reshape(self.shape)
+            self._upload_dirty_ranges(residency.handle)
+        downloaded = np.frombuffer(residency.handle.download(), dtype=self._array.dtype).reshape(self.shape)
         np.copyto(self._array, downloaded)
         self._device_dirty = False
         self._dirty_ranges.clear()
 
-    def _release_runtime_native(self) -> None:
-        self.synchronize()
-        self._native_buffer = None
-        self._native_generation = -1
+    def _resident_buffer(self, context: _InvocationContext) -> Any:
+        with self._access_domain.lock:
+            return self._resident_buffer_locked(context)
 
-    def _resident_buffer(self) -> Any:
-        state = _session_state()
-        if state._native_runtime is None or state._rhi_host is None:
+    def _resident_buffer_locked(self, context: _InvocationContext) -> Any:
+        state = context.session
+        if state.rhi_host is None:
             raise RuntimeError("device TensorStorage residency requires a GPU RHI host")
-        if self._planned_device_writes:
-            return self._planned_buffer()
-        if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            if self._native_buffer is not None and self._device_dirty:
+        buffer = self._residency.handle_for(state.identity)
+        if buffer is None:
+            if self._residency.current is not None and self._device_dirty:
                 self.synchronize()
-            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
-            self._native_generation = state._runtime_generation
+            buffer = self._residency.replace(state.identity, state.rhi_host.create_buffer(self._array.nbytes))
             self._dirty_ranges.mark_all()
             self._device_dirty = False
-        assert self._native_buffer is not None
         if self._dirty_ranges:
-            self._upload_dirty_ranges()
-        return self._native_buffer
+            self._upload_dirty_ranges(buffer)
+        return buffer
 
-    def _begin_planned_upload(
-        self,
-    ) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
-        state = _session_state()
-        if state._native_runtime is None or state._rhi_host is None:
-            raise RuntimeError("planned TensorStorage residency requires a GPU RHI host")
-        if self._native_buffer is not None and self._device_dirty:
-            raise RuntimeError("cannot replace device-dirty TensorStorage residency")
-        if self._planned_device_writes:
-            raise RuntimeError("cannot upload TensorStorage while a planned device write is pending")
-        transaction = _PlannedTensorState(self, "upload")
-        if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
-            self._native_generation = state._runtime_generation
-            self._dirty_ranges.mark_all()
+    def _upload_dirty_ranges(self, buffer: Any) -> None:
         bytes_view = self._array.reshape(-1).view(np.uint8)
         uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
-        return self._native_buffer, transaction, uploads
-
-    def _begin_planned_device_write(self) -> _PlannedTensorState:
-        if self._device_dirty:
-            raise RuntimeError("cannot overwrite device-dirty TensorStorage in a planned command program")
-        if self._planned_device_writes:
-            raise RuntimeError("TensorStorage already has a pending planned device write")
-        state = _session_state()
-        if state._native_runtime is None or state._rhi_host is None:
-            raise RuntimeError("planned TensorStorage write requires a GPU RHI host")
-        transaction = _PlannedTensorState(self, "write")
-        if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            self._native_buffer = state._rhi_host.create_buffer(self._array.nbytes)
-            self._native_generation = state._runtime_generation
-        return transaction
-
-    def _planned_buffer(self) -> Any:
-        state = _session_state()
-        if (
-            self._native_buffer is None
-            or state._rhi_host is None
-            or self._native_generation != state._runtime_generation
-        ):
-            raise RuntimeError("planned TensorStorage buffer was not prepared")
-        return self._native_buffer
-
-    def _planned_device_write_pending(self) -> bool:
-        return self._planned_device_writes != 0
-
-    def _upload_dirty_ranges(self) -> None:
-        assert self._native_buffer is not None
-        bytes_view = self._array.reshape(-1).view(np.uint8)
-        uploads = [(begin, bytes(bytes_view[begin:end])) for begin, end in self._dirty_ranges.ranges]
-        self._native_buffer.upload_ranges(uploads)
+        buffer.upload_ranges(uploads)
         self._dirty_ranges.clear()
 
     def _mark_device_dirty(self) -> None:
@@ -861,14 +765,10 @@ class TensorStorage:
         self._dirty_ranges.clear()
 
     def _ensure_host_mutation_allowed(self) -> None:
-        with self._borrow_lock:
-            if self._active_borrows:
-                raise RuntimeError("host mutation is forbidden while a device dispatch borrows TensorStorage")
+        self._access_domain.require_host_mutation("TensorStorage")
 
     def _ensure_host_read_allowed(self) -> None:
-        with self._borrow_lock:
-            if any(access != "read" for _, _, access in self._active_borrows):
-                raise RuntimeError("host reads are forbidden while a device dispatch writes TensorStorage")
+        self._access_domain.require_host_read("TensorStorage")
 
 
 class RawBuffer:
@@ -887,14 +787,11 @@ class RawBuffer:
         self._array = np.frombuffer(view, dtype=np.uint8)
         self._alignment = alignment
         self._readonly = view.readonly
-        self._native_buffer: Any | None = None
-        self._native_generation = -1
+        self._residency = _SingleResidency()
         self._host_version = 1
         self._uploaded_version = 0
         self._device_dirty = False
-        self._borrow_lock = threading.RLock()
-        self._active_borrows: list[tuple[object, object, str]] = []
-        _session_state()._runtime_children.add(self)
+        self._access_domain = _ResourceAccessDomain()
 
     @classmethod
     def allocate(cls, byte_size: int, *, alignment: int) -> RawBuffer:
@@ -959,48 +856,43 @@ class RawBuffer:
         )
 
     def synchronize(self) -> None:
-        if not self._device_dirty or self._native_buffer is None:
+        residency = self._residency.current
+        if not self._device_dirty or residency is None:
             return
-        downloaded = self._native_buffer.download()
+        downloaded = residency.handle.download()
         self._array[:] = np.frombuffer(downloaded, dtype=np.uint8)
         self._device_dirty = False
         self._host_version += 1
         self._uploaded_version = self._host_version
 
-    def _release_runtime_native(self) -> None:
-        self.synchronize()
-        self._native_buffer = None
-        self._native_generation = -1
+    def _resident_buffer(self, context: _InvocationContext) -> Any:
+        with self._access_domain.lock:
+            return self._resident_buffer_locked(context)
 
-    def _resident_buffer(self) -> Any:
-        state = _session_state()
-        if state._native_runtime is None or state._rhi_host is None:
+    def _resident_buffer_locked(self, context: _InvocationContext) -> Any:
+        state = context.session
+        if state.rhi_host is None:
             raise RuntimeError("device RawBuffer residency requires a GPU RHI host")
-        if self._native_buffer is None or self._native_generation != state._runtime_generation:
-            if self._native_buffer is not None and self._device_dirty:
+        buffer = self._residency.handle_for(state.identity)
+        if buffer is None:
+            if self._residency.current is not None and self._device_dirty:
                 self.synchronize()
-            self._native_buffer = state._rhi_host.create_buffer(self.byte_size)
-            self._native_generation = state._runtime_generation
+            buffer = self._residency.replace(state.identity, state.rhi_host.create_buffer(self.byte_size))
             self._uploaded_version = 0
             self._device_dirty = False
-        assert self._native_buffer is not None
         if self._uploaded_version != self._host_version:
-            self._native_buffer.upload(self._array.tobytes())
+            buffer.upload(self._array.tobytes())
             self._uploaded_version = self._host_version
-        return self._native_buffer
+        return buffer
 
     def _mark_device_dirty(self) -> None:
         self._device_dirty = True
 
     def _ensure_host_mutation_allowed(self) -> None:
-        with self._borrow_lock:
-            if self._active_borrows:
-                raise RuntimeError("host mutation is forbidden while a device dispatch borrows RawBuffer")
+        self._access_domain.require_host_mutation("RawBuffer")
 
     def _ensure_host_read_allowed(self) -> None:
-        with self._borrow_lock:
-            if any(access != "read" for _, _, access in self._active_borrows):
-                raise RuntimeError("host reads are forbidden while a device dispatch writes RawBuffer")
+        self._access_domain.require_host_read("RawBuffer")
 
 
 class TensorView:
@@ -1306,19 +1198,8 @@ class TensorView:
             self._owner._host_version += 1
             self._owner._device_dirty = False
 
-    def _resident_buffer(self) -> Any:
-        return self._owner._resident_buffer()
-
-    def _begin_planned_upload(
-        self,
-    ) -> tuple[Any, _PlannedTensorState, list[tuple[int, bytes]]]:
-        return self._owner._begin_planned_upload()
-
-    def _planned_buffer(self) -> Any:
-        return self._owner._planned_buffer()
-
-    def _planned_device_write_pending(self) -> bool:
-        return self._owner._planned_device_write_pending()
+    def _resident_buffer(self, context: _InvocationContext) -> Any:
+        return self._owner._resident_buffer(context)
 
     def _mark_device_dirty(self) -> None:
         self._owner._mark_device_dirty()

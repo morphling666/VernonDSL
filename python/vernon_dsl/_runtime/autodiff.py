@@ -12,6 +12,14 @@ from ..ad import ProgramExpression
 from ..bundle import make_target_options
 from ..frontend.autodiff_profiles import DerivativeGroup
 from .kernel import Kernel, _session_state
+from .session import (
+    _invocation_context,
+    _InvocationContext,
+    _SessionArtifactCache,
+    _use_invocation_context,
+    opengl,
+    opengles,
+)
 
 
 def _validate_grid(grid: tuple[int, int, int]) -> None:
@@ -41,7 +49,7 @@ class _CompiledKernelVjp:
 
 @dataclass
 class _KernelVjpState:
-    compiled: dict[tuple[Any, ...], _CompiledKernelVjp] = field(default_factory=dict)
+    compiled: _SessionArtifactCache = field(default_factory=_SessionArtifactCache)
 
 
 _kernel_states: weakref.WeakKeyDictionary[Kernel, dict[str, _KernelVjpState]] = weakref.WeakKeyDictionary()
@@ -50,13 +58,6 @@ _kernel_states: weakref.WeakKeyDictionary[Kernel, dict[str, _KernelVjpState]] = 
 def _kernel_state(kernel: Kernel, expression: ProgramExpression) -> _KernelVjpState:
     transforms = _kernel_states.setdefault(kernel, {})
     return transforms.setdefault(expression.transform.identity, _KernelVjpState())
-
-
-def invalidate_loaded_vjps() -> None:
-    for transforms in list(_kernel_states.values()):
-        for state in transforms.values():
-            for specialization in state.compiled.values():
-                specialization.compiled._release_runtime_native()
 
 
 def clear_vjp_cache() -> None:
@@ -68,21 +69,16 @@ def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
     if not isinstance(kernel, Kernel):
         raise TypeError("single-entry VJP execution requires one compute Kernel")
     runtime_state = _session_state()
-    if runtime_state._native is None or runtime_state._native_runtime is None:
+    if runtime_state.native is None:
         raise RuntimeError("VJP execution requires the native compiler and runtime")
     options = make_target_options(
-        runtime_state._architecture.name,
-        {"version": runtime_state._interactive_glsl_version()}
-        if runtime_state._architecture in {runtime_state.opengl, runtime_state.opengles}
-        else {},
+        runtime_state.arch.name,
+        {"version": runtime_state.interactive_glsl_version} if runtime_state.arch in {opengl, opengles} else {},
     )
     key = kernel._specialization_key((), options.target, tuple(sorted(options.options.items())))
     state = _kernel_state(kernel, expression)
-    specialization = state.compiled.get(key)
-    if specialization is not None and not kernel._dependencies_current(specialization):
-        del state.compiled[key]
-        specialization = None
-    if specialization is None:
+
+    def compile_vjp() -> _CompiledKernelVjp:
         from ..program import _capture_kernel_program, _capture_recipes
         from .program_autodiff import compile_program_autodiff
 
@@ -91,7 +87,7 @@ def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
             transform=expression.transform,
         )
         _, output_recipe = _capture_recipes(capture, invocation.outputs)
-        specialization = _CompiledKernelVjp(
+        return _CompiledKernelVjp(
             compile_program_autodiff(parsed, template),
             invocation,
             parameter_names,
@@ -99,8 +95,13 @@ def _compile_kernel_vjp(expression: ProgramExpression) -> _CompiledKernelVjp:
             kernel._workgroup_size,
             kernel._dependency_hashes(frontend),
         )
-        state.compiled[key] = specialization
-    return specialization
+
+    return state.compiled.get_or_create(
+        runtime_state,
+        key,
+        compile_vjp,
+        kernel._dependencies_current,
+    )
 
 
 def execute_direct_vjp(
@@ -108,36 +109,40 @@ def execute_direct_vjp(
     arguments: tuple[Any, ...],
     grid: tuple[int, int, int] | None,
 ) -> tuple[Any, Any]:
-    if grid is None:
-        raise TypeError("grid is required for single-entry structured VJP execution")
-    _validate_grid(grid)
-    specialization = _compile_kernel_vjp(expression)
-    if len(arguments) != len(specialization.parameter_names):
-        raise TypeError(f"single-entry VJP expects {len(specialization.parameter_names)} launch arguments")
-    inputs = dict(zip(specialization.parameter_names, arguments, strict=True))
-    inputs.update(dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True)))
-    invocation = dataclasses.replace(
-        specialization.invocation,
-        inputs=inputs,
-        outputs=specialization.output_recipe.resolve(inputs, ()),
-    )
-    _, pullback = specialization.compiled.invoke(invocation)
-    pullback._lease.release()
-    extent = tuple(count * size for count, size in zip(grid, specialization.workgroup_size, strict=True))
-    carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
-    return None, _KernelPullback(pullback, carrier_shape)
+    with _invocation_context() as context:
+        if grid is None:
+            raise TypeError("grid is required for single-entry structured VJP execution")
+        _validate_grid(grid)
+        specialization = _compile_kernel_vjp(expression)
+        if len(arguments) != len(specialization.parameter_names):
+            raise TypeError(f"single-entry VJP expects {len(specialization.parameter_names)} launch arguments")
+        inputs = dict(zip(specialization.parameter_names, arguments, strict=True))
+        inputs.update(dict(zip(("__grid_x", "__grid_y", "__grid_z"), grid, strict=True)))
+        invocation = dataclasses.replace(
+            specialization.invocation,
+            inputs=inputs,
+            outputs=specialization.output_recipe.resolve(inputs, ()),
+        )
+        _, pullback = specialization.compiled.invoke(invocation)
+        pullback._lease.release()
+        extent = tuple(count * size for count, size in zip(grid, specialization.workgroup_size, strict=True))
+        carrier_shape = () if extent == (1, 1, 1) else tuple(reversed(extent))
+        return None, _KernelPullback(pullback, carrier_shape, context)
 
 
 @dataclass
 class _KernelPullback:
     pullback: Any
     carrier_shape: tuple[int, ...]
+    context: _InvocationContext
 
     def __call__(self, cotangent: Any = None) -> dict[str, Any]:
-        return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
+        with _use_invocation_context(self.context):
+            return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
 
     def apply_logical(self, cotangent: Any) -> dict[str, Any]:
-        return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
+        with _use_invocation_context(self.context):
+            return self.pullback.apply_with_carrier(self._canonical_cotangent(cotangent), ())
 
     def _canonical_cotangent(self, cotangent: Any) -> Any:
         if cotangent is None or not self.carrier_shape:
@@ -160,5 +165,4 @@ class _KernelPullback:
 __all__ = [
     "clear_vjp_cache",
     "execute_direct_vjp",
-    "invalidate_loaded_vjps",
 ]

@@ -288,7 +288,7 @@ class ModuleTests(unittest.TestCase):
 
         np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
-        specialization = next(iter(module._program_cache.values()))
+        specialization = next(iter(module._program_cache._partition(vd.current_session()).snapshot.values()))
         signature = specialization.executable.program_ad_signature
         self.assertEqual([value["path"] for value in signature["inputs"]], ["source"])
         self.assertEqual([value["path"] for value in signature["outputs"]], ["square", "cube"])
@@ -371,7 +371,7 @@ class ModuleTests(unittest.TestCase):
         np.testing.assert_array_equal(outputs.square.to_numpy(), np.array([4.0], dtype=np.float32))
         np.testing.assert_array_equal(outputs.cube.to_numpy(), np.array([8.0], dtype=np.float32))
         module(vd.storage.from_numpy(np.array([3.0], dtype=np.float32)))
-        self.assertEqual(len(module._program_cache), 1)
+        self.assertEqual(len(module._program_cache._partition(vd.current_session()).snapshot), 1)
 
     def test_primal_cache_hit_does_not_reexecute_forward(self) -> None:
         module = AnnotatedSquare()
@@ -422,7 +422,7 @@ class ModuleTests(unittest.TestCase):
     def test_gpu_primal_cache_hit_executes_canonical_program(self, backend: BackendRow) -> None:
         module = FanIn()
         module(vd.storage.from_numpy(np.array([2.0], dtype=np.float32)))
-        specialization = next(iter(module._program_cache.values()))
+        specialization = next(iter(module._program_cache._partition(vd.current_session()).snapshot.values()))
         self.assertIsNotNone(specialization.native_program)
         with mock.patch(
             "vernon_dsl._runtime.kernel.Kernel.__call__",

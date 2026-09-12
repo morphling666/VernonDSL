@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import copy
+import gc
 import hashlib
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -1169,6 +1171,7 @@ asset = vd.program_asset(id="module/square", program=Square())
             from vernon_dsl._program_assets.source import load_program_asset_declaration
 
             native = _native_module()
+            lifecycle_hooks = hasattr(native, "_reset_lifecycle_test_counts")
             declaration = load_program_asset_declaration(source, "asset")
             captured = capture_program(declaration)
             for backend_row in BACKEND_TEST_MATRIX:
@@ -1214,56 +1217,86 @@ asset = vd.program_asset(id="module/square", program=Square())
                             (runtime_root / descriptor["path"]).unlink()
                     else:
                         backend = getattr(native.RhiBackend, backend_row.rhi_backend)
-                        host = native.RhiHost(backend)
+                        owned_context = target_name in {"opengl", "opengles"}
+                        if lifecycle_hooks:
+                            gc.collect()
+                            native._reset_lifecycle_test_counts()
+                        if owned_context:
+                            version = (4, 3) if target_name == "opengl" else (3, 1)
+                            try:
+                                host = native.RhiHost.create_owned_opengl(backend, *version)
+                            except RuntimeError as error:
+                                self.skipTest(str(error))
+                        else:
+                            host = native.RhiHost(backend)
+                        host_refcount = sys.getrefcount(host)
                         runtime = host.create_runtime()
+                        self.assertEqual(sys.getrefcount(host), host_refcount)
                         compiled_stages = []
+                    runtime_refcount = sys.getrefcount(runtime)
                     loaded = runtime.load_in_memory_program(
                         canonical_json(deployed).encode(),
                         str(runtime_root),
                         compiled_stages,
                     )
+                    self.assertEqual(sys.getrefcount(runtime), runtime_refcount)
                     source_array = np.array([3.0], dtype=np.float32)
                     output_array = np.zeros(1, dtype=np.float32)
+                    source_buffer = None
                     output_buffer = None
-                    invocation = loaded.program_instance().begin_invocation()
-                    builder = invocation.builder
-                    if target_name == "cpu":
-                        for parameter, array in zip(loaded.parameters, (source_array, output_array), strict=True):
-                            prepared = builder.prepare_host_tensor(parameter.slot, array)
-                            invocation.bind(
-                                parameter.slot,
-                                ("test", parameter.slot),
-                                lambda prepared=prepared: prepared,
-                            )
-                    else:
+
+                    if target_name != "cpu":
                         assert host is not None
                         source_buffer = host.create_buffer(source_array.nbytes)
                         output_buffer = host.create_buffer(output_array.nbytes)
                         source_buffer.upload(source_array.tobytes())
                         output_buffer.upload(output_array.tobytes())
-                        for parameter, buffer in zip(
-                            loaded.parameters,
-                            (source_buffer, output_buffer),
-                            strict=True,
-                        ):
-                            prepared = builder.prepare_rhi_tensor(
-                                parameter.slot,
-                                buffer,
-                                parameter.access,
-                                [1],
-                                [4],
-                            )
-                            invocation.bind(
-                                parameter.slot,
-                                ("test", parameter.slot),
-                                lambda prepared=prepared: prepared,
-                            )
-                    invocation.forward()
-                    invocation.commit()
-                    if target_name != "cpu":
-                        assert output_buffer is not None
-                        output_array = np.frombuffer(output_buffer.download(), dtype=np.float32)
-                    np.testing.assert_array_equal(output_array, np.array([9.0], dtype=np.float32))
+
+                    def execute_loaded(
+                        loaded: object = loaded,
+                        target_name: str = target_name,
+                        source_array: np.ndarray = source_array,
+                        output_array: np.ndarray = output_array,
+                        source_buffer: object | None = source_buffer,
+                        output_buffer: object | None = output_buffer,
+                    ) -> np.ndarray:
+                        invocation = loaded.program_instance().begin_invocation()
+                        builder = invocation.builder
+                        if target_name == "cpu":
+                            for parameter, array in zip(loaded.parameters, (source_array, output_array), strict=True):
+                                prepared = builder.prepare_host_tensor(parameter.slot, array)
+                                invocation.bind(
+                                    parameter.slot,
+                                    ("test", parameter.slot),
+                                    lambda prepared=prepared: prepared,
+                                )
+                        else:
+                            assert source_buffer is not None
+                            assert output_buffer is not None
+                            for parameter, buffer in zip(
+                                loaded.parameters,
+                                (source_buffer, output_buffer),
+                                strict=True,
+                            ):
+                                prepared = builder.prepare_rhi_tensor(
+                                    parameter.slot,
+                                    buffer,
+                                    parameter.access,
+                                    [1],
+                                    [4],
+                                )
+                                invocation.bind(
+                                    parameter.slot,
+                                    ("test", parameter.slot),
+                                    lambda prepared=prepared: prepared,
+                                )
+                        invocation.forward()
+                        invocation.commit()
+                        if output_buffer is not None:
+                            return np.frombuffer(output_buffer.download(), dtype=np.float32)
+                        return output_array
+
+                    np.testing.assert_array_equal(execute_loaded(), np.array([9.0], dtype=np.float32))
                     if target_name == "cpu":
                         legacy_deployment = copy.deepcopy(deployed)
                         legacy_deployment["variants"][0]["stage_bindings"] = {
@@ -1310,6 +1343,40 @@ asset = vd.program_asset(id="module/square", program=Square())
                                 )
                         finally:
                             artifact_path.write_bytes(original_bytes)
+                    del runtime
+                    host = None
+                    gc.collect()
+                    if backend_row.rhi_backend is not None and lifecycle_hooks:
+                        self.assertEqual(
+                            native._lifecycle_test_counts(),
+                            {
+                                "runtimes": 0,
+                                "rhi_devices": 0,
+                                "owned_contexts": 0,
+                                "runtime_order": 0,
+                                "rhi_device_order": 0,
+                                "owned_context_order": 0,
+                            },
+                        )
+                    self.assertEqual(tuple(parameter.name for parameter in loaded.parameters), ("source", "output"))
+                    output_array.fill(0)
+                    if output_buffer is not None:
+                        output_buffer.upload(output_array.tobytes())
+                    np.testing.assert_array_equal(execute_loaded(), np.array([9.0], dtype=np.float32))
+                    del execute_loaded, loaded, source_buffer, output_buffer
+                    gc.collect()
+                    if backend_row.rhi_backend is not None and lifecycle_hooks:
+                        self.assertEqual(
+                            native._lifecycle_test_counts(),
+                            {
+                                "runtimes": 1,
+                                "rhi_devices": 1,
+                                "owned_contexts": int(owned_context),
+                                "runtime_order": 1,
+                                "rhi_device_order": 2,
+                                "owned_context_order": 3 if owned_context else 0,
+                            },
+                        )
 
     def test_cpu_graphics_pipeline_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

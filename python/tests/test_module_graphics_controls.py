@@ -553,7 +553,9 @@ class ModuleGraphicsControlTests(unittest.TestCase):
             )
         )
         module(vertices, *controls)
-        invocation_controls = next(iter(module._program_cache.values())).invocation.graphics_controls
+        invocation_controls = next(
+            iter(module._program_cache._partition(vd.current_session()).snapshot.values())
+        ).invocation.graphics_controls
         self.assertEqual(len(invocation_controls), 2)
         self.assertNotEqual(invocation_controls[0]["render_pass"][0], invocation_controls[1]["render_pass"][0])
         for texture in textures:
@@ -698,8 +700,9 @@ class ModuleGraphicsControlTests(unittest.TestCase):
                 vd.dynamic_state(viewport=(0, 0, size, size), stencil_reference=stencil),
             )
             self.assertGreater(texture.to_numpy()[..., :3].sum(), 0)
-            self.assertEqual(len(module._program_cache), 1)
-            specialization = next(iter(module._program_cache.values()))
+            session_cache = module._program_cache._partition(vd.current_session()).snapshot
+            self.assertEqual(len(session_cache), 1)
+            specialization = next(iter(session_cache.values()))
             if executable_identity is None:
                 executable_identity = id(specialization.native_program)
                 manifest_snapshot = repr(specialization.invocation.graph)

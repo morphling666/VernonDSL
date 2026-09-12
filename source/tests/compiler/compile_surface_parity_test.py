@@ -41,7 +41,8 @@ else:
 
 import vernon_dsl as vd  # noqa: E402
 import vernon_dsl._program_assets.compile_orchestration as compile_orchestration_module  # noqa: E402
-import vernon_dsl._runtime.session as runtime_module  # noqa: E402
+import vernon_dsl._runtime.pipeline as pipeline_runtime_module  # noqa: E402
+import vernon_dsl._runtime.program_autodiff as program_autodiff_module  # noqa: E402
 from program_asset_fixture import (  # noqa: E402
     OFFSET,
     scale,
@@ -279,8 +280,8 @@ class CompileSurfaceParityTests(unittest.TestCase):
 
     def test_interactive_pipeline_and_both_cooker_surfaces_share_plan(self) -> None:
         cases = (
-            ("opengl", runtime_module.opengl, (3, 3)),
-            ("vulkan", runtime_module.vulkan, None),
+            ("opengl", vd.opengl, (3, 3)),
+            ("vulkan", vd.vulkan, None),
         )
         for target_name, architecture, api_version in cases:
             with self.subTest(target=target_name), tempfile.TemporaryDirectory() as directory:
@@ -301,6 +302,18 @@ class CompileSurfaceParityTests(unittest.TestCase):
                         return object()
 
                 capture = PipelineCapture()
+
+                class RuntimeCapture:
+                    pass
+
+                runtime = RuntimeCapture()
+                runtime.arch = architecture
+                runtime.native = native
+                runtime.native_runtime = capture
+                runtime.identity = 101
+                runtime.interactive_glsl_version = (
+                    0 if api_version is None else api_version[0] * 100 + api_version[1] * 10
+                )
                 pipeline = vd.pipeline(
                     triangle_vertex,
                     solid_fragment,
@@ -309,12 +322,9 @@ class CompileSurfaceParityTests(unittest.TestCase):
                 position = vd.storage.from_numpy(np.zeros((3, 2), dtype=np.float32))
                 target = vd.RenderTarget.from_attachments(colors={0: vd.Texture.zeros(shape=(16, 16))})
                 render_pass = vd.render_pass(target)
-                with mock.patch.multiple(
-                    runtime_module,
-                    _architecture=architecture,
-                    _native_runtime=capture,
-                    _api_version=api_version,
-                    _runtime_generation=101,
+                with (
+                    mock.patch.object(pipeline_runtime_module, "_session_state", return_value=runtime),
+                    mock.patch.object(program_autodiff_module, "_session_state", return_value=runtime),
                 ):
                     compiled = pipeline._compile({"position": position}, render_pass, None, None)
                     repeated = pipeline._compile({"position": position}, render_pass, None, None)
@@ -405,7 +415,7 @@ class CompileSurfaceParityTests(unittest.TestCase):
         self.assertTrue(program.has_cpu_entry("scale"))
 
         vd.init(arch=vd.cpu)
-        runtime_module.Kernel.clear_cache()
+        type(scale).clear_cache()
         scale.compile_count = 0
         first = vd.storage.from_numpy(source)
         second = vd.storage.from_numpy(source)

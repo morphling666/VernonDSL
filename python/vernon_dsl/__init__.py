@@ -94,9 +94,12 @@ from .render import (
     triangles,
 )
 from .runtime import (
+    Architecture,
     Kernel,
     Pipeline,
     RenderTarget,
+    RuntimeConfiguration,
+    RuntimeSession,
     SamplerState,
     TensorLayout,
     TensorStorage,
@@ -106,6 +109,7 @@ from .runtime import (
     TextureView,
     cpu,
     cuda,
+    current_session,
     d32_float,
     directx,
     init,
@@ -158,6 +162,7 @@ from .types import (
 
 __all__ = [
     "Annotated",
+    "Architecture",
     "AttachmentOperation",
     "BlendFactor",
     "BlendOperation",
@@ -193,6 +198,8 @@ __all__ = [
     "RasterizationState",
     "RenderPass",
     "RenderTarget",
+    "RuntimeConfiguration",
+    "RuntimeSession",
     "Sampler",
     "Specialization",
     "SamplerState",
@@ -226,6 +233,7 @@ __all__ = [
     "cpu",
     "cross",
     "cuda",
+    "current_session",
     "d32_float",
     "directx",
     "dot",
