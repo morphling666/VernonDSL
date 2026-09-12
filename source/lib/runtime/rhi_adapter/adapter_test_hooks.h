@@ -20,6 +20,7 @@ struct RhiAdapterPreparationStats {
 };
 
 RhiAdapterPreparationStats getRhiAdapterPreparationStats(const VernonRuntimeRhiAdapter &adapter);
+size_t getRhiAdapterRetainedLeaseCount(const VernonRuntimeRhiAdapter &adapter);
 
 } // namespace vernon::runtime
 

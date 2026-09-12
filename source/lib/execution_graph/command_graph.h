@@ -2,6 +2,7 @@
 #define VERNON_RUNTIME_COMMAND_GRAPH_H
 
 #include "VernonRHI.h"
+#include "rhi/rhi_lifecycle.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -262,6 +263,8 @@ struct ExecutionResourceRecord {
     bool graphOwned{};
     uint64_t resourceKey{};
     std::vector<uint64_t> imageViewKeys;
+    std::optional<rhi::RetainedRhiResourceLease> resourceLease;
+    std::vector<rhi::RetainedRhiResourceLease> imageViewLeases;
     VernonRhiBuffer buffer{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
     VernonRhiImage image{static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
 };

@@ -173,8 +173,10 @@ TEST(RuntimeMetal, CreatesDeviceAndRoundTripsAllBufferMemoryClasses) {
     ASSERT_EQ(vernonRhiDeviceSubmit(device, shutdownEncoder, &shutdownCompletion), VERNON_RHI_STATUS_OK);
 
     vernonRhiDestroyDevice(device);
-    EXPECT_EQ(vernonRhiCompletionGetState(device, shutdownCompletion, &completionState),
-              VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiCompletionGetState(device, shutdownCompletion, &completionState), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiCompletionWait(device, shutdownCompletion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, shutdownCompletion), VERNON_RHI_STATUS_OK);
+    vernonRhiDestroyDevice(device);
 }
 
 TEST(RuntimeMetal, BoundsInFlightSubmissionsUntilCompletionObservation) {
@@ -735,12 +737,13 @@ TEST(RuntimeMetal, RetainedBufferDelaysSlotReuse) {
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &first), VERNON_RHI_STATUS_OK);
     const uint64_t resource = vernon::rhi::bufferResource(device, first);
     ASSERT_NE(resource, 0u);
-    ASSERT_TRUE(vernon::rhi::retainResource(device, vernon::rhi::ResourceKind::Buffer, resource));
+    auto retained = vernon::rhi::retainResource(device, vernon::rhi::ResourceKind::Buffer, resource);
+    ASSERT_TRUE(retained.isOk());
     ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, first), VERNON_RHI_STATUS_OK);
     VernonRhiBuffer replacement{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &replacement), VERNON_RHI_STATUS_OK);
     EXPECT_NE(replacement.index, first.index);
-    vernon::rhi::releaseResource(device, vernon::rhi::ResourceKind::Buffer, resource);
+    ASSERT_TRUE(retained.value().release().isOk());
     VernonRhiBuffer recycled{};
     ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &recycled), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(recycled.index, first.index);

@@ -3,7 +3,6 @@
 
 #include "execution_command_model.h"
 #include "execution_graph/command_graph.h"
-#include "rhi/logical_resource_record.h"
 
 #include <memory>
 #include <mutex>
@@ -43,6 +42,28 @@ public:
 };
 
 namespace detail {
+
+inline void releaseResourceLease(rhi::RetainedRhiResourceLease &lease) noexcept {
+    if (!lease.active())
+        return;
+    if (lease.release().isErr())
+        resultContractViolation();
+}
+
+inline void releaseExecutionResourceRecords(ExecutionProvider provider, VernonRhiDevice device,
+                                            std::vector<ExecutionResourceRecord> &records) noexcept {
+    if (provider != ExecutionProvider::Rhi)
+        return;
+    for (auto record = records.rbegin(); record != records.rend(); ++record) {
+        if (record->graphOwned && vernonRhiDeviceDestroyBuffer(device, record->buffer) != VERNON_RHI_STATUS_OK)
+            resultContractViolation();
+        for (auto viewLease = record->imageViewLeases.rbegin(); viewLease != record->imageViewLeases.rend();
+             ++viewLease)
+            releaseResourceLease(*viewLease);
+        if (record->resourceLease)
+            releaseResourceLease(*record->resourceLease);
+    }
+}
 
 using CpuPassExecutor = VernonRhiStatus (*)(void *context, uint32_t scheduleOffset, ComputePass &pass,
                                             ComputeEncoder &encoder, const ExecutionResources &resources);

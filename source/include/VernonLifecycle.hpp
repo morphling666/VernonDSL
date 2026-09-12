@@ -162,6 +162,108 @@ inline void requireLifecycleSuccess(Result<void, LifecycleError> result) noexcep
 
 } // namespace detail
 
+template <typename T> class CheckedIntrusiveRef;
+
+template <typename T> class CheckedIntrusiveControl {
+public:
+    static constexpr std::uint64_t maximumReferenceCount = std::numeric_limits<std::uint64_t>::max();
+
+    CheckedIntrusiveControl(const CheckedIntrusiveControl &) = delete;
+    CheckedIntrusiveControl &operator=(const CheckedIntrusiveControl &) = delete;
+
+protected:
+    explicit CheckedIntrusiveControl(std::uint64_t maximumReferences = maximumReferenceCount) noexcept
+        : maximumReferences_(maximumReferences) {
+        if (maximumReferences == 0)
+            resultContractViolation();
+    }
+    ~CheckedIntrusiveControl() = default;
+
+private:
+    [[nodiscard]] Result<void, LifecycleError> retainReference() noexcept {
+        auto retained = checkedAtomicRetain(references_, maximumReferences_);
+        if (retained.isErr())
+            return Result<void, LifecycleError>{
+                err(LifecycleError{LifecycleErrorCode::AdmissionSaturated,
+                                   {"retain_intrusive_reference", references_.load(std::memory_order_acquire), 0}})};
+        return Result<void, LifecycleError>{ok()};
+    }
+
+    void releaseReference() noexcept {
+        std::uint64_t current = references_.load(std::memory_order_acquire);
+        for (;;) {
+            if (current == 0)
+                resultContractViolation();
+            if (references_.compare_exchange_weak(current, current - 1, std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) {
+                if (current == 1)
+                    delete static_cast<T *>(this);
+                return;
+            }
+        }
+    }
+
+    std::atomic<std::uint64_t> references_{1};
+    const std::uint64_t maximumReferences_;
+
+    friend class CheckedIntrusiveRef<T>;
+};
+
+template <typename T> class [[nodiscard]] CheckedIntrusiveRef {
+public:
+    CheckedIntrusiveRef(const CheckedIntrusiveRef &) = delete;
+    CheckedIntrusiveRef &operator=(const CheckedIntrusiveRef &) = delete;
+
+    CheckedIntrusiveRef(CheckedIntrusiveRef &&other) noexcept : value_(std::exchange(other.value_, nullptr)) {}
+    CheckedIntrusiveRef &operator=(CheckedIntrusiveRef &&other) noexcept {
+        if (this != &other) {
+            reset();
+            value_ = std::exchange(other.value_, nullptr);
+        }
+        return *this;
+    }
+    ~CheckedIntrusiveRef() noexcept { reset(); }
+
+    [[nodiscard]] static CheckedIntrusiveRef adopt(T *value) noexcept {
+        if (!value)
+            resultContractViolation();
+        return CheckedIntrusiveRef{value};
+    }
+
+    [[nodiscard]] static Result<CheckedIntrusiveRef, LifecycleError> retain(T *value) noexcept {
+        if (!value)
+            return Result<CheckedIntrusiveRef, LifecycleError>{
+                err(LifecycleError{LifecycleErrorCode::StaleAdmission, {"retain_intrusive_reference", 0, 0}})};
+        auto retained = value->retainReference();
+        if (retained.isErr())
+            return Result<CheckedIntrusiveRef, LifecycleError>{err(std::move(retained).error())};
+        return Result<CheckedIntrusiveRef, LifecycleError>{ok(CheckedIntrusiveRef{value})};
+    }
+
+    [[nodiscard]] Result<CheckedIntrusiveRef, LifecycleError> retain() const noexcept { return retain(&value()); }
+
+    [[nodiscard]] T &value() const noexcept {
+        if (!value_)
+            resultContractViolation();
+        return *value_;
+    }
+
+    [[nodiscard]] T *operator->() const noexcept { return &value(); }
+    [[nodiscard]] explicit operator bool() const noexcept { return value_ != nullptr; }
+
+    void reset() noexcept {
+        if (value_) {
+            T *value = std::exchange(value_, nullptr);
+            value->releaseReference();
+        }
+    }
+
+private:
+    explicit CheckedIntrusiveRef(T *value) noexcept : value_(value) {}
+
+    T *value_{};
+};
+
 class OwnerControlBlock;
 class OwnerRef;
 class ChildReservation;

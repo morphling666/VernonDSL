@@ -1,19 +1,16 @@
 #include "backend_dispatch.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
-#include "logical_resource_record.h"
 #include "metal_backend.h"
 #include "sampler_filter.h"
 #include "VernonTextureTypes.h"
 
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <unordered_map>
 #include <utility>
-#include <vector>
 
 namespace vernon::rhi {
 uint32_t metalTexturePixelFormat(VernonTextureFormat format);
@@ -22,59 +19,85 @@ bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
 
 namespace {
 
-template <typename Native> struct MetalResourceSlot : vernon::rhi::LogicalResourceRecord {
-    Native native;
+using BufferHandle = vernon::rhi::ResourceHandle<vernon::rhi::BufferResourceTag>;
+using ImageHandle = vernon::rhi::ResourceHandle<vernon::rhi::ImageResourceTag>;
+using ImageViewHandle = vernon::rhi::ResourceHandle<vernon::rhi::ImageViewResourceTag>;
+using SamplerHandle = vernon::rhi::ResourceHandle<vernon::rhi::SamplerResourceTag>;
+
+template <typename Tag, typename Native> struct MetalResourcePayload {
+    using Lifecycle = vernon::rhi::ResourceLifecycleSlot<Tag>;
+
+    explicit MetalResourcePayload(Lifecycle slot) noexcept : lifecycle(std::move(slot)) {}
+    MetalResourcePayload(const MetalResourcePayload &) = delete;
+    MetalResourcePayload &operator=(const MetalResourcePayload &) = delete;
+
+    Lifecycle lifecycle;
+    Native native{};
 };
 
-struct MetalBufferSlot : MetalResourceSlot<vernon::rhi::metal::Buffer> {
+struct MetalBufferPayload : MetalResourcePayload<vernon::rhi::BufferResourceTag, vernon::rhi::metal::Buffer> {
+    using MetalResourcePayload::MetalResourcePayload;
     VernonRhiBufferDescriptor descriptor{};
 };
 
-struct MetalImageSlot : MetalResourceSlot<vernon::rhi::metal::Image> {
+struct MetalImagePayload : MetalResourcePayload<vernon::rhi::ImageResourceTag, vernon::rhi::metal::Image> {
+    using MetalResourcePayload::MetalResourcePayload;
     VernonRhiImageDescriptor descriptor{};
 };
 
-struct MetalImageViewSlot : MetalResourceSlot<vernon::rhi::metal::ImageView> {
+struct MetalImageViewPayload
+    : MetalResourcePayload<vernon::rhi::ImageViewResourceTag, vernon::rhi::metal::ImageView> {
+    using MetalResourcePayload::MetalResourcePayload;
     VernonRhiImageViewDescriptor descriptor{};
-    uint64_t imageResource{};
+    VernonRhiImageDescriptor imageDescriptor{};
+    uint64_t parentKey{};
+    vernon::Option<vernon::rhi::RetainedResourceLease<vernon::rhi::ImageResourceTag>> imageLease;
 };
 
-using MetalSamplerSlot = MetalResourceSlot<vernon::rhi::metal::Sampler>;
+using MetalSamplerPayload =
+    MetalResourcePayload<vernon::rhi::SamplerResourceTag, vernon::rhi::metal::Sampler>;
+
+template <typename Payload>
+using MetalPayloadSlots = vernon::rhi::StableResourceSlotContainer<Payload>;
 
 struct MetalDevice {
+    MetalDevice() noexcept = default;
+    MetalDevice(const MetalDevice &) = delete;
+    MetalDevice &operator=(const MetalDevice &) = delete;
+    MetalDevice(MetalDevice &&) = delete;
+    MetalDevice &operator=(MetalDevice &&) = delete;
+
     vernon::rhi::metal::DeviceState state;
-    std::vector<MetalBufferSlot> buffers;
-    std::vector<MetalImageSlot> images;
-    std::vector<MetalImageViewSlot> imageViews;
-    std::vector<MetalSamplerSlot> samplers;
+    MetalPayloadSlots<MetalBufferPayload> buffers;
+    MetalPayloadSlots<MetalImagePayload> images;
+    MetalPayloadSlots<MetalImageViewPayload> imageViews;
+    MetalPayloadSlots<MetalSamplerPayload> samplers;
+    vernon::rhi::CommandDeviceStateRef commandState;
     std::string error;
     std::mutex mutex;
-};
-
-struct MetalDeviceSlot {
-    std::shared_ptr<MetalDevice> device;
-    uint32_t generation{1};
+    std::mutex slotMutex;
+    std::mutex creationMutex;
 };
 
 constexpr uint32_t metalDeviceBit = uint32_t{1} << 28;
-std::vector<MetalDeviceSlot> metalDevices;
-std::mutex deviceMutex;
-std::unordered_map<uint64_t, vernon::rhi::metal::RenderingState *> renderingStates;
-std::mutex renderingStateMutex;
+constexpr size_t maximumMetalDevices = 256;
+vernon::rhi::DeviceRegistry<MetalDevice, maximumMetalDevices> metalDevices;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
 template <typename Handle> uint64_t resourceKey(Handle handle) {
-    return vernon::rhi::encodeResourceKey(handle);
+    return (static_cast<uint64_t>(handle.generation) << 32) | (static_cast<uint64_t>(handle.index) + 1);
 }
 
-bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
+template <typename Handle> vernon::Result<Handle, vernon::RhiError> decodeResourceKey(uint64_t key,
+                                                                                      const char *operation) noexcept {
     const uint64_t encodedIndex = key & UINT32_MAX;
-    generation = static_cast<uint32_t>(key >> 32);
+    const uint32_t generation = static_cast<uint32_t>(key >> 32);
     if (!encodedIndex || !generation)
-        return false;
-    index = static_cast<uint32_t>(encodedIndex - 1);
-    return true;
+        return vernon::Result<Handle, vernon::RhiError>{
+            vernon::err(vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, key, 0}})};
+    return vernon::Result<Handle, vernon::RhiError>{
+        vernon::ok(Handle{static_cast<uint32_t>(encodedIndex - 1), generation})};
 }
 
 uint32_t maximumMipLevels(const VernonRhiImageDescriptor &descriptor) {
@@ -129,143 +152,251 @@ bool supportsImageState(const VernonRhiImageDescriptor &descriptor, VernonRhiRes
     }
 }
 
-template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
-    uint32_t index = 0;
-    uint32_t generation = 0;
-    if (!decodeResourceKey(key, index, generation) || index >= slots.size())
-        return static_cast<typename Slots::value_type *>(nullptr);
-    auto &slot = slots[index];
-    return slot.isRetained(generation) ? &slot : nullptr;
+VernonRhiStatus statusForError(const vernon::RhiError &error) noexcept {
+    switch (error.code) {
+    case vernon::RhiErrorCode::InvalidArgument:
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    case vernon::RhiErrorCode::Unsupported:
+        return VERNON_RHI_STATUS_UNSUPPORTED;
+    case vernon::RhiErrorCode::ResourceExhausted:
+        return VERNON_RHI_STATUS_RESOURCE_EXHAUSTED;
+    case vernon::RhiErrorCode::BackendFailure:
+    case vernon::RhiErrorCode::LifecycleFailure:
+    case vernon::RhiErrorCode::SynchronizationFailure:
+        return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
-template <typename Slots, typename Handle> auto *lookupPublicResource(Slots &slots, Handle handle) {
-    if (handle.index >= slots.size())
-        return static_cast<typename Slots::value_type *>(nullptr);
-    auto &slot = slots[handle.index];
-    return slot.isPublic(handle.generation) ? &slot : nullptr;
+vernon::rhi::DeviceRegistryHandle decodeDeviceHandle(VernonRhiDevice handle) noexcept {
+    return {handle.index & ~metalDeviceBit, handle.generation};
 }
 
-template <typename Slots> uint32_t allocateSlot(Slots &slots) {
-    uint32_t index = 0;
-    while (index < slots.size() && slots[index].occupied)
-        ++index;
-    if (index == slots.size())
-        slots.emplace_back();
-    return index;
+VernonRhiDevice encodeDeviceHandle(vernon::rhi::DeviceRegistryHandle handle) noexcept {
+    return {handle.index | metalDeviceBit, handle.generation};
 }
 
-std::shared_ptr<MetalDevice> lookupMetalDevice(VernonRhiDevice handle) {
+using MetalDeviceAnchor = vernon::rhi::DeviceRegistryAnchor<MetalDevice>;
+
+vernon::Result<MetalDeviceAnchor, vernon::RhiError> lookupMetalDevice(VernonRhiDevice handle) noexcept {
     if ((handle.index & metalDeviceBit) == 0)
-        return {};
-    const uint32_t index = handle.index & ~metalDeviceBit;
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    if (index >= metalDevices.size())
-        return {};
-    MetalDeviceSlot &slot = metalDevices[index];
-    return slot.device && slot.generation == handle.generation ? slot.device : std::shared_ptr<MetalDevice>{};
+        return vernon::Result<MetalDeviceAnchor, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"lookup_metal_device", handle.index, 0}})};
+    return metalDevices.lookup(decodeDeviceHandle(handle));
+}
+
+template <typename Payload>
+vernon::Result<Payload *, vernon::RhiError> payloadAt(MetalPayloadSlots<Payload> &payloads, uint32_t index,
+                                                       const char *operation) noexcept {
+    Payload *payload = payloads.get(index);
+    if (!payload)
+        return vernon::Result<Payload *, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {operation, index, 0}})};
+    return vernon::Result<Payload *, vernon::RhiError>{vernon::ok(payload)};
+}
+
+template <typename Payload>
+vernon::Result<Payload *, vernon::RhiError> reservePayload(MetalDevice &device, MetalPayloadSlots<Payload> &payloads,
+                                                           const char *operation) noexcept {
+    for (std::size_t index = 0; index < payloads.size(); ++index)
+        if (!payloads[index].lifecycle.snapshot().occupied)
+            return vernon::Result<Payload *, vernon::RhiError>{vernon::ok(&payloads[index])};
+    if (payloads.size() >= UINT32_MAX)
+        return vernon::Result<Payload *, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::ResourceExhausted, {operation, payloads.size(), 0}})};
+    using Lifecycle = typename Payload::Lifecycle;
+    auto lifecycle = Lifecycle::create(static_cast<uint32_t>(payloads.size()));
+    if (lifecycle.isErr())
+        return vernon::Result<Payload *, vernon::RhiError>{vernon::err(std::move(lifecycle).error())};
+    std::lock_guard<std::mutex> guard(device.slotMutex);
+    return payloads.emplace(operation, std::move(lifecycle).value());
+}
+
+template <typename Payload, typename Handle>
+vernon::Result<std::pair<Payload *, vernon::OperationPin>, vernon::RhiError>
+pinPayload(MetalDevice &device, MetalPayloadSlots<Payload> &payloads, Handle handle, const char *operation) noexcept {
+    Payload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(payloads, handle.index, operation);
+        if (found.isErr())
+            return vernon::Result<std::pair<Payload *, vernon::OperationPin>, vernon::RhiError>{
+                vernon::err(std::move(found).error())};
+        payload = found.value();
+    }
+    auto pin = payload->lifecycle.pin(handle);
+    if (pin.isErr())
+        return vernon::Result<std::pair<Payload *, vernon::OperationPin>, vernon::RhiError>{
+            vernon::err(std::move(pin).error())};
+    return vernon::Result<std::pair<Payload *, vernon::OperationPin>, vernon::RhiError>{
+        vernon::ok(std::make_pair(payload, std::move(pin).value()))};
+}
+
+vernon::Result<void, vernon::RhiError> teardownBuffer(void *context, BufferHandle handle) noexcept {
+    auto &device = *static_cast<MetalDevice *>(context);
+    MetalBufferPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        if (handle.index >= device.buffers.size())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(
+                vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"teardown_metal_buffer", handle.index, 0}})};
+        payload = &device.buffers[handle.index];
+    }
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.destroyBuffer(payload->native);
+    payload->descriptor = {};
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<void, vernon::RhiError> teardownImage(void *context, ImageHandle handle) noexcept {
+    auto &device = *static_cast<MetalDevice *>(context);
+    MetalImagePayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        if (handle.index >= device.images.size())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(
+                vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"teardown_metal_image", handle.index, 0}})};
+        payload = &device.images[handle.index];
+    }
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.destroyImage(payload->native);
+    payload->descriptor = {};
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<void, vernon::RhiError> teardownImageView(void *context, ImageViewHandle handle) noexcept {
+    auto &device = *static_cast<MetalDevice *>(context);
+    MetalImageViewPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        if (handle.index >= device.imageViews.size())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{
+                vernon::RhiErrorCode::InvalidArgument, {"teardown_metal_image_view", handle.index, 0}})};
+        payload = &device.imageViews[handle.index];
+    }
+    if (!payload->imageLease)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(vernon::RhiError{
+            vernon::RhiErrorCode::LifecycleFailure,
+            {"release_metal_image_view_parent", handle.generation, handle.index}})};
+    auto prepared = payload->imageLease.value().prepareRelease();
+    if (prepared.isErr())
+        return vernon::Result<void, vernon::RhiError>{vernon::err(std::move(prepared).error())};
+    {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        device.state.destroyImageView(payload->native);
+        payload->descriptor = {};
+        payload->imageDescriptor = {};
+        payload->parentKey = 0;
+    }
+    if (prepared.value().commit().isErr())
+        vernon::resultContractViolation();
+    payload->imageLease.reset();
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<void, vernon::RhiError> teardownSampler(void *context, SamplerHandle handle) noexcept {
+    auto &device = *static_cast<MetalDevice *>(context);
+    MetalSamplerPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        if (handle.index >= device.samplers.size())
+            return vernon::Result<void, vernon::RhiError>{vernon::err(
+                vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"teardown_metal_sampler", handle.index, 0}})};
+        payload = &device.samplers[handle.index];
+    }
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.destroySampler(payload->native);
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
+}
+
+vernon::Result<void, vernon::RhiError> teardownDevice(MetalDevice &device) noexcept {
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.shutdown();
+    return vernon::Result<void, vernon::RhiError>{vernon::ok()};
 }
 
 } // namespace
-
-void vernon::rhi::metal::registerRenderingState(uint64_t commandBuffer, RenderingState *rendering) {
-    std::lock_guard<std::mutex> guard(renderingStateMutex);
-    renderingStates[commandBuffer] = rendering;
-}
-
-vernon::rhi::metal::RenderingState *vernon::rhi::metal::findRenderingState(uint64_t commandBuffer) {
-    std::lock_guard<std::mutex> guard(renderingStateMutex);
-    const auto found = renderingStates.find(commandBuffer);
-    return found == renderingStates.end() ? nullptr : found->second;
-}
-
-void vernon::rhi::metal::unregisterRenderingState(uint64_t commandBuffer, RenderingState *rendering) {
-    std::lock_guard<std::mutex> guard(renderingStateMutex);
-    const auto found = renderingStates.find(commandBuffer);
-    if (found != renderingStates.end() && found->second == rendering)
-        renderingStates.erase(found);
-}
 
 namespace vernon::rhi::metal_api {
 
 VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
     if (!descriptor)
         return invalidDevice();
-    auto device = std::shared_ptr<MetalDevice>(new (std::nothrow) MetalDevice());
-    if (!device) {
-        setDeviceCreationError("Metal device state allocation failed");
+    auto reservation = metalDevices.reserve();
+    if (reservation.isErr()) {
+        setDeviceCreationError("Metal device registry reservation failed");
         return invalidDevice();
     }
-    if (!device->state.initialize(descriptor->device_index, device->error)) {
-        setDeviceCreationError(device->error);
+    MetalDevice &device = reservation.value().device();
+    auto owner = reservation.value().retainOwner();
+    if (owner.isErr()) {
+        setDeviceCreationError("Metal device owner retention failed");
         return invalidDevice();
     }
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    uint32_t index = 0;
-    while (index < metalDevices.size() && metalDevices[index].device)
-        ++index;
-    if (index == metalDevices.size()) {
-        if (index >= metalDeviceBit)
-            return invalidDevice();
-        metalDevices.emplace_back();
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    if (commandState.isErr()) {
+        setDeviceCreationError("Metal command state allocation failed");
+        return invalidDevice();
     }
-    metalDevices[index].device = std::move(device);
-    return {index | metalDeviceBit, metalDevices[index].generation};
+    device.commandState = std::move(commandState).value();
+    if (!device.state.initialize(descriptor->device_index, device.error)) {
+        setDeviceCreationError(device.error);
+        return invalidDevice();
+    }
+    auto published = metalDevices.publish(std::move(reservation).value());
+    if (published.isErr()) {
+        device.state.shutdown();
+        setDeviceCreationError("Metal device registry publication failed");
+        return invalidDevice();
+    }
+    return encodeDeviceHandle(published.value());
 }
 
-void destroyDevice(VernonRhiDevice handle) {
-    std::shared_ptr<MetalDevice> device;
-    {
-        const uint32_t index = handle.index & ~metalDeviceBit;
-        std::lock_guard<std::mutex> guard(deviceMutex);
-        if (index >= metalDevices.size() || metalDevices[index].generation != handle.generation)
-            return;
-        MetalDeviceSlot &slot = metalDevices[index];
-        device = std::move(slot.device);
-        if (++slot.generation == 0)
-            slot.generation = 1;
-    }
-    if (!device)
-        return;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    for (MetalImageViewSlot &slot : device->imageViews)
-        if (slot.occupied)
-            device->state.destroyImageView(slot.native);
-    for (MetalBufferSlot &slot : device->buffers)
-        if (slot.occupied)
-            device->state.destroyBuffer(slot.native);
-    for (MetalImageSlot &slot : device->images)
-        if (slot.occupied)
-            device->state.destroyImage(slot.native);
-    for (MetalSamplerSlot &slot : device->samplers)
-        if (slot.occupied)
-            device->state.destroySampler(slot.native);
-    device->state.shutdown();
+vernon::Result<void, vernon::RhiError> destroyDevice(VernonRhiDevice handle) noexcept {
+    if ((handle.index & metalDeviceBit) == 0)
+        return vernon::Result<void, vernon::RhiError>{vernon::err(
+            vernon::RhiError{vernon::RhiErrorCode::InvalidArgument, {"destroy_metal_device", handle.index, 0}})};
+    return metalDevices.remove(decodeDeviceHandle(handle), teardownDevice);
 }
 
-bool ownsDevice(VernonRhiDevice handle) { return static_cast<bool>(lookupMetalDevice(handle)); }
+vernon::Result<vernon::rhi::CommandDeviceStateRef, vernon::RhiError>
+commandState(VernonRhiDevice handle) noexcept {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return vernon::Result<vernon::rhi::CommandDeviceStateRef, vernon::RhiError>{
+            vernon::err(std::move(anchor).error())};
+    return anchor.value().device().commandState.retain();
+}
+
+bool ownsDevice(VernonRhiDevice handle) { return lookupMetalDevice(handle).isOk(); }
 
 VernonStringView lastError(VernonRhiDevice handle) {
-    auto device = lookupMetalDevice(handle);
-    return device ? VernonStringView{device->error.data(), device->error.size()} : VernonStringView{};
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return {};
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return {device.error.data(), device.error.size()};
 }
 
 VernonRhiStatus synchronize(VernonRhiDevice handle) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return device->state.synchronize(device->error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return device.state.synchronize(device.error) ? VERNON_RHI_STATUS_OK : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 void *deviceStateForBackend(VernonRhiDevice handle) {
-    auto device = lookupMetalDevice(handle);
-    return device ? &device->state : nullptr;
+    auto anchor = lookupMetalDevice(handle);
+    return anchor.isOk() ? &anchor.value().device().state : nullptr;
 }
 
 VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescriptor *descriptor,
                              VernonRhiBuffer *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     constexpr uint32_t allUsages =
         VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION | VERNON_RHI_BUFFER_UNIFORM |
@@ -274,121 +405,156 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         descriptor->size > (std::numeric_limits<size_t>::max)() ||
         descriptor->memory_class > VERNON_RHI_MEMORY_READBACK || (descriptor->usage & ~allUsages) != 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const uint32_t index = allocateSlot(device->buffers);
-    MetalBufferSlot &slot = device->buffers[index];
-    if (!device->state.createBuffer(slot.native, *descriptor, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    slot.descriptor = *descriptor;
-    slot.publish();
-    *output = {index, slot.generation};
+    auto owner = anchor.value().retainOwner();
+    if (owner.isErr())
+        return statusForError(owner.error());
+    auto reservation = ResourceCreationReservation::create(owner.value());
+    if (reservation.isErr())
+        return statusForError(reservation.error());
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> creationGuard(device.creationMutex);
+    auto reserved = reservePayload(device, device.buffers, "reserve_metal_buffer");
+    if (reserved.isErr())
+        return statusForError(reserved.error());
+    MetalBufferPayload &payload = *reserved.value();
+    {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        if (!device.state.createBuffer(payload.native, *descriptor, device.error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        payload.descriptor = *descriptor;
+    }
+    auto published = payload.lifecycle.publish(std::move(reservation).value(), &device, teardownBuffer);
+    if (published.isErr()) {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        device.state.destroyBuffer(payload.native);
+        payload.descriptor = {};
+        return statusForError(published.error());
+    }
+    *output = {published.value().index, published.value().generation};
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, const void *source,
                              uint64_t size) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!source || size == 0 || size > (std::numeric_limits<size_t>::max)())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
-    if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "upload_buffer");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+    MetalBufferPayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (offset > payload.descriptor.size || size > payload.descriptor.size - offset)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    if (payload.descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
         vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
-        device->error = "device-level Metal upload cannot execute while a command encoder is recording";
+        device.error = "device-level Metal upload cannot execute while a command encoder is recording";
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
-    return device->state.uploadBuffer(slot->native, offset, source, size, device->error)
+    return device.state.uploadBuffer(payload.native, offset, source, size, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffer,
                                    const VernonRhiBufferUploadRange *ranges, size_t rangeCount) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!ranges || rangeCount == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "upload_buffer_ranges");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (slot->descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
+    MetalBufferPayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (payload.descriptor.memory_class != VERNON_RHI_MEMORY_UPLOAD &&
         vernon::rhi::deviceHasActiveCommandEncoder(handle)) {
-        device->error = "device-level Metal upload cannot execute while a command encoder is recording";
+        device.error = "device-level Metal upload cannot execute while a command encoder is recording";
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
     for (size_t index = 0; index < rangeCount; ++index) {
         const VernonRhiBufferUploadRange &range = ranges[index];
         if (!range.source || range.size == 0 || range.size > (std::numeric_limits<size_t>::max)() ||
-            range.offset > slot->descriptor.size || range.size > slot->descriptor.size - range.offset)
+            range.offset > payload.descriptor.size || range.size > payload.descriptor.size - range.offset)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
-    return device->state.uploadBufferRanges(slot->native, ranges, rangeCount, device->error)
+    return device.state.uploadBufferRanges(payload.native, ranges, rangeCount, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uint64_t offset, void *destination,
                                uint64_t size) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!destination || size == 0 || size > (std::numeric_limits<size_t>::max)())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
-    if (!slot || offset > slot->descriptor.size || size > slot->descriptor.size - offset)
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "download_buffer");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return device->state.downloadBuffer(slot->native, offset, destination, size, device->error)
+    MetalBufferPayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (offset > payload.descriptor.size || size > payload.descriptor.size - offset)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    return device.state.downloadBuffer(payload.native, offset, destination, size, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        device->state.destroyBuffer(slot->native);
-        slot->recycle();
+    MetalDevice &device = anchor.value().device();
+    MetalBufferPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(device.buffers, buffer.index, "destroy_buffer");
+        if (found.isErr())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        payload = found.value();
     }
+    auto destroyed = payload->lifecycle.destroyPublic(BufferHandle{buffer.index, buffer.generation});
+    if (destroyed.isErr())
+        return statusForError(destroyed.error());
     return VERNON_RHI_STATUS_OK;
 }
 
 uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->buffers, buffer) != nullptr;
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "is_buffer_valid");
+    return pinned.isOk();
 }
 
 VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer, void **output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !output)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *slot = lookupPublicResource(device->buffers, buffer);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.buffers, BufferHandle{buffer.index, buffer.generation}, "get_buffer_native_handle");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = (__bridge void *)slot->native.buffer;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    *output = (__bridge void *)pinned.value().first->native.buffer;
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor,
                             VernonRhiImage *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const bool validCube = descriptor && descriptor->dimension == VERNON_RHI_IMAGE_CUBE &&
                            descriptor->width == descriptor->height && descriptor->depth == 1 &&
@@ -415,361 +581,551 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         return VERNON_RHI_STATUS_UNSUPPORTED;
     if (vernon::rhi::metal::pixelFormat(descriptor->format) == MTLPixelFormatInvalid)
         return VERNON_RHI_STATUS_UNSUPPORTED;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const uint32_t index = allocateSlot(device->images);
-    MetalImageSlot &slot = device->images[index];
-    if (!device->state.createImage(slot.native, *descriptor, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    slot.descriptor = *descriptor;
-    slot.publish();
-    *output = {index, slot.generation};
+    auto owner = anchor.value().retainOwner();
+    if (owner.isErr())
+        return statusForError(owner.error());
+    auto reservation = ResourceCreationReservation::create(owner.value());
+    if (reservation.isErr())
+        return statusForError(reservation.error());
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> creationGuard(device.creationMutex);
+    auto reserved = reservePayload(device, device.images, "reserve_metal_image");
+    if (reserved.isErr())
+        return statusForError(reserved.error());
+    MetalImagePayload &payload = *reserved.value();
+    {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        if (!device.state.createImage(payload.native, *descriptor, device.error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+        payload.descriptor = *descriptor;
+    }
+    auto published = payload.lifecycle.publish(std::move(reservation).value(), &device, teardownImage);
+    if (published.isErr()) {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        device.state.destroyImage(payload.native);
+        payload.descriptor = {};
+        return statusForError(published.error());
+    }
+    *output = {published.value().index, published.value().generation};
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageViewDescriptor *descriptor,
                                 VernonRhiImageView *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         vernon::rhi::metal::pixelFormat(descriptor->format) == MTLPixelFormatInvalid ||
         descriptor->mip_level_count == 0 || descriptor->array_layer_count == 0 || descriptor->aspects == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *image = lookupPublicResource(device->images, descriptor->image);
-    if (!image || !vernon::rhi::validImageViewDescriptor(image->descriptor, *descriptor))
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (!image->retain())
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    const uint32_t index = allocateSlot(device->imageViews);
-    MetalImageViewSlot &slot = device->imageViews[index];
-    if (!device->state.createImageView(slot.native, image->native, *descriptor, device->error)) {
-        image->release();
-        return VERNON_RHI_STATUS_UNSUPPORTED;
+    auto owner = anchor.value().retainOwner();
+    if (owner.isErr())
+        return statusForError(owner.error());
+    auto reservation = ResourceCreationReservation::create(owner.value());
+    if (reservation.isErr())
+        return statusForError(reservation.error());
+    MetalDevice &device = anchor.value().device();
+    const ImageHandle imageHandle{descriptor->image.index, descriptor->image.generation};
+    MetalImagePayload *image = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(device.images, imageHandle.index, "create_image_view");
+        if (found.isErr())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        image = found.value();
     }
-    slot.descriptor = *descriptor;
-    slot.imageResource = resourceKey(descriptor->image);
-    slot.publish();
-    *output = {index, slot.generation};
-    return VERNON_RHI_STATUS_OK;
+    auto imageLease = image->lifecycle.retain(imageHandle);
+    if (imageLease.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto imagePin = image->lifecycle.pin(imageHandle);
+    if (imagePin.isErr())
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    VernonRhiStatus result = VERNON_RHI_STATUS_OK;
+    vernon::Option<vernon::rhi::RetainedResourceLease<vernon::rhi::ImageResourceTag>> rollbackLease;
+    MetalImageViewPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> creationGuard(device.creationMutex);
+        {
+            std::lock_guard<std::mutex> nativeGuard(device.mutex);
+            if (!vernon::rhi::validImageViewDescriptor(image->descriptor, *descriptor))
+                result = VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        }
+        if (result == VERNON_RHI_STATUS_OK) {
+            auto reserved = reservePayload(device, device.imageViews, "reserve_metal_image_view");
+            if (reserved.isErr()) {
+                result = statusForError(reserved.error());
+            } else {
+                payload = reserved.value();
+                {
+                    std::lock_guard<std::mutex> nativeGuard(device.mutex);
+                    if (!device.state.createImageView(payload->native, image->native, *descriptor, device.error)) {
+                        result = VERNON_RHI_STATUS_UNSUPPORTED;
+                    } else {
+                        payload->descriptor = *descriptor;
+                        payload->imageDescriptor = image->descriptor;
+                        payload->parentKey = resourceKey(imageHandle);
+                        payload->imageLease.emplace(std::move(imageLease).value());
+                    }
+                }
+                if (result == VERNON_RHI_STATUS_OK) {
+                    auto published = payload->lifecycle.publish(std::move(reservation).value(), &device,
+                                                                teardownImageView);
+                    if (published.isErr()) {
+                        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+                        device.state.destroyImageView(payload->native);
+                        payload->descriptor = {};
+                        payload->imageDescriptor = {};
+                        payload->parentKey = 0;
+                        auto taken = payload->imageLease.take();
+                        if (taken)
+                            rollbackLease.emplace(std::move(taken).value());
+                        result = statusForError(published.error());
+                    } else {
+                        *output = {published.value().index, published.value().generation};
+                    }
+                }
+            }
+        }
+    }
+    if (result != VERNON_RHI_STATUS_OK && rollbackLease) {
+        auto released = rollbackLease.value().release();
+        if (released.isErr())
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    return result;
 }
 
 VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView imageView) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageViewSlot *slot = lookupPublicResource(device->imageViews, imageView);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const uint64_t imageResource = slot->imageResource;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences != 0)
-        return VERNON_RHI_STATUS_OK;
-    device->state.destroyImageView(slot->native);
-    slot->recycle();
-    MetalImageSlot *image = lookupResourceRecord(device->images, imageResource);
-    if (image && image->release()) {
-        device->state.destroyImage(image->native);
-        image->recycle();
+    MetalDevice &device = anchor.value().device();
+    MetalImageViewPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(device.imageViews, imageView.index, "destroy_image_view");
+        if (found.isErr())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        payload = found.value();
     }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = payload->lifecycle.destroyPublic(ImageViewHandle{imageView.index, imageView.generation});
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusForError(destroyed.error());
 }
 
 VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView imageView, uint64_t *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !output)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageViewSlot *slot = lookupPublicResource(device->imageViews, imageView);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.imageViews, ImageViewHandle{imageView.index, imageView.generation},
+                             "get_image_view_native_handle");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = reinterpret_cast<uintptr_t>((__bridge void *)slot->native.texture);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    *output = reinterpret_cast<uintptr_t>((__bridge void *)pinned.value().first->native.texture);
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image,
                             const VernonRhiImageUploadDescriptor *uploads, size_t uploadCount) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!uploads || uploadCount == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "upload_image");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    MetalImagePayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
     for (size_t index = 0; index < uploadCount; ++index) {
         const auto &upload = uploads[index];
-        if (upload.struct_size < sizeof(upload) || !upload.data || upload.mip_level >= slot->descriptor.mip_levels)
+        if (upload.struct_size < sizeof(upload) || !upload.data || upload.mip_level >= payload.descriptor.mip_levels)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
-    return device->state.uploadImage(slot->native, slot->descriptor, uploads, uploadCount, device->error)
+    return device.state.uploadImage(payload.native, payload.descriptor, uploads, uploadCount, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_UNSUPPORTED;
 }
 
 VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
                               const VernonRhiImageDownloadDescriptor *download, void *destination, size_t size) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !download || download->struct_size < sizeof(*download) || !destination)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "download_image");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const auto required = vernon::rhi::imageDownloadByteSize(slot->descriptor, *download);
+    MetalImagePayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    const auto required = vernon::rhi::imageDownloadByteSize(payload.descriptor, *download);
     if (!required || size != *required)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return device->state.downloadImage(slot->native, slot->descriptor, *download, destination, size, device->error)
+    return device.state.downloadImage(payload.native, payload.descriptor, *download, destination, size, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage image) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot || slot->descriptor.mip_levels < 2 ||
-        !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
-        !(slot->descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
-        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
-        slot->descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "generate_image_mipmaps");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    return device->state.generateImageMipmaps(slot->native, slot->descriptor.mip_levels, device->error)
+    MetalImagePayload &payload = *pinned.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (payload.descriptor.mip_levels < 2 ||
+        !(payload.descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_SOURCE) ||
+        !(payload.descriptor.usage & VERNON_RHI_IMAGE_TRANSFER_DESTINATION) ||
+        payload.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
+        payload.descriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT)
+        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    return device.state.generateImageMipmaps(payload.native, payload.descriptor.mip_levels, device.error)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        device->state.destroyImage(slot->native);
-        slot->recycle();
+    MetalDevice &device = anchor.value().device();
+    MetalImagePayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(device.images, image.index, "destroy_image");
+        if (found.isErr())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        payload = found.value();
     }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = payload->lifecycle.destroyPublic(ImageHandle{image.index, image.generation});
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusForError(destroyed.error());
 }
 
 uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->images, image) != nullptr;
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "is_image_valid");
+    return pinned.isOk();
 }
 
 VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image, uint64_t *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !output)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *slot = lookupPublicResource(device->images, image);
-    if (!slot)
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.images, ImageHandle{image.index, image.generation}, "get_image_native_handle");
+    if (pinned.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    *output = reinterpret_cast<uintptr_t>((__bridge void *)slot->native.texture);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    *output = reinterpret_cast<uintptr_t>((__bridge void *)pinned.value().first->native.texture);
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor,
                               VernonRhiSampler *output) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     vernon::rhi::SamplerFilter filter;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         !vernon::rhi::decodeSamplerFilter(*descriptor, filter))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const uint32_t index = allocateSlot(device->samplers);
-    MetalSamplerSlot &slot = device->samplers[index];
-    if (!device->state.createSampler(slot.native, *descriptor, device->error))
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    slot.publish();
-    *output = {index, slot.generation};
+    auto owner = anchor.value().retainOwner();
+    if (owner.isErr())
+        return statusForError(owner.error());
+    auto reservation = ResourceCreationReservation::create(owner.value());
+    if (reservation.isErr())
+        return statusForError(reservation.error());
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> creationGuard(device.creationMutex);
+    auto reserved = reservePayload(device, device.samplers, "reserve_metal_sampler");
+    if (reserved.isErr())
+        return statusForError(reserved.error());
+    MetalSamplerPayload &payload = *reserved.value();
+    {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        if (!device.state.createSampler(payload.native, *descriptor, device.error))
+            return VERNON_RHI_STATUS_INTERNAL_ERROR;
+    }
+    auto published = payload.lifecycle.publish(std::move(reservation).value(), &device, teardownSampler);
+    if (published.isErr()) {
+        std::lock_guard<std::mutex> nativeGuard(device.mutex);
+        device.state.destroySampler(payload.native);
+        return statusForError(published.error());
+    }
+    *output = {published.value().index, published.value().generation};
     return VERNON_RHI_STATUS_OK;
 }
 
 VernonRhiStatus destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalSamplerSlot *slot = lookupPublicResource(device->samplers, sampler);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        device->state.destroySampler(slot->native);
-        slot->recycle();
+    MetalDevice &device = anchor.value().device();
+    MetalSamplerPayload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(device.samplers, sampler.index, "destroy_sampler");
+        if (found.isErr())
+            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+        payload = found.value();
     }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = payload->lifecycle.destroyPublic(SamplerHandle{sampler.index, sampler.generation});
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : statusForError(destroyed.error());
 }
 
 uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->samplers, sampler) != nullptr;
+    MetalDevice &device = anchor.value().device();
+    auto pinned =
+        pinPayload(device, device.samplers, SamplerHandle{sampler.index, sampler.generation}, "is_sampler_valid");
+    return pinned.isOk();
+}
+
+template <typename Payload, typename Handle>
+uint64_t publicResourceKey(VernonRhiDevice deviceHandle, MetalPayloadSlots<Payload> MetalDevice::*member,
+                           Handle handle) noexcept {
+    auto anchor = lookupMetalDevice(deviceHandle);
+    if (anchor.isErr())
+        return 0;
+    MetalDevice &device = anchor.value().device();
+    auto pinned = pinPayload(device, device.*member, handle, "resource_key");
+    return pinned.isOk() ? resourceKey(handle) : 0;
 }
 
 uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->buffers, buffer) ? resourceKey(buffer) : 0;
+    return publicResourceKey(handle, &MetalDevice::buffers, BufferHandle{buffer.index, buffer.generation});
 }
 
 uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->images, image) ? resourceKey(image) : 0;
+    return publicResourceKey(handle, &MetalDevice::images, ImageHandle{image.index, image.generation});
 }
 
 uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->imageViews, view) ? resourceKey(view) : 0;
+    return publicResourceKey(handle, &MetalDevice::imageViews, ImageViewHandle{view.index, view.generation});
 }
 
 uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupPublicResource(device->samplers, sampler) ? resourceKey(sampler) : 0;
+    return publicResourceKey(handle, &MetalDevice::samplers, SamplerHandle{sampler.index, sampler.generation});
 }
 
-bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (kind == ResourceKind::Buffer) {
-        MetalBufferSlot *slot = lookupResourceRecord(device->buffers, key);
-        return slot && slot->retain();
+template <typename Payload, typename Handle>
+vernon::Result<typename Payload::Lifecycle::RetainedLease, vernon::RhiError>
+retainTypedResource(MetalDevice &device, MetalPayloadSlots<Payload> &payloads, Handle handle,
+                    const char *operation) noexcept {
+    Payload *payload = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(device.slotMutex);
+        auto found = payloadAt(payloads, handle.index, operation);
+        if (found.isErr())
+            return vernon::Result<typename Payload::Lifecycle::RetainedLease, vernon::RhiError>{
+                vernon::err(std::move(found).error())};
+        payload = found.value();
     }
-    if (kind == ResourceKind::Image) {
-        MetalImageSlot *slot = lookupResourceRecord(device->images, key);
-        return slot && slot->retain();
-    }
-    if (kind == ResourceKind::ImageView) {
-        MetalImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-        return slot && slot->retain();
-    }
-    MetalSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
-    return slot && slot->retain();
+    return payload->lifecycle.retain(handle);
 }
 
-uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return 0;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (kind == ResourceKind::Buffer) {
-        MetalBufferSlot *slot = lookupResourceRecord(device->buffers, key);
-        return slot ? reinterpret_cast<uintptr_t>((__bridge void *)slot->native.buffer) : 0;
+Result<RetainedRhiResourceLease, RhiError> retainResource(VernonRhiDevice handle, ResourceKind kind,
+                                                          uint64_t key) noexcept {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return Result<RetainedRhiResourceLease, RhiError>{err(std::move(anchor).error())};
+    MetalDevice &device = anchor.value().device();
+    switch (kind) {
+    case ResourceKind::Buffer: {
+        auto decoded = decodeResourceKey<BufferHandle>(key, "retain_metal_buffer");
+        if (decoded.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(decoded).error())};
+        auto retained = retainTypedResource(device, device.buffers, decoded.value(), "retain_metal_buffer");
+        if (retained.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(retained).error())};
+        return Result<RetainedRhiResourceLease, RhiError>{
+            ok(RetainedRhiResourceLease{std::move(retained).value()})};
     }
-    if (kind == ResourceKind::Image) {
-        MetalImageSlot *slot = lookupResourceRecord(device->images, key);
-        return slot ? reinterpret_cast<uintptr_t>((__bridge void *)slot->native.texture) : 0;
+    case ResourceKind::Image: {
+        auto decoded = decodeResourceKey<ImageHandle>(key, "retain_metal_image");
+        if (decoded.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(decoded).error())};
+        auto retained = retainTypedResource(device, device.images, decoded.value(), "retain_metal_image");
+        if (retained.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(retained).error())};
+        return Result<RetainedRhiResourceLease, RhiError>{
+            ok(RetainedRhiResourceLease{std::move(retained).value()})};
     }
-    if (kind == ResourceKind::ImageView) {
-        MetalImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-        return slot ? reinterpret_cast<uintptr_t>((__bridge void *)slot->native.texture) : 0;
+    case ResourceKind::ImageView: {
+        auto decoded = decodeResourceKey<ImageViewHandle>(key, "retain_metal_image_view");
+        if (decoded.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(decoded).error())};
+        auto retained =
+            retainTypedResource(device, device.imageViews, decoded.value(), "retain_metal_image_view");
+        if (retained.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(retained).error())};
+        return Result<RetainedRhiResourceLease, RhiError>{
+            ok(RetainedRhiResourceLease{std::move(retained).value()})};
     }
-    MetalSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
-    return slot ? reinterpret_cast<uintptr_t>((__bridge void *)slot->native.sampler) : 0;
+    case ResourceKind::Sampler: {
+        auto decoded = decodeResourceKey<SamplerHandle>(key, "retain_metal_sampler");
+        if (decoded.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(decoded).error())};
+        auto retained = retainTypedResource(device, device.samplers, decoded.value(), "retain_metal_sampler");
+        if (retained.isErr())
+            return Result<RetainedRhiResourceLease, RhiError>{err(std::move(retained).error())};
+        return Result<RetainedRhiResourceLease, RhiError>{
+            ok(RetainedRhiResourceLease{std::move(retained).value()})};
+    }
+    }
+    return Result<RetainedRhiResourceLease, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"retain_metal_resource", key, static_cast<uint32_t>(kind)}})};
 }
 
-bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !descriptor)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const MetalImageSlot *slot = lookupResourceRecord(device->images, key);
-    if (!slot || !slot->occupied)
-        return false;
-    *descriptor = slot->descriptor;
-    return true;
-}
-
-bool describeImageViewResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageViewDescriptor *view,
-                               VernonRhiImageDescriptor *image, uint64_t *parentKey) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !view || !image || !parentKey)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const MetalImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-    if (!slot)
-        return false;
-    const MetalImageSlot *parent = lookupResourceRecord(device->images, slot->imageResource);
-    if (!parent)
-        return false;
-    *view = slot->descriptor;
-    *image = parent->descriptor;
-    *parentKey = slot->imageResource;
-    return true;
-}
-
-void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
-        return;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (kind == ResourceKind::Buffer) {
-        MetalBufferSlot *slot = lookupResourceRecord(device->buffers, key);
-        if (slot && slot->release()) {
-            device->state.destroyBuffer(slot->native);
-            slot->recycle();
+Result<uint64_t, RhiError> resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) noexcept {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(anchor).error())};
+    MetalDevice &device = anchor.value().device();
+    switch (kind) {
+    case ResourceKind::Buffer: {
+        auto decoded = decodeResourceKey<BufferHandle>(key, "resolve_metal_buffer");
+        if (decoded.isErr())
+            return Result<uint64_t, RhiError>{err(std::move(decoded).error())};
+        MetalBufferPayload *payload{};
+        {
+            std::lock_guard<std::mutex> slots(device.slotMutex);
+            if (decoded.value().index >= device.buffers.size())
+                return Result<uint64_t, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_metal_buffer", key, 0}})};
+            payload = &device.buffers[decoded.value().index];
         }
-    } else if (kind == ResourceKind::Image) {
-        MetalImageSlot *slot = lookupResourceRecord(device->images, key);
-        if (slot && slot->release()) {
-            device->state.destroyImage(slot->native);
-            slot->recycle();
-        }
-    } else if (kind == ResourceKind::ImageView) {
-        MetalImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-        if (slot && slot->release()) {
-            const uint64_t parentKey = slot->imageResource;
-            device->state.destroyImageView(slot->native);
-            slot->recycle();
-            MetalImageSlot *parent = lookupResourceRecord(device->images, parentKey);
-            if (parent && parent->release()) {
-                device->state.destroyImage(parent->native);
-                parent->recycle();
-            }
-        }
-    } else {
-        MetalSamplerSlot *slot = lookupResourceRecord(device->samplers, key);
-        if (slot && slot->release()) {
-            device->state.destroySampler(slot->native);
-            slot->recycle();
-        }
+        std::lock_guard<std::mutex> guard(device.mutex);
+        return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            (__bridge void *)payload->native.buffer)))};
     }
+    case ResourceKind::Image: {
+        auto decoded = decodeResourceKey<ImageHandle>(key, "resolve_metal_image");
+        if (decoded.isErr())
+            return Result<uint64_t, RhiError>{err(std::move(decoded).error())};
+        MetalImagePayload *payload{};
+        {
+            std::lock_guard<std::mutex> slots(device.slotMutex);
+            if (decoded.value().index >= device.images.size())
+                return Result<uint64_t, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_metal_image", key, 0}})};
+            payload = &device.images[decoded.value().index];
+        }
+        std::lock_guard<std::mutex> guard(device.mutex);
+        return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            (__bridge void *)payload->native.texture)))};
+    }
+    case ResourceKind::ImageView: {
+        auto decoded = decodeResourceKey<ImageViewHandle>(key, "resolve_metal_image_view");
+        if (decoded.isErr())
+            return Result<uint64_t, RhiError>{err(std::move(decoded).error())};
+        MetalImageViewPayload *payload{};
+        {
+            std::lock_guard<std::mutex> slots(device.slotMutex);
+            if (decoded.value().index >= device.imageViews.size())
+                return Result<uint64_t, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_metal_image_view", key, 0}})};
+            payload = &device.imageViews[decoded.value().index];
+        }
+        std::lock_guard<std::mutex> guard(device.mutex);
+        return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            (__bridge void *)payload->native.texture)))};
+    }
+    case ResourceKind::Sampler: {
+        auto decoded = decodeResourceKey<SamplerHandle>(key, "resolve_metal_sampler");
+        if (decoded.isErr())
+            return Result<uint64_t, RhiError>{err(std::move(decoded).error())};
+        MetalSamplerPayload *payload{};
+        {
+            std::lock_guard<std::mutex> slots(device.slotMutex);
+            if (decoded.value().index >= device.samplers.size())
+                return Result<uint64_t, RhiError>{
+                    err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_metal_sampler", key, 0}})};
+            payload = &device.samplers[decoded.value().index];
+        }
+        std::lock_guard<std::mutex> guard(device.mutex);
+        return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+            (__bridge void *)payload->native.sampler)))};
+    }
+    }
+    return Result<uint64_t, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_metal_resource", key, static_cast<uint32_t>(kind)}})};
+}
+
+Result<void, RhiError> describeImageResource(VernonRhiDevice handle, uint64_t key,
+                                              VernonRhiImageDescriptor *descriptor) noexcept {
+    if (!descriptor)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_metal_image", key, 0}})};
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return Result<void, RhiError>{err(std::move(anchor).error())};
+    auto decoded = decodeResourceKey<ImageHandle>(key, "describe_metal_image");
+    if (decoded.isErr())
+        return Result<void, RhiError>{err(std::move(decoded).error())};
+    MetalDevice &device = anchor.value().device();
+    MetalImagePayload *payload{};
+    {
+        std::lock_guard<std::mutex> slots(device.slotMutex);
+        auto found = payloadAt(device.images, decoded.value().index, "describe_metal_image");
+        if (found.isErr())
+            return Result<void, RhiError>{err(std::move(found).error())};
+        payload = found.value();
+    }
+    std::lock_guard<std::mutex> guard(device.mutex);
+    *descriptor = payload->descriptor;
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> describeImageViewResource(VernonRhiDevice handle, uint64_t key,
+                                                  VernonRhiImageViewDescriptor *view,
+                                                  VernonRhiImageDescriptor *image,
+                                                  uint64_t *parentKey) noexcept {
+    if (!view || !image || !parentKey)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_metal_image_view", key, 0}})};
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return Result<void, RhiError>{err(std::move(anchor).error())};
+    auto decoded = decodeResourceKey<ImageViewHandle>(key, "describe_metal_image_view");
+    if (decoded.isErr())
+        return Result<void, RhiError>{err(std::move(decoded).error())};
+    MetalDevice &device = anchor.value().device();
+    MetalImageViewPayload *payload{};
+    {
+        std::lock_guard<std::mutex> slots(device.slotMutex);
+        auto found = payloadAt(device.imageViews, decoded.value().index, "describe_metal_image_view");
+        if (found.isErr())
+            return Result<void, RhiError>{err(std::move(found).error())};
+        payload = found.value();
+    }
+    std::lock_guard<std::mutex> guard(device.mutex);
+    *view = payload->descriptor;
+    *image = payload->imageDescriptor;
+    *parentKey = payload->parentKey;
+    return Result<void, RhiError>{ok()};
 }
 
 bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &backend) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (!device->state.beginCommands(native, device->error))
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (!device.state.beginCommands(native, device.error))
         return false;
     backend = VERNON_RHI_BACKEND_METAL;
     return true;
@@ -777,93 +1133,118 @@ bool beginCommands(VernonRhiDevice handle, uint64_t &native, VernonRhiBackend &b
 
 bool submitCommands(VernonRhiDevice handle, uint64_t native, bool, bool &completed, bool &externalCompletion) {
     externalCompletion = false;
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
     completed = false;
-    return device->state.submitCommands(native, device->error);
+    return device.state.submitCommands(native, device.error);
 }
 
 bool pollCommands(VernonRhiDevice handle, uint64_t native, bool &completed, bool &succeeded) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return device->state.pollCommands(native, completed, succeeded, device->error);
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return device.state.pollCommands(native, completed, succeeded, device.error);
 }
 
 bool completeBorrowedCommands(VernonRhiDevice handle, uint64_t native) {
-    auto device = lookupMetalDevice(handle);
-    if (!device)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    return device->state.completeCommands(native, device->error);
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return device.state.completeCommands(native, device.error);
 }
 
 void abandonCommands(VernonRhiDevice handle, uint64_t native) {
-    auto device = lookupMetalDevice(handle);
-    if (device) {
-        std::lock_guard<std::mutex> guard(device->mutex);
-        device->state.abandonCommands(native);
-    }
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr())
+        return;
+    MetalDevice &device = anchor.value().device();
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.state.abandonCommands(native);
 }
 
 bool recordBarriers(VernonRhiDevice handle, uint64_t, uint64_t native, const VernonRhiBarrier *barriers,
                     size_t barrierCount) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !native || (barrierCount && !barriers))
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !native || (barrierCount && !barriers))
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
+    MetalDevice &device = anchor.value().device();
     for (size_t index = 0; index < barrierCount; ++index) {
         const VernonRhiBarrier &barrier = barriers[index];
         if (barrier.is_image) {
-            MetalImageSlot *slot = lookupResourceRecord(device->images, resourceKey(barrier.image));
-            if (!slot || !supportsImageState(slot->descriptor, barrier.old_state) ||
-                !supportsImageState(slot->descriptor, barrier.new_state))
+            auto pinned = pinPayload(device, device.images,
+                                     ImageHandle{barrier.image.index, barrier.image.generation}, "record_barrier");
+            if (pinned.isErr())
+                return false;
+            std::lock_guard<std::mutex> guard(device.mutex);
+            if (!supportsImageState(pinned.value().first->descriptor, barrier.old_state) ||
+                !supportsImageState(pinned.value().first->descriptor, barrier.new_state))
                 return false;
         } else {
-            MetalBufferSlot *slot = lookupResourceRecord(device->buffers, resourceKey(barrier.buffer));
-            if (!slot || !supportsBufferState(slot->descriptor, barrier.old_state) ||
-                !supportsBufferState(slot->descriptor, barrier.new_state))
+            auto pinned = pinPayload(device, device.buffers,
+                                     BufferHandle{barrier.buffer.index, barrier.buffer.generation}, "record_barrier");
+            if (pinned.isErr())
+                return false;
+            std::lock_guard<std::mutex> guard(device.mutex);
+            if (!supportsBufferState(pinned.value().first->descriptor, barrier.old_state) ||
+                !supportsBufferState(pinned.value().first->descriptor, barrier.new_state))
                 return false;
         }
     }
-    // Vernon barriers occur between provider encoders. All owned Metal resources use
-    // hazard-tracked storage, so Metal orders their reads and writes without an
-    // explicit fence or resource-state transition.
     return true;
 }
 
 bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer source, uint64_t sourceOffset,
                       VernonRhiBuffer destination, uint64_t destinationOffset, uint64_t size) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !native || !size)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !native || !size)
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalBufferSlot *sourceSlot = lookupResourceRecord(device->buffers, resourceKey(source));
-    MetalBufferSlot *destinationSlot = lookupResourceRecord(device->buffers, resourceKey(destination));
-    if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->descriptor.size ||
-        size > sourceSlot->descriptor.size - sourceOffset || destinationOffset > destinationSlot->descriptor.size ||
-        size > destinationSlot->descriptor.size - destinationOffset)
+    MetalDevice &device = anchor.value().device();
+    auto sourcePin =
+        pinPayload(device, device.buffers, BufferHandle{source.index, source.generation}, "record_buffer_copy");
+    if (sourcePin.isErr())
         return false;
-    return device->state.copyBuffer(native, sourceSlot->native, sourceOffset, destinationSlot->native,
-                                    destinationOffset, size, device->error);
+    auto destinationPin = pinPayload(device, device.buffers,
+                                     BufferHandle{destination.index, destination.generation}, "record_buffer_copy");
+    if (destinationPin.isErr())
+        return false;
+    MetalBufferPayload &sourcePayload = *sourcePin.value().first;
+    MetalBufferPayload &destinationPayload = *destinationPin.value().first;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (sourceOffset > sourcePayload.descriptor.size ||
+        size > sourcePayload.descriptor.size - sourceOffset ||
+        destinationOffset > destinationPayload.descriptor.size ||
+        size > destinationPayload.descriptor.size - destinationOffset)
+        return false;
+    return device.state.copyBuffer(native, sourcePayload.native, sourceOffset, destinationPayload.native,
+                                   destinationOffset, size, device.error);
 }
 
-bool supportsImageCopy(VernonRhiDevice handle) { return lookupMetalDevice(handle) != nullptr; }
+bool supportsImageCopy(VernonRhiDevice handle) { return lookupMetalDevice(handle).isOk(); }
 
 bool recordImageCopy(VernonRhiDevice handle, uint64_t, uint64_t native, VernonRhiImage source,
                      VernonRhiImage destination, const VernonRhiImageCopyRegion *regions, size_t regionCount) {
-    auto device = lookupMetalDevice(handle);
-    if (!device || !native || !regions || !regionCount)
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || !native || !regions || !regionCount)
         return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    MetalImageSlot *sourceSlot = lookupResourceRecord(device->images, resourceKey(source));
-    MetalImageSlot *destinationSlot = lookupResourceRecord(device->images, resourceKey(destination));
-    return sourceSlot && destinationSlot &&
-           device->state.copyImage(native, sourceSlot->native, destinationSlot->native, regions, regionCount,
-                                   device->error);
+    MetalDevice &device = anchor.value().device();
+    auto sourcePin =
+        pinPayload(device, device.images, ImageHandle{source.index, source.generation}, "record_image_copy");
+    if (sourcePin.isErr())
+        return false;
+    auto destinationPin = pinPayload(device, device.images,
+                                     ImageHandle{destination.index, destination.generation}, "record_image_copy");
+    if (destinationPin.isErr())
+        return false;
+    std::lock_guard<std::mutex> guard(device.mutex);
+    return device.state.copyImage(native, sourcePin.value().first->native, destinationPin.value().first->native,
+                                  regions, regionCount, device.error);
 }
 
 bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rendering, int32_t x, int32_t y,
@@ -925,12 +1306,12 @@ bool restartRendering(uint64_t native, vernon::rhi::metal::RenderingState &rende
 bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
                   uint32_t colorDiscardMask, uint32_t depthStencilDiscard, const uint64_t *, size_t, uint64_t,
                   uint64_t renderingObject) {
-    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
         backendKind != vernon::rhi::CommandRenderingDynamic || !renderingObject)
         return false;
     auto *rendering = reinterpret_cast<vernon::rhi::metal::RenderingState *>(
         static_cast<uintptr_t>(renderingObject));
-    vernon::rhi::metal::unregisterRenderingState(native, rendering);
     for (size_t index = 0; index < rendering->colorTextures.size(); ++index)
         if (rendering->colorTextures[index])
             [rendering->encoder setColorStoreAction:(colorDiscardMask & (uint32_t{1} << index))
@@ -951,28 +1332,32 @@ bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend back
     return true;
 }
 
-bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, int32_t x,
-                int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
-                const float color[4]) {
-    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
+                uint64_t renderingObject, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
+                uint64_t target, uint32_t location, const float color[4]) {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
         backendKind != vernon::rhi::CommandRenderingDynamic || !target || location >= 8 || !color)
         return false;
     id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
-    auto *rendering = vernon::rhi::metal::findRenderingState(native);
+    auto *rendering =
+        reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingObject));
     return rendering && rendering->colorTextures[location] == texture &&
            restartRendering(native, *rendering, x, y, width, height, layers, static_cast<int32_t>(location), color,
                             1.0f, 0, 0);
 }
 
 bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                       int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
-                       float depth, uint32_t stencil, uint32_t aspects) {
-    if (!lookupMetalDevice(handle) || backend != VERNON_RHI_BACKEND_METAL ||
+                       uint64_t renderingObject, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
+                       uint64_t target, float depth, uint32_t stencil, uint32_t aspects) {
+    auto anchor = lookupMetalDevice(handle);
+    if (anchor.isErr() || backend != VERNON_RHI_BACKEND_METAL ||
         backendKind != vernon::rhi::CommandRenderingDynamic || !target ||
         (aspects & ~(VERNON_RHI_ATTACHMENT_DEPTH | VERNON_RHI_ATTACHMENT_STENCIL)) || !aspects)
         return false;
     id<MTLTexture> texture = (__bridge id<MTLTexture>)(reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
-    auto *rendering = vernon::rhi::metal::findRenderingState(native);
+    auto *rendering =
+        reinterpret_cast<vernon::rhi::metal::RenderingState *>(static_cast<uintptr_t>(renderingObject));
     return rendering && rendering->depthStencilTexture == texture &&
            restartRendering(native, *rendering, x, y, width, height, layers, -1, nullptr, depth, stencil, aspects);
 }
@@ -1034,6 +1419,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         lastError,
         synchronize,
         deviceStateForBackend,
+        commandState,
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
@@ -1059,7 +1445,6 @@ const vernon::rhi::BackendDispatch &vernon::rhi::metalBackendDispatch() {
         retainResource,
         resolveResource,
         describeImageResource,
-        releaseResource,
         beginCommands,
         submitCommands,
         pollCommands,

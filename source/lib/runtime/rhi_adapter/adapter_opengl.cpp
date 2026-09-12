@@ -67,15 +67,15 @@ const OpenGLAdapterState &openGLState(const VernonRuntimeRhiAdapter &adapter) {
 
 void destroyBackend(void *state) noexcept { delete static_cast<OpenGLAdapterState *>(state); }
 
-VernonStatus synchronizeBackend(void *state, std::string &error) noexcept {
+RhiAdapterResult<void> synchronizeBackend(void *state, std::string &error) noexcept {
     try {
         auto &device = *static_cast<OpenGLAdapterState *>(state)->device;
         device.makeCurrent();
         device.driver.finish();
-        return VERNON_STATUS_OK;
+        return RhiAdapterResult<void>{vernon::ok()};
     } catch (...) {
-        setBackendError(error, "OpenGL synchronization threw an exception");
-        return VERNON_STATUS_INTERNAL_ERROR;
+        return RhiAdapterResult<void>{vernon::err(
+            vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure, {"opengl_synchronize", 0, 0}})};
     }
 }
 
@@ -196,21 +196,24 @@ struct PreparedBindingSet {
 void releaseCommandBindings(void *context, uint64_t);
 void releaseCommandPipeline(void *context, uint64_t);
 
-bool retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                          PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
+RhiAdapterResult<void> retainCommandObjects(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                            PreparedPipeline &pipeline, PreparedBindingSet *bindings) {
     pipeline.references.fetch_add(1, std::memory_order_relaxed);
     if (!deferCommandCleanup(adapter, encoder, &pipeline, 0, releaseCommandPipeline)) {
         releaseCommandPipeline(&pipeline, 0);
-        return false;
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_command_pipeline_cleanup_registration_failed", 0, 0}})};
     }
     if (bindings) {
         bindings->references.fetch_add(1, std::memory_order_relaxed);
         if (!deferCommandCleanup(adapter, encoder, bindings, 0, releaseCommandBindings)) {
             releaseCommandBindings(bindings, 0);
-            return false;
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"opengl_command_bindings_cleanup_registration_failed", 0, 0}})};
         }
     }
-    return true;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 uint32_t getCapabilities(void *) {
@@ -232,11 +235,11 @@ uint32_t stencilOperation(uint32_t value) {
     return value < std::size(operations) ? operations[value] : 0;
 }
 
-VernonStatus configureGraphicsState(VernonRuntimeRhiAdapter &adapter,
-                                    const VernonRuntimeProviderPipelineDescriptor &descriptor,
-                                    PreparedPipeline &pipeline) {
+RhiAdapterResult<void> configureGraphicsStateResult(VernonRuntimeRhiAdapter &adapter,
+                                                    const VernonRuntimeProviderPipelineDescriptor &descriptor,
+                                                    PreparedPipeline &pipeline) {
     if (!descriptor.color_format_count)
-        return VERNON_STATUS_OK;
+        return RhiAdapterResult<void>{vernon::ok()};
     const auto &rasterization = descriptor.rasterization;
     const auto &depthStencil = descriptor.depth_stencil;
     if (descriptor.sample_count != 1 || descriptor.color_format_count > 8 ||
@@ -258,14 +261,18 @@ VernonStatus configureGraphicsState(VernonRuntimeRhiAdapter &adapter,
           !openGLState(adapter).device->driver.blendFuncSeparatei ||
           !openGLState(adapter).device->driver.blendEquationSeparatei ||
           !openGLState(adapter).device->driver.colorMaski)))
-        return fail(adapter, "OpenGL graphics pipeline contains unsupported graphics state");
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"opengl_graphics_pipeline_contains_unsupported_graphics_state", 0, 0}})};
     const auto validFace = [](const VernonStencilFaceState &face) {
         return face.stencil_fail <= VERNON_RHI_STENCIL_DECREMENT_WRAP &&
                face.depth_fail <= VERNON_RHI_STENCIL_DECREMENT_WRAP && face.pass <= VERNON_RHI_STENCIL_DECREMENT_WRAP &&
                face.compare <= VERNON_RHI_COMPARE_ALWAYS;
     };
     if (!validFace(depthStencil.front) || !validFace(depthStencil.back))
-        return fail(adapter, "OpenGL graphics pipeline contains invalid stencil state");
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"opengl_graphics_pipeline_contains_invalid_stencil_state", 0, 0}})};
     for (size_t index = 0; index < descriptor.color_blend_count; ++index) {
         const auto &blend = descriptor.color_blends[index];
         if (blend.blend_enabled > 1 || blend.source_color_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
@@ -274,13 +281,15 @@ VernonStatus configureGraphicsState(VernonRuntimeRhiAdapter &adapter,
             blend.destination_alpha_factor > VERNON_RHI_BLEND_ONE_MINUS_DESTINATION_ALPHA ||
             blend.color_operation > VERNON_RHI_BLEND_MAXIMUM || blend.alpha_operation > VERNON_RHI_BLEND_MAXIMUM ||
             (blend.write_mask & ~VERNON_RHI_COLOR_WRITE_ALL))
-            return fail(adapter, "OpenGL graphics pipeline contains invalid blend state");
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"opengl_graphics_pipeline_contains_invalid_blend_state", 0, 0}})};
     }
     pipeline.rasterization = rasterization;
     pipeline.depthStencil = depthStencil;
     pipeline.colorBlends.assign(descriptor.color_blends, descriptor.color_blends + descriptor.color_blend_count);
     pipeline.depthStencilFormat = descriptor.depth_stencil_format;
-    return VERNON_STATUS_OK;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
@@ -292,37 +301,41 @@ VernonRuntimeProviderDeviceIdentity getDeviceIdentity(void *data) {
                 state.device->callbacks.api_version_minor};
 }
 
-VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
-                           VernonRuntimeProviderObject *output) {
+RhiAdapterResult<void> prepareShaderResult(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
+                                           VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || !descriptor->data ||
         descriptor->size == 0 ||
         (descriptor->stage != VERNON_RUNTIME_PROVIDER_STAGE_VERTEX &&
          descriptor->stage != VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT &&
          descriptor->stage != VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE))
-        return fail(adapter, "OpenGL adapter received an invalid shader");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_shader", 0, 0}})};
     try {
         auto shader = std::make_unique<PreparedShader>();
         shader->stage = descriptor->stage;
         shader->source.assign(static_cast<const char *>(descriptor->data), descriptor->size);
         *output = toHandle(shader.release());
         adapter.shaderPreparations.fetch_add(1, std::memory_order_relaxed);
-        return VERNON_STATUS_OK;
+        return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return fail(adapter, "OpenGL shader preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_shader_preparation_ran_out_of_memory", 0, 0}})};
     }
 }
 
-VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
-                           VernonRuntimeProviderObject *output) {
+RhiAdapterResult<void> prepareLayoutResult(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
+                                           VernonRuntimeProviderObject *output) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) ||
         (descriptor->binding_count != 0 && !descriptor->bindings) ||
         (descriptor->vertex_attribute_count != 0 && !descriptor->vertex_attributes))
-        return fail(adapter, "OpenGL adapter received an invalid pipeline layout");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_pipeline_layout", 0, 0}})};
     auto layout = std::unique_ptr<PreparedLayout>(new (std::nothrow) PreparedLayout());
     if (!layout)
-        return fail(adapter, "OpenGL layout preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_layout_preparation_ran_out_of_memory", 0, 0}})};
     try {
         layout->entries.reserve(descriptor->binding_count);
         for (size_t index = 0; index < descriptor->binding_count; ++index) {
@@ -368,16 +381,9 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
                                       source.binding != UINT32_MAX && source.element_size != 0;
             if (!inlineValue && !uniformBuffer && !storageBuffer && !sampledImage && !storageImage && !sampler &&
                 !vertexBuffer)
-                return fail(adapter, "OpenGL adapter pipeline layout binding " + std::to_string(index) +
-                                         " is unsupported (kind=" + std::to_string(source.kind) +
-                                         ", interface=" + std::to_string(source.interface_kind) +
-                                         ", stage_mask=" + std::to_string(source.stage_mask) +
-                                         ", binding=" + std::to_string(source.binding) +
-                                         ", element_size=" + std::to_string(source.element_size) +
-                                         ", element_count=" + std::to_string(source.element_count) +
-                                         ", vector_count=" + std::to_string(source.vector_count) +
-                                         ", numeric_type=" + std::to_string(source.numeric_type) +
-                                         ", name_size=" + std::to_string(source.name.size) + ")");
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"opengl_validate_pipeline_layout_binding", index, source.kind}})};
             PreparedLayout::Entry entry;
             entry.layout = source;
             if (source.name.data && source.name.size)
@@ -396,19 +402,24 @@ VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayout
             std::string capabilityDiagnostic;
             const uint32_t locationLimit = maximumLocations > 0 ? static_cast<uint32_t>(maximumLocations) : 0;
             if (!bindingExists)
-                return fail(adapter, "OpenGL vertex attribute references an unknown binding");
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"opengl_validate_vertex_attribute_binding", attribute.binding, attribute.location}})};
             if (!validateVertexAttributeCapability(VertexAttributeBackend::OpenGL, attribute, locationLimit,
                                                    openGLState(adapter).device->driver.vertexAttribLPointer != nullptr,
                                                    capabilityDiagnostic))
-                return fail(adapter, std::move(capabilityDiagnostic));
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument,
+                    {"opengl_validate_vertex_attribute_capability", attribute.location, attribute.binding}})};
             layout->vertexAttributes.push_back(attribute);
         }
     } catch (const std::bad_alloc &) {
-        return fail(adapter, "OpenGL layout preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_layout_preparation_ran_out_of_memory", 0, 0}})};
     }
     *output = toHandle(layout.release());
     adapter.layoutPreparations.fetch_add(1, std::memory_order_relaxed);
-    return VERNON_STATUS_OK;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
 std::optional<rhi::opengl::Enum> storageImageFormat(VernonRhiFormat format) {
@@ -432,8 +443,9 @@ std::optional<rhi::opengl::Enum> storageImageFormat(VernonRhiFormat format) {
     }
 }
 
-VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
-                             VernonRuntimeProviderObject *output) {
+RhiAdapterResult<void> preparePipelineResult(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
+                                             VernonRuntimeProviderObject *output) {
+    std::string backendDiagnostic;
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
     const bool compute = descriptor && descriptor->kind == VERNON_RUNTIME_PROVIDER_COMPUTE_PIPELINE;
@@ -441,7 +453,8 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         (compute ? descriptor->shader_count != 1
                  : descriptor->kind != VERNON_RUNTIME_PROVIDER_GRAPHICS_PIPELINE || descriptor->shader_count != 2) ||
         !descriptor->shaders || !layout)
-        return fail(adapter, "OpenGL adapter received an invalid pipeline");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_pipeline", 0, 0}})};
     if (!compute && descriptor->color_format_count) {
         auto *first = fromHandle<PreparedShader>(descriptor->shaders[0]);
         auto *second = fromHandle<PreparedShader>(descriptor->shaders[1]);
@@ -454,14 +467,15 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 adapter.livePreparedPipelines.fetch_add(1, std::memory_order_relaxed);
                 pipeline->native = std::move(base);
                 pipeline->layout = layout;
-                const VernonStatus stateStatus = configureGraphicsState(adapter, *descriptor, *pipeline);
-                if (stateStatus != VERNON_STATUS_OK)
+                auto stateStatus = configureGraphicsStateResult(adapter, *descriptor, *pipeline);
+                if (!stateStatus)
                     return stateStatus;
                 *output = toHandle(pipeline.release());
                 adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
-                return VERNON_STATUS_OK;
+                return RhiAdapterResult<void>{vernon::ok()};
             } catch (const std::bad_alloc &) {
-                return fail(adapter, "OpenGL graphics variant allocation failed", VERNON_STATUS_INTERNAL_ERROR);
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::BackendFailure, {"opengl_graphics_variant_allocation_failed", 0, 0}})};
             }
         }
     }
@@ -472,24 +486,28 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
     for (size_t index = 0; index < descriptor->shader_count; ++index) {
         const auto *shader = fromHandle<PreparedShader>(descriptor->shaders[index]);
         if (!shader)
-            return fail(adapter, "OpenGL pipeline contains an invalid shader");
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"opengl_pipeline_contains_an_invalid_shader", 0, 0}})};
         const auto kind = shader->stage == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX     ? rhi::opengl::kVertexShader
                           : shader->stage == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT ? rhi::opengl::kFragmentShader
                                                                                     : rhi::opengl::kComputeShader;
         hasVertex |= shader->stage == VERNON_RUNTIME_PROVIDER_STAGE_VERTEX;
         hasFragment |= shader->stage == VERNON_RUNTIME_PROVIDER_STAGE_FRAGMENT;
         hasCompute |= shader->stage == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE;
-        compiled[index] = openGLState(adapter).device->compileShader(kind, shader->source, adapter.error);
+        compiled[index] = openGLState(adapter).device->compileShader(kind, shader->source, backendDiagnostic);
         if (!compiled[index]) {
             for (size_t previous = 0; previous < index; ++previous)
                 openGLState(adapter).device->driver.deleteShader(compiled[previous]);
-            return VERNON_STATUS_INTERNAL_ERROR;
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure,
+                {"opengl_compile_shader", static_cast<uint64_t>(kind), static_cast<uint32_t>(index)}})};
         }
     }
     if ((compute && !hasCompute) || (!compute && (!hasVertex || !hasFragment))) {
         for (size_t index = 0; index < descriptor->shader_count; ++index)
             openGLState(adapter).device->driver.deleteShader(compiled[index]);
-        return fail(adapter, "OpenGL pipeline shader stages are incomplete");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_pipeline_shader_stages_are_incomplete", 0, 0}})};
     }
     try {
         auto pipeline = std::make_unique<PreparedPipeline>();
@@ -503,15 +521,17 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
         pipeline->compute = compute;
         pipeline->native->bindings.reserve(layout->entries.size());
         pipeline->native->program = openGLState(adapter).device->linkProgram(
-            {compiled.begin(), compiled.begin() + descriptor->shader_count}, adapter.error);
+            {compiled.begin(), compiled.begin() + descriptor->shader_count}, backendDiagnostic);
         if (!pipeline->native->program)
-            return VERNON_STATUS_INTERNAL_ERROR;
-        const VernonStatus stateStatus = configureGraphicsState(adapter, *descriptor, *pipeline);
-        if (stateStatus != VERNON_STATUS_OK)
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"opengl_link_program", descriptor->shader_count, 0}})};
+        auto stateStatus = configureGraphicsStateResult(adapter, *descriptor, *pipeline);
+        if (!stateStatus)
             return stateStatus;
         if (!compute && !openGLState(adapter).device->createGraphicsObjects(
-                            pipeline->native->vertexArray, pipeline->native->framebuffer, adapter.error)) {
-            return VERNON_STATUS_INTERNAL_ERROR;
+                            pipeline->native->vertexArray, pipeline->native->framebuffer, backendDiagnostic)) {
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                                            {"opengl_create_graphics_objects", 0, 0}})};
         }
         if (!compute)
             openGLState(adapter).framebufferSignatures.emplace(pipeline->native->framebuffer,
@@ -559,7 +579,9 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                        entry.layout.binding == attribute.binding;
             });
             if (binding == layout->entries.end())
-                return fail(adapter, "OpenGL vertex attribute references a missing binding");
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                      {"opengl_vertex_attribute_references_a_missing_binding", 0, 0}})};
             pipeline->native->vertexAttributes.push_back({attribute, binding->layout.divisor});
         }
         if (!compute && descriptor->color_format_count == 0)
@@ -567,31 +589,26 @@ VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDesc
                 fromHandle<PreparedShader>(descriptor->shaders[index])->graphicsBase = pipeline->native;
         *output = toHandle(pipeline.release());
         adapter.pipelinePreparations.fetch_add(1, std::memory_order_relaxed);
-        return VERNON_STATUS_OK;
+        return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return fail(adapter, "OpenGL pipeline preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_pipeline_preparation_ran_out_of_memory", 0, 0}})};
     }
 }
 
-VernonStatus retainResource(void *data, VernonRuntimeProviderResourceReference resource) {
-    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
-    return retainRhiResource(adapter, resource) ? VERNON_STATUS_OK
-                                                : fail(adapter, "OpenGL adapter received a stale resource");
-}
-
-void releaseResource(void *data, VernonRuntimeProviderResourceReference resource) {
-    releaseRhiResource(*static_cast<VernonRuntimeRhiAdapter *>(data), resource);
-}
-
-VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
-                                const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+RhiAdapterResult<void> updateBindingsImplResult(VernonRuntimeRhiAdapter &adapter, PreparedBindingSet &bindings,
+                                                const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    std::string backendDiagnostic;
     if (valueCount != bindings.slots.size() || (valueCount != 0 && !values))
-        return fail(adapter, "OpenGL binding values do not match the prepared layout");
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"opengl_binding_values_do_not_match_the_prepared_layout", 0, 0}})};
     std::fill(bindings.seenSlots.begin(), bindings.seenSlots.end(), uint8_t{0});
     for (size_t index = 0; index < valueCount; ++index) {
         const auto found = bindings.slotIndices.find(values[index].slot);
         if (found == bindings.slotIndices.end() || bindings.seenSlots[found->second])
-            return fail(adapter, "OpenGL binding slot is invalid or duplicated");
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"opengl_binding_slot_is_invalid_or_duplicated", 0, 0}})};
         bindings.seenSlots[found->second] = 1;
         bindings.valueIndices[found->second] = index;
     }
@@ -599,7 +616,8 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         const auto &slot = bindings.slots[index];
         const auto *value = &values[bindings.valueIndices[index]];
         if (value->kind != slot.kind)
-            return fail(adapter, "OpenGL binding slot or kind is invalid");
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"opengl_binding_slot_or_kind_is_invalid", 0, 0}})};
         if (packedUniformBytes(slot.kind, slot.interfaceKind)) {
             if (!value->payload.inline_value.data || value->payload.inline_value.size != slot.byteSize ||
                 (value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 ||
@@ -607,7 +625,8 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                  (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0) ||
                 (slot.kind == VERNON_RUNTIME_PROVIDER_INLINE_VALUE &&
                  (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_TRANSPOSE) != 0 && slot.columnCount <= 1))
-                return fail(adapter, "OpenGL inline binding is invalid");
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument, {"opengl_inline_binding_is_invalid", 0, 0}})};
             bindings.resolvedValues[index] = 0;
         } else {
             const bool defaultResource = (value->flags & VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0;
@@ -620,7 +639,13 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                                slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
             const uint64_t expectedKind =
                 slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLER ? kRhiSamplerResource : kRhiBufferResource;
-            const uint64_t native = defaultResource ? 0 : resolveRhiResource(adapter, resource);
+            uint64_t native = 0;
+            if (!defaultResource) {
+                auto resolved = resolveRhiResource(adapter, resource);
+                if (!resolved)
+                    return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+                native = std::move(resolved).value();
+            }
             const bool imageBinding = slot.kind == VERNON_RUNTIME_PROVIDER_SAMPLED_IMAGE ||
                                       slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE;
             if ((value->flags & ~VERNON_RUNTIME_PROVIDER_BINDING_DEFAULT_RESOURCE) != 0 ||
@@ -629,11 +654,15 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                                       native == 0)) ||
                 (slot.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER && !defaultResource &&
                  value->payload.buffer.stride == 0))
-                return fail(adapter, "OpenGL resource binding is invalid");
+                return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                    vernon::ProviderErrorCode::InvalidArgument, {"opengl_resource_binding_is_invalid", 0, 0}})};
             if (imageBinding) {
                 VernonRhiImageDescriptor imageDescriptor{};
-                if (!defaultResource && !describeRhiImage(adapter, resource, imageDescriptor))
-                    return fail(adapter, "OpenGL image binding metadata is invalid");
+                if (!defaultResource) {
+                    auto described = describeRhiImage(adapter, resource, imageDescriptor);
+                    if (!described)
+                        return RhiAdapterResult<void>{vernon::err(std::move(described).error())};
+                }
                 bindings.resolvedImageDescriptors[index] = imageDescriptor;
             }
             bindings.resolvedValues[index] = native;
@@ -648,8 +677,10 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
                 slot.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                 slot.stageMask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
                 if (!bindings.device->uploadBuffer(slot.inlineBuffer, 0, value->payload.inline_value.data,
-                                                   value->payload.inline_value.size, adapter.error))
-                    return VERNON_STATUS_INTERNAL_ERROR;
+                                                   value->payload.inline_value.size, backendDiagnostic))
+                    return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                        vernon::ProviderErrorCode::BackendFailure,
+                        {"opengl_upload_inline_binding", value->payload.inline_value.size, slot.slot}})};
                 slot.resource = slot.inlineBuffer.name;
             }
         } else {
@@ -672,25 +703,32 @@ VernonStatus updateBindingsImpl(VernonRuntimeRhiAdapter &adapter, PreparedBindin
         }
         slot.flags = value->flags;
     }
-    return VERNON_STATUS_OK;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-bool retainBindingResources(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
-                            const PreparedBindingSet *bindings) {
+RhiAdapterResult<void> retainBindingResources(VernonRuntimeRhiAdapter &adapter, VernonRuntimeProviderObject encoder,
+                                              const PreparedBindingSet *bindings) {
     if (!bindings)
-        return true;
-    for (const auto &slot : bindings->slots)
-        if (slot.resourceReference.resource.value && !retainCommandResource(adapter, encoder, slot.resourceReference))
-            return false;
-    return true;
+        return RhiAdapterResult<void>{vernon::ok()};
+    for (const auto &slot : bindings->slots) {
+        if (!slot.resourceReference.resource.value)
+            continue;
+        auto retained = retainCommandResource(adapter, encoder, slot.resourceReference);
+        if (!retained)
+            return retained;
+    }
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
-                            VernonRuntimeProviderObject *output) {
+RhiAdapterResult<void> createBindingsResult(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
+                                            VernonRuntimeProviderObject *output) {
+    std::string backendDiagnostic;
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *layout = descriptor ? fromHandle<PreparedLayout>(descriptor->layout) : nullptr;
     if (!descriptor || !output || descriptor->struct_size < sizeof(*descriptor) || !layout)
-        return fail(adapter, "OpenGL adapter received an invalid binding-set descriptor");
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"opengl_adapter_received_an_invalid_binding_set_descriptor", 0, 0}})};
     try {
         auto bindings = std::make_unique<PreparedBindingSet>();
         bindings->device = openGLState(adapter).device;
@@ -706,10 +744,14 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
             PreparedBindingSet::Slot slot;
             slot.slot = entry.layout.slot;
             if (!bindings->slotIndices.emplace(slot.slot, index).second)
-                return fail(adapter, "OpenGL binding layout contains duplicate slots");
+                return RhiAdapterResult<void>{
+                    vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                      {"opengl_binding_layout_contains_duplicate_slots", 0, 0}})};
             if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER &&
                 !bindings->vertexSlotByBinding.emplace(entry.layout.binding, index).second)
-                return fail(adapter, "OpenGL binding layout contains duplicate vertex-buffer bindings");
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"opengl_binding_layout_contains_duplicate_vertex_buffer_bindings", 0, 0}})};
             slot.kind = entry.layout.kind;
             slot.interfaceKind = entry.layout.interface_kind;
             slot.valueCount =
@@ -726,35 +768,40 @@ VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDes
                 if (entry.layout.kind == VERNON_RUNTIME_PROVIDER_UNIFORM_BUFFER ||
                     entry.layout.kind == VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER ||
                     entry.layout.stage_mask == VERNON_RUNTIME_PROVIDER_STAGE_COMPUTE) {
-                    if (!bindings->device->createBuffer(slot.inlineBuffer, entry.layout.element_size, adapter.error))
-                        return VERNON_STATUS_INTERNAL_ERROR;
+                    if (!bindings->device->createBuffer(slot.inlineBuffer, entry.layout.element_size,
+                                                        backendDiagnostic))
+                        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                            vernon::ProviderErrorCode::BackendFailure,
+                            {"opengl_create_inline_binding_buffer", entry.layout.element_size, entry.layout.slot}})};
                 }
             }
             bindings->slots.push_back(std::move(slot));
         }
-        const VernonStatus status = updateBindingsImpl(adapter, *bindings, descriptor->values, descriptor->value_count);
-        if (status != VERNON_STATUS_OK)
+        auto status = updateBindingsImplResult(adapter, *bindings, descriptor->values, descriptor->value_count);
+        if (!status)
             return status;
         *output = toHandle(bindings.release());
         adapter.bindingCreations.fetch_add(1, std::memory_order_relaxed);
-        return VERNON_STATUS_OK;
+        return RhiAdapterResult<void>{vernon::ok()};
     } catch (const std::bad_alloc &) {
-        return fail(adapter, "OpenGL binding preparation ran out of memory", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_binding_preparation_ran_out_of_memory", 0, 0}})};
     }
 }
 
-VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
-                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+RhiAdapterResult<void> updateBindingsResult(void *data, VernonRuntimeProviderObject handle,
+                                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *bindings = fromHandle<PreparedBindingSet>(handle);
     if (!bindings)
-        return fail(adapter, "OpenGL adapter received an invalid binding set");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_binding_set", 0, 0}})};
     std::lock_guard<std::mutex> guard(bindings->mutex);
-    return updateBindingsImpl(adapter, *bindings, values, valueCount);
+    return updateBindingsImplResult(adapter, *bindings, values, valueCount);
 }
 
-VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncoder,
-                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
+RhiAdapterResult<void> encodeDispatchResult(void *data, VernonRuntimeProviderObject commandEncoder,
+                                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
@@ -762,18 +809,26 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
         (!bindings && !pipeline->native->bindings.empty()) ||
         (bindings && bindings->slots.size() != pipeline->native->bindings.size()) || descriptor->group_count[0] == 0 ||
         descriptor->group_count[1] == 0 || descriptor->group_count[2] == 0 || descriptor->push_constant_size != 0)
-        return fail(adapter, "OpenGL adapter received an invalid compute dispatch");
+        return RhiAdapterResult<void>{
+            vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                              {"opengl_adapter_received_an_invalid_compute_dispatch", 0, 0}})};
     std::unique_lock<std::mutex> guard;
     if (bindings)
         guard = std::unique_lock<std::mutex>(bindings->mutex);
     auto &device = *pipeline->native->device;
-    if (nativeCommandEncoder(adapter, commandEncoder) != reinterpret_cast<uintptr_t>(&device) ||
+    auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
+    if (!nativeCommand)
+        return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
+    if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device) ||
         commandEncoderRendering(adapter, commandEncoder))
-        return fail(adapter, "OpenGL dispatch command encoder is invalid");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_dispatch_command_encoder_is_invalid", 0, 0}})};
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return fail(adapter, "OpenGL dispatch could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_dispatch_could_not_retain_provider_objects", 0, 0}})};
     if (!retainBindingResources(adapter, commandEncoder, bindings))
-        return fail(adapter, "OpenGL dispatch could not retain its resources", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_dispatch_could_not_retain_its_resources", 0, 0}})};
     device.makeCurrent();
     device.driver.useProgram(pipeline->native->program);
     for (size_t index = 0; index < pipeline->native->bindings.size(); ++index) {
@@ -783,11 +838,15 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
             (binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_BUFFER &&
              binding.kind != VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE &&
              binding.kind != VERNON_RUNTIME_PROVIDER_INLINE_VALUE))
-            return fail(adapter, "OpenGL compute binding set does not match its pipeline");
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"opengl_compute_binding_set_does_not_match_its_pipeline", 0, 0}})};
         if (binding.kind == VERNON_RUNTIME_PROVIDER_STORAGE_IMAGE) {
             const auto format = storageImageFormat(slot.textureFormat);
             if (!slot.resource || !format || !device.driver.bindImageTexture)
-                return fail(adapter, "OpenGL storage image format or entry point is unavailable");
+                return RhiAdapterResult<void>{vernon::err(
+                    vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                          {"opengl_storage_image_format_or_entry_point_is_unavailable", 0, 0}})};
             const rhi::opengl::Enum access = binding.access == 1   ? rhi::opengl::kReadOnly
                                              : binding.access == 2 ? rhi::opengl::kWriteOnly
                                                                    : rhi::opengl::kReadWrite;
@@ -802,15 +861,18 @@ VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject commandEncod
     for (size_t index = 0; index < pipeline->native->bindings.size(); ++index)
         if (pipeline->native->bindings[index].access != 0 && bindings->slots[index].resourceReference.resource.value &&
             !recordCommandWriteResource(adapter, commandEncoder, bindings->slots[index].resourceReference))
-            return fail(adapter, "OpenGL dispatch could not track a written resource", VERNON_STATUS_INTERNAL_ERROR);
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"opengl_dispatch_could_not_track_a_written_resource", 0, 0}})};
     if (!recordProviderCommand(adapter, commandEncoder, false))
-        return fail(adapter, "OpenGL dispatch command encoder state changed");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_dispatch_command_encoder_state_changed", 0, 0}})};
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    return VERNON_STATUS_OK;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
-                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
+RhiAdapterResult<void> encodeDrawResult(void *data, VernonRuntimeProviderObject commandEncoder,
+                                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
     auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
     auto *pipeline = descriptor ? fromHandle<PreparedPipeline>(descriptor->pipeline) : nullptr;
     auto *bindings = descriptor ? fromHandle<PreparedBindingSet>(descriptor->bindings) : nullptr;
@@ -818,27 +880,39 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         (!bindings && descriptor->bindings.value != 0) ||
         (pipeline->native->bindings.empty() ? bindings != nullptr : bindings == nullptr) ||
         (descriptor->index_count != 0 && descriptor->index_type != 0))
-        return fail(adapter, "OpenGL adapter received an invalid draw");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_adapter_received_an_invalid_draw", 0, 0}})};
     std::unique_lock<std::mutex> bindingGuard;
     if (bindings) {
         bindingGuard = std::unique_lock<std::mutex>(bindings->mutex);
         if (bindings->slots.size() != pipeline->native->bindings.size())
-            return fail(adapter, "OpenGL draw binding set does not match its pipeline");
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"opengl_draw_binding_set_does_not_match_its_pipeline", 0, 0}})};
     }
     auto &device = *pipeline->native->device;
-    const int claim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
-    if (nativeCommandEncoder(adapter, commandEncoder) != reinterpret_cast<uintptr_t>(&device) || claim < 0)
-        return fail(adapter, "OpenGL draw command encoder is invalid");
+    auto renderingClaim = claimCommandRendering(adapter, commandEncoder, vernon::rhi::CommandRenderingStateless);
+    if (!renderingClaim)
+        return RhiAdapterResult<void>{vernon::err(std::move(renderingClaim).error())};
+    const int claim = std::move(renderingClaim).value();
+    auto nativeCommand = nativeCommandEncoder(adapter, commandEncoder);
+    if (!nativeCommand)
+        return RhiAdapterResult<void>{vernon::err(std::move(nativeCommand).error())};
+    if (std::move(nativeCommand).value() != reinterpret_cast<uintptr_t>(&device) || claim < 0)
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_draw_command_encoder_is_invalid", 0, 0}})};
     const bool firstDraw = claim != 0;
     const bool standaloneRendering = !commandEncoderHasRenderingDescriptor(adapter, commandEncoder);
-    const uint64_t renderingFramebuffer =
-        commandRenderingObject(adapter, commandEncoder, pipeline->native->framebuffer);
-    if (!renderingFramebuffer)
-        return fail(adapter, "OpenGL command framebuffer state is invalid");
+    auto renderingObject = commandRenderingObject(adapter, commandEncoder, pipeline->native->framebuffer);
+    if (!renderingObject)
+        return RhiAdapterResult<void>{vernon::err(std::move(renderingObject).error())};
+    const uint64_t renderingFramebuffer = std::move(renderingObject).value();
     if (!retainCommandObjects(adapter, commandEncoder, *pipeline, bindings))
-        return fail(adapter, "OpenGL draw could not retain provider objects", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_provider_objects", 0, 0}})};
     if (!retainBindingResources(adapter, commandEncoder, bindings))
-        return fail(adapter, "OpenGL draw could not retain its bindings", VERNON_STATUS_INTERNAL_ERROR);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_bindings", 0, 0}})};
     std::array<VernonRhiLoadOperation, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorLoads{};
     std::array<std::array<float, 4>, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> colorClears{};
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
@@ -847,8 +921,10 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                   std::end(descriptor->color_attachments[index].clear_color), colorClears[index].begin());
         VernonRhiStoreOperation ignoredStore =
             static_cast<VernonRhiStoreOperation>(descriptor->color_attachments[index].store_operation);
-        (void)commandColorOperations(adapter, commandEncoder, index, colorLoads[index], ignoredStore,
-                                     colorClears[index].data());
+        auto operations = commandColorOperations(adapter, commandEncoder, index, colorLoads[index], ignoredStore,
+                                                 colorClears[index].data());
+        if (!operations)
+            return RhiAdapterResult<void>{vernon::err(std::move(operations).error())};
     }
     VernonRhiLoadOperation depthLoad = static_cast<VernonRhiLoadOperation>(descriptor->depth_load_operation);
     VernonRhiStoreOperation depthStore = static_cast<VernonRhiStoreOperation>(descriptor->depth_store_operation);
@@ -856,8 +932,10 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     VernonRhiStoreOperation stencilStore = static_cast<VernonRhiStoreOperation>(descriptor->stencil_store_operation);
     float clearDepth = descriptor->clear_depth;
     uint32_t clearStencil = descriptor->clear_stencil;
-    (void)commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad, stencilStore, clearDepth,
-                                 clearStencil);
+    auto depthOperations = commandDepthOperations(adapter, commandEncoder, depthLoad, depthStore, stencilLoad,
+                                                  stencilStore, clearDepth, clearStencil);
+    if (!depthOperations)
+        return RhiAdapterResult<void>{vernon::err(std::move(depthOperations).error())};
     auto &driver = device.driver;
     std::array<rhi::opengl::Enum, VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS> drawBuffers{};
     drawBuffers.fill(rhi::opengl::kNone);
@@ -950,7 +1028,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         const auto &slot = bindings->slots[index];
         if (slot.slot != binding.slot || slot.kind != binding.kind || slot.valueCount != binding.valueCount ||
             slot.columnCount != binding.columnCount || slot.numericType != binding.numericType)
-            return fail(adapter, "OpenGL draw binding order does not match its pipeline");
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"opengl_draw_binding_order_does_not_match_its_pipeline", 0, 0}})};
         if (!binding.active)
             continue;
         if (binding.kind == VERNON_RUNTIME_PROVIDER_VERTEX_BUFFER) {
@@ -1035,7 +1115,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     for (const GraphicsVertexAttribute &attribute : pipeline->native->vertexAttributes) {
         const auto found = bindings->vertexSlotByBinding.find(attribute.layout.binding);
         if (found == bindings->vertexSlotByBinding.end())
-            return fail(adapter, "OpenGL vertex attribute binding is missing");
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::InvalidArgument, {"opengl_vertex_attribute_binding_is_missing", 0, 0}})};
         const auto &slot = bindings->slots[found->second];
         driver.bindBuffer(rhi::opengl::kArrayBuffer, static_cast<rhi::opengl::Uint>(slot.resource));
         driver.enableVertexAttribArray(attribute.layout.location);
@@ -1063,10 +1144,17 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     for (size_t index = 0; index < descriptor->color_attachment_count; ++index) {
         const auto &attachment = descriptor->color_attachments[index];
         if (!retainCommandResource(adapter, commandEncoder, attachment.view))
-            return fail(adapter, "OpenGL draw could not retain its color attachment", VERNON_STATUS_INTERNAL_ERROR);
-        colorImages[index] = resolveRhiResource(adapter, attachment.view);
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::BackendFailure,
+                                                  {"opengl_draw_could_not_retain_its_color_attachment", 0, 0}})};
+        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, attachment.view);
+        if (!resolved)
+            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+        colorImages[index] = std::move(resolved).value();
         if (attachment.location >= VERNON_RUNTIME_PROVIDER_MAX_COLOR_ATTACHMENTS || colorImages[index] == 0)
-            return fail(adapter, "OpenGL draw contains an invalid color attachment");
+            return RhiAdapterResult<void>{
+                vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                  {"opengl_draw_contains_an_invalid_color_attachment", 0, 0}})};
         framebufferSignature.values[framebufferSignature.count++] = attachment.location;
         framebufferSignature.values[framebufferSignature.count++] = attachment.view.resource.value;
         const auto target = rhi::opengl::kColorAttachment0 + attachment.location;
@@ -1075,10 +1163,15 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     }
     const bool hasDepth = descriptor->depth_stencil_view.resource.value != 0;
     if (hasDepth && !retainCommandResource(adapter, commandEncoder, descriptor->depth_stencil_view))
-        return fail(adapter, "OpenGL draw could not retain its depth attachment", VERNON_STATUS_INTERNAL_ERROR);
-    const uint64_t depthImage = hasDepth ? resolveRhiResource(adapter, descriptor->depth_stencil_view) : 0;
-    if (hasDepth && depthImage == 0)
-        return fail(adapter, "OpenGL depth attachment is stale");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_depth_attachment", 0, 0}})};
+    uint64_t depthImage = 0;
+    if (hasDepth) {
+        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->depth_stencil_view);
+        if (!resolved)
+            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+        depthImage = std::move(resolved).value();
+    }
     framebufferSignature.values[framebufferSignature.count++] = hasDepth;
     framebufferSignature.values[framebufferSignature.count++] = descriptor->depth_stencil_view.resource.value;
     if (firstDraw || !state.framebufferValid || state.framebuffer != renderingFramebuffer) {
@@ -1105,7 +1198,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                     hasDepth ? static_cast<rhi::opengl::Uint>(depthImage) : 0, 0);
         driver.drawBuffers(static_cast<rhi::opengl::Size>(drawBufferCount), drawBuffers.data());
         if (driver.checkFramebufferStatus(rhi::opengl::kFramebuffer) != rhi::opengl::kFramebufferComplete)
-            return fail(adapter, "OpenGL draw framebuffer is incomplete", VERNON_STATUS_INTERNAL_ERROR);
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_framebuffer_is_incomplete", 0, 0}})};
         state.framebufferSignatures.insert_or_assign(static_cast<rhi::opengl::Uint>(renderingFramebuffer),
                                                      framebufferSignature);
     }
@@ -1126,7 +1220,9 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     if (hasDepth && firstDraw) {
         if (pipeline->depthStencilFormat != rhi::opengl::kDepth32fStencil8 &&
             (stencilLoad != VERNON_RHI_LOAD_DISCARD || stencilStore != VERNON_RHI_STORE_DISCARD || clearStencil))
-            return fail(adapter, "OpenGL draw requests stencil operations for a depth-only attachment");
+            return RhiAdapterResult<void>{vernon::err(
+                vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                      {"opengl_draw_requests_stencil_operations_for_a_depth_only_attachment", 0, 0}})};
         if (depthLoad == VERNON_RHI_LOAD_CLEAR)
             driver.depthMask(1);
         if (stencilLoad == VERNON_RHI_LOAD_CLEAR) {
@@ -1163,7 +1259,8 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
         }
     } else if (!std::equal(std::begin(descriptor->viewport), std::end(descriptor->viewport),
                            std::begin(descriptor->scissor))) {
-        return fail(adapter, "OpenGL context does not expose glScissor", VERNON_STATUS_UNSUPPORTED_TARGET);
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::Unsupported, {"opengl_context_does_not_expose_glscissor", 0, 0}})};
     }
     rhi::opengl::Enum topology = rhi::opengl::kTriangles;
     if (descriptor->topology == 1)
@@ -1171,13 +1268,16 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
     else if (descriptor->topology == 2)
         topology = rhi::opengl::kPoints;
     else if (descriptor->topology != 0)
-        return fail(adapter, "OpenGL draw topology is invalid");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{vernon::ProviderErrorCode::InvalidArgument,
+                                                                        {"opengl_draw_topology_is_invalid", 0, 0}})};
     if (descriptor->index_count != 0) {
         if (!retainCommandResource(adapter, commandEncoder, descriptor->index_buffer))
-            return fail(adapter, "OpenGL draw could not retain its index buffer", VERNON_STATUS_INTERNAL_ERROR);
-        const uint64_t indexBuffer = resolveRhiResource(adapter, descriptor->index_buffer);
-        if (!indexBuffer)
-            return fail(adapter, "OpenGL draw index buffer is stale");
+            return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+                vernon::ProviderErrorCode::BackendFailure, {"opengl_draw_could_not_retain_its_index_buffer", 0, 0}})};
+        auto resolved = resolveCommandRhiResource(adapter, commandEncoder, descriptor->index_buffer);
+        if (!resolved)
+            return RhiAdapterResult<void>{vernon::err(std::move(resolved).error())};
+        const uint64_t indexBuffer = std::move(resolved).value();
         driver.bindBuffer(rhi::opengl::kElementArrayBuffer, static_cast<rhi::opengl::Uint>(indexBuffer));
         driver.drawElementsInstanced(
             topology, static_cast<rhi::opengl::Size>(descriptor->index_count), rhi::opengl::kUnsignedInt,
@@ -1207,21 +1307,29 @@ VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject commandEncoder,
                                          discarded.data());
     }
     if (!recordProviderCommand(adapter, commandEncoder, true))
-        return fail(adapter, "OpenGL draw command encoder state changed");
+        return RhiAdapterResult<void>{vernon::err(vernon::ProviderError{
+            vernon::ProviderErrorCode::InvalidArgument, {"opengl_draw_command_encoder_state_changed", 0, 0}})};
     adapter.dispatches.fetch_add(1, std::memory_order_relaxed);
-    return VERNON_STATUS_OK;
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 
-void destroyShader(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedShader>(handle); }
-void destroyLayout(void *, VernonRuntimeProviderObject handle) { delete fromHandle<PreparedLayout>(handle); }
+RhiAdapterResult<void> destroyShaderResult(void *, VernonRuntimeProviderObject handle) {
+    delete fromHandle<PreparedShader>(handle);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+RhiAdapterResult<void> destroyLayoutResult(void *, VernonRuntimeProviderObject handle) {
+    delete fromHandle<PreparedLayout>(handle);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
 void releaseCommandBindings(void *context, uint64_t) {
     auto *bindings = static_cast<PreparedBindingSet *>(context);
     if (!bindings || bindings->references.fetch_sub(1, std::memory_order_acq_rel) != 1)
         return;
     delete bindings;
 }
-void destroyBindings(void *, VernonRuntimeProviderObject handle) {
+RhiAdapterResult<void> destroyBindingsResult(void *, VernonRuntimeProviderObject handle) {
     releaseCommandBindings(fromHandle<PreparedBindingSet>(handle), 0);
+    return RhiAdapterResult<void>{vernon::ok()};
 }
 NativeGraphicsBundle::~NativeGraphicsBundle() {
     if (!device)
@@ -1245,8 +1353,73 @@ void releaseCommandPipeline(void *context, uint64_t) {
         return;
     delete pipeline;
 }
-void destroyPipeline(void *, VernonRuntimeProviderObject handle) {
+RhiAdapterResult<void> destroyPipelineResult(void *, VernonRuntimeProviderObject handle) {
     releaseCommandPipeline(fromHandle<PreparedPipeline>(handle), 0);
+    return RhiAdapterResult<void>{vernon::ok()};
+}
+
+void destroyShader(void *data, VernonRuntimeProviderObject handle) {
+    auto result = destroyShaderResult(data, handle);
+    if (!result)
+        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
+                            "OpenGL shader destruction failed");
+}
+void destroyLayout(void *data, VernonRuntimeProviderObject handle) {
+    auto result = destroyLayoutResult(data, handle);
+    if (!result)
+        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
+                            "OpenGL layout destruction failed");
+}
+void destroyPipeline(void *data, VernonRuntimeProviderObject handle) {
+    auto result = destroyPipelineResult(data, handle);
+    if (!result)
+        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
+                            "OpenGL pipeline destruction failed");
+}
+void destroyBindings(void *data, VernonRuntimeProviderObject handle) {
+    auto result = destroyBindingsResult(data, handle);
+    if (!result)
+        recordProviderError(*static_cast<VernonRuntimeRhiAdapter *>(data), std::move(result).error(),
+                            "OpenGL binding-set destruction failed");
+}
+
+VernonStatus prepareShader(void *data, const VernonRuntimeProviderShaderDescriptor *descriptor,
+                           VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, prepareShaderResult(data, descriptor, output), "OpenGL shader preparation failed");
+}
+VernonStatus prepareLayout(void *data, const VernonRuntimeProviderPipelineLayoutDescriptor *descriptor,
+                           VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, prepareLayoutResult(data, descriptor, output), "OpenGL layout preparation failed");
+}
+VernonStatus preparePipeline(void *data, const VernonRuntimeProviderPipelineDescriptor *descriptor,
+                             VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, preparePipelineResult(data, descriptor, output),
+                          "OpenGL pipeline preparation failed");
+}
+VernonStatus createBindings(void *data, const VernonRuntimeProviderBindingSetDescriptor *descriptor,
+                            VernonRuntimeProviderObject *output) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, createBindingsResult(data, descriptor, output),
+                          "OpenGL binding-set creation failed");
+}
+VernonStatus updateBindings(void *data, VernonRuntimeProviderObject handle,
+                            const VernonRuntimeProviderBindingValue *values, size_t valueCount) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, updateBindingsResult(data, handle, values, valueCount),
+                          "OpenGL binding-set update failed");
+}
+VernonStatus encodeDispatch(void *data, VernonRuntimeProviderObject encoder,
+                            const VernonRuntimeProviderDispatchDescriptor *descriptor) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, encodeDispatchResult(data, encoder, descriptor), "OpenGL dispatch encoding failed");
+}
+VernonStatus encodeDraw(void *data, VernonRuntimeProviderObject encoder,
+                        const VernonRuntimeProviderDrawDescriptor *descriptor) {
+    auto &adapter = *static_cast<VernonRuntimeRhiAdapter *>(data);
+    return providerStatus(adapter, encodeDrawResult(data, encoder, descriptor), "OpenGL draw encoding failed");
 }
 
 } // namespace
@@ -1260,8 +1433,8 @@ void initializeOpenGLProvider(VernonRuntimeRhiAdapter &adapter) {
     adapter.provider.prepare_shader = prepareShader;
     adapter.provider.prepare_pipeline_layout = prepareLayout;
     adapter.provider.prepare_pipeline = preparePipeline;
-    adapter.provider.retain_resource = retainResource;
-    adapter.provider.release_resource = releaseResource;
+    adapter.provider.retain_resource = retainRhiResourceCallback;
+    adapter.provider.release_resource = releaseRhiResourceCallback;
     adapter.provider.describe_image = describeProviderImageCallback;
     adapter.provider.create_binding_set = createBindings;
     adapter.provider.update_binding_set = updateBindings;

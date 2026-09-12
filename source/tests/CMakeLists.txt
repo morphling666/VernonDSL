@@ -192,6 +192,16 @@ if(TARGET VernonRuntime)
     add_executable(VernonLifecycleControlTests runtime/lifecycle_control_test.cpp)
     target_link_libraries(VernonLifecycleControlTests PRIVATE GTest::gtest_main Vernon::Runtime)
     vernon_discover_gtests(VernonLifecycleControlTests)
+    add_executable(VernonRhiLifecycleCoreTests rhi/rhi_lifecycle_core_test.cpp)
+    target_include_directories(VernonRhiLifecycleCoreTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/include"
+                                                                   "${VERNON_REPOSITORY_ROOT}/source/lib")
+    target_link_libraries(VernonRhiLifecycleCoreTests PRIVATE GTest::gtest_main)
+    if(MSVC)
+        target_compile_options(VernonRhiLifecycleCoreTests PRIVATE /EHs-c-)
+    else()
+        target_compile_options(VernonRhiLifecycleCoreTests PRIVATE -fno-exceptions)
+    endif()
+    vernon_discover_gtests(VernonRhiLifecycleCoreTests)
     add_library(VernonRuntimeSupportNoExceptionsCheck OBJECT runtime/runtime_support_no_exceptions_compile.cpp)
     target_link_libraries(VernonRuntimeSupportNoExceptionsCheck PRIVATE Vernon::Runtime)
     if(MSVC)
@@ -201,6 +211,16 @@ if(TARGET VernonRuntime)
     endif()
     add_dependencies(VernonRuntimeSupportTests VernonRuntimeSupportNoExceptionsCheck)
     add_dependencies(VernonLifecycleControlTests VernonRuntimeSupportNoExceptionsCheck)
+
+    add_executable(VernonRhiCommandBenchmarkTests rhi/rhi_command_benchmark_test.cpp)
+    set_target_properties(VernonRhiCommandBenchmarkTests PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+                                                                    "${CMAKE_BINARY_DIR}/source")
+    target_include_directories(VernonRhiCommandBenchmarkTests PRIVATE "${VERNON_REPOSITORY_ROOT}/source/lib"
+                                                                      "${VERNON_TEST_ROOT}/support")
+    target_link_libraries(VernonRhiCommandBenchmarkTests PRIVATE GTest::gtest_main Vernon::Runtime Vernon::RHI)
+    vernon_enable_glfw_context_owner_for_test(VernonRhiCommandBenchmarkTests)
+    vernon_stage_target_files(VernonRhiCommandBenchmarkTests VernonRuntime VernonRHI)
+
     if(Python_EXECUTABLE)
         if(APPLE)
             set(_vernon_lifecycle_baseline_platform "macos")
@@ -228,6 +248,25 @@ if(TARGET VernonRuntime)
                        TRUE
                        SKIP_RETURN_CODE
                        77)
+
+        set(_vernon_rhi_command_baseline
+            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-rhi-command-phase3-${_vernon_lifecycle_baseline_configuration}.json"
+        )
+        add_test(
+            NAME VernonRhiCommandPhase3PerformanceGate
+            COMMAND
+                "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_rhi_command_benchmark.py" --benchmark
+                "$<TARGET_FILE:VernonRhiCommandBenchmarkTests>" --baseline "${_vernon_rhi_command_baseline}"
+                --repository "${VERNON_REPOSITORY_ROOT}" --output
+                "${VERNON_TEST_BINARY_ROOT}/rhi_command_phase3_benchmark.json")
+        set_tests_properties(
+            VernonRhiCommandPhase3PerformanceGate
+            PROPERTIES RUN_SERIAL
+                       TRUE
+                       TIMEOUT
+                       300
+                       LABELS
+                       benchmark)
     endif()
 
     if(VERNON_ENABLE_CUDA_RUNTIME)

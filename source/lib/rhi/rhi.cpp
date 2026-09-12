@@ -66,12 +66,8 @@ void vernon::rhi::setDeviceCreationError(std::string error) { creationError = st
 VernonStringView vernon::rhi::deviceCreationError() { return {creationError.data(), creationError.size()}; }
 
 void vernon::rhi::destroyDevice(VernonRhiDevice device) {
-    if (deviceHasActiveCommandEncoder(device))
-        return;
-    drainDeviceCompletions(device);
     if (const BackendDispatch *backend = dispatch(device))
-        backend->destroyDevice(device);
-    forgetDeviceCommandLimits(device);
+        (void)backend->destroyDevice(device);
 }
 
 VernonStringView vernon::rhi::deviceLastError(VernonRhiDevice device) {
@@ -85,6 +81,15 @@ VernonRhiStatus vernon::rhi::synchronizeDevice(VernonRhiDevice device) {
 }
 
 bool vernon::rhi::deviceExists(VernonRhiDevice device) { return dispatch(device) != nullptr; }
+
+vernon::Result<vernon::rhi::CommandDeviceStateRef, vernon::RhiError>
+vernon::rhi::commandState(VernonRhiDevice device) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend || !backend->commandState)
+        return Result<CommandDeviceStateRef, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"command_state", device.generation, device.index}})};
+    return backend->commandState(device);
+}
 
 uint64_t vernon::rhi::getTrackedBufferState(VernonRhiDevice device, VernonRhiBuffer buffer) {
     const BackendDispatch *backend = dispatch(device);
@@ -240,32 +245,122 @@ uint64_t vernon::rhi::samplerResource(VernonRhiDevice device, VernonRhiSampler s
     return backend && backend->samplerResource ? backend->samplerResource(device, sampler) : 0;
 }
 
-bool vernon::rhi::retainResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {
+vernon::Result<vernon::rhi::RetainedRhiResourceLease, vernon::RhiError>
+vernon::rhi::retainResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) noexcept {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->retainResource && backend->retainResource(device, kind, key);
+    if (!backend)
+        return Result<RetainedRhiResourceLease, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"retain_resource", key, static_cast<uint32_t>(kind)}})};
+    if (!backend->retainResource)
+        return Result<RetainedRhiResourceLease, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"retain_resource", key, static_cast<uint32_t>(kind)}})};
+    auto retained = backend->retainResource(device, kind, key);
+    if (retained.isErr())
+        return retained;
+    if (!retained.value().bindOwner(device.index, device.generation, static_cast<uint32_t>(kind), key)) {
+        auto released = retained.value().release();
+        if (released.isErr())
+            resultContractViolation();
+        return Result<RetainedRhiResourceLease, RhiError>{
+            err(RhiError{RhiErrorCode::LifecycleFailure, {"retain_resource", key, static_cast<uint32_t>(kind)}})};
+    }
+    return retained;
 }
 
-uint64_t vernon::rhi::resolveResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {
+vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::resolveResource(VernonRhiDevice device, ResourceKind kind,
+                                                                        uint64_t key,
+                                                                        RetainedRhiResourceLease &lease) noexcept {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->resolveResource ? backend->resolveResource(device, kind, key) : 0;
+    if (!backend)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+    if (!backend->resolveRetainedResource)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+    if (!lease.authorizes(device.index, device.generation, static_cast<uint32_t>(kind), key))
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+    auto pinned = lease.pin();
+    if (pinned.isErr())
+        return Result<uint64_t, RhiError>{err(std::move(pinned).error())};
+    return backend->resolveRetainedResource(device, kind, key);
 }
 
-bool vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key, VernonRhiImageDescriptor &descriptor) {
+vernon::Result<uint64_t, vernon::RhiError> vernon::rhi::resolvePinnedResource(VernonRhiDevice device, ResourceKind kind,
+                                                                              uint64_t key) noexcept {
     const BackendDispatch *backend = dispatch(device);
-    return backend && backend->describeImageResource && backend->describeImageResource(device, key, &descriptor);
+    if (!backend)
+        return Result<uint64_t, RhiError>{err(
+            RhiError{RhiErrorCode::InvalidArgument, {"resolve_pinned_resource", key, static_cast<uint32_t>(kind)}})};
+    if (!backend->resolveRetainedResource)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"resolve_pinned_resource", key, static_cast<uint32_t>(kind)}})};
+    return backend->resolveRetainedResource(device, kind, key);
 }
 
-bool vernon::rhi::describeImageViewResource(VernonRhiDevice device, uint64_t key, VernonRhiImageViewDescriptor &view,
-                                            VernonRhiImageDescriptor &image, uint64_t &parentKey) {
-    const BackendDispatch *backend = dispatch(device);
-    return backend && backend->describeImageViewResource &&
-           backend->describeImageViewResource(device, key, &view, &image, &parentKey);
+vernon::Result<void, vernon::RhiError>
+vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key,
+                                   VernonRhiImageDescriptor &descriptor) noexcept {
+    auto retained = retainResource(device, ResourceKind::Image, key);
+    if (retained.isErr())
+        return Result<void, RhiError>{err(std::move(retained).error())};
+    auto described = describeImageResource(device, key, descriptor, retained.value());
+    auto released = retained.value().release();
+    if (described.isErr())
+        return described;
+    return released;
 }
 
-void vernon::rhi::releaseResource(VernonRhiDevice device, ResourceKind kind, uint64_t key) {
-    if (const BackendDispatch *backend = dispatch(device))
-        if (backend->releaseResource)
-            backend->releaseResource(device, kind, key);
+vernon::Result<void, vernon::RhiError> vernon::rhi::describeImageResource(VernonRhiDevice device, uint64_t key,
+                                                                          VernonRhiImageDescriptor &descriptor,
+                                                                          RetainedRhiResourceLease &lease) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
+    if (!backend->describeImageResource)
+        return Result<void, RhiError>{err(RhiError{RhiErrorCode::Unsupported, {"describe_image_resource", key, 0}})};
+    if (!lease.authorizes(device.index, device.generation, static_cast<uint32_t>(ResourceKind::Image), key))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
+    auto pinned = lease.pin();
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    return backend->describeImageResource(device, key, &descriptor);
+}
+
+vernon::Result<void, vernon::RhiError> vernon::rhi::describeImageViewResource(VernonRhiDevice device, uint64_t key,
+                                                                              VernonRhiImageViewDescriptor &view,
+                                                                              VernonRhiImageDescriptor &image,
+                                                                              uint64_t &parentKey) noexcept {
+    auto retained = retainResource(device, ResourceKind::ImageView, key);
+    if (retained.isErr())
+        return Result<void, RhiError>{err(std::move(retained).error())};
+    auto described = describeImageViewResource(device, key, view, image, parentKey, retained.value());
+    auto released = retained.value().release();
+    if (described.isErr())
+        return described;
+    return released;
+}
+
+vernon::Result<void, vernon::RhiError>
+vernon::rhi::describeImageViewResource(VernonRhiDevice device, uint64_t key, VernonRhiImageViewDescriptor &view,
+                                       VernonRhiImageDescriptor &image, uint64_t &parentKey,
+                                       RetainedRhiResourceLease &lease) noexcept {
+    const BackendDispatch *backend = dispatch(device);
+    if (!backend)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
+    if (!backend->describeImageViewResource)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::Unsupported, {"describe_image_view_resource", key, 0}})};
+    if (!lease.authorizes(device.index, device.generation, static_cast<uint32_t>(ResourceKind::ImageView), key))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
+    auto pinned = lease.pin();
+    if (pinned.isErr())
+        return Result<void, RhiError>{err(std::move(pinned).error())};
+    return backend->describeImageViewResource(device, key, &view, &image, &parentKey);
 }
 
 bool vernon::rhi::beginCommandRecording(VernonRhiDevice device, uint64_t &native, VernonRhiBackend &backendKind) {
@@ -353,32 +448,32 @@ bool vernon::rhi::endCommandRendering(VernonRhiDevice device, uint64_t native, V
 }
 
 VernonRhiStatus vernon::rhi::clearCommandColor(VernonRhiDevice device, uint64_t native, VernonRhiBackend backendKind,
-                                               uint32_t renderingKind, int32_t x, int32_t y, uint32_t width,
-                                               uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
-                                               const float color[4]) {
+                                               uint32_t renderingKind, uint64_t renderingObject, int32_t x, int32_t y,
+                                               uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
+                                               uint32_t location, const float color[4]) {
     const BackendDispatch *backend = dispatch(device);
     if (!backend)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!backend->clearColor)
         return VERNON_RHI_STATUS_UNSUPPORTED;
-    return backend->clearColor(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
-                               location, color)
+    return backend->clearColor(device, native, backendKind, renderingKind, renderingObject, x, y, width, height, layers,
+                               target, location, color)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }
 
 VernonRhiStatus vernon::rhi::clearCommandDepthStencil(VernonRhiDevice device, uint64_t native,
-                                                      VernonRhiBackend backendKind, uint32_t renderingKind, int32_t x,
-                                                      int32_t y, uint32_t width, uint32_t height, uint32_t layers,
-                                                      uint64_t target, float depth, uint32_t stencil,
-                                                      uint32_t aspects) {
+                                                      VernonRhiBackend backendKind, uint32_t renderingKind,
+                                                      uint64_t renderingObject, int32_t x, int32_t y, uint32_t width,
+                                                      uint32_t height, uint32_t layers, uint64_t target, float depth,
+                                                      uint32_t stencil, uint32_t aspects) {
     const BackendDispatch *backend = dispatch(device);
     if (!backend)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (!backend->clearDepthStencil)
         return VERNON_RHI_STATUS_UNSUPPORTED;
-    return backend->clearDepthStencil(device, native, backendKind, renderingKind, x, y, width, height, layers, target,
-                                      depth, stencil, aspects)
+    return backend->clearDepthStencil(device, native, backendKind, renderingKind, renderingObject, x, y, width, height,
+                                      layers, target, depth, stencil, aspects)
                ? VERNON_RHI_STATUS_OK
                : VERNON_RHI_STATUS_INTERNAL_ERROR;
 }

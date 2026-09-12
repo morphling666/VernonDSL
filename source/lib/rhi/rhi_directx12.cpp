@@ -4,7 +4,6 @@
 #include "directx12_mipmap_3d.h"
 #include "image_data_layout.h"
 #include "image_descriptor_validation.h"
-#include "logical_resource_record.h"
 #include "rhi_test_hooks.h"
 #include "sampler_filter.h"
 
@@ -12,14 +11,11 @@
 #include <array>
 #include <cassert>
 #include <cstring>
-#include <deque>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -28,58 +24,79 @@ bool deviceHasActiveCommandEncoder(VernonRhiDevice device);
 }
 
 namespace {
-struct DirectX12BufferSlot : vernon::rhi::LogicalResourceRecord {
+using vernon::err;
+using vernon::ok;
+using vernon::Option;
+using vernon::Result;
+using vernon::RhiError;
+using vernon::RhiErrorCode;
+using vernon::rhi::BufferResourceTag;
+using vernon::rhi::ImageResourceTag;
+using vernon::rhi::ImageViewResourceTag;
+using vernon::rhi::NativeDescriptorRangeResourceTag;
+using vernon::rhi::ResourceCreationReservation;
+using vernon::rhi::ResourceHandle;
+using vernon::rhi::ResourceLifecycleSlot;
+using vernon::rhi::SamplerResourceTag;
+
+template <typename Tag> struct DirectX12ResourceSlot {
+    explicit DirectX12ResourceSlot(ResourceLifecycleSlot<Tag> value) noexcept : lifecycle(std::move(value)) {}
+
+    ResourceLifecycleSlot<Tag> lifecycle;
+};
+
+struct DirectX12BufferSlot : DirectX12ResourceSlot<BufferResourceTag> {
+    using DirectX12ResourceSlot::DirectX12ResourceSlot;
     vernon::rhi::directx12::Buffer buffer;
     VernonRhiDirectX12BorrowedBufferDescriptor descriptor{};
     VernonRhiBufferDescriptor ownedDescriptor{};
 };
 
-struct DirectX12ImageSlot : vernon::rhi::LogicalResourceRecord {
+struct DirectX12ImageSlot : DirectX12ResourceSlot<ImageResourceTag> {
+    using DirectX12ResourceSlot::DirectX12ResourceSlot;
     vernon::rhi::directx12::Image image;
     VernonRhiDirectX12BorrowedImageDescriptor descriptor{};
     VernonRhiImageDescriptor ownedDescriptor{};
 };
 
-struct DirectX12ImageViewSlot : vernon::rhi::LogicalResourceRecord {
+struct DirectX12ImageViewSlot : DirectX12ResourceSlot<ImageViewResourceTag> {
+    using DirectX12ResourceSlot::DirectX12ResourceSlot;
     vernon::rhi::directx12::Image image;
     VernonRhiImageViewDescriptor descriptor{};
     uint64_t imageResource{};
+    Option<vernon::rhi::RetainedResourceLease<ImageResourceTag>> imageLease;
 };
 
-struct DirectX12DescriptorRangeSlot {
+struct DirectX12DescriptorRangeSlot : DirectX12ResourceSlot<NativeDescriptorRangeResourceTag> {
+    using DirectX12ResourceSlot::DirectX12ResourceSlot;
     VernonRhiDirectX12BorrowedDescriptorRangeDescriptor descriptor{};
-    uint32_t generation{1};
-    bool occupied{};
 };
 
-struct DirectX12SamplerSlot : vernon::rhi::LogicalResourceRecord {
+struct DirectX12SamplerSlot : DirectX12ResourceSlot<SamplerResourceTag> {
+    using DirectX12ResourceSlot::DirectX12ResourceSlot;
     vernon::rhi::directx12::Sampler sampler;
 };
 
 struct DirectX12InteropDevice {
     vernon::rhi::directx12::DeviceState state;
-    std::deque<DirectX12BufferSlot> buffers;
-    std::deque<DirectX12ImageSlot> images;
-    std::deque<DirectX12ImageViewSlot> imageViews;
-    std::deque<DirectX12SamplerSlot> samplers;
-    std::deque<DirectX12DescriptorRangeSlot> descriptorRanges;
+    vernon::rhi::StableResourceSlotContainer<DirectX12BufferSlot> buffers;
+    vernon::rhi::StableResourceSlotContainer<DirectX12ImageSlot> images;
+    vernon::rhi::StableResourceSlotContainer<DirectX12ImageViewSlot> imageViews;
+    vernon::rhi::StableResourceSlotContainer<DirectX12SamplerSlot> samplers;
+    vernon::rhi::StableResourceSlotContainer<DirectX12DescriptorRangeSlot> descriptorRanges;
+    vernon::rhi::CommandDeviceStateRef commandState;
     uint32_t queueCapabilities{};
     ID3D12RootSignature *mipmapRootSignature{};
     ID3D12PipelineState *mipmap2dPipeline{};
     ID3D12PipelineState *mipmap3dPipeline{};
-    bool owned{};
     std::string error;
+    std::mutex resourceReservations;
     std::mutex mutex;
 };
 
-struct DirectX12DeviceSlot {
-    std::shared_ptr<DirectX12InteropDevice> device;
-    uint32_t generation{1};
-};
-
 constexpr uint32_t directX12DeviceBit = uint32_t{1} << 31;
-std::vector<DirectX12DeviceSlot> directX12Devices;
-std::mutex deviceMutex;
+constexpr size_t directX12DeviceCapacity = 1024;
+vernon::rhi::DeviceRegistry<DirectX12InteropDevice, directX12DeviceCapacity> directX12Devices;
 
 VernonRhiDevice invalidDevice() { return {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0}; }
 
@@ -94,71 +111,164 @@ bool decodeResourceKey(uint64_t key, uint32_t &index, uint32_t &generation) {
     return true;
 }
 
-template <typename Slots> auto *lookupResourceRecord(Slots &slots, uint64_t key) {
+template <typename Handle, typename Tag> ResourceHandle<Tag> typedHandle(Handle handle) {
+    return {handle.index, handle.generation};
+}
+
+template <typename Handle, typename Tag> Handle publicHandle(ResourceHandle<Tag> handle) {
+    return {handle.index, handle.generation};
+}
+
+template <typename Slots> auto *lookupRetainedResource(Slots &slots, uint64_t key) {
     uint32_t index = 0;
     uint32_t generation = 0;
     if (!decodeResourceKey(key, index, generation) || index >= slots.size())
         return static_cast<typename Slots::value_type *>(nullptr);
-    auto &slot = slots[index];
-    return slot.isRetained(generation) ? &slot : nullptr;
+    return &slots[index];
 }
 
-template <typename Slot, typename = void> struct HasPublicAlive : std::false_type {};
-template <typename Slot>
-struct HasPublicAlive<Slot, std::void_t<decltype(std::declval<Slot &>().publicAlive)>> : std::true_type {};
-
-template <typename Slot> bool publicAlive(const Slot &slot) {
-    if constexpr (HasPublicAlive<Slot>::value)
-        return slot.publicAlive;
-    return true;
-}
-
-std::shared_ptr<DirectX12InteropDevice> lookupDirectX12Device(VernonRhiDevice handle) {
-    if ((handle.index & directX12DeviceBit) == 0)
-        return {};
-    const uint32_t index = handle.index & ~directX12DeviceBit;
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    if (index >= directX12Devices.size())
-        return {};
-    DirectX12DeviceSlot &slot = directX12Devices[index];
-    return slot.device && slot.generation == handle.generation ? slot.device
-                                                               : std::shared_ptr<DirectX12InteropDevice>{};
-}
-
-template <typename Slots, typename Handle>
-typename Slots::value_type *lookupDirectX12Slot(Slots &slots, Handle handle) {
-    if (handle.index >= slots.size())
-        return nullptr;
-    auto &slot = slots[handle.index];
-    return slot.occupied && publicAlive(slot) && slot.generation == handle.generation ? &slot : nullptr;
-}
-
-template <typename Slots, typename Handle>
-typename Slots::value_type &allocateDirectX12Slot(Slots &slots, Handle &output) {
+template <typename Slot> bool matchesRetainedResource(const Slot &slot, uint64_t key) {
     uint32_t index = 0;
-    while (index < slots.size() && slots[index].occupied)
-        ++index;
-    if (index == slots.size())
-        slots.emplace_back();
-    auto &slot = slots[index];
-    if constexpr (std::is_base_of_v<vernon::rhi::LogicalResourceRecord, typename Slots::value_type>)
-        slot.publish();
-    else
-        slot.occupied = true;
-    output = {index, slot.generation};
-    return slot;
+    uint32_t generation = 0;
+    if (!decodeResourceKey(key, index, generation))
+        return false;
+    const auto snapshot = slot.lifecycle.snapshot();
+    return snapshot.occupied && snapshot.generation == generation;
 }
 
-template <typename Slot> void releaseDirectX12Slot(Slot &slot) {
-    if constexpr (std::is_base_of_v<vernon::rhi::LogicalResourceRecord, Slot>) {
-        if (slot.publicAlive)
-            slot.destroyPublicOwner();
-        slot.recycle();
-    } else {
-        slot.occupied = false;
-        if (++slot.generation == 0)
-            slot.generation = 1;
+template <typename Slots, typename Handle> auto *lookupPublicResource(Slots &slots, Handle handle) {
+    if (handle.index >= slots.size())
+        return static_cast<typename Slots::value_type *>(nullptr);
+    return &slots[handle.index];
+}
+
+template <typename Tag, typename Slots>
+Result<typename Slots::value_type *, RhiError> availableResourceSlot(Slots &slots) noexcept {
+    uint32_t index = 0;
+    while (index < slots.size() && slots[index].lifecycle.snapshot().occupied)
+        ++index;
+    if (index == slots.size()) {
+        auto lifecycle = ResourceLifecycleSlot<Tag>::create(index);
+        if (lifecycle.isErr())
+            return Result<typename Slots::value_type *, RhiError>{err(std::move(lifecycle).error())};
+        return slots.emplace("allocate_resource_slot", std::move(lifecycle).value());
     }
+    return Result<typename Slots::value_type *, RhiError>{ok(&slots[index])};
+}
+
+using DirectX12DeviceAnchor = vernon::rhi::DeviceRegistryAnchor<DirectX12InteropDevice>;
+
+class DirectX12DeviceAccess {
+public:
+    explicit DirectX12DeviceAccess(DirectX12DeviceAnchor anchor) noexcept : anchor_(std::move(anchor)) {}
+    DirectX12InteropDevice *operator->() noexcept { return &anchor_.device(); }
+    DirectX12InteropDevice &operator*() noexcept { return anchor_.device(); }
+    Result<vernon::OwnerRef, RhiError> retainOwner() const noexcept { return anchor_.retainOwner(); }
+
+private:
+    DirectX12DeviceAnchor anchor_;
+};
+
+std::optional<DirectX12DeviceAccess> lookupDirectX12Device(VernonRhiDevice handle) noexcept {
+    const uint32_t index = handle.index & ~directX12DeviceBit;
+    if ((handle.index & directX12DeviceBit) == 0 || index >= directX12DeviceCapacity)
+        return std::nullopt;
+    auto found = directX12Devices.lookup({index, handle.generation});
+    if (found.isErr())
+        return std::nullopt;
+    return std::optional<DirectX12DeviceAccess>{std::in_place, std::move(found).value()};
+}
+
+Result<ResourceCreationReservation, RhiError> reserveResource(DirectX12DeviceAccess &device) noexcept {
+    auto owner = device.retainOwner();
+    if (owner.isErr())
+        return Result<ResourceCreationReservation, RhiError>{err(std::move(owner).error())};
+    return ResourceCreationReservation::create(owner.value());
+}
+
+template <typename Tag, typename Slots, typename Handle>
+Result<vernon::OperationPin, RhiError> pinPublicResource(DirectX12InteropDevice &device, Slots &slots,
+                                                         Handle handle) noexcept {
+    ResourceLifecycleSlot<Tag> *lifecycle{};
+    {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        if (handle.index >= slots.size())
+            return Result<vernon::OperationPin, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"pin_resource", handle.generation, handle.index}})};
+        lifecycle = &slots[handle.index].lifecycle;
+    }
+    return lifecycle->pin(typedHandle<Handle, Tag>(handle));
+}
+
+template <typename Tag, typename Slots, typename Handle>
+Result<void, RhiError> destroyPublicResource(DirectX12InteropDevice &device, Slots &slots, Handle handle) noexcept {
+    ResourceLifecycleSlot<Tag> *lifecycle{};
+    {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        if (handle.index >= slots.size())
+            return Result<void, RhiError>{
+                err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_resource", handle.generation, handle.index}})};
+        lifecycle = &slots[handle.index].lifecycle;
+    }
+    return lifecycle->destroyPublic(typedHandle<Handle, Tag>(handle));
+}
+
+Result<void, RhiError> teardownBuffer(void *context, ResourceHandle<BufferResourceTag> handle) noexcept {
+    auto &device = *static_cast<DirectX12InteropDevice *>(context);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    auto &slot = device.buffers[handle.index];
+    device.state.destroyBuffer(slot.buffer);
+    slot.descriptor = {};
+    slot.ownedDescriptor = {};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> teardownImage(void *context, ResourceHandle<ImageResourceTag> handle) noexcept {
+    auto &device = *static_cast<DirectX12InteropDevice *>(context);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    auto &slot = device.images[handle.index];
+    device.state.destroyImage(slot.image);
+    slot.image.subresourceStates.clear();
+    slot.image.stateJournals.clear();
+    slot.descriptor = {};
+    slot.ownedDescriptor = {};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> teardownImageView(void *context, ResourceHandle<ImageViewResourceTag> handle) noexcept {
+    auto &device = *static_cast<DirectX12InteropDevice *>(context);
+    auto &slot = device.imageViews[handle.index];
+    if (!slot.imageLease)
+        return Result<void, RhiError>{err(RhiError{
+            RhiErrorCode::LifecycleFailure, {"release_directx12_image_view_parent", handle.generation, handle.index}})};
+    auto prepared = slot.imageLease.value().prepareRelease();
+    if (prepared.isErr())
+        return Result<void, RhiError>{err(std::move(prepared).error())};
+    {
+        std::lock_guard<std::mutex> guard(device.mutex);
+        slot.image = {};
+        slot.descriptor = {};
+        slot.imageResource = 0;
+    }
+    if (prepared.value().commit().isErr())
+        vernon::resultContractViolation();
+    slot.imageLease.reset();
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> teardownSampler(void *context, ResourceHandle<SamplerResourceTag> handle) noexcept {
+    auto &device = *static_cast<DirectX12InteropDevice *>(context);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.samplers[handle.index].sampler = {};
+    return Result<void, RhiError>{ok()};
+}
+
+Result<void, RhiError> teardownDescriptorRange(void *context,
+                                               ResourceHandle<NativeDescriptorRangeResourceTag> handle) noexcept {
+    auto &device = *static_cast<DirectX12InteropDevice *>(context);
+    std::lock_guard<std::mutex> guard(device.mutex);
+    device.descriptorRanges[handle.index].descriptor = {};
+    return Result<void, RhiError>{ok()};
 }
 
 D3D12_RESOURCE_STATES directX12ResourceState(VernonRhiResourceState state) {
@@ -341,6 +451,10 @@ vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDes
         (descriptor->queue_capabilities &
          ~(VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS)) != 0)
         return invalidDevice();
+    auto reserved = directX12Devices.reserve();
+    if (reserved.isErr())
+        return invalidDevice();
+    auto reservation = std::move(reserved).value();
     auto *queue = static_cast<ID3D12CommandQueue *>(descriptor->queue);
     auto *commands = static_cast<ID3D12GraphicsCommandList *>(descriptor->command_list);
     auto *nativeDevice = static_cast<ID3D12Device *>(descriptor->device);
@@ -348,21 +462,14 @@ vernonRhiCreateBorrowedDirectX12Device(const VernonRhiDirectX12BorrowedDeviceDes
         commands->GetType() != D3D12_COMMAND_LIST_TYPE_DIRECT || !belongsToDirectX12Device(queue, nativeDevice) ||
         !belongsToDirectX12Device(commands, nativeDevice))
         return invalidDevice();
-    auto device = std::shared_ptr<DirectX12InteropDevice>(new (std::nothrow) DirectX12InteropDevice());
-    if (!device || !device->state.initializeBorrowed(nativeDevice, queue, commands, device->error))
+    auto &device = reservation.device();
+    if (!device.state.initializeBorrowed(nativeDevice, queue, commands, device.error))
         return invalidDevice();
-    device->queueCapabilities = descriptor->queue_capabilities;
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    uint32_t index = 0;
-    while (index < directX12Devices.size() && directX12Devices[index].device)
-        ++index;
-    if (index == directX12Devices.size()) {
-        if (index >= directX12DeviceBit)
-            return invalidDevice();
-        directX12Devices.emplace_back();
-    }
-    directX12Devices[index].device = std::move(device);
-    return {index | directX12DeviceBit, directX12Devices[index].generation};
+    device.queueCapabilities = descriptor->queue_capabilities;
+    auto published = directX12Devices.publish(std::move(reservation));
+    if (published.isErr())
+        return invalidDevice();
+    return {published.value().index | directX12DeviceBit, published.value().generation};
 }
 
 extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQueue(VernonRhiDevice handle,
@@ -370,6 +477,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedQu
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
     *output = device->state.queue;
     return VERNON_RHI_STATUS_OK;
 }
@@ -379,6 +487,7 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceGetBorrowedCo
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> guard(device->mutex);
     *output = device->state.commandList();
     return VERNON_RHI_STATUS_OK;
 }
@@ -389,18 +498,32 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
     if (!device || !descriptor || descriptor->struct_size < sizeof(*descriptor) || !descriptor->resource ||
         !descriptor->size || descriptor->state == VERNON_RHI_STATE_UNDEFINED || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<BufferResourceTag>(device->buffers);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12BufferSlot &slot = *available.value();
+    std::lock_guard<std::mutex> guard(device->mutex);
     auto *resource = static_cast<ID3D12Resource *>(descriptor->resource);
     if (!belongsToDirectX12Device(resource, device->state.device))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const D3D12_RESOURCE_DESC native = resource->GetDesc();
     if (native.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || native.Width < descriptor->size)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot &slot = allocateDirectX12Slot(device->buffers, *output);
     slot.buffer.resource = resource;
     slot.buffer.state = directX12ResourceState(descriptor->state);
     slot.buffer.owned = false;
     slot.descriptor = *descriptor;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownBuffer);
+    if (published.isErr()) {
+        slot.buffer = {};
+        slot.descriptor = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiBuffer>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -411,6 +534,15 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
         descriptor->image.struct_size < sizeof(descriptor->image) || descriptor->state == VERNON_RHI_STATE_UNDEFINED ||
         !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<ImageResourceTag>(device->images);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12ImageSlot &slot = *available.value();
+    std::lock_guard<std::mutex> guard(device->mutex);
     auto *resource = static_cast<ID3D12Resource *>(descriptor->resource);
     if (!belongsToDirectX12Device(resource, device->state.device))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -433,8 +565,6 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
         native.DepthOrArraySize != expectedDepthOrLayers || native.MipLevels != descriptor->image.mip_levels ||
         native.SampleDesc.Count != descriptor->image.sample_count || !validCube)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot &slot = allocateDirectX12Slot(device->images, *output);
     slot.image.resource = resource;
     slot.image.format = format;
     slot.image.dimension = descriptor->image.dimension;
@@ -445,11 +575,18 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
                                                 directX12PlaneCount(descriptor->image.format),
                                             slot.image.state);
     } catch (const std::bad_alloc &) {
-        releaseDirectX12Slot(slot);
+        slot.image = {};
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
     slot.image.owned = false;
     slot.descriptor = *descriptor;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
+    if (published.isErr()) {
+        slot.image = {};
+        slot.descriptor = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiImage>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -461,6 +598,15 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
         !descriptor->cpu_handle || !descriptor->descriptor_count ||
         descriptor->heap_type > VERNON_RHI_NATIVE_DESCRIPTOR_DEPTH_STENCIL || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<NativeDescriptorRangeResourceTag>(device->descriptorRanges);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12DescriptorRangeSlot &slot = *available.value();
+    std::lock_guard<std::mutex> guard(device->mutex);
     auto *heap = static_cast<ID3D12DescriptorHeap *>(descriptor->heap);
     if (!belongsToDirectX12Device(heap, device->state.device))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
@@ -487,9 +633,13 @@ extern "C" VERNON_RHI_CAPI VernonRhiStatus vernonRhiDirectX12DeviceImportBorrowe
             (descriptor->gpu_handle - gpuStart) / increment + descriptor->descriptor_count > native.NumDescriptors)
             return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     }
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12DescriptorRangeSlot &slot = allocateDirectX12Slot(device->descriptorRanges, *output);
     slot.descriptor = *descriptor;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownDescriptorRange);
+    if (published.isErr()) {
+        slot.descriptor = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiNativeDescriptorRange>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -498,12 +648,8 @@ vernonRhiDeviceDestroyNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNat
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12DescriptorRangeSlot *slot = lookupDirectX12Slot(device->descriptorRanges, range);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    releaseDirectX12Slot(*slot);
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = destroyPublicResource<NativeDescriptorRangeResourceTag>(**device, device->descriptorRanges, range);
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
 extern "C" VERNON_RHI_CAPI VernonRhiStatus
@@ -512,8 +658,11 @@ vernonRhiDeviceGetNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeD
     auto device = lookupDirectX12Device(handle);
     if (!device || !output || output->struct_size < sizeof(*output))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto pin = pinPublicResource<NativeDescriptorRangeResourceTag>(**device, device->descriptorRanges, range);
+    if (pin.isErr())
+        return vernon::toVernonRhiStatus(pin.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12DescriptorRangeSlot *slot = lookupDirectX12Slot(device->descriptorRanges, range);
+    DirectX12DescriptorRangeSlot *slot = lookupPublicResource(device->descriptorRanges, range);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = slot->descriptor;
@@ -521,54 +670,66 @@ vernonRhiDeviceGetNativeDescriptorRange(VernonRhiDevice handle, VernonRhiNativeD
 }
 
 VernonRhiDevice createOwnedDevice(const VernonRhiOwnedDeviceDescriptor *descriptor) {
-
-    auto device = std::shared_ptr<DirectX12InteropDevice>(new (std::nothrow) DirectX12InteropDevice());
-    const bool forceSoftware = (descriptor->flags & VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE) != 0;
-    if (!device || !device->state.initialize(descriptor->device_index, forceSoftware, device->error))
+    auto reserved = directX12Devices.reserve();
+    if (reserved.isErr()) {
+        setDeviceCreationError("DirectX 12 device registry reservation failed");
         return invalidDevice();
-    device->owned = true;
-    device->queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
-    std::lock_guard<std::mutex> guard(deviceMutex);
-    uint32_t index = 0;
-    while (index < directX12Devices.size() && directX12Devices[index].device)
-        ++index;
-    if (index == directX12Devices.size())
-        directX12Devices.emplace_back();
-    directX12Devices[index].device = std::move(device);
-    return {index | directX12DeviceBit, directX12Devices[index].generation};
+    }
+    auto reservation = std::move(reserved).value();
+    auto &device = reservation.device();
+    auto owner = reservation.retainOwner();
+    if (owner.isErr()) {
+        setDeviceCreationError("DirectX 12 device owner retention failed");
+        return invalidDevice();
+    }
+    auto commandState = vernon::rhi::createCommandDeviceState(std::move(owner).value());
+    if (commandState.isErr()) {
+        setDeviceCreationError("DirectX 12 command state allocation failed");
+        return invalidDevice();
+    }
+    device.commandState = std::move(commandState).value();
+    const bool forceSoftware = (descriptor->flags & VERNON_RHI_OWNED_DEVICE_FORCE_SOFTWARE) != 0;
+    if (!device.state.initialize(descriptor->device_index, forceSoftware, device.error)) {
+        setDeviceCreationError(device.error);
+        return invalidDevice();
+    }
+    device.queueCapabilities = VERNON_RHI_QUEUE_TRANSFER | VERNON_RHI_QUEUE_COMPUTE | VERNON_RHI_QUEUE_GRAPHICS;
+    auto published = directX12Devices.publish(std::move(reservation));
+    if (published.isErr()) {
+        setDeviceCreationError("DirectX 12 device registry publish failed");
+        return invalidDevice();
+    }
+    return {published.value().index | directX12DeviceBit, published.value().generation};
 }
 
-void destroyDevice(VernonRhiDevice handle) {
+Result<void, RhiError> teardownDevice(DirectX12InteropDevice &device) noexcept {
+    std::lock_guard<std::mutex> guard(device.mutex);
+    if (device.mipmap3dPipeline)
+        device.mipmap3dPipeline->Release();
+    if (device.mipmap2dPipeline)
+        device.mipmap2dPipeline->Release();
+    if (device.mipmapRootSignature)
+        device.mipmapRootSignature->Release();
+    device.mipmap3dPipeline = nullptr;
+    device.mipmap2dPipeline = nullptr;
+    device.mipmapRootSignature = nullptr;
+    device.state.shutdown();
+    return Result<void, RhiError>{ok()};
+}
 
-    std::shared_ptr<DirectX12InteropDevice> device;
-    {
-        const uint32_t index = handle.index & ~directX12DeviceBit;
-        std::lock_guard<std::mutex> guard(deviceMutex);
-        if (index >= directX12Devices.size() || directX12Devices[index].generation != handle.generation)
-            return;
-        DirectX12DeviceSlot &slot = directX12Devices[index];
-        device = std::move(slot.device);
-        ++slot.generation;
-        if (slot.generation == 0)
-            slot.generation = 1;
-    }
-    if (device) {
-        std::lock_guard<std::mutex> guard(device->mutex);
-        for (DirectX12BufferSlot &buffer : device->buffers)
-            if (buffer.occupied)
-                device->state.destroyBuffer(buffer.buffer);
-        for (DirectX12ImageSlot &image : device->images)
-            if (image.occupied)
-                device->state.destroyImage(image.image);
-        if (device->mipmap3dPipeline)
-            device->mipmap3dPipeline->Release();
-        if (device->mipmap2dPipeline)
-            device->mipmap2dPipeline->Release();
-        if (device->mipmapRootSignature)
-            device->mipmapRootSignature->Release();
-        device->state.shutdown();
-    }
-    return;
+Result<void, RhiError> destroyDevice(VernonRhiDevice handle) noexcept {
+    if ((handle.index & directX12DeviceBit) == 0)
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"destroy_directx12_device", handle.index, 0}})};
+    return directX12Devices.remove({handle.index & ~directX12DeviceBit, handle.generation}, teardownDevice);
+}
+
+Result<vernon::rhi::CommandDeviceStateRef, RhiError> commandState(VernonRhiDevice handle) noexcept {
+    auto device = lookupDirectX12Device(handle);
+    if (!device)
+        return Result<vernon::rhi::CommandDeviceStateRef, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"directx12_command_state", handle.index, 0}})};
+    return device->commandState.retain();
 }
 
 VernonStringView lastError(VernonRhiDevice handle) {
@@ -597,8 +758,15 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
         descriptor->size > (std::numeric_limits<size_t>::max)() ||
         descriptor->memory_class > VERNON_RHI_MEMORY_READBACK)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<BufferResourceTag>(device->buffers);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12BufferSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot &slot = allocateDirectX12Slot(device->buffers, *output);
     const bool unorderedAccess =
         descriptor->memory_class == VERNON_RHI_MEMORY_DEVICE && (descriptor->usage & VERNON_RHI_BUFFER_STORAGE) != 0;
     const D3D12_HEAP_TYPE heapType = descriptor->memory_class == VERNON_RHI_MEMORY_UPLOAD     ? D3D12_HEAP_TYPE_UPLOAD
@@ -610,10 +778,17 @@ VernonRhiStatus createBuffer(VernonRhiDevice handle, const VernonRhiBufferDescri
                                                                  : D3D12_RESOURCE_STATE_COMMON;
     if (!device->state.createBuffer(slot.buffer, static_cast<size_t>(descriptor->size), unorderedAccess, heapType,
                                     initialState, device->error)) {
-        releaseDirectX12Slot(slot);
+        device->state.destroyBuffer(slot.buffer);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
     slot.ownedDescriptor = *descriptor;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownBuffer);
+    if (published.isErr()) {
+        device->state.destroyBuffer(slot.buffer);
+        slot.ownedDescriptor = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiBuffer>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -626,8 +801,11 @@ VernonRhiStatus uploadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, uin
 
     if (!source)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
+    DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
@@ -670,8 +848,11 @@ VernonRhiStatus uploadBufferRanges(VernonRhiDevice handle, VernonRhiBuffer buffe
         return VERNON_RHI_STATUS_UNSUPPORTED;
     if (!ranges || rangeCount == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
+    DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (slot->ownedDescriptor.memory_class == VERNON_RHI_MEMORY_UPLOAD) {
@@ -746,8 +927,11 @@ VernonRhiStatus downloadBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer, u
 
     if (!destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
+    DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot || offset > slot->ownedDescriptor.size || size > slot->ownedDescriptor.size - offset)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     ID3D12Resource *readback = nullptr;
@@ -774,8 +958,11 @@ uint32_t isBufferValid(VernonRhiDevice handle, VernonRhiBuffer buffer) {
         return 0;
     }
 
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupDirectX12Slot(device->buffers, buffer) != nullptr;
+    return lookupPublicResource(device->buffers, buffer) != nullptr;
 }
 
 VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescriptor *descriptor,
@@ -793,8 +980,15 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
         descriptor->sample_count != 1 || (depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_COLOR_ATTACHMENT)) ||
         (!depthFormat && (descriptor->usage & VERNON_RHI_IMAGE_DEPTH_STENCIL_ATTACHMENT)))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<ImageResourceTag>(device->images);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12ImageSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot &slot = allocateDirectX12Slot(device->images, *output);
     D3D12_RESOURCE_DESC native{};
     native.Dimension = descriptor->dimension == VERNON_RHI_IMAGE_3D ? D3D12_RESOURCE_DIMENSION_TEXTURE3D
                                                                     : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -825,7 +1019,7 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
             native.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     }
     if (!device->state.createImage(slot.image, native, format, D3D12_RESOURCE_STATE_COMMON, device->error)) {
-        releaseDirectX12Slot(slot);
+        device->state.destroyImage(slot.image);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
     slot.image.dimension = descriptor->dimension;
@@ -835,10 +1029,16 @@ VernonRhiStatus createImage(VernonRhiDevice handle, const VernonRhiImageDescript
                                             slot.image.state);
     } catch (const std::bad_alloc &) {
         device->state.destroyImage(slot.image);
-        releaseDirectX12Slot(slot);
         return VERNON_RHI_STATUS_INTERNAL_ERROR;
     }
     slot.ownedDescriptor = *descriptor;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImage);
+    if (published.isErr()) {
+        device->state.destroyImage(slot.image);
+        slot.ownedDescriptor = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiImage>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -856,8 +1056,11 @@ VernonRhiStatus uploadImage(VernonRhiDevice handle, VernonRhiImage image, const 
 
     if (!uploads || uploadCount == 0)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
+    DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const VernonRhiImageDescriptor &descriptor = slot->ownedDescriptor;
@@ -958,8 +1161,11 @@ VernonRhiStatus downloadImage(VernonRhiDevice handle, VernonRhiImage image,
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
+    DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned || !download || download->struct_size < sizeof(*download) || !destination)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const auto expected = imageDownloadByteSize(slot->ownedDescriptor, *download);
@@ -1053,8 +1259,11 @@ VernonRhiStatus generateImageMipmaps(VernonRhiDevice handle, VernonRhiImage imag
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return VERNON_RHI_STATUS_UNSUPPORTED;
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
+    DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot || !slot->image.owned || slot->ownedDescriptor.mip_levels < 2 ||
         slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT ||
         slot->ownedDescriptor.format == VERNON_RHI_FORMAT_D32_FLOAT_S8_UINT ||
@@ -1169,16 +1378,8 @@ VernonRhiStatus destroyImage(VernonRhiDevice handle, VernonRhiImage image) {
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        device->state.destroyImage(slot->image);
-        releaseDirectX12Slot(*slot);
-    }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = destroyPublicResource<ImageResourceTag>(**device, device->images, image);
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
 uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
@@ -1187,8 +1388,11 @@ uint32_t isImageValid(VernonRhiDevice handle, VernonRhiImage image) {
         return 0;
     }
 
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupDirectX12Slot(device->images, image) != nullptr;
+    return lookupPublicResource(device->images, image) != nullptr;
 }
 
 VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDescriptor *descriptor,
@@ -1204,8 +1408,15 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     if (filter.maxAnisotropy > 1.0f)
         return VERNON_RHI_STATUS_UNSUPPORTED;
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<SamplerResourceTag>(device->samplers);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    DirectX12SamplerSlot &slot = *available.value();
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12SamplerSlot &slot = allocateDirectX12Slot(device->samplers, *output);
     auto address = [](uint32_t mode) {
         constexpr D3D12_TEXTURE_ADDRESS_MODE values[] = {
             D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_CLAMP, D3D12_TEXTURE_ADDRESS_MODE_MIRROR};
@@ -1222,6 +1433,12 @@ VernonRhiStatus createSampler(VernonRhiDevice handle, const VernonRhiSamplerDesc
     slot.sampler.descriptor.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     slot.sampler.descriptor.MinLOD = 0;
     slot.sampler.descriptor.MaxLOD = D3D12_FLOAT32_MAX;
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownSampler);
+    if (published.isErr()) {
+        slot.sampler = {};
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiSampler>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -1231,14 +1448,8 @@ VernonRhiStatus destroySampler(VernonRhiDevice handle, VernonRhiSampler sampler)
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12SamplerSlot *slot = lookupDirectX12Slot(device->samplers, sampler);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0)
-        releaseDirectX12Slot(*slot);
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = destroyPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
 uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
@@ -1247,8 +1458,11 @@ uint32_t isSamplerValid(VernonRhiDevice handle, VernonRhiSampler sampler) {
         return 0;
     }
 
+    auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupDirectX12Slot(device->samplers, sampler) != nullptr;
+    return lookupPublicResource(device->samplers, sampler) != nullptr;
 }
 
 VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage image, uint64_t *output) {
@@ -1259,8 +1473,11 @@ VernonRhiStatus getImageNativeHandle(VernonRhiDevice handle, VernonRhiImage imag
 
     if (!output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image);
+    DirectX12ImageSlot *slot = lookupPublicResource(device->images, image);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = reinterpret_cast<uint64_t>(slot->image.resource);
@@ -1274,24 +1491,49 @@ VernonRhiStatus createImageView(VernonRhiDevice handle, const VernonRhiImageView
         !descriptor->mip_level_count || !descriptor->array_layer_count || !descriptor->aspects)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *parent = lookupDirectX12Slot(device->images, descriptor->image);
+    auto reservation = reserveResource(*device);
+    if (reservation.isErr())
+        return vernon::toVernonRhiStatus(reservation.error());
+    std::lock_guard<std::mutex> reservationGuard(device->resourceReservations);
+    auto available = availableResourceSlot<ImageViewResourceTag>(device->imageViews);
+    if (available.isErr())
+        return vernon::toVernonRhiStatus(available.error());
+    auto parentPin = pinPublicResource<ImageResourceTag>(**device, device->images, descriptor->image);
+    if (parentPin.isErr())
+        return vernon::toVernonRhiStatus(parentPin.error());
+    std::unique_lock<std::mutex> guard(device->mutex);
+    DirectX12ImageSlot *parent = lookupPublicResource(device->images, descriptor->image);
     if (!parent)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     const VernonRhiImageDescriptor &imageDescriptor =
         parent->image.owned ? parent->ownedDescriptor : parent->descriptor.image;
     if (!vernon::rhi::validImageViewDescriptor(imageDescriptor, *descriptor))
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    if (!parent->retain())
-        return VERNON_RHI_STATUS_INTERNAL_ERROR;
-    DirectX12ImageViewSlot &slot = allocateDirectX12Slot(device->imageViews, *output);
-    slot.image = parent->image;
+    auto retained = parent->lifecycle.retain(typedHandle<VernonRhiImage, ImageResourceTag>(descriptor->image));
+    if (retained.isErr())
+        return vernon::toVernonRhiStatus(retained.error());
+    DirectX12ImageViewSlot &slot = *available.value();
+    slot.image.resource = parent->image.resource;
+    slot.image.state = parent->image.state;
     slot.image.owned = false;
     slot.image.format = directX12Format(descriptor->format);
     slot.image.dimension = descriptor->dimension;
     slot.image.view = *descriptor;
     slot.descriptor = *descriptor;
     slot.imageResource = resourceKey(descriptor->image);
+    slot.imageLease.emplace(std::move(retained).value());
+    auto published = slot.lifecycle.publish(std::move(reservation).value(), &**device, teardownImageView);
+    if (published.isErr()) {
+        slot.image = {};
+        slot.descriptor = {};
+        slot.imageResource = 0;
+        auto parentLease = slot.imageLease.take();
+        guard.unlock();
+        if (parentLease)
+            (void)parentLease.value().release();
+        return vernon::toVernonRhiStatus(published.error());
+    }
+    *output = publicHandle<VernonRhiImageView>(published.value());
     return VERNON_RHI_STATUS_OK;
 }
 
@@ -1299,29 +1541,19 @@ VernonRhiStatus destroyImageView(VernonRhiDevice handle, VernonRhiImageView view
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageViewSlot *slot = lookupDirectX12Slot(device->imageViews, view);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    const uint64_t parentKey = slot->imageResource;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences != 0)
-        return VERNON_RHI_STATUS_OK;
-    releaseDirectX12Slot(*slot);
-    DirectX12ImageSlot *parent = lookupResourceRecord(device->images, parentKey);
-    if (parent && parent->release()) {
-        device->state.destroyImage(parent->image);
-        releaseDirectX12Slot(*parent);
-    }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = destroyPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
 VernonRhiStatus getImageViewNativeHandle(VernonRhiDevice handle, VernonRhiImageView view, uint64_t *output) {
     auto device = lookupDirectX12Device(handle);
     if (!device || !output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageViewSlot *slot = lookupDirectX12Slot(device->imageViews, view);
+    DirectX12ImageViewSlot *slot = lookupPublicResource(device->imageViews, view);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = reinterpret_cast<uint64_t>(slot->image.resource);
@@ -1334,16 +1566,8 @@ VernonRhiStatus destroyBuffer(VernonRhiDevice handle, VernonRhiBuffer buffer) {
         return VERNON_RHI_STATUS_UNSUPPORTED;
     }
 
-    std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
-    if (!slot)
-        return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-    slot->destroyPublicOwner();
-    if (slot->bindingReferences == 0) {
-        device->state.destroyBuffer(slot->buffer);
-        releaseDirectX12Slot(*slot);
-    }
-    return VERNON_RHI_STATUS_OK;
+    auto destroyed = destroyPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    return destroyed.isOk() ? VERNON_RHI_STATUS_OK : vernon::toVernonRhiStatus(destroyed.error());
 }
 
 VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer buffer, void **output) {
@@ -1354,8 +1578,11 @@ VernonRhiStatus getBufferNativeHandle(VernonRhiDevice handle, VernonRhiBuffer bu
 
     if (!output)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return vernon::toVernonRhiStatus(operation.error());
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer);
+    DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer);
     if (!slot)
         return VERNON_RHI_STATUS_INVALID_ARGUMENT;
     *output = slot->buffer.resource;
@@ -1446,14 +1673,14 @@ bool recordBarriers(VernonRhiDevice handle, uint64_t encoderKey, uint64_t native
             void (*restore)(void *, uint64_t){};
             void *rollbackContext{};
             if (barriers[index].is_image) {
-                auto *slot = lookupResourceRecord(device->images, resourceKey(barriers[index].image));
+                auto *slot = lookupRetainedResource(device->images, resourceKey(barriers[index].image));
                 if (!slot)
                     return false;
                 imageDescriptor = slot->ownedDescriptor.struct_size ? &slot->ownedDescriptor : &slot->descriptor.image;
                 resource = slot->image.resource;
                 rollbackContext = &slot->image;
             } else {
-                auto *slot = lookupResourceRecord(device->buffers, resourceKey(barriers[index].buffer));
+                auto *slot = lookupRetainedResource(device->buffers, resourceKey(barriers[index].buffer));
                 if (!slot)
                     return false;
                 current = &slot->buffer.state;
@@ -1575,8 +1802,8 @@ bool recordBufferCopy(VernonRhiDevice handle, uint64_t native, VernonRhiBuffer s
     if (!device || !commands || commands != device->state.commandList() || !size)
         return false;
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12BufferSlot *sourceSlot = lookupDirectX12Slot(device->buffers, source);
-    DirectX12BufferSlot *destinationSlot = lookupDirectX12Slot(device->buffers, destination);
+    DirectX12BufferSlot *sourceSlot = lookupRetainedResource(device->buffers, resourceKey(source));
+    DirectX12BufferSlot *destinationSlot = lookupRetainedResource(device->buffers, resourceKey(destination));
     if (!sourceSlot || !destinationSlot || sourceOffset > sourceSlot->ownedDescriptor.size ||
         size > sourceSlot->ownedDescriptor.size - sourceOffset ||
         destinationOffset > destinationSlot->ownedDescriptor.size ||
@@ -1606,8 +1833,8 @@ bool recordImageCopy(VernonRhiDevice handle, uint64_t encoderKey, uint64_t nativ
     if (!device || !commands || commands != device->state.commandList() || !regions || !regionCount)
         return false;
     std::lock_guard<std::mutex> guard(device->mutex);
-    DirectX12ImageSlot *sourceSlot = lookupDirectX12Slot(device->images, source);
-    DirectX12ImageSlot *destinationSlot = lookupDirectX12Slot(device->images, destination);
+    DirectX12ImageSlot *sourceSlot = lookupRetainedResource(device->images, resourceKey(source));
+    DirectX12ImageSlot *destinationSlot = lookupRetainedResource(device->images, resourceKey(destination));
     if (!sourceSlot || !destinationSlot)
         return false;
     const auto prepare = [&](DirectX12ImageSlot &slot, D3D12_RESOURCE_STATES target) {
@@ -1685,9 +1912,9 @@ bool endRendering(VernonRhiDevice handle, uint64_t native, VernonRhiBackend back
     return true;
 }
 
-bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, int32_t x,
-                int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target, uint32_t location,
-                const float color[4]) {
+bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind, uint64_t,
+                int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
+                uint32_t location, const float color[4]) {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || !target || backend != VERNON_RHI_BACKEND_DIRECTX12 ||
@@ -1699,8 +1926,8 @@ bool clearColor(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backen
 }
 
 bool clearDepthStencil(VernonRhiDevice handle, uint64_t native, VernonRhiBackend backend, uint32_t backendKind,
-                       int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers, uint64_t target,
-                       float depth, uint32_t stencil, uint32_t aspects) {
+                       uint64_t, int32_t x, int32_t y, uint32_t width, uint32_t height, uint32_t layers,
+                       uint64_t target, float depth, uint32_t stencil, uint32_t aspects) {
     auto device = lookupDirectX12Device(handle);
     auto *commands = reinterpret_cast<ID3D12GraphicsCommandList *>(native);
     if (!device || !commands || !target || backend != VERNON_RHI_BACKEND_DIRECTX12 ||
@@ -1722,8 +1949,11 @@ uint64_t bufferResource(VernonRhiDevice handle, VernonRhiBuffer buffer) {
         return 0;
     }
 
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12BufferSlot *slot = lookupDirectX12Slot(device->buffers, buffer))
+    if (DirectX12BufferSlot *slot = lookupPublicResource(device->buffers, buffer))
         return resourceKey(buffer);
     return 0;
 }
@@ -1734,8 +1964,11 @@ uint64_t imageResource(VernonRhiDevice handle, VernonRhiImage image) {
         return 0;
     }
 
+    auto operation = pinPublicResource<ImageResourceTag>(**device, device->images, image);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12ImageSlot *slot = lookupDirectX12Slot(device->images, image))
+    if (DirectX12ImageSlot *slot = lookupPublicResource(device->images, image))
         return resourceKey(image);
     return 0;
 }
@@ -1744,8 +1977,11 @@ uint64_t imageViewResource(VernonRhiDevice handle, VernonRhiImageView view) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return 0;
+    auto operation = pinPublicResource<ImageViewResourceTag>(**device, device->imageViews, view);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    return lookupDirectX12Slot(device->imageViews, view) ? resourceKey(view) : 0;
+    return lookupPublicResource(device->imageViews, view) ? resourceKey(view) : 0;
 }
 
 uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
@@ -1754,136 +1990,186 @@ uint64_t samplerResource(VernonRhiDevice handle, VernonRhiSampler sampler) {
         return 0;
     }
 
+    auto operation = pinPublicResource<SamplerResourceTag>(**device, device->samplers, sampler);
+    if (operation.isErr())
+        return 0;
     std::lock_guard<std::mutex> guard(device->mutex);
-    if (DirectX12SamplerSlot *slot = lookupDirectX12Slot(device->samplers, sampler))
+    if (DirectX12SamplerSlot *slot = lookupPublicResource(device->samplers, sampler))
         return resourceKey(sampler);
     return 0;
 }
 
-bool retainResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+Result<vernon::rhi::RetainedRhiResourceLease, RhiError> retainResource(VernonRhiDevice handle, ResourceKind kind,
+                                                                       uint64_t key) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return false;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
+    if (!device)
+        return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"retain_resource", key, static_cast<uint32_t>(kind)}})};
+    std::unique_lock<std::mutex> guard(device->mutex);
     if (kind == ResourceKind::Buffer) {
-        DirectX12BufferSlot *slot = lookupResourceRecord(device->buffers, key);
-        return slot && slot->retain();
+        DirectX12BufferSlot *slot = lookupRetainedResource(device->buffers, key);
+        if (slot) {
+            guard.unlock();
+            auto lease = slot->lifecycle.retain(typedHandle<VernonRhiBuffer, BufferResourceTag>(
+                VernonRhiBuffer{static_cast<uint32_t>((key & UINT32_MAX) - 1), static_cast<uint32_t>(key >> 32)}));
+            if (lease.isOk())
+                return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+                    ok(vernon::rhi::RetainedRhiResourceLease{std::move(lease).value()})};
+            return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{err(std::move(lease).error())};
+        }
     }
     if (kind == ResourceKind::Image) {
-        DirectX12ImageSlot *slot = lookupResourceRecord(device->images, key);
-        return slot && slot->retain();
+        DirectX12ImageSlot *slot = lookupRetainedResource(device->images, key);
+        if (slot) {
+            guard.unlock();
+            auto lease = slot->lifecycle.retain(ResourceHandle<ImageResourceTag>{
+                static_cast<uint32_t>((key & UINT32_MAX) - 1), static_cast<uint32_t>(key >> 32)});
+            if (lease.isOk())
+                return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+                    ok(vernon::rhi::RetainedRhiResourceLease{std::move(lease).value()})};
+            return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{err(std::move(lease).error())};
+        }
     }
     if (kind == ResourceKind::ImageView) {
-        DirectX12ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-        return slot && slot->retain();
+        DirectX12ImageViewSlot *slot = lookupRetainedResource(device->imageViews, key);
+        if (slot) {
+            guard.unlock();
+            auto lease = slot->lifecycle.retain(ResourceHandle<ImageViewResourceTag>{
+                static_cast<uint32_t>((key & UINT32_MAX) - 1), static_cast<uint32_t>(key >> 32)});
+            if (lease.isOk())
+                return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+                    ok(vernon::rhi::RetainedRhiResourceLease{std::move(lease).value()})};
+            return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{err(std::move(lease).error())};
+        }
     }
-    DirectX12SamplerSlot *slot = lookupResourceRecord(device->samplers, key);
-    return slot && slot->retain();
+    if (kind == ResourceKind::Sampler) {
+        DirectX12SamplerSlot *slot = lookupRetainedResource(device->samplers, key);
+        if (slot) {
+            guard.unlock();
+            auto lease = slot->lifecycle.retain(ResourceHandle<SamplerResourceTag>{
+                static_cast<uint32_t>((key & UINT32_MAX) - 1), static_cast<uint32_t>(key >> 32)});
+            if (lease.isOk())
+                return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+                    ok(vernon::rhi::RetainedRhiResourceLease{std::move(lease).value()})};
+            return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{err(std::move(lease).error())};
+        }
+    }
+    return Result<vernon::rhi::RetainedRhiResourceLease, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"retain_resource", key, static_cast<uint32_t>(kind)}})};
 }
 
-uint64_t resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
+Result<uint64_t, RhiError> resolveResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) noexcept {
     auto device = lookupDirectX12Device(handle);
-    if (!device) {
-        return 0;
-    }
-
-    std::lock_guard<std::mutex> guard(device->mutex);
+    if (!device)
+        return Result<uint64_t, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+    std::unique_lock<std::mutex> guard(device->mutex);
     if (kind == ResourceKind::Buffer) {
-        auto *slot = lookupResourceRecord(device->buffers, key);
-        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->buffer) : 0;
+        auto *slot = lookupRetainedResource(device->buffers, key);
+        if (slot) {
+            guard.unlock();
+            if (!matchesRetainedResource(*slot, key))
+                return Result<uint64_t, RhiError>{err(
+                    RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+            guard.lock();
+            return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&slot->buffer)))};
+        }
     }
     if (kind == ResourceKind::Image) {
-        auto *slot = lookupResourceRecord(device->images, key);
-        return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->image) : 0;
+        auto *slot = lookupRetainedResource(device->images, key);
+        if (slot) {
+            guard.unlock();
+            if (!matchesRetainedResource(*slot, key))
+                return Result<uint64_t, RhiError>{err(
+                    RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+            guard.lock();
+            return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&slot->image)))};
+        }
     }
     if (kind == ResourceKind::ImageView) {
-        auto *slot = lookupResourceRecord(device->imageViews, key);
-        return slot ? reinterpret_cast<uintptr_t>(&slot->image) : 0;
+        auto *slot = lookupRetainedResource(device->imageViews, key);
+        if (slot) {
+            guard.unlock();
+            if (!matchesRetainedResource(*slot, key))
+                return Result<uint64_t, RhiError>{err(
+                    RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+            guard.lock();
+            return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&slot->image)))};
+        }
     }
-    auto *slot = lookupResourceRecord(device->samplers, key);
-    return slot && slot->occupied ? reinterpret_cast<uintptr_t>(&slot->sampler) : 0;
+    if (kind == ResourceKind::Sampler) {
+        auto *slot = lookupRetainedResource(device->samplers, key);
+        if (slot) {
+            guard.unlock();
+            if (!matchesRetainedResource(*slot, key))
+                return Result<uint64_t, RhiError>{err(
+                    RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
+            guard.lock();
+            return Result<uint64_t, RhiError>{ok(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&slot->sampler)))};
+        }
+    }
+    return Result<uint64_t, RhiError>{
+        err(RhiError{RhiErrorCode::InvalidArgument, {"resolve_resource", key, static_cast<uint32_t>(kind)}})};
 }
 
-bool describeImageResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageDescriptor *descriptor) {
+Result<void, RhiError> describeImageResource(VernonRhiDevice handle, uint64_t key,
+                                             VernonRhiImageDescriptor *descriptor) noexcept {
     auto device = lookupDirectX12Device(handle);
     if (!device || !descriptor)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const DirectX12ImageSlot *slot = lookupResourceRecord(device->images, key);
-    if (!slot || !slot->occupied)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
+    std::unique_lock<std::mutex> guard(device->mutex);
+    const DirectX12ImageSlot *slot = lookupRetainedResource(device->images, key);
+    if (!slot) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
+    }
+    guard.unlock();
+    if (!matchesRetainedResource(*slot, key))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_resource", key, 0}})};
+    guard.lock();
     *descriptor = slot->image.owned ? slot->ownedDescriptor : slot->descriptor.image;
-    return true;
+    return Result<void, RhiError>{ok()};
 }
 
-bool describeImageViewResource(VernonRhiDevice handle, uint64_t key, VernonRhiImageViewDescriptor *view,
-                               VernonRhiImageDescriptor *image, uint64_t *parentKey) {
+Result<void, RhiError> describeImageViewResource(VernonRhiDevice handle, uint64_t key,
+                                                 VernonRhiImageViewDescriptor *view, VernonRhiImageDescriptor *image,
+                                                 uint64_t *parentKey) noexcept {
     auto device = lookupDirectX12Device(handle);
     if (!device || !view || !image || !parentKey)
-        return false;
-    std::lock_guard<std::mutex> guard(device->mutex);
-    const DirectX12ImageViewSlot *slot = lookupResourceRecord(device->imageViews, key);
-    if (!slot)
-        return false;
-    const DirectX12ImageSlot *parent = lookupResourceRecord(device->images, slot->imageResource);
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
+    std::unique_lock<std::mutex> guard(device->mutex);
+    const DirectX12ImageViewSlot *slot = lookupRetainedResource(device->imageViews, key);
+    if (!slot) {
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
+    }
+    guard.unlock();
+    if (!matchesRetainedResource(*slot, key))
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
+    guard.lock();
+    const DirectX12ImageSlot *parent = lookupRetainedResource(device->images, slot->imageResource);
     if (!parent)
-        return false;
+        return Result<void, RhiError>{
+            err(RhiError{RhiErrorCode::InvalidArgument, {"describe_image_view_resource", key, 0}})};
     *view = slot->descriptor;
     *image = parent->image.owned ? parent->ownedDescriptor : parent->descriptor.image;
     *parentKey = slot->imageResource;
-    return true;
-}
-
-void releaseResource(VernonRhiDevice handle, ResourceKind kind, uint64_t key) {
-    auto device = lookupDirectX12Device(handle);
-    if (!device)
-        return;
-
-    std::lock_guard<std::mutex> guard(device->mutex);
-    if (kind == ResourceKind::Buffer) {
-        auto *slot = lookupResourceRecord(device->buffers, key);
-        if (!slot || !slot->release())
-            return;
-        device->state.destroyBuffer(slot->buffer);
-        releaseDirectX12Slot(*slot);
-        return;
-    }
-    if (kind == ResourceKind::Image) {
-        auto *slot = lookupResourceRecord(device->images, key);
-        if (!slot || !slot->release())
-            return;
-        device->state.destroyImage(slot->image);
-        releaseDirectX12Slot(*slot);
-        return;
-    }
-    if (kind == ResourceKind::ImageView) {
-        auto *slot = lookupResourceRecord(device->imageViews, key);
-        if (!slot || !slot->release())
-            return;
-        const uint64_t parentKey = slot->imageResource;
-        releaseDirectX12Slot(*slot);
-        auto *parent = lookupResourceRecord(device->images, parentKey);
-        if (parent && parent->release()) {
-            device->state.destroyImage(parent->image);
-            releaseDirectX12Slot(*parent);
-        }
-        return;
-    }
-    auto *slot = lookupResourceRecord(device->samplers, key);
-    if (!slot || !slot->release())
-        return;
-    releaseDirectX12Slot(*slot);
-    return;
+    return Result<void, RhiError>{ok()};
 }
 
 uint64_t trackedBufferState(VernonRhiDevice handle, VernonRhiBuffer buffer) {
     auto device = lookupDirectX12Device(handle);
     if (!device)
         return UINT64_MAX;
+    auto operation = pinPublicResource<BufferResourceTag>(**device, device->buffers, buffer);
+    if (operation.isErr())
+        return UINT64_MAX;
     std::lock_guard<std::mutex> guard(device->mutex);
-    const auto *slot = lookupResourceRecord(device->buffers, resourceKey(buffer));
+    const auto *slot = lookupRetainedResource(device->buffers, resourceKey(buffer));
     return slot ? static_cast<uint64_t>(slot->buffer.state) : UINT64_MAX;
 }
 
@@ -1901,6 +2187,7 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         lastError,
         synchronize,
         deviceStateForBackend,
+        commandState,
         createBuffer,
         uploadBuffer,
         uploadBufferRanges,
@@ -1926,7 +2213,6 @@ const vernon::rhi::BackendDispatch &vernon::rhi::directX12BackendDispatch() {
         retainResource,
         resolveResource,
         describeImageResource,
-        releaseResource,
         beginCommands,
         submitCommands,
         nullptr,

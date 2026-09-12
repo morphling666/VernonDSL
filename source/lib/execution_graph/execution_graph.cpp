@@ -1,5 +1,6 @@
 #include "execution_graph/command_graph.h"
 
+#include "execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
 
 #include <algorithm>
@@ -286,21 +287,7 @@ CommandGraph::CommandGraph(VernonRhiDevice device)
 
 bool CommandGraph::validate(std::string &error) { return buildPlan(error); }
 
-CommandGraph::~CommandGraph() {
-    for (const detail::ExecutionResourceRecord &record : resourceRecords_) {
-        if (provider_ == detail::ExecutionProvider::Rhi && record.graphOwned)
-            vernonRhiDeviceDestroyBuffer(device_, record.buffer);
-        if (provider_ == detail::ExecutionProvider::Rhi)
-            for (uint64_t viewKey : record.imageViewKeys)
-                vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
-        if (provider_ == detail::ExecutionProvider::Rhi && record.resourceKey)
-            vernon::rhi::releaseResource(device_,
-                                         record.resource.kind == ResourceKind::Buffer
-                                             ? vernon::rhi::ResourceKind::Buffer
-                                             : vernon::rhi::ResourceKind::Image,
-                                         record.resourceKey);
-    }
-}
+CommandGraph::~CommandGraph() { detail::releaseExecutionResourceRecords(provider_, device_, resourceRecords_); }
 
 ExecutionParameter CommandGraph::parameter(std::string name) {
     if (compiled_)
@@ -374,8 +361,12 @@ GraphBuffer CommandGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
         return result;
     }
     const uint64_t resourceKey = vernon::rhi::bufferResource(device_, buffer);
-    if (!resourceKey || !vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey))
+    if (!resourceKey)
         return {};
+    auto retained = vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+    if (retained.isErr())
+        return {};
+    auto resourceLease = std::move(retained).value();
     GraphBuffer result;
     result.id = static_cast<uint32_t>(resources_.size());
     result.kind = ResourceKind::Buffer;
@@ -386,17 +377,19 @@ GraphBuffer CommandGraph::importBuffer(VernonRhiBuffer buffer, bool exported) {
         resourceRecords_.reserve(resourceRecords_.size() + 1);
         importedBuffers_.reserve(importedBuffers_.size() + 1);
         if (!importedBuffers_.emplace(key, result.id).second) {
-            vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+            detail::releaseResourceLease(resourceLease);
             return {};
         }
     } catch (const std::bad_alloc &) {
-        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Buffer, resourceKey);
+        detail::releaseResourceLease(resourceLease);
         return {};
     }
     resources_.push_back(result);
-    resourceRecords_.push_back({result, exported});
-    resourceRecords_.back().buffer = buffer;
-    resourceRecords_.back().resourceKey = resourceKey;
+    detail::ExecutionResourceRecord record{result, exported};
+    record.resourceKey = resourceKey;
+    record.resourceLease.emplace(std::move(resourceLease));
+    record.buffer = buffer;
+    resourceRecords_.push_back(std::move(record));
     dirty_ = true;
     return result;
 }
@@ -409,9 +402,11 @@ GraphImage CommandGraph::importImage(VernonRhiImage image, VernonRhiImageView vi
     VernonRhiImageDescriptor imageDescriptor{};
     VernonRhiImageViewDescriptor viewDescriptor{};
     uint64_t parentKey{};
-    if (!imageKey || !viewKey ||
-        !vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey) ||
-        parentKey != imageKey)
+    if (!imageKey || !viewKey)
+        return {};
+    auto described =
+        vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey);
+    if (described.isErr() || parentKey != imageKey)
         return {};
     GraphImage result;
     result.kind = ResourceKind::Image;
@@ -431,43 +426,56 @@ GraphImage CommandGraph::importImage(VernonRhiImage image, VernonRhiImageView vi
         result.id = found->second;
         if (std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey) ==
             record.imageViewKeys.end()) {
+            auto retainedView = vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
+            if (retainedView.isErr())
+                return {};
+            auto viewLease = std::move(retainedView).value();
             try {
                 record.imageViewKeys.reserve(record.imageViewKeys.size() + 1);
+                record.imageViewLeases.reserve(record.imageViewLeases.size() + 1);
             } catch (const std::bad_alloc &) {
+                detail::releaseResourceLease(viewLease);
                 return {};
             }
-            if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey))
-                return {};
             record.imageViewKeys.push_back(viewKey);
+            record.imageViewLeases.push_back(std::move(viewLease));
         }
         record.exported |= exported;
         return result;
     }
-    try {
-        resources_.reserve(resources_.size() + 1);
-        resourceRecords_.reserve(resourceRecords_.size() + 1);
-        importedImages_.reserve(importedImages_.size() + 1);
-    } catch (const std::bad_alloc &) {
+    auto retainedImage = vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, imageKey);
+    if (retainedImage.isErr())
+        return {};
+    auto imageLease = std::move(retainedImage).value();
+    auto retainedView = vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey);
+    if (retainedView.isErr()) {
+        detail::releaseResourceLease(imageLease);
         return {};
     }
+    auto viewLease = std::move(retainedView).value();
     result.id = static_cast<uint32_t>(resources_.size());
     detail::ExecutionResourceRecord record{result, exported};
     record.image = image;
     record.resourceKey = imageKey;
+    record.resourceLease.emplace(std::move(imageLease));
     try {
+        resources_.reserve(resources_.size() + 1);
+        resourceRecords_.reserve(resourceRecords_.size() + 1);
+        importedImages_.reserve(importedImages_.size() + 1);
+        record.imageViewKeys.reserve(1);
+        record.imageViewLeases.reserve(1);
         record.imageViewKeys.push_back(viewKey);
-        if (!importedImages_.emplace(key, result.id).second)
+        record.imageViewLeases.push_back(std::move(viewLease));
+        if (!importedImages_.emplace(key, result.id).second) {
+            detail::releaseResourceLease(record.imageViewLeases.back());
+            detail::releaseResourceLease(*record.resourceLease);
             return {};
+        }
     } catch (const std::bad_alloc &) {
-        return {};
-    }
-    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::Image, imageKey)) {
-        importedImages_.erase(key);
-        return {};
-    }
-    if (!vernon::rhi::retainResource(device_, vernon::rhi::ResourceKind::ImageView, viewKey)) {
-        vernon::rhi::releaseResource(device_, vernon::rhi::ResourceKind::Image, imageKey);
-        importedImages_.erase(key);
+        detail::releaseResourceLease(viewLease);
+        if (!record.imageViewLeases.empty())
+            detail::releaseResourceLease(record.imageViewLeases.back());
+        detail::releaseResourceLease(*record.resourceLease);
         return {};
     }
     resources_.push_back(result);

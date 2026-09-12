@@ -1,7 +1,8 @@
 #ifndef VERNON_RHI_BACKEND_DISPATCH_H
 #define VERNON_RHI_BACKEND_DISPATCH_H
 
-#include "VernonRHI.h"
+#include "rhi_command_state.h"
+#include "rhi_lifecycle.h"
 
 #include <string>
 
@@ -29,10 +30,11 @@ struct BackendDispatch {
     uint32_t (*commandCapabilitiesForDevice)(VernonRhiDevice);
     bool (*ownsDevice)(VernonRhiDevice);
     VernonRhiDevice (*createOwnedDevice)(const VernonRhiOwnedDeviceDescriptor *);
-    void (*destroyDevice)(VernonRhiDevice);
+    Result<void, RhiError> (*destroyDevice)(VernonRhiDevice) noexcept;
     VernonStringView (*lastError)(VernonRhiDevice);
     VernonRhiStatus (*synchronize)(VernonRhiDevice);
     void *(*deviceState)(VernonRhiDevice);
+    Result<CommandDeviceStateRef, RhiError> (*commandState)(VernonRhiDevice) noexcept;
 
     VernonRhiStatus (*createBuffer)(VernonRhiDevice, const VernonRhiBufferDescriptor *, VernonRhiBuffer *);
     VernonRhiStatus (*uploadBuffer)(VernonRhiDevice, VernonRhiBuffer, uint64_t, const void *, uint64_t);
@@ -60,10 +62,9 @@ struct BackendDispatch {
     uint64_t (*bufferResource)(VernonRhiDevice, VernonRhiBuffer);
     uint64_t (*imageResource)(VernonRhiDevice, VernonRhiImage);
     uint64_t (*samplerResource)(VernonRhiDevice, VernonRhiSampler);
-    bool (*retainResource)(VernonRhiDevice, ResourceKind, uint64_t);
-    uint64_t (*resolveResource)(VernonRhiDevice, ResourceKind, uint64_t);
-    bool (*describeImageResource)(VernonRhiDevice, uint64_t, VernonRhiImageDescriptor *);
-    void (*releaseResource)(VernonRhiDevice, ResourceKind, uint64_t);
+    Result<RetainedRhiResourceLease, RhiError> (*retainResource)(VernonRhiDevice, ResourceKind, uint64_t) noexcept;
+    Result<uint64_t, RhiError> (*resolveRetainedResource)(VernonRhiDevice, ResourceKind, uint64_t) noexcept;
+    Result<void, RhiError> (*describeImageResource)(VernonRhiDevice, uint64_t, VernonRhiImageDescriptor *) noexcept;
 
     bool (*beginCommands)(VernonRhiDevice, uint64_t &, VernonRhiBackend &);
     bool (*submitCommands)(VernonRhiDevice, uint64_t, bool, bool &, bool &);
@@ -77,18 +78,18 @@ struct BackendDispatch {
                             const VernonRhiImageCopyRegion *, size_t);
     bool (*endRendering)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint32_t, uint32_t, const uint64_t *,
                          size_t, uint64_t, uint64_t);
-    bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t, uint32_t,
-                       uint32_t, uint64_t, uint32_t, const float[4]);
-    bool (*clearDepthStencil)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, int32_t, int32_t, uint32_t,
-                              uint32_t, uint32_t, uint64_t, float, uint32_t, uint32_t);
+    bool (*clearColor)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint64_t, int32_t, int32_t, uint32_t,
+                       uint32_t, uint32_t, uint64_t, uint32_t, const float[4]);
+    bool (*clearDepthStencil)(VernonRhiDevice, uint64_t, VernonRhiBackend, uint32_t, uint64_t, int32_t, int32_t,
+                              uint32_t, uint32_t, uint32_t, uint64_t, float, uint32_t, uint32_t);
     uint64_t (*trackedBufferState)(VernonRhiDevice, VernonRhiBuffer);
 
     VernonRhiStatus (*createImageView)(VernonRhiDevice, const VernonRhiImageViewDescriptor *, VernonRhiImageView *);
     VernonRhiStatus (*destroyImageView)(VernonRhiDevice, VernonRhiImageView);
     VernonRhiStatus (*getImageViewNativeHandle)(VernonRhiDevice, VernonRhiImageView, uint64_t *);
     uint64_t (*imageViewResource)(VernonRhiDevice, VernonRhiImageView);
-    bool (*describeImageViewResource)(VernonRhiDevice, uint64_t, VernonRhiImageViewDescriptor *,
-                                      VernonRhiImageDescriptor *, uint64_t *);
+    Result<void, RhiError> (*describeImageViewResource)(VernonRhiDevice, uint64_t, VernonRhiImageViewDescriptor *,
+                                                        VernonRhiImageDescriptor *, uint64_t *) noexcept;
 };
 
 void setDeviceCreationError(std::string error);

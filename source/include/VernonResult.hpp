@@ -94,6 +94,14 @@ public:
         }
     }
 
+    template <typename... Args, std::enable_if_t<std::is_constructible_v<T, Args &&...>, int> = 0>
+    T &emplace(Args &&...arguments) noexcept(std::is_nothrow_constructible_v<T, Args &&...>) {
+        reset();
+        new (&storage_.value) T(std::forward<Args>(arguments)...);
+        present_ = true;
+        return storage_.value;
+    }
+
     [[nodiscard]] Option take() noexcept(std::is_nothrow_move_constructible_v<T>) {
         if (!present_)
             return Option{};

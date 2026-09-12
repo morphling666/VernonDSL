@@ -7,6 +7,8 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -172,6 +174,203 @@ TEST_P(RhiResourceLifetime, RecordsIndependentCommandEncoders) {
     EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, secondCompletion), VERNON_RHI_STATUS_OK);
 }
 
+TEST_P(RhiResourceLifetime, CommandDestroyRejectsConcurrentOperationPinAndCanRetry) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+
+    for (unsigned iteration = 0; iteration != 64; ++iteration) {
+        VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+        ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+        std::atomic<bool> start{};
+        VernonRhiStatus finishStatus = VERNON_RHI_STATUS_INTERNAL_ERROR;
+        VernonRhiStatus destroyStatus = VERNON_RHI_STATUS_INTERNAL_ERROR;
+        std::thread finisher([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            finishStatus = vernonRhiCommandEncoderFinish(device, encoder);
+        });
+        std::thread destroyer([&] {
+            while (!start.load(std::memory_order_acquire)) {
+            }
+            destroyStatus = vernonRhiDeviceDestroyCommandEncoder(device, encoder);
+        });
+        start.store(true, std::memory_order_release);
+        finisher.join();
+        destroyer.join();
+        EXPECT_TRUE(finishStatus == VERNON_RHI_STATUS_OK || finishStatus == VERNON_RHI_STATUS_INVALID_ARGUMENT);
+        EXPECT_TRUE(destroyStatus == VERNON_RHI_STATUS_OK || destroyStatus == VERNON_RHI_STATUS_INVALID_ARGUMENT);
+        if (destroyStatus != VERNON_RHI_STATUS_OK)
+            EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    }
+}
+
+TEST_P(RhiResourceLifetime, CommandChildrenKeepDevicePublishedUntilExplicitDestroy) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+
+    vernonRhiDestroyDevice(device);
+    EXPECT_TRUE(vernon::rhi::deviceExists(device));
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+
+    vernonRhiDestroyDevice(device);
+    EXPECT_TRUE(vernon::rhi::deviceExists(device));
+    ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    EXPECT_TRUE(vernon::rhi::deviceExists(device));
+}
+
+TEST_P(RhiResourceLifetime, FailedCommandDestroyRollsBackAndCanRetry) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
+    VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+    ASSERT_TRUE(vernon::rhi::beginProviderRendering(device, encoder));
+
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_INVALID_ARGUMENT);
+    EXPECT_EQ(vernonRhiCommandEncoderEndRendering(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+}
+
+TEST_P(RhiResourceLifetime, GuessedCompletionCannotObservePartiallyInitializedSubmission) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiCommandEncoderDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCompletion previous{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+
+    for (unsigned iteration = 0; iteration != 32; ++iteration) {
+        VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+        ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &descriptor, &encoder), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+
+        VernonRhiCompletion guessed{};
+        if (previous.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+            guessed.index = previous.index;
+            guessed.generation = previous.generation + 1;
+            if (!guessed.generation)
+                guessed.generation = 1;
+        }
+        VernonRhiCompletion submitted{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+        VernonRhiStatus submitStatus = VERNON_RHI_STATUS_INTERNAL_ERROR;
+        std::atomic<bool> done{};
+        std::thread submitter([&] {
+            submitStatus = vernonRhiDeviceSubmit(device, encoder, &submitted);
+            done.store(true, std::memory_order_release);
+        });
+        if (previous.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+            while (!done.load(std::memory_order_acquire)) {
+                VernonRhiCompletionState state{};
+                const VernonRhiStatus status = vernonRhiCompletionGetState(device, guessed, &state);
+                EXPECT_TRUE(status == VERNON_RHI_STATUS_INVALID_ARGUMENT || status == VERNON_RHI_STATUS_OK);
+            }
+        }
+        submitter.join();
+        ASSERT_EQ(submitStatus, VERNON_RHI_STATUS_OK);
+        if (previous.index != VERNON_RHI_INVALID_HANDLE_INDEX) {
+            EXPECT_EQ(submitted.index, guessed.index);
+            EXPECT_EQ(submitted.generation, guessed.generation);
+        }
+        ASSERT_EQ(vernonRhiCompletionWait(device, submitted), VERNON_RHI_STATUS_OK);
+        ASSERT_EQ(vernonRhiDeviceDestroyCompletion(device, submitted), VERNON_RHI_STATUS_OK);
+        previous = submitted;
+    }
+}
+
+TEST_P(RhiResourceLifetime, SubmitMovesRetainedLeaseAndCompletionKeepsOnlyDeviceChild) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_STORAGE;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer retained{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &retained), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_COMPUTE;
+    VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiBarrier barrier{};
+    barrier.struct_size = sizeof(barrier);
+    barrier.destination_stage_mask = VERNON_RHI_STAGE_COMPUTE;
+    barrier.destination_access = VERNON_RHI_ACCESS_SHADER_READ;
+    barrier.old_state = VERNON_RHI_STATE_COMMON;
+    barrier.new_state = VERNON_RHI_STATE_SHADER_READ;
+    barrier.buffer = retained;
+    ASSERT_EQ(vernonRhiCommandEncoderBarrier(device, encoder, &barrier, 1), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, retained), VERNON_RHI_STATUS_OK);
+    const uint64_t encoderKey = vernon::rhi::commandEncoderKey(device, encoder);
+    ASSERT_NE(encoderKey, 0u);
+    EXPECT_EQ(vernon::rhi::bufferResource(device, retained), 0u);
+    const uint64_t retainedKey =
+        (static_cast<uint64_t>(retained.generation) << 32) | (static_cast<uint64_t>(retained.index) + 1);
+    EXPECT_TRUE(
+        vernon::rhi::resolveCommandResource(device, encoderKey, vernon::rhi::ResourceKind::Image, retainedKey).isErr());
+    EXPECT_TRUE(
+        vernon::rhi::resolveCommandResource(device, encoderKey, vernon::rhi::ResourceKind::Buffer, retainedKey).isOk());
+
+    VernonRhiBuffer whileRetained{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &whileRetained), VERNON_RHI_STATUS_OK);
+    EXPECT_NE(whileRetained.index, retained.index);
+    ASSERT_EQ(vernonRhiCommandEncoderFinish(device, encoder), VERNON_RHI_STATUS_OK);
+    VernonRhiCompletion completion{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceSubmit(device, encoder, &completion), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiCompletionWait(device, completion), VERNON_RHI_STATUS_OK);
+
+    VernonRhiBuffer recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, retained.index);
+    EXPECT_NE(recycled.generation, retained.generation);
+    vernonRhiDestroyDevice(device);
+    EXPECT_TRUE(vernon::rhi::deviceExists(device));
+    EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device, completion), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, whileRetained), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
+}
+
+TEST_P(RhiResourceLifetime, FailedMultiResourceRetainRollsBackEarlierCommandLease) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiBufferDescriptor bufferDescriptor{};
+    bufferDescriptor.struct_size = sizeof(bufferDescriptor);
+    bufferDescriptor.size = 64;
+    bufferDescriptor.usage = VERNON_RHI_BUFFER_TRANSFER_SOURCE | VERNON_RHI_BUFFER_TRANSFER_DESTINATION;
+    bufferDescriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer source{};
+    VernonRhiBuffer destination{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &source), VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &destination), VERNON_RHI_STATUS_OK);
+
+    VernonRhiCommandEncoderDescriptor encoderDescriptor{};
+    encoderDescriptor.struct_size = sizeof(encoderDescriptor);
+    encoderDescriptor.required_capabilities = VERNON_RHI_QUEUE_TRANSFER;
+    VernonRhiCommandEncoder encoder{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
+    ASSERT_EQ(vernonRhiDeviceCreateCommandEncoder(device, &encoderDescriptor, &encoder), VERNON_RHI_STATUS_OK);
+    const VernonRhiBuffer staleDestination{destination.index, destination.generation + 1};
+    EXPECT_NE(vernonRhiCommandEncoderCopyBuffer(device, encoder, source, 0, staleDestination, 0, 16),
+              VERNON_RHI_STATUS_OK);
+
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, source), VERNON_RHI_STATUS_OK);
+    VernonRhiBuffer recycled{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &bufferDescriptor, &recycled), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(recycled.index, source.index);
+    EXPECT_NE(recycled.generation, source.generation);
+
+    EXPECT_EQ(vernonRhiDeviceDestroyCommandEncoder(device, encoder), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, destination), VERNON_RHI_STATUS_OK);
+    EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
+}
+
 TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
@@ -236,6 +435,30 @@ TEST_P(RhiResourceLifetime, RetainedBufferDelaysSlotReuse) {
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, replacement), VERNON_RHI_STATUS_OK);
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
     vernonRuntimeRhiAdapterDestroy(adapter);
+}
+
+TEST_P(RhiResourceLifetime, ResolveRequiresExactRetainedLeaseAfterPublicDestroy) {
+    const VernonRhiDevice device = this->device();
+    VernonRhiBufferDescriptor descriptor{};
+    descriptor.struct_size = sizeof(descriptor);
+    descriptor.size = 64;
+    descriptor.usage = VERNON_RHI_BUFFER_STORAGE;
+    descriptor.memory_class = VERNON_RHI_MEMORY_DEVICE;
+    VernonRhiBuffer buffer{};
+    ASSERT_EQ(vernonRhiDeviceCreateBuffer(device, &descriptor, &buffer), VERNON_RHI_STATUS_OK);
+    const uint64_t key = vernon::rhi::bufferResource(device, buffer);
+    ASSERT_NE(key, 0u);
+    auto retained = vernon::rhi::retainResource(device, vernon::rhi::ResourceKind::Buffer, key);
+    ASSERT_TRUE(retained.isOk());
+    ASSERT_EQ(vernonRhiDeviceDestroyBuffer(device, buffer), VERNON_RHI_STATUS_OK);
+
+    auto wrongKey = vernon::rhi::resolveResource(device, vernon::rhi::ResourceKind::Buffer, key + 1, retained.value());
+    EXPECT_TRUE(wrongKey.isErr());
+    auto wrongKind = vernon::rhi::resolveResource(device, vernon::rhi::ResourceKind::Image, key, retained.value());
+    EXPECT_TRUE(wrongKind.isErr());
+    auto resolved = vernon::rhi::resolveResource(device, vernon::rhi::ResourceKind::Buffer, key, retained.value());
+    EXPECT_TRUE(resolved.isOk());
+    EXPECT_TRUE(retained.value().release().isOk());
 }
 
 TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {

@@ -1,6 +1,5 @@
 #include "execution_graph/command_graph.h"
 
-#include "rhi/logical_resource_record.h"
 #include "rhi/rhi_internal.h"
 
 #include <algorithm>
@@ -14,11 +13,23 @@ bool writes(AccessMode access) { return access != AccessMode::Read; }
 } // namespace
 
 bool CommandGraph::validateDeclarations(std::string &error) const {
-    for (size_t index = 0; index < resourceRecords_.size(); ++index)
-        if (!resourceRecords_[index].resourceKey) {
+    for (size_t index = 0; index < resourceRecords_.size(); ++index) {
+        const detail::ExecutionResourceRecord &record = resourceRecords_[index];
+        bool retained = true;
+        if (provider_ == detail::ExecutionProvider::Rhi && record.resourceLease) {
+            retained = record.resourceLease->active();
+            if (retained && record.resource.kind == ResourceKind::Buffer)
+                retained = record.resourceLease->holds(
+                    rhi::ResourceHandle<rhi::BufferResourceTag>{record.buffer.index, record.buffer.generation});
+            if (retained && record.resource.kind == ResourceKind::Image)
+                retained = record.resourceLease->holds(
+                    rhi::ResourceHandle<rhi::ImageResourceTag>{record.image.index, record.image.generation});
+        }
+        if (!record.resourceKey || !retained) {
             error = "execution graph resource " + std::to_string(index) + " is stale";
             return false;
         }
+    }
     const auto validateResource = [&](const std::string &passName, const GraphResource &resource) {
         if (resource.graphIdentity != graphIdentity_ || resource.id >= resources_.size() ||
             resources_[resource.id].graphIdentity != graphIdentity_ || resources_[resource.id].kind != resource.kind) {
@@ -44,12 +55,17 @@ bool CommandGraph::validateDeclarations(std::string &error) const {
         bool retainedView = true;
         if (!record.imageViewKeys.empty()) {
             const uint64_t viewKey = vernon::rhi::encodeResourceKey(image.view);
-            retainedView =
-                viewKey &&
-                std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey) !=
-                    record.imageViewKeys.end() &&
-                vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor, imageDescriptor, parentKey) &&
-                parentKey == record.resourceKey;
+            const auto found = std::find(record.imageViewKeys.begin(), record.imageViewKeys.end(), viewKey);
+            const size_t leaseIndex = static_cast<size_t>(found - record.imageViewKeys.begin());
+            retainedView = viewKey && found != record.imageViewKeys.end() &&
+                           leaseIndex < record.imageViewLeases.size() && record.imageViewLeases[leaseIndex].active() &&
+                           record.imageViewLeases[leaseIndex].holds(
+                               rhi::ResourceHandle<rhi::ImageViewResourceTag>{image.view.index, image.view.generation});
+            if (retainedView) {
+                auto described = vernon::rhi::describeImageViewResource(device_, viewKey, viewDescriptor,
+                                                                        imageDescriptor, parentKey);
+                retainedView = described.isOk() && parentKey == record.resourceKey;
+            }
         } else {
             viewDescriptor.format = image.format;
             viewDescriptor.base_mip_level = image.subresources.base_mip_level;

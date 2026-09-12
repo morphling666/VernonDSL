@@ -9,21 +9,7 @@
 
 namespace vernon::execution {
 
-CompiledCommandGraph::State::~State() {
-    for (const detail::ExecutionResourceRecord &record : resourceRecords) {
-        if (provider == detail::ExecutionProvider::Rhi && record.graphOwned)
-            vernonRhiDeviceDestroyBuffer(device, record.buffer);
-        if (provider == detail::ExecutionProvider::Rhi)
-            for (uint64_t viewKey : record.imageViewKeys)
-                vernon::rhi::releaseResource(device, vernon::rhi::ResourceKind::ImageView, viewKey);
-        if (provider == detail::ExecutionProvider::Rhi && record.resourceKey)
-            vernon::rhi::releaseResource(device,
-                                         record.resource.kind == ResourceKind::Buffer
-                                             ? vernon::rhi::ResourceKind::Buffer
-                                             : vernon::rhi::ResourceKind::Image,
-                                         record.resourceKey);
-    }
-}
+CompiledCommandGraph::State::~State() { detail::releaseExecutionResourceRecords(provider, device, resourceRecords); }
 
 ExecutionSubmission::Impl::~Impl() {
     if (completion.index != VERNON_RHI_INVALID_HANDLE_INDEX)

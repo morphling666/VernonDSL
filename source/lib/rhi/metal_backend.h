@@ -58,10 +58,6 @@ struct RenderingState {
     bool hasDepth{};
 };
 
-void registerRenderingState(uint64_t commandBuffer, RenderingState *rendering);
-RenderingState *findRenderingState(uint64_t commandBuffer);
-void unregisterRenderingState(uint64_t commandBuffer, RenderingState *rendering);
-
 struct VERNON_RHI_CAPI DeviceState {
     bool initialize(uint32_t deviceIndex, std::string &error);
     void shutdown();
