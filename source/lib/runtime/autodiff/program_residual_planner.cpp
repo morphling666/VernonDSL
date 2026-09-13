@@ -149,7 +149,7 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
         if (value < materialized.size() && materialized[value].argument.kind == VERNON_PROGRAM_TENSOR &&
             (materialized[value].argument.tensor.byte_size || materialized[value].concreteShape))
             return materialized[value].argument.tensor.byte_size;
-        return program::isTapeValueType(slot.type) ? std::optional<size_t>(1) : programValueByteSize(slot, parameter);
+        return program::isTapeValue(slot) ? std::optional<size_t>(1) : programValueByteSize(slot, parameter);
     };
     uint64_t initialStateBytes = 0;
     for (const program::GraphInput &input : forward->inputs) {
@@ -162,7 +162,7 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
         initialStateBytes += *bytes;
     }
     for (uint32_t value : program::residualCaptures(execution)) {
-        if (!producers[value] || (rematerializeTapes && program::isTapeValueType(execution.values[value].type)))
+        if (!producers[value] || (rematerializeTapes && program::isTapeValue(execution.values[value])))
             continue;
         const program::Value &slot = execution.values[value];
         const std::optional<size_t> bytes = materializedBytes(value, slot, findParameter(stagePlan, slot.name));
@@ -179,8 +179,8 @@ bool planProgramResiduals(const program::Program &execution, const program::Reso
     const uint32_t retainBegin =
         result.checkpoint.replaySegments.empty() ? 0 : result.checkpoint.replaySegments.back().beginStep;
     for (uint32_t value : program::residualCaptures(execution))
-        if (producers[value] && ((rematerializeTapes && program::isTapeValueType(execution.values[value].type)) ||
-                                 *producers[value] < retainBegin))
+        if (producers[value] &&
+            ((rematerializeTapes && program::isTapeValue(execution.values[value])) || *producers[value] < retainBegin))
             result.replayEnd = std::max(result.replayEnd, *producers[value] + 1);
     for (uint32_t value : program::residualCaptures(execution))
         if (!producers[value] || *producers[value] >= result.replayEnd)

@@ -14,13 +14,19 @@ ProgramInvocationState::ProgramInvocationState(const program::ResolvedExecutionP
                                                std::map<uint32_t, ProgramStorageBacking> storageBackings)
     : plan_(&plan), values_(std::move(values)), storageBackings_(std::move(storageBackings)),
       arguments_(values_.size()), deviceValues_(values_.size()) {
+    finalizeInvocationValues();
+}
+
+void ProgramInvocationState::finalizeInvocationValues() {
+    arguments_.resize(values_.size());
+    deviceValues_.resize(values_.size());
     for (size_t value = 0; value < values_.size(); ++value) {
         arguments_[value] = values_[value].argument;
         rebindDescriptor(static_cast<uint32_t>(value));
     }
 }
 
-ProgramInvocationState::~ProgramInvocationState() noexcept {
+void ProgramInvocationState::destroyOwnedImages() noexcept {
     if (imageDevice_.index == VERNON_RHI_INVALID_HANDLE_INDEX)
         return;
     for (auto image = ownedImages_.rbegin(); image != ownedImages_.rend(); ++image) {
@@ -29,6 +35,22 @@ ProgramInvocationState::~ProgramInvocationState() noexcept {
         if (image->image.index != VERNON_RHI_INVALID_HANDLE_INDEX)
             vernonRhiDeviceDestroyImage(imageDevice_, image->image);
     }
+    ownedImages_.clear();
+    imageDevice_ = {static_cast<uint32_t>(VERNON_RHI_INVALID_HANDLE_INDEX), 0};
+}
+
+ProgramInvocationState::~ProgramInvocationState() noexcept { destroyOwnedImages(); }
+
+void ProgramInvocationState::prepareForInvocation(const program::ResolvedExecutionPlan &plan) {
+    destroyOwnedImages();
+    plan_ = &plan;
+    std::fill(arguments_.begin(), arguments_.end(), VernonProgramArgument{});
+    for (std::shared_ptr<DeviceBuffer> &value : deviceValues_)
+        value.reset();
+    deviceUploads_.clear();
+    controlImages_.clear();
+    controlImageDescriptors_.clear();
+    invocationContext_ = nullptr;
 }
 
 ProgramInvocationState::ProgramInvocationState(ProgramInvocationState &&other) noexcept

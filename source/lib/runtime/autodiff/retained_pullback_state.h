@@ -10,11 +10,11 @@ namespace vernon::runtime::ad {
 class RetainedPullbackState {
 public:
     RetainedPullbackState(ProgramResidualPlan plan, const program_execution::ProgramInvocationState &invocation,
-                          ProgramTapeScratch tapeScratch);
+                          ProgramTapeSnapshot tape);
     RetainedPullbackState(ProgramResidualPlan plan, const program::Program &program,
                           std::vector<program_execution::CanonicalValueSnapshot> values,
                           std::map<uint32_t, program_execution::ProgramStorageBacking> storages,
-                          ProgramTapeScratch tapeScratch);
+                          ProgramTapeSnapshot tape);
 
     const ProgramResidualPlan &residualPlan() const { return residualPlan_; }
     const std::vector<std::vector<uint8_t>> &residualCaptures() const { return residualCaptures_; }

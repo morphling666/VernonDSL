@@ -114,6 +114,8 @@ public:
           signature_(std::move(signature)), derivativeBindings_(std::move(derivativeBindings)),
           state_(std::move(state)), passTelemetry_(std::move(passTelemetry)) {
         rebuildStageBindingLayoutViews(stagePlan_);
+        if (topology_ && topology_->resolvedProgram)
+            preparation_ = prepareProgramInvocation(topology_->resolvedProgram->program);
     }
 
     VernonStatus apply(const VernonProgramArgument *arguments, size_t argumentCount,
@@ -159,8 +161,8 @@ public:
         std::string error;
         std::map<uint32_t, ProgramStorageBacking> storageBackings;
         ProgramTapeScratch tapeScratch(execution.values.size());
-        if (!buildProgramInvocationValues(*context_, execution, topology_.get(), storage, storageBackings, tapeScratch,
-                                          frame, context_->autodiffMemoryPolicy, error))
+        if (!buildProgramInvocationValues(*context_, execution, topology_.get(), preparation_, bindingScratch_, storage,
+                                          storageBackings, tapeScratch, frame, context_->autodiffMemoryPolicy, error))
             return fail(*context_, error);
 
         size_t temporaryBytes = 0;
@@ -201,11 +203,11 @@ public:
                     return fail(*context_, error);
                 for (;;) {
                     program_execution::SubmissionState replaySubmission;
-                    auto replayStatus = executePipelineProgramGraph(*context_, *topology_, *replay, values,
-                                                                    resolvePhysicalEndpoint, replaySubmission);
+                    const VernonStatus replayStatus = executePipelineProgramGraph(
+                        *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
                     publication.noteSubmission(replaySubmission);
-                    if (replayStatus.isErr())
-                        return vernon::toVernonStatus(std::move(replayStatus).error());
+                    if (replayStatus != VERNON_STATUS_OK)
+                        return replayStatus;
                     bool retry = false;
                     if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                         return fail(*context_, error);
@@ -222,21 +224,21 @@ public:
                 }
             } else {
                 program_execution::SubmissionState replaySubmission;
-                auto replayStatus = executePipelineProgramGraph(*context_, *topology_, *replay, values,
-                                                                resolvePhysicalEndpoint, replaySubmission);
+                const VernonStatus replayStatus = executePipelineProgramGraph(
+                    *context_, *topology_, *replay, values, resolvePhysicalEndpoint, replaySubmission);
                 publication.noteSubmission(replaySubmission);
-                if (replayStatus.isErr())
-                    return vernon::toVernonStatus(std::move(replayStatus).error());
+                if (replayStatus != VERNON_STATUS_OK)
+                    return replayStatus;
                 if (!sealProgramTapeValues(values.values(), values.arguments(), tapeScratch, error))
                     return fail(*context_, error);
             }
         }
         program_execution::SubmissionState backwardSubmission;
-        auto status = executePipelineProgramGraph(*context_, *topology_, *backward, values, resolvePhysicalEndpoint,
-                                                  backwardSubmission);
+        const VernonStatus status = executePipelineProgramGraph(*context_, *topology_, *backward, values,
+                                                                resolvePhysicalEndpoint, backwardSubmission);
         publication.noteInPlaceSubmission(backwardSubmission);
-        if (status.isErr())
-            return vernon::toVernonStatus(std::move(status).error());
+        if (status != VERNON_STATUS_OK)
+            return status;
 
         if (device) {
             std::vector<char> downloads = publication.hostReadbackValues(execution.values.size());
@@ -314,12 +316,29 @@ private:
     VernonRuntimeContext *context_;
     std::shared_ptr<const program::ResolvedExecutionPlan> topology_;
     StageBindingPlan stagePlan_;
+    ProgramInvocationPreparation preparation_;
+    ProgramBoundaryBindingScratch bindingScratch_;
     Signature signature_;
     std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::shared_ptr<const RetainedPullbackState> state_;
     std::vector<AutodiffPullbackPassTelemetry> passTelemetry_;
     mutable std::mutex applyMutex_;
     program_execution::ExecutionControlPlaneUsage usage_;
+};
+
+class ProgramForwardWorkspace final : public CanonicalProgramExecutionWorkspace {
+public:
+    ProgramForwardWorkspace(const program::ResolvedExecutionPlan &plan, const ProgramInvocationPreparation &preparation,
+                            size_t boundaryCount)
+        : arena(plan, std::vector<ProgramValueState>(preparation.layouts.size()), preparation.storageBackings),
+          tapeScratch(preparation.layouts.size()), publication(plan.publications) {
+        boundaryArguments.reserve(boundaryCount);
+    }
+
+    ProgramInvocationState arena;
+    ProgramTapeScratch tapeScratch;
+    PublicationTransaction publication;
+    ProgramBoundaryBindingScratch bindingScratch;
 };
 
 class ProgramExecutable final : public CanonicalProgramExecution {
@@ -336,6 +355,7 @@ public:
             return;
         }
         const program::Program &canonicalProgram = locked->resolvedProgram->program;
+        preparation_ = prepareProgramInvocation(canonicalProgram);
         const bool hasBackward = program::findGraph(canonicalProgram, "backward") != nullptr;
         for (const program::TapePlan &plan : canonicalProgram.abi.tapePlans)
             if (!plan.forwardProducer || (hasBackward && !plan.backwardConsumer)) {
@@ -428,6 +448,13 @@ public:
 
     const Signature &signature() const override { return signature_; }
 
+    std::unique_ptr<CanonicalProgramExecutionWorkspace> createWorkspace() const override {
+        const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
+        if (!topology)
+            return {};
+        return std::make_unique<ProgramForwardWorkspace>(*topology, preparation_, forwardBindings_.size());
+    }
+
     VernonStatus forward(const ForwardExecutionTarget &target, std::unique_ptr<PullbackExecution> &pullback) override {
         target.outcome = {};
         const std::shared_ptr<const program::ResolvedExecutionPlan> topology = topology_.lock();
@@ -439,29 +466,32 @@ public:
             return fail(*context_, signatureError_);
         if (!topology || !forward)
             return fail(*context_, "Program autodiff forward requires a live Program");
-        std::vector<HostProgramValue> hostStorage;
+        auto *workspace = target.programContext
+                              ? static_cast<ProgramForwardWorkspace *>(target.programContext->executionWorkspace)
+                              : nullptr;
+        if (!workspace)
+            return fail(*context_, "Program invocation has no instance-local execution workspace");
+        workspace->arena.prepareForInvocation(*topology);
+        workspace->tapeScratch.reset();
+        workspace->publication.reset();
+        ProgramInvocationState &arena = workspace->arena;
+        ProgramTapeScratch &tapeScratch = workspace->tapeScratch;
+        PublicationTransaction &publication = workspace->publication;
         std::string error;
-        std::vector<char> required(execution->values.size());
-        program::markGraphValues(*forward, required);
-        for (uint32_t value : program::residualCaptures(*execution))
-            if (value < required.size())
-                required[value] = 1;
-        PublicationTransaction publication(topology->publications);
         struct OutcomePublication {
             const PublicationTransaction &publication;
             program_execution::InvocationMutationOutcome &outcome;
             ~OutcomePublication() { outcome.merge(publication.mutationOutcome()); }
         } outcomePublication{publication, target.outcome};
         ForwardInvocationSpec frame{
-            required,
+            preparation_.forwardRequiredValues,
             {target.arguments, target.argumentCount, forwardBindings_, publication},
         };
-        std::map<uint32_t, ProgramStorageBacking> storageBackings;
-        ProgramTapeScratch tapeScratch(execution->values.size());
-        if (!buildProgramInvocationValues(*context_, *execution, topology.get(), hostStorage, storageBackings,
+        if (!buildProgramInvocationValues(*context_, *execution, topology.get(), preparation_,
+                                          workspace->bindingScratch, arena.values(), arena.storageBackings(),
                                           tapeScratch, frame, context_->autodiffMemoryPolicy, error))
             return fail(*context_, error);
-        ProgramInvocationState arena(*topology, std::move(hostStorage), std::move(storageBackings));
+        arena.finalizeInvocationValues();
         auto allocatedImages = arena.allocateOwnedImageStorages(*context_, *execution);
         if (allocatedImages.isErr())
             return fail(*context_, program_execution::programInvocationErrorMessage(allocatedImages.error()));
@@ -496,12 +526,12 @@ public:
                 return fail(*context_, error);
             for (;;) {
                 program_execution::SubmissionState submission;
-                auto status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
-                                                          resolvePhysicalEndpoint, submission);
+                const VernonStatus status = executePipelineProgramGraph(*context_, *topology, *forward, arena,
+                                                                        resolvePhysicalEndpoint, submission);
                 publication.noteInPlaceSubmission(submission);
                 recordRenderPassMutations(*forward, submission, target.outcome);
-                if (status.isErr())
-                    return vernon::toVernonStatus(std::move(status).error());
+                if (status != VERNON_STATUS_OK)
+                    return status;
                 bool retry = false;
                 if (!validateProgramTapeStates(tapeScratch, tapeStates, retry, error))
                     return fail(*context_, error);
@@ -516,12 +546,12 @@ public:
             }
         } else {
             program_execution::SubmissionState submission;
-            auto status =
+            const VernonStatus status =
                 executePipelineProgramGraph(*context_, *topology, *forward, arena, resolvePhysicalEndpoint, submission);
             publication.noteInPlaceSubmission(submission);
             recordRenderPassMutations(*forward, submission, target.outcome);
-            if (status.isErr())
-                return vernon::toVernonStatus(std::move(status).error());
+            if (status != VERNON_STATUS_OK)
+                return status;
             if (!validateProgramTapeValues(arena.values(), tapeScratch, error))
                 return fail(*context_, error);
         }
@@ -658,10 +688,12 @@ private:
                 }
                 retainedSnapshots.push_back(std::move(retainedSnapshot).value());
             }
-            state = std::make_shared<const RetainedPullbackState>(
-                std::move(plan), *execution, std::move(retainedSnapshots), *sourceStorages, std::move(tapeScratch));
+            state =
+                std::make_shared<const RetainedPullbackState>(std::move(plan), *execution, std::move(retainedSnapshots),
+                                                              *sourceStorages, tapeScratch.releaseSnapshot());
         } else {
-            state = std::make_shared<const RetainedPullbackState>(std::move(plan), arena, std::move(tapeScratch));
+            state =
+                std::make_shared<const RetainedPullbackState>(std::move(plan), arena, tapeScratch.releaseSnapshot());
         }
         pullback = std::make_unique<ProgramPullback>(*context_, topology, stagePlan_, signature_, derivativeBindings_,
                                                      std::move(state), std::move(telemetry));
@@ -672,6 +704,7 @@ private:
     std::weak_ptr<const program::ResolvedExecutionPlan> topology_;
     const CanonicalProgramAutodiffState *programAutodiff_{};
     StageBindingPlan stagePlan_;
+    ProgramInvocationPreparation preparation_;
     Signature signature_;
     std::vector<std::pair<uint32_t, uint32_t>> derivativeBindings_;
     std::vector<std::pair<uint32_t, uint32_t>> forwardBindings_;

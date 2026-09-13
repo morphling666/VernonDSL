@@ -234,6 +234,7 @@ public:
     size_t requiredBytes(size_t lane) const;
 
     bool compact(bool retainConstructionStorage = false);
+    bool resetConstruction();
     bool resetCompactedReplay();
     size_t constructionBytes() const;
     bool isCompacted() const;
@@ -311,9 +312,12 @@ public:
     HostStaticTapeBatch &operator=(const HostStaticTapeBatch &) = delete;
 
     size_t size() const { return laneCount_; }
+    size_t payloadStride() const { return payloadStride_; }
+    size_t invocationCapacity() const { return invocationCapacity_; }
     VernonAdTapeAllocator *descriptor(size_t lane);
     VernonAdRegionHandle rootRegion(size_t lane) const;
     bool compact(bool retainConstructionStorage = false);
+    bool resetConstruction();
     bool markConstructionRecyclable();
     bool resetRecyclableConstruction();
     bool initializeReader(size_t lane, Reader &reader) const;

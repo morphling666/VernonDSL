@@ -57,8 +57,14 @@ struct PlannedComputeLaunch {
     std::vector<ComputeLaunchArgument> arguments;
     std::vector<std::vector<uint8_t>> hostTensorStorage;
     std::vector<ResultCommitPlan> resultCommits;
+    std::vector<const VernonTensorView *> validationTensors;
+    std::vector<uint8_t> assignedArguments;
+    size_t hostTensorStorageCount{};
     VernonLaunchSize grid{};
     VernonRuntimeProviderObject commandEncoder{};
+
+    void reset();
+    std::vector<uint8_t> &appendHostTensorStorage();
 };
 
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,

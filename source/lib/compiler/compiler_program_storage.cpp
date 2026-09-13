@@ -128,9 +128,7 @@ bool isProgramSamplerType(llvm::StringRef type) {
 
 bool isProgramAdTapeType(llvm::StringRef type) {
     std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type.str());
-    return semantic && semantic->kind == vernon::program::SemanticTypeKind::Opaque &&
-           semantic->parameter ==
-               vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::AdTape)->contract;
+    return semantic && semantic->isAdTape();
 }
 
 bool isProgramTensorViewType(llvm::StringRef type) {

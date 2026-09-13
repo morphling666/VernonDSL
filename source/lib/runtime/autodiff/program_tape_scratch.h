@@ -25,6 +25,7 @@ class ProgramTapeScratch {
 public:
     explicit ProgramTapeScratch(size_t valueCount);
 
+    void reset();
     void setHostBatch(uint32_t value, std::shared_ptr<HostStaticTapeBatch> batch);
     std::shared_ptr<HostStaticTapeBatch> hostBatch(uint32_t value) const;
     std::vector<std::shared_ptr<HostStaticTapeBatch>> releaseHostBatches();

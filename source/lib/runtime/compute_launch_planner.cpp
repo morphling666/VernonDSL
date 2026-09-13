@@ -8,14 +8,11 @@
 #include <cstring>
 #include <limits>
 #include <optional>
-#include <unordered_map>
 #include <utility>
 
 namespace vernon::runtime {
 
 namespace {
-
-using ComputeArgumentMap = std::unordered_map<uint32_t, const VernonProgramArgument *>;
 
 bool fail(std::string &error, const char *message) {
     error = message;
@@ -59,9 +56,15 @@ bool packTensorViewDescriptor(const VernonTensorView &tensor, std::vector<uint8_
     return true;
 }
 
-bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgumentMap &arguments,
-                          const VernonStageInvocationDescriptor &invocation, PlannedComputeLaunch &plan,
-                          std::string &error) {
+const VernonProgramArgument *findArgument(const VernonStageInvocationDescriptor &invocation, uint32_t slot) {
+    for (size_t index = 0; index < invocation.argument_count; ++index)
+        if (invocation.arguments[index].slot == slot)
+            return &invocation.arguments[index];
+    return nullptr;
+}
+
+bool planComputeArguments(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
+                          PlannedComputeLaunch &plan, std::string &error) {
     constexpr size_t kMaxComputeArgumentIndex = 4095;
     size_t computeArgumentSpan = 0;
     size_t computeArgumentCount = 0;
@@ -75,20 +78,21 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
             ++computeArgumentCount;
         }
 
-    plan = {};
+    plan.reset();
     plan.arguments.resize(computeArgumentSpan);
-    plan.hostTensorStorage.reserve(computeArgumentCount);
-    std::vector<uint8_t> assigned(computeArgumentSpan);
+    plan.hostTensorStorage.reserve(std::max(plan.hostTensorStorage.capacity(), computeArgumentCount));
+    plan.assignedArguments.resize(computeArgumentSpan);
+    std::fill(plan.assignedArguments.begin(), plan.assignedArguments.end(), 0);
 
     for (const Parameter &parameter : stagePlan.parameters) {
-        const auto suppliedIt = arguments.find(parameter.slot);
-        if (suppliedIt == arguments.end())
+        const VernonProgramArgument *suppliedArgument = findArgument(invocation, parameter.slot);
+        if (!suppliedArgument)
             return fail(error, "compute argument is missing");
-        const VernonProgramArgument &supplied = *suppliedIt->second;
+        const VernonProgramArgument &supplied = *suppliedArgument;
         for (const ParameterUse &use : parameter.uses) {
             if (use.stage != "compute" && use.stage != stagePlan.compute)
                 continue;
-            if (assigned[use.index])
+            if (plan.assignedArguments[use.index])
                 return fail(error, "compute argument index is duplicated");
 
             ComputeLaunchArgument &argument = plan.arguments[use.index];
@@ -96,7 +100,7 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
                 if (parameter.kind != "image" || !supplied.image.view.identity || !supplied.image.view.resource.value)
                     return fail(error, "compute image argument is invalid");
                 argument = ComputeImageArgument{supplied.image.view};
-                assigned[use.index] = 1;
+                plan.assignedArguments[use.index] = 1;
                 continue;
             }
             if (supplied.kind != VERNON_PROGRAM_TENSOR)
@@ -143,26 +147,26 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
                     auto packed = packTensor(packedTensor, layout.value());
                     if (packed.isErr())
                         return fail(error, tensorBridgeErrorMessage(packed.error()));
-                    plan.hostTensorStorage.push_back(std::move(packed).value());
-                    argument = ComputeScalarArgument{plan.hostTensorStorage.back().data(),
-                                                     plan.hostTensorStorage.back().size()};
+                    std::vector<uint8_t> &storage = plan.appendHostTensorStorage();
+                    storage = std::move(packed).value();
+                    argument = ComputeScalarArgument{storage.data(), storage.size()};
                     if (use.interfaceKind == "result")
                         plan.resultCommits.push_back(
-                            {plan.hostTensorStorage.size() - 1, supplied.tensor, std::move(layout).value()});
+                            {plan.hostTensorStorageCount - 1, supplied.tensor, std::move(layout).value()});
                 }
             }
             if (use.tensorViewDescriptor) {
-                plan.hostTensorStorage.emplace_back();
-                if (!packTensorViewDescriptor(supplied.tensor, plan.hostTensorStorage.back()))
+                std::vector<uint8_t> &storage = plan.appendHostTensorStorage();
+                if (!packTensorViewDescriptor(supplied.tensor, storage))
                     return fail(error, "failed to pack TensorView dispatch descriptor");
                 auto *tensor = std::get_if<ComputeTensorArgument>(&argument);
                 if (!tensor)
                     return fail(error, "TensorView descriptor is attached to a non-Tensor argument");
                 tensor->tensorView = &supplied.tensor;
-                tensor->tensorViewData = plan.hostTensorStorage.back().data();
-                tensor->tensorViewSize = plan.hostTensorStorage.back().size();
+                tensor->tensorViewData = storage.data();
+                tensor->tensorViewSize = storage.size();
             }
-            assigned[use.index] = 1;
+            plan.assignedArguments[use.index] = 1;
         }
     }
 
@@ -178,6 +182,24 @@ bool planComputeArguments(const StageBindingPlan &stagePlan, const ComputeArgume
 }
 
 } // namespace
+
+void PlannedComputeLaunch::reset() {
+    arguments.clear();
+    for (std::vector<uint8_t> &storage : hostTensorStorage)
+        storage.clear();
+    hostTensorStorageCount = 0;
+    resultCommits.clear();
+    validationTensors.clear();
+    assignedArguments.clear();
+    grid = {};
+    commandEncoder = {};
+}
+
+std::vector<uint8_t> &PlannedComputeLaunch::appendHostTensorStorage() {
+    if (hostTensorStorageCount == hostTensorStorage.size())
+        hostTensorStorage.emplace_back();
+    return hostTensorStorage[hostTensorStorageCount++];
+}
 
 std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument &argument,
                                                      const ComputeBindingSource &source) {
@@ -214,27 +236,27 @@ std::optional<int64_t> computeBindingDescriptorValue(const ComputeLaunchArgument
 
 bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageInvocationDescriptor &invocation,
                            PlannedComputeLaunch &plan, std::string &error) {
-    ComputeArgumentMap arguments;
     for (size_t index = 0; index < invocation.argument_count; ++index)
-        if (!arguments.emplace(invocation.arguments[index].slot, &invocation.arguments[index]).second)
-            return fail(error, "duplicate pipeline argument slot");
-    if (arguments.size() != stagePlan.parameters.size())
+        for (size_t other = index + 1; other < invocation.argument_count; ++other)
+            if (invocation.arguments[index].slot == invocation.arguments[other].slot)
+                return fail(error, "duplicate pipeline argument slot");
+    if (invocation.argument_count != stagePlan.parameters.size())
         return fail(error, "pipeline argument count does not match layout");
 
-    std::vector<const VernonTensorView *> tensors;
-    tensors.reserve(stagePlan.parameters.size());
+    plan.validationTensors.clear();
+    plan.validationTensors.reserve(stagePlan.parameters.size());
     for (const Parameter &parameter : stagePlan.parameters) {
-        const auto found = arguments.find(parameter.slot);
-        if (found == arguments.end())
+        const VernonProgramArgument *argument = findArgument(invocation, parameter.slot);
+        if (!argument)
             return fail(error, "pipeline argument kind does not match layout");
         if (parameter.kind == "image") {
-            if (found->second->kind != VERNON_PROGRAM_IMAGE)
+            if (argument->kind != VERNON_PROGRAM_IMAGE)
                 return fail(error, "pipeline argument kind does not match layout");
             continue;
         }
-        if (parameter.kind != "tensor" || found->second->kind != VERNON_PROGRAM_TENSOR)
+        if (parameter.kind != "tensor" || argument->kind != VERNON_PROGRAM_TENSOR)
             return fail(error, "pipeline argument kind does not match layout");
-        const VernonTensorView &tensor = found->second->tensor;
+        const VernonTensorView &tensor = argument->tensor;
         const ValueLayout &expectedLayout =
             parameter.tensorArgument == TensorRepresentation::WholeValue && parameter.valueLayout
                 ? *parameter.valueLayout
@@ -307,23 +329,29 @@ bool planComputeInvocation(const StageBindingPlan &stagePlan, const VernonStageI
         }
         if (tensor.storage == VERNON_TENSOR_HOST && !tensor.host_data)
             return fail(error, "pipeline Tensor argument does not match layout");
-        tensors.push_back(&tensor);
+        plan.validationTensors.push_back(&tensor);
     }
-    for (size_t left = 0; left < tensors.size(); ++left)
-        for (size_t right = left + 1; right < tensors.size(); ++right)
-            if (tensorViewsHaveWritableOverlap(*tensors[left], *tensors[right]))
+    for (size_t left = 0; left < plan.validationTensors.size(); ++left)
+        for (size_t right = left + 1; right < plan.validationTensors.size(); ++right)
+            if (tensorViewsHaveWritableOverlap(*plan.validationTensors[left], *plan.validationTensors[right]))
                 return error = "pipeline Tensor arguments #" + std::to_string(left) + " and #" + std::to_string(right) +
                                " have incompatible physical overlap (offsets " +
-                               std::to_string(tensors[left]->byte_offset) + " and " +
-                               std::to_string(tensors[right]->byte_offset) + ", element bytes " +
-                               std::to_string(tensors[left]->element_layout.byte_size) + " and " +
-                               std::to_string(tensors[right]->element_layout.byte_size) + ", ranks " +
-                               std::to_string(tensors[left]->rank) + " and " + std::to_string(tensors[right]->rank) +
-                               ", first strides " +
-                               std::to_string(tensors[left]->rank ? tensors[left]->byte_strides[0] : 0) + " and " +
-                               std::to_string(tensors[right]->rank ? tensors[right]->byte_strides[0] : 0) + ")",
+                               std::to_string(plan.validationTensors[left]->byte_offset) + " and " +
+                               std::to_string(plan.validationTensors[right]->byte_offset) + ", element bytes " +
+                               std::to_string(plan.validationTensors[left]->element_layout.byte_size) + " and " +
+                               std::to_string(plan.validationTensors[right]->element_layout.byte_size) + ", ranks " +
+                               std::to_string(plan.validationTensors[left]->rank) + " and " +
+                               std::to_string(plan.validationTensors[right]->rank) + ", first strides " +
+                               std::to_string(plan.validationTensors[left]->rank
+                                                  ? plan.validationTensors[left]->byte_strides[0]
+                                                  : 0) +
+                               " and " +
+                               std::to_string(plan.validationTensors[right]->rank
+                                                  ? plan.validationTensors[right]->byte_strides[0]
+                                                  : 0) +
+                               ")",
                        false;
-    return planComputeArguments(stagePlan, arguments, invocation, plan, error);
+    return planComputeArguments(stagePlan, invocation, plan, error);
 }
 
 bool commitComputeResults(const PlannedComputeLaunch &plan, std::string &error) {

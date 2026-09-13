@@ -174,11 +174,16 @@ def probe_runtime(row: BackendRow, requirements: BackendRequirements) -> ProbeRe
     api_version = _requested_api_version(row, requirements)
     if api_version is not None and row.architecture in {vd.opengl, vd.opengles}:
         options["api_version"] = api_version
+    expected_available = row.architecture == vd.cpu
+    if row.architecture not in {vd.cpu, vd.opengl, vd.opengles}:
+        backend = getattr(_native.RuntimeBackend, row.runtime_backend)
+        expected_available = bool(_native.runtime_available(backend))
     try:
         vd.init(arch=row.architecture, **options)  # type: ignore[arg-type]
     except RuntimeUnavailableError as error:
         vd.init(arch=vd.cpu)
-        return ProbeResult(ProbeKind.DEVICE_OR_CONTEXT_UNAVAILABLE, str(error))
+        kind = ProbeKind.PROBE_FAILURE if expected_available else ProbeKind.DEVICE_OR_CONTEXT_UNAVAILABLE
+        return ProbeResult(kind, str(error))
 
     selected_session = runtime_session.current_session()
     if selected_session is None:

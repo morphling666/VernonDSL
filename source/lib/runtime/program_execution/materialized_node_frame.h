@@ -26,7 +26,10 @@ struct MaterializedNodeFrame {
     std::vector<HostCopy> copiesAfter;
     std::vector<DeviceBufferCopy> deviceCopiesBefore;
     std::vector<DeviceBufferCopy> deviceCopiesAfter;
+    size_t hostEndpointCarrierCount{};
 
+    void reset(size_t endpointCount);
+    std::vector<uint8_t> &appendHostEndpointCarrier(size_t byteSize);
     bool prepareHost(std::string &error) const;
     bool commitHost(std::string &error) const;
 };

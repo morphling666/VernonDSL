@@ -8,7 +8,7 @@
 #include "runtime/tensor_bridge.h"
 
 #include <algorithm>
-#include <set>
+#include <limits>
 
 namespace vernon::runtime::ad {
 using program_execution::ProgramStorageBacking;
@@ -34,42 +34,49 @@ bool sameBoundaryBinding(const VernonProgramArgument &lhs, const VernonProgramAr
     return sameResourceReference(lhs.resource, rhs.resource);
 }
 
-class ProgramOwnerBindings {
-public:
-    bool bind(program::ProgramOwnerId owner, const VernonProgramArgument &argument, std::string &error) {
-        const auto [binding, inserted] = bindings_.emplace(std::make_pair(owner.kind, owner.id), argument);
-        if (!inserted && !sameBoundaryBinding(binding->second, argument))
-            return error = "Program invocation binds one owner to different resources", false;
-        return true;
-    }
-
-private:
-    std::map<std::pair<program::ProgramOwnerKind, uint32_t>, VernonProgramArgument> bindings_;
-};
-
 } // namespace
+
+void ProgramBoundaryBindingScratch::reset(const program::Program &program) {
+    valueCount = program.values.size();
+    bySlot.resize(program.abi.boundarySlots.size());
+    std::fill(bySlot.begin(), bySlot.end(), nullptr);
+    externalValues.resize(program.values.size());
+    for (auto &value : externalValues)
+        value.reset();
+    ownerBindings.resize(program.values.size() + program.storages.size());
+    for (auto &binding : ownerBindings)
+        binding.reset();
+    tensorOwners.clear();
+    stagedOwners.resize(ownerBindings.size());
+    std::fill(stagedOwners.begin(), stagedOwners.end(), std::numeric_limits<size_t>::max());
+    inPlaceOwners.resize(ownerBindings.size());
+    std::fill(inPlaceOwners.begin(), inPlaceOwners.end(), 0);
+    liveValues.resize(program.values.size());
+    std::fill(liveValues.begin(), liveValues.end(), 0);
+    liveStorages.resize(program.storages.size());
+    std::fill(liveStorages.begin(), liveStorages.end(), 0);
+}
+
+size_t ProgramBoundaryBindingScratch::ownerIndex(program::ProgramOwnerId owner) const {
+    return owner.kind == program::ProgramOwnerKind::Value ? owner.id : valueCount + owner.id;
+}
 
 bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program &execution,
                            const program::ResolvedExecutionPlan &plan, const ProgramBoundaryBindingRequest &request,
-                           std::map<uint32_t, VernonProgramArgument> &externalValues,
-                           std::map<uint32_t, ProgramStorageBacking> &backings, std::vector<char> &live,
-                           std::string &error) {
+                           ProgramBoundaryBindingScratch &scratch, std::map<uint32_t, ProgramStorageBacking> &backings,
+                           std::vector<char> &live, std::string &error) {
     if (request.argumentCount != request.valueBySlot.size() || (request.argumentCount && !request.arguments)) {
         error = "Program invocation does not match its canonical boundary slots";
         return false;
     }
-    std::map<uint32_t, const VernonProgramArgument *> bySlot;
     for (size_t index = 0; index < request.argumentCount; ++index) {
         const VernonProgramArgument &argument = request.arguments[index];
-        if (!bySlot.emplace(argument.slot, &argument).second) {
+        if (argument.slot >= scratch.bySlot.size() || scratch.bySlot[argument.slot]) {
             error = "Program invocation binds one canonical slot more than once";
             return false;
         }
+        scratch.bySlot[argument.slot] = &argument;
     }
-    ProgramOwnerBindings ownerBindings;
-    std::vector<std::pair<program::ProgramOwnerId, const VernonTensorView *>> tensorOwners;
-    std::map<std::pair<program::ProgramOwnerKind, uint32_t>, size_t> stagedOwners;
-    std::set<std::pair<program::ProgramOwnerKind, uint32_t>> inPlaceOwners;
     if (request.publication) {
         for (const program::ResolvedPublicationTransaction &transaction : plan.publications.transactions) {
             const uint32_t slot = transaction.slot;
@@ -81,19 +88,19 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 return false;
             }
             const program::BoundarySlot &boundary = execution.abi.boundarySlots[slot];
-            const auto key = std::make_pair(transaction.stagingOwner.kind, transaction.stagingOwner.id);
-            const auto supplied = bySlot.find(slot);
-            if (supplied == bySlot.end()) {
+            const size_t ownerIndex = scratch.ownerIndex(transaction.stagingOwner);
+            const VernonProgramArgument *supplied = scratch.bySlot[slot];
+            if (!supplied || ownerIndex >= scratch.ownerBindings.size()) {
                 error = "publication output is not bound at its exact canonical slot";
                 return false;
             }
             if (transaction.mode == program::PublicationCommitMode::InPlace) {
                 if (boundary.aliasOwner.kind != program::ProgramOwnerKind::Storage)
                     return error = "in-place publication boundary is not Storage-backed", false;
-                auto bound = request.publication->bindInPlace(slot, *supplied->second);
+                auto bound = request.publication->bindInPlace(slot, *supplied);
                 if (bound.isErr())
                     return error = program_execution::publicationErrorMessage(bound.error()), false;
-                inPlaceOwners.insert(key);
+                scratch.inPlaceOwners[ownerIndex] = 1;
                 continue;
             }
             const program::PublicationTarget *target = program::findPublicationTarget(execution.abi, slot);
@@ -106,48 +113,47 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 error = "commit-after-success publication requires its exact publication slot";
                 return false;
             }
-            if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
+            if (supplied->kind == VERNON_PROGRAM_IMAGE) {
                 VernonProgramArgument staging{};
-                auto bound = request.publication->bindImageCommit(context, slot, *target, *supplied->second, staging);
+                auto bound = request.publication->bindImageCommit(context, slot, *target, *supplied, staging);
                 if (bound.isErr())
                     return error = program_execution::publicationErrorMessage(bound.error()), false;
-                externalValues.emplace(transaction.value, staging);
+                scratch.externalValues[transaction.value] = staging;
                 backings[transaction.stagingOwner.id].external = std::move(staging);
-            } else if (supplied->second->kind != VERNON_PROGRAM_TENSOR) {
+            } else if (supplied->kind != VERNON_PROGRAM_TENSOR) {
                 error = "commit-after-success publication has an unsupported resource kind";
                 return false;
-            } else if (supplied->second->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
-                auto destination = resolveBackendRhiBufferReference(context, supplied->second->tensor.resource);
+            } else if (supplied->tensor.storage == VERNON_TENSOR_RHI_RESOURCE) {
+                auto destination = resolveBackendRhiBufferReference(context, supplied->tensor.resource);
                 if (destination.isErr()) {
                     error = "PublicationPlan device output is not backed by a referenced Vernon RHI buffer";
                     return false;
                 }
-                auto bound =
-                    request.publication->bindDeviceCommit(slot, *target, *supplied->second, destination.value());
+                auto bound = request.publication->bindDeviceCommit(slot, *target, *supplied, destination.value());
                 if (bound.isErr())
                     return error = program_execution::publicationErrorMessage(bound.error()), false;
             } else {
-                auto bound = request.publication->bindHostCommit(slot, *target, *supplied->second);
+                auto bound = request.publication->bindHostCommit(slot, *target, *supplied);
                 if (bound.isErr())
                     return error = program_execution::publicationErrorMessage(bound.error()), false;
             }
-            stagedOwners.emplace(key, slot);
+            scratch.stagedOwners[ownerIndex] = slot;
         }
     }
     for (const auto &[slot, value] : request.valueBySlot) {
-        const auto supplied = bySlot.find(slot);
+        const VernonProgramArgument *supplied = slot < scratch.bySlot.size() ? scratch.bySlot[slot] : nullptr;
         if (slot >= execution.abi.boundarySlots.size() || execution.abi.boundarySlots[slot].id != slot ||
-            value >= execution.values.size() || supplied == bySlot.end()) {
+            value >= execution.values.size() || !supplied) {
             error = "Program invocation is missing a canonical boundary slot";
             return false;
         }
         const program::BoundarySlot &boundary = execution.abi.boundarySlots[slot];
-        if (!program_execution::argumentMatchesBoundary(boundary, *supplied->second)) {
+        if (!program_execution::argumentMatchesBoundary(boundary, *supplied)) {
             error = "Program invocation argument does not match its canonical boundary contract";
             return false;
         }
         const program::ProgramOwnerId &owner = boundary.aliasOwner;
-        if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
+        if (supplied->kind == VERNON_PROGRAM_IMAGE) {
             if (owner.kind != program::ProgramOwnerKind::Storage || owner.id >= execution.storages.size()) {
                 error = "Program image boundary does not reference Storage";
                 return false;
@@ -155,7 +161,7 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             const program::Storage &storage = execution.storages[owner.id];
             if (storage.ownership == program::StorageOwnership::Borrowed) {
                 program_execution::BoundProgramImage resolvedImage;
-                if (!program_execution::resolveBorrowedProgramImage(context, storage, supplied->second->image.view,
+                if (!program_execution::resolveBorrowedProgramImage(context, storage, supplied->image.view,
                                                                     resolvedImage, error))
                     return false;
             } else if (boundary.role != program::BoundaryRole::Output &&
@@ -164,54 +170,57 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
                 return false;
             }
         }
-        if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
-            for (const auto &[boundOwner, tensor] : tensorOwners)
+        if (supplied->kind == VERNON_PROGRAM_TENSOR) {
+            for (const auto &[boundOwner, tensor] : scratch.tensorOwners)
                 if ((boundOwner.kind != owner.kind || boundOwner.id != owner.id) &&
-                    tensorViewsHaveWritableOverlap(*tensor, supplied->second->tensor)) {
+                    tensorViewsHaveWritableOverlap(*tensor, supplied->tensor)) {
                     error = "Program boundary Storage owners have incompatible physical overlap";
                     return false;
                 }
-            tensorOwners.emplace_back(owner, &supplied->second->tensor);
+            scratch.tensorOwners.push_back({owner, &supplied->tensor});
         }
-        if (!ownerBindings.bind(owner, *supplied->second, error))
-            return false;
-        const auto ownerKey = std::make_pair(owner.kind, owner.id);
-        if (inPlaceOwners.count(ownerKey)) {
+        const size_t ownerIndex = scratch.ownerIndex(owner);
+        if (ownerIndex >= scratch.ownerBindings.size())
+            return error = "Program boundary owner is outside the canonical Program", false;
+        auto &ownerBinding = scratch.ownerBindings[ownerIndex];
+        if (ownerBinding && !sameBoundaryBinding(*ownerBinding, *supplied))
+            return error = "Program invocation binds one owner to different resources", false;
+        ownerBinding = *supplied;
+        if (scratch.inPlaceOwners[ownerIndex]) {
             if (owner.kind != program::ProgramOwnerKind::Storage) {
                 error = "in-place Program output owner is not Storage-backed";
                 return false;
             }
-            if (supplied->second->kind == VERNON_PROGRAM_IMAGE) {
-                backings[owner.id].external = *supplied->second;
-                externalValues.emplace(value, *supplied->second);
+            if (supplied->kind == VERNON_PROGRAM_IMAGE) {
+                backings[owner.id].external = *supplied;
+                scratch.externalValues[value] = *supplied;
                 live[value] = 1;
                 continue;
             }
-            if (supplied->second->kind != VERNON_PROGRAM_TENSOR) {
+            if (supplied->kind != VERNON_PROGRAM_TENSOR) {
                 error = "in-place Program output owner has no physical Storage";
                 return false;
             }
             ProgramStorageBacking &backing = backings[owner.id];
-            backing.external = *supplied->second;
-            backing.bytes = supplied->second->tensor.byte_size;
+            backing.external = *supplied;
+            backing.bytes = supplied->tensor.byte_size;
             backing.sized = backing.bytes != 0;
-            externalValues.emplace(value, *supplied->second);
+            scratch.externalValues[value] = *supplied;
             live[value] = 1;
             continue;
         }
-        const auto staged = stagedOwners.find(ownerKey);
-        if (staged != stagedOwners.end()) {
+        if (scratch.stagedOwners[ownerIndex] != std::numeric_limits<size_t>::max()) {
             if (boundary.role == program::BoundaryRole::Input) {
                 if (owner.kind != program::ProgramOwnerKind::Storage) {
                     error = "staged Program input requires Storage data";
                     return false;
                 }
-                if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
+                if (supplied->kind == VERNON_PROGRAM_TENSOR) {
                     ProgramStorageBacking &backing = backings[owner.id];
-                    backing.initial = *supplied->second;
-                    backing.bytes = std::max(backing.bytes, supplied->second->tensor.byte_size);
+                    backing.initial = *supplied;
+                    backing.bytes = std::max(backing.bytes, supplied->tensor.byte_size);
                     backing.sized = true;
-                } else if (supplied->second->kind != VERNON_PROGRAM_IMAGE) {
+                } else if (supplied->kind != VERNON_PROGRAM_IMAGE) {
                     error = "staged Program input has an unsupported Storage resource";
                     return false;
                 }
@@ -219,14 +228,14 @@ bool bindProgramBoundaries(VernonRuntimeContext &context, const program::Program
             live[value] = 1;
             continue;
         }
-        externalValues.emplace(value, *supplied->second);
+        scratch.externalValues[value] = *supplied;
         live[value] = 1;
         if (owner.kind != program::ProgramOwnerKind::Storage)
             continue;
         ProgramStorageBacking &backing = backings[owner.id];
-        backing.external = *supplied->second;
-        if (supplied->second->kind == VERNON_PROGRAM_TENSOR) {
-            backing.bytes = supplied->second->tensor.byte_size;
+        backing.external = *supplied;
+        if (supplied->kind == VERNON_PROGRAM_TENSOR) {
+            backing.bytes = supplied->tensor.byte_size;
             backing.sized = backing.bytes != 0;
         }
     }

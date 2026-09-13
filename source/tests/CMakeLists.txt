@@ -289,13 +289,13 @@ if(TARGET VernonRuntime)
                        benchmark)
 
         set(_vernon_runtime_session_baseline
-            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-12-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-session-phase5-${_vernon_lifecycle_baseline_configuration}.json"
+            "${VERNON_REPOSITORY_ROOT}/reports/baselines/2026-09-13-${_vernon_lifecycle_baseline_platform}-${_vernon_lifecycle_baseline_architecture}-runtime-session-phase9-${_vernon_lifecycle_baseline_configuration}.json"
         )
-        add_test(NAME VernonRuntimeSessionPhase5PerformanceGate
+        add_test(NAME VernonRuntimeSessionPhase9PerformanceGate
                  COMMAND "${Python_EXECUTABLE}" "${VERNON_REPOSITORY_ROOT}/tools/check_runtime_session_benchmark.py"
                          --repository "${VERNON_REPOSITORY_ROOT}" --baseline "${_vernon_runtime_session_baseline}")
         set_tests_properties(
-            VernonRuntimeSessionPhase5PerformanceGate
+            VernonRuntimeSessionPhase9PerformanceGate
             PROPERTIES RUN_SERIAL
                        TRUE
                        SKIP_RETURN_CODE
@@ -401,6 +401,7 @@ if(TARGET VernonRuntime)
                     VernonCommandGraph
                     Vernon::RuntimeRHIAdapter
                     VernonDSLCompiler)
+        vernon_enable_glfw_context_owner_for_test(VernonCompilerRuntimeIntegrationTests)
         vernon_stage_target_files(
             VernonCompilerRuntimeIntegrationTests
             VernonRuntime

@@ -23,14 +23,6 @@ std::atomic<std::size_t> trackedAllocations{};
 constexpr std::size_t recordIterationCount = 4096;
 constexpr std::size_t submissionIterationCount = 128;
 
-std::vector<vernon::tests::BackendTestRow> rhiBackendCases() {
-    std::vector<vernon::tests::BackendTestRow> result;
-    for (const auto &backend : vernon::tests::backendTestMatrix)
-        if (backend.rhi)
-            result.push_back(backend);
-    return result;
-}
-
 template <typename Function>
 VernonRhiStatus sampleOperation(Function &&function, std::vector<std::uint64_t> &samples,
                                 std::size_t &allocationCount) {
@@ -221,9 +213,16 @@ TEST_P(RhiCommandBenchmark, SubmissionAndCompletionPollHotPath) {
 
 TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     RecordProperty("backend", std::string(GetParam().name));
-    const VernonRuntimeCapabilities capabilities = vernonRuntimeGetContextCapabilities(runtime());
-    if (!capabilities.supports_graphics)
-        GTEST_SKIP() << GetParam().name << " does not support graphics command recording";
+    vernon::tests::BackendTestRequirements requirements;
+    requirements.graphics = true;
+    const vernon::tests::BackendProbeResult probe =
+        vernon::tests::probeRuntimeBackend(GetParam(), requirements, runtime());
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+        return;
+    }
 
     const VernonRhiDevice testDevice = device();
     VernonRhiImageDescriptor imageDescriptor{};
@@ -235,8 +234,6 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     imageDescriptor.usage = VERNON_RHI_IMAGE_COLOR_ATTACHMENT;
     VernonRhiImage image{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     const VernonRhiStatus imageStatus = vernonRhiDeviceCreateImage(testDevice, &imageDescriptor, &image);
-    if (imageStatus == VERNON_RHI_STATUS_UNSUPPORTED)
-        GTEST_SKIP() << GetParam().name << " does not support color-attachment images";
     ASSERT_EQ(imageStatus, VERNON_RHI_STATUS_OK);
     VernonRhiImageViewDescriptor viewDescriptor{};
     viewDescriptor.struct_size = sizeof(viewDescriptor);
@@ -247,10 +244,6 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView view{VERNON_RHI_INVALID_HANDLE_INDEX, 0};
     const VernonRhiStatus viewStatus = vernonRhiDeviceCreateImageView(testDevice, &viewDescriptor, &view);
-    if (viewStatus == VERNON_RHI_STATUS_UNSUPPORTED) {
-        EXPECT_EQ(vernonRhiDeviceDestroyImage(testDevice, image), VERNON_RHI_STATUS_OK);
-        GTEST_SKIP() << GetParam().name << " does not support color-attachment image views";
-    }
     ASSERT_EQ(viewStatus, VERNON_RHI_STATUS_OK);
     const VernonRhiCommandEncoder encoder = createEncoder(testDevice, VERNON_RHI_QUEUE_GRAPHICS);
     ASSERT_NE(encoder.index, VERNON_RHI_INVALID_HANDLE_INDEX);
@@ -310,7 +303,7 @@ TEST_P(RhiCommandBenchmark, GraphicsBeginDrawEndBookkeepingHotPath) {
     EXPECT_EQ(vernonRhiDeviceDestroyImage(testDevice, image), VERNON_RHI_STATUS_OK);
 }
 
-INSTANTIATE_TEST_SUITE_P(Backends, RhiCommandBenchmark, testing::ValuesIn(rhiBackendCases()),
+INSTANTIATE_TEST_SUITE_P(Backends, RhiCommandBenchmark, testing::ValuesIn(vernon::tests::rhiBackendCases()),
                          [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
                              return std::string(info.param.name);
                          });

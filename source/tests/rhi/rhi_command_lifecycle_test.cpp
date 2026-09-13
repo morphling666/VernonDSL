@@ -8,17 +8,8 @@
 #include <cstdint>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace {
-
-std::vector<vernon::tests::BackendTestRow> rhiBackendCases() {
-    std::vector<vernon::tests::BackendTestRow> result;
-    for (const auto &backend : vernon::tests::backendTestMatrix)
-        if (backend.rhi)
-            result.push_back(backend);
-    return result;
-}
 
 class RhiCommandLifecycleTest : public testing::TestWithParam<vernon::tests::BackendTestRow> {
 protected:
@@ -72,7 +63,7 @@ TEST_P(RhiCommandLifecycleTest, FailedCompletionCleanupRemainsRetryable) {
     EXPECT_EQ(vernonRhiDeviceDestroyCompletion(device(), completion), VERNON_RHI_STATUS_INVALID_ARGUMENT);
 }
 
-INSTANTIATE_TEST_SUITE_P(Backends, RhiCommandLifecycleTest, testing::ValuesIn(rhiBackendCases()),
+INSTANTIATE_TEST_SUITE_P(Backends, RhiCommandLifecycleTest, testing::ValuesIn(vernon::tests::rhiBackendCases()),
                          [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
                              return std::string(info.param.name);
                          });

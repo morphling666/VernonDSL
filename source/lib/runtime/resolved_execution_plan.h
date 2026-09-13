@@ -207,6 +207,8 @@ struct ResolvedPublicationPlan {
 struct ResolvedExecutionPlan {
     std::shared_ptr<const ResolvedProgram> resolvedProgram;
     std::vector<vernon::runtime::ValueLayout> boundaryLayoutViews;
+    std::vector<shape::DeclaredShape> declaredValueShapes;
+    std::vector<std::optional<shape::ConcreteShape>> preparedValueShapes;
     std::vector<std::shared_ptr<VernonStageExecutable>> stageCache;
     std::map<NodeKey, ResolvedNodePlan> nodes;
     std::map<uint32_t, AliasDomainPlan> aliasDomains;

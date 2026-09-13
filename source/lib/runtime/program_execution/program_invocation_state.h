@@ -105,6 +105,9 @@ public:
     ProgramInvocationState(ProgramInvocationState &&other) noexcept;
     ProgramInvocationState &operator=(ProgramInvocationState &&) = delete;
 
+    void prepareForInvocation(const program::ResolvedExecutionPlan &plan);
+    void finalizeInvocationValues();
+
     vernon::Option<CanonicalValueSnapshot> snapshotValue(uint32_t value) const;
     ProgramInvocationResult<void> importSnapshot(const CanonicalValueSnapshot &snapshot);
     ProgramInvocationResult<void> importStorageSnapshots(const std::map<uint32_t, ProgramStorageBacking> &snapshots);
@@ -127,6 +130,7 @@ public:
     const std::vector<ProgramValueState> &values() const { return values_; }
     std::vector<ProgramValueState> &values() { return values_; }
     const std::map<uint32_t, ProgramStorageBacking> &storageBackings() const { return storageBackings_; }
+    std::map<uint32_t, ProgramStorageBacking> &storageBackings() { return storageBackings_; }
     const std::vector<ProgramDeviceUpload> &deviceUploads() const { return deviceUploads_; }
     void setInvocationContext(const ProgramInvocationContext *context) { invocationContext_ = context; }
     const ProgramInvocationContext *invocationContext() const { return invocationContext_; }
@@ -142,6 +146,7 @@ private:
 
     friend class ResolvedTransferExecutor;
 
+    void destroyOwnedImages() noexcept;
     void rebindDescriptor(uint32_t value);
 
     const program::ResolvedExecutionPlan *plan_;

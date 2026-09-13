@@ -590,12 +590,7 @@ void markGraphValues(const Graph &graph, std::vector<char> &live) {
     }
 }
 
-bool isTapeValueType(std::string_view type) {
-    const std::optional<vernon::program::SemanticType> semantic = vernon::program::parseSemanticType(type);
-    return semantic && semantic->kind == vernon::program::SemanticTypeKind::Opaque &&
-           semantic->parameter ==
-               vernon::program::builtinStorageContract(vernon::program::BuiltinStorageContractId::AdTape)->contract;
-}
+bool isTapeValue(const Value &value) noexcept { return value.canonicalType.semantic.isAdTape(); }
 
 static bool parseProgram(const nlohmann::json &value, Program &program, Diagnostic &diagnostic) {
     program = {};
@@ -1430,7 +1425,7 @@ static bool parseProgram(const nlohmann::json &value, Program &program, Diagnost
 
     std::vector<uint32_t> tapeValues;
     for (const Value &logicalValue : program.values)
-        if (isTapeValueType(logicalValue.type))
+        if (isTapeValue(logicalValue))
             tapeValues.push_back(logicalValue.id);
     if (abi["tape_plans"].size() != tapeValues.size())
         return fail(diagnostic, "PROGRAM_ABI_MISMATCH", "parse", "/abi/tape_plans",

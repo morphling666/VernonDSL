@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace vernon::tests {
 
@@ -34,6 +35,14 @@ inline constexpr std::array<BackendTestRow, 7> backendTestMatrix{{
     {"OpenGL", VERNON_TARGET_OPENGL, VERNON_RUNTIME_OPENGL, VERNON_RHI_BACKEND_OPENGL},
     {"OpenGLES", VERNON_TARGET_OPENGL_ES, VERNON_RUNTIME_OPENGL_ES, VERNON_RHI_BACKEND_OPENGL_ES},
 }};
+
+inline std::vector<BackendTestRow> rhiBackendCases() {
+    std::vector<BackendTestRow> result;
+    for (const BackendTestRow &backend : backendTestMatrix)
+        if (backend.rhi)
+            result.push_back(backend);
+    return result;
+}
 
 struct BackendTestRequirements {
     bool compute{};

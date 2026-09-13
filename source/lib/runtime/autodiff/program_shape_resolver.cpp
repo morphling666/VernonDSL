@@ -24,54 +24,31 @@ public:
 
     bool resolve(std::string &error) {
         for (const program::Value &value : program_.values) {
-            const shape::DeclaredShape declared = shape::decodeRuntimeContractShape(value.shape);
+            const shape::DeclaredShape &declared = declaredShape(value);
             if (value.id < values_.size() && values_[value.id].concreteShape &&
                 !shape::matches(declared, *values_[value.id].concreteShape))
                 return error = "bound shape for Program value " + std::to_string(value.id) +
                                " conflicts with the declared Program shape: value '" + value.name + "' bound " +
                                formatShape(*values_[value.id].concreteShape) + ", declared " + formatShape(value.shape),
                        false;
-            if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared);
-                concrete && !bind(value.id, *concrete, "Program declaration", error))
+            if (topology_ && value.id < topology_->preparedValueShapes.size()) {
+                const std::optional<shape::ConcreteShape> &concrete = topology_->preparedValueShapes[value.id];
+                if (concrete && !bind(value.id, *concrete, "Program declaration", error))
+                    return false;
+            } else if (const std::optional<shape::ConcreteShape> concrete = shape::concrete(declared);
+                       concrete && !bind(value.id, *concrete, "Program declaration", error)) {
                 return false;
+            }
         }
-        if (!seedCompiledStages(error))
-            return false;
         return propagateStorageAliases();
     }
 
 private:
-    bool seedCompiledStages(std::string &error) {
-        if (!topology_)
-            return true;
-        for (const auto &[node, nodePlan] : topology_->nodes) {
-            (void)node;
-            if (!nodePlan.stage)
-                continue;
-            const StageBindingPlan &bindingProjection = nodePlan.stage->bindingProjection;
-            if (!bindingProjection.vertex.empty())
-                continue;
-            for (size_t index = 0; index < nodePlan.projections.size() && index < bindingProjection.parameters.size();
-                 ++index) {
-                const program::NodeEndpointProjection &binding = nodePlan.projections[index];
-                const Parameter &parameter = bindingProjection.parameters[index];
-                if (binding.logicalLeaf || parameter.invocationCarrier || binding.target.viewTransform)
-                    continue;
-                const uint32_t value = binding.value;
-                if (value >= program_.values.size())
-                    return error = "compiled stage binding refers to an invalid Program value", false;
-                if (program::isTapeValueType(program_.values[value].type) ||
-                    (program_.values[value].layout && program_.values[value].shape.empty()))
-                    continue;
-                const std::optional<shape::ConcreteShape> concrete =
-                    shape::concrete(shape::decodeRuntimeContractShape(parameter.shape));
-                if (!concrete)
-                    continue;
-                if (!bind(value, *concrete, "compiled stage binding", error))
-                    return false;
-            }
-        }
-        return true;
+    const shape::DeclaredShape &declaredShape(const program::Value &value) const {
+        if (topology_ && value.id < topology_->declaredValueShapes.size())
+            return topology_->declaredValueShapes[value.id];
+        fallbackDeclaredShape_ = shape::decodeRuntimeContractShape(value.shape);
+        return fallbackDeclaredShape_;
     }
 
     bool propagateStorageAliases() {
@@ -87,8 +64,7 @@ private:
                 continue;
             for (const program::Value &value : program_.values)
                 if (value.storage && *value.storage == storage.id && value.id < values_.size() &&
-                    !values_[value.id].concreteShape &&
-                    shape::matches(shape::decodeRuntimeContractShape(value.shape), *resolved))
+                    !values_[value.id].concreteShape && shape::matches(declaredShape(value), *resolved))
                     values_[value.id].concreteShape = *resolved;
         }
         return true;
@@ -97,7 +73,7 @@ private:
     bool bind(uint32_t value, const shape::ConcreteShape &concrete, const char *source, std::string &error) {
         if (value >= program_.values.size() || value >= values_.size())
             return error = std::string(source) + " refers to an invalid Program value", false;
-        if (!shape::matches(shape::decodeRuntimeContractShape(program_.values[value].shape), concrete)) {
+        if (!shape::matches(declaredShape(program_.values[value]), concrete)) {
             return error = std::string(source) + " for value '" + program_.values[value].name + "' (" +
                            program_.values[value].type +
                            (program_.values[value].layout ? ", canonical layout" : ", no canonical layout") +
@@ -114,6 +90,7 @@ private:
     const program::Program &program_;
     const program::ResolvedExecutionPlan *topology_;
     std::vector<ProgramValueState> &values_;
+    mutable shape::DeclaredShape fallbackDeclaredShape_;
 };
 
 } // namespace

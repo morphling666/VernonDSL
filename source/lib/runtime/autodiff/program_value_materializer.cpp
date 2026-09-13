@@ -1,3 +1,4 @@
+#include "program_invocation_builder.h"
 #include "program_invocation_values.h"
 #include "program_tape_scratch.h"
 
@@ -174,6 +175,12 @@ bool attachTape(const program::Program &execution, const program::ResolvedExecut
         if (!tapeLaneCount(execution, topology, hosts, slot.id, lanes, error) ||
             !tapePayloadStride(slot.type, stride, error))
             return false;
+        batch = tapeScratch.hostBatch(slot.id);
+        if (batch && (batch->size() != lanes || batch->payloadStride() != stride ||
+                      batch->invocationCapacity() != policy->invocationLimit()))
+            batch.reset();
+        if (batch)
+            return fillProgramTapeHostValue(value, std::move(batch), tapeScratch, slot.id, error);
         auto created = HostStaticTapeBatch::create(lanes, stride, policy->invocationLimit(), policy, nullptr);
         if (created.isErr()) {
             switch (created.error()) {
@@ -251,15 +258,15 @@ bool fillProgramTapeHostValue(ProgramValueState &value, std::shared_ptr<HostStat
 }
 
 bool materializeProgramOwnedStorages(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
+                                     const ProgramInvocationPreparation &preparation,
                                      std::vector<ProgramValueState> &storage, const std::vector<char> &liveStorage,
-                                     const std::vector<std::optional<ValueLayout>> &layouts,
                                      std::map<uint32_t, ProgramStorageBacking> &backings, std::string &error) {
+    const auto &layouts = preparation.layouts;
     if (!resolveProgramShapes(execution, topology, storage, error))
         return false;
     for (const program::Storage &slot : execution.storages) {
         if (slot.id >= liveStorage.size() || !liveStorage[slot.id] ||
-            (slot.initialValue < execution.values.size() &&
-             program::isTapeValueType(execution.values[slot.initialValue].type)))
+            (slot.initialValue < execution.values.size() && preparation.tapeValues[slot.initialValue]))
             continue;
         ProgramStorageBacking &backing = backings[slot.id];
         if (backing.external || backing.sized)
@@ -268,7 +275,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
             for (const program::Value &value : execution.values) {
                 if (!value.storage || *value.storage != slot.id)
                     continue;
-                const std::optional<size_t> bytes = programValueByteSize(value);
+                const std::optional<size_t> &bytes = preparation.staticByteSizes[value.id];
                 if (bytes) {
                     backing.bytes = std::max(backing.bytes, *bytes);
                     backing.sized = true;
@@ -346,8 +353,7 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
     }
     for (const program::Storage &slot : execution.storages) {
         if (slot.id >= liveStorage.size() || !liveStorage[slot.id] ||
-            (slot.initialValue < execution.values.size() &&
-             program::isTapeValueType(execution.values[slot.initialValue].type)))
+            (slot.initialValue < execution.values.size() && preparation.tapeValues[slot.initialValue]))
             continue;
         ProgramStorageBacking &backing = backings[slot.id];
         if (backing.external)
@@ -384,18 +390,18 @@ bool materializeProgramOwnedStorages(const program::Program &execution, const pr
 }
 
 bool materializeProgramValues(const program::Program &execution, const program::ResolvedExecutionPlan *topology,
-                              std::vector<ProgramValueState> &storage, const std::vector<char> &live,
-                              const std::vector<std::optional<ValueLayout>> &layouts,
-                              const std::map<uint32_t, ProgramStorageBacking> &backings,
-                              const std::map<uint32_t, VernonProgramArgument> &externalValues,
+                              const ProgramInvocationPreparation &preparation, std::vector<ProgramValueState> &storage,
+                              const std::vector<char> &live, const std::map<uint32_t, ProgramStorageBacking> &backings,
+                              const std::vector<std::optional<VernonProgramArgument>> &externalValues,
                               const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures,
                               const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, ProgramTapeScratch &tapeScratch,
                               std::string &error) {
+    const auto &layouts = preparation.layouts;
     for (const program::Value &slot : execution.values) {
         if (!live[slot.id])
             continue;
         ProgramValueState &value = storage[slot.id];
-        if (program::isTapeValueType(slot.type)) {
+        if (preparation.tapeValues[slot.id]) {
             if (!attachTape(execution, topology, storage, slot, tapeCaptures, tapePolicy, tapeScratch, value, error))
                 return false;
             continue;
@@ -421,10 +427,11 @@ bool materializeProgramValues(const program::Program &execution, const program::
             byteSize = backing.bytes;
             if (!value.concreteShape)
                 value.concreteShape = storage[backing.owner].concreteShape;
-        } else if (const auto external = externalValues.find(slot.id); external != externalValues.end()) {
-            value.argument = external->second;
+        } else if (slot.id < externalValues.size() && externalValues[slot.id]) {
+            value.argument = *externalValues[slot.id];
             if (value.argument.kind == VERNON_PROGRAM_TENSOR && value.argument.tensor.rank) {
-                value.boundTensorLayout.emplace();
+                if (!value.boundTensorLayout)
+                    value.boundTensorLayout.emplace();
                 value.boundTensorLayout->shape.assign(value.argument.tensor.shape,
                                                       value.argument.tensor.shape + value.argument.tensor.rank);
                 value.boundTensorLayout->byteStrides.assign(value.argument.tensor.byte_strides,
@@ -440,8 +447,8 @@ bool materializeProgramValues(const program::Program &execution, const program::
             if (value.argument.kind == VERNON_PROGRAM_TENSOR)
                 value.argument.tensor.element_layout = programValueLayoutView(*layouts[slot.id]);
             continue;
-        } else if (!programValueHasDynamicShape(slot)) {
-            const std::optional<size_t> bytes = programValueByteSize(slot);
+        } else if (!preparation.dynamicShapes[slot.id]) {
+            const std::optional<size_t> &bytes = preparation.staticByteSizes[slot.id];
             if (!bytes)
                 return error = "Program autodiff value has no materializable tensor parameter", false;
             value.ownedHostBytes.resize(*bytes);

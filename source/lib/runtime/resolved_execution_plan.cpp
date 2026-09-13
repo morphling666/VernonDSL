@@ -110,6 +110,38 @@ static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diag
         return reject(diagnostic, "", "execution plan has no resolved Program");
     const Program &program = plan.resolvedProgram->program;
 
+    plan.declaredValueShapes.resize(program.values.size());
+    plan.preparedValueShapes.resize(program.values.size());
+    for (const Value &value : program.values) {
+        plan.declaredValueShapes[value.id] = shape::decodeRuntimeContractShape(value.shape);
+        plan.preparedValueShapes[value.id] = shape::concrete(plan.declaredValueShapes[value.id]);
+    }
+    for (const auto &[key, node] : plan.nodes) {
+        (void)key;
+        if (!node.stage || !node.stage->bindingProjection.vertex.empty())
+            continue;
+        const StageBindingPlan &bindings = node.stage->bindingProjection;
+        for (size_t index = 0; index < node.projections.size() && index < bindings.parameters.size(); ++index) {
+            const NodeEndpointProjection &projection = node.projections[index];
+            const vernon::runtime::Parameter &parameter = bindings.parameters[index];
+            if (projection.value >= program.values.size() || projection.logicalLeaf || parameter.invocationCarrier ||
+                projection.target.viewTransform || isTapeValue(program.values[projection.value]) ||
+                (program.values[projection.value].layout && program.values[projection.value].shape.empty()))
+                continue;
+            const std::optional<shape::ConcreteShape> concrete =
+                shape::concrete(shape::decodeRuntimeContractShape(parameter.shape));
+            if (!concrete)
+                continue;
+            if (!shape::matches(plan.declaredValueShapes[projection.value], *concrete))
+                return reject(diagnostic, "/values/" + std::to_string(projection.value),
+                              "compiled Stage shape conflicts with the Program Value");
+            if (plan.preparedValueShapes[projection.value] && *plan.preparedValueShapes[projection.value] != *concrete)
+                return reject(diagnostic, "/values/" + std::to_string(projection.value),
+                              "compiled Stages disagree on the Program Value shape");
+            plan.preparedValueShapes[projection.value] = concrete;
+        }
+    }
+
     plan.aliasDomains.clear();
     for (const Storage &storage : program.storages)
         plan.aliasDomains.emplace(storage.id, AliasDomainPlan{storage.id});
@@ -132,7 +164,6 @@ static bool buildResolvedExecutionPoliciesImpl(ResolvedExecutionPlan &plan, Diag
         const std::optional<GraphDirection> direction = graphDirection(graph.direction);
         if (!direction)
             return reject(diagnostic, "/graphs/" + std::to_string(graphIndex), "unsupported graph direction");
-
         std::map<uint32_t, ResidencyRequirement> currentResidency;
         for (const Value &value : program.values)
             currentResidency[value.id] = ResidencyRequirement::Host;

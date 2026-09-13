@@ -6,6 +6,39 @@ namespace vernon::runtime::ad {
 
 ProgramTapeScratch::ProgramTapeScratch(size_t valueCount) : hostBatches_(valueCount), carriers_(valueCount) {}
 
+void ProgramTapeScratch::reset() {
+    hostBatches_.resize(carriers_.size());
+    for (std::shared_ptr<HostStaticTapeBatch> &batch : hostBatches_) {
+        if (!batch)
+            continue;
+        bool reset = false;
+        switch (batch->constructionState()) {
+        case HostStaticTapeBatch::ConstructionState::Constructing:
+            reset = batch->resetConstruction();
+            break;
+        case HostStaticTapeBatch::ConstructionState::FrozenReader:
+            reset = batch->markConstructionRecyclable() && batch->resetRecyclableConstruction();
+            break;
+        case HostStaticTapeBatch::ConstructionState::Recyclable:
+            reset = batch->resetRecyclableConstruction();
+            break;
+        case HostStaticTapeBatch::ConstructionState::Released:
+            break;
+        }
+        if (!reset)
+            batch.reset();
+    }
+    for (auto &value : carriers_)
+        for (Carrier &carrier : value) {
+            carrier.buffer.reset();
+            carrier.retainedBuffer.reset();
+            carrier.argument = {};
+            carrier.shape.clear();
+            carrier.strides.clear();
+            carrier.readOnly = false;
+        }
+}
+
 void ProgramTapeScratch::setHostBatch(uint32_t value, std::shared_ptr<HostStaticTapeBatch> batch) {
     if (value < hostBatches_.size())
         hostBatches_[value] = std::move(batch);

@@ -6,7 +6,6 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
-#include <new>
 #include <utility>
 
 namespace vernon::runtime::ad {
@@ -968,6 +967,18 @@ bool HostDynamicTapeBatch::resetCompactedReplay() {
     return true;
 }
 
+bool HostDynamicTapeBatch::resetConstruction() {
+    std::lock_guard lock(impl_->mutex);
+    if (impl_->compacted || impl_->lanes.empty())
+        return false;
+    std::fill(impl_->lanes.begin(), impl_->lanes.end(), Impl::Lane{});
+    impl_->payload.rewind();
+    impl_->children.rewind();
+    impl_->regions.rewind();
+    impl_->records.rewind();
+    return true;
+}
+
 size_t HostDynamicTapeBatch::constructionBytes() const {
     return impl_->lanes.capacity() * sizeof(Impl::Lane) + impl_->payload.allocatedBytes() +
            impl_->children.allocatedBytes() + impl_->regions.allocatedBytes() + impl_->records.allocatedBytes();
@@ -1361,6 +1372,19 @@ bool HostStaticTapeBatch::compact(bool retainConstructionStorage) {
         dispatchBudget_->releaseTransientBytes(released);
     else
         policy_->release(released);
+    return true;
+}
+
+bool HostStaticTapeBatch::resetConstruction() {
+    if (compacted_ || constructionState_ != ConstructionState::Constructing || dispatchBudget_ ||
+        descriptors_.size() != laneCount_ || lanes_.size() != laneCount_)
+        return false;
+    if (HostDynamicTapeBatch *dynamic = dynamicBatch())
+        if (dynamic->isCompacted() ? !dynamic->resetCompactedReplay() : !dynamic->resetConstruction())
+            return false;
+    std::fill(lanes_.begin(), lanes_.end(), LaneState{});
+    initializeDescriptors();
+    compactedLogicalBytes_ = 0;
     return true;
 }
 

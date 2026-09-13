@@ -175,7 +175,9 @@ PublicationResult<void> PublicationTransaction::applyConcreteShapes(const progra
         for (const program::Value &value : program.values) {
             if (!value.storage || *value.storage != transaction->stagingOwner.id || value.id >= values.size())
                 continue;
-            values[value.id].concreteShape = shape::ConcreteShape();
+            if (!values[value.id].concreteShape)
+                values[value.id].concreteShape.emplace();
+            values[value.id].concreteShape->clear();
             if (tensor.rank)
                 values[value.id].concreteShape->assign(tensor.shape, tensor.shape + tensor.rank);
         }
@@ -404,6 +406,18 @@ VernonStatus publicationErrorStatus(PublicationError error) noexcept {
                    error == PublicationError::CommitFailed
                ? VERNON_STATUS_INTERNAL_ERROR
                : VERNON_STATUS_INVALID_ARGUMENT;
+}
+
+void PublicationTransaction::reset() {
+    rollback();
+    releaseDeviceImages();
+    entries_.clear();
+    boundMutations_.clear();
+    hostRegions_.clear();
+    preparedHostCopies_.clear();
+    status_ = Status::Open;
+    overallSubmission_ = SubmissionState::NotSubmitted;
+    inPlaceSubmission_ = SubmissionState::NotSubmitted;
 }
 
 void PublicationTransaction::rollback() noexcept {

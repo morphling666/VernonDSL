@@ -270,6 +270,8 @@ struct Value {
     std::optional<ValueLayout> layout;
 };
 
+bool isTapeValue(const Value &value) noexcept;
+
 enum class GraphInputKind {
     UserInput,
     InvocationControl,
@@ -558,7 +560,6 @@ ManifestResult<ResolvedProgram> resolve(Program program, const ArtifactSystem &a
 const Graph *findGraph(const Program &program, std::string_view direction);
 std::vector<uint32_t> residualCaptures(const Program &program);
 void markGraphValues(const Graph &graph, std::vector<char> &live);
-bool isTapeValueType(std::string_view type);
 bool resolveControlValue(const Program &program, const ControlComponent &control, std::string_view graph,
                          uint32_t &valueId);
 

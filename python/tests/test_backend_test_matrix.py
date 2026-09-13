@@ -99,7 +99,10 @@ class BackendTestMatrixTests(unittest.TestCase):
         initialize.assert_called_once_with(arch=backend_test_matrix.vd.cpu)
 
     def test_runtime_probe_skips_only_declared_unavailability(self) -> None:
-        fake = SimpleNamespace()
+        fake = SimpleNamespace(
+            RuntimeBackend=SimpleNamespace(CUDA=object()),
+            runtime_available=lambda backend: False,
+        )
         with (
             mock.patch("backend_test_matrix._native", fake),
             mock.patch(
@@ -111,8 +114,27 @@ class BackendTestMatrixTests(unittest.TestCase):
         self.assertIs(result.kind, ProbeKind.DEVICE_OR_CONTEXT_UNAVAILABLE)
         self.assertEqual(result.reason, "no device")
 
+    def test_runtime_probe_classifies_failed_expected_backend_as_regression(self) -> None:
+        fake = SimpleNamespace(
+            RuntimeBackend=SimpleNamespace(CUDA=object()),
+            runtime_available=lambda backend: True,
+        )
+        with (
+            mock.patch("backend_test_matrix._native", fake),
+            mock.patch(
+                "backend_test_matrix.vd.init",
+                side_effect=[RuntimeUnavailableError("context creation failed"), None],
+            ),
+        ):
+            result = probe_runtime(BACKEND_TEST_MATRIX[1], BackendRequirements(compute=True))
+        self.assertIs(result.kind, ProbeKind.PROBE_FAILURE)
+        self.assertEqual(result.reason, "context creation failed")
+
     def test_runtime_probe_does_not_hide_regressions(self) -> None:
-        fake = SimpleNamespace()
+        fake = SimpleNamespace(
+            RuntimeBackend=SimpleNamespace(CUDA=object()),
+            runtime_available=lambda backend: True,
+        )
         with (
             mock.patch("backend_test_matrix._native", fake),
             mock.patch("backend_test_matrix.vd.init", side_effect=RuntimeError("driver regression")),

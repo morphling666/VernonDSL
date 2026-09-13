@@ -23,6 +23,11 @@ namespace vernon::runtime {
 
 template <typename T> using RuntimeResult = vernon::Result<T, vernon::RuntimeError>;
 
+VernonStatus executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
+                                         const program::Graph &graph, program_execution::ProgramInvocationState &frame,
+                                         const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+                                         program_execution::SubmissionState &submission);
+
 bool isOpenGLBackend(VernonRuntimeBackend backend);
 RuntimeResult<void> probeBackend(VernonRuntimeBackend backend, std::string &diagnostic);
 RuntimeResult<void> initializeBackend(VernonRuntimeContext &context, uint32_t deviceIndex);
@@ -45,11 +50,6 @@ RuntimeResult<void> invokeBackendPipeline(VernonStageExecutable &pipeline,
                                           const VernonStageInvocationDescriptor &invocation,
                                           const PlannedGraphicsInvocation &plan);
 RuntimeResult<void> invokeBackendComputePipeline(VernonStageExecutable &pipeline, const PlannedComputeLaunch &plan);
-RuntimeResult<void>
-executePipelineProgramGraph(VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution,
-                            const program::Graph &graph, program_execution::ProgramInvocationState &frame,
-                            const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
-                            program_execution::SubmissionState &submission);
 
 RuntimeResult<VernonRuntimeProviderResourceReference>
 referenceBackendRhiBuffer(VernonRuntimeContext &context, VernonRhiBuffer buffer, uint64_t offset, uint64_t size);

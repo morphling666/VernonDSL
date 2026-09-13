@@ -12,6 +12,7 @@ namespace vernon::runtime::ad {
 class ProgramTapeScratch;
 class HostStaticTapeBatch;
 class AutodiffMemoryPolicy;
+struct ProgramInvocationPreparation;
 
 std::optional<ValueLayout> resolvedProgramValueLayout(const program::Value &value);
 std::optional<size_t> programValueByteSize(const program::Value &value, const Parameter *parameter = nullptr);
@@ -23,17 +24,17 @@ bool fillProgramTapeHostValue(program_execution::ProgramValueState &value, std::
                               ProgramTapeScratch &tapeScratch, uint32_t valueId, std::string &error);
 
 bool materializeProgramOwnedStorages(const program::Program &execution, const program::ResolvedExecutionPlan *plan,
+                                     const ProgramInvocationPreparation &preparation,
                                      std::vector<program_execution::ProgramValueState> &values,
                                      const std::vector<char> &liveStorage,
-                                     const std::vector<std::optional<ValueLayout>> &layouts,
                                      std::map<uint32_t, program_execution::ProgramStorageBacking> &backings,
                                      std::string &error);
 
 bool materializeProgramValues(const program::Program &execution, const program::ResolvedExecutionPlan *plan,
+                              const ProgramInvocationPreparation &preparation,
                               std::vector<program_execution::ProgramValueState> &values, const std::vector<char> &live,
-                              const std::vector<std::optional<ValueLayout>> &layouts,
                               const std::map<uint32_t, program_execution::ProgramStorageBacking> &backings,
-                              const std::map<uint32_t, VernonProgramArgument> &externalValues,
+                              const std::vector<std::optional<VernonProgramArgument>> &externalValues,
                               const std::vector<std::shared_ptr<HostStaticTapeBatch>> *tapeCaptures,
                               const std::shared_ptr<AutodiffMemoryPolicy> &tapePolicy, ProgramTapeScratch &tapeScratch,
                               std::string &error);

@@ -13,14 +13,6 @@
 
 namespace {
 
-std::vector<vernon::tests::BackendTestRow> rhiBackendCases() {
-    std::vector<vernon::tests::BackendTestRow> result;
-    for (const vernon::tests::BackendTestRow &backend : vernon::tests::backendTestMatrix)
-        if (backend.rhi)
-            result.push_back(backend);
-    return result;
-}
-
 class RhiResourceLifetime : public testing::TestWithParam<vernon::tests::BackendTestRow> {
 protected:
     void SetUp() override {
@@ -34,35 +26,28 @@ protected:
     }
 
     VernonRhiDevice device() { return runtime_.context().device; }
+    VernonRuntimeContext *runtime() { return runtime_.context().runtime; }
+    vernon::tests::BackendProbeResult graphicsProbe() {
+        vernon::tests::BackendTestRequirements requirements;
+        requirements.graphics = true;
+        return vernon::tests::probeRuntimeBackend(GetParam(), requirements, runtime());
+    }
+    vernon::tests::BackendProbeResult imageSubresourceViewProbe() {
+        vernon::tests::BackendTestRequirements requirements;
+        requirements.graphics = true;
+        if (GetParam().runtime == VERNON_RUNTIME_OPENGL) {
+            requirements.minimumApiMajor = 4;
+            requirements.minimumApiMinor = 3;
+        } else if (GetParam().runtime == VERNON_RUNTIME_OPENGL_ES) {
+            requirements.minimumApiMajor = 3;
+            requirements.minimumApiMinor = 2;
+        }
+        return vernon::tests::probeRuntimeBackend(GetParam(), requirements, runtime());
+    }
 
 private:
     vernon::tests::BackendRuntimeOwner runtime_;
 };
-
-VernonRhiStatus probeImageSupport(VernonRhiDevice device) {
-    VernonRhiImageDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    descriptor.dimension = VERNON_RHI_IMAGE_2D;
-    descriptor.format = VERNON_RHI_FORMAT_RGBA8_UNORM;
-    descriptor.width = descriptor.height = descriptor.depth = 1;
-    descriptor.mip_levels = descriptor.array_layers = descriptor.sample_count = 1;
-    descriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
-    VernonRhiImage image{};
-    const VernonRhiStatus status = vernonRhiDeviceCreateImage(device, &descriptor, &image);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    return vernonRhiDeviceDestroyImage(device, image);
-}
-
-VernonRhiStatus probeSamplerSupport(VernonRhiDevice device) {
-    VernonRhiSamplerDescriptor descriptor{};
-    descriptor.struct_size = sizeof(descriptor);
-    VernonRhiSampler sampler{};
-    const VernonRhiStatus status = vernonRhiDeviceCreateSampler(device, &descriptor, &sampler);
-    if (status != VERNON_RHI_STATUS_OK)
-        return status;
-    return vernonRhiDeviceDestroySampler(device, sampler);
-}
 
 TEST_P(RhiResourceLifetime, BatchedBufferUploadsValidateBeforeMutation) {
     const VernonRhiDevice device = this->device();
@@ -250,6 +235,13 @@ TEST_P(RhiResourceLifetime, CommandChildrenKeepDevicePublishedUntilExplicitDestr
 
 TEST_P(RhiResourceLifetime, FailedCommandDestroyRollsBackAndCanRetry) {
     const VernonRhiDevice device = this->device();
+    const vernon::tests::BackendProbeResult probe = graphicsProbe();
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+        return;
+    }
     VernonRhiCommandEncoderDescriptor descriptor{};
     descriptor.struct_size = sizeof(descriptor);
     descriptor.required_capabilities = VERNON_RHI_QUEUE_GRAPHICS;
@@ -393,9 +385,9 @@ TEST_P(RhiResourceLifetime, FailedMultiResourceRetainRollsBackEarlierCommandLeas
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(device, recycled), VERNON_RHI_STATUS_OK);
 }
 
-TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
-    const vernon::tests::BackendTestRow test = GetParam();
+TEST_P(RhiResourceLifetime, ImageAndSamplerSupportMatchesGraphicsCapability) {
     const VernonRhiDevice device = this->device();
+    const bool supportsGraphics = vernonRuntimeGetContextCapabilities(runtime()).supports_graphics;
 
     VernonRhiImageDescriptor imageDescriptor{};
     imageDescriptor.struct_size = sizeof(imageDescriptor);
@@ -410,16 +402,21 @@ TEST_P(RhiResourceLifetime, UnsupportedResourceKindsAreRejected) {
     imageDescriptor.usage = VERNON_RHI_IMAGE_SAMPLED;
     VernonRhiImage image{};
     const VernonRhiStatus imageStatus = vernonRhiDeviceCreateImage(device, &imageDescriptor, &image);
-    if (imageStatus == VERNON_RHI_STATUS_OK) {
+    if (supportsGraphics) {
+        ASSERT_EQ(imageStatus, VERNON_RHI_STATUS_OK);
         EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
-        GTEST_SKIP() << test.name << " supports images and samplers";
-    }
-    EXPECT_EQ(imageStatus, VERNON_RHI_STATUS_UNSUPPORTED);
+    } else
+        EXPECT_EQ(imageStatus, VERNON_RHI_STATUS_UNSUPPORTED);
 
     VernonRhiSamplerDescriptor samplerDescriptor{};
     samplerDescriptor.struct_size = sizeof(samplerDescriptor);
     VernonRhiSampler sampler{};
-    EXPECT_EQ(vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &sampler), VERNON_RHI_STATUS_UNSUPPORTED);
+    const VernonRhiStatus samplerStatus = vernonRhiDeviceCreateSampler(device, &samplerDescriptor, &sampler);
+    if (supportsGraphics) {
+        ASSERT_EQ(samplerStatus, VERNON_RHI_STATUS_OK);
+        EXPECT_EQ(vernonRhiDeviceDestroySampler(device, sampler), VERNON_RHI_STATUS_OK);
+    } else
+        EXPECT_EQ(samplerStatus, VERNON_RHI_STATUS_UNSUPPORTED);
 }
 
 TEST_P(RhiResourceLifetime, RetainedBufferDelaysSlotReuse) {
@@ -487,16 +484,13 @@ TEST_P(RhiResourceLifetime, ResolveRequiresExactRetainedLeaseAfterPublicDestroy)
 TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
-    const VernonRhiStatus imageSupport = probeImageSupport(device);
-    if (imageSupport == VERNON_RHI_STATUS_UNSUPPORTED) {
-        GTEST_SKIP() << test.name << " does not support images";
+    const vernon::tests::BackendProbeResult probe = graphicsProbe();
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+        return;
     }
-    ASSERT_EQ(imageSupport, VERNON_RHI_STATUS_OK);
-    const VernonRhiStatus samplerSupport = probeSamplerSupport(device);
-    if (samplerSupport == VERNON_RHI_STATUS_UNSUPPORTED) {
-        GTEST_SKIP() << test.name << " does not support samplers";
-    }
-    ASSERT_EQ(samplerSupport, VERNON_RHI_STATUS_OK);
 
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, *test.rhi);
     ASSERT_NE(adapter, nullptr);
@@ -556,11 +550,13 @@ TEST_P(RhiResourceLifetime, RetainedImageAndSamplerDelaySlotReuse) {
 TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
     const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
-    const VernonRhiStatus imageSupport = probeImageSupport(device);
-    if (imageSupport == VERNON_RHI_STATUS_UNSUPPORTED) {
-        GTEST_SKIP() << test.name << " does not support images";
+    const vernon::tests::BackendProbeResult probe = imageSubresourceViewProbe();
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+        return;
     }
-    ASSERT_EQ(imageSupport, VERNON_RHI_STATUS_OK);
     VernonRuntimeRhiAdapter *adapter = vernonRuntimeRhiAdapterCreateForDevice(device, *test.rhi);
     ASSERT_NE(adapter, nullptr);
     const VernonRuntimeDeviceProvider *provider = vernonRuntimeRhiAdapterGetProvider(adapter);
@@ -587,13 +583,7 @@ TEST_P(RhiResourceLifetime, RetainedImageViewKeepsParentDescriptorAlive) {
     viewDescriptor.array_layer_count = 1;
     viewDescriptor.aspects = VERNON_RHI_IMAGE_ASPECT_COLOR;
     VernonRhiImageView view{};
-    const VernonRhiStatus viewStatus = vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view);
-    if (viewStatus == VERNON_RHI_STATUS_UNSUPPORTED) {
-        EXPECT_EQ(vernonRhiDeviceDestroyImage(device, image), VERNON_RHI_STATUS_OK);
-        vernonRuntimeRhiAdapterDestroy(adapter);
-        GTEST_SKIP() << test.name << " does not support non-identity image views";
-    }
-    ASSERT_EQ(viewStatus, VERNON_RHI_STATUS_OK);
+    ASSERT_EQ(vernonRhiDeviceCreateImageView(device, &viewDescriptor, &view), VERNON_RHI_STATUS_OK);
     VernonRuntimeProviderResourceReference reference{};
     ASSERT_EQ(vernonRuntimeRhiAdapterReferenceImageView(adapter, view, &reference), VERNON_STATUS_OK);
     ASSERT_EQ(provider->retain_resource(provider->user_data, reference), VERNON_STATUS_OK);
@@ -640,13 +630,14 @@ TEST_P(RhiResourceLifetime, RuntimeContextAndAdapterRetainTheirRhiDevice) {
 }
 
 TEST_P(RhiResourceLifetime, CommandGraphRetainsImportedImageViewAndParent) {
-    const vernon::tests::BackendTestRow test = GetParam();
     const VernonRhiDevice device = this->device();
-    const VernonRhiStatus imageSupport = probeImageSupport(device);
-    if (imageSupport == VERNON_RHI_STATUS_UNSUPPORTED) {
-        GTEST_SKIP() << test.name << " does not support images";
+    const vernon::tests::BackendProbeResult probe = graphicsProbe();
+    if (!probe.available()) {
+        if (probe.skippable())
+            GTEST_SKIP() << probe.reason;
+        FAIL() << probe.reason;
+        return;
     }
-    ASSERT_EQ(imageSupport, VERNON_RHI_STATUS_OK);
 
     VernonRhiImageDescriptor imageDescriptor{};
     imageDescriptor.struct_size = sizeof(imageDescriptor);
@@ -691,7 +682,7 @@ TEST_P(RhiResourceLifetime, CommandGraphRetainsImportedImageViewAndParent) {
     EXPECT_EQ(vernonRhiDeviceDestroyImage(device, recycled), VERNON_RHI_STATUS_OK);
 }
 
-INSTANTIATE_TEST_SUITE_P(Backends, RhiResourceLifetime, testing::ValuesIn(rhiBackendCases()),
+INSTANTIATE_TEST_SUITE_P(Backends, RhiResourceLifetime, testing::ValuesIn(vernon::tests::rhiBackendCases()),
                          [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
                              return std::string(info.param.name);
                          });

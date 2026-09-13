@@ -120,6 +120,10 @@ struct SemanticType {
     bool isTensorView() const { return kind == SemanticTypeKind::TensorView; }
     bool isImage() const { return kind == SemanticTypeKind::Image || kind == SemanticTypeKind::ImageView; }
     bool isSampler() const { return kind == SemanticTypeKind::Sampler; }
+    bool isAdTape() const {
+        return kind == SemanticTypeKind::Opaque &&
+               parameter == builtinStorageContract(BuiltinStorageContractId::AdTape)->contract;
+    }
     bool isRankedValue() const { return kind == SemanticTypeKind::Tensor; }
 };
 

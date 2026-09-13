@@ -1,6 +1,7 @@
 #include "VernonCompiler.h"
 #include "VernonRuntime.h"
 #include "VernonVersions.h"
+#include "backend_runtime_owner.h"
 #include "backend_test_matrix.h"
 #include "program_fixture_manifest_table.h"
 #include "runtime_rhi_test_utils.h"
@@ -288,19 +289,21 @@ TEST_P(RhiRuntimeSynchronization, CanonicalProgramExecutesIndependentWorkgroupBa
         vernon::tests::probeCompilerBackend(compiler, backend, requirements);
     if (!compilerProbe.available()) {
         vernonCompilerDestroy(compiler);
-        GTEST_SKIP() << compilerProbe.reason;
+        if (compilerProbe.skippable())
+            GTEST_SKIP() << compilerProbe.reason;
+        FAIL() << compilerProbe.reason;
+        return;
     }
     vernonCompilerDestroy(compiler);
-    vernon::tests::OwnedRhiRuntime owned(backend.runtime, nullptr, backend.runtime == VERNON_RUNTIME_DIRECTX12);
-    vernon::tests::RhiRuntime &context = owned.context();
-    const vernon::tests::BackendProbeResult runtimeProbe =
-        vernon::tests::probeRuntimeBackend(backend, requirements, context.runtime);
+    vernon::tests::BackendRuntimeOwner owned;
+    const vernon::tests::BackendProbeResult runtimeProbe = owned.initialize(backend, requirements);
     if (!runtimeProbe.available()) {
         if (runtimeProbe.skippable())
             GTEST_SKIP() << runtimeProbe.reason;
         FAIL() << runtimeProbe.reason;
         return;
     }
+    vernon::tests::RhiRuntime &context = owned.context();
     const auto *fixture = vernon::tests::findProgramFixtureManifest("synchronization", backend.runtime);
     ASSERT_NE(fixture, nullptr);
     vernon::tests::OwnedProgramExecutable program(context.runtime, std::string(fixture->manifestPath));

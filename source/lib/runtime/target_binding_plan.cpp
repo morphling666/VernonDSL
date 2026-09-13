@@ -601,7 +601,7 @@ bool buildTargetBindingPlan(const ResolvedProgram &program, const Node &node, co
         }
         const std::optional<program_plan::TapeCarrier> tapeCarrier =
             program_plan::tapeCarrierFromRoleName(endpoint.role);
-        const bool typedTapeCarrier = program::isTapeValueType(value.type) && tapeCarrier;
+        const bool typedTapeCarrier = program::isTapeValue(value) && tapeCarrier;
 
         if (typedTapeCarrier) {
             if (backend == VERNON_RUNTIME_CPU || !compiled || !compiled->elementLayout || !endpoint.viewDescriptor)

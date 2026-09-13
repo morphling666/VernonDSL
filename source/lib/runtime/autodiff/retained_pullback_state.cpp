@@ -73,7 +73,7 @@ captureStorages(const program_execution::ProgramInvocationState &invocation) {
 std::vector<char> captureTapeValues(const program::Program &program) {
     std::vector<char> result(program.values.size());
     for (const program::Value &value : program.values)
-        result[value.id] = program::isTapeValueType(value.type);
+        result[value.id] = program::isTapeValue(value);
     return result;
 }
 
@@ -86,20 +86,20 @@ std::vector<char> captureTapeValues(const program_execution::ProgramInvocationSt
 
 RetainedPullbackState::RetainedPullbackState(ProgramResidualPlan plan,
                                              const program_execution::ProgramInvocationState &invocation,
-                                             ProgramTapeScratch tapeScratch)
+                                             ProgramTapeSnapshot tape)
     : residualPlan_(std::move(plan)), values_(captureValues(residualPlan_, invocation)),
       storages_(captureStorages(invocation)), residualCaptures_(captureBytes(invocation.values().size(), values_)),
       captureShapes_(makeCaptureShapes(invocation.values().size(), values_)),
-      tapeValues_(captureTapeValues(invocation)), tape_(tapeScratch.releaseSnapshot()) {}
+      tapeValues_(captureTapeValues(invocation)), tape_(std::move(tape)) {}
 
 RetainedPullbackState::RetainedPullbackState(ProgramResidualPlan plan, const program::Program &program,
                                              std::vector<program_execution::CanonicalValueSnapshot> values,
                                              std::map<uint32_t, program_execution::ProgramStorageBacking> storages,
-                                             ProgramTapeScratch tapeScratch)
+                                             ProgramTapeSnapshot tape)
     : residualPlan_(std::move(plan)), values_(ownRetainedStorage(std::move(values))),
       storages_(sanitizeStorages(std::move(storages))), residualCaptures_(captureBytes(program.values.size(), values_)),
       captureShapes_(makeCaptureShapes(program.values.size(), values_)), tapeValues_(captureTapeValues(program)),
-      tape_(tapeScratch.releaseSnapshot()) {}
+      tape_(std::move(tape)) {}
 
 bool RetainedPullbackState::importInto(program_execution::ProgramInvocationState &invocation,
                                        ProgramTapeScratch &tapeScratch, bool importTape, std::string &error) const {

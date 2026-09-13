@@ -11,8 +11,15 @@ from unittest import mock
 
 import vernon_dsl as vd
 import vernon_dsl._runtime.session as runtime_session
+from backend_test_matrix import BackendRequirements, BackendRow, backend_matrix_test, expand_backend_matrix_tests
 
 
+@vd.kernel
+def write_session_liveness_value(output: vd.TensorView[vd.f32, (1,), vd.write]) -> None:
+    output[0] = 7.0
+
+
+@expand_backend_matrix_tests
 class RuntimeSessionTests(unittest.TestCase):
     def setUp(self) -> None:
         registry = runtime_session._registry
@@ -99,7 +106,9 @@ class RuntimeSessionTests(unittest.TestCase):
         def selected(session: vd.RuntimeSession) -> tuple[vd.RuntimeSession, vd.RuntimeSession]:
             with session:
                 barrier.wait()
-                return vd.current_session(), runtime_session._session_state()
+                current = vd.current_session()
+                assert current is not None
+                return current, runtime_session._session_state()
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = tuple(executor.map(selected, (first, second)))
@@ -192,6 +201,19 @@ class RuntimeSessionTests(unittest.TestCase):
 
         gc.collect()
         self.assertIsNone(old_reference())
+
+    @backend_matrix_test(BackendRequirements())
+    def test_repeated_init_preserves_live_old_session_work(self, backend: BackendRow) -> None:
+        old = vd.init(arch=vd.cpu)
+        with old:
+            output = vd.storage.zeros(dtype=vd.f32, shape=(1,))
+        replacement = vd.init(arch=backend.architecture)  # type: ignore[arg-type]
+
+        self.assertIs(vd.current_session(), replacement)
+        self.assertEqual(old.retired, replacement is not old)
+        with old:
+            write_session_liveness_value(output)
+            self.assertEqual(output.to_numpy()[0], 7.0)
 
     def test_session_local_cache_does_not_keep_retired_session_alive(self) -> None:
         cache = runtime_session._SessionArtifactCache()

@@ -8,6 +8,9 @@
 namespace vernon::runtime::program {
 class InvocationSnapshot;
 }
+namespace vernon::runtime::ad {
+class CanonicalProgramExecutionWorkspace;
+}
 
 namespace vernon::runtime {
 
@@ -15,6 +18,7 @@ struct ProgramInvocationContext {
     const program::InvocationSnapshot &bindings;
     const std::optional<uint64_t> &checkpointMemoryBudget;
     const std::string &checkpointPolicy;
+    ad::CanonicalProgramExecutionWorkspace *executionWorkspace{};
 };
 
 } // namespace vernon::runtime

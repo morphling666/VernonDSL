@@ -1,3 +1,5 @@
+#include "backend_runtime_owner.h"
+#include "backend_test_matrix.h"
 #include "runtime/autodiff/retained_pullback_state.h"
 #include "runtime/content_hash.h"
 #include "runtime/program_execution/failure_injection.h"
@@ -455,12 +457,29 @@ TEST(ProgramPublication, InPlaceBindingIsExplicitAndNotRollbackStaged) {
     EXPECT_EQ(destination, 11.0f);
 }
 
-TEST(ProgramPublication, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
+class ProgramPublicationDevice : public testing::TestWithParam<vernon::tests::BackendTestRow> {
+protected:
+    void SetUp() override {
+        vernon::tests::BackendTestRequirements requirements;
+        requirements.storageBuffers = true;
+        const vernon::tests::BackendProbeResult probe = runtimeOwner_.initialize(GetParam(), requirements);
+        if (!probe.available()) {
+            if (probe.skippable())
+                GTEST_SKIP() << probe.reason;
+            FAIL() << probe.reason;
+        }
+    }
+
+    vernon::tests::RhiRuntime &runtime() { return runtimeOwner_.context(); }
+
+private:
+    vernon::tests::BackendRuntimeOwner runtimeOwner_;
+};
+
+TEST_P(ProgramPublicationDevice, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
     using namespace vernon::runtime;
     using namespace vernon::runtime::program;
-    auto runtime = vernon::tests::createRhiRuntime(VERNON_RUNTIME_METAL);
-    if (!runtime.runtime)
-        GTEST_SKIP() << "Metal runtime backend is unavailable";
+    auto &runtime = this->runtime();
     const float initial = 2.0f;
     auto buffer =
         vernon::tests::createBuffer(runtime, sizeof(float), alignof(float), VERNON_RHI_BUFFER_STORAGE, &initial);
@@ -486,8 +505,12 @@ TEST(ProgramPublication, ValidDeviceInPlaceBackingRetainsWritesAfterRollback) {
     EXPECT_FLOAT_EQ(observed, written);
 
     EXPECT_EQ(vernonRhiDeviceDestroyBuffer(runtime.device, buffer.handle), VERNON_RHI_STATUS_OK);
-    vernon::tests::destroyRhiRuntime(runtime);
 }
+
+INSTANTIATE_TEST_SUITE_P(Backends, ProgramPublicationDevice, testing::ValuesIn(vernon::tests::rhiBackendCases()),
+                         [](const testing::TestParamInfo<vernon::tests::BackendTestRow> &info) {
+                             return std::string(info.param.name);
+                         });
 
 TEST(ProgramPublication, InvalidDeviceCommitRollsBackBeforeSubmission) {
     using namespace vernon::runtime;
@@ -529,7 +552,8 @@ TEST(RetainedPullbackState, SnapshotsDoNotAliasInvocationOrRetryScratch) {
     program_execution::ProgramInvocationState forward(plan, std::move(forwardValues), {});
     ad::ProgramResidualPlan residuals;
     residuals.retainedValues = {0};
-    ad::RetainedPullbackState retained(std::move(residuals), forward, ad::ProgramTapeScratch(1));
+    ad::ProgramTapeScratch tapeScratch(1);
+    ad::RetainedPullbackState retained(std::move(residuals), forward, tapeScratch.releaseSnapshot());
 
     forward.values()[0].ownedHostBytes[0] = 42;
     std::vector<program_execution::ProgramValueState> applyValues(1);

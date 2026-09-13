@@ -38,7 +38,8 @@ public:
             return {BackendProbeKind::PlatformNotBuilt, std::string(backend.name) + " GLFW context owner is not built"};
 #endif
         } else {
-            runtime_ = std::make_unique<OwnedRhiRuntime>(backend.runtime);
+            runtime_ = std::make_unique<OwnedRhiRuntime>(backend.runtime, nullptr,
+                                                         backend.runtime == VERNON_RUNTIME_DIRECTX12);
         }
         return probeRuntimeBackend(backend, requirements, runtime_->runtime());
     }

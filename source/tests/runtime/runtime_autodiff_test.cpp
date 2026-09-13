@@ -343,6 +343,31 @@ TEST(RuntimeAutodiffTapeAllocator, ResetsFailedCompactLaneWithoutLeakingItsBatch
     EXPECT_EQ(policy->usage().currentBytes, 0u);
 }
 
+TEST(RuntimeAutodiffTapeAllocator, DiscardsUnretainedConstructionWithoutReallocation) {
+    using namespace vernon::runtime::ad;
+    auto policy = std::make_shared<HostTapeMemoryPolicy>();
+    auto batch = createStaticBatch(1, sizeof(uint32_t), 1024, policy, nullptr);
+    ASSERT_NE(batch, nullptr);
+    VernonAdTapeAllocator *const descriptor = batch->descriptor(0);
+    ASSERT_NE(descriptor, nullptr);
+    const size_t allocated = batch->allocatedBytes();
+
+    VernonAdRegionHandle region = VERNON_AD_INVALID_REGION_HANDLE;
+    VernonAdRecordHandle record = VERNON_AD_INVALID_RECORD_HANDLE;
+    ASSERT_EQ(descriptor->reset(descriptor), VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(descriptor->begin_region(descriptor, VERNON_AD_INVALID_REGION_HANDLE, &region),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(descriptor->reserve_record(descriptor, region, sizeof(uint32_t), alignof(uint32_t), 0, &record),
+              VERNON_AD_TAPE_ALLOCATOR_OK);
+    ASSERT_EQ(descriptor->end_region(descriptor, region, 1, 0), VERNON_AD_TAPE_ALLOCATOR_OK);
+
+    ASSERT_TRUE(batch->resetConstruction());
+    EXPECT_EQ(batch->descriptor(0), descriptor);
+    EXPECT_EQ(batch->allocatedBytes(), allocated);
+    EXPECT_EQ(batch->logicalBytes(), 0u);
+    EXPECT_EQ(batch->constructionState(), HostStaticTapeBatch::ConstructionState::Constructing);
+}
+
 TEST(RuntimeAutodiffTapeAllocator, PromotesDynamicLaneIntoSharedImmutableBatch) {
     using namespace vernon::runtime::ad;
     auto policy = std::make_shared<HostTapeMemoryPolicy>();

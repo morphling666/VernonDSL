@@ -5,16 +5,12 @@
 #include "program_tape_scratch.h"
 #include "runtime/program_execution/failure_injection.h"
 #include "runtime/program_execution/publication_transaction.h"
-#include "runtime_autodiff_internal.h"
 
 #include <algorithm>
-#include <limits>
 #include <map>
 #include <optional>
-#include <set>
 
 namespace vernon::runtime::ad {
-using program_execution::ProgramInvocationState;
 using program_execution::ProgramStorageBacking;
 using program_execution::ProgramValueOwnership;
 using program_execution::ProgramValueState;
@@ -44,7 +40,7 @@ bool attachResiduals(const InvocationBuildRequest &request, const program::Progr
             continue;
         values[value].ownership = ProgramValueOwnership::RetainedResidual;
         const program::Value &slot = execution.values[value];
-        if (!program::isTapeValueType(slot.type) && slot.storage) {
+        if (!program::isTapeValue(slot) && slot.storage) {
             ProgramStorageBacking &backing = backings[*slot.storage];
             backing.bytes = std::max(backing.bytes, (*request.captures)[value].size());
             backing.sized = true;
@@ -54,22 +50,36 @@ bool attachResiduals(const InvocationBuildRequest &request, const program::Progr
 }
 
 bool build(VernonRuntimeContext &context, const program::Program &execution, const program::ResolvedExecutionPlan *plan,
+           const ProgramInvocationPreparation &preparation, ProgramBoundaryBindingScratch &bindingScratch,
            std::vector<ProgramValueState> &values, std::map<uint32_t, ProgramStorageBacking> &storageBackings,
            ProgramTapeScratch &tapeScratch, const InvocationBuildRequest &request,
            std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
-    values.assign(execution.values.size(), {});
-    std::vector<char> typedControls(execution.values.size());
-    std::set<uint32_t> typedControlStorages;
-    for (const program::Graph &graph : execution.graphs)
-        for (const program::GraphInput &input : graph.inputs)
-            if (input.kind == program::GraphInputKind::Control && input.value < execution.values.size()) {
-                typedControls[input.value] = 1;
-                if (execution.values[input.value].storage)
-                    typedControlStorages.insert(*execution.values[input.value].storage);
-            }
+    values.resize(execution.values.size());
+    for (size_t valueIndex = 0; valueIndex < values.size(); ++valueIndex) {
+        ProgramValueState &value = values[valueIndex];
+        value.ownedHostBytes.clear();
+        value.strides.clear();
+        if (plan && valueIndex < plan->preparedValueShapes.size() && plan->preparedValueShapes[valueIndex]) {
+            if (!value.concreteShape)
+                value.concreteShape.emplace();
+            *value.concreteShape = *plan->preparedValueShapes[valueIndex];
+        } else {
+            value.concreteShape.reset();
+        }
+        if (value.boundTensorLayout) {
+            value.boundTensorLayout->shape.clear();
+            value.boundTensorLayout->byteStrides.clear();
+        }
+        value.argument = {};
+        value.stagedDeviceInitial.reset();
+        value.ownership = ProgramValueOwnership::OwnedInvocation;
+    }
+    for (const auto &[storage, prepared] : preparation.storageBackings)
+        storageBackings.insert_or_assign(storage, prepared);
 
-    std::vector<char> live = request.required;
-    live.resize(execution.values.size());
+    bindingScratch.reset(execution);
+    std::vector<char> &live = bindingScratch.liveValues;
+    std::copy(request.required.begin(), request.required.end(), live.begin());
     if (request.boundaries)
         for (const auto &[slot, value] : request.boundaries->valueBySlot) {
             (void)slot;
@@ -83,24 +93,18 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
         for (size_t value = 0; value < request.tapeCaptures->size() && value < live.size(); ++value)
             live[value] |= static_cast<bool>((*request.tapeCaptures)[value]);
     for (const program::Value &slot : execution.values)
-        if (slot.storage && typedControlStorages.count(*slot.storage))
+        if (slot.storage && *slot.storage < preparation.typedControlStorages.size() &&
+            preparation.typedControlStorages[*slot.storage])
             live[slot.id] = 0;
 
-    std::vector<char> liveStorage(execution.storages.size());
+    std::vector<char> &liveStorage = bindingScratch.liveStorages;
     for (const program::Value &slot : execution.values)
         if (live[slot.id] && slot.storage && *slot.storage < liveStorage.size() &&
-            !typedControlStorages.count(*slot.storage))
+            (*slot.storage >= preparation.typedControlStorages.size() ||
+             !preparation.typedControlStorages[*slot.storage]))
             liveStorage[*slot.storage] = 1;
 
-    std::map<uint32_t, ProgramStorageBacking> backings;
-    for (const program::Storage &slot : execution.storages)
-        backings.emplace(slot.id, ProgramStorageBacking{
-                                      slot.initialValue,
-                                      static_cast<size_t>(slot.buffer.byteLength),
-                                      slot.buffer.byteLength > 0,
-                                      std::nullopt,
-                                  });
-    std::map<uint32_t, VernonProgramArgument> externalValues;
+    auto &backings = storageBackings;
     if (request.boundaries) {
         ProgramBoundaryBindingRequest binding{
             request.boundaries->arguments,
@@ -108,12 +112,16 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             request.boundaries->valueBySlot,
             &request.boundaries->publication,
         };
-        if (!plan || !bindProgramBoundaries(context, execution, *plan, binding, externalValues, backings, live, error))
+        if (!plan || !bindProgramBoundaries(context, execution, *plan, binding, bindingScratch, backings, live, error))
             return false;
         auto applied = request.boundaries->publication.applyConcreteShapes(execution, values);
         if (applied.isErr())
             return error = program_execution::publicationErrorMessage(applied.error()), false;
-        for (auto &[value, argument] : externalValues) {
+        for (size_t value = 0; value < bindingScratch.externalValues.size(); ++value) {
+            std::optional<VernonProgramArgument> &external = bindingScratch.externalValues[value];
+            if (!external)
+                continue;
+            VernonProgramArgument &argument = *external;
             if (value >= execution.values.size() || execution.values[value].storage ||
                 argument.kind != VERNON_PROGRAM_TENSOR || argument.tensor.storage != VERNON_TENSOR_HOST ||
                 !argument.tensor.host_data || !argument.tensor.byte_size)
@@ -128,20 +136,19 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
         for (const auto &snapshot : *request.retainedSnapshots) {
             if (snapshot.value >= values.size() || snapshot.logical.argument.kind != VERNON_PROGRAM_TENSOR)
                 continue;
-            externalValues.emplace(snapshot.value, snapshot.logical.argument);
+            bindingScratch.externalValues[snapshot.value] = snapshot.logical.argument;
             values[snapshot.value].concreteShape = snapshot.logical.concreteShape;
             values[snapshot.value].strides = snapshot.logical.strides;
         }
     }
 
-    std::vector<std::optional<ValueLayout>> layouts(execution.values.size());
     for (const program::Value &slot : execution.values) {
-        if (typedControls[slot.id] || program::isTapeValueType(slot.type) ||
-            (slot.storage && typedControlStorages.count(*slot.storage)))
+        const bool typedControlStorage = slot.storage && *slot.storage < preparation.typedControlStorages.size() &&
+                                         preparation.typedControlStorages[*slot.storage];
+        if (preparation.typedControls[slot.id] || preparation.tapeValues[slot.id] || typedControlStorage)
             continue;
-        layouts[slot.id] = resolvedProgramValueLayout(slot);
-        const auto external = externalValues.find(slot.id);
-        const VernonProgramArgument *argument = external != externalValues.end() ? &external->second
+        const std::optional<VernonProgramArgument> &external = bindingScratch.externalValues[slot.id];
+        const VernonProgramArgument *argument = external ? &*external
                                                 : slot.storage && backings[*slot.storage].external
                                                     ? &*backings[*slot.storage].external
                                                     : nullptr;
@@ -149,59 +156,116 @@ bool build(VernonRuntimeContext &context, const program::Program &execution, con
             values[slot.id].argument = *argument;
             continue;
         }
-        const bool dynamic = programValueHasDynamicShape(slot);
-        if (!layouts[slot.id] || !layouts[slot.id]->byteSize || (!dynamic && !programValueByteSize(slot)))
+        const bool dynamic = preparation.dynamicShapes[slot.id];
+        if (!preparation.layouts[slot.id] || !preparation.layouts[slot.id]->byteSize ||
+            (!dynamic && !preparation.materializableStaticValues[slot.id]))
             return error = "Program Value '" + slot.name + "' has no materializable tensor layout", false;
         if (argument) {
             const VernonTensorView &tensor = argument->tensor;
             if (tensor.rank < slot.shape.size() || (tensor.rank && (!tensor.shape || !tensor.byte_strides)))
                 return error = "Program invocation Tensor has incomplete shape metadata", false;
-            values[slot.id].concreteShape = shape::ConcreteShape();
+            if (!values[slot.id].concreteShape)
+                values[slot.id].concreteShape.emplace();
+            values[slot.id].concreteShape->clear();
             values[slot.id].strides.clear();
             if (!slot.shape.empty()) {
                 values[slot.id].concreteShape->assign(tensor.shape, tensor.shape + slot.shape.size());
                 values[slot.id].strides.assign(tensor.byte_strides, tensor.byte_strides + slot.shape.size());
             }
         }
-        if (!slot.storage)
-            continue;
-        ProgramStorageBacking &backing = backings[*slot.storage];
-        if (backing.owner == UINT32_MAX || backing.owner >= execution.values.size())
-            backing.owner = slot.id;
-        if (!dynamic) {
-            if (const std::optional<size_t> bytes = programValueByteSize(slot))
-                backing.bytes = std::max(backing.bytes, *bytes);
-            backing.sized = true;
-        }
     }
     if (!attachResiduals(request, execution, values, backings, error) ||
-        !materializeProgramOwnedStorages(execution, plan, values, liveStorage, layouts, backings, error) ||
-        !materializeProgramValues(execution, plan, values, live, layouts, backings, externalValues,
+        !materializeProgramOwnedStorages(execution, plan, preparation, values, liveStorage, backings, error) ||
+        !materializeProgramValues(execution, plan, preparation, values, live, backings, bindingScratch.externalValues,
                                   request.tapeCaptures, tapePolicy, tapeScratch, error))
         return false;
-    storageBackings = std::move(backings);
     return true;
 }
 
 } // namespace
 
+ProgramInvocationPreparation prepareProgramInvocation(const program::Program &execution) {
+    ProgramInvocationPreparation result;
+    result.typedControls.resize(execution.values.size());
+    result.typedControlStorages.resize(execution.storages.size());
+    result.tapeValues.resize(execution.values.size());
+    result.dynamicShapes.resize(execution.values.size());
+    result.materializableStaticValues.resize(execution.values.size());
+    result.staticByteSizes.resize(execution.values.size());
+    result.layouts.resize(execution.values.size());
+    result.forwardRequiredValues.resize(execution.values.size());
+    result.backwardRequiredValues.resize(execution.values.size());
+    if (const program::Graph *forward = program::findGraph(execution, "forward")) {
+        program::markGraphValues(*forward, result.forwardRequiredValues);
+        for (uint32_t value : program::residualCaptures(execution))
+            if (value < result.forwardRequiredValues.size())
+                result.forwardRequiredValues[value] = 1;
+    }
+    if (const program::Graph *backward = program::findGraph(execution, "backward"))
+        program::markGraphValues(*backward, result.backwardRequiredValues);
+    for (const program::Graph &graph : execution.graphs)
+        for (const program::GraphInput &input : graph.inputs)
+            if (input.kind == program::GraphInputKind::Control && input.value < execution.values.size()) {
+                result.typedControls[input.value] = 1;
+                const std::optional<uint32_t> storage = execution.values[input.value].storage;
+                if (storage && *storage < result.typedControlStorages.size())
+                    result.typedControlStorages[*storage] = 1;
+            }
+    for (const program::Storage &slot : execution.storages)
+        result.storageBackings.emplace(slot.id, ProgramStorageBacking{
+                                                    slot.initialValue,
+                                                    static_cast<size_t>(slot.buffer.byteLength),
+                                                    slot.buffer.byteLength > 0,
+                                                    std::nullopt,
+                                                });
+    for (const program::Value &slot : execution.values) {
+        result.tapeValues[slot.id] = program::isTapeValue(slot);
+        result.dynamicShapes[slot.id] = programValueHasDynamicShape(slot);
+        const bool typedControlStorage = slot.storage && *slot.storage < result.typedControlStorages.size() &&
+                                         result.typedControlStorages[*slot.storage];
+        if (result.typedControls[slot.id] || result.tapeValues[slot.id] || typedControlStorage)
+            continue;
+        result.layouts[slot.id] = resolvedProgramValueLayout(slot);
+        const std::optional<size_t> staticBytes =
+            result.dynamicShapes[slot.id] ? std::nullopt : programValueByteSize(slot);
+        result.staticByteSizes[slot.id] = staticBytes;
+        result.materializableStaticValues[slot.id] = staticBytes.has_value();
+        if (!slot.storage)
+            continue;
+        auto backing = result.storageBackings.find(*slot.storage);
+        if (backing == result.storageBackings.end())
+            continue;
+        if (backing->second.owner == UINT32_MAX || backing->second.owner >= execution.values.size())
+            backing->second.owner = slot.id;
+        if (staticBytes) {
+            backing->second.bytes = std::max(backing->second.bytes, *staticBytes);
+            backing->second.sized = true;
+        }
+    }
+    return result;
+}
+
 bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
-                                  const program::ResolvedExecutionPlan *plan, std::vector<ProgramValueState> &values,
+                                  const program::ResolvedExecutionPlan *plan,
+                                  const ProgramInvocationPreparation &preparation,
+                                  ProgramBoundaryBindingScratch &bindingScratch, std::vector<ProgramValueState> &values,
                                   std::map<uint32_t, ProgramStorageBacking> &storageBackings,
                                   ProgramTapeScratch &tapeScratch, const ForwardInvocationSpec &spec,
                                   std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
     if (program_execution::injectFailure(program_execution::FailureBoundary::Allocation))
         return error = "injected Program invocation allocation failure", false;
-    return build(context, execution, plan, values, storageBackings, tapeScratch, {spec.requiredValues, &spec.bindings},
-                 std::move(tapePolicy), error);
+    return build(context, execution, plan, preparation, bindingScratch, values, storageBackings, tapeScratch,
+                 {spec.requiredValues, &spec.bindings}, std::move(tapePolicy), error);
 }
 
 bool buildProgramInvocationValues(VernonRuntimeContext &context, const program::Program &execution,
-                                  const program::ResolvedExecutionPlan *plan, std::vector<ProgramValueState> &values,
+                                  const program::ResolvedExecutionPlan *plan,
+                                  const ProgramInvocationPreparation &preparation,
+                                  ProgramBoundaryBindingScratch &bindingScratch, std::vector<ProgramValueState> &values,
                                   std::map<uint32_t, ProgramStorageBacking> &storageBackings,
                                   ProgramTapeScratch &tapeScratch, const PullbackInvocationSpec &spec,
                                   std::shared_ptr<AutodiffMemoryPolicy> tapePolicy, std::string &error) {
-    return build(context, execution, plan, values, storageBackings, tapeScratch,
+    return build(context, execution, plan, preparation, bindingScratch, values, storageBackings, tapeScratch,
                  {spec.requiredValues, &spec.bindings, &spec.captures, &spec.captureShapes, spec.tapeCaptures,
                   spec.retainedSnapshots},
                  std::move(tapePolicy), error);

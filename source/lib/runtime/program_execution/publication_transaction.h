@@ -43,6 +43,7 @@ public:
     explicit PublicationTransaction(const program::ResolvedPublicationPlan &plan) : plan_(&plan) {}
     ~PublicationTransaction() noexcept { rollback(); }
 
+    void reset();
     PublicationResult<void> bindHostCommit(uint32_t slot, const program::PublicationTarget &target,
                                            const VernonProgramArgument &destination);
     PublicationResult<void> bindDeviceCommit(uint32_t slot, const program::PublicationTarget &target,

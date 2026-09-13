@@ -82,6 +82,13 @@ struct ForwardExecutionTarget {
     program_execution::InvocationMutationOutcome &outcome;
 };
 
+class CanonicalProgramExecutionWorkspace {
+public:
+    virtual ~CanonicalProgramExecutionWorkspace() = default;
+
+    std::vector<VernonProgramArgument> boundaryArguments;
+};
+
 class PullbackExecution {
 public:
     virtual ~PullbackExecution() = default;
@@ -100,6 +107,7 @@ class CanonicalProgramExecution {
 public:
     virtual ~CanonicalProgramExecution() = default;
     virtual const Signature &signature() const = 0;
+    virtual std::unique_ptr<CanonicalProgramExecutionWorkspace> createWorkspace() const = 0;
     virtual VernonStatus forward(const ForwardExecutionTarget &target,
                                  std::unique_ptr<PullbackExecution> &pullback) = 0;
 };

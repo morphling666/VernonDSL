@@ -1,5 +1,4 @@
 #include "VernonRuntime.h"
-#include "execution_graph/command_graph.h"
 #include "execution_graph/execution_graph_internal.h"
 #include "rhi/rhi_internal.h"
 #include "runtime/autodiff/runtime_autodiff_internal.h"
@@ -91,8 +90,15 @@ struct RuntimeProgramControl {
 
 struct RuntimeProgramInstanceState {
     RuntimeProgramInstanceState(VernonProgramExecutable &value, vernon::runtime::RuntimeChildLifecycle childLifecycle,
-                                vernon::OwnerRef invocationOwner) noexcept
-        : lifecycle(std::move(childLifecycle)), owner(std::move(invocationOwner)), pipeline(&value), bindings(&value) {}
+                                vernon::OwnerRef invocationOwner)
+        : lifecycle(std::move(childLifecycle)), owner(std::move(invocationOwner)), pipeline(&value), bindings(&value) {
+        if (value.programAutodiff.canonicalExecution) {
+            WorkspaceSlot slot;
+            slot.workspace = value.programAutodiff.canonicalExecution->createWorkspace();
+            if (slot.workspace)
+                workspaces.push_back(std::move(slot));
+        }
+    }
     ~RuntimeProgramInstanceState() noexcept {
         if (!lifecycle.published())
             return;
@@ -107,6 +113,53 @@ struct RuntimeProgramInstanceState {
     vernon::OwnerRef owner;
     VernonProgramExecutable *pipeline;
     vernon::runtime::program::ProgramInstance bindings;
+
+    vernon::runtime::ad::CanonicalProgramExecutionWorkspace *acquireWorkspace() noexcept {
+        try {
+            std::lock_guard lock(workspaceMutex);
+            for (WorkspaceSlot &slot : workspaces)
+                if (!slot.inUse) {
+                    slot.inUse = true;
+                    return slot.workspace.get();
+                }
+            if (!pipeline->programAutodiff.canonicalExecution)
+                return nullptr;
+            WorkspaceSlot slot;
+            slot.workspace = pipeline->programAutodiff.canonicalExecution->createWorkspace();
+            if (!slot.workspace)
+                return nullptr;
+            slot.inUse = true;
+            auto *result = slot.workspace.get();
+            workspaces.push_back(std::move(slot));
+            return result;
+        } catch (...) {
+            return nullptr;
+        }
+    }
+
+    void releaseWorkspace(vernon::runtime::ad::CanonicalProgramExecutionWorkspace *workspace) noexcept {
+        try {
+            std::lock_guard lock(workspaceMutex);
+            for (WorkspaceSlot &slot : workspaces)
+                if (slot.workspace.get() == workspace) {
+                    if (!slot.inUse)
+                        vernon::resultContractViolation();
+                    slot.inUse = false;
+                    return;
+                }
+        } catch (...) {
+            vernon::resultContractViolation();
+        }
+        vernon::resultContractViolation();
+    }
+
+private:
+    struct WorkspaceSlot {
+        std::unique_ptr<vernon::runtime::ad::CanonicalProgramExecutionWorkspace> workspace;
+        bool inUse{};
+    };
+    std::mutex workspaceMutex;
+    std::vector<WorkspaceSlot> workspaces;
 };
 
 struct VernonProgramInstance {
@@ -122,6 +175,8 @@ struct VernonProgramInvocation {
     ~VernonProgramInvocation() {
         if (pendingPullback)
             vernonProgramPullbackDestroy(pendingPullback);
+        if (executionWorkspace)
+            instance->releaseWorkspace(executionWorkspace);
     }
     std::shared_ptr<RuntimeProgramInstanceState> instance;
     vernon::runtime::RuntimeChildLifecycle lifecycle;
@@ -131,6 +186,7 @@ struct VernonProgramInvocation {
     VernonPullback *pendingPullback{};
     std::optional<uint64_t> checkpointMemoryBudget;
     std::string checkpointPolicy;
+    vernon::runtime::ad::CanonicalProgramExecutionWorkspace *executionWorkspace{};
     bool executed{};
     bool finished{};
     bool succeeded{};
@@ -2218,45 +2274,12 @@ void vernon::runtime::destroyResolvedStage(VernonStageExecutable *stage) {
     delete stage;
 }
 
+extern "C++" {
+
 namespace {
 
-struct PipelineComputeResource {
-    uint32_t value{};
-    std::string access;
-};
-
-struct PipelineComputePassDescription {
-    std::string name;
-    uint64_t grid[3]{1, 1, 1};
-    std::vector<uint32_t> operands;
-    std::vector<uint32_t> results;
-    std::vector<PipelineComputeResource> resources;
-};
-
-extern "C++" std::string programNodeName(const program::Node &node) {
+std::string programNodeName(const program::Node &node) {
     return "program." + std::to_string(node.id) + "." + (node.name.empty() ? node.stage : node.name);
-}
-
-extern "C++" PipelineComputePassDescription describeProgramNode(const program::Node &node) {
-    PipelineComputePassDescription description;
-    description.name = programNodeName(node);
-    const program::ComputeOperation &compute = program::computeOperation(node);
-    for (size_t axis = 0; axis < 3; ++axis)
-        description.grid[axis] =
-            compute.workgroups[axis].kind == program::ControlKind::Static ? compute.workgroups[axis].value : 0;
-    description.operands = node.operands;
-    description.results = node.results;
-    description.resources.reserve(node.accesses.size());
-    for (const program::ResourceAccess &resource : node.accesses) {
-        const uint32_t value = resource.kind == program::AccessKind::Read         ? resource.value
-                               : resource.kind == program::AccessKind::Initialize ? resource.after
-                                                                                  : resource.before;
-        const std::string access = resource.kind == program::AccessKind::Read         ? "read"
-                                   : resource.kind == program::AccessKind::Initialize ? "write"
-                                                                                      : resource.access;
-        description.resources.push_back({value, access.empty() ? "read_write" : access});
-    }
-    return description;
 }
 
 bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const uint64_t staticGrid[3],
@@ -2289,106 +2312,71 @@ bool resolveProgramGrid(vernon::runtime::program::DispatchMapping mapping, const
     return false;
 }
 
-class PipelineComputePass final : public vernon::execution::ComputePass {
-public:
-    PipelineComputePass(const program::Node &node, VernonStageExecutable &pipeline,
-                        vernon::runtime::program_execution::MaterializedNodeFrame materialized,
-                        const std::vector<vernon::execution::GraphBuffer> &resources,
-                        const std::vector<VernonProgramArgument> *arena, const program::Program *program,
-                        VernonLaunchSize grid)
-        : ComputePass(programNodeName(node)), description_(describeProgramNode(node)), pipeline_(pipeline),
-          materialized_(std::move(materialized)), resources_(resources), arena_(arena), program_(program), grid_(grid) {
-    }
+VernonStatus executeCpuProgramNode(VernonRuntimeContext &context, const program::Program &program,
+                                   const program::Node &node, VernonStageExecutable &pipeline,
+                                   vernon::runtime::program_execution::ProgramInvocationState &arena,
+                                   vernon::runtime::program_execution::MaterializedNodeFrame &materialized,
+                                   VernonLaunchSize grid,
+                                   vernon::runtime::program_execution::SubmissionState &submission) {
+    std::string error;
+    if (!materialized.prepareHost(error))
+        return fail(&context, programNodeName(node) + ": " + error, VERNON_STATUS_INTERNAL_ERROR);
+    if (!grid.x || !grid.y || !grid.z)
+        return VERNON_STATUS_OK;
 
-    void declare() override {
-        for (const PipelineComputeResource &use : description_.resources) {
-            if (use.access == "read")
-                read(resources_.at(use.value));
-            else if (use.access == "write")
-                write(resources_.at(use.value));
-            else
-                readWrite(resources_.at(use.value));
-        }
-        setFlags(vernon::execution::PassSideEffect);
-    }
+    VernonAdTapeAllocator *allocator = nullptr;
+    VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
+    const auto bindTape = [&](uint32_t valueId) {
+        const std::vector<VernonProgramArgument> &arguments = arena.arguments();
+        if (valueId >= arguments.size() || valueId >= program.values.size() ||
+            !program::isTapeValue(program.values[valueId]))
+            return;
+        const VernonProgramArgument &argument = arguments[valueId];
+        constexpr size_t allocatorDescriptorBytes = sizeof(VernonAdTapeAllocator *);
+        constexpr size_t rootDescriptorBytes = sizeof(VernonAdRegionHandle);
+        if (argument.kind != VERNON_PROGRAM_TENSOR || !argument.tensor.host_data ||
+            argument.tensor.byte_size < allocatorDescriptorBytes + rootDescriptorBytes)
+            return;
+        const auto *bytes = static_cast<const uint8_t *>(argument.tensor.host_data);
+        std::memcpy(&allocator, bytes, allocatorDescriptorBytes);
+        std::memcpy(&root, bytes + allocatorDescriptorBytes, rootDescriptorBytes);
+    };
+    for (uint32_t operand : node.operands)
+        bindTape(operand);
+    for (uint32_t result : node.results)
+        bindTape(result);
+    vernon::runtime::setCpuProgramTape(pipeline, allocator, root);
 
-    VernonRhiStatus execute(vernon::execution::ComputeEncoder &,
-                            const vernon::execution::ExecutionResources &) override {
-        VernonStageInvocationDescriptor invocation{};
-        invocation.struct_size = sizeof(invocation);
-        invocation.abi_version = VERNON_PROGRAM_VERSION;
-        invocation.arguments = materialized_.arguments.data();
-        invocation.argument_count = materialized_.arguments.size();
-        invocation.compute_grid = grid_;
-        PlannedComputeLaunch plan;
-        std::string error;
-        if (!materialized_.prepareHost(error)) {
-            invocationDiagnostic(*pipeline_.context) = description_.name + ": " + error;
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        }
-        if (!grid_.x || !grid_.y || !grid_.z)
-            return VERNON_RHI_STATUS_OK;
-        const uint32_t workgroup[3]{pipeline_.workgroupSize.x, pipeline_.workgroupSize.y, pipeline_.workgroupSize.z};
-        if (pipeline_.context && pipeline_.context->backend == VERNON_RUNTIME_CPU) {
-            VernonAdTapeAllocator *allocator = nullptr;
-            VernonAdRegionHandle root = VERNON_AD_INVALID_REGION_HANDLE;
-            const auto bindTape = [&](uint32_t valueId) {
-                if (!arena_ || !program_ || valueId >= arena_->size() || valueId >= program_->values.size() ||
-                    !program::isTapeValueType(program_->values[valueId].type))
-                    return;
-                const VernonProgramArgument &argument = (*arena_)[valueId];
-                constexpr size_t allocatorDescriptorBytes = sizeof(VernonAdTapeAllocator *);
-                constexpr size_t rootDescriptorBytes = sizeof(VernonAdRegionHandle);
-                if (argument.kind != VERNON_PROGRAM_TENSOR || !argument.tensor.host_data ||
-                    argument.tensor.byte_size < allocatorDescriptorBytes + rootDescriptorBytes)
-                    return;
-                const auto *bytes = static_cast<const uint8_t *>(argument.tensor.host_data);
-                std::memcpy(&allocator, bytes, allocatorDescriptorBytes);
-                std::memcpy(&root, bytes + allocatorDescriptorBytes, rootDescriptorBytes);
-            };
-            for (uint32_t operand : description_.operands)
-                bindTape(operand);
-            for (uint32_t result : description_.results)
-                bindTape(result);
-            vernon::runtime::setCpuProgramTape(pipeline_, allocator, root);
-        }
-        if (!planComputeInvocation(pipeline_.bindingProjection, invocation, plan, error)) {
-            invocationDiagnostic(*pipeline_.context) = std::move(error);
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        }
-        const uint32_t grid[3]{plan.grid.x, plan.grid.y, plan.grid.z};
-        if (!validateDispatchContract(pipeline_.dispatchContract, grid, workgroup, error)) {
-            invocationDiagnostic(*pipeline_.context) = std::move(error);
-            return VERNON_RHI_STATUS_INVALID_ARGUMENT;
-        }
-        auto invoked = invokeBackendComputePipeline(pipeline_, plan);
-        if (invoked.isErr()) {
-            std::string &detail = invocationDiagnostic(*pipeline_.context);
-            if (detail.empty())
-                detail = "pipeline compute failed";
-            detail = description_.name + ": " + detail;
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        }
-        if (!commitComputeResults(plan, error)) {
-            invocationDiagnostic(*pipeline_.context) = description_.name + ": " + error;
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        }
-        if (!materialized_.commitHost(error)) {
-            invocationDiagnostic(*pipeline_.context) = description_.name + ": " + error;
-            return VERNON_RHI_STATUS_INTERNAL_ERROR;
-        }
-        return VERNON_RHI_STATUS_OK;
-    }
+    VernonStageInvocationDescriptor invocation{};
+    invocation.struct_size = sizeof(invocation);
+    invocation.abi_version = VERNON_PROGRAM_VERSION;
+    invocation.arguments = materialized.arguments.data();
+    invocation.argument_count = materialized.arguments.size();
+    invocation.compute_grid = grid;
+    PlannedComputeLaunch plan;
+    if (!planComputeInvocation(pipeline.bindingProjection, invocation, plan, error))
+        return fail(&context, std::move(error));
+    const uint32_t launchGrid[3]{plan.grid.x, plan.grid.y, plan.grid.z};
+    const uint32_t workgroup[3]{pipeline.workgroupSize.x, pipeline.workgroupSize.y, pipeline.workgroupSize.z};
+    if (!validateDispatchContract(pipeline.dispatchContract, launchGrid, workgroup, error))
+        return fail(&context, std::move(error));
 
-private:
-    PipelineComputePassDescription description_;
-    VernonStageExecutable &pipeline_;
-    vernon::runtime::program_execution::MaterializedNodeFrame materialized_;
-    const std::vector<vernon::execution::GraphBuffer> &resources_;
-    const std::vector<VernonProgramArgument> *arena_{};
-    const program::Program *program_{};
-    VernonLaunchSize grid_{};
-};
+    submission = vernon::runtime::program_execution::SubmissionState::Indeterminate;
+    auto invoked = invokeBackendComputePipeline(pipeline, plan);
+    if (invoked.isErr()) {
+        const VernonStatus status = vernon::toVernonStatus(std::move(invoked).error());
+        std::string &detail = invocationDiagnostic(context);
+        if (detail.empty())
+            detail = "pipeline compute failed";
+        detail = programNodeName(node) + ": " + detail;
+        return status;
+    }
+    if (!commitComputeResults(plan, error))
+        return fail(&context, programNodeName(node) + ": " + error, VERNON_STATUS_INTERNAL_ERROR);
+    if (!materialized.commitHost(error))
+        return fail(&context, programNodeName(node) + ": " + error, VERNON_STATUS_INTERNAL_ERROR);
+    return VERNON_STATUS_OK;
+}
 
 struct ManagedGraphicsCommandContext {
     VernonStageExecutable &pipeline;
@@ -2514,7 +2502,49 @@ VernonStatus executePipelineProgramGraphImpl(
             },
             controlBindingError))
         return fail(&context, std::move(controlBindingError));
-    if (context.backend != VERNON_RUNTIME_CPU) {
+    if (context.backend == VERNON_RUNTIME_CPU) {
+        const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
+        if (!direction)
+            return fail(&context, "Program graph has an invalid direction");
+        for (const program::Node &node : graph.nodes) {
+            const program::ResolvedNodePlan *resolvedNode = execution.node(*direction, node.id);
+            if (!resolvedNode || !resolvedNode->stage)
+                return fail(&context, "pipeline node has no resolved kernel stage");
+            if (program::executionKind(node) != program::ExecutionKind::Compute)
+                return fail(&context, "CPU Program execution requires compute nodes");
+
+            vernon::runtime::program_execution::MaterializedNodeFrame materialized;
+            std::string error;
+            if (!vernon::runtime::program_execution::materializeNodeFrame(arena, canonicalProgram, node, *resolvedNode,
+                                                                          resolvePhysicalEndpoint, materialized, error))
+                return fail(&context, std::move(error));
+            const program::ComputeOperation &compute = program::computeOperation(node);
+            uint64_t controlGrid[3]{};
+            for (size_t axis = 0; axis < 3; ++axis) {
+                auto controlValue = arena.resolveControl(canonicalProgram, compute.workgroups[axis]);
+                if (controlValue.isErr())
+                    return fail(&context, program_execution::programInvocationErrorMessage(controlValue.error()));
+                controlGrid[axis] = controlValue.value();
+                if (!controlGrid[axis] || controlGrid[axis] > UINT32_MAX)
+                    return fail(&context, "Program compute grid is outside the portable uint32 range");
+            }
+            const auto *controls = std::get_if<program::ResolvedComputeControls>(&resolvedNode->controls);
+            VernonLaunchSize grid{};
+            if (!controls ||
+                !resolveProgramGrid(controls->dispatchMapping, controlGrid, materialized.arguments, grid, error))
+                return fail(&context, std::move(error));
+            const VernonStatus status = executeCpuProgramNode(context, canonicalProgram, node, *resolvedNode->stage,
+                                                              arena, materialized, grid, submission);
+            if (status != VERNON_STATUS_OK)
+                return status;
+        }
+        if (vernon::runtime::program_execution::injectFailure(
+                vernon::runtime::program_execution::FailureBoundary::Completion))
+            return fail(&context, "injected CPU Program wait failure", VERNON_STATUS_INTERNAL_ERROR);
+        submission = vernon::runtime::program_execution::SubmissionState::Completed;
+        return VERNON_STATUS_OK;
+    }
+    {
         vernon::execution::detail::RhiCommandExecutionPlan commandPlan;
         vernon::runtime::program_execution::ResolvedTransferExecutor transfers(context, arena);
         const std::optional<program::GraphDirection> graphDirection = program::graphDirection(graph.direction);
@@ -2698,95 +2728,7 @@ VernonStatus executePipelineProgramGraphImpl(
         }
         return flushCommands();
     }
-    vernon::execution::CommandGraph commandGraph;
-    std::vector<vernon::execution::GraphBuffer> resources;
-    resources.reserve(valueArguments.size());
-    std::vector<char> used(canonicalProgram.values.size());
-    program::markGraphValues(graph, used);
-    for (size_t index = 0; index < valueArguments.size(); ++index) {
-        if (index >= used.size() || !used[index]) {
-            resources.push_back({});
-            continue;
-        }
-        const VernonProgramArgument &argument = valueArguments[index];
-        if (argument.kind != VERNON_PROGRAM_TENSOR)
-            return fail(&context, "Program graph requires materialized tensor values");
-        if (argument.tensor.storage == VERNON_TENSOR_HOST && argument.tensor.host_data) {
-            const uint64_t identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(argument.tensor.host_data));
-            const bool output =
-                std::any_of(graph.outputs.begin(), graph.outputs.end(),
-                            [&](const program::GraphOutput &candidate) { return candidate.value == index; });
-            resources.push_back(commandGraph.importHostBuffer(identity, output));
-            continue;
-        }
-        auto device = arena.buffer(static_cast<uint32_t>(index));
-        if (!device || device.value().index == VERNON_RHI_INVALID_HANDLE_INDEX)
-            return fail(&context, "Program graph requires a materialized host or RHI Storage backing");
-        const bool output =
-            std::any_of(graph.outputs.begin(), graph.outputs.end(),
-                        [&](const program::GraphOutput &candidate) { return candidate.value == index; });
-        resources.push_back(commandGraph.importBuffer(device.value(), output));
-    }
-    std::vector<vernon::execution::ExecutionPass *> passes(graph.nodes.size());
-    for (const program::Node &node : graph.nodes) {
-        const std::optional<program::GraphDirection> direction = program::graphDirection(graph.direction);
-        const program::ResolvedNodePlan *resolvedNode = direction ? execution.node(*direction, node.id) : nullptr;
-        if (!resolvedNode)
-            return fail(&context, "pipeline node has no resolved kernel stage");
-        VernonStageExecutable &stage = *resolvedNode->stage;
-        vernon::runtime::program_execution::MaterializedNodeFrame materialized;
-        std::string materializationError;
-        if (!vernon::runtime::program_execution::materializeNodeFrame(arena, canonicalProgram, node, *resolvedNode,
-                                                                      resolvePhysicalEndpoint, materialized,
-                                                                      materializationError))
-            return fail(&context, std::move(materializationError));
-        uint64_t controlGrid[3]{};
-        constexpr const char *axisNames[] = {"x", "y", "z"};
-        for (size_t axis = 0; axis < 3; ++axis) {
-            const program::ControlComponent &component = program::computeOperation(node).workgroups[axis];
-            const std::string source = component.kind == program::ControlKind::Static
-                                           ? "static declaration"
-                                           : "Value " + std::to_string(component.reference);
-            auto control = arena.resolveControl(canonicalProgram, component);
-            if (control.isErr())
-                return fail(&context,
-                            "Program compute grid axis " + std::string(axisNames[axis]) + " from " + source +
-                                " failed: " + program_execution::programInvocationErrorMessage(control.error()));
-            controlGrid[axis] = std::move(control).value();
-            if (!controlGrid[axis] || controlGrid[axis] > UINT32_MAX)
-                return fail(&context, "Program compute grid axis " + std::string(axisNames[axis]) + " from " + source +
-                                          " must be in [1, UINT32_MAX]");
-        }
-        VernonLaunchSize grid{};
-        const auto *computeControls = std::get_if<program::ResolvedComputeControls>(&resolvedNode->controls);
-        if (!computeControls || !resolveProgramGrid(computeControls->dispatchMapping, controlGrid,
-                                                    materialized.arguments, grid, materializationError))
-            return fail(&context, std::move(materializationError));
-        auto &pass = commandGraph.emplacePass<PipelineComputePass>(node, stage, std::move(materialized), resources,
-                                                                   &valueArguments, &canonicalProgram, grid);
-        for (uint32_t dependency : execution.predecessors(*direction, node.id)) {
-            if (dependency >= passes.size() || !passes[dependency])
-                return fail(&context, "Program node dependency is not materialized");
-            pass.dependsOn(*passes[dependency]);
-        }
-        passes[node.id] = &pass;
-    }
-    std::string error;
-    std::shared_ptr<vernon::execution::CompiledCommandGraph> compiled = commandGraph.compile(error);
-    if (!compiled)
-        return fail(&context, "cannot compile pipeline CommandGraph: " + error);
-    vernon::execution::ExecutionSubmission executionSubmission = compiled->submit();
-    submission = vernon::runtime::program_execution::SubmissionState::Indeterminate;
-    if (executionSubmission.wait() != VERNON_RHI_STATUS_OK) {
-        const std::string detail = invocationDiagnostic(context);
-        return fail(&context, detail.empty() ? "pipeline CommandGraph submission failed"
-                                             : "pipeline CommandGraph submission failed: " + detail);
-    }
-    if (vernon::runtime::program_execution::injectFailure(
-            vernon::runtime::program_execution::FailureBoundary::Completion))
-        return fail(&context, "injected pipeline CommandGraph wait failure", VERNON_STATUS_INTERNAL_ERROR);
-    submission = vernon::runtime::program_execution::SubmissionState::Completed;
-    return VERNON_STATUS_OK;
+    return VERNON_STATUS_INTERNAL_ERROR;
 }
 
 VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const VernonStageInvocationDescriptor &invocation) {
@@ -2823,6 +2765,16 @@ VernonStatus encodeStageInvocation(VernonStageExecutable &pipeline, const Vernon
 }
 
 } // namespace
+
+VernonStatus vernon::runtime::executePipelineProgramGraph(
+    VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution, const program::Graph &graph,
+    program_execution::ProgramInvocationState &frame,
+    const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
+    program_execution::SubmissionState &submission) {
+    return executePipelineProgramGraphImpl(context, execution, graph, frame, resolvePhysicalEndpoint, submission);
+}
+
+} // extern "C++"
 
 VernonStatus vernon::runtime::submitResolvedStage(VernonStageExecutable *pipeline,
                                                   const VernonStageInvocationDescriptor *invocation,
@@ -3022,6 +2974,12 @@ ProgramInvocationHandleResult beginProgramInvocationOperation(VernonProgramInsta
     }
     auto invocation =
         std::make_unique<VernonProgramInvocation>(*instance, std::move(child).value(), std::move(transaction).value());
+    invocation->executionWorkspace = instance->state->acquireWorkspace();
+    if (!invocation->executionWorkspace) {
+        fail(context, "cannot acquire Program execution workspace", VERNON_STATUS_INTERNAL_ERROR);
+        return ProgramInvocationHandleResult{vernon::err(vernon::RuntimeError{
+            vernon::RuntimeErrorCode::ResourceExhausted, {"cannot acquire Program execution workspace", 0, 0}})};
+    }
     auto published = invocation->lifecycle.publish();
     if (published.isErr()) {
         fail(context, "cannot publish Program invocation", vernon::toVernonStatus(published.error()));
@@ -3429,10 +3387,12 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
         if (snapshot.isErr())
             return fail(pipeline->context, "cannot freeze Program invocation bindings", VERNON_STATUS_INTERNAL_ERROR);
         invocation->snapshot = std::move(snapshot).value();
-        std::vector<VernonProgramArgument> arguments;
+        std::vector<VernonProgramArgument> &arguments = invocation->executionWorkspace->boundaryArguments;
+        arguments.clear();
         const program::Program &program = *executableProgram(*pipeline);
         const size_t count = publicBoundaryCount(program);
-        arguments.reserve(count);
+        if (arguments.capacity() < count)
+            arguments.reserve(count);
         for (size_t index = 0; index < count; ++index) {
             const program::BoundarySlot *parameter = publicBoundaryAt(program, index);
             if (!parameter)
@@ -3448,6 +3408,7 @@ VernonStatus vernonRuntimeProgramInvocationExecute(VernonProgramInvocation *invo
             *invocation->snapshot,
             invocation->checkpointMemoryBudget,
             invocation->checkpointPolicy,
+            invocation->executionWorkspace,
         };
         VernonPullback *pullback = nullptr;
         vernon::runtime::program_execution::InvocationMutationOutcome outcome;
@@ -3706,19 +3667,6 @@ VernonStatus vernonRuntimeReferenceRhiCommandEncoder(VernonRuntimeContext *conte
 }
 
 } // extern "C"
-
-vernon::runtime::RuntimeResult<void> vernon::runtime::executePipelineProgramGraph(
-    VernonRuntimeContext &context, const program::ResolvedExecutionPlan &execution, const program::Graph &graph,
-    program_execution::ProgramInvocationState &arena,
-    const program_execution::ResolvePhysicalEndpoint &resolvePhysicalEndpoint,
-    program_execution::SubmissionState &submission) {
-    const VernonStatus status =
-        executePipelineProgramGraphImpl(context, execution, graph, arena, resolvePhysicalEndpoint, submission);
-    return status == VERNON_STATUS_OK
-               ? RuntimeResult<void>{vernon::ok()}
-               : RuntimeResult<void>{
-                     vernon::err(vernon::runtimeErrorFromStatus(status, {"execute_pipeline_program_graph", 0, 0}))};
-}
 
 VernonStageExecutable::~VernonStageExecutable() {
     if (backendState)

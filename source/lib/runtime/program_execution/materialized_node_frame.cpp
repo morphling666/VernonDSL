@@ -52,6 +52,32 @@ std::optional<shape::DeclaredShape> logicalProjectionShape(const Parameter &para
 
 } // namespace
 
+void MaterializedNodeFrame::reset(size_t endpointCount) {
+    arguments.clear();
+    shapes.resize(endpointCount);
+    strides.resize(endpointCount);
+    for (size_t endpoint = 0; endpoint < endpointCount; ++endpoint) {
+        shapes[endpoint].clear();
+        strides[endpoint].clear();
+    }
+    for (std::vector<uint8_t> &carrier : hostEndpointCarriers)
+        carrier.clear();
+    hostEndpointCarrierCount = 0;
+    deviceEndpointCarriers.clear();
+    copiesBefore.clear();
+    copiesAfter.clear();
+    deviceCopiesBefore.clear();
+    deviceCopiesAfter.clear();
+}
+
+std::vector<uint8_t> &MaterializedNodeFrame::appendHostEndpointCarrier(size_t byteSize) {
+    if (hostEndpointCarrierCount == hostEndpointCarriers.size())
+        hostEndpointCarriers.emplace_back();
+    std::vector<uint8_t> &carrier = hostEndpointCarriers[hostEndpointCarrierCount++];
+    carrier.resize(byteSize);
+    return carrier;
+}
+
 bool MaterializedNodeFrame::prepareHost(std::string &error) const {
     for (const HostCopy &copy : copiesBefore) {
         if (!copy.source || !copy.destination)
@@ -79,10 +105,8 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
     const VernonStageExecutable &stage = *nodePlan.stage;
     if (nodePlan.projections.size() != stage.bindingProjection.parameters.size())
         return error = "resolved Program stage has an invalid endpoint plan", false;
-    output = {};
+    output.reset(nodePlan.projections.size());
     output.arguments.reserve(nodePlan.projections.size());
-    output.shapes.reserve(nodePlan.projections.size());
-    output.strides.reserve(nodePlan.projections.size());
 
     uint64_t dispatchInvocations = 1;
     if (program::executionKind(node) == program::ExecutionKind::Compute) {
@@ -152,8 +176,10 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 materialized.tensor.byte_strides = value.boundTensorLayout->byteStrides.data();
             }
         }
-        std::vector<uint64_t> suppliedShape;
-        std::vector<int64_t> suppliedStrides;
+        std::vector<uint64_t> &outputShape = output.shapes[parameterIndex];
+        std::vector<int64_t> &outputStrides = output.strides[parameterIndex];
+        std::vector<uint64_t> &suppliedShape = outputShape;
+        std::vector<int64_t> &suppliedStrides = outputStrides;
         if (materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.rank && materialized.tensor.shape &&
             materialized.tensor.byte_strides) {
             suppliedShape.assign(materialized.tensor.shape, materialized.tensor.shape + materialized.tensor.rank);
@@ -191,19 +217,17 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             }
         }
 
-        output.shapes.emplace_back();
-        output.strides.emplace_back();
         if (materialized.kind == VERNON_PROGRAM_TENSOR && materialized.tensor.rank) {
-            const shape::DeclaredShape declared = shape::decodeRuntimeContractShape(programValue.shape);
+            const shape::DeclaredShape &declared = invocation.plan().declaredValueShapes[binding.value];
             const bool suppliedRankedValue = programValue.shape.empty() && programValue.canonicalType.rankedValue &&
                                              suppliedShape == programValue.canonicalType.innerShape &&
                                              suppliedStrides.size() == suppliedShape.size();
             if (suppliedRankedValue) {
-                output.shapes.back() = suppliedShape;
-                output.strides.back() = suppliedStrides;
+                outputShape = suppliedShape;
+                outputStrides = suppliedStrides;
             } else if (binding.value < invocation.values().size() && invocation.values()[binding.value].concreteShape) {
-                output.shapes.back() = *invocation.values()[binding.value].concreteShape;
-                output.strides.back() = invocation.values()[binding.value].strides;
+                outputShape = *invocation.values()[binding.value].concreteShape;
+                outputStrides = invocation.values()[binding.value].strides;
             } else if (!shape::isConcrete(declared)) {
                 return error = "resolved Program TensorView shape is not concrete", false;
             } else if (!materialized.tensor.shape || !materialized.tensor.byte_strides) {
@@ -211,16 +235,15 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                                "logical layout",
                        false;
             } else {
-                output.shapes.back().assign(materialized.tensor.shape,
-                                            materialized.tensor.shape + materialized.tensor.rank);
-                output.strides.back().assign(materialized.tensor.byte_strides,
-                                             materialized.tensor.byte_strides + materialized.tensor.rank);
+                outputShape.assign(materialized.tensor.shape, materialized.tensor.shape + materialized.tensor.rank);
+                outputStrides.assign(materialized.tensor.byte_strides,
+                                     materialized.tensor.byte_strides + materialized.tensor.rank);
             }
-            if (output.shapes.back().size() != output.strides.back().size())
+            if (outputShape.size() != outputStrides.size())
                 return error = "resolved Program TensorView shape has no strides", false;
-            materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
-            materialized.tensor.shape = output.shapes.back().data();
-            materialized.tensor.byte_strides = output.strides.back().data();
+            materialized.tensor.rank = static_cast<uint32_t>(outputShape.size());
+            materialized.tensor.shape = outputShape.data();
+            materialized.tensor.byte_strides = outputStrides.data();
         }
 
         if (binding.target.carrier == program::TargetCarrier::UniformBuffer && !binding.target.endpointProjection &&
@@ -265,11 +288,11 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 return error = "resolved tape carrier has an incompatible "
                                "Stage-local view",
                        false;
-            output.shapes.back() = std::move(view.shape);
-            output.strides.back() = std::move(view.strides);
-            materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
-            materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
-            materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
+            outputShape = std::move(view.shape);
+            outputStrides = std::move(view.strides);
+            materialized.tensor.rank = static_cast<uint32_t>(outputShape.size());
+            materialized.tensor.shape = outputShape.empty() ? nullptr : outputShape.data();
+            materialized.tensor.byte_strides = outputStrides.empty() ? nullptr : outputStrides.data();
         }
 
         if (binding.target.endpointProjection) {
@@ -295,10 +318,10 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                        false;
 
             size_t elements = 0;
-            std::vector<int64_t> canonicalStrides = output.strides.back();
-            if (!shape::checkedElementCount(output.shapes.back(), elements) ||
+            std::vector<int64_t> canonicalStrides = outputStrides;
+            if (!shape::checkedElementCount(outputShape, elements) ||
                 elements > std::numeric_limits<size_t>::max() / projection.carrierByteSize ||
-                !shape::rowMajorByteStrides(output.shapes.back(), projection.carrierByteSize, output.strides.back()))
+                !shape::rowMajorByteStrides(outputShape, projection.carrierByteSize, outputStrides))
                 return error = "physical endpoint carrier size overflows", false;
             const size_t byteSize = elements * projection.carrierByteSize;
             VernonTensorView canonical = materialized.tensor;
@@ -308,7 +331,7 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 static_cast<uint32_t>(std::min(projection.leafByteSize, projection.carrierAlignment));
             canonical.byte_strides = canonicalStrides.empty() ? nullptr : canonicalStrides.data();
 
-            std::vector<int64_t> leafCarrierStrides = output.strides.back();
+            std::vector<int64_t> leafCarrierStrides = outputStrides;
             VernonTensorView leafCarrier = canonical;
             leafCarrier.byte_offset = projection.leafByteOffset;
             leafCarrier.byte_size = byteSize;
@@ -319,15 +342,15 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             materialized.tensor.byte_offset = 0;
             materialized.tensor.byte_size = byteSize;
             materialized.tensor.element_layout = pipelineValueLayout(*targetTensorLayout);
-            materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
+            materialized.tensor.byte_strides = outputStrides.empty() ? nullptr : outputStrides.data();
             const bool writes = materialized.tensor.access != VERNON_ACCESS_READ;
             if (!elements) {
                 // Empty domains retain canonical identity and have no carrier.
             } else if (canonical.storage == VERNON_TENSOR_HOST) {
-                output.hostEndpointCarriers.emplace_back(byteSize);
-                materialized.tensor.host_data = output.hostEndpointCarriers.back().data();
+                std::vector<uint8_t> &hostCarrier = output.appendHostEndpointCarrier(byteSize);
+                materialized.tensor.host_data = hostCarrier.data();
                 const auto *canonicalBytes = static_cast<const uint8_t *>(canonical.host_data);
-                auto *carrierBytes = output.hostEndpointCarriers.back().data();
+                auto *carrierBytes = hostCarrier.data();
                 for (const ProgramTensorCopyRegion &region : regions) {
                     output.copiesBefore.push_back(
                         {canonicalBytes, carrierBytes, region.sourceOffset, region.destinationOffset, region.size});
@@ -372,9 +395,9 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
             std::vector<uint64_t> compactShape;
             std::vector<int64_t> compactStrides;
             if (!projectionShape || !parameterLayout.byteSize ||
-                !shape::materializeLeafProjection(output.shapes.back(), output.strides.back(), *projectionShape,
+                !shape::materializeLeafProjection(outputShape, outputStrides, *projectionShape,
                                                   parameterLayout.byteSize, projectedShape, projectedStrides) ||
-                !shape::materializeCompactProjection(output.shapes.back(), *projectionShape, parameterLayout.byteSize,
+                !shape::materializeCompactProjection(outputShape, *projectionShape, parameterLayout.byteSize,
                                                      compactShape, compactStrides))
                 return error = "aggregate leaf has an incompatible physical shape", false;
             if (slot.shape.empty() && valueLayout.leaves.size() == 1 && leaf.byteOffset == 0 &&
@@ -394,24 +417,23 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 canonical.rank = static_cast<uint32_t>(projectedShape.size());
                 canonical.shape = projectedShape.empty() ? nullptr : projectedShape.data();
                 canonical.byte_strides = projectedStrides.empty() ? nullptr : projectedStrides.data();
-                output.shapes.back() = std::move(compactShape);
-                output.strides.back() = std::move(compactStrides);
+                outputShape = std::move(compactShape);
+                outputStrides = std::move(compactStrides);
                 materialized.tensor.byte_offset = 0;
                 materialized.tensor.byte_size = byteSize;
-                materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
-                materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
-                materialized.tensor.byte_strides =
-                    output.strides.back().empty() ? nullptr : output.strides.back().data();
+                materialized.tensor.rank = static_cast<uint32_t>(outputShape.size());
+                materialized.tensor.shape = outputShape.empty() ? nullptr : outputShape.data();
+                materialized.tensor.byte_strides = outputStrides.empty() ? nullptr : outputStrides.data();
                 const bool writes = materialized.tensor.access != VERNON_ACCESS_READ;
                 std::vector<ProgramTensorCopyRegion> regions;
                 if (canonical.storage == VERNON_TENSOR_HOST) {
-                    output.hostEndpointCarriers.emplace_back(byteSize);
-                    materialized.tensor.host_data = output.hostEndpointCarriers.back().data();
+                    std::vector<uint8_t> &hostCarrier = output.appendHostEndpointCarrier(byteSize);
+                    materialized.tensor.host_data = hostCarrier.data();
                     VernonTensorView compact = materialized.tensor;
                     if (!planProgramTensorCopy(canonical, compact, regions, error))
                         return false;
                     const auto *canonicalBytes = static_cast<const uint8_t *>(canonical.host_data);
-                    auto *compactBytes = output.hostEndpointCarriers.back().data();
+                    auto *compactBytes = hostCarrier.data();
                     for (const ProgramTensorCopyRegion &region : regions) {
                         output.copiesBefore.push_back(
                             {canonicalBytes, compactBytes, region.sourceOffset, region.destinationOffset, region.size});
@@ -448,12 +470,12 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                     return error = "aggregate leaf has no materializable backing", false;
                 }
             } else {
-                output.shapes.back() = std::move(projectedShape);
-                output.strides.back() = std::move(projectedStrides);
+                outputShape = std::move(projectedShape);
+                outputStrides = std::move(projectedStrides);
             }
-            materialized.tensor.rank = static_cast<uint32_t>(output.shapes.back().size());
-            materialized.tensor.shape = output.shapes.back().empty() ? nullptr : output.shapes.back().data();
-            materialized.tensor.byte_strides = output.strides.back().empty() ? nullptr : output.strides.back().data();
+            materialized.tensor.rank = static_cast<uint32_t>(outputShape.size());
+            materialized.tensor.shape = outputShape.empty() ? nullptr : outputShape.data();
+            materialized.tensor.byte_strides = outputStrides.empty() ? nullptr : outputStrides.data();
         }
 
         if (binding.target.viewTransform) {
@@ -461,26 +483,24 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                 !materialized.tensor.byte_strides ||
                 parameter.shape.size() != binding.target.viewTransform->axes.size())
                 return error = "Program view transform has an incompatible logical view", false;
-            auto &shape = output.shapes.back();
-            auto &strides = output.strides.back();
-            const std::vector<uint64_t> logicalShape = shape;
-            const std::vector<int64_t> logicalStrides = strides;
-            shape.clear();
-            strides.clear();
+            const std::vector<uint64_t> logicalShape = outputShape;
+            const std::vector<int64_t> logicalStrides = outputStrides;
+            outputShape.clear();
+            outputStrides.clear();
             for (size_t physicalAxis = 0; physicalAxis < binding.target.viewTransform->axes.size(); ++physicalAxis) {
                 const auto &axis = binding.target.viewTransform->axes[physicalAxis];
                 if (axis.source == program::ViewAxisSource::Constant) {
                     if (!axis.constantExtent || !axis.zeroStride)
                         return error = "constant view axis has no storage mapping", false;
-                    shape.push_back(axis.constantExtent);
-                    strides.push_back(0);
+                    outputShape.push_back(axis.constantExtent);
+                    outputStrides.push_back(0);
                 } else if (axis.source == program::ViewAxisSource::InvocationLinearCarrier) {
                     if (!axis.zeroStride)
                         return error = "dispatch-derived view axis must "
                                        "broadcast",
                                false;
-                    shape.push_back(dispatchInvocations);
-                    strides.push_back(0);
+                    outputShape.push_back(dispatchInvocations);
+                    outputStrides.push_back(0);
                 } else {
                     if (axis.logicalAxis >= logicalShape.size())
                         return error = "view transform references an unknown "
@@ -492,13 +512,13 @@ bool materializeNodeFrame(const ProgramInvocationState &invocation, const progra
                         return error = "view transform extent disagrees with "
                                        "logical Value",
                                false;
-                    shape.push_back(logicalExtent ? logicalExtent : physicalExtent);
-                    strides.push_back(axis.zeroStride ? 0 : logicalStrides[axis.logicalAxis]);
+                    outputShape.push_back(logicalExtent ? logicalExtent : physicalExtent);
+                    outputStrides.push_back(axis.zeroStride ? 0 : logicalStrides[axis.logicalAxis]);
                 }
             }
-            materialized.tensor.rank = static_cast<uint32_t>(shape.size());
-            materialized.tensor.shape = shape.data();
-            materialized.tensor.byte_strides = strides.data();
+            materialized.tensor.rank = static_cast<uint32_t>(outputShape.size());
+            materialized.tensor.shape = outputShape.data();
+            materialized.tensor.byte_strides = outputStrides.data();
         }
         output.arguments.push_back(materialized);
     }
